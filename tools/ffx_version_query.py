@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Decoder, EncodingKind, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -29,6 +29,50 @@ template<class T> T load(word address) {
 }
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
+}
+static inline uint32_t f16_to_f32_bits(uint16_t h) {
+    const uint32_t sign = uint32_t(h >> 15) << 31;
+    uint32_t exp = (h >> 10) & 0x1fu, frac = h & 0x3ffu;
+    if (exp == 0u) {
+        if (frac == 0u) return sign;
+        int e = -14;
+        while ((frac & 0x400u) == 0u) { frac <<= 1; --e; }
+        return sign | (uint32_t(e + 127) << 23) | ((frac & 0x3ffu) << 13);
+    }
+    if (exp == 31u) return sign | 0x7f800000u | (frac ? ((frac | 0x200u) << 13) : 0u);
+    return sign | ((exp + 112u) << 23) | (frac << 13);
+}
+static inline uint16_t f32_to_f16_bits(uint32_t f, unsigned mode) {
+    const uint16_t sign = static_cast<uint16_t>((f >> 16) & 0x8000u);
+    const uint32_t exp = (f >> 23) & 0xffu, frac = f & 0x7fffffu;
+    const bool neg = sign != 0u;
+    if (exp == 255u) return static_cast<uint16_t>(sign | (frac ? (0x7e00u | ((frac >> 13) & 0x3ffu)) : 0x7c00u));
+    const int e = int(exp) - 127;
+    if (e > 15) {
+        const bool inf = (mode == 0u) || (mode == 1u && neg) || (mode == 2u && !neg);
+        return static_cast<uint16_t>(sign | (inf ? 0x7c00u : 0x7bffu));
+    }
+    if (e >= -14) {
+        const uint32_t mant = frac >> 13, rem = frac & 0x1fffu;
+        const bool inc = mode == 0u ? (rem > 0x1000u || (rem == 0x1000u && (mant & 1u) != 0u))
+                       : (mode == 1u ? (neg && rem != 0u) : (mode == 2u ? (!neg && rem != 0u) : false));
+        uint16_t r = static_cast<uint16_t>(((e + 15) << 10) | mant);
+        if (inc) ++r;
+        return static_cast<uint16_t>(sign | r);
+    }
+    if (exp == 0u && frac == 0u) return sign;
+    const uint32_t sig = (exp == 0u) ? frac : (0x800000u | frac);
+    const int shift = (-14 - e) + 13;
+    uint32_t mant = 0;
+    bool gt = false, eq = false, nz = sig != 0u;
+    if (shift <= 25) {
+        mant = sig >> shift;
+        const uint32_t half = 1u << (shift - 1), rem = sig & ((1u << shift) - 1u);
+        gt = rem > half; eq = rem == half; nz = rem != 0u;
+    }
+    const bool inc = mode == 0u ? (gt || (eq && (mant & 1u) != 0u))
+                   : (mode == 1u ? (neg && nz) : (mode == 2u ? (!neg && nz) : false));
+    return static_cast<uint16_t>(sign | (mant + (inc ? 1u : 0u)));
 }
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
@@ -58,7 +102,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
-    has_wide = any(i.mnemonic == M.VMOVUPS for i in body)
+    wide_xmm = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+    wide_any = {**wide, **wide_xmm}
+    avx_f16c_ops = {M.VCVTPH2PS, M.VCVTPS2PH, M.VMASKMOVPS, M.VMASKMOVPD, M.VMOVNTPS, M.VMOVNTPD, M.VMOVNTDQ}
+    has_wide = any(i.mnemonic == M.VMOVUPS or i.mnemonic in avx_f16c_ops for i in body)
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -210,6 +257,49 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
+        elif op in (M.VMOVNTPS, M.VMOVNTPD, M.VMOVNTDQ) and i.encoding == EncodingKind.VEX and has_wide and i.op0_kind == K.MEMORY and i.op1_register in wide_any:
+            nbytes = 32 if i.op1_register in wide else 16
+            stmt = f"memcpy(reinterpret_cast<void*>({address()}), {wide_any[i.op1_register]}.data(), {nbytes});"
+        elif op == M.VCVTPH2PS and i.encoding == EncodingKind.VEX and has_wide and i.op0_register in wide_any:
+            dst = wide_any[i.op0_register]
+            lanes = 8 if i.op0_register in wide else 4
+            s_init = (f"auto s = {wide_xmm[i.op1_register]};" if i.op1_kind == K.REGISTER
+                      else f"std::array<uint8_t,16> s{{}}; memcpy(s.data(), reinterpret_cast<const void*>({address()}), {2 * lanes});")
+            stmt = (f"{{ {s_init} {dst} = {{}}; for (size_t k=0; k<{lanes}; ++k) {{ "
+                    f"uint16_t h; memcpy(&h, s.data()+2*k, 2); const uint32_t f = f16_to_f32_bits(h); "
+                    f"memcpy({dst}.data()+4*k, &f, 4); }} }}")
+        elif op == M.VCVTPS2PH and i.encoding == EncodingKind.VEX and has_wide and i.op1_register in wide_any:
+            imm = i.immediate(2)
+            if imm & 4:
+                raise ValueError(f"unsupported MXCSR rounding mode in VCVTPS2PH at {i.ip:#x}: {i}")
+            mode = imm & 3
+            src = wide_any[i.op1_register]
+            lanes = 8 if i.op1_register in wide else 4
+            if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm:
+                dst = wide_xmm[i.op0_register]
+                stmt = (f"{{ auto s = {src}; {dst} = {{}}; for (size_t k=0; k<{lanes}; ++k) {{ "
+                        f"uint32_t f; memcpy(&f, s.data()+4*k, 4); const uint16_t h = f32_to_f16_bits(f, {mode}u); "
+                        f"memcpy({dst}.data()+2*k, &h, 2); }} }}")
+            elif i.op0_kind == K.MEMORY:
+                stmt = (f"{{ const word p = {address()}; for (size_t k=0; k<{lanes}; ++k) {{ "
+                        f"uint32_t f; memcpy(&f, {src}.data()+4*k, 4); const uint16_t h = f32_to_f16_bits(f, {mode}u); "
+                        f"store<uint16_t>(p + 2 * k, h); }} }}")
+            else:
+                raise ValueError(f"unsupported VCVTPS2PH dest at {i.ip:#x}: {i}")
+        elif op in (M.VMASKMOVPS, M.VMASKMOVPD) and i.encoding == EncodingKind.VEX and has_wide:
+            ls = 4 if op == M.VMASKMOVPS else 8
+            if i.op0_kind == K.REGISTER and i.op0_register in wide_any and i.op2_kind == K.MEMORY:
+                dst, mreg = wide_any[i.op0_register], wide_any[i.op1_register]
+                lanes = (32 if i.op0_register in wide else 16) // ls
+                stmt = (f"{{ auto m = {mreg}; const word p = {address()}; {dst} = {{}}; for (size_t k=0; k<{lanes}; ++k) {{ "
+                        f"if (m[(k + 1) * {ls} - 1] & 0x80u) memcpy({dst}.data()+k*{ls}, reinterpret_cast<const void*>(p + k*{ls}), {ls}); }} }}")
+            elif i.op0_kind == K.MEMORY and i.op2_kind == K.REGISTER and i.op2_register in wide_any:
+                mreg, src = wide_any[i.op1_register], wide_any[i.op2_register]
+                lanes = (32 if i.op2_register in wide else 16) // ls
+                stmt = (f"{{ auto m = {mreg}; auto s = {src}; const word p = {address()}; for (size_t k=0; k<{lanes}; ++k) {{ "
+                        f"if (m[(k + 1) * {ls} - 1] & 0x80u) memcpy(reinterpret_cast<void*>(p + k*{ls}), s.data()+k*{ls}, {ls}); }} }}")
+            else:
+                raise ValueError(f"unsupported {op} form at {i.ip:#x}: {i}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:

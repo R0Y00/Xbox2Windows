@@ -1,0 +1,11 @@
+EXPORTS
+    vcvtph2ps_op
+    vcvtps2ph_rn_op
+    vcvtps2ph_floor_op
+    vmaskmovps_load_op
+    vmaskmovps_store_op
+    vmaskmovpd_load_op
+    vmaskmovpd_store_op
+    vmovntps_op
+    vmovntpd_op
+    vmovntdq_op
