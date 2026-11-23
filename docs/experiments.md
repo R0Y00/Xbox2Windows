@@ -3646,6 +3646,17 @@ Build the dev preset and run `ctest --preset dev --no-tests=error -R 'frame_to_h
 
 The desktop shim exports `XMemAllocDefault(size, attributes)` and `XMemFreeDefault(pointer, attributes)` through its existing unhooked allocator. The arguments use the same x64 widths as the normal allocation pair. The original four exports retain their ordinals. Both named allocation pairs run the same source-built checks for zero-filled heap and graphics memory, alignment, matching release, null release and rejected attribute words on Windows. Run `ctest --preset release --no-tests=error -R '^xmem_shim_(exports|allocation|default_allocation)$'`. [Public ABI reference](https://github.com/XWine1/SlimEra/blob/397807a9563f62b56cf7aaea9809b6fa635ba651/era.h)
 
+### Startup address-space reservations
+
+The desktop `XMemVirtualAlloc` export implements the reserve-only calls identified in [#874](https://github.com/R0Y00/Xbox2Windows/issues/874#issuecomment-7106400503). The accepted inputs use a null base, a size of 16 or 24 GiB, allocation type `0x20402000`, and an (attribute, protection) pair of `(0x21, 0x04)` or `(0x03, 0x801)`. The desktop policy reserves ordinary Windows address space with `MEM_RESERVE` and `PAGE_NOACCESS` without committing backing pages. Other inputs return null and set `ERROR_INVALID_PARAMETER`. These rules describe the Windows shim. The meaning of the console-specific bits and later commit or mapping operations remains open.
+
+The source-built EXE imports the new API by name. Both the Windows loader and `pe_map` must obtain two non-overlapping, 64 KiB-aligned regions at each size. It checks the full reserved ranges with `VirtualQuery`, confirms that malformed requests leave valid ranges intact, then releases and re-reserves an address with Win32. Omitting the shim from the resolver must fail at the named import before entry.
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_xmem_reservation
+ctest --preset dev --no-tests=error -R '^cpu_native_xmem_reservation$' -V
+```
+
 ### Grouped allocation descriptor builders
 
 In the inspected Bink image, the function interval beginning at RVA `0x67c0` contains direct calls to the group initializer (`0x25b80`), append helper (`0x25b20`) and grouped allocator (`0x25a40`). The initializer places two adjacent arrays after a 64-byte header. Each successful append records a destination and a padded stride. With five available slots, requests of 0, 33, 1, 1025 and 32 bytes produced strides of 32, 64, 128, 1280 and 512 bytes in order. The stride in 32-byte units is congruent to the previous total in units plus one, modulo 32. All five stored strides were even. These helpers do not establish who produces odd tagged entries.

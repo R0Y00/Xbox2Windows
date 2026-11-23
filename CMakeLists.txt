@@ -2511,6 +2511,20 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(cpu_two_imports PRIVATE cpu_import_provider cpu_register_probe)
     add_library(pe_map SHARED tools/pe_map.cpp)
     target_link_libraries(pe_map PRIVATE bcrypt)
+    # Keep the synthetic entry CRT-free in both presets, including Debug's /RTC defaults.
+    set(reservation_obj "${CMAKE_CURRENT_BINARY_DIR}/xmem_reservation.obj")
+    add_custom_command(OUTPUT "${reservation_obj}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /c /std:c++17 /O2 /GS- /Zl "/Fo${reservation_obj}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/xmem_reservation.cpp"
+        DEPENDS tests/cpu/xmem_reservation.cpp VERBATIM)
+    add_executable(cpu_xmem_reservation "${reservation_obj}")
+    set_target_properties(cpu_xmem_reservation PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_xmem_reservation PRIVATE
+        /ENTRY:reservation_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_xmem_reservation PRIVATE xmem_shim kernel32)
+    add_test(NAME cpu_native_xmem_reservation COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/xmem_reservation_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xmem_reservation>" "$<TARGET_FILE:xmem_shim>")
     add_library(cpu_shim_startup_guest SHARED tests/cpu/shim_startup.cpp)
     target_compile_features(cpu_shim_startup_guest PRIVATE cxx_std_17)
     set_target_properties(cpu_shim_startup_guest PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)

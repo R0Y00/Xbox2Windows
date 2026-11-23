@@ -67,12 +67,13 @@ bool export_checks()
     HMODULE module = GetModuleHandleW(L"xmem.dll");
     if (!module) return false;
     unsigned found = 0;
+    const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics",
+                              "XMemVirtualQuery", "XMemAllocDefault", "XMemFreeDefault"};
     for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
-                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics"}) {
+                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics", "XMemVirtualAlloc"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
     }
-    const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery"};
     for (WORD ordinal = 1; ordinal <= std::size(existing); ++ordinal) {
         if (GetProcAddress(module, MAKEINTRESOURCEA(ordinal)) != GetProcAddress(module, existing[ordinal - 1]))
             return false;

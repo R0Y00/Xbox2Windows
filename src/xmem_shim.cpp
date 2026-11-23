@@ -6,8 +6,8 @@
 //   XMemGetWorkingSetStatistics(selector, output): the seven AMD callers pass 0x20000001 and
 //     read the 64-bit value at +8 (zero on failure).
 // Graphics allocations go through era_title_gpu, which registers them with era_query and, once a
-// D3D12 device is attached to the registry, gives them desktop GPU addresses. The exports are
-// unchanged; nothing here loads D3D12. DXGI and gdi32 are delay-loaded.
+// D3D12 device is attached to the registry, gives them desktop GPU addresses.
+// Nothing here loads D3D12. DXGI and gdi32 are delay-loaded.
 #include "era_heap.h"
 #include "era_query.h"
 #include "era_title_gpu.h"
@@ -56,6 +56,24 @@ extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
         era_title_gpu::untrack(allocation);
     }
     era_heap::release_with_attributes(allocation, attributes);
+}
+
+extern "C" void* XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
+                                  ULONGLONG attributes, DWORD protection)
+{
+    // Only the two reserve-only call shapes observed during startup are in scope.
+    constexpr DWORD startup_reserve = 0x20402000;
+    constexpr SIZE_T gib = SIZE_T{1} << 30;
+    const bool startup_attributes =
+        (attributes == 0x21 && protection == PAGE_READWRITE) ||
+        (attributes == 3 && protection == (0x800 | PAGE_NOACCESS));
+    if (address || (bytes != 16 * gib && bytes != 24 * gib) ||
+        allocation_type != startup_reserve || !startup_attributes) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    // Reserve Windows VA at its allocation granularity, without committing pages.
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
 }
 
 extern "C" BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer)

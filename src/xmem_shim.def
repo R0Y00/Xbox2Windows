@@ -6,3 +6,4 @@ EXPORTS
     XMemFreeDefault=XMemFree @6
     XMemVirtualQuery @4
     XMemGetWorkingSetStatistics @3
+    XMemVirtualAlloc
