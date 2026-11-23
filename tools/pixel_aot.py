@@ -427,6 +427,30 @@ uint narrow16(float value) {
     uint rounded = (full + 0xfffu + ((full >> 13) & 1u)) >> 13;
     return sign | min(((exponent - 113u) << 10) + rounded, 0x7c00u);
 }
+// v_interp_p2_f16 under round toward zero: binary32 to the binary16 encoding with the discarded bits
+// dropped, in integer arithmetic. A magnitude below 2^-24 gives a signed zero, a binary16 subnormal result
+// is kept, and a finite magnitude above 65504 gives the largest finite half as IEEE 754 defines for this
+// direction. Infinity stays infinity and a NaN is narrowed as in narrow16.
+uint narrow16_rtz(float value) {
+    uint bits = asuint(value);
+    uint sign = (bits >> 16) & 0x8000u;
+    uint exponent = (bits >> 23) & 0xffu;
+    uint mantissa = bits & 0x7fffffu;
+    if (exponent == 0xffu) {
+        return sign | 0x7c00u | (mantissa != 0u ? 0x200u | (mantissa >> 13) : 0u);
+    }
+    if (exponent < 103u) {
+        return sign;
+    }
+    uint full = mantissa | 0x800000u;
+    if (exponent < 113u) {
+        return sign | (full >> (126u - exponent));
+    }
+    if (exponent > 142u) {
+        return sign | 0x7bffu;
+    }
+    return sign | (((exponent - 112u) << 10) + (mantissa >> 13));
+}
 """
 
 
@@ -446,7 +470,7 @@ HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
 HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
 # Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
 # mode: the widening is exact and the pack always truncates.
-HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
+HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32", "v_interp_p1ll_f16", "v_interp_p2_f16")
 # FLAT_SCR_LO and FLAT_SCR_HI hold the scratch base address. Only scratch_* and flat_* memory instructions and
 # s_getreg_b32 can observe it, and none of them is lowered, so a whole-register write changes no result.
 FLAT_SCRATCH = ("HW_REG_FLAT_SCR_LO", "HW_REG_FLAT_SCR_HI")
@@ -2050,6 +2074,42 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
+        elif m := match(r"v_interp_(p1ll|p1lv|p2)_f16 (.+)"):
+            # 16-bit attribute interpolation, phase one into a binary32 partial and phase two into a binary16
+            # result (LLVM 15 VOP3_INTERP16 value types). As for the binary32 pair, the matched phases stand
+            # for the desktop interpolated input; the result is that input narrowed under the tracked
+            # binary16 rounding mode. Only the low attribute word of attr0 has a desktop binding, and only
+            # round toward zero is lowered. LLVM lists no rule for the upper half of the destination, so the
+            # result is tracked as a low half that only the exact widening may read.
+            form, rest = m.groups()
+            if form == "p1lv":
+                raise ValueError("Unsupported 16-bit interpolation form: v_interp_p1lv_f16")
+            shape = (r"(v\d+), (v\d+), attr(\d+)\.([xyzw])( high)?" if form == "p1ll"
+                     else r"(v\d+), (v\d+), attr(\d+)\.([xyzw]), (v\d+)( high)?")
+            operands = re.fullmatch(shape, rest)
+            if not operands or any(int(reg[1:]) > 255 for reg in operands.groups() if reg and reg[0] == "v"):
+                raise ValueError(f"Unsupported 16-bit interpolation operands: {line}")
+            dst, src, attribute, component = operands.groups()[:4]
+            if operands.groups()[-1]:
+                raise ValueError(f"Unsupported 16-bit interpolation of the high attribute word: {line}")
+            if attribute != "0":
+                raise ValueError(f"Unsupported 16-bit interpolation attribute: {line}")
+            if half_rounding != HALF_ROUNDING["3"]:
+                raise ValueError(f"16-bit interpolation requires round toward zero: {line}")
+            if mask != "entry" or sampler is not None or scalar.get("m0") != "interp_base":
+                raise ValueError("Unknown interpolation context")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if form == "p1ll" and vector.get(src) == "bary_i":
+                vector[dst] = ("partial16", component)
+            elif (form == "p2" and vector.get(src) == "bary_j"
+                    and vector.get(operands[5]) == ("partial16", component)):
+                interpolated = True
+                attribute_input = True
+                vector[dst] = ("half16", f"alu{i}")
+                lines.append(f"    precise float alu{i} = asfloat(narrow16_rtz(uv.{component}));")
+            else:
+                raise ValueError("Unpaired interpolation")
         elif m := match(r"(image_sample(?:_lz)?) v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:(0x[7f]) dim:SQ_RSRC_IMG_2D"):
             op, *operands, dmask = m.groups()
             lod_zero = op == "image_sample_lz"
@@ -2398,8 +2458,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             source = bars or call or plain
+            half = vector.get(source) if source.startswith("v") else None
             if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", source):
                 word = f"{int(source, 0) & 0xffffffff}u"
+            elif isinstance(half, tuple) and half[0] == "half16":
+                # A 16-bit interpolation result: only its low half is defined, and that is all this reads.
+                word = f"asuint({half[1]})"
             else:
                 word = f"asuint({fp_operand(source, scalar, vector, pending, sample_dest)})"
             expression = f"widen16({word})"

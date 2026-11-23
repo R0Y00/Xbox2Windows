@@ -93,6 +93,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"(?:s_load_dwordx4|s_buffer_load_dwordx[24])\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
     r"s_buffer_load_dword\s+s\d+,\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
     r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xyzw]",
+    r"v_interp_p1ll_f16\s+v\d+,\s+v\d+,\s+attr0\.[xyzw]",
+    r"v_interp_p2_f16\s+v\d+,\s+v\d+,\s+attr0\.[xyzw],\s+v\d+",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0x[7f]\s+dim:SQ_RSRC_IMG_2D",
     r"v_cube(?:id|sc|tc|ma)_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
     r"v_(?:fmaak|fmamk)_f32\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+",

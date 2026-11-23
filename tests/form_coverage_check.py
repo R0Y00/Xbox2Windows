@@ -257,6 +257,10 @@ def check_shader_records():
     # The mode-register fixture records the immediate write; the register forms reach only rejections.
     assert ("SOPK", "s_setreg_imm32_b32") in gfx and "s_setreg_imm32_b32" in pixel.ACCEPTED
     assert not {"s_setreg_b32", "s_getreg_b32"} & pixel.ACCEPTED
+    # The 16-bit interpolation fixture records the two paired forms; the one-LDS form reaches only rejections.
+    half_interp = {("VOP3", "v_interp_p1ll_f16"), ("VOP3", "v_interp_p2_f16")}
+    assert half_interp <= gfx and half_interp <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    assert ("VOP3", "v_interp_p1lv_f16") in gfx and "v_interp_p1lv_f16" not in pixel.ACCEPTED
     # The trigonometry fixture covers both encodings of v_sin_f32 and v_cos_f32 once its test passes.
     trig = {("VOP1", "v_sin_f32"), ("VOP1", "v_cos_f32"), ("VOP3", "v_sin_f32_e64"), ("VOP3", "v_cos_f32_e64")}
     assert trig <= gfx and trig <= fc.gfx_forms(pixel.ACCEPTED, gfx)

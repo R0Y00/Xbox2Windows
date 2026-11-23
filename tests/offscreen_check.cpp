@@ -635,6 +635,12 @@ OperationResult run_check_pixel_attribute_rg(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_attribute_fine(const OperationContext& ctx)
+{
+    check_attribute_pixel(ctx.device, ctx.argv[3], ctx.argv[4], false, true);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
 {
     check_pixel_quad_lod(ctx.device, ctx.argv[3]);
@@ -871,6 +877,7 @@ const OperationSpec kOperations[] = {
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
+    {"--check-pixel-attribute-fine", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_fine},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},

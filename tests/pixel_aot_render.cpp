@@ -61,6 +61,7 @@ struct MipDraw {
     UINT requestedMip = 0;
     bool isTailDraw = false;
     bool partialQuad = false;
+    bool fineAttribute = false;  // vertices 6 to 8 of the test vertex shader
 };
 
 struct Extent {
@@ -173,8 +174,9 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
             std::printf("requested_mip=%u sampled_mip=%u ", req.requestedMip, req.sampledLevel + firstResident);
         const auto& sampled = levels.at(req.sampledLevel);
         ComPtr<ID3D12Resource> partialTriangle;
-        if (req.partialQuad)
-            partialTriangle = upload(device, std::vector<Word>{3, 4, 5});
+        if (req.partialQuad || req.fineAttribute)
+            partialTriangle = upload(device, req.fineAttribute ? std::vector<Word>{6, 7, 8}
+                                                                : std::vector<Word>{3, 4, 5});
         const auto [width, height] = req.isTailDraw ? base.mip(req.requestedMip)
                                                    : Extent{sampled.width * req.scale, sampled.height * req.scale};
         auto dstDesc = texture_desc(width, height, desc.RTVFormats[0], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
@@ -514,7 +516,7 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
     draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
 }
 
-void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg)
+void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg, bool fine)
 {
     PixelInput input{32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
     if (rg) input.writeMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
@@ -525,7 +527,13 @@ void check_attribute_pixel(ID3D12Device* device, const char* shader, const char*
     file.read(reinterpret_cast<char*>(input.expected.data()), input.expected.size() * sizeof(Color));
     if (!file || file.peek() != std::char_traits<char>::eof())
         throw std::runtime_error("Expected a 256-byte constant buffer and 32 by 32 float4 colors");
-    draw_verified(device, shader, {std::move(input)}, 0, 0, nullptr);
+    if (!fine) {
+        draw_verified(device, shader, {std::move(input)}, 0, 0, nullptr);
+        return;
+    }
+    MipDraw draw{0, 1};
+    draw.fineAttribute = true;
+    draw_verified(device, shader, {std::move(input)}, {32, 32}, 0, {draw}, nullptr);
 }
 
 void check_sampled_coverage(ID3D12Device* device, const char* shader, const char* reference)

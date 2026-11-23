@@ -3794,7 +3794,7 @@ def check_mode_register_controls():
     assert translate([HALF_RTZ, HALF_RNE] + packed) == translate(["s_nop 0", "s_nop 0"] + packed)
     for operation in ("v_cvt_f16_f32_e64 v12, -|s44|", "v_cvt_f16_u16_e32 v12, v12", "v_add_f16_e32 v12, v12, v13",
                       "v_cvt_f32_f64_e32 v12, v[12:13]", "v_dot2_f32_f16 v12, v12, v13, v14",
-                      "v_fma_mixlo_f16 v12, v12, v13, v14", "v_interp_p2_f16 v12, v1, attr0.x"):
+                      "v_fma_mixlo_f16 v12, v12, v13, v14", "v_interp_p1lv_f16 v12, v0, attr0.x, v12"):
         expect_value_error(translate, with_constants([HALF_RTZ, operation]), "under round toward zero")
     # The exact widening and the pack that always truncates do not depend on the mode.
     assert translate([HALF_RTZ] + with_constants(HALF_BODY)) == translate(["s_nop 0"] + with_constants(HALF_BODY))
@@ -3867,6 +3867,87 @@ def attribute_color(rg):
 
 def translate_attribute(code):
     return lower(code, 8, 14, None)
+
+
+# 16-bit attribute interpolation of attr0 under round toward zero. Phase one writes a binary32 partial and
+# phase two the binary16 result; w and x reuse the partial's register, z and y take a fresh one. Each result
+# is widened exactly, the third through the e64 encoding, and the four binary32 values leave uncompressed.
+def attribute_half():
+    code = ["s_mov_b32 s30, s14", "s_mov_b32 m0, s30", HALF_RTZ]
+    code += [f"v_interp_p1ll_f16 v{8 + i}, v0, attr0.{channel}" for i, channel in enumerate("wzxy")]
+    results = (8, 13, 10, 15)
+    code += [f"v_interp_p2_f16 v{result}, v1, attr0.{channel}, v{8 + i}"
+             for i, (channel, result) in enumerate(zip("wzxy", results))]
+    code += [f"v_cvt_f32_f16_{'e64' if i == 2 else 'e32'} v{20 + i}, v{result}" for i, result in enumerate(results)]
+    return code + ["exp mrt0 v20, v21, v22, v23 done vm", "s_endpgm"]
+
+
+def check_attribute_half_controls():
+    """Only the paired low-word attr0 forms under round toward zero are lowered; the rest is refused by name."""
+    program = attribute_half()
+    source = translate_attribute(program)
+    for channel in "wzxy":
+        assert f"asfloat(narrow16_rtz(uv.{channel}));" in source
+    assert "float4 main(float4 uv : TEXCOORD0)" in source and source.count("narrow16_rtz(uv.") == 4
+    # The widening may negate or take the magnitude; it still reads only the low half.
+    translate_attribute([line.replace("v_cvt_f32_f16_e64 v22, v10", "v_cvt_f32_f16_e64 v22, -|v10|")
+                         for line in program])
+    # Rounding mode: nearest even at entry, an explicit nearest even, and a restore before phase two.
+    wrong_mode = "16-bit interpolation requires round toward zero"
+    expect_value_error(translate_attribute, [line for line in program if line != HALF_RTZ], wrong_mode)
+    expect_value_error(translate_attribute, [HALF_RNE if line == HALF_RTZ else line for line in program], wrong_mode)
+    restore = program.index("v_interp_p2_f16 v8, v1, attr0.w, v8")
+    expect_value_error(translate_attribute, program[:restore] + [HALF_RNE] + program[restore:], wrong_mode)
+    # Operand shapes that have no desktop binding or no lowering.
+    high = "Unsupported 16-bit interpolation of the high attribute word"
+    expect_value_error(translate_attribute,
+                       [line + " high" if line.startswith("v_interp_p1ll_f16 v8,") else line for line in program], high)
+    expect_value_error(translate_attribute,
+                       [line + " high" if line.startswith("v_interp_p2_f16 v8,") else line for line in program], high)
+    expect_value_error(translate_attribute, [line.replace("attr0.z", "attr1.z") for line in program],
+                       "Unsupported 16-bit interpolation attribute")
+    # The one-LDS form stays out of the rounding exemption, so the mode gate names it first.
+    expect_value_error(translate_attribute,
+                       [line.replace("v_interp_p1ll_f16 v9, v0, attr0.z", "v_interp_p1lv_f16 v9, v0, attr0.z, v9")
+                        for line in program], "under round toward zero: v_interp_p1lv_f16")
+    expect_value_error(translate_attribute, program[:2] + ["v_interp_p1lv_f16 v9, v0, attr0.z, v9"] + program[3:],
+                       "Unsupported 16-bit interpolation form: v_interp_p1lv_f16")
+    for bad in ("v_interp_p1ll_f16 v8, -v0, attr0.w", "v_interp_p1ll_f16 v8, |v0|, attr0.w",
+                "v_interp_p1ll_f16 v8, v0, attr0.w clamp", "v_interp_p1ll_f16 v8, v0, attr0.w mul:2",
+                "v_interp_p1ll_f16 v8, s0, attr0.w", "v_interp_p1ll_f16 v256, v0, attr0.w",
+                "v_interp_p1ll_f16 v8, v0, attr0.w, v8"):
+        expect_value_error(translate_attribute,
+                           [bad if line == "v_interp_p1ll_f16 v8, v0, attr0.w" else line for line in program],
+                           "Unsupported 16-bit interpolation operands")
+    for bad in ("v_interp_p2_f16 v8, v1, attr0.w", "v_interp_p2_f16 v8, v1, attr0.w, -v8",
+                "v_interp_p2_f16 v8, v1, attr0.w, v8 clamp", "v_interp_p2_f16 v8, v1, attr0.w, v8 high clamp"):
+        expect_value_error(translate_attribute,
+                           [bad if line == "v_interp_p2_f16 v8, v1, attr0.w, v8" else line for line in program],
+                           "Unsupported 16-bit interpolation operands")
+    # Pairing: the barycentric registers, the channel, and the kind of partial must all agree.
+    unpaired = "Unpaired interpolation"
+    for old, new in (("v_interp_p1ll_f16 v8, v0, attr0.w", "v_interp_p1ll_f16 v8, v1, attr0.w"),
+                     ("v_interp_p2_f16 v8, v1, attr0.w, v8", "v_interp_p2_f16 v8, v0, attr0.w, v8"),
+                     ("v_interp_p2_f16 v8, v1, attr0.w, v8", "v_interp_p2_f16 v8, v1, attr0.z, v8"),
+                     ("v_interp_p2_f16 v8, v1, attr0.w, v8", "v_interp_p2_f16 v8, v1, attr0.w, v12"),
+                     ("v_interp_p1ll_f16 v8, v0, attr0.w", "v_interp_p1_f32_e32 v8, v0, attr0.w")):
+        expect_value_error(translate_attribute, [new if line == old else line for line in program], unpaired)
+    expect_value_error(translate_attribute,
+                       [line.replace("v_interp_p2_f16 v8, v1, attr0.w, v8", "v_interp_p2_f32_e32 v8, v1, attr0.w")
+                        for line in program], unpaired)
+    # Context: the unsampled attribute profile with m0 holding the interpolation base.
+    expect_value_error(lambda p: lower(p, 14, 8, None), program, "Unknown interpolation context")
+    expect_value_error(lambda p: lower(p, 8, 14, [1, 2, 3, 4]), program, "Unknown interpolation context")
+    expect_value_error(translate_attribute, [line for line in program if line != "s_mov_b32 m0, s30"],
+                       "Unknown interpolation context")
+    # Only the exact widening of the low half reads a result. A whole-word read, a pack, an export, the
+    # widening of the upper half and any read of the phase-one partial are refused.
+    widen = "v_cvt_f32_f16_e32 v20, v8"
+    for reader in ("v_mov_b32_e32 v20, v8", "v_add_f32_e32 v20, v8, v8", "v_cvt_pkrtz_f16_f32_e32 v20, v8, v8",
+                   "v_cvt_f32_f16_sdwa v20, v8 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1",
+                   "v_cvt_f32_f16_e32 v20, v9", "v_mov_b32_e32 v20, v9"):
+        must_reject(translate_attribute, [reader if line == widen else line for line in program])
+    must_reject(translate_attribute, [line for line in program if line != widen])
 
 
 def buffer_color(rg):
@@ -4860,6 +4941,7 @@ def check_controls(directory):
     must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
     check_scheduling_hints()
     check_mode_register_controls()
+    check_attribute_half_controls()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
     check_three_constant_buffers()
@@ -5987,6 +6069,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.append((attribute_half(), translate_attribute))
     fixtures.append((with_constants(DPP_INT32_BODY), translate))
     fixtures.append((with_constants(DPP_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)

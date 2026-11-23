@@ -39,7 +39,7 @@ struct PixelMismatch : std::runtime_error {
 
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
                             UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL);
-void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg);
+void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg, bool fine = false);
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
                             const char* reference, const char* previous);
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
