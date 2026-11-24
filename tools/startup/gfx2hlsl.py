@@ -530,7 +530,8 @@ class Stage:
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
         try:
-            off = int(ops[2], 0)
+            # `off` is the SMEM form with no m0 offset, so the byte offset is zero.
+            off = 0 if ops[2] == 'off' else int(ops[2], 0)
         except ValueError:
             if p[1] == ('smpheap',) and self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
@@ -591,7 +592,9 @@ class Stage:
     def op_s_buffer_load_dword(self, ops, mods, count=1):
         dst = reg_range(ops[0])
         buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
-        offset = self.u(ops[2])
+        # The SMEM offset operand is either a literal, m0 (a register offset) or `off`, which means no m0
+        # offset at all: zero. Treating `off` as an unknown uint operand refused the whole translation.
+        offset = '0u' if ops[2] == 'off' else self.u(ops[2])
         for i in range(count):
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
             if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', ops[2]):

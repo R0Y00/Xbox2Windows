@@ -5611,6 +5611,15 @@ control mismatching. The D3D12 debug layer was unavailable.
 [Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
 [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+**Scalar memory loads with an `off` offset.** The SMEM offset operand is a literal, `m0`, or `off`.
+`off` is the form with no `m0` offset, so its byte offset is zero. `gfx2hlsl` passed it to the uint operand
+helper and refused the whole translation with `operand 'off'`; that was the largest single group - 7 of 29 -
+of refused shaders in the first main-game loading-screen cache (#870). Both `s_load_dword*` and
+`s_buffer_load_dword*` now treat `off` as zero, the literal and `m0` forms keep their previous behaviour, and
+an operand that is none of those is still refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_smem_offset$' -V`. Not covered: an `m0` offset for
+`s_load_dword*`, which stays refused.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
