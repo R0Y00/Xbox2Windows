@@ -332,6 +332,15 @@ with tempfile.TemporaryDirectory() as folder:
     validate_sampler(directory, "quoted_semi_lowered", quoted_lowered)
     assert 'OpName %main "main;tag"' in quoted_lowered.splitlines()
 
+    # A string literal may span lines; a semicolon on a continuation line is text, not a comment, and the
+    # literal keeps its inner newline and spacing.
+    multiline = atomic_source.replace("OpExecutionMode %main LocalSize 1 1 1",
+                                      'OpExecutionMode %main LocalSize 1 1 1\n%text = OpString "first line\n  int tmp = 0; }" ; note', 1)
+    validate_sampler(directory, "multiline_original", multiline)
+    multiline_lowered = window.lower(multiline)
+    validate_sampler(directory, "multiline_lowered", multiline_lowered)
+    assert '%text = OpString "first line\n  int tmp = 0; }"' in multiline_lowered
+
     # An index that is already 64 bits wide is used as it is (not converted again) and guarded against
     # shift wrap-around so a huge 64-bit index cannot drop high bits and alias an in-window address.
     wide_index = atomic_source.replace(access, "%index64 = OpUConvert %ulong %c1\n"

@@ -325,10 +325,22 @@ def merge_pointer_types(lines):
     return "\n".join(re.sub(ID, lambda m: aliases.get(m[0], m[0]), line) for line in kept) + "\n"
 
 
-def strip_comment(line):
-    """Drop a trailing ; comment, keeping any ; inside a string literal."""
+def logical_lines(assembly):
+    """Instruction lines without `;` comments; a quoted string may span lines and may hold a `;`.
+
+    Quote and escape state carries across the whole module, and a literal that spans lines stays one
+    entry with its inner newlines and spaces untouched.
+    """
+    lines, current = [], []
     quoted = escaped = False
-    for at, char in enumerate(line):
+    comment = False
+    for char in assembly:
+        if char == "\n" and not quoted:
+            lines.append("".join(current).strip())
+            current, comment = [], False
+            continue
+        if comment:
+            continue
         if quoted and escaped:
             escaped = False
         elif quoted and char == "\\":
@@ -336,13 +348,15 @@ def strip_comment(line):
         elif char == '"':
             quoted = not quoted
         elif char == ";" and not quoted:
-            return line[:at]
-    return line
+            comment = True
+            continue
+        current.append(char)
+    lines.append("".join(current).strip())
+    return [line for line in lines if line]
 
 
 def lower(assembly):
-    stripped = (strip_comment(line).strip() for line in split_sampler_views(lower_ballot_extract(assembly)).splitlines())
-    lines = [line for line in stripped if line]
+    lines = logical_lines(split_sampler_views(lower_ballot_extract(assembly)))
     model = "OpMemoryModel PhysicalStorageBuffer64 GLSL450"
     if model not in lines or lines.count("%user_data = OpVariable %_ptr_PC_UserData PushConstant") != 1:
         raise ValueError("expected a physical-address module with the named user-data block")
