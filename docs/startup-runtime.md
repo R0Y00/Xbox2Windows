@@ -1391,8 +1391,10 @@ These are measured on one executable; treat them as hypotheses for others.
   `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
   state. `CB_TARGET_MASK` is not located, so all four channels are written unless the translated
   export leaves some unwritten (manifest `wmask`, above). A word the decoder refuses for any of the eight targets leaves the
-  registers unused (a blending target other than 0 with a `SRC1_*` dual-source factor is refused
-  too, since only target 0 has a second shader output): the pipeline keeps the path it had before and the refusal is logged. No target
+  registers unused (a blending target other than 0 with a `SRC1_*` dual-source factor, or any
+  blending target other than 0 alongside a dual-source target 0, is refused too, since only
+  target 0 has a second shader output): the pipeline keeps the path it had before and the refusal
+  is logged. No target
   is drawn unblended in place of a refused word
   (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`).
   `tests/startup_slot57_blend_draw_check.py` draws through a source-built slot 57 pipeline: red
