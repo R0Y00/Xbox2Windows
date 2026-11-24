@@ -417,6 +417,15 @@ target_compile_features(startup_storage_refusal_order PRIVATE cxx_std_17)
 add_dependencies(startup_storage_refusal_order startup_stub_xcrdapi)
 add_test(NAME startup_storage_refusal_order COMMAND startup_storage_refusal_order "$<TARGET_FILE:startup_stub_xcrdapi>")
 set_tests_properties(startup_storage_refusal_order PROPERTIES TIMEOUT 60)
+# DirectStorage Queue::CancelRequestsWithTag (#1843 slice 3): exact/masked/wildcard cancellation before and
+# after Submit without counting cancelled requests as failures, plus a negative control expecting execution.
+add_executable(startup_storage_cancel tests/startup_storage_cancel.cpp)
+target_compile_features(startup_storage_cancel PRIVATE cxx_std_17)
+add_dependencies(startup_storage_cancel startup_stub_xcrdapi)
+add_test(NAME startup_storage_cancel COMMAND startup_storage_cancel "$<TARGET_FILE:startup_stub_xcrdapi>")
+add_test(NAME startup_storage_cancel_control COMMAND startup_storage_cancel "$<TARGET_FILE:startup_stub_xcrdapi>" --control-expect-uncancelled)
+set_tests_properties(startup_storage_cancel startup_storage_cancel_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_storage_cancel_control PROPERTIES WILL_FAIL TRUE)
 # Failed requests counted by cause for the heartbeat (#1198): at or past EOF, crossing EOF, other read
 # failure, destination capacity, non-writable destination, zlib, BCPack, other. The test compiles the
 # stand-in's source into itself to read the counters; the one-bucket expectations are the negative control.

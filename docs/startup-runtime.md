@@ -1166,3 +1166,23 @@ only the resolve path with valid addresses on a device, so it does not cover the
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_buffer_.*_control$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`
+
+## DirectStorage request cancellation (`CancelRequestsWithTag`)
+
+Queue slot 7 (`IDStorageQueue::CancelRequestsWithTag(mask, value)`, `#1843` slice 3) cancels
+previously enqueued requests whose `UINT64 CancellationTag` at request offset `+0x38`
+(per Microsoft's MIT `Xbox-GDK-Samples` `DirectStorageWin32/dstorage_win32.h`) matches
+`(tag & mask) == value`:
+
+- Waiting requests not yet submitted are compacted out of `waiting` in place without allocating,
+  leaving non-matching requests, status entries and fences in queue order.
+- Already-submitted requests waiting for the worker (and any OOM-deferred requests) are marked
+  cancelled in place so `submitted_total`/`finished_total` ordering and deferred-completion cutoffs
+  remain intact, and skipped without executing I/O, touching their destination, incrementing
+  `requests_failed`, or failing subsequent status entries.
+- Requests enqueued *after* `CancelRequestsWithTag` with the same tag are not affected.
+
+Checks:
+
+- `ctest --preset dev --no-tests=error -R '^startup_storage_cancel(_control)?$' -V`
+- `ctest --preset release --no-tests=error -R '^startup_storage_cancel(_control)?$' -V`
