@@ -121,7 +121,14 @@ def check_layout(create, width, height, padded_width, padded_height):
 
 def main():
     os.environ["X2W_D3D12_RENDER"] = "0"
-    create = ctypes.WinDLL(sys.argv[1]).XGCreateTextureComputer
+    try:
+        module = ctypes.WinDLL(sys.argv[1])
+    except OSError as error:
+        # A test directory configured before the shim was built has no xg_xs.dll, and ctypes then
+        # reports only the loader error. Name the target that produces it.
+        raise SystemExit("cannot load %s (%s); build the startup_stub_xg_xs target first"
+                         % (sys.argv[1], error))
+    create = module.XGCreateTextureComputer
     create.argtypes = (PTR, ctypes.POINTER(PTR), ctypes.c_uint64, ctypes.c_uint64)
     create.restype = HRESULT
     check_layout(create, 81, 69, 128, 128)

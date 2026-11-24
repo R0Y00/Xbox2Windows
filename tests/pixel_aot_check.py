@@ -23872,6 +23872,8 @@ def main():
         check_controls(directory)
         try:
             if mode == "binary":
+                if len(args) != 3:
+                    raise SystemExit("usage: pixel_aot_check.py binary <llvm-mc> <llvm-objcopy> <libLLVM>")
                 check_binary(directory, *args)
             elif mode == "bits":
                 return check_bit_draws(directory, *args)

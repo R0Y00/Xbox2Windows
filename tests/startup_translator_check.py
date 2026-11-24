@@ -52,6 +52,24 @@ def check_root_descriptor(failures):
         failures.append('root descriptor: got %s, expected %s' % (got, want))
 
 
+def check_numeric_symbol_refusal(failures):
+    # A register that holds a descriptor or a buffer pointer has no 32-bit value: reading it as a
+    # number must be refused rather than silently emitted as s<n>.
+    for shape in (('ptr', ('table', 0)), ('desc', ('table', 0), 0, 0)):
+        stage = gfx2hlsl.Stage.__new__(gfx2hlsl.Stage)
+        stage.sym = {8: shape}
+        stage.used_s = set()
+        try:
+            got = stage.S(8)
+        except gfx2hlsl.Unsupported as error:
+            if 'numeric use of s8' not in str(error):
+                failures.append('numeric symbol %r: unexpected message %s' % (shape, error))
+        else:
+            failures.append('numeric symbol %r was read as %s' % (shape, got))
+        if stage.used_s:
+            failures.append('numeric symbol %r marked s8 as used' % (shape,))
+
+
 def check_negative_control(failures):
     # A key that ignores the register's dword index (the former behaviour) gives the second
     # descriptor offset 0, the same resource as the first: the check above must tell them apart.
@@ -170,7 +188,8 @@ def check_negative_discovery(failures):
 
 def main():
     failures = []
-    for check in (check_wide_load, check_offset_load, check_root_descriptor, check_negative_control, check_missing_fxc,
+    for check in (check_wide_load, check_offset_load, check_root_descriptor, check_numeric_symbol_refusal,
+                  check_negative_control, check_missing_fxc,
                   check_fxc_discovery, check_negative_discovery):
         check(failures)
     for line in failures:

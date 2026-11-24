@@ -260,6 +260,24 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+def smem_mods(mods):
+    """Non-negative 21-bit signed immediate byte offset from SMEM modifiers, refusing unknown or negative forms."""
+    imm = None
+    for m in mods:
+        if m in ('glc', 'dlc'):
+            continue
+        if m.startswith('offset:') and imm is None and re.fullmatch(r'0[xX][0-9a-fA-F]+|\d+', m[7:]):
+            # SMEM OFFSET[20:0] is signed two's complement on RDNA 2; disasm_rdna2 prints w1 & 0x1fffff
+            # unsigned, so 0x100000..0x1fffff are negative byte offsets and must not read at +1..2 MiB.
+            value = int(m[7:], 0)
+            if value > 0xfffff:
+                raise Unsupported('SMEM immediate offset %s' % m)
+            imm = value
+        else:
+            raise Unsupported('SMEM modifier %s' % m)
+    return imm
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -331,6 +349,9 @@ class Stage:
         if tok in ('exec_lo', 'exec'):
             return 'exec'
         if tok == 'm0':
+            m = self.sym.get('m0')
+            if m:
+                raise Unsupported('numeric use of m0 holding %s' % m[0])
             return 'm0'
         r = reg_range(tok)
         if r:
@@ -593,10 +614,20 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
-        if dname == 'm0':
-            return None
-        syms = [self.sym.get(reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else None for t in srcs]
+        if pair and ('m0' in srcs or dname == 'm0'):
+            raise Unsupported('64-bit scalar operand m0')
+        def src_sym(t):
+            if t == 'm0':
+                return self.sym.get('m0')
+            r = reg_range(t)
+            return self.sym.get(r[1]) if r and r[0] == 's' else None
+        syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if dname == 'm0':
+                if scc:
+                    raise Unsupported('scc from descriptor data')
+                self.sym['m0'] = syms[0] if base == 's_mov_b32' else ('descnum',)
+                return None
             if dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
                 raise Unsupported('mask from descriptor data')
             d = reg_range(dname)[1]
@@ -617,6 +648,12 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
+        if dname == 'm0':
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % expr)
+            if scc:
+                self.emit('scc = %s;' % scc.replace('$', 'm0'))
+            return None
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
             var = dname[:4].rstrip('_') if dname.startswith('exec') else 'vcc'
             if var == 'exec':
@@ -659,7 +696,10 @@ class Stage:
         return None
 
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
-        d = reg_range(ops[0])[1]
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's':
+            raise Unsupported('saveexec destination %s' % ops[0])
+        d = dst[1]
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.set_s(d, 'exec')
         self.masks.add(d)
@@ -677,8 +717,11 @@ class Stage:
         self.op_s_and_saveexec_b64(ops, mods, '{0} & ~exec')
 
     def op_s_andn2_wrexec_b64(self, ops, mods):
-        d = reg_range(ops[0])[1]
-        src = 's%d' % reg_range(ops[1])[1]
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's':
+            raise Unsupported('wrexec destination %s' % ops[0])
+        d = dst[1]
+        src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.exec_known = False
         self.emit('exec = (%s & ~exec) & 1; scc = exec != 0;' % self.u(src))
         self.set_s(d, 'exec')
@@ -694,7 +737,13 @@ class Stage:
 
     def scalar_select(self, ops, pair):
         low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops]
+        if pair and 'm0' in low:
+            raise Unsupported('64-bit scalar operand m0')
         expr = 'scc ? %s : %s' % (self.u(low[1]), self.u(low[2]))
+        if low[0] == 'm0':
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % expr)
+            return
         if low[0] in ('exec', 'vcc'):
             if low[0] == 'exec':
                 self.exec_known = False
@@ -706,42 +755,74 @@ class Stage:
             self.masks.add(d)
             self.set_s(d + 1, '0u')
 
+    def smem_soffset(self, tok, record_use=True):
+        """Runtime expression for an SMEM scalar offset operand (s0..s105 or m0)."""
+        if tok == 'm0':
+            return self.u(tok)
+        r = reg_range(tok)
+        if r and r[0] == 's' and r[1] == r[2] and r[1] <= 105:
+            if record_use:
+                return self.S(r[1])
+            saved = set(self.used_s)
+            try:
+                return self.S(r[1])
+            finally:
+                self.used_s = saved
+        raise Unsupported('operand %r' % tok)
+
     def op_s_load_dwordx4(self, ops, mods, count=4):
+        imm = smem_mods(mods)
+        if len(ops) != 3:
+            raise Unsupported('s_load with %d operands' % len(ops))
         dst, base = reg_range(ops[0]), reg_range(ops[1])
+        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
+            raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
+        if not base or base[0] != 's' or base[2] - base[1] != 1 or base[2] > 105:
+            raise Unsupported('s_load base %s' % ops[1])
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
-        try:
-            # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
-            off = int(smem_offset(ops[2]), 0)
-        except ValueError:
-            if p[1] == ('smpheap',) and self.pipe.sampler_heap and count == 4:
+        # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
+        token = smem_offset(ops[2])
+        if re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', token):
+            off = int(token, 0)
+            if off < 0 or off > 0xfffff:
+                raise Unsupported('SMEM immediate offset %s' % ops[2])
+            if imm is not None:
+                raise Unsupported('SMEM literal offset %s with offset:%#x' % (ops[2], imm))
+            if p[1][0] == 'root':
+                buf = self.pipe.resource((p[1], None), 'buf')
+                for i in range(count):
+                    self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
+                return
+            for i in range(count):
+                self.sym[dst[1] + i] = ('desc', p[1], off, i)
+            return
+        if p[1] == ('smpheap',):
+            if self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
                 # first destination register; image() indexes the heap table with it.
                 d = dst[1]
                 self.used_s.add(d)
-                self.emit('s%d = %s;' % (d, self.u(ops[2])))
+                expr = self.smem_soffset(token)
+                if imm:
+                    expr = '%s + %d' % (expr, imm)
+                self.emit('s%d = %s;' % (d, expr))
                 for i in range(count):
                     self.sym[d + i] = ('smpheap', d, i)
                 return
-            if p[1] == ('smpheap',):
-                # Shortcut (default unless X2W_SAMPLER_HEAP=1): a fixed default sampler.
-                for i in range(count):
-                    self.sym[dst[1] + i] = ('const', 0)
-                self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
-                return
-            raise Unsupported('s_load with a register offset through %s' % (p[1],))
-        if p[1][0] == 'root':
-            buf = self.pipe.resource((p[1], None), 'buf')
+            self.smem_soffset(token, record_use=False)
+            if count != 4:
+                raise Unsupported('s_load of %d dwords from %s' % (count, p[1]))
+            # Shortcut (default unless X2W_SAMPLER_HEAP=1): a fixed default sampler.
             for i in range(count):
-                self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
+                self.sym[dst[1] + i] = ('const', 0)
+            self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
             return
-        for i in range(count):
-            self.sym[dst[1] + i] = ('desc', p[1], off, i)
+        raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
     def op_s_bfm_b32(self, ops, mods):
         """Fold constant bitfield masks: titles build inline sampler words with them."""
-        d = reg_range(ops[0])[1]
         vals = []
         for o in ops[1:3]:
             r = reg_range(o)
@@ -752,6 +833,16 @@ class Stage:
                     vals.append(int(o, 0))
                 except ValueError:
                     vals.append(None)
+        if ops[0] == 'm0':
+            if None not in vals:
+                value = (((1 << (vals[0] & 31)) - 1) << (vals[1] & 31)) & 0xffffffff
+                expr = '0x%08xu' % value
+            else:
+                expr = '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2]))
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % expr)
+            return None
+        d = reg_range(ops[0])[1]
         if None not in vals:
             value = (((1 << (vals[0] & 31)) - 1) << (vals[1] & 31)) & 0xffffffff
             self.set_s(d, '0x%08xu' % value, ('const', value))
@@ -772,13 +863,33 @@ class Stage:
         self.op_s_load_dwordx4(ops, mods, 1)
 
     def op_s_buffer_load_dword(self, ops, mods, count=1):
+        imm = smem_mods(mods)
+        if len(ops) != 3:
+            raise Unsupported('s_buffer_load with %d operands' % len(ops))
         dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
+            raise Unsupported('s_buffer_load destination %s for %d dwords' % (ops[0], count))
         buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
         token = smem_offset(ops[2])
-        offset = self.u(token)
+        is_lit = bool(re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', token))
+        if is_lit:
+            val = int(token, 0)
+            if val < 0 or val > 0xfffff:
+                raise Unsupported('SMEM immediate offset %s' % ops[2])
+            if imm is not None:
+                raise Unsupported('SMEM literal offset %s with offset:%#x' % (ops[2], imm))
+            offset = self.u(token)
+            extra = 0
+        else:
+            offset = self.smem_soffset(token)
+            extra = imm or 0
+            sreg = reg_range(token)
+            if sreg and offset == ('s%d' % sreg[1]) and dst[1] <= sreg[1] < dst[2]:
+                self.emit('a = %s;' % offset)
+                offset = 'a'
         for i in range(count):
-            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
-            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', token):
+            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i))
+            if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):

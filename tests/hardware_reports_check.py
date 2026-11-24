@@ -172,6 +172,23 @@ class HardwareReportChecks(unittest.TestCase):
                 row = hardware_reports.matching_row(only_report(body), rows)
                 self.assertEqual(row.adapter if row else None, expected)
 
+    def test_markdown_lists_failed_and_skipped_separately(self):
+        """A skipped test is not a failed one, and both are named on the one Tests line.
+
+        wave64 defaults to SKIP and bvh is forced to FAIL here, so a summary that merged the two
+        statuses into one list would still produce a plausible line.
+        """
+        body = report(bvh="FAIL")
+        text = hardware_reports.markdown(hardware_reports.summarize([comment(401, body)], README))
+        line = next(t for t in text.splitlines() if "failed:" in t)
+        before, after = line.split("failed:", 1)
+        self.assertIn("bvh_wave64", before, line)      # skipped, ahead of the failed part
+        self.assertNotIn("bvh_differential", before, line)
+        self.assertIn("bvh_differential", after, line)
+        self.assertNotIn("bvh_wave64", after, line)
+
+
+
     def test_flags_results_that_differ_from_the_row(self):
         body = report(adapter="Example Graphics", device="2222", lanes=64, lane_range="32..64", model="0x65",
                       tier=0, bvh="SKIP")

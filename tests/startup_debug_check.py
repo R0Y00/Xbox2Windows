@@ -17,6 +17,18 @@ REPO = Path(__file__).resolve().parents[1]
 DEBUG = REPO / "tools/startup/debug_launch.py"
 
 
+def missing_heap_flags(logdir):
+    """Explain a missing flag line rather than dumping stdout alone.
+
+    The probe prints one line per state. A probe built before the flag line existed prints only
+    "debug-probe reserved ok", which looks like a heap-flag regression; name that possibility here.
+    """
+    printed = text(logdir / "stdout.txt")
+    if "debug-probe heap flags" in printed:
+        return printed
+    return ("no heap-flags line in the probe output; rebuild startup_debug_probe if it predates this "
+            "check. Output was:\n" + printed)
+
 def run(probe, work, name, variables, options=("--continue-asserts", "10")):
     logdir = work / name
     env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_") and k.upper() != "_NO_DEBUG_HEAP"}
@@ -51,11 +63,11 @@ def main(probe):
         assert len(sites) == 2 and sites[0] != sites[1], text(logdir / "events.txt")
         assert not (logdir / "threads_stop.txt").exists() and "VALLOC" not in text(logdir / "files.txt")
         # The launcher keeps the debug heap off by default ...
-        assert "debug-probe heap flags 0x0\n" in text(logdir / "stdout.txt"), text(logdir / "stdout.txt")
+        assert "debug-probe heap flags 0x0\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
         # ... and a caller who sets _NO_DEBUG_HEAP=0 gets it back (control: the loader's three heap bits).
         out, logdir = run(probe, work, "debug-heap", {"_NO_DEBUG_HEAP": "0"})
         assert "process exited with 0x00000000" in out, out
-        assert "debug-probe heap flags 0x70\n" in text(logdir / "stdout.txt"), text(logdir / "stdout.txt")
+        assert "debug-probe heap flags 0x70\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
 
         # X2W_STOP_AT on the second site: the first is still stepped over, the run stops at the second.
         out, logdir = run(probe, work, "stop", {"X2W_STOP_AT": f"{sites[1]:x}"})

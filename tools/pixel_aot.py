@@ -282,6 +282,13 @@ float4 gather_compare(float2 uv, int2 offset, int mip, float reference) {{
 # D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT and D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT.
 COMPARISON_FILTERS = {0: ("point", 0x80), 1: ("bilinear", 0x94)}
 
+ZW_COORDINATES = "A sampled program that reads attr0.z/w must take sample coordinates from attr0.x/y"
+
+
+def xy_coordinates(values, quad_values):
+    """Coordinates that are attr0.x/y themselves or whole-quad values, which cannot read an entry attr0.z/w."""
+    return all(value in quad_values or (isinstance(value, tuple) and value[0] == "entry_uv") for value in values)
+
 
 def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
     if reg in sample_dest:
@@ -3104,6 +3111,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     result_type = "uint4" if integer_export else "float4"
     lines.append(f"{result_type} main(float2 uv : TEXCOORD0) : SV_Target0 {{")
     attribute_input = False
+    attribute_scales = False  # a sampled program read attr0.z/w as plain values
+    free_coordinates = False  # a sample took a coordinate that is not attr0.x/y
     interpolated = False
     region = None
     seen_skip = False
@@ -4317,7 +4326,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         # clamp and output modifiers do not match here and stay unrecognised.
         elif m := match(r"v_interp_p([12])_f32_e(?:32|64) (v\d+), (v\d+), attr0\.([xyzw])"):
             phase, dst, src, component = m.groups()
-            entry_interp = mask == "entry" and sampler is None
+            # With a sampler, attr0.z/w at entry are plain values; only attr0.x/y are sample coordinates.
+            entry_interp = mask == "entry" and (sampler is None or component in "zw")
             if ((not entry_interp and (mask not in ("entry", "quad") or component not in "xy"))
                     or scalar.get("m0") != "interp_base"):
                 raise ValueError("Unknown interpolation context")
@@ -4328,6 +4338,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif phase == "2" and vector.get(src) == "bary_j" and vector.get(dst) == ("partial", component, mask):
                 interpolated = True
                 if entry_interp:
+                    if sampler is not None:
+                        if free_coordinates:
+                            raise ValueError(ZW_COORDINATES)
+                        attribute_scales = True
                     attribute_input = True
                     vector[dst] = f"alu{i}"
                     lines.append(f"    float alu{i} = uv.{component};")
@@ -4388,6 +4402,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 offset_arg = sample_offset_arg(coord_regs.pop(0), vector, sample_dest, known_ssa_bits)
             if any(reg not in vector for reg in coord_regs):
                 raise ValueError("Unsupported texture coordinate")
+            uv_regs = coord_regs[:2] if base_op in ("image_sample_lz", "image_sample_l") else coord_regs[-2:]
+            if not xy_coordinates([vector[reg] for reg in uv_regs], quad_values):
+                if attribute_scales:
+                    raise ValueError(ZW_COORDINATES)
+                free_coordinates = True
 
             def sample_coord(reg):
                 value = vector[reg]
@@ -4524,6 +4543,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             offset_arg = sample_offset_arg(address.pop(0), vector, sample_dest, known_ssa_bits) if has_offset else ""
             if not explicit_zero and any(vector.get(reg) not in quad_values for reg in address[1:]):
                 raise ValueError("Implicit comparison sampling requires coordinates with quad provenance")
+            if not xy_coordinates([vector.get(reg) for reg in address[1:]], quad_values):
+                if attribute_scales:
+                    raise ValueError(ZW_COORDINATES)
+                free_coordinates = True
             if sample_kind is None:
                 lines[lines.index(SAMPLED_RESOURCES)] = comparison_resources(comparison_sampler_state(sampler))
             sample_kind = "comparison"
@@ -4587,6 +4610,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if level is None or not level.is_integer() or not 0 <= level < gather_mips:
                     raise ValueError("Gather requires a known integer LOD inside the view")
                 mip = int(level)
+            if not xy_coordinates([vector[reg] for reg in addr], quad_values):
+                if attribute_scales:
+                    raise ValueError(ZW_COORDINATES)
+                free_coordinates = True
             coords = [f"uv.{value[1]}" if isinstance(value, tuple) and value[0] == "entry_uv" else value
                       for value in (vector[reg] for reg in addr)]
             if any(not isinstance(value, str) or not (value in ("uv.x", "uv.y")

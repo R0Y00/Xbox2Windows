@@ -365,6 +365,8 @@ def controls():
     scalar_alu_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    ff1_exec_controls()
+    writelane_controls()
 
 
 def grid_controls():
@@ -1606,6 +1608,260 @@ def bcnt_exec_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"bcnt_exec: mutation '{label}' escaped detection")
+    return 0
+
+
+WRITELANE = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0x11223344",
+    "s_mov_b32 s5, 31",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, 1, v3",
+    "v_writelane_b32 v4, s4, 3",
+    "v_writelane_b32 v4, 0x55667788, s5",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v4, v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+WRITELANE_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=4, wave_size=32)
+
+
+def writelane_words(*, lane_fn=lambda flat: flat & 31, writes=((3, 0x11223344), (31, 0x55667788))):
+    """Independent reference for one WRITELANE group: initial tid.x + 1, overwritten at matching lanes."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        val = flat + 1
+        lane = lane_fn(flat)
+        for target, scalar in writes:
+            if lane == (target & 31):
+                val = scalar
+        words[flat] = val
+    return words
+
+
+def writelane_controls():
+    """v_writelane_b32: exact output, wave statement, and one rejection per assumption."""
+    lines = aot.lower(WRITELANE, 64, **WRITELANE_BINDING).splitlines()
+    assert lines[2].endswith(", uint gindex : SV_GroupIndex) {"), lines
+    expected_expr = ("(((gindex & 31u) == (0x0000001fu & 31u)) ? 0x55667788u : "
+                     "(((gindex & 31u) == (0x00000003u & 31u)) ? 0x11223344u : (0x00000001u + tid.x)))")
+    assert lines[3] == f"    outputData.Store(tid.x * 4u + 0u, {expected_expr});", lines
+    unstated = dict(WRITELANE_BINDING)
+    del unstated["wave_size"]
+    single = variant(WRITELANE, ("s10, 6, v0", "s10, 5, v0"))
+    single_lines = aot.lower(single, 32, **unstated).splitlines()
+    single_expr = ("(((gindex & 31u) == 0x0000001fu) ? 0x55667788u : "
+                   "(((gindex & 31u) == 0x00000003u) ? 0x11223344u : (0x00000001u + tid.x)))")
+    assert single_lines[3] == f"    outputData.Store(tid.x * 4u + 0u, {single_expr});", single_lines
+    # Without wave_size=32, lane >= 32 (literal or SGPR) or a non-constant lane is refused.
+    rejects("Unverified writelane lane", aot.lower,
+            variant(single, ("v4, s4, 3", "v4, s4, 35")), 32, **unstated)
+    rejects("Unverified writelane lane", aot.lower,
+            variant(single, ("s5, 31", "s5, 35")), 32, **unstated)
+    cbv_lane = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "s_load_dwordx4 s[16:19], s[8:9], 0x10",
+        "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dword s6, s[16:19], null",
+        "s_mov_b32 s4, 0x11223344",
+        "v_lshl_add_u32 v3, s10, 5, v0",
+        "v_add_nc_u32_e32 v4, 1, v3",
+        "s_waitcnt lgkmcnt(0)",
+        "v_writelane_b32 v4, s4, s6",
+        "buffer_store_dword v4, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    rejects("Unverified writelane lane", aot.lower, cbv_lane, 32, **(unstated | dict(constant_descriptor=16)))
+    # With wave_size=32, lane 35 is accepted and masked to 5 bits (behaving as lane 3).
+    wrapped_lines = aot.lower(variant(WRITELANE, ("v4, s4, 3", "v4, s4, 35")), 64, **WRITELANE_BINDING).splitlines()
+    wrapped_expr = ("(((gindex & 31u) == (0x0000001fu & 31u)) ? 0x55667788u : "
+                    "(((gindex & 31u) == (0x00000023u & 31u)) ? 0x11223344u : (0x00000001u + tid.x)))")
+    assert wrapped_lines[3] == f"    outputData.Store(tid.x * 4u + 0u, {wrapped_expr});", wrapped_lines
+    # Rejection tests:
+    # 1. Unknown or pending scalar source
+    rejects("Unverified writelane scalar source", aot.lower,
+            variant(WRITELANE, ("v4, s4, 3", "v4, s30, 3")), 64, **WRITELANE_BINDING)
+    rejects("Unverified writelane scalar source", aot.lower,
+            variant(WRITELANE, ("v4, s4, 3", "v4, s12, 3")), 64, **WRITELANE_BINDING)
+    # 2. Unknown or pending lane
+    rejects("Unverified writelane lane", aot.lower,
+            variant(WRITELANE, ("v4, s4, 3", "v4, s4, s30")), 64, **WRITELANE_BINDING)
+    rejects("Unverified writelane lane", aot.lower,
+            variant(WRITELANE, ("v4, s4, 3", "v4, s4, s12")), 64, **WRITELANE_BINDING)
+    # 3. Unknown old vD
+    rejects("Unverified writelane old value", aot.lower,
+            variant(WRITELANE, ("v4, s4, 3", "v40, s4, 3")), 64, **WRITELANE_BINDING)
+    # 4. Inside a guarded region
+    guarded = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "s_mov_b32 s4, 0x11223344",
+        "v_lshl_add_u32 v3, s10, 5, v0",
+        "v_add_nc_u32_e32 v4, 1, v3",
+        "v_cmp_lt_u32_e32 vcc_lo, 4, v3",
+        "s_and_saveexec_b32 s2, vcc_lo",
+        "v_writelane_b32 v4, s4, 3",
+        "s_or_b32 exec_lo, exec_lo, s2",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v4, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    rejects("v_writelane_b32 inside guarded region", aot.lower, guarded, 32, **unstated)
+    # 5. Group larger than 32 without wave_size=32
+    rejects("Unverified writelane wave size", aot.lower, WRITELANE, 64, **unstated)
+    # 6. vD above v255
+    rejects("Invalid writelane vector destination", aot.lower,
+            variant(WRITELANE, ("v4, s4, 3", "v256, s4, 3")), 64, **WRITELANE_BINDING)
+
+
+def writelane_binary(directory, assembler, objcopy, library):
+    """The assembled WRITELANE program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, WRITELANE), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_writelane_b32")] == [
+        line for line in WRITELANE if line.startswith("v_writelane_b32")], decoded
+    assert aot.lower(decoded, 64, **WRITELANE_BINDING) == aot.lower(WRITELANE, 64, **WRITELANE_BINDING)
+
+
+def writelane_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("writelane.hlsl", "writelane.cso", "writelane.case")]
+    source = aot.lower(WRITELANE, 64, **WRITELANE_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = writelane_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[64] ^= 1
+    for label, reference, word in (
+            ("gindex without & 31", writelane_words(lane_fn=lambda flat: flat), 35),
+            ("lane off by one", writelane_words(writes=((4, 0x11223344), (31, 0x55667788))), 3),
+            ("scalar not written", writelane_words(writes=()), 3),
+            ("sentinel past group", off, 64)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"writelane: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("lane without & 31", source.replace("(gindex & 31u)", "gindex")),
+            ("!= for ==", source.replace("==", "!=")),
+            ("old value replaced by 0", source.replace("(0x00000001u + tid.x)", "0x00000000u"))):
+        if mutated == source:
+            raise AssertionError(f"writelane: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"writelane: mutation '{label}' escaped detection")
+    return 0
+
+
+FF1_EXEC = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_ff1_i32_b64 s4, exec",
+    "s_ff1_i32_b32 s5, exec_lo",
+    "s_add_u32 s6, s4, s5",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_mad_u32_u24 v1, v3, 64, s6",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v1, v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+FF1_EXEC_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=4)
+
+
+def ff1_exec_words(*, result_fn=lambda flat: 0):
+    """Independent reference for one FF1_EXEC group: per thread, flat * 64 + ff1."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        words[flat] = flat * 64 + result_fn(flat)
+    return words
+
+
+def ff1_exec_controls():
+    """s_ff1_i32_b64/b32 of exec: exact output and one rejection per assumption."""
+    expected_line = ("    outputData.Store(tid.x * 4u + 0u, (((tid.x & 0xffffffu) * (0x00000040u & 0xffffffu)) "
+                     "+ (0x00000000u + 0x00000000u)));")
+    lines = aot.lower(FF1_EXEC, 64, **FF1_EXEC_BINDING).splitlines()
+    assert lines[3] == expected_line, lines
+    # Inside a guarded region:
+    guarded = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "v_lshl_add_u32 v3, s10, 6, v0",
+        "v_cmp_lt_u32_e32 vcc_lo, 4, v3",
+        "s_and_saveexec_b32 s2, vcc_lo",
+        "s_ff1_i32_b64 s4, exec",
+        "s_or_b32 exec_lo, exec_lo, s2",
+        "v_mad_u32_u24 v1, v3, 64, s4",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v1, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    rejects("First active lane inside guarded region", aot.lower, guarded, 64, **FF1_EXEC_BINDING)
+    # Any other source:
+    for bad_src in ("vcc", "exec_hi", "s4", "0", "exec_lo"):
+        rejects("Unsupported first active lane source: " + bad_src, aot.lower,
+                variant(FF1_EXEC, ("s4, exec", f"s4, {bad_src}")), 64, **FF1_EXEC_BINDING)
+    rejects("Unsupported first active lane source: exec", aot.lower,
+            variant(FF1_EXEC, ("s5, exec_lo", "s5, exec")), 64, **FF1_EXEC_BINDING)
+    # Invalid or pending destination (and single SGPR required for b64):
+    rejects("Invalid scalar destination or pending load", aot.lower,
+            variant(FF1_EXEC, ("s4, exec", "s106, exec")), 64, **FF1_EXEC_BINDING)
+    rejects("Invalid scalar destination or pending load", aot.lower,
+            variant(FF1_EXEC, ("s4, exec", "s12, exec")), 64, **FF1_EXEC_BINDING)
+    rejects("Unsupported compute instruction", aot.lower,
+            variant(FF1_EXEC, ("s4, exec", "s[4:5], exec")), 64, **FF1_EXEC_BINDING)
+
+
+def ff1_exec_binary(directory, assembler, objcopy, library):
+    """The assembled FF1_EXEC program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, FF1_EXEC), library, offsets=True))
+    assert [line for line in decoded if line.startswith("s_ff1_i32_")] == [
+        line for line in FF1_EXEC if line.startswith("s_ff1_i32_")], decoded
+    assert aot.lower(decoded, 64, **FF1_EXEC_BINDING) == aot.lower(FF1_EXEC, 64, **FF1_EXEC_BINDING)
+
+
+def ff1_exec_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("ff1_exec.hlsl", "ff1_exec.cso", "ff1_exec.case")]
+    source = aot.lower(FF1_EXEC, 64, **FF1_EXEC_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = ff1_exec_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[64] ^= 1
+    for label, reference, word in (
+            ("result taken as 1", ff1_exec_words(result_fn=lambda flat: 1), 0),
+            ("result taken as lane index", ff1_exec_words(result_fn=lambda flat: flat & 31), 1),
+            ("sentinel past group", off, 64)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"ff1_exec: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    mutated = source.replace("0x00000000u + 0x00000000u", "0x00000001u + 0x00000000u")
+    if mutated == source:
+        raise AssertionError("ff1_exec: mutation did not change the source")
+    msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+    msrc.write_text(mutated, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+    bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+    if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+        raise AssertionError("ff1_exec: mutation escaped detection")
     return 0
 
 
@@ -3840,6 +4096,8 @@ def binary(directory, assembler, objcopy, library):
     scalar_alu_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    ff1_exec_binary(directory, assembler, objcopy, library)
+    writelane_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
     ds_controls()
@@ -6593,6 +6851,8 @@ if __name__ == "__main__":
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
                  "draw-mbcnt": mbcnt_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
+                 "draw-ff1-exec": ff1_exec_draw,
+                 "draw-writelane": writelane_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES),
