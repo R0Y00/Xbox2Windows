@@ -641,6 +641,26 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 
+# CopyResource, ResolveSubresource and CopyBufferRegion on a recording list (slots 17, 19 and 15).
+add_executable(startup_list_copy tests/startup_list_copy.cpp)
+target_compile_features(startup_list_copy PRIVATE cxx_std_17)
+target_link_libraries(startup_list_copy PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_list_copy_${backend} COMMAND startup_list_copy ${backend})
+    set_tests_properties(startup_list_copy_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
+# Validation of the whole-resource copies (src/startup_stubs/list_copy.h); the mutated runs are negative controls.
+add_executable(startup_list_copy_check tests/startup_list_copy_check.cpp)
+target_include_directories(startup_list_copy_check PRIVATE src)
+target_compile_features(startup_list_copy_check PRIVATE cxx_std_17)
+add_test(NAME startup_list_copy_validation COMMAND startup_list_copy_check)
+foreach(mutation IN ITEMS overflow typeless samples)
+    add_test(NAME startup_list_copy_validation_${mutation}_control COMMAND startup_list_copy_check --mutate ${mutation})
+    set_tests_properties(startup_list_copy_validation_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
+
 add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
 target_include_directories(startup_nv12_draw PRIVATE src)

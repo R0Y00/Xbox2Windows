@@ -248,6 +248,19 @@ inside the range, an empty view alone) and reads the counters through the `x2w_d
 then copies a view into an empty slot, clears the copy red and reads the target back. It does not draw. The export reads
 the same counters the totals line prints.
 
+Command-list slots 15 (`CopyBufferRegion`), 17 (`CopyResource`) and 19 (`ResolveSubresource`), unshifted like slots 12 to 25,
+copy whole resources in render mode (`src/startup_stubs/list_copy.inl`; the checks are in `list_copy.h`). Each argument is
+mapped to its desktop resource, the pair is moved to the copy or resolve states for the call and back to COMMON at Close
+(an upload buffer stays readable and a readback buffer stays a copy destination), and the call is forwarded. A call the
+desktop would reject is counted, logged (first six) and not forwarded, with the reason: `unresolved`, `same_resource`,
+`not_buffer`, `not_texture`, `dimension_mismatch`, `size_mismatch`, `format_mismatch`, `sample_mismatch`,
+`bad_subresource`, `source_not_multisampled`, `destination_multisampled`, `bad_format`, `zero_size` or
+`range_overflow`. A typeless resolve format (or an unknown one over a typeless source) resolves as the family's typed
+choice: half float for `R16G16B16A16`, normalised for the 8-bit and 10-bit families. Calls on a closed list are ignored.
+These slots have not been seen in a title log yet. `CopyTextureRegion` (16) and `CopyTiles` (18) are not handled.
+`ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,
+resolves and reads back through the `x2w_d3d12_list_copy_stats` export.
+
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
