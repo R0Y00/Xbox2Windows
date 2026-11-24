@@ -63,7 +63,7 @@ def address_name(dst):
     return "%x2w_address_" + dst[1:]
 
 
-def word_pointer(dst, base, index, wide=False, defer=False):
+def word_pointer(dst, base, index, wide=False, defer=False, index_kind=None):
     """Select the last DWORD offset for an unaligned or unrepresentable address.
 
     Returns the lines and the ID of the boolean that is true only for an aligned, in-window address.
@@ -77,9 +77,14 @@ def word_pointer(dst, base, index, wide=False, defer=False):
     addr = base
     if index:
         addr = name + "_address"
+        if index_kind is None:
+            lines.append(f"{name}_index = OpUConvert %ulong {index}")
+            index = f"{name}_index"
+        elif index_kind == "s64":
+            lines.append(f"{name}_index = OpBitcast %ulong {index}")
+            index = f"{name}_index"
         lines.extend([
-            f"{name}_index = OpUConvert %ulong {index}",
-            f"{name}_delta = OpShiftLeftLogical %ulong {name}_index {scale}",
+            f"{name}_delta = OpShiftLeftLogical %ulong {index} {scale}",
             f"{addr} = OpIAdd %ulong {base} {name}_delta",
         ])
     lines.extend([
@@ -95,6 +100,14 @@ def word_pointer(dst, base, index, wide=False, defer=False):
             f"{name}_nowrap = OpUGreaterThanEqual %bool {addr} {base}",
             f"{valid} = OpLogicalAnd %bool {name}_valid {name}_nowrap",
         ])
+        if index_kind is not None:
+            # A 64-bit index can drop high bits when shifted left; reject any shift that wraps.
+            lines.extend([
+                f"{name}_unshifted = OpShiftRightLogical %ulong {name}_delta {scale}",
+                f"{name}_noshift = OpIEqual %bool {name}_unshifted {index}",
+                f"{name}_checked64 = OpLogicalAnd %bool {valid} {name}_noshift",
+            ])
+            valid = name + "_checked64"
     lines.extend([
         f"{name}_word64 = OpShiftRightLogical %ulong {addr} %x2w_shift",
         f"{name}_word = OpUConvert %uint {name}_word64",
@@ -312,8 +325,24 @@ def merge_pointer_types(lines):
     return "\n".join(re.sub(ID, lambda m: aliases.get(m[0], m[0]), line) for line in kept) + "\n"
 
 
+def strip_comment(line):
+    """Drop a trailing ; comment, keeping any ; inside a string literal."""
+    quoted = escaped = False
+    for at, char in enumerate(line):
+        if quoted and escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == ";" and not quoted:
+            return line[:at]
+    return line
+
+
 def lower(assembly):
-    lines = [line.strip() for line in split_sampler_views(lower_ballot_extract(assembly)).splitlines() if line.strip()]
+    stripped = (strip_comment(line).strip() for line in split_sampler_views(lower_ballot_extract(assembly)).splitlines())
+    lines = [line for line in stripped if line]
     model = "OpMemoryModel PhysicalStorageBuffer64 GLSL450"
     if model not in lines or lines.count("%user_data = OpVariable %_ptr_PC_UserData PushConstant") != 1:
         raise ValueError("expected a physical-address module with the named user-data block")
@@ -411,6 +440,10 @@ def lower(assembly):
             start = number
         elif line.startswith("OpLoopMerge "):
             loop_headers.update(range(start, number))
+    wide_types = {m[1]: "s64" if m[2] == "1" else "u64"
+                  for m in map(re.compile(rf"({ID}) = OpTypeInt 64 ([01])").fullmatch, lines) if m}
+    wide_ids = {m[1]: wide_types[m[2]]
+                for m in map(re.compile(rf"({ID}) = Op\w+ ({ID})").match, lines) if m and m[2] in wide_types}
     constants = {m[1]: int(m[2]) for m in map(CONSTANT.fullmatch, lines) if m}
     failures = {}
     for line in lines:
@@ -468,14 +501,14 @@ def lower(assembly):
             dst, pointer, index = access.groups()
             if pointer not in arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, arrays[pointer], index)
+            new, valid_of[dst] = word_pointer(dst, arrays[pointer], index, index_kind=wide_ids.get(index))
             output.extend(new)
             continue
         if signed := SIGNED_ACCESS.fullmatch(line):
             dst, pointer, index = signed.groups()
             if pointer not in signed_arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, signed_arrays[pointer], index, defer=True)
+            new, valid_of[dst] = word_pointer(dst, signed_arrays[pointer], index, defer=True, index_kind=wide_ids.get(index))
             signed_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
@@ -483,7 +516,7 @@ def lower(assembly):
             dst, pointer, index = floating.groups()
             if pointer not in float_arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, float_arrays[pointer], index, defer=True)
+            new, valid_of[dst] = word_pointer(dst, float_arrays[pointer], index, defer=True, index_kind=wide_ids.get(index))
             float_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
@@ -491,7 +524,7 @@ def lower(assembly):
             dst, pointer, index = quad.groups()
             if pointer not in vec4_arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, vec4_arrays[pointer], index, "vec4")
+            new, valid_of[dst] = word_pointer(dst, vec4_arrays[pointer], index, "vec4", index_kind=wide_ids.get(index))
             vec4_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
@@ -499,7 +532,7 @@ def lower(assembly):
             dst, pointer, index = wide.groups()
             if pointer not in wide_arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, wide_arrays[pointer], index, True)
+            new, valid_of[dst] = word_pointer(dst, wide_arrays[pointer], index, True, index_kind=wide_ids.get(index))
             wide_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
