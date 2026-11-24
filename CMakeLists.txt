@@ -104,6 +104,13 @@ foreach(scenario IN ITEMS controls lifetime)
     add_test(NAME era_physical_${scenario} COMMAND era_physical_check ${scenario})
 endforeach()
 
+# Device-free rules of the placed acceleration-structure build (#870): standard C++17 only.
+add_executable(placed_build_causes_check tests/placed_build_causes_check.cpp)
+target_include_directories(placed_build_causes_check PRIVATE src)
+target_compile_features(placed_build_causes_check PRIVATE cxx_std_17)
+add_test(NAME placed_build_causes COMMAND placed_build_causes_check)
+set_tests_properties(placed_build_causes PROPERTIES TIMEOUT 30)
+
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
     src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)

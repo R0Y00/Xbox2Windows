@@ -4,6 +4,8 @@
 #include "startup_stubs/placed_build.h"
 #include <array>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 namespace dxr_fixture {
 // These are the existing slot-133 and IUnknown contracts, called on the
@@ -15,7 +17,7 @@ class PlacedBuildScene {
         ~Buffer() { wrapper.Reset(); if (memory) VirtualFree(memory, 0, MEM_RELEASE); }
     };
     Microsoft::WRL::ComPtr<IUnknown> guest_;
-    std::array<Buffer, 7> buffers_;
+    std::array<Buffer, 8> buffers_;
 
 public:
     // Wrong-routing control (issue #874): also build a decoy BLAS from another triangle into its own placed
@@ -79,6 +81,7 @@ public:
         must_reject(unmapped, ts);
         must_reject(tlas, short_scratch);
         must_reject(ts, tlas);
+        check_updates(top, top_size, tlas, ts);
         check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS");
         check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS");
         const auto verify_offset = [&](const auto& build, UINT64 dest, UINT64 scratch, const auto& sizes) {
@@ -94,6 +97,56 @@ public:
         std::printf("Placed DXR bytes dest/scratch: BLAS=%llu/%llu TLAS=%llu/%llu; short scratch, missing dest and swapped states rejected before recording\n",
             bottom_size.ResultDataMaxSizeInBytes, bottom_size.ScratchDataSizeInBytes,
             top_size.ResultDataMaxSizeInBytes, top_size.ScratchDataSizeInBytes);
+    }
+
+    // PERFORM_UPDATE with SourceAccelerationStructureData, through the same resolver. The scratch of an update
+    // is sized by UpdateScratchDataSizeInBytes; the fixture sets it to the build scratch size so that the one
+    // scratch buffer placed for the build fits.
+    void check_updates(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& top,
+                       const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& top_size, UINT64 tlas, UINT64 scratch) {
+        constexpr auto update_flag = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        constexpr UINT64 dest_offset = 512, unmapped = 0x1000;
+        auto sizes = top_size;
+        sizes.UpdateScratchDataSizeInBytes = top_size.ScratchDataSizeInBytes;
+        const auto request = [&](UINT64 source, bool update) {
+            auto build = top;
+            build.Inputs.Flags = update ? (build.Inputs.Flags | update_flag) : (build.Inputs.Flags & ~update_flag);
+            build.SourceAccelerationStructureData = source;
+            build.DestAccelerationStructureData = build.ScratchAccelerationStructureData = 0;
+            return build;
+        };
+        // Each refusal returns E_INVALIDARG and publishes neither address, and keeps the source as the title gave it.
+        const auto must_reject = [&](UINT64 source, bool update, const char* what) {
+            auto build = request(source, update);
+            if (x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, sizes, build) != E_INVALIDARG ||
+                build.DestAccelerationStructureData || build.ScratchAccelerationStructureData ||
+                build.SourceAccelerationStructureData != source)
+                throw std::runtime_error(std::string("Invalid DXR update was accepted or partially published: ") + what);
+        };
+        must_reject(0, true, "update without a source");
+        must_reject(tlas, false, "source without PERFORM_UPDATE");
+        must_reject(tlas + 1, true, "unaligned source");
+        must_reject(unmapped, true, "source outside the placed buffers");
+        must_reject(scratch, true, "source in a buffer that is not an acceleration structure");
+        must_reject(tlas + 256, true, "source partly overlapping the destination");
+
+        // In place: the source is the destination.
+        auto in_place = request(tlas, true);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, sizes, in_place), "Resolve in-place update");
+        if (!in_place.DestAccelerationStructureData || in_place.SourceAccelerationStructureData != in_place.DestAccelerationStructureData)
+            throw std::runtime_error("An in-place update must translate source and destination to the same address");
+
+        // Out of place: another placed acceleration structure, its interior offset kept.
+        const auto other = place(7, dest_offset + top_size.ResultDataMaxSizeInBytes,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) + dest_offset;
+        auto moved = request(other, true);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, sizes, moved), "Resolve out-of-place update");
+        auto base = request(0, false);
+        check(x2w_startup::resolve_placed_build(guest_.Get(), other - dest_offset, scratch - 768, sizes, base),
+            "Resolve the source placement base");
+        if (moved.SourceAccelerationStructureData != base.DestAccelerationStructureData + dest_offset ||
+            moved.SourceAccelerationStructureData == moved.DestAccelerationStructureData)
+            throw std::runtime_error("An out-of-place update lost the source address or aliased the destination");
     }
 
     // The decoy BLAS for the wrong-routing control, placed and resolved through the same slot-133 path.
