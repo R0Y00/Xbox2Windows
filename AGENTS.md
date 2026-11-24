@@ -105,6 +105,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -m pip install -r requirements-dev.txt
 ./out/pe-env/bin/python -B tests/script_state_check.py
 ./out/pe-env/bin/python -B tests/resource_root_check.py
+./out/pe-env/bin/python -B tests/pe_authentihash_check.py
 ./out/pe-env/bin/python -B tests/bcpack_check.py
 ./out/pe-env/bin/python -B tests/bcpack_symbols_check.py
 ./out/pe-env/bin/python -B tests/bcpack_tables_check.py

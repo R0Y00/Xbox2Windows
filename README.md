@@ -289,7 +289,7 @@ Maintainers link independent results to the original report and record the adapt
 
 The installation metadata inspected for this case study lists a Scarlett executable. The main executable was absent from the inspected files. The public regression suite uses source-built fixtures and independently built shaders. [Intake methods and evidence](docs/experiments.md#static-executable-intake)
 
-Windows Authenticode verification on the local copy reported `HashMismatch` for 12 DLLs and `NotSigned` for four. Three independently compared whole-file SHA-256 values matched the community reports. The cause of the digest mismatch and the original signing path remain undetermined. [Methods and fingerprints](https://github.com/R0Y00/Xbox2Windows/issues/52)
+Windows Authenticode verification on the local copy reported `HashMismatch` for 12 DLLs and `NotSigned` for four. Three independently compared whole-file SHA-256 values matched the community reports. The cause of the digest mismatch and the original signing path remain undetermined. [Methods and fingerprints](https://github.com/R0Y00/Xbox2Windows/issues/52) · `tools/pe_authentihash.py` recomputes the Authenticode SHA-256 digest of a PE file; `tests/pe_authentihash_check.py` checks it on self-built PE32 and PE32+ files against digests from the Windows API.
 
 XCL is a public behavioural reference for what a retail title may ask of the platform. The [XCL reference](docs/xcl-reference.md) records the GPL-2.0-only boundary and the pinned revision; the [capability matrix](docs/xcl-capability-matrix.md) maps selected XCL behaviours to named checked-in tests. Neither document is an Xbox2Windows measurement or a roadmap.
 

@@ -136,6 +136,7 @@ jobs:
           python -B tools/run_checks_parallel.py \
             tests/script_state_check.py \
             tests/resource_root_check.py \
+            tests/pe_authentihash_check.py \
             tests/bcpack_check.py \
             tests/bcpack_symbols_check.py \
             tests/bcpack_tables_check.py \
