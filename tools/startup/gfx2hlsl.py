@@ -622,6 +622,8 @@ class Stage:
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
             return 'exec'
+        if tok == 'vcc_hi':
+            return '0u'  # wave32: the high half of the lane mask holds no lane, so it reads as zero
         if tok == 'm0':
             m = self.sym.get('m0')
             if m:
