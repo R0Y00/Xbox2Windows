@@ -13387,7 +13387,7 @@ VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
 
 ## Startup single root constants
 
-Command-list slot 38 (`SetGraphicsRoot32BitConstant`) stores one root constant word for a translated shader. The cases are in `tests/startup_mrt_check.py`, which sets the slot through `tests/startup_root_constant.cpp` and reads the word back through a rewritten `rootconst` manifest entry: set, overwrite, offset 3 read at offset 3 and at offset 0, the corner (15, 7), parameter 16, parameter 0xffffffff, offset 8 and offset 0xffffffff dropped, the same root signature again (word kept), a switched one (word cleared) and no call. The slot number is derived, not seen in a title log. Details are in [startup-runtime.md](startup-runtime.md#single-root-constants).
+Command-list slot 38 (`SetGraphicsRoot32BitConstant`) stores one root constant word for a translated shader. The cases are in `tests/startup_mrt_check.py`, which sets the slot through `draw_root_constant` in `tests/startup_root_cbv.cpp` and reads the word back through a rewritten `rootconst` manifest entry: set, overwrite, offset 3 read at offset 3 and at offset 0, the corner (15, 7), parameter 16, parameter 0xffffffff, offset 8 and offset 0xffffffff dropped, the same root signature again (word kept), a switched one (word cleared) and no call. The slot number is derived, not seen in a title log. Details are in [startup-runtime.md](startup-runtime.md#single-root-constants).
 
 Limits: this was written and checked on Linux only (syntax with MinGW, `git diff --check`, the link and bidi checks). The `startup_mrt_*` tests need Windows with D3D12 and were not run, so the expected pixels and the mutations are not yet confirmed there.
 
