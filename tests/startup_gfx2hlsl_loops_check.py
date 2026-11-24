@@ -6,9 +6,9 @@
 
 The simple fixture is a bottom-tested loop: s0 counts from 1 to 4 and the branch returns to the
 header while s0 < 4. The nested fixture has an outer loop whose body contains a self-loop on s1.
-Both are natural loops with one latch and one forward exit. The third fixture jumps from the
-preheader into the loop body, so the header does not dominate the body; that shape must keep the
-pc dispatcher.
+The header-exit fixture is a top-tested loop with a two-block body, so its exit is taken from the
+header. The fifth fixture jumps from the preheader into the loop body, so the header does not
+dominate the body; that shape must keep the pc dispatcher.
 
 The binary and compile modes are optional. The compile mode needs DXC only; it does not open a
 GPU adapter. A missing DXC exits 77 with a named skip reason.
@@ -58,6 +58,29 @@ s_endpgm
 NESTED_WORDS = bytes.fromhex(
     '800380be' '00810080' '008304bf' '050084bf' '800381be' '01810180' '018204bf'
     'fdff85bf' 'f8ff82bf' '0002007e' '0f1800f8' '00000000' '000081bf')
+
+# The exit is taken from the loop header and the body has two blocks, separated by an unconditional
+# forward jump to the next block. The preheader sets both counters, so this also pins the constant
+# invalidation at the header and both body blocks.
+HEADER_EXIT_MULTI_BODY_SOURCE = """\
+s_mov_b32 s0, 0
+s_mov_b32 s1, 0
+.Lheader:
+s_cmp_lt_i32 s0, 3
+s_cbranch_scc0 4  ; .Lexit
+s_add_u32 s0, s0, 1
+s_branch 0  ; .Lbody2
+.Lbody2:
+s_add_u32 s1, s1, 1
+s_branch -6  ; .Lheader
+.Lexit:
+v_mov_b32_e32 v0, s1
+exp mrt0 v0, v0, v0, v0 done vm
+s_endpgm
+"""
+HEADER_EXIT_MULTI_BODY_WORDS = bytes.fromhex(
+    '800380be' '800381be' '008304bf' '040084bf' '00810080' '000082bf'
+    '01810180' 'faff82bf' '0102007e' '0f1800f8' '00000000' '000081bf')
 
 # The preheader jumps into .Lbody, and the header jumps to .Lexit on the other edge. The body's branch
 # back to the header therefore is not a natural loop: the header does not dominate the body.
@@ -152,6 +175,18 @@ def controls():
     check('nested: every block has the 65536 guard', body.count('guard >= 65536u') == len(nested.ps.blocks))
     print('  body:\n' + '\n'.join('    ' + line for line in body.splitlines()))
 
+    header_exit = pipeline(HEADER_EXIT_MULTI_BODY_WORDS)
+    body = '\n'.join(header_exit.ps.body())
+    check('header exit multi-block: one structured loop', body.count('for (;;) {') == 1)
+    check('header exit multi-block: the pc dispatcher is gone', 'uint pc' not in body)
+    check('header exit multi-block: the header exit becomes break', 'if (!scc) break;' in body)
+    check('header exit multi-block: both body blocks accumulate',
+          's0 = s0 + 0x00000001u;' in body and 's1 = s1 + 0x00000001u;' in body)
+    check('header exit multi-block: five blocks', len(header_exit.ps.blocks) == 5)
+    check('header exit multi-block: every block has the 65536 guard',
+          body.count('guard >= 65536u') == len(header_exit.ps.blocks))
+    print('  body:\n' + '\n'.join('    ' + line for line in body.splitlines()))
+
     unsupported = pipeline(UNSUPPORTED_WORDS)
     body = '\n'.join(unsupported.ps.body())
     check('conditional entry: the pc dispatcher remains',
@@ -172,6 +207,8 @@ def controls():
 def check_binary(llvm_mc):
     for name, source, words in (('simple', SIMPLE_SOURCE, SIMPLE_WORDS),
                                 ('nested', NESTED_SOURCE, NESTED_WORDS),
+                                ('header exit multi-block', HEADER_EXIT_MULTI_BODY_SOURCE,
+                                 HEADER_EXIT_MULTI_BODY_WORDS),
                                 ('conditional entry', UNSUPPORTED_SOURCE, UNSUPPORTED_WORDS),
                                 ('non-adjacent exit', NONADJACENT_SOURCE, NONADJACENT_WORDS),
                                 ('two exits', TWO_EXITS_SOURCE, TWO_EXITS_WORDS)):
@@ -196,6 +233,7 @@ def check_compile(dxc):
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         for name, words in (('simple', SIMPLE_WORDS), ('nested', NESTED_WORDS),
+                            ('header_exit_multi_block', HEADER_EXIT_MULTI_BODY_WORDS),
                             ('conditional_entry', UNSUPPORTED_WORDS)):
             pipe = pipeline(words)
             compile_hlsl(compiler, 'dxc', pipe.hlsl_vs(), 'vs_%s' % name, 'vs_6_0', directory)
