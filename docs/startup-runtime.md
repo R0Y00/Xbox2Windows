@@ -658,7 +658,14 @@ code that names the export (see `src/startup_stubs/trap.h`).
 ## Run
 
 Prepare a folder with the executable and its package DLLs yourself. Never commit or upload it.
-Then:
+Alternatively, stage one executable and its adjacent DLLs with:
+
+```powershell
+.\tools\startup\stage_package.ps1 -PackageDir <package root> -Exe <title>.exe -RunDir <fresh run folder>
+```
+
+The destination must be absent or empty and separate from the package. Archives and subdirectories
+are not copied. Keep using the package root as `-DataDir`, then run the staged executable:
 
 ```powershell
 .\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `

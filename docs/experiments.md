@@ -313,6 +313,20 @@ cmake --build --preset dev --target startup_storage_root_check startup_stub_game
 ctest --preset dev --no-tests=error -R '^startup_storage_root' -V
 ```
 
+## Startup package staging
+
+`tools/startup/stage_package.ps1` copies one executable and its adjacent DLLs into a fresh
+run directory. Package archives and subdirectories stay at the data root. The tool refuses
+destinations in the package, ancestors of the package, nonempty destinations and destination
+paths through reparse points. It does not resolve dependencies or establish executable compatibility.
+`startup_stage_package` checks staging from a changed PowerShell location, exact DLL extensions
+and DLL selection beside a nested executable. It also checks preservation of package data and
+refusal of overwrites, overlapping paths, junctions and invalid executable inputs.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_stage_package$' -V
+```
+
 ## Typed startup colour exports
 
 The [startup draw fixture](startup-runtime.md) uses a source-built gfx1013 pixel shader
