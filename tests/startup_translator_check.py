@@ -40,6 +40,18 @@ def check_offset_load(failures):
         failures.append('s_load_dwordx8 at +0x40: got %s, expected %s' % (got, want))
 
 
+def check_root_descriptor(failures):
+    # A descriptor that comes from a root parameter rather than a table has no byte offset; the
+    # resource is the parameter itself. Both halves matter: a key that reports 0 instead of None
+    # would look like the first entry of a table.
+    stage = gfx2hlsl.Stage.__new__(gfx2hlsl.Stage)
+    stage.sym = {8: ('ptr', ('root', 2))}
+    got = stage.descriptor('s[8:11]')
+    want = (('root', 2), None)
+    if got != want:
+        failures.append('root descriptor: got %s, expected %s' % (got, want))
+
+
 def check_negative_control(failures):
     # A key that ignores the register's dword index (the former behaviour) gives the second
     # descriptor offset 0, the same resource as the first: the check above must tell them apart.
@@ -158,7 +170,7 @@ def check_negative_discovery(failures):
 
 def main():
     failures = []
-    for check in (check_wide_load, check_offset_load, check_negative_control, check_missing_fxc,
+    for check in (check_wide_load, check_offset_load, check_root_descriptor, check_negative_control, check_missing_fxc,
                   check_fxc_discovery, check_negative_discovery):
         check(failures)
     for line in failures:

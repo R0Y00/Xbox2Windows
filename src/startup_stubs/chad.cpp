@@ -7,11 +7,14 @@
 
 // Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the DSP stream interface; otherwise they trap. Seen:
-//   XDspConnectWithMaximumStreamLimit(queue memory, 0x60000, 30, 0x80, 1, &handle) -> 0 on success.
+//   XDspConnectWithMaximumStreamLimit(queue memory, 0x60000, 30, 0x80, 1, &handle) -> 0 on success,
+//   E_POINTER when handle is null or unwritable.
 // The others have not been seen yet; they succeed (0) and log their first calls with registers.
 // No stream is processed.
 namespace {
 using u64 = std::uint64_t;
+constexpr long hr_ok = 0;
+constexpr long hr_pointer = static_cast<long>(0x80004003);  // E_POINTER
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
 int connection;
 
@@ -20,7 +23,7 @@ long accept(const char* name, unsigned index, u64 rcx, u64 rdx, u64 r8, u64 r9, 
     if (!permissive()) x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, index, rcx, rdx, r8, r9, return_address);
     if (x2w_local::first_calls(calls, 6))
         x2w_trap::record("x2w-audio", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, index, rcx, rdx, r8, r9, return_address);
-    return 0;
+    return hr_ok;
 }
 }  // namespace
 
@@ -34,9 +37,20 @@ extern "C" __declspec(noinline) long XDspConnectWithMaximumStreamLimit(u64 rcx, 
 {
     static LONG calls;
     const long result = accept("XDspConnectWithMaximumStreamLimit", 1, rcx, rdx, r8, r9, _ReturnAddress(), calls);
-    if (handle && x2w_local::writable(handle, sizeof(void*))) *handle = &connection;
+    if (!handle || !x2w_local::writable(handle, sizeof(void*))) {
+        x2w_local::logf("x2w-audio XDspConnectWithMaximumStreamLimit memory=0x%llx bytes=0x%llx streams=%llu r9=0x%llx flag=%llu "
+                        "handle_out=%p -> E_POINTER",
+                        static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(rdx),
+                        static_cast<unsigned long long>(r8), static_cast<unsigned long long>(r9),
+                        static_cast<unsigned long long>(flag), static_cast<void*>(handle));
+        return hr_pointer;
+    }
+    *handle = &connection;
     x2w_local::logf("x2w-audio XDspConnectWithMaximumStreamLimit memory=0x%llx bytes=0x%llx streams=%llu r9=0x%llx flag=%llu "
-                    "handle_out=%p -> 0", rcx, rdx, r8, r9, flag, static_cast<void*>(handle));
+                    "handle_out=%p -> 0",
+                    static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(rdx),
+                    static_cast<unsigned long long>(r8), static_cast<unsigned long long>(r9),
+                    static_cast<unsigned long long>(flag), static_cast<void*>(handle));
     return result;
 }
 

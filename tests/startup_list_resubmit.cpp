@@ -311,11 +311,21 @@ int main(int argc, char** argv)
     if (!probe.submit(compute, false)) return 75; // The failed recording is dropped by the queue wrapper.
     const auto recovered_reset = static_cast<HRESULT>(invoke(compute, 139, arg(compute_b)));
     const auto recovered_close = static_cast<HRESULT>(invoke(compute, 9));
-    std::printf("7 recovered Reset: 0x%08lx, Close: 0x%08lx\n",
-                static_cast<unsigned long>(recovered_reset), static_cast<unsigned long>(recovered_close));
-    if (FAILED(recovered_reset) || FAILED(recovered_close) || !probe.submit(compute, false)) return 76;
+    const unsigned compute_b_pool = x2w_d3d12_allocator_pool_size(compute_b);
+    std::printf("7 recovered Reset: 0x%08lx, Close: 0x%08lx, desktop allocators behind compute_b: %u (expected 2)\n",
+                static_cast<unsigned long>(recovered_reset), static_cast<unsigned long>(recovered_close),
+                compute_b_pool);
+    if (FAILED(recovered_reset) || FAILED(recovered_close) || compute_b_pool != 2 || !probe.submit(compute, false))
+        return 76;
     if (invoke(probe.fence, 8) >= probe.fence_value ||
         !ok(invoke(compute_gate, 10, 1)) || !probe.reached()) return 78;
+    // Once the failed list is released, Reset on compute_b reuses the retired desktop allocator instead of growing.
+    if (!ok(invoke(compute_b, 8))) return 80;
+    const unsigned compute_b_reused = x2w_d3d12_allocator_pool_size(compute_b);
+    std::printf("7 after compute_b Reset, desktop allocators behind compute_b: %u (expected 2)\n", compute_b_reused);
+    if (compute_b_reused != 2 || !ok(invoke(compute, 139, arg(compute_b))) || !ok(invoke(compute, 9)) ||
+        !probe.submit(compute))
+        return 81;
     const auto remaining_errors = probe.debug_errors(expected_fault_messages);
     std::printf("7 device removed reason after recovery: 0x%08lx, unexpected debug layer errors: %llu\n",
                 static_cast<unsigned long>(probe.desktop->GetDeviceRemovedReason()), remaining_errors);

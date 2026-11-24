@@ -284,6 +284,30 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_VERTEX_FETCH", nullptr, 0)) {
+        // TEXCOORD float3 in slot 0 and POSITION float3 in slot 1, 12 bytes each; vertices 0-2 are unused. Vertices
+        // 3-8 are drawn from start vertex 3: positions cover pixels [1, 3) x [1, 3) of the 8x4 target, texture
+        // coordinates read as positions would cover [0, 4) x [0, 1). Vertices 9-14 are drawn through indices 4-9 with
+        // base vertex 5: positions cover column 0, texture coordinates read as positions pixel (3, 3).
+        struct Rect { float x0, y0, x1, y1; };
+        const auto corners = [](float (*out)[3], Rect r) {
+            const float c[6][2] = {{r.x0, r.y0}, {r.x1, r.y0}, {r.x0, r.y1}, {r.x1, r.y0}, {r.x1, r.y1}, {r.x0, r.y1}};
+            for (int v = 0; v < 6; ++v) { out[v][0] = c[v][0]; out[v][1] = c[v][1]; out[v][2] = 0.5f; }
+        };
+        static float texcoords[15][3], positions[15][3];
+        corners(texcoords + 3, {-1.0f, 1.0f, 0.0f, 0.5f});
+        corners(positions + 3, {-0.75f, 0.5f, -0.25f, -0.5f});
+        corners(texcoords + 9, {-0.25f, -0.5f, 0.0f, -1.0f});
+        corners(positions + 9, {-1.0f, 1.0f, -0.75f, -1.0f});
+        static const std::uint16_t indices[6] = {4, 5, 6, 7, 8, 9};
+        const D3D12_VERTEX_BUFFER_VIEW views[2] = {
+            {reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(texcoords), sizeof(texcoords), sizeof(texcoords[0])},
+            {reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(positions), sizeof(positions), sizeof(positions[0])}};
+        const D3D12_INDEX_BUFFER_VIEW index_view{reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(indices), sizeof(indices), DXGI_FORMAT_R16_UINT};
+        invoke(list, 48, 0, 2, arg(views));
+        invoke(list, 12, 6, 1, 3, 0);
+        invoke(list, 47, arg(&index_view));
+        invoke(list, 13, 6, 1, 0, 5, 0);
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;

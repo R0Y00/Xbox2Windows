@@ -112,6 +112,15 @@ class HardwareReportChecks(unittest.TestCase):
         self.assertEqual(parsed.notes, [])
         self.assertEqual(hardware_reports.evidence_label(parsed), "1.0 report, debug layer enabled")
 
+    def test_evidence_label_follows_the_readme_wording(self):
+        # The test executables print driver=unavailable via DXGI when the version query fails.
+        parsed = only_report(report(driver="unavailable via DXGI"))
+        self.assertEqual(hardware_reports.evidence_label(parsed), "Hardware report")
+        # Run-GpuCheck.ps1 -AdapterFilter adds this line after the backend on hardware runs.
+        filtered = report().replace("Backend: hardware", "Backend: hardware\r\nAdapter filter: GPU 100")
+        parsed = only_report(filtered)
+        self.assertEqual(hardware_reports.evidence_label(parsed), "1.0 report, adapter filter GPU 100")
+
     def test_cells_use_the_readme_wording(self):
         cases = [
             ({}, ("32", SKIP_32, PASSED)),
@@ -121,6 +130,9 @@ class HardwareReportChecks(unittest.TestCase):
             ({"tier": 0, "bvh": "SKIP"}, ("32", SKIP_32, "Skipped, DXR unsupported")),
             ({"tier": 10, "bvh": "SKIP"}, ("32", SKIP_32, "Skipped, DXR tier 1.0")),
             ({"bvh": "FAIL"}, ("32", SKIP_32, "Failed")),
+            ({"wave64": "FAIL"}, ("32", "Failed", PASSED)),
+            # dxr_tier=11 is DXR 1.1, so the skip has another cause and names no tier.
+            ({"tier": 11, "bvh": "SKIP"}, ("32", SKIP_32, "Skipped")),
         ]
         for options, expected in cases:
             with self.subTest(options=options):

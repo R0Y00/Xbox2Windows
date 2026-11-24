@@ -130,6 +130,12 @@ print(f"dstorage page-array control: exit={run.returncode} {'ok' if ok else 'MIS
 if not ok:
     failures.append(f"dstorage page-array control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
 
+run = subprocess.run([consumer, "dstorage-error-record"], capture_output=True, text=True, env=env, timeout=20)
+ok = run.returncode == 0 and "dstorage-error-record ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage error record: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage error record: exit {run.returncode}, stderr {run.stderr.strip()!r}")
+
 store_env = dict(env, X2W_RUNTIME_PROXY="1", X2W_FAKE_USER="1")
 run = subprocess.run([consumer, "store"], capture_output=True, text=True, env=store_env, timeout=20)
 traps_after = open(log, encoding="ascii").read().count("x2w-trap ") if os.path.exists(log) else 0
