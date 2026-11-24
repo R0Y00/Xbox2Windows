@@ -47,6 +47,14 @@ The presenter only samples non-empty single-sample 2D surfaces without
 `D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE` and with a supported view format
 (`src/startup_stubs/present_view_format.h`), and marks itself failed if
 closing its command list fails.
+A typeless surface is sampled through a typed view (`present_view_format`): the 8-bit RGBA, BGRA and BGRX
+families and `R10G10B10A2_TYPELESS` as UNORM, and `R16G16B16A16_TYPELESS` (an HDR scene surface) as
+`R16G16B16A16_FLOAT`, so values above 1 and below 0 reach the shader unchanged and the 8-bit back buffer
+clamps them; no tone mapping or sRGB conversion is added. The half-float view is an assumption about the
+data: a 16-bit RGBA typeless texture that holds UNORM data would show wrong colours, not be refused. The 32-bit
+and the one-, two- and three-channel typeless formats, depth/stencil planes and block-compressed formats are
+still refused (the first four refusals are logged as `not supported`). Only the 8-bit RGBA/BGRA formats have
+the "Present mean" readback; a 16-bit or 10-bit surface is shown but not measured.
 When a present cannot show its surface, the GDI fallback selects a visible,
 unowned guest window in the same process. If only the presenter is visible,
 the fallback leaves it alone. With two visible guests it draws into the upper

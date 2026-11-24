@@ -3,6 +3,7 @@
 // texels through the mapped view against a CPU decode of the bytes that were uploaded.
 // --mutate identity: the table with the old behaviour (the typeless format unchanged); it must fail.
 // --mutate srgb: the device run with an sRGB view of the RGBA8 texture; it must fail on a texel.
+// --mutate unorm16: the device run with a UNORM view of the RGBA16 half-float texture; it must fail on a texel.
 #include "startup_stubs/present_view_format.h"
 
 #include <d3dcompiler.h>
@@ -18,13 +19,14 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
-int failures;
-bool identity, srgb;
+int failures, format_checks, surface_checks;
+bool identity, srgb, unorm16;
 
 DXGI_FORMAT map_format(DXGI_FORMAT format) { return identity ? format : x2w_startup::present_view_format(format); }
 
 void expect(const char* name, DXGI_FORMAT format, DXGI_FORMAT wanted)
 {
+    ++format_checks;
     if (map_format(format) != wanted) {
         std::printf("FAIL %s: format %d -> %d, expected %d\n", name, format, map_format(format), wanted);
         ++failures;
@@ -38,11 +40,13 @@ void table()
     expect("bgra8", DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM);
     expect("bgrx8", DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM);
     expect("rgb10a2", DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM);
+    expect("rgba16 (HDR)", DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT);
     for (DXGI_FORMAT typed : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-                              DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_BC1_UNORM,
+                              DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_SNORM,
+                              DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_BC1_UNORM,
                               static_cast<DXGI_FORMAT>(191) /* DXGI_FORMAT_A4B4G4R4_UNORM */})
         expect("typed passes", typed, typed);
-    for (DXGI_FORMAT ambiguous : {DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32_TYPELESS, DXGI_FORMAT_R16G16B16A16_TYPELESS,
+    for (DXGI_FORMAT ambiguous : {DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32_TYPELESS,
                                   DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R16G16_TYPELESS,
                                   DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R8G8_TYPELESS,
                                   DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC2_TYPELESS,
@@ -54,6 +58,7 @@ void table()
 
 void expect_supported(const char* name, const D3D12_RESOURCE_DESC& desc, bool wanted)
 {
+    ++surface_checks;
     const bool got = x2w_startup::present_surface_supported(desc);
     if (got != wanted) {
         std::printf("FAIL %s: supported=%d, expected %d (dim=%d samples=%u flags=0x%x fmt=%d)\n",
@@ -71,6 +76,19 @@ void surface_support()
     rt.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     rt.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     expect_supported("2d typeless rt", rt, true);
+
+    D3D12_RESOURCE_DESC hdr = tex2d;
+    hdr.Format = DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    hdr.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    expect_supported("2d typeless rgba16 rt", hdr, true);
+    hdr.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    expect_supported("2d typeless rgba16 deny_srv", hdr, false);
+    hdr.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    hdr.SampleDesc.Count = 4;
+    expect_supported("2d typeless rgba16 msaa4", hdr, false);
+    D3D12_RESOURCE_DESC two_channel16 = tex2d;
+    two_channel16.Format = DXGI_FORMAT_R16G16_TYPELESS;
+    expect_supported("2d typeless rg16 refused", two_channel16, false);
 
     D3D12_RESOURCE_DESC deny = tex2d;
     deny.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
@@ -127,13 +145,28 @@ struct Case {
     const char* name;
     DXGI_FORMAT typeless;
     DXGI_FORMAT view;
-    std::vector<unsigned> texel;  // 16 texels, 4 bytes each, little-endian
-    float (*decode)(unsigned, int);
+    std::vector<unsigned> texel;  // 16 texels of `words` 32-bit words each, little-endian
+    unsigned words;
+    float (*decode)(const unsigned*, int);
 };
 
-float decode_rgba8(unsigned t, int c) { return static_cast<float>((t >> (8 * c)) & 255) / 255.0f; }
-float decode_bgra8(unsigned t, int c) { return decode_rgba8(t, c == 0 ? 2 : c == 2 ? 0 : c); }
-float decode_rgb10a2(unsigned t, int c) { return c == 3 ? static_cast<float>(t >> 30) / 3.0f : static_cast<float>((t >> (10 * c)) & 1023) / 1023.0f; }
+float decode_rgba8(const unsigned* t, int c) { return static_cast<float>((t[0] >> (8 * c)) & 255) / 255.0f; }
+float decode_bgra8(const unsigned* t, int c) { return decode_rgba8(t, c == 0 ? 2 : c == 2 ? 0 : c); }
+float decode_rgb10a2(const unsigned* t, int c)
+{
+    return c == 3 ? static_cast<float>(t[0] >> 30) / 3.0f : static_cast<float>((t[0] >> (10 * c)) & 1023) / 1023.0f;
+}
+
+// Half to single, from the format's bit fields (no hardware or library conversion). Infinities and NaNs are not
+// used by the fixture.
+float half_to_float(unsigned h)
+{
+    const float sign = (h & 0x8000u) ? -1.0f : 1.0f;
+    const unsigned exponent = (h >> 10) & 31u, mantissa = h & 1023u;
+    if (exponent == 0) return sign * std::ldexp(static_cast<float>(mantissa), -24);
+    return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f, static_cast<int>(exponent) - 15);
+}
+float decode_rgba16f(const unsigned* t, int c) { return half_to_float((t[c / 2] >> (16 * (c & 1))) & 0xffffu); }
 
 bool readback(ID3D12Device* device, const Case& item)
 {
@@ -153,7 +186,8 @@ bool readback(ID3D12Device* device, const Case& item)
     auto back = make_buffer(D3D12_HEAP_TYPE_READBACK, out_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
     unsigned char* mapped = nullptr;
     check(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "map upload");
-    for (UINT y = 0; y < side; ++y) std::memcpy(mapped + y * pitch, &item.texel[y * side], side * 4);
+    const UINT texel_bytes = item.words * 4;
+    for (UINT y = 0; y < side; ++y) std::memcpy(mapped + y * pitch, &item.texel[y * side * item.words], side * texel_bytes);
     upload->Unmap(0, nullptr);
 
     D3D12_RESOURCE_DESC tex{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, item.typeless, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
@@ -166,7 +200,9 @@ bool readback(ID3D12Device* device, const Case& item)
     check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heaps)), "heap");
     auto cpu = heaps->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = srgb && item.view == DXGI_FORMAT_R8G8B8A8_UNORM ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : item.view;
+    srv.Format = srgb && item.view == DXGI_FORMAT_R8G8B8A8_UNORM ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                 : unorm16 && item.view == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_FORMAT_R16G16B16A16_UNORM
+                                                                          : item.view;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -240,8 +276,9 @@ bool readback(ID3D12Device* device, const Case& item)
     int bad = 0;
     for (int i = 0; i < 16 && bad < 3; ++i)
         for (int c = 0; c < 4; ++c) {
-            const float expected = item.decode(item.texel[i], c);
-            if (!(std::fabs(words[i * 4 + c] - expected) <= 1e-4f)) {
+            const float expected = item.decode(&item.texel[i * item.words], c);
+            // Absolute for values up to 1, relative above it (the half-float case reaches 65504).
+            if (!(std::fabs(words[i * 4 + c] - expected) <= 1e-4f * std::fmax(1.0f, std::fabs(expected)))) {
                 std::printf("FAIL %s texel %d channel %d: read %f, expected %f\n", item.name, i, c, words[i * 4 + c], expected);
                 ++bad;
                 break;
@@ -324,6 +361,7 @@ int main(int argc, char** argv)
             ++i;
             identity = !std::strcmp(argv[i], "identity");
             srgb = !std::strcmp(argv[i], "srgb");
+            unorm16 = !std::strcmp(argv[i], "unorm16");
         } else {
             adapter = argv[i];
         }
@@ -335,23 +373,33 @@ int main(int argc, char** argv)
             std::printf("startup_present_view: %d FAILED\n", failures);
             return 1;
         }
-        std::printf("startup_present_view: PASS (4 mapped, 6 typed, 18 refused, 2 invalid, 13 surface checks)\n");
+        std::printf("startup_present_view: PASS (%d format checks, %d surface checks)\n", format_checks, surface_checks);
         return 0;
     }
     try {
         auto device = create_device(!std::strcmp(adapter, "warp"));
         if (!device) return std::strcmp(adapter, "warp") ? 77 : 1;
-        std::vector<unsigned> rgba(16), rgb10(16);
+        std::vector<unsigned> rgba(16), rgb10(16), rgba16f(32);
         for (unsigned i = 0; i < 16; ++i) {
             // Byte 0..3 are r, g, b, a for the RGBA family; a 128 value sits in each of the first channels.
             rgba[i] = ((i * 16 + 3) | (255 - i * 16) << 8 | ((i * 37) & 255) << 16 | ((i * 53 + 7) & 255) << 24) & 0xffffffffu;
             rgb10[i] = ((i * 61 + 5) & 1023) | ((i * 97 + 11) & 1023) << 10 | ((i * 131 + 17) & 1023) << 20 | (i & 3) << 30;
         }
         rgba[5] = 0x80808080u;
+        // Half-float texels: HDR values above 1, negatives, the largest finite value, the smallest normal, a subnormal and
+        // both zeros, rotated by texel so every channel position meets every value.
+        static const unsigned half_values[16] = {0x3c00, 0x3800, 0x4100, 0xb400, 0x7bff, 0x0400, 0x0001, 0x0000,
+                                                 0x8000, 0x4248, 0xc500, 0x3555, 0x5640, 0xbc00, 0x2e66, 0x6400};
+        for (unsigned i = 0; i < 16; ++i) {
+            const auto h = [&](unsigned c) { return half_values[(i * 5 + c * 3 + (i >> 2)) & 15]; };
+            rgba16f[2 * i] = h(0) | h(1) << 16;
+            rgba16f[2 * i + 1] = h(2) | h(3) << 16;
+        }
         const Case cases[] = {
-            {"rgba8", DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, rgba, decode_rgba8},
-            {"bgra8", DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM, rgba, decode_bgra8},
-            {"rgb10a2", DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, rgb10, decode_rgb10a2},
+            {"rgba8", DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, rgba, 1, decode_rgba8},
+            {"bgra8", DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM, rgba, 1, decode_bgra8},
+            {"rgb10a2", DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, rgb10, 1, decode_rgb10a2},
+            {"rgba16f", DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT, rgba16f, 2, decode_rgba16f},
         };
         for (const Case& item : cases) {
             Case run = item;
@@ -364,6 +412,6 @@ int main(int argc, char** argv)
         return 1;
     }
     if (failures) return 1;
-    std::printf("startup_present_view_%s: PASS (3 families read back)\n", adapter);
+    std::printf("startup_present_view_%s: PASS (4 families read back)\n", adapter);
     return 0;
 }
