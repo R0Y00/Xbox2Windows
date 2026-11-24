@@ -15200,6 +15200,12 @@ def check_controls(directory):
     # A partial UNUSED_PRESERVE result needs a tracked numeric destination, as for SDWA moves.
     for register in ("v0", "v8", "v20"):
         must_reject(translate, with_constants([sdwa_arith("floor", register, ["s44"], "BYTE_2", "UNUSED_PRESERVE")]))
+    translate(uncompressed_export(SDWA_INT_TO_FLOAT))
+    for old, new in (("dst_sel:DWORD", "dst_sel:WORD_0"), ("sext(v18)", "sext(v18"),
+                     ("sext(v18)", "1"), ("v12,", "v256,")):
+        invalid = SDWA_INT_TO_FLOAT.copy()
+        invalid[1] = invalid[1].replace(old, new)
+        must_reject(translate, uncompressed_export(invalid))
     check_sdwa_unary_lowering()
 
     program = assembly(False)
@@ -18407,12 +18413,36 @@ def check_cvt_int_f32_draw(directory, compiler, renderer, backend):
         raise AssertionError("Swapping the unsigned and signed conversions escaped detection")
 
 
+SDWA_INT_TO_FLOAT = [
+    "v_mov_b32_e32 v18, s44",
+    "v_cvt_f32_i32_sdwa v12, sext(v18) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+    "v_cvt_f32_u32_sdwa v13, sext(v18) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+    "v_cvt_f32_i32_sdwa v14, s45 clamp dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+    "v_cvt_f32_u32_sdwa v15, s46 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+]
+
+
 def check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend):
     source = directory / "cvt_int_f32_e64.hlsl"
     shader = directory / "cvt_int_f32_e64.cso"
     case = directory / "cvt_int_f32_e64.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     constants = bytes(256)
+    source.write_text(translate(uncompressed_export(SDWA_INT_TO_FLOAT)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    # The first byte sign-extends to -128. Its unsigned word rounds to 2**32.
+    # The last channel rounds the two adjacent binary32 midpoints in opposite directions.
+    for a, b, c, expected in (
+        (0x41008000, 0x40000000, 0x01000001, (-128.0, 4294967296.0, 1.0, 16777216.0)),
+        (0x41007f00, 0, 0x01000003, (127.0, 127.0, 0.0, 16777220.0)),
+    ):
+        data = bytearray(256)
+        struct.pack_into("<3I", data, 12, a, b, c)
+        write_case(case, bytes(data), expected)
+        subprocess.run(draw, check=True)
+    wrong_case = directory / "sdwa_int_to_float_wrong.case"
+    write_case(wrong_case, bytes(data), (*expected[:3], 16777218.0))
+    run_pixel_batch(renderer, backend, shader, [(wrong_case, "mismatch")])
     # The plain e64 encoding performs the same conversion as e32, so the same word pairs and
     # nearest-even references prove the two encodings agree, ties included.
     for w0, w1 in CVT_INT_WORDS:

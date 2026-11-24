@@ -4434,6 +4434,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel, unused, old_value)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
+        elif m := match(r"v_cvt_f32_([iu])32_sdwa (v\d+), (sext\([vs]\d+\)|[vs]\d+)( clamp)? dst_sel:DWORD dst_unused:UNUSED_(?:PAD|PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            kind, dst, token, clamp, field = m.groups()
+            if mask != "entry" or int(dst[1:]) > 255:
+                raise ValueError("Invalid SDWA integer conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            sext = token.startswith("sext(")
+            src = token[5:-1] if sext else token
+            word = int_operand(src, scalar, vector, pending, sample_dest, signed=False)
+            selected = sdwa_source(word, field, sext)
+            value = f"asint({selected})" if kind == "i" else selected
+            expression = f"float({value})"
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_cvt_f32_f16_sdwa (v\d+), (-?)(?:\|([vs]\d+)\||([vs]\d+))( clamp)? dst_sel:DWORD dst_unused:UNUSED_(?:PAD|PRESERVE) src0_sel:(WORD_[01])"):
             # The SDWA form widens the selected half; modifiers apply after widening, as in the e64 form.
             dst, negate, bars, plain, clamp, src_sel = m.groups()

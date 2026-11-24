@@ -397,6 +397,7 @@ def check_shader_records():
         # SDWA forms of the unary binary32 operations, whole-dword sources only.
         sdwa_unary_forms = {("SDWA", f"v_{op}_f32_sdwa") for op in (
             "exp", "log", "rcp", "rcp_iflag", "rsq", "sqrt", "sin", "cos", "rndne", "frexp_mant")}
+        assert {("SDWA", "v_cvt_f32_i32_sdwa"), ("SDWA", "v_cvt_f32_u32_sdwa")} <= covered
         assert sdwa_unary_forms <= covered, (name, sdwa_unary_forms - covered)
     # Integer, binary16, binary32 and binary64 comparisons: e32 counts as VOPC and e64 as VOP3, for every predicate
     # the translator lowers; the rejected exec-writing neighbours stay out.
