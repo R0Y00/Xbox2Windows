@@ -200,6 +200,22 @@ def controls():
     # attr0.z: change channel bits 7:6 of the p1ll and p2 from x (0) to z (2)
     z = patch(patch(PS_WORDS, 0, w1=2 << 6), 1, w1=2 << 6)
     refused('attribute channel z', z, 'channel z')
+    # An attribute spelled without a channel is refused, not an AttributeError (decode always prints a channel,
+    # so the instruction goes straight to a Stage probe).
+    for op, operands in (('v_interp_p1ll_f16', 'v5, v6, attr0'), ('v_interp_p2_f16', 'v5, v6, attr0, v4')):
+        try:
+            G.Stage.__new__(G.Stage).one(op, '%s %s' % (op, operands))
+        except G.Unsupported as error:
+            assert 'expected attrN.x/.y/.z/.w' in str(error), (op, str(error))
+            print('refused: %s without a channel (%s)' % (op, error))
+        else:
+            raise AssertionError('%s without a channel was lowered' % op)
+    # An attribute the vertex stage does not export (attr5; the vertex stage exports only param0): the whole pair
+    # moves to attr5 (w1 bits 5:0), and the pipeline refuses it later, so interp_f16 needs no bound of its own.
+    out_of_range = PS_WORDS
+    for index in range(8):
+        out_of_range = patch(out_of_range, index, w1=5)
+    refused('attribute not exported by the vertex stage', out_of_range, 'attribute 5')
     # p2 whose src2 is not the p1ll result: v4 -> v8 in the third source
     other = patch(PS_WORDS, 1, w1=(0x104 ^ 0x108) << 18)
     refused('p2 source is not the p1ll result', other, 'is not the v_interp_p1ll_f16 result')

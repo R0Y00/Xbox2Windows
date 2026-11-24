@@ -1703,6 +1703,8 @@ class Stage:
             if not re.fullmatch(r'v\d+', tok):
                 raise Unsupported('%s operand %s: only plain VGPRs are lowered' % (op, tok))
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', ops[2])
+        if not m:
+            raise Unsupported('%s interpolant %s: expected attrN.x/.y/.z/.w' % (op, ops[2]))
         chan = 'xyzw'.index(m.group(2))
         if chan > 1:
             raise Unsupported('%s on channel %s: a compr export fills only the x and y channels' % (op, m.group(2)))
