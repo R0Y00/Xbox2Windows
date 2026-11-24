@@ -1073,6 +1073,8 @@ class Stage:
             return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
+        if base in VEC_H:
+            return self.half_unary(base, ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             # A missing source used to raise IndexError and an extra one was dropped without a word.
@@ -2602,6 +2604,35 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, True)
 
+    def half_src(self, tok):
+        """float expression for the binary16 value in the low half of a 32-bit operand."""
+        neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+        if neg:
+            tok = tok[1:]
+        absolute = tok.startswith('|') and tok.endswith('|')
+        if absolute:
+            tok = tok[1:-1]
+        if tok in FLOATS:
+            text = repr(float(struct.unpack('<e', struct.pack('<e', FLOATS[tok]))[0]))
+        elif tok == '-0':
+            text = '0.0'
+        else:
+            text = 'f16tof32(%s & 0xffffu)' % self.u(tok)
+        if absolute:
+            text = 'abs(%s)' % text
+        return '(-%s)' % text if neg else text
+
+    def half_unary(self, base, ops, mods):
+        """VEC_H: binary16 one-source operation, computed in binary32 and rounded into the low half."""
+        if mods:
+            raise Unsupported('%s with %s' % (base, mods))
+        if len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
+        d = reg_range(ops[0])
+        if not d or d[0] != 'v':
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        self.set_v(d[1], 'f32tof16(%s)' % VEC_H[base].format(self.half_src(ops[1])))
+
     def i64_words(self, tok):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
         pair = reg_range(tok)
@@ -3028,6 +3059,15 @@ VEC_F = {
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
     'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
+}
+# binary16 one-source operations (VOP1, or VOP3 without modifiers): the source is the low half of the operand,
+# the result is rounded to binary16 and written to the low half with the high half cleared, as v_cvt_f16_f32 does.
+# v_fract_f16 stops at the largest binary16 below one; v_sin/cos take revolutions, as the binary32 forms do.
+VEC_H = {
+    'v_ceil_f16': 'ceil({0})', 'v_floor_f16': 'floor({0})', 'v_trunc_f16': 'trunc({0})', 'v_rndne_f16': 'round({0})',
+    'v_fract_f16': 'min(frac({0}), 0.99951171875)', 'v_rcp_f16': '1.0 / {0}', 'v_rsq_f16': 'rsqrt({0})',
+    'v_sqrt_f16': 'sqrt({0})', 'v_sin_f16': 'sin({0} * 6.283185307)', 'v_cos_f16': 'cos({0} * 6.283185307)',
+    'v_exp_f16': 'exp2({0})', 'v_log_f16': 'log2({0})',
 }
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
