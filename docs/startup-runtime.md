@@ -267,6 +267,33 @@ by reading a render log. The device prints the counts by cause value, so
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
+### Refused slot 70 calls and token nulls in the five-second report
+
+Two census lines follow the five-second report whenever their counts changed
+(`src/startup_stubs/memory_srv_census.h`):
+
+- `x2w-d3d12 memory SRV refusals (slot 70): total N; <reason> n, ...; distinct shapes K` counts every
+  refused slot 70 call by reason. It then prints one `x2w-d3d12 memory SRV refused shape i:` line per
+  distinct `reason`, dimension, format, size, mips, layout and flags, for the reasons a different
+  description could avoid (`unsupported_description`, `buffer_unavailable`, `texture_unavailable`).
+  Up to 32 shapes are kept; later shapes are only counted.
+- `x2w-draw token texture nulls: total N in P pipelines; <pipeline key>=n ...` counts the texture SRVs
+  bound null with cause token, per translated pipeline (up to 16, then `other`).
+
+The first refusal of each of the first four distinct shapes logs its `Device::slot70` line even after
+the first eight refusal lines are spent. The first token null of each of the first two pipelines logs
+`x2w-draw token texture null: pipeline <key> srv <i> entry <address> words <w0> ... <w7>`. All-zero
+words mean nothing wrote the entry, for example a refused slot 70 call. Other words may be a
+descriptor the title wrote itself. These lines only count and print; a refusal still leaves the
+destination descriptor as it was.
+
+`ctest --preset dev --no-tests=error -R '^startup_memory_srv_(census|diag_warp|diag_supported_control_warp)$' -V`
+checks this. `startup_memory_srv_census` covers the limits without a device. `startup_memory_srv_diag_warp`
+spends the line limit with eight zero-address refusals, has a 2048x2048 BC1 10-mip texture refused, and
+draws from the untouched entry. It then publishes a supported 1-mip R8 texture and draws from it. It
+expects one counted and named BC1 shape, its line past the limit, one token null with zero words, and
+the R8 texels. The control publishes the supported R8 texture in place of the BC1 one and must fail.
+
 ## Root constant buffer views
 
 Command-list slot 42 (desktop `SetGraphicsRootConstantBufferView` plus four) records the title address for a root

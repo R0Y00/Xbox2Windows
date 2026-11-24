@@ -1024,7 +1024,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             facts.token_known = known;
             facts.resource_wrapper = had_texture;
             facts.dimension_matches = !mismatched;
-            count_null_binding(x2w_local::classify_null_binding(facts));
+            const auto cause = x2w_local::classify_null_binding(facts);
+            count_null_binding(cause);
+            if (cause == x2w_local::NullCause::unknown_token && token_null_census.note(tr->key)) {
+                char line[256];
+                x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
+                log("%s", line);
+            }
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }
