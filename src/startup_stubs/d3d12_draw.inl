@@ -458,27 +458,31 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
-x2w_startup::GraphicsPipelineCache* pipeline_cache_for(ID3D12Device* device, bool create = true)
+std::shared_ptr<x2w_startup::GraphicsPipelineCache> pipeline_cache_for(ID3D12Device* device, bool create = true)
 {
-    static std::unique_ptr<x2w_startup::GraphicsPipelineCache> cache;
+    // The present thread flushes outside draw_lock while the draw thread may replace the cache on a
+    // device change. A shared_ptr keeps the old cache alive until a concurrent Flush returns.
+    static std::mutex lock;
+    static std::shared_ptr<x2w_startup::GraphicsPipelineCache> cache;
     static ID3D12Device* owner;
+    std::lock_guard<std::mutex> guard(lock);
     if (!cache || owner != device) {
         if (!create) return nullptr;
-        cache.reset(new x2w_startup::GraphicsPipelineCache(device));
+        cache = std::make_shared<x2w_startup::GraphicsPipelineCache>(device);
         owner = device;
         const auto stats = cache->stats();
         log("x2w-draw PSO cache %s (file %s, hits %ld, misses %ld, stores %ld, duplicates %ld, failures %ld)",
             cache->enabled() ? "enabled" : "disabled", cache->configured() ? "present" : "unset",
             stats.hits, stats.misses, stats.stores, stats.duplicates, stats.failures);
     }
-    return cache.get();
+    return cache;
 }
 
 // Called outside draw_lock after a presented frame: a batch of new PSOs writes the library once,
 // while a frame without new stores does not touch the file.
 void flush_pipeline_cache()
 {
-    if (auto* cache = pipeline_cache_for(device_of(the_device), false)) cache->Flush();
+    if (auto cache = pipeline_cache_for(device_of(the_device), false)) cache->Flush();
 }
 
 using x2w_startup::graphics_pipeline_cache_detail::hash_blend_key;
@@ -525,7 +529,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
     bool cache_hit = false;
-    x2w_startup::GraphicsPipelineCache* cache = pipeline_cache_for(device_of(the_device));
+    const auto cache = pipeline_cache_for(device_of(the_device));
     const HRESULT hr = cache
         ? cache->GetOrCreateGraphicsPipeline(desc, key, IID_PPV_ARGS(&pipeline), &cache_hit)
         : device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
