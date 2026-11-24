@@ -81,6 +81,7 @@ PIXEL_VOP2_F16_FUSED_SCALE = tuple(pixel_aot.VOP2_F16_FUSED_SCALE) if pixel_aot 
 PIXEL_INLINE_F16 = tuple(pixel_aot.INLINE_F16) if pixel_aot is not None else ()
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_VOP3_INT16_TERNARY = pixel_aot.VOP3_INT16_TERNARY if pixel_aot is not None else {}
+PIXEL_VOP3_F16_TERNARY = pixel_aot.VOP3_F16_TERNARY if pixel_aot is not None else {}
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 # Explicit _e32 VOPC writes VCC only; suffix-less and _e64 may name an SGPR destination.
 PIXEL_VOPC_DST = rf"(?:_e32\s+{PIXEL_VCC}|(?:_e64)?\s+{PIXEL_LANE_MASK})"
@@ -270,6 +271,11 @@ if PIXEL_VOP3_INT16_TERNARY:
         rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_INT16_TERNARY))})(?:_e64)?\s+{INT16_VGPR},"
         rf"\s+{INT16_SOURCE},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
     )
+if PIXEL_VOP3_F16_TERNARY:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP3_F16_TERNARY))})(?:_e64)?\s+{INT16_VGPR},"
+        rf"\s+{F16_ARITH_SOURCE},\s+{F16_ARITH_SOURCE},\s+{F16_ARITH_SOURCE}"
+    )
 # 64-bit VOP3 shifts (issue #928): a VGPR-pair destination, a 32-bit amount (VGPR, SGPR, inline integer or
 # literal) and a 64-bit value (VGPR pair, SGPR pair or inline integer), with at most one SGPR or literal source.
 # This matches syntax only; pixel_aot also checks the pair ranges and that the sources are tracked.
@@ -398,6 +404,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
+    | {f"v_{name}" for name in PIXEL_VOP3_F16_TERNARY}
     | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP2_F16_FUSED_SCALE + PIXEL_VOP1_F16_ROUND}
     | {"v_cvt_f16_i16", "v_cvt_f16_u16"}
     | {

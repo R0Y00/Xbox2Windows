@@ -85,6 +85,11 @@ def check_scanner_tracks_pixel_aot():
         opcode = f"v_{name}"
         assert is_opcode_recognized(opcode), opcode
         assert is_instruction_supported(f"{opcode} v1, v2, v3, v4"), opcode
+    assert len(pixel_aot.VOP3_F16_TERNARY) == 3
+    for name in pixel_aot.VOP3_F16_TERNARY:
+        opcode = f"v_{name}"
+        assert is_opcode_recognized(opcode), opcode
+        assert is_instruction_supported(f"{opcode} v1, v2, v3, v4"), opcode
     for op in ("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16"):
         assert is_opcode_recognized(op), op
         assert is_instruction_supported(f"{op} v1, v2, v3, v4"), op

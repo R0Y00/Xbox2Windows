@@ -1073,12 +1073,18 @@ uint class64(uint lo, uint hi) {
     ),
     "min16_num": (
         "float min16_num(float a, float b) {\n"
-        "    return isnan(a) ? b : (isnan(b) ? a : min(a, b));\n"
+        "    if (isnan(a)) return b;\n"
+        "    if (isnan(b)) return a;\n"
+        "    if (a == 0.0f && b == 0.0f) return asfloat(asuint(a) | asuint(b));\n"
+        "    return min(a, b);\n"
         "}"
     ),
     "max16_num": (
         "float max16_num(float a, float b) {\n"
-        "    return isnan(a) ? b : (isnan(b) ? a : max(a, b));\n"
+        "    if (isnan(a)) return b;\n"
+        "    if (isnan(b)) return a;\n"
+        "    if (a == 0.0f && b == 0.0f) return asfloat(asuint(a) & asuint(b));\n"
+        "    return max(a, b);\n"
         "}"
     ),
     "dot_u64_add": (
@@ -1310,6 +1316,13 @@ VOP3_INT16_TERNARY = {
     "mad_u16": "mad_u16", "mad_i16": "mad_i16",
     "min3_i16": "min3_i16", "min3_u16": "min3_u16", "max3_i16": "max3_i16", "max3_u16": "max3_u16",
     "med3_i16": "med3_i16", "med3_u16": "med3_u16",
+}
+# Three-operand binary16 forms: min3, max3 and med3 (LLVM 15 VOP3Instructions.td: V_{MIN3,MAX3,MED3}_F16 map
+# to AMDGPUfmin3, AMDGPUfmax3 and AMDGPUfmed3). clamp and modifiers are not modelled and are refused.
+VOP3_F16_TERNARY = {
+    "min3_f16": "min3_f16",
+    "max3_f16": "max3_f16",
+    "med3_f16": "med3_f16",
 }
 
 # Quad-local DPP16/DPP8 extra f32, carry-in/carry-out, and dot-accumulate ops.
@@ -1582,6 +1595,26 @@ def f16_vop2_result(name, a, b):
     if count < 0x400:  # subnormal (exponent is -14 here), or a rounded-to-zero result keeping the exact sign
         return sign | count
     return sign | ((exponent + 15) << 10) | (count - 0x400)
+
+
+def f16_min3_max3_med3_result(op, a, b, c):
+    """Exact binary16 result bits of v_{min3,max3,med3}_f16 on three finite operands.
+
+    Exact rational evaluation on finite values. Because the result is always one of the three input
+    operands, it cannot overflow, underflow, or introduce rounding error. Used at translation time so
+    that a chained result stays a proven value.
+    """
+    def value(bits):
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0:
+            return sign * Fraction(mantissa, 1 << 24)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+
+    triplet = [(value(bits), bool(bits & 0x8000), bits) for bits in (a, b, c)]
+    ordered = sorted(triplet, key=lambda item: (item[0], -1 if item[1] else 1))
+    pick = {"min3": 0, "max3": 2, "med3": 1}[op[:4]]
+    return ordered[pick][2]
 
 
 def f16_pk_fmac_lane_result(a, b, c):
@@ -5543,6 +5576,42 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expr = pk_int16_lane_expr({**VOP3_INT16, **VOP3_INT16_TERNARY}[name], word_vars, [0] * len(word_vars), False)
             vector[dst] = ("low16", f"alu{i}")
             lines.append(f"    precise float alu{i} = asfloat({expr});")
+        elif m := match(rf"v_({'|'.join(VOP3_F16_TERNARY)})(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+), ([^,\s]+)"):
+            # Three-operand binary16 VOP3 operations: min3_f16, max3_f16, med3_f16. All three sources must have a
+            # statically known finite low half. Because the result is always one of the three inputs, the result
+            # is finite, requires no rounding error, and cannot overflow. Each source is widened exactly via
+            # widen16, and the ternary expression is evaluated in binary32 and narrowed back to binary16 by narrow16.
+            # The result is ("half16", alu): only bits 15:0 are defined. Modifiers, op_sel, clamp, DPP and SDWA
+            # are refused.
+            name, dst, s0, s1, s2 = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 arithmetic operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            words, proven = zip(*(half16_arith_source(tok, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+                                  for tok in (s0, s1, s2)))
+            result = f16_min3_max3_med3_result(name, *proven)
+            for k, word in enumerate(words):
+                lines.append(f"    uint hf{i}_{k} = ({word}) & 0xffffu;")
+            w0, w1, w2 = f"widen16(hf{i}_0)", f"widen16(hf{i}_1)", f"widen16(hf{i}_2)"
+            if name.startswith("min3"):
+                helpers.add("min16_num")
+                expr = f"min16_num(min16_num({w0}, {w1}), {w2})"
+            elif name.startswith("max3"):
+                helpers.add("max16_num")
+                expr = f"max16_num(max16_num({w0}, {w1}), {w2})"
+            else:
+                helpers.add("min16_num")
+                helpers.add("max16_num")
+                expr = f"max16_num(min16_num({w0}, {w1}), min16_num(max16_num({w0}, {w1}), {w2}))"
+            lines.append(f"    precise float hs{i} = {expr};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
         elif m := match(rf"v_({'|'.join(VOP2_F16)})_f16(_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
             # Plain non-fused binary16 VOP2 arithmetic. Both sources must have a statically known finite low half
             # and the result must not overflow, so the lowering needs no NaN, infinity or overflow rule. Each half

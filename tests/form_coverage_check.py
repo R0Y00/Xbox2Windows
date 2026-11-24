@@ -760,6 +760,36 @@ def check_int16_ternary_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_f16_ternary_forms():
+    """The 3 three-operand 16-bit float VOP3 forms count as covered once the translator accepts their fixtures; the
+    unlowered nearby forms (v_fma_f16, v_div_fixup_f16) stay uncovered."""
+    import pixel_aot
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for group in range(3):
+            pixel.translate_f16(pixel.f16_ternary_ops(group))
+        forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_F16_TERNARY}
+        assert len(forms) == 3
+        neighbours = {("VOP3", "v_fma_f16"), ("VOP3", "v_div_fixup_f16")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # With only the unrelated two-operand fixtures accepted the ternary forms are not covered.
+        pixel.ACCEPTED.clear()
+        pixel.translate_int(pixel.int16_vop3_ops(0))
+        reference = fc.load_reference("gfx1013.tsv")
+        assert not forms & fc.gfx_forms(pixel.ACCEPTED, reference)
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 def check_sopk_wait_forms():
     """The SOPK wait forms count once a program using them lowers; a refused SGPR operand records nothing."""
     import pixel_aot_check as pixel
@@ -1295,6 +1325,7 @@ if __name__ == "__main__":
     check_pack_b32_forms()
     check_int16_vop3_forms()
     check_int16_ternary_forms()
+    check_f16_ternary_forms()
     check_f16_arith_forms()
     check_f16_round_forms()
     check_f16_fmac_ldexp_forms()

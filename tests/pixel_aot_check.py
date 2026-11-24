@@ -6488,7 +6488,7 @@ def check_int16_ternary_controls():
     # The two-operand forms keep their operand count; the neighbours that stay unsupported are still refused.
     refuse("v_add_nc_u16 v24, v18, v19, v20", "Wrong 16-bit integer operand count for v_add_nc_u16")
     for line in ("v_mad_u32_u16 v24, v18, v19, v20", "v_mad_i32_i16 v24, v18, v19, v20",
-                 "v_sad_u16 v24, v18, v19, v20", "v_med3_f16 v24, v18, v19, v20", "v_mad_f16 v24, v18, v19, v20"):
+                 "v_sad_u16 v24, v18, v19, v20", "v_min3_f64 v24, v18, v19, v20", "v_mad_f16 v24, v18, v19, v20"):
         refuse(line, "Unsupported instruction")
     sample = next(i for i, line in enumerate(with_constants([])) if line.startswith("image_sample"))
     overlap = with_constants([])
@@ -6524,6 +6524,423 @@ def check_int16_ternary_controls():
         expect_value_error(translate_int, uncompressed_export(
             [*prefix, producer, "v_mov_b32_sdwa v25, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1"]),
             "Reads the undefined high half of a 16-bit result")
+
+
+F16_TERNARY_WORDS = (
+    # Permutations of (0.5, 1.0, 2.0) -> (0x3800, 0x3c00, 0x4000)
+    (0x12343800, 0x56783c00, 0x9abc4000, 0xdef04400),
+    (0x23453800, 0x67894000, 0xabcd3c00, 0xef014400),
+    (0x34563c00, 0x789a3800, 0xbcde4000, 0xf0124400),
+    (0x45674000, 0x89ab3800, 0xcdef3c00, 0x01234400),
+    (0x56783c00, 0x9abc4000, 0xdef03800, 0x12344400),
+    (0x67894000, 0xabcd3c00, 0xef013800, 0x23454400),
+    # Negative values: -2.0, -1.0, -0.5 -> (0xc000, 0xbc00, 0xb800)
+    (0x789ac000, 0xbcdebc00, 0xf012b800, 0x34564400),
+    # Mixed values: -1.0, 0.5, 2.0 -> (0xbc00, 0x3800, 0x4000)
+    (0x89abbc00, 0xcdef3800, 0x01234000, 0x45674400),
+    # Subnormals: 0x0001, 0x0010, 0x0100, 0x0400
+    (0x9abc0001, 0xdef00010, 0x12340100, 0x56780400),
+    # Ties: a == b, b == c, a == c, a == b == c
+    (0xabcd3c00, 0xef013c00, 0x23454000, 0x67894400),
+    (0xbcde3800, 0xf0123c00, 0x34563c00, 0x789a4400),
+    (0xcdef3c00, 0x01233800, 0x45673c00, 0x89ab4400),
+    (0xdef03c00, 0x12343c00, 0x56783c00, 0x9abc4400),
+    # Zero and extremes: -0.0 (0x8000), +0.0 (0x0000), 65504 (0x7bff)
+    (0xef018000, 0x23450000, 0x67897bff, 0xabcdfbff),
+)
+
+F16_TERNARY_GROUPS = (
+    (("min3_f16", "v18", "v19", "v20"), ("max3_f16", "v18", "v19", "v20"),
+     ("med3_f16", "v18", "v19", "v20"), ("med3_f16", "s44", "v19", "v21")),
+    (("min3_f16", "v18", "v19", "1.0"), ("max3_f16", "v18", "0.5", "v20"),
+     ("med3_f16", "0", "v19", "v20"), ("med3_f16", "v18", "0x3c00", "s46")),
+    (("min3_f16", "s44", "s45", "v20"), ("max3_f16", "v18", "s45", "s46"),
+     ("med3_f16", "s44", "v19", "s46"), ("max3_f16", "v18", "v19", "v21")),
+)
+
+F16_TERNARY_CHAIN = (
+    "v_add_f16 v24, v18, v19",
+    "v_min3_f16 v25, v24, v20, v21",
+    "v_med3_f16 v26, v24, v25, s46",
+    "v_max3_f16 v27, v25, v26, v24",
+)
+
+F16_TERNARY_MED_CHAIN = (
+    "v_subrev_f16 v24, v18, v19",
+    "v_med3_f16 v25, v24, v20, v21",
+    "v_med3_f16 v26, v24, v25, v20",
+    "v_min3_f16 v27, v25, v26, v24",
+)
+
+
+def f16_ternary_ops(group):
+    """The group's ops on constant binary16 words, widened with SDWA WORD_0 into v12..v15 and exported."""
+    words = F16_TERNARY_WORDS[0]
+    body = [f"v_mov_b32_e32 v{18 + k}, {words[k]:#x}" for k in range(4)]
+    body += [f"s_mov_b32 s{44 + k}, {words[k]:#x}" for k in range(4)]
+    body += [f"v_mov_b32_e32 v{24 + k}, {word:#x}" for k, word in enumerate(INT16_VOP3_SENTINELS)]
+    if group < 3:
+        body += [f"v_{op} v{24 + k}, {a}, {b}, {c}" for k, (op, a, b, c) in enumerate(F16_TERNARY_GROUPS[group])]
+    elif group == 3:
+        body += list(F16_TERNARY_CHAIN)
+    else:
+        body += list(F16_TERNARY_MED_CHAIN)
+    body += [INT16_VOP3_WIDEN.format(dst=12 + k, src=24 + k) for k in range(4)]
+    return uncompressed_export(body)
+
+
+F16_TERNARY_CHAINS = (
+    (0x3800, 0x3800, 0x3c00, 0x4000),
+    (0xbc00, 0x3c00, 0x3800, 0x4000),
+    (0x4000, 0x3c00, 0x3800, 0x4200),
+    (0x0001, 0x0002, 0x0010, 0x0020),
+)
+
+F16_TERNARY_PROGRAMS = (
+    *(("main", i) for i in range(len(F16_TERNARY_WORDS))),
+    *(("chain", i) for i in range(len(F16_TERNARY_CHAINS))),
+)
+
+F16_TERNARY_OP_MUTATIONS = {
+    "med3_as_min3": ("v_med3_f16", "v_min3_f16"),
+    "med3_as_max3": ("v_med3_f16", "v_max3_f16"),
+    "max3_as_min3": ("v_max3_f16", "v_min3_f16"),
+    "min3_as_max3": ("v_min3_f16", "v_max3_f16"),
+}
+
+F16_TERNARY_MUTATIONS = (
+    "med3_as_min3",
+    "med3_as_max3",
+    "max3_as_min3",
+    "min3_as_max3",
+    "source_high",
+)
+
+
+def f16_ternary_program(kind, index):
+    """One draw program: main runs all 4 ternary ops on constant words; chain runs arithmetic chains."""
+    body = []
+    if kind == "main":
+        words = F16_TERNARY_WORDS[index]
+        body += [f"v_mov_b32_e32 v{18 + k}, {words[k]:#x}" for k in range(4)]
+        body += [f"s_mov_b32 s{44 + k}, {words[k]:#x}" for k in range(4)]
+        body += [f"v_mov_b32_e32 v{24 + k}, {word:#x}" for k, word in enumerate(INT16_VOP3_SENTINELS)]
+        body += [
+            "v_min3_f16 v24, v18, v19, v20",
+            "v_max3_f16 v25, v18, v19, v20",
+            "v_med3_f16 v26, v18, v19, v20",
+            "v_med3_f16 v27, s44, v19, v21",
+        ]
+        body += [INT16_VOP3_WIDEN.format(dst=12 + k, src=24 + k) for k in range(4)]
+    else:
+        w0, w1, w2, w3 = F16_TERNARY_CHAINS[index]
+        body += [
+            f"v_mov_b32_e32 v18, {w0:#x}",
+            f"v_mov_b32_e32 v19, {w1:#x}",
+            f"v_mov_b32_e32 v20, {w2:#x}",
+            f"v_mov_b32_e32 v21, {w3:#x}",
+            f"s_mov_b32 s46, {w2:#x}",
+        ]
+        body += [f"v_mov_b32_e32 v{24 + k}, {word:#x}" for k, word in enumerate(INT16_VOP3_SENTINELS)]
+        if index % 2 == 0:
+            body += [
+                "v_add_f16 v24, v18, v19",
+                "v_min3_f16 v25, v24, v20, v21",
+                "v_med3_f16 v26, v24, v25, s46",
+                "v_max3_f16 v27, v25, v26, v24",
+            ]
+        else:
+            body += [
+                "v_subrev_f16 v24, v18, v19",
+                "v_med3_f16 v25, v24, v20, v21",
+                "v_med3_f16 v26, v24, v25, v20",
+                "v_min3_f16 v27, v25, v26, v24",
+            ]
+        body += [INT16_VOP3_WIDEN.format(dst=12 + k, src=24 + k) for k in range(4)]
+    return uncompressed_export(body)
+
+
+def f16_ternary_expected(kind, index, mutation=None):
+    """The four exported words of f16_ternary_program(kind, index)."""
+    def fval(bits):
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0:
+            return sign * Fraction(mantissa, 1 << 24)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+
+    def compute(op, a, b, c):
+        if mutation == "med3_as_min3" and "med3" in op:
+            op = "min3_f16"
+        elif mutation == "med3_as_max3" and "med3" in op:
+            op = "max3_f16"
+        elif mutation == "max3_as_min3" and "max3" in op:
+            op = "min3_f16"
+        elif mutation == "min3_as_max3" and "min3" in op:
+            op = "max3_f16"
+
+        triplet = [(fval(bits), bool(bits & 0x8000), bits) for bits in (a, b, c)]
+        ordered = sorted(triplet, key=lambda item: (item[0], -1 if item[1] else 1))
+        pick = {"min3": 0, "max3": 2, "med3": 1}[op[:4]]
+        return ordered[pick][2]
+
+    def add_sub(op, a, b):
+        va, vb = fval(a), fval(b)
+        exact = (va + vb) if op == "add" else (vb - va)
+        sign = 0x8000 if exact < 0 else 0
+        mag = abs(exact)
+        if mag == 0:
+            neg = (bool(a & 0x8000) and bool(b & 0x8000)) if op == "add" else (bool(b & 0x8000) and not bool(a & 0x8000))
+            return 0x8000 if neg else 0
+        exponent = max(mag.numerator.bit_length() - mag.denominator.bit_length(), -14)
+        while mag < Fraction(2) ** exponent and exponent > -14:
+            exponent -= 1
+        while mag >= Fraction(2) ** (exponent + 1):
+            exponent += 1
+        scaled = mag / Fraction(2) ** (exponent - 10)
+        count = scaled.numerator // scaled.denominator
+        rem = scaled - count
+        if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and count & 1):
+            count += 1
+        if count >= 0x800:
+            count, exponent = 0x400, exponent + 1
+        if count < 0x400:
+            return sign | count
+        return sign | ((exponent + 15) << 10) | (count - 0x400)
+
+    if kind == "main":
+        words = F16_TERNARY_WORDS[index]
+        w0, w1, w2, w3 = (w & 0xffff for w in words)
+        a0 = (words[0] >> 16) & 0xffff if mutation == "source_high" else w0
+        r24 = compute("min3_f16", a0, w1, w2)
+        r25 = compute("max3_f16", a0, w1, w2)
+        r26 = compute("med3_f16", a0, w1, w2)
+        r27 = compute("med3_f16", a0, w1, w3)
+        return (r24, r25, r26, r27)
+    else:
+        w0, w1, w2, w3 = F16_TERNARY_CHAINS[index]
+        if index % 2 == 0:
+            r24 = add_sub("add", w0, w1)
+            r25 = compute("min3_f16", r24, w2, w3)
+            r26 = compute("med3_f16", r24, r25, w2)
+            r27 = compute("max3_f16", r25, r26, r24)
+        else:
+            r24 = add_sub("subrev", w0, w1)
+            r25 = compute("med3_f16", r24, w2, w3)
+            r26 = compute("med3_f16", r24, r25, w2)
+            r27 = compute("min3_f16", r25, r26, r24)
+        return (r24, r25, r26, r27)
+
+
+def f16_ternary_mutated(mutation, program):
+    """The lowered source of program (instruction lines) with one deviation applied."""
+    if mutation in F16_TERNARY_OP_MUTATIONS:
+        old, new = F16_TERNARY_OP_MUTATIONS[mutation]
+        lines = [line.replace(old, new) for line in program]
+        assert lines != program, mutation
+        return translate_f16(lines)
+    text = translate_f16(program)
+    if mutation == "source_high":
+        mutated = re.sub(r"uint (hf\d+_0) = \((.+)\) & 0xffffu;", r"uint \1 = ((\2) >> 16u) & 0xffffu;", text)
+        assert mutated != text
+        return mutated
+    raise AssertionError(f"Unknown mutation {mutation}")
+
+
+def f16_ternary_detecting_program(mutation):
+    """The first program whose expected words the modelled mutation changes."""
+    for kind, index in F16_TERNARY_PROGRAMS:
+        if f16_ternary_expected(kind, index, mutation=mutation) != f16_ternary_expected(kind, index):
+            return kind, index
+    raise AssertionError(f"No program separates {mutation}")
+
+
+def check_f16_ternary_mutation_coverage():
+    """Every mutation must change the affected lanes for some word set, so the draw can detect it."""
+    for mutation in F16_TERNARY_MUTATIONS:
+        f16_ternary_detecting_program(mutation)
+    strict_perms = {(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)}
+    observed_perms, tie_shapes = set(), set()
+    def fval(bits):
+        sign = -1 if bits & 0x8000 else 1
+        exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+        if exponent == 0:
+            return sign * Fraction(mantissa, 1 << 24)
+        return sign * Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+    for words in F16_TERNARY_WORDS:
+        a, b, c = (w & 0xffff for w in words[:3])
+        va, vb, vc = (fval(x) for x in (a, b, c))
+        if len({va, vb, vc}) == 3:
+            observed_perms.add(tuple(sorted([va, vb, vc]).index(x) for x in (va, vb, vc)))
+        if len({a, b, c}) < 3:
+            tie_shapes.add((a == b, b == c, a == c))
+    assert observed_perms == strict_perms, observed_perms
+    assert tie_shapes == {(True, False, False), (False, True, False), (False, False, True), (True, True, True)}, tie_shapes
+    assert len(F16_TERNARY_WORDS) >= 12 and all(len(words) == 4 for words in F16_TERNARY_WORDS)
+
+
+def check_f16_ternary_lowering():
+    """Verify CLI mode registration, signed-zero tie ordering and helper lowering for f16 ternary ops."""
+    import inspect
+    import itertools
+
+    # 1. Verify 'draw-f16-ternary' is registered in CLI dispatch guard
+    main_code = inspect.getsource(main)
+    dispatch_section = main_code.split("if mode in (", 1)[1].split("):", 1)[0]
+    assert '"draw-f16-ternary"' in dispatch_section, "draw-f16-ternary missing from CLI mode dispatch guard"
+
+    # 2. Emitted helper lowering in translated shaders
+    prefix = [
+        "v_mov_b32_e32 v18, 0x12343800",
+        "v_mov_b32_e32 v19, 0x56783c00",
+        "v_mov_b32_e32 v20, 0x9abc4000",
+    ]
+    min_shader = translate_f16(uncompressed_export([*prefix, "v_min3_f16 v24, v18, v19, v20"]))
+    max_shader = translate_f16(uncompressed_export([*prefix, "v_max3_f16 v24, v18, v19, v20"]))
+    med_shader = translate_f16(uncompressed_export([*prefix, "v_med3_f16 v24, v18, v19, v20"]))
+    assert "float min16_num(float a, float b)" in min_shader
+    assert "min16_num(min16_num(" in min_shader
+    assert "float max16_num(float a, float b)" in max_shader
+    assert "max16_num(max16_num(" in max_shader
+    assert "float min16_num(float a, float b)" in med_shader
+    assert "float max16_num(float a, float b)" in med_shader
+    assert "max16_num(min16_num(" in med_shader
+
+    # 3. Signed-zero tie permutations (-0.0 < +0.0 in IEEE total ordering)
+    def hlsl_min16(a, b):
+        if math.isnan(a): return b
+        if math.isnan(b): return a
+        if a == 0.0 and b == 0.0:
+            ua = struct.unpack(">I", struct.pack(">f", a))[0]
+            ub = struct.unpack(">I", struct.pack(">f", b))[0]
+            return struct.unpack(">f", struct.pack(">I", ua | ub))[0]
+        return min(a, b)
+
+    def hlsl_max16(a, b):
+        if math.isnan(a): return b
+        if math.isnan(b): return a
+        if a == 0.0 and b == 0.0:
+            ua = struct.unpack(">I", struct.pack(">f", a))[0]
+            ub = struct.unpack(">I", struct.pack(">f", b))[0]
+            return struct.unpack(">f", struct.pack(">I", ua & ub))[0]
+        return max(a, b)
+
+    def to_f16_bits(flt):
+        u32 = struct.unpack(">I", struct.pack(">f", flt))[0]
+        sign = (u32 >> 31) & 1
+        exp = (u32 >> 23) & 0xff
+        mant = u32 & 0x7fffff
+        if exp == 0 and mant == 0:
+            return 0x8000 if sign else 0x0000
+        h_exp = exp - 127 + 15
+        return (sign << 15) | (h_exp << 10) | (mant >> 13)
+
+    def f16_to_f32(bits):
+        sign = -1.0 if (bits & 0x8000) else 1.0
+        exp = (bits >> 10) & 0x1f
+        mant = bits & 0x3ff
+        if exp == 0:
+            val = sign * (mant / (1 << 24))
+            return -0.0 if (val == 0.0 and sign < 0) else val
+        val = sign * ((mant | 0x400) / 1024.0) * (2.0 ** (exp - 15))
+        return -0.0 if (val == 0.0 and sign < 0) else val
+
+    tie_cases = [
+        # (-0.0, -0.0, +0.0) -> min: -0.0, med: -0.0, max: +0.0
+        (0x8000, 0x8000, 0x0000, 0x8000, 0x8000, 0x0000),
+        # (-0.0, +0.0, +0.0) -> min: -0.0, med: +0.0, max: +0.0
+        (0x8000, 0x0000, 0x0000, 0x8000, 0x0000, 0x0000),
+        # (-1.0, -0.0, +0.0) -> min: -1.0, med: -0.0, max: +0.0
+        (0xbc00, 0x8000, 0x0000, 0xbc00, 0x8000, 0x0000),
+        # (-0.0, +0.0, +1.0) -> min: -0.0, med: +0.0, max: +1.0
+        (0x8000, 0x0000, 0x3c00, 0x8000, 0x0000, 0x3c00),
+    ]
+
+    for b0, b1, b2, exp_min, exp_med, exp_max in tie_cases:
+        for p0, p1, p2 in set(itertools.permutations((b0, b1, b2))):
+            assert pixel_aot.f16_min3_max3_med3_result("min3_f16", p0, p1, p2) == exp_min
+            assert pixel_aot.f16_min3_max3_med3_result("med3_f16", p0, p1, p2) == exp_med
+            assert pixel_aot.f16_min3_max3_med3_result("max3_f16", p0, p1, p2) == exp_max
+
+            f0, f1, f2 = f16_to_f32(p0), f16_to_f32(p1), f16_to_f32(p2)
+            hlsl_min_val = hlsl_min16(hlsl_min16(f0, f1), f2)
+            hlsl_max_val = hlsl_max16(hlsl_max16(f0, f1), f2)
+            hlsl_med_val = hlsl_max16(hlsl_min16(f0, f1), hlsl_min16(hlsl_max16(f0, f1), f2))
+
+            assert to_f16_bits(hlsl_min_val) == exp_min
+            assert to_f16_bits(hlsl_med_val) == exp_med
+            assert to_f16_bits(hlsl_max_val) == exp_max
+
+
+def check_f16_ternary_controls():
+    """Lowering, spelling and refusals of the 3 three-operand 16-bit float VOP3 forms and their half16 results."""
+    check_f16_ternary_lowering()
+    check_f16_ternary_mutation_coverage()
+    assert set(pixel_aot.VOP3_F16_TERNARY) == {"min3_f16", "max3_f16", "med3_f16"}
+    for group in range(5):
+        lowered = translate_f16(f16_ternary_ops(group))
+        body = lowered.split("uint4 main", 1)[1]
+        assert "0xffff0000u" not in body and "asfloat(0u | " not in body, group
+        assert body.count("widen16(hf") >= 12, group
+    prefix = [
+        "v_mov_b32_e32 v18, 0x12343800",
+        "v_mov_b32_e32 v19, 0x56783c00",
+        "v_mov_b32_e32 v20, 0x9abc4000",
+        "s_mov_b32 s44, 0x12343800",
+        "s_mov_b32 s45, 0x56783c00",
+        "s_mov_b32 s46, 0x9abc4000",
+    ]
+
+    def lowered_op(line):
+        return translate_f16(uncompressed_export([*prefix, line]))
+
+    assert lowered_op("v_min3_f16_e64 v24, v18, v19, v20") == lowered_op("v_min3_f16 v24, v18, v19, v20")
+    assert lowered_op("v_min3_f16 v24, v18, v19, v20") != lowered_op("v_max3_f16 v24, v18, v19, v20")
+    assert lowered_op("v_med3_f16 v24, v18, v19, v20") != lowered_op("v_min3_f16 v24, v18, v19, v20")
+    # Inline constants, 16-bit literals and scalar registers are accepted.
+    for line in ("v_max3_f16 v24, v18, v19, 1.0", "v_max3_f16 v24, 0.5, v19, v20", "v_med3_f16 v24, v18, 0, 1.0",
+                 "v_min3_f16 v24, v18, 0x3c00, v20", "v_med3_f16 v24, s44, v19, s46"):
+        lowered_op(line)
+
+    def refuse(line, message):
+        expect_value_error(translate_f16, uncompressed_export([*prefix, line]), message)
+
+    for op in sorted(pixel_aot.VOP3_F16_TERNARY):
+        refuse(f"v_{op} v24, v18, v19, v20 clamp", "Unsupported instruction")
+        refuse(f"v_{op} v24, v18, v19, v20 op_sel:[0,0,0,1]", "Unsupported instruction")
+        refuse(f"v_{op} v24, -v18, v19, v20", "Unsupported binary16 source modifier")
+        refuse(f"v_{op} v24, v18, |v19|, v20", "Unsupported binary16 source modifier")
+        refuse(f"v_{op} v24, v18, v19, 2", "Unsupported binary16 integer inline constant")
+        refuse(f"v_{op} v24, 0x10000, v19, v20", "16-bit literal out of range")
+        for slot in range(3):
+            tokens = ["v18", "v19", "v20"]
+            tokens[slot] = "v200"
+            refuse(f"v_{op} v24, {', '.join(tokens)}", "binary16 operand lacks a finite proof")
+        refuse(f"v_{op} v24, v18, v19", "Unsupported instruction")
+        refuse(f"v_{op} v256, v18, v19, v20", "Register out of range")
+        refuse(f"v_{op} v24, v18, v19, s106", "Register out of range")
+        refuse(f"v_{op}_dpp v24, v18, v19, v20 quad_perm:[0,1,2,3]", "Unsupported instruction")
+        refuse(f"v_{op}_sdwa v24, v18, v19, v20 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 "
+               "src1_sel:WORD_0 src2_sel:WORD_0", "Unsupported instruction")
+        # Denorm mode unknown at entry
+        expect_value_error(translate_int, uncompressed_export([*prefix, f"v_{op} v24, v18, v19, v20"]),
+                           "binary16 denormal mode unknown at entry")
+    # Outstanding sample overlap
+    sample = next(i for i, line in enumerate(with_constants([])) if line.startswith("image_sample"))
+    overlap = with_constants([])
+    overlap.insert(sample + 1, "v_min3_f16 v12, 1.0, 0.5, 0")
+    expect_value_error(lambda prog: lower(prog, 20, 24, [1, 2, 3, 4], constant_descriptor=64, half_denorm="preserve"),
+                       overlap, "Write overlaps an outstanding sample")
+    # Half16 chaining and readers
+    chain_prog = uncompressed_export([*prefix, "v_add_f16 v24, v18, v19", "v_min3_f16 v25, v24, v20, 1.0"])
+    chain_hlsl = translate_f16(chain_prog)
+    assert "widen16(hf" in chain_hlsl, chain_hlsl
+    # Full-word reader of half16 result without widening is refused
+    expect_value_error(translate_f16, uncompressed_export([*prefix, "v_min3_f16 v24, v18, v19, v20", "v_add_nc_u32 v25, v24, v18"]),
+                       "Expected a numeric register")
+    expect_value_error(translate_f16, uncompressed_export(
+        [*prefix, "v_min3_f16 v24, v18, v19, v20", "v_mov_b32_sdwa v25, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1"]),
+        "Reads the undefined high half of a 16-bit result")
 
 
 def check_int16_vop3_controls():
@@ -15710,6 +16127,7 @@ def check_controls(directory):
     must_reject(translate, base_m24[:wqm] + ["v_mul_hi_i32_i24_e64 v20, 1, 2"] + base_m24[wqm:])
     check_int16_vop3_controls()
     check_int16_ternary_controls()
+    check_f16_ternary_controls()
     check_f16_arith_controls()
     check_f16_round_controls()
     check_f16_fmac_ldexp_controls()
@@ -16040,6 +16458,8 @@ def check_binary(directory, assembler, objcopy, library):
                     for op in QUADMASK_BITREPLICATE_INSTRUCTIONS)
     fixtures.extend((int16_vop3_ops(group), translate_int) for group in range(4))
     fixtures.extend((int16_ternary_ops(group), translate_int) for group in range(5))
+    fixtures.extend((f16_ternary_ops(group), translate_f16) for group in range(5))
+    fixtures.extend((f16_ternary_program(*key), translate_f16) for key in F16_TERNARY_PROGRAMS)
     fixtures.extend((f16_arith_program(*key), translate_f16) for key in F16_ARITH_PROGRAMS)
     fixtures.extend((f16_round_program(*key), translate_f16) for key in F16_ROUND_PROGRAMS)
     fixtures.extend((f16_fmac_ldexp_program(*key), translate_f16) for key in F16_FMAC_LDEXP_PROGRAMS)
@@ -20879,6 +21299,39 @@ def check_int16_ternary_draw(directory, compiler, renderer, backend):
     assert refused != programs[0]
     expect_value_error(translate_int, refused, "Reads the undefined high half of a 16-bit result")
 
+
+def check_f16_ternary_draw(directory, compiler, renderer, backend):
+    """The 3 three-operand 16-bit float VOP3 ops and half16 chains against the Python reference, then mutations that
+    must mismatch (one batch per mutation; the statuses are printed).
+    """
+    check_f16_ternary_mutation_coverage()
+    source = directory / "f16_ternary.hlsl"
+    shader = directory / "f16_ternary.cso"
+    constants = bytes(256)
+
+    def build(text):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+    def case(kind, index, tag):
+        path = directory / f"f16_ternary-{tag}-{kind}-{index}.case"
+        write_case(path, constants, tuple(as_float(word) for word in f16_ternary_expected(kind, index)), integer_rt=True)
+        return path
+
+    programs = {key: f16_ternary_program(*key) for key in F16_TERNARY_PROGRAMS}
+    for key in F16_TERNARY_PROGRAMS:
+        build(translate_f16(programs[key]))
+        run_pixel_batch(renderer, backend, shader, [(case(*key, "ref"), "pass")])
+
+    for mutation in F16_TERNARY_MUTATIONS:
+        key = f16_ternary_detecting_program(mutation)
+        build(f16_ternary_mutated(mutation, programs[key]))
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, [case(*key, "mut")])
+        print(f"f16_ternary mutation {mutation}: program {key} statuses {statuses}")
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {mutation} escaped detection")
+
+
 FLAT_SCRATCH_WORDS = (
     (0x12345678, 0x9abcdef0, 0x00ff00ff, 0xaa55aa55),
     (0x00000001, 0x80000000, 0x7fffffff, 0xffffffff),
@@ -21345,7 +21798,7 @@ def main():
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-scc-skip",
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
-                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
+                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-f16-ternary", "draw-flat-scratch", "draw-smem-pointers",
                     "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -21373,6 +21826,7 @@ def main():
                         "draw-sad": check_sad_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-int16-ternary": check_int16_ternary_draw,
+                        "draw-f16-ternary": check_f16_ternary_draw,
                         "draw-f16-arith": check_f16_arith_draw,
                         "draw-f16-round": check_f16_round_draw,
                         "draw-f16-fmac-ldexp": check_f16_fmac_ldexp_draw,

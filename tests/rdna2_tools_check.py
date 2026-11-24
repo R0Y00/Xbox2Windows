@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import (SMEM_OPS, SOPK_OPS, SOPP_OPS, VOP1_OPS, VOP2_OPS, disasm_rdna2, decode_instruction,
                            disassemble_binary)
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
-from pixel_aot import VOP3_INT16, VOP3_INT16_TERNARY, fma_mix_operand, lower, native_program, parse_fma_mix
+from pixel_aot import VOP3_INT16, VOP3_INT16_TERNARY, VOP3_F16_TERNARY, fma_mix_operand, lower, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
@@ -4700,8 +4700,26 @@ class TestRdna2Scanner(unittest.TestCase):
         for line in ("v_mad_u16_e64 v5, v1, v2, v3", "v_max3_i16 v5, v1, v2, 4", "v_med3_u16 v5, v1, -16, 64",
                      "v_mad_i16 v5, v1, 0x0012, s105"):
             self.assertTrue(is_instruction_supported(line), line)
-        for line in ("v_mad_u32_u16 v5, v1, v2, v3", "v_med3_f16 v5, v1, v2, v3"):
+        for line in ("v_mad_u32_u16 v5, v1, v2, v3", "v_fma_f16 v5, v1, v2, v3"):
             self.assertFalse(is_instruction_supported(line), line)
+
+    def test_non_packed_f16_ternary_forms(self):
+        """The 3 three-operand 16-bit float VOP3 forms take three binary16 sources; clamp, op_sel and modifiers are not supported."""
+        names = ("min3_f16", "max3_f16", "med3_f16")
+        self.assertEqual(set(names), set(VOP3_F16_TERNARY))
+        for name in names:
+            line = f"v_{name} v5, v1, v2, v3"
+            self.assertTrue(is_instruction_supported(line), line)
+            self.assertTrue(is_opcode_recognized(f"v_{name}"), name)
+            for bad in (f"v_{name} v5, v1, v2", f"v_{name} v5, v1, v2, v3 clamp",
+                        f"v_{name} v5, v1, v2, v3 op_sel:[0,0,0,1]", f"v_{name} v5, -v1, v2, v3",
+                        f"v_{name} v5, v1, 4, v3", f"v_{name} v5, v1, v2, 0x10000",
+                        f"v_{name}_dpp v5, v1, v2, v3 quad_perm:[0,1,2,3]", f"v_{name} v256, v1, v2, v3",
+                        f"v_{name} v5, v1, v2, s106"):
+                self.assertFalse(is_instruction_supported(bad), bad)
+        for line in ("v_min3_f16_e64 v5, v1, v2, v3", "v_max3_f16 v5, v1, v2, 1.0",
+                     "v_med3_f16 v5, v1, 0x3c00, s105"):
+            self.assertTrue(is_instruction_supported(line), line)
 
     def test_float_to_word_conversions_e32_and_e64(self):
         """v_cvt_u32_f32 and v_cvt_i32_f32 accept plain e32 and e64 with optional source abs/neg;
