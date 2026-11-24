@@ -624,7 +624,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         auto* file_object = reinterpret_cast<Object*>(source);
         static const bool windows = x2w_local::env_on("X2W_DSTORAGE_CHUNK_WINDOWS");
         LARGE_INTEGER file_size{};
-        const bool bc_format = bcpack == 1 || bcpack == 3 || bcpack == 4 || bcpack == 5 || bcpack == 7;
+        const bool bc_format = bcpack == 1 || bcpack == 7;
         if (windows && ((bc_format && !zlib) || (zlib && !bcpack)) && file_object && file_object->kind == file &&
             GetFileSizeEx(file_object->handle, &file_size) && file_size.QuadPart > 0 &&
             x2w_startup::decode_chunk_window([&](u64 start, std::size_t bytes, std::vector<unsigned char>& target) {
