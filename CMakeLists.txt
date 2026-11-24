@@ -5918,6 +5918,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/bcpack_symbols_check.py")
     add_test(NAME bcpack_tables COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bcpack_tables_check.py")
+    # The class of a failed BCPack request from the synthetic streams (src/startup_stubs/bcpack_inspect.h, #1198);
+    # the collapse control reports every failure as one class and must fail.
+    add_executable(bcpack_inspect_check tests/bcpack_inspect_check.cpp)
+    target_compile_features(bcpack_inspect_check PRIVATE cxx_std_17)
+    target_include_directories(bcpack_inspect_check PRIVATE src)
+    add_test(NAME bcpack_inspect COMMAND bcpack_inspect_check)
+    add_test(NAME bcpack_inspect_collapse_control COMMAND bcpack_inspect_check --mutate collapse)
+    set_tests_properties(bcpack_inspect_collapse_control PROPERTIES WILL_FAIL TRUE)
     add_test(NAME bc7_block_reference COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bc7_blocks_check.py")
     add_test(NAME bc7_tile_swizzle COMMAND "${INTAKE_PYTHON}" -B

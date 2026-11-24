@@ -242,13 +242,42 @@ inline bool phase1(Lane& ln) {
     return true;
 }
 
+// Why decode_lanes returned false, for inspect_bcpack (bcpack_inspect.h). Filled only when a report is passed.
+enum class LaneFailure : uint8_t {
+    none,
+    bad_arguments,       // no lanes, more than 16, a zero target or an alphabet wider than 8 bits
+    header_invalid,      // a fragment header names an alphabet wider than 8 bits
+    fragment_not_home,   // a flushed fragment did not end at the rANS home state
+    end_state_invalid,   // all lanes finished in a state that is not a terminal state
+    trailing_input,      // all lanes finished and a non-zero input byte is left
+    request_shorter,     // every lane reached its target and the decode still did not finish
+    request_longer,      // all input read, every lane stopped at a fragment boundary before its target
+    truncated,           // all input read, a lane stopped inside a fragment before its target
+    no_progress,         // no progress for 64 cycles in another state, or the cycle limit
+};
+
+struct LaneReport {
+    LaneFailure failure = LaneFailure::none;
+    size_t bytes_read = 0;        // input bytes handed to lanes when the decode ended
+    uint32_t min_symbols = 0;     // fewest and most symbols any lane had produced
+    uint32_t max_symbols = 0;
+    uint32_t target_symbols = 0;  // symbols per lane that were requested
+};
+
 inline bool decode_lanes(const uint8_t* input, size_t input_size,
                          const uint8_t* alphabet_bits, size_t num_lanes,
                          size_t target_symbols_per_lane,
-                         std::vector<uint16_t>& symbols) {
-    if (num_lanes == 0 || num_lanes > 16 || target_symbols_per_lane == 0) return false;
+                         std::vector<uint16_t>& symbols, LaneReport* report = nullptr) {
+    if (report) *report = LaneReport{};
+    if (num_lanes == 0 || num_lanes > 16 || target_symbols_per_lane == 0) {
+        if (report) report->failure = LaneFailure::bad_arguments;
+        return false;
+    }
     for (size_t i = 0; i < num_lanes; ++i) {
-        if (alphabet_bits[i] > 8) return false;
+        if (alphabet_bits[i] > 8) {
+            if (report) report->failure = LaneFailure::bad_arguments;
+            return false;
+        }
     }
     symbols.assign(num_lanes * target_symbols_per_lane, 0);
 
@@ -268,6 +297,31 @@ inline bool decode_lanes(const uint8_t* input, size_t input_size,
     uint64_t last_total_syms = UINT64_MAX;
     uint32_t last_state_sum = UINT32_MAX;
     uint64_t last_change = 0;
+
+    // Records why and where the decode stopped; nothing happens without a report.
+    auto note = [&](LaneFailure failure) {
+        if (!report) return;
+        report->failure = failure;
+        report->bytes_read = pos;
+        report->target_symbols = static_cast<uint32_t>(target_symbols_per_lane);
+        report->min_symbols = lanes[0].nsyms;
+        report->max_symbols = lanes[0].nsyms;
+        for (const Lane& ln : lanes) {
+            if (ln.nsyms < report->min_symbols) report->min_symbols = ln.nsyms;
+            if (ln.nsyms > report->max_symbols) report->max_symbols = ln.nsyms;
+        }
+    };
+    // A stall: the request and the stream disagree about the symbol count, or the stream is damaged.
+    auto stall_failure = [&]() {
+        bool met = true, at_boundary = true;
+        for (const Lane& ln : lanes) {
+            met &= ln.nsyms == target_symbols_per_lane;
+            at_boundary &= ln.state == LANE_HDR0 && !ln.ib_full;
+        }
+        if (met) return LaneFailure::request_shorter;
+        if (!met && pos == input_size) return at_boundary ? LaneFailure::request_longer : LaneFailure::truncated;
+        return LaneFailure::no_progress;
+    };
 
     while (cycle < max_cycles) {
         size_t served = 0;
@@ -314,7 +368,10 @@ inline bool decode_lanes(const uint8_t* input, size_t input_size,
         for (size_t i = 0; i < num_lanes; ++i) {
             Lane& ln = lanes[i];
             if (!ln.stall) {
-                if (!phase1(ln)) return false;
+                if (!phase1(ln)) {
+                    note(ln.eab > 8 ? LaneFailure::header_invalid : LaneFailure::fragment_not_home);
+                    return false;
+                }
             }
             uint32_t bit = 1u << i;
             if (!(ln.done && !ln.sym_full && (slots & bit) == 0)) {
@@ -332,12 +389,17 @@ inline bool decode_lanes(const uint8_t* input, size_t input_size,
             for (size_t i = 0; i < num_lanes; ++i) {
                 uint32_t f = lanes[i].final_state;
                 if (f != 0x1000000 && f != 0x10000 && f != 0x100) {
+                    note(LaneFailure::end_state_invalid);
                     return false;
                 }
             }
             for (size_t p = pos; p < input_size; ++p) {
-                if (input[p] != 0) return false;
+                if (input[p] != 0) {
+                    note(LaneFailure::trailing_input);
+                    return false;
+                }
             }
+            if (report) note(LaneFailure::none);
             return true;
         }
 
@@ -347,9 +409,11 @@ inline bool decode_lanes(const uint8_t* input, size_t input_size,
             last_state_sum = state_sum;
             last_change = cycle;
         } else if (cycle - last_change > 64) {
+            note(stall_failure());
             return false;
         }
     }
+    note(LaneFailure::no_progress);
     return false;
 }
 
