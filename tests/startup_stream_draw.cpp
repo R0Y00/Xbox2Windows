@@ -271,7 +271,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_bc_chain(void*, void*);
         if (const int result = draw_bc_chain(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
+        extern int root_heap_control(ID3D12Device*);
         extern int draw_root_cbv(void*);
+        if (const int result = root_heap_control(desktop.Get())) return result;
         if (const int result = draw_root_cbv(list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_1D_SRV", nullptr, 0)) {
         extern int draw_1d_srvs(void*, void*);
@@ -350,6 +352,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         last = 2;
     }
     if (const int rc = submit(last)) return rc;
+    if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
+        extern int root_heap_report();
+        if (const int rc = root_heap_report()) return rc;
+    }
 
     return read_stream_target(desktop.Get(), frame, pixels);
 }

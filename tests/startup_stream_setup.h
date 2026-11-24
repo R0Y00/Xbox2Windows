@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <vector>
 #include <d3d12.h>
 #include <dxgi.h>
 #include <wrl/client.h>
@@ -12,6 +13,8 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
 // The guest root signature that prepare_stream_pipeline created (null before it ran).
 void* stream_root_signature();
 void* stream_alternate_root_signature();
+// The serialized form of stream_root_signature().
+const std::vector<char>& stream_root_blob();
 
 struct StreamAttachment {
     Microsoft::WRL::ComPtr<ID3D12Resource> texture, readback;

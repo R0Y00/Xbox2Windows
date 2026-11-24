@@ -34,9 +34,29 @@ struct Stream {
 namespace {
 void* stream_root = nullptr;
 void* stream_alternate_root = nullptr;
+std::vector<char> stream_root_bytes;
+
+// X2W_TEST_ROOT_FLAGS: root signature flags (startup_root_heap.cpp). A root signature with flags is serialized as
+// version 1.1, which carries the descriptor-heap indexing flags; without flags the version 1.0 blob is unchanged.
+HRESULT serialize_root(const D3D12_ROOT_SIGNATURE_DESC& desc, ComPtr<ID3DBlob>& blob)
+{
+    if (!desc.Flags) return D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr);
+    std::vector<D3D12_ROOT_PARAMETER1> parameters(desc.NumParameters);
+    for (UINT i = 0; i < desc.NumParameters; ++i) {
+        const D3D12_ROOT_PARAMETER& p = desc.pParameters[i];
+        if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_CBV && p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) return E_INVALIDARG;
+        parameters[i].ParameterType = p.ParameterType;
+        parameters[i].Descriptor = {p.Descriptor.ShaderRegister, p.Descriptor.RegisterSpace, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+        parameters[i].ShaderVisibility = p.ShaderVisibility;
+    }
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{D3D_ROOT_SIGNATURE_VERSION_1_1};
+    versioned.Desc_1_1 = {desc.NumParameters, parameters.data(), 0, nullptr, desc.Flags};
+    return D3D12SerializeVersionedRootSignature(&versioned, &blob, nullptr);
+}
 }
 void* stream_root_signature() { return stream_root; }
 void* stream_alternate_root_signature() { return stream_alternate_root; }
+const std::vector<char>& stream_root_blob() { return stream_root_bytes; }
 
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
@@ -46,6 +66,15 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     std::vector<char> vs{std::istreambuf_iterator<char>(vs_file), {}};
     std::vector<char> ps{std::istreambuf_iterator<char>(ps_file), {}};
     if (vs.empty() || ps.empty()) return 3;
+    // X2W_TEST_DEBUG_LAYER=1 (startup_root_heap.cpp): the debug layer must be on before the first device exists.
+    if (GetEnvironmentVariableW(L"X2W_TEST_DEBUG_LAYER", nullptr, 0)) {
+        ComPtr<ID3D12Debug> debug;
+        if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            std::printf("no debug layer: skipped\n");
+            return 77;
+        }
+        debug->EnableDebugLayer();
+    }
 
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
@@ -95,21 +124,31 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
         root_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = &root_cbv;
+        char flags[16]{};
+        if (GetEnvironmentVariableA("X2W_TEST_ROOT_FLAGS", flags, sizeof(flags)))
+            root_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(std::strtoul(flags, nullptr, 0));
     }
+    // A runtime or device that rejects the requested root signature flags is a capability skip.
+    const int rejected = root_desc.Flags ? 77 : 0;
     ComPtr<ID3DBlob> blob;
-    if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr))) return 6;
+    if (FAILED(serialize_root(root_desc, blob))) return rejected ? rejected : 6;
+    stream_root_bytes.assign(static_cast<const char*>(blob->GetBufferPointer()),
+                             static_cast<const char*>(blob->GetBufferPointer()) + blob->GetBufferSize());
     std::ofstream(root_path, std::ios::binary).write(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
     using CreateRoot = HRESULT (WINAPI*)(void*, UINT, const void*, SIZE_T, REFIID, void**);
     using CreateStream = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     auto** slots = *static_cast<void***>(device);
     ID3D12RootSignature* root = nullptr;
     if (FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                                        __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root)))) return 7;
+                                                        __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root)))) {
+        if (rejected) std::printf("CreateRootSignature rejects flags 0x%x: skipped\n", static_cast<unsigned>(root_desc.Flags));
+        return rejected ? rejected : 7;
+    }
     stream_root = root;
     if (std::strcmp(cbv_mode, "switch_root") == 0) {
         root_cbv.Descriptor.ShaderRegister = 1;
         ComPtr<ID3DBlob> alternate;
-        if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &alternate, nullptr)) ||
+        if (FAILED(serialize_root(root_desc, alternate)) ||
             FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, alternate->GetBufferPointer(),
                                                             alternate->GetBufferSize(), __uuidof(ID3D12RootSignature),
                                                             &stream_alternate_root))) return 7;

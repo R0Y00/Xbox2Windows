@@ -19,6 +19,7 @@
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
+#include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/derived_blend.h"
@@ -1418,6 +1419,20 @@ std::unordered_map<const Wrapper*, std::vector<RootParameter>>& root_infos()
     static std::unordered_map<const Wrapper*, std::vector<RootParameter>> map;
     return map;
 }
+// The heap-indexing flags (x2w_startup::root_flags_heap_indexed) each title root signature was created with.
+std::unordered_map<const Wrapper*, UINT>& root_heap_flag_map()
+{
+    static std::unordered_map<const Wrapper*, UINT> map;
+    return map;
+}
+UINT root_heap_flags(const Wrapper* root)
+{
+    AcquireSRWLockShared(&root_lock);
+    const auto found = root_heap_flag_map().find(root);
+    const UINT flags = found == root_heap_flag_map().end() ? 0 : found->second;
+    ReleaseSRWLockShared(&root_lock);
+    return flags;
+}
 const std::vector<RootParameter>* root_info(const Wrapper* root)
 {
     AcquireSRWLockShared(&root_lock);
@@ -1428,7 +1443,8 @@ const std::vector<RootParameter>* root_info(const Wrapper* root)
 }
 
 // Device slot 16, desktop CreateRootSignature(node, blob, size, riid, ppv); the parameter list is
-// kept for the translated shaders (register and space of each root descriptor).
+// kept for the translated shaders (register and space of each root descriptor), and the heap-indexing
+// flags for command-list slot 34.
 HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const void* blob, SIZE_T size, const GUID* iid, void** out)
 {
     if (!out || !iid) return E_POINTER;
@@ -1445,10 +1461,12 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     Wrapper* w = wrap(root, root_signature_kind);
     note_root_blob(w, blob, size);
     std::vector<RootParameter> parameters;
+    UINT heap_flags = 0;
     ID3D12VersionedRootSignatureDeserializer* deserializer = nullptr;
     if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&deserializer)))) {
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
         if (SUCCEEDED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
+            heap_flags = static_cast<UINT>(desc->Desc_1_1.Flags) & x2w_startup::root_flags_heap_indexed;
             for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
                 const auto& parameter = desc->Desc_1_1.pParameters[i];
                 RootParameter info{parameter.ParameterType, 0, 0};
@@ -1468,11 +1486,12 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
         for (std::size_t i = 0; i < parameters.size() && used < 220; ++i)
             used += std::snprintf(text + used, sizeof(text) - used, " %d:r%u,s%u", parameters[i].type, parameters[i].shader_register,
                                   parameters[i].space);
-        log("x2w-d3d12 Device::CreateRootSignature size=0x%llx -> %p parameters (type:register,space)%s", static_cast<u64>(size),
-            static_cast<void*>(w), text);
+        log("x2w-d3d12 Device::CreateRootSignature size=0x%llx -> %p heap flags 0x%x parameters (type:register,space)%s",
+            static_cast<u64>(size), static_cast<void*>(w), heap_flags, text);
     }
     AcquireSRWLockExclusive(&root_lock);
     root_infos()[w] = std::move(parameters);
+    root_heap_flag_map()[w] = heap_flags;
     ReleaseSRWLockExclusive(&root_lock);
     *out = w;
     return S_OK;
@@ -1631,6 +1650,10 @@ struct Pass {
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
     const std::vector<RootParameter>* root = nullptr;
+    // Heap-indexing flags of the title root signature last set by slot 34. While nonzero, that root signature is
+    // deferred: it is not set on the desktop list, root SRVs are not forwarded, and real draws go through decide_real_root.
+    UINT root_heap_flags = 0;
+    ID3D12RootSignature* deferred_root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
@@ -1660,6 +1683,8 @@ struct Pass {
     UINT default_viewport_h = 0, default_scissor_h = 0;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
+// Heap-indexed title root signatures not set on the desktop list, and real draws refused under one, by decision.
+LONG heap_roots_deferred, heap_root_refusals[x2w_startup::real_root_decision_count];
 
 ID3D12GraphicsCommandList* recording(Wrapper* self) { return self->own().list_open ? static_cast<ID3D12GraphicsCommandList*>(self->own().real) : nullptr; }
 Pass& pass_of(Wrapper* self)
@@ -1727,7 +1752,9 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
 }
-// List slot 34 (desktop 30 + 4), SetGraphicsRootSignature.
+// List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
+// draws either way. A root signature that indexes a descriptor heap directly is not set on the desktop list: the
+// title's heaps are never forwarded there (slot 32), so the debug layer would reject it (message ID 1419).
 void __stdcall list_graphics_root(Wrapper* self, void* root)
 {
     Wrapper* w = as_wrapper(root);
@@ -1737,8 +1764,19 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
         std::fill_n(pass.root_address, 16, 0);
     pass.root = params;
     pass.srv_bound = 0;
-    if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
+    const bool real = w && w->own().kind == root_signature_kind && w->own().real;
+    pass.root_heap_flags = real ? root_heap_flags(w) : 0;
+    pass.deferred_root = pass.root_heap_flags ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
+    auto* list = recording(self);
+    if (!list || !real) return;
+    if (!pass.root_heap_flags) {
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
+        return;
+    }
+    const LONG deferred = InterlockedIncrement(&heap_roots_deferred);
+    if (deferred <= 3)
+        log("x2w-render root signature %p with heap flags 0x%x not set on the desktop list (title heaps are not forwarded)",
+            static_cast<void*>(w), pass.root_heap_flags);
 }
 DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 {
@@ -1881,7 +1919,8 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     Pass& pass = pass_of(self);
     if (parameter < 32) pass.srv_bound &= ~(1u << parameter);
     if (parameter < 16) pass.root_address[parameter] = address;
-    if (!list || !pass.root || parameter >= pass.root->size() || parameter >= 32 ||
+    // Under a deferred heap-indexed root the desktop list holds another root signature; only the title address is kept.
+    if (!list || !pass.root || pass.root_heap_flags || parameter >= pass.root->size() || parameter >= 32 ||
         (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
         return;
     const std::size_t bytes = readable_window(address, 0x10000);
@@ -1925,6 +1964,25 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
         InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
                                                                                                                 : &untranslated_draws);
         return;
+    }
+    if (list && pass.root_heap_flags) {
+        // The desktop list holds no copy of the title's heaps, and the root constants and descriptor tables the
+        // title set are kept only as title values, so the deferred root signature cannot be set with its state.
+        x2w_startup::RealRootDraw request;
+        request.root_flags = pass.root_heap_flags;
+        request.state_restorable = false;
+        const x2w_startup::RealRootDecision decision = x2w_startup::decide_real_root(request);
+        if (decision != x2w_startup::RealRootDecision::bind) {
+            const LONG n = InterlockedIncrement(&heap_root_refusals[static_cast<int>(decision)]);
+            InterlockedIncrement(&render_draws_skipped);
+            if (n <= 3 || n % 1000 == 0)
+                log("x2w-render real draw refused: root signature heap flags 0x%x, %s (%ld so far)", pass.root_heap_flags,
+                    x2w_startup::real_root_reason(decision), n);
+            return;
+        }
+        // Not reached with the facts above: a change that mirrors the title heaps and restores the root state on the
+        // list, with an end-to-end fixture, makes the deferred bind here.
+        list->SetGraphicsRootSignature(pass.deferred_root);
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
@@ -3110,11 +3168,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
-            "textures uploaded %ld (%ld KiB, unreadable %ld)", render_resets,
+            "textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
+            "sampler heap %ld, both heaps %ld, state %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
-            texture_bytes_uploaded, textures_unreadable);
+            texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
+            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
+            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
+            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
+            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)]);
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];
