@@ -6073,6 +6073,13 @@ the handler writes back in one statement. VGPR pairs, SGPR pairs and the integer
 sources; the low word is always shifted unsigned and only the arithmetic form signs the high word.
 Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_b64_shift$' -V`.
 
+**The high half of an unsigned product.** `v_mul_hi_u32` had no lowering - the census form
+`v_mul_hi_u32 v1, v0, 0xaaaaaaab` was one of the refused shaders in the loading-screen cache (#870, issue #1792).
+These stages have no 64-bit multiply and a plain `*` yields the low half, so the handler calls a preamble helper
+built from halfword products. The check builds synthetic VOP3A words, decodes and translates them, and fails
+without the helper. `v_mul_hi_i32` and the 24-bit forms are not part of this change.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mul_hi_u32$' -V`.
+
 **The 32-bit scalar complement logic operations.** The scalar table had `s_nand_b64`, `s_nor_b64` and
 `s_xnor_b64` and the 32-bit `s_andn2_b32` and `s_orn2_b32`, but not `s_nand_b32`, `s_nor_b32` or `s_xnor_b32`
 (#870, issue #1919). They now lower as `~(S0 & S1)`, `~(S0 | S1)` and `~(S0 ^ S1)` on 32 bits, the text
