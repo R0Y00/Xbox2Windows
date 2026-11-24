@@ -6088,6 +6088,14 @@ alignment. An aligned-down second dword must change the fourth output. Unnamed f
 `d16` forms remain refused. Run
 `ctest --preset dev --no-tests=error -R '^startup_(gfx2hlsl_tbuffer_16f$|vertex_fetch_formats_)' -V`.
 
+**Untyped-format buffer loads.** `buffer_load_format_{x,xy,xyz,xyzw}` (MUBUF) carry no format in the
+instruction, unlike `tbuffer_load_format_*`: the element format is the `DATA_FORMAT` of the resource
+descriptor, read at run time. The translator tracks only where descriptor words came from, never their
+contents, so the format is unknown (census form `buffer_load_format_xyz v[6:8], off, s[32:35], 0`, issue #1809,
+#870). Picking one from the destination width would load wrong data without any error, so each form is refused
+by name with that reason. Lowering needs pipeline state that supplies the descriptor words. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_buffer_format$' -V`.
+
 **The 64-bit vector shifts.** `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` had no lowering - the
 census form `v_lshrrev_b64 v[10:11], 0, 0` was one of the refused shaders in the loading-screen cache (#870,
 issue #1817). A 64-bit value here is two 32-bit words, so the count must never reach 32 in a 32-bit shift and

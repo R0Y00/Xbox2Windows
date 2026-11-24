@@ -1044,6 +1044,27 @@ class Stage:
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
 
+    def buffer_format_load(self, ops, mods, count):
+        # Untyped-format MUBUF loads carry no format in the instruction: the element format is the
+        # DATA_FORMAT field of the resource descriptor, read at run time. descriptor() only tracks where the
+        # descriptor words came from, not their contents, so the format is unknown here. Guessing one from the
+        # destination width would load silently wrong data, so the form is refused by name until the pipeline
+        # supplies descriptor words (issue #1809).
+        raise Unsupported('buffer_load_format_%s needs the descriptor DATA_FORMAT, which is not tracked'
+                          % 'xyzw'[:count])
+
+    def op_buffer_load_format_x(self, ops, mods):
+        self.buffer_format_load(ops, mods, 1)
+
+    def op_buffer_load_format_xy(self, ops, mods):
+        self.buffer_format_load(ops, mods, 2)
+
+    def op_buffer_load_format_xyz(self, ops, mods):
+        self.buffer_format_load(ops, mods, 3)
+
+    def op_buffer_load_format_xyzw(self, ops, mods):
+        self.buffer_format_load(ops, mods, 4)
+
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
 
