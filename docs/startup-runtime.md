@@ -853,6 +853,28 @@ It writes:
 | `<log>/files.txt` | every file the process opened |
 | `<log>/translate.txt` | with `-Translate`: one line per shader request translated during the run |
 
+### Package on another volume
+
+A console executable opens its package at a fixed drive letter, so a package that lives on another
+volume never mounts: the first open returns "not found", nothing is mounted, and the run usually
+stops within a second on a table sized from data that was never loaded. `-MapDrive` rewrites opens on
+a mapped letter to the real folder, in the caller's own path structure and inside the debugger's
+existing file hook, so the letter does not have to be free and a real volume on it is not disturbed:
+
+```powershell
+.\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
+    -MapDrive "G=D:\package"
+```
+
+The value is `LETTER=FOLDER`, and several mappings are separated by `;`. The debugger logs a `MAP`
+line for each rewrite and the rewritten path in `<log>/files.txt`. An open on a letter that is not
+mapped is left untouched. Two limits: only opens that pass through the file hooks the launcher
+already installs are rewritten, so a title that reads its package through a memory-mapped API rather
+than an open is not covered; and when the replacement is longer than the caller's buffer the launcher
+allocates the new name in the process and repoints the `UNICODE_STRING`, leaving that allocation to
+the process. `startup_map_drive` covers the rewrite, the negative control without the option, and
+that an unmapped letter is left alone.
+
 ### Translating shaders during a run
 
 With `-Render -Translate`, `run.ps1` starts `tools/startup/gfx2hlsl.py --watch <shader cache>` beside

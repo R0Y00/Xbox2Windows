@@ -20,6 +20,7 @@ param(
     [int]$MemoryGiB = 14,
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
+    [string]$MapDrive = "",                    # e.g. "G=D:\package": rewrite opens on a console letter
     [string]$StoragePath = "",                 # X2W_STORAGE_PATH: persistent local storage root (a trailing \ is added when missing)
     [string]$ShaderCache = "out/startup/shader_cache",
     [switch]$Render,                           # draw through translated pipelines
@@ -73,9 +74,11 @@ if ($Translate -and $Render) {
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+$mapArgs = @()
+if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 try {
     & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs *> "$LogDir.out"
+        --trace-files 1 --continue-asserts $ContinueAsserts @mapArgs @traceArgs *> "$LogDir.out"
     $debuggerExit = $LASTEXITCODE
 } finally {
     # taskkill /T needs a live parent PID to reach the watcher's workers.
