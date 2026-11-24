@@ -14,7 +14,9 @@ def pixel_shader(reg, masks):
     return G.Pipeline(VS_WORDS, words, root_blob(), ps_hw_inputs=masks).hlsl_ps()
 
 
-def main(dxc, renderer, adapter, fxc=None):
+def main(dxc=None, renderer=None, adapter=None, fxc=None):
+    if not (dxc and renderer and adapter):
+        return 77
     try:
         pixel_shader(1, (0x8100, 0x8000))
     except G.Unsupported as err:
