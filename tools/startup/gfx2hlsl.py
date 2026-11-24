@@ -1984,6 +1984,52 @@ class Stage:
         self.used_v.update((dst[1], dst[2]))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
+    def carry_out_op(self, ops, mods, kind):
+        """v_{add,sub,subrev}_co_u32 D, SDST, S0, S1: a 32-bit add or subtract with a carry or borrow out.
+
+        AMD RDNA 2 ISA: V_ADD_CO_U32 D = S0 + S1 with the carry out of bit 31 written to the lane's bit of SDST;
+        V_SUB_CO_U32 D = S0 - S1 with a borrow when S1 > S0; V_SUBREV_CO_U32 swaps S0 and S1. These forms are VOP3b
+        only and take no carry-in. The result and the carry go through the scratch registers a and w first, so D or
+        SDST may overlap a source.
+        """
+        name = 'v_%s_co_u32' % kind
+        if mods:
+            raise Unsupported('%s with %s' % (name, ' '.join(mods)))
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands' % (name, len(ops)))
+        d = reg_range(ops[0])
+        if not d or d[0] != 'v' or d[1] != d[2] or d[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        sdst = reg_range(ops[1])
+        if ops[1] not in ('vcc', 'vcc_lo') and not (sdst and sdst[0] == 's' and sdst[1] == sdst[2] and sdst[1] <= 105):
+            raise Unsupported('%s carry-out destination %s' % (name, ops[1]))
+        a, b = self.u(ops[2]), self.u(ops[3])
+        if kind == 'subrev':
+            a, b = b, a
+        if kind == 'add':
+            self.emit('a = %s + %s;' % (a, b))
+            self.emit('w = (%s + %s) < %s ? 1u : 0u;' % (a, b, a))
+        else:
+            self.emit('a = %s - %s;' % (a, b))
+            self.emit('w = %s > %s ? 1u : 0u;' % (b, a))
+        self.set_v(d[1], 'a')
+        predicate = 'w' if self.exec_known else '(exec & w)'
+        if ops[1] in ('vcc', 'vcc_lo'):
+            self.emit('vcc = %s;' % predicate)
+        else:
+            # The carry is a per-lane bit: never a uniform scalar, whatever the scratch name hides.
+            self.set_s(sdst[1], predicate, uniform=False)
+            self.masks.add(sdst[1])
+
+    def op_v_add_co_u32(self, ops, mods):
+        self.carry_out_op(ops, mods, 'add')
+
+    def op_v_sub_co_u32(self, ops, mods):
+        self.carry_out_op(ops, mods, 'sub')
+
+    def op_v_subrev_co_u32(self, ops, mods):
+        self.carry_out_op(ops, mods, 'subrev')
+
     def op_v_lshlrev_b64(self, ops, mods):
         self.shift64(ops, mods, 'shl64')
 
