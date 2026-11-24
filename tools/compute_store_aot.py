@@ -154,9 +154,12 @@ def shared_lds_step(line, step, vector, words):
     """HLSL statements for one gfx1013 DS instruction on `groupshared uint lds[]`; updates `vector` for reads.
 
     The byte address is the address VGPR plus the instruction offset (offset0/offset1 in elements of the access
-    size, times 64 for st64), and word i of the access is lds[(address >> 2) + i]. A word outside the allocation
-    reads as zero and is not written. The low two address bits are dropped: the caller keeps b32 accesses
-    4-byte aligned and wider ones aligned to their size, which is not checked.
+    size, times 64 for st64), and word i of the access is lds[(address >> 2) + i].
+
+    Input contract, not checked: every access is in bounds and aligned (b32 to 4 bytes, wider forms to their
+    size); every word a read or an atomic touches was written earlier in the group; and no two lanes of one
+    non-atomic write store to the same word. Outside the contract a word past the allocation reads as zero and
+    is not written, and the low two address bits are dropped.
     """
     m = next((m for form in LDS_SHARED_FORMS if (m := re.fullmatch(form, line))), None)
     if m is None:
@@ -383,7 +386,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
     mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
     wave_size is the caller's statement that the program runs as wave32 (32). A lane index is only
-    derived for a group of more than 32 threads under that statement.
+    derived for a group of more than 32 threads under that statement. With group-shared LDS on gfx1013
+    the statement may also be 64 (wave64), which lets a group of up to 64 threads count as one guest wave.
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
@@ -475,8 +479,6 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if output_format is not None and (output_format not in MUBUF_OUTPUT_FORMATS or cpu != "gfx1030"
                                       or stride is None):
         raise ValueError("Unsupported formatted output binding")
-    if wave_size not in (None, 32):
-        raise ValueError("Unsupported wave size statement")
     if mubuf_d16_xyz_mode is not None and (mubuf_d16_xyz_mode != "preserve-w"
                                            or output_format != MUBUF_D16_OUTPUT_FORMATS[4] or cpu != "gfx1030"):
         raise ValueError("D16 XYZ mode requires a gfx1030 RGBA16 UINT output binding")
@@ -499,6 +501,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     shared_lds = cpu == "gfx1013" and lds_bytes != 0
     if shared_lds and not (4 <= lds_bytes <= LDS_SHARED_LIMIT and lds_bytes % 4 == 0):
         raise ValueError("Invalid shared LDS allocation")
+    # wave64 is stated only for the one-wave shared LDS profile; elsewhere it is not a known lane layout.
+    if wave_size not in (None, 32) and not (wave_size == 64 and shared_lds):
+        raise ValueError("Unsupported wave size statement")
+    # Per-instruction group barriers give the group one wave's DS order. With several guest waves the order
+    # before s_barrier is not fixed by the program, so the profile is one wave: at most 32 threads is one wave
+    # of either width, and a larger group needs the wave64 statement.
+    if shared_lds and dims[0] * dims[1] * dims[2] > (wave_size or 32):
+        raise ValueError("Shared LDS requires a group of one guest wave")
     lds_word = None
     lds_strided_words = {}
     lds_strided_width = None
@@ -2084,8 +2094,9 @@ def main():
                              "R32_SINT for signed min/max UAVs, R32_FLOAT for finite-normal atomics)")
     parser.add_argument("--image-float-domain", choices=("finite-normal",),
                         help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
-    parser.add_argument("--wave-size", type=int, choices=(32,),
-                        help="Caller's statement that the program runs as wave32, for lane indices in larger groups")
+    parser.add_argument("--wave-size", type=int, choices=(32, 64),
+                        help="Caller's statement of the wave width: 32 for lane indices in larger groups, "
+                             "64 (gfx1013 shared LDS only) for a group of up to 64 threads as one wave")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")

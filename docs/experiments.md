@@ -4214,21 +4214,33 @@ size, times 64 for the `st64` forms), and accesses word `(address >> 2) + i`. Th
   `ds_max_u32`, as HLSL `Interlocked*` operations (`ds_sub_u32` adds the negated value);
 - `s_barrier`.
 
-The group runs its DS instructions in program order, as a single wave does: every DS instruction is
-followed by `GroupMemoryBarrierWithGroupSync()`, so a read sees the writes of every earlier instruction from
-all threads and a later write cannot overtake an earlier read. A group of several waves needs `s_barrier`
-for this, so the extra barriers select one of the orders the hardware allows; `s_barrier` becomes the same
-barrier and adds one only where no DS barrier precedes it. Barriers need uniform control flow, so a DS
-instruction or `s_barrier` after a lane guard is refused. Each access becomes an indexed read or write
-guarded by `index < N / 4`: a word outside the allocation reads as zero and is not written. That
-out-of-range rule is the translation's choice and is not compared with hardware. The low two address bits
-are dropped; keeping b32 accesses 4-byte aligned and wider ones aligned to their size is the caller's
-guarantee and is not checked. Not lowered yet: the returning (`_rtn`) forms, whose results depend on the
+The profile is one guest wave per group. A group of at most 32 threads is one wave at either guest wave
+width and needs no statement. A group of 33 to 64 threads needs `--wave-size 64`, the caller's statement that
+the program runs as wave64; that statement is accepted only with a shared LDS allocation. Larger groups, and
+groups of more than 32 threads under `--wave-size 32`, are several guest waves and are refused.
+
+Within that one wave, DS instructions take effect in program order: every DS instruction is followed by
+`GroupMemoryBarrierWithGroupSync()`, so a read sees the writes of every earlier instruction from all lanes
+and a later write cannot overtake an earlier read. The HLSL barrier waits for the whole group, which on the
+desktop may run as several host waves; with one guest wave this reproduces the guest order. With several
+guest waves the per-instruction barriers would also order DS operations between waves before `s_barrier`,
+which the guest program does not guarantee, so that case is left until it has its own native comparison.
+`s_barrier` becomes the same barrier and adds one only where no DS barrier precedes it. Barriers need
+uniform control flow, so a DS instruction or `s_barrier` after a lane guard is refused.
+
+The caller guarantees the LDS input contract, which is not checked:
+- every access is in bounds and aligned: b32 accesses to 4 bytes, wider ones to their size;
+- every word that a read or an atomic touches was written earlier in the group;
+- no two lanes of one non-atomic write store to the same word.
+
+Outside the contract, each access is still guarded by `index < N / 4`: a word past the allocation reads as
+zero and is not written, and the low two address bits are dropped. That rule keeps an access from reaching
+other words; it is not compared with hardware. Not lowered yet: the returning (`_rtn`) forms, whose results depend on the
 order of lanes that update one word; `ds_write_b96`/`ds_read_b96`; byte, short and d16 accesses; signed
 min/max; float atomics; and `ds_permute`/`ds_bpermute` and the other lane-routing forms on gfx1013.
 
-`compute_store_aot_lds_shared` runs eight 64-thread programs with a 1024-byte allocation on one and two
-groups (one group for the four-word programs), and compares every UAV word with a CPU reference. Each lane
+`compute_store_aot_lds_shared` runs eight 64-thread wave64 programs with a 1024-byte allocation on one and
+two groups (one group for the four-word programs), and compares every UAV word with a CPU reference. Each lane
 writes its own words, and after a barrier reads another lane's:
 - the next lane's word and the mirrored lane's word (`63 - l`);
 - pairs 64 words apart through `write2`/`read2` and `st64`;
@@ -4244,11 +4256,13 @@ mismatch at the first word they change:
 - an `st64` read spelled as a plain `read2`, at word 1;
 - `ds_min_u32` in place of `ds_max_u32`, at word 11.
 
-The translation controls check the barrier count, the `Interlocked*` methods and the rejections listed
-above. Every program is also assembled and disassembled with LLVM 15 for gfx1013, and the CLI must emit the
+The translation controls check the barrier count, the `Interlocked*` methods, the allocation guard on every
+access and the rejections listed above. The one-wave controls accept a 32-thread group without a statement
+and refuse 64 threads without one, 64 threads and a 32 x 2 group under wave32, 128 threads under wave64, and
+the wave64 statement without a shared allocation or on gfx1030. Every program is also assembled and disassembled with LLVM 15 for gfx1013, and the CLI must emit the
 same HLSL.
 
-Measured on `a3633d4` with this change, Windows 10 build 19045:
+Measured on `b96960b` with this change, Windows 10 build 19045:
 
 | Adapter | Result | Debug layer |
 |---|---|---|

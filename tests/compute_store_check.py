@@ -3699,7 +3699,10 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
 # read by another. Lane l of group g has tid = 64 * g + l; v5 = l * 4 is its word address, v8 its index.
 SHARED_PREFIX = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0", "s_load_dwordx4 s[20:23], s[12:13], 0x30",
                  "v_lshl_add_u32 v8, s11, 6, v0", "s_waitcnt lgkmcnt(0)", "v_lshlrev_b32_e32 v5, 2, v0"]
-SHARED_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=8, cpu="gfx1013", lds_bytes=1024)
+SHARED_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=8, cpu="gfx1013", lds_bytes=1024,
+                      wave_size=64)
+# Without an allocation the wave64 statement is refused, so the no-LDS controls drop it.
+SHARED_NO_LDS = {key: value for key, value in SHARED_BINDING.items() if key != "wave_size"} | {"lds_bytes": 0}
 SHARED_WIDE_BINDING = SHARED_BINDING | {"stride": 16}
 SHARED_MIRROR = "v_sub_nc_u32_e32 v9, 0xfc, v5"  # (63 - l) * 4
 SHARED_DATA = ["v_add_nc_u32_e32 v6, 0x10000000, v8", "v_add_nc_u32_e32 v7, 0x20000000, v8"]
@@ -3827,6 +3830,9 @@ def shared_controls():
         steps = sum(line.startswith("ds_") for line in lines)
         assert source.count("GroupMemoryBarrierWithGroupSync();") == steps, name
         assert "uint3 local : SV_GroupThreadID" in source, name
+        # Out-of-range words are outside the input contract; every access stays guarded by the allocation size.
+        guard = f" < {binding['lds_bytes'] // 4}u"
+        assert all(guard in line for line in source.splitlines() if "lds[" in line and "groupshared" not in line), name
     programs = {name: lines for name, lines, _ in SHARED_CASES}
     atomics = aot.lower(programs["shared_atomics"], 64, **SHARED_BINDING)
     for method in ("Add", "And", "Or", "Xor", "Min", "Max"):
@@ -3857,13 +3863,24 @@ def shared_controls():
             lines[:i + 1] + lines[i + 2:], 64, **SHARED_BINDING)
     for size in (0x10004 // 2, 2, 6, 32772):
         rejects("Invalid shared LDS allocation", aot.lower, lines, 64, **SHARED_BINDING | {"lds_bytes": size})
+    # The profile is one guest wave. 32 threads are one wave at either width and need no statement; 64 threads
+    # need the wave64 statement, and are two waves under wave32; 128 threads are two wave64 waves.
+    unstated = {key: value for key, value in SHARED_BINDING.items() if key != "wave_size"}
+    half = variant(lines, ("v_lshl_add_u32 v8, s11, 6, v0", "v_lshl_add_u32 v8, s11, 5, v0"))
+    assert "groupshared uint lds[256];" in aot.lower(half, 32, **unstated)
+    for group, binding in ((64, unstated), (64, SHARED_BINDING | {"wave_size": 32}), (128, SHARED_BINDING),
+                           ((32, 2, 1), SHARED_BINDING | {"wave_size": 32})):
+        rejects("Shared LDS requires a group of one guest wave", aot.lower, lines, group, **binding)
+    # wave64 is not a lane layout outside the shared LDS profile.
+    rejects("Unsupported wave size statement", aot.lower, lines, 64, **SHARED_NO_LDS | {"wave_size": 64})
+    rejects("Unsupported wave size statement", aot.lower, lines, 64, **SHARED_BINDING | {"cpu": "gfx1030"})
     # Without an allocation gfx1013 keeps refusing the local-ID address, DS and s_barrier.
-    rejects("Unverified dispatch byte offset", aot.lower, lines, 64, **SHARED_BINDING | {"lds_bytes": 0})
+    rejects("Unverified dispatch byte offset", aot.lower, lines, 64, **SHARED_NO_LDS)
     rejects("Unverified private LDS write", aot.lower, SHARED_PREFIX[:5] + lines[len(SHARED_PREFIX):], 64,
-            **SHARED_BINDING | {"lds_bytes": 0})
+            **SHARED_NO_LDS)
     rejects("Unsupported compute instruction: s_barrier", aot.lower,
             SHARED_PREFIX[:5] + ["s_barrier", "buffer_store_dword v8, v8, s[20:23], 0 idxen", "s_endpgm"], 64,
-            **SHARED_BINDING | {"lds_bytes": 0, "stride": 4})
+            **SHARED_NO_LDS | {"stride": 4})
     # The CPU references differ from the mutants'.
     for name, lines, binding in SHARED_CASES:
         for _, first in shared_mutants(name, lines, binding):
