@@ -38,6 +38,7 @@
 #include "console_plane_size.h"
 #include "descriptor_heap_type.h"
 #include "null_binding_cause.h"
+#include "resolve_subresource.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
 #include "present_view_format.h"
@@ -2297,6 +2298,40 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 {
     if (auto* list = recording(self)) list->OMSetStencilRef(reference);
 }
+// List slot 19, ResolveSubresource(dest, dest subresource, source, source subresource, format). Both
+// textures use COMMON state tracking; the list moves them to RESOLVE_DEST / RESOLVE_SOURCE for the call.
+void __stdcall list_resolve_subresource(Wrapper* self, void* destination, UINT destination_subresource, void* source,
+                                        UINT source_subresource, UINT format)
+{
+    const auto refuse = [](const char* reason) {
+        static LONG refusals;
+        if (first_calls(refusals, 16)) log("x2w-render ResolveSubresource refused: %s", reason);
+    };
+    auto* list = recording(self);
+    if (!list) return refuse("list is closed");
+    Wrapper* to = as_wrapper(destination);
+    Wrapper* from = as_wrapper(source);
+    if (!to || !from || to->own().kind != resource_kind || from->own().kind != resource_kind || !to->own().real ||
+        !from->own().real || to == from)
+        return refuse("missing desktop resource");
+    const auto* to_info = resource_info(to);
+    const auto* from_info = resource_info(from);
+    if (!to_info || !from_info || to_info->initial_state != D3D12_RESOURCE_STATE_COMMON ||
+        from_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return refuse("resource does not use COMMON state tracking");
+    auto* target = static_cast<ID3D12Resource*>(to->own().real);
+    auto* origin = static_cast<ID3D12Resource*>(from->own().real);
+    const auto side = [](ID3D12Resource* resource) {
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        return x2w_resolve::Side{desc.Width, desc.Height, desc.MipLevels, desc.DepthOrArraySize, desc.SampleDesc.Count,
+                                 desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D};
+    };
+    const auto verdict = x2w_resolve::check(side(target), destination_subresource, side(origin), source_subresource, format);
+    if (verdict != x2w_resolve::Verdict::ok) return refuse("arguments do not describe a valid resolve");
+    require_state(self, target, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    require_state(self, origin, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    list->ResolveSubresource(target, destination_subresource, origin, source_subresource, static_cast<DXGI_FORMAT>(format));
+}
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -3755,6 +3790,7 @@ void build_tables()
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
+        list_typed[19] = reinterpret_cast<ListTyped>(&list_resolve_subresource);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);

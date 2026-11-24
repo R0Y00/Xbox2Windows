@@ -659,6 +659,11 @@ endforeach()
 add_executable(startup_command_list_slot_names tests/startup_command_list_slot_names.cpp)
 target_compile_features(startup_command_list_slot_names PRIVATE cxx_std_17)
 add_test(NAME startup_command_list_slot_names COMMAND startup_command_list_slot_names)
+
+# Rules that gate a title's ResolveSubresource (src/startup_stubs/resolve_subresource.h, #870).
+add_executable(startup_resolve_subresource tests/startup_resolve_subresource.cpp)
+target_compile_features(startup_resolve_subresource PRIVATE cxx_std_17)
+add_test(NAME startup_resolve_subresource COMMAND startup_resolve_subresource)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
