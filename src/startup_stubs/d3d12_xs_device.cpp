@@ -31,6 +31,7 @@
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/graphics_pipeline_cache.h"
 
 #include <d3d12.h>
 #include "command_list_slot_names.h"
@@ -3569,6 +3570,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
         if (render_mode()) present_signature(self, surface, frame);
     }
+    flush_pipeline_cache();
     const ULONGLONG now = GetTickCount64();
     if (frame == 1) started = last_report = now;
     if (frame <= 2) {

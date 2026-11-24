@@ -741,6 +741,25 @@ returns success. Other store methods are not answered: a call that still carries
 handle returns `0x80004005`.
 [#1147](https://github.com/R0Y00/Xbox2Windows/issues/1147)
 
+The translated graphics path also keeps a desktop pipeline library in
+`X2W_SHADER_CACHE\pso_<adapter>.lib`. The file is a versioned header around
+`ID3D12PipelineLibrary::Serialize`; the header records the adapter/driver identity and a checksum.
+Each translated pipeline is registered under a name that includes the translation revision, output
+formats, DSV, the title's blend/depth blocks and the translated VS/PS bytes. The adapter is located
+through the device LUID and `IDXGIFactory4::EnumAdapterByLuid`; vendor, device, subsystem, revision
+and UMD version are hashed, while the LUID is only a fallback because it can change across boots.
+Blend and depth states are hashed field by field, so
+ABI padding cannot change the name; the WARP test mutates each semantic field and requires the key to
+change, while a padding-only change must leave it identical. A warm hit calls `LoadGraphicsPipeline`; a miss,
+corrupt/truncated blob, driver or adapter mismatch, unsupported `ID3D12PipelineLibrary`, or failed
+store falls back to `CreateGraphicsPipelineState`. Cache failures are logged and never fail a draw.
+The file is replaced atomically, and a new device resets the in-process cache before use. Stores are
+coalesced: a new PSO marks the library dirty, and `Flush()` at the end of each presented frame,
+outside `draw_lock`, or destruction serializes it once. A cold batch therefore does not rewrite the
+whole library on every draw. The WARP test reports an eight-PSO batch
+and compares a cold-created and a warm-loaded pixel; those numbers are diagnostic and do not establish
+a speedup for a title workload.
+
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
 requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
