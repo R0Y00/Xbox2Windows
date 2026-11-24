@@ -1857,7 +1857,7 @@ VEC_F = {
     'v_madmk_f32': (3, 'mad32({0}, {1}, {2}, false)'), 'v_madak_f32': (3, 'mad32({0}, {1}, {2}, false)'),
     'v_rcp_f32': (1, '1.0 / {0}'), 'v_rcp_iflag_f32': (1, '1.0 / {0}'), 'v_rsq_f32': (1, 'rsqrt({0})'), 'v_sqrt_f32': (1, 'sqrt({0})'),
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
-    'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
+    'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'fract32({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
     'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
@@ -2082,6 +2082,12 @@ class Pipeline:
                '    precise float product = ftz32(legacy ? mul_legacy(a, b) : a * b);',
                '    precise float sum = product + ftz32(c);',
                '    return ftz32(sum);',
+               '}',
+               # Match pixel_aot: x - floor(x) capped at 0x3f7fffff, so a tiny negative input cannot round up to
+               # 1.0. The cap is a comparison, not min: min returns its other operand for a NaN.
+               'float fract32(float value) {',
+               '    float f = frac(value);',
+               '    return f >= 1.0f ? asfloat(0x3f7fffffu) : f;',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
