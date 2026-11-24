@@ -352,7 +352,6 @@ def check_shader_records():
     sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
     rejected_forms = {
         "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
-        "v_mul_i32_i24_sdwa",
         "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
