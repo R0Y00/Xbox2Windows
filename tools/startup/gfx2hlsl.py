@@ -2248,6 +2248,27 @@ class Stage:
         if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
             raise Unsupported('unverified 1D image sample address or modifiers')
         lod = bias = None
+        grads = None
+        if how == 'd':
+            # Address dwords are ddx then ddy (one per coordinate axis each) and then the coordinates, so a 2D
+            # sample is six registers, a 2D array seven and a volume nine. Offsets, bias, clamp, a16 and the
+            # other layout-changing modifiers are refused; only cache-policy bits are accepted.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_sample_d modifier %s' % m)
+            if dmask == 0:
+                raise Unsupported('image_sample_d with an empty dmask')
+            if one:
+                raise Unsupported('image_sample_d on a 1D image')
+            axes = 3 if dim == 'SQ_RSRC_IMG_3D' else 2
+            want = 3 * axes + (1 if dim == 'SQ_RSRC_IMG_2D_ARRAY' else 0)
+            if want == 9 and len(cs) == 16 and not ops[1].startswith('['):
+                # A contiguous nine-dword volume address is encoded as a sixteen-register range; the rest is padding.
+                cs = cs[:9]
+            if len(cs) != want:
+                raise Unsupported('image_sample_d with %d address registers' % len(cs))
+            grads = (cs[:axes], cs[axes:2 * axes])
+            cs = cs[2 * axes:]
         if how in ('l', 'b'):
             # image_sample_l: the address dwords are the coordinates and then the explicit level. image_sample_b:
             # the RDNA 2 ISA (section 8.2.5, "{ offset } { bias } { z-compare } { derivative } { body }") puts one
@@ -2355,7 +2376,11 @@ class Stage:
             if how == 'sample' and self.kind == 'cs':
                 # A compute lane has no pixel quad to supply derivatives; level 0 would be a guess.
                 raise Unsupported('image_sample with implicit LOD in a compute program')
-            if how == 'l':
+            if how == 'd':
+                axes = len(grads[0])
+                dx, dy = ['float%d(%s)' % (axes, ', '.join(self.f(r) for r in g)) for g in grads]
+                call = '%s.SampleGrad(%s, %s, %s, %s)' % (tex, smp, uv, dx, dy)
+            elif how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'b':
                 # SampleBias adds the bias to the implicit LOD, like the ISA's _B suffix ("Add this BIAS to the LOD
@@ -2501,6 +2526,12 @@ class Stage:
 
     def op_image_sample_b(self, ops, mods):
         self.image(ops, mods, 'b')
+
+    def op_image_sample_d(self, ops, mods):
+        self.image(ops, mods, 'd')
+
+    def op_image_sample_c_d(self, ops, mods):
+        raise Unsupported('image_sample_c_d: SampleCmpGrad needs shader model 6.8; only c and c_lz are lowered')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
