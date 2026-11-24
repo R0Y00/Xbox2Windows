@@ -13384,6 +13384,16 @@ On Intel UHD Graphics (TGL GT1) with Mesa 26.2.7, DXC 1.10.2605.37 and SPIRV-Too
 python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device Intel
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device llvmpipe
+
+## Startup single root constants
+
+Command-list slot 38 (`SetGraphicsRoot32BitConstant`) stores one root constant word for a translated shader. The cases are in `tests/startup_mrt_check.py`, which sets the slot through `tests/startup_root_constant.cpp` and reads the word back through a rewritten `rootconst` manifest entry: set, overwrite, offset 3 read at offset 3 and at offset 0, the corner (15, 7), parameter 16, parameter 0xffffffff, offset 8 and offset 0xffffffff dropped, the same root signature again (word kept), a switched one (word cleared) and no call. The slot number is derived, not seen in a title log. Details are in [startup-runtime.md](startup-runtime.md#single-root-constants).
+
+Limits: this was written and checked on Linux only (syntax with MinGW, `git diff --check`, the link and bidi checks). The `startup_mrt_*` tests need Windows with D3D12 and were not run, so the expected pixels and the mutations are not yet confirmed there.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer
+ctest --preset dev --no-tests=error -R "^startup_mrt_" -V
 ```
 
 ## SAL (/6) lifting in cpu_switch_aot

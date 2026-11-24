@@ -4243,6 +4243,7 @@ void build_tables()
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
+        list_typed[38] = reinterpret_cast<ListTyped>(&list_root_constant);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);

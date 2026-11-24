@@ -306,7 +306,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
-    if (export_word) invoke(list, 40, 0, 1, arg(&export_word), 0);
+    if (export_word && !GetEnvironmentVariableW(L"X2W_TEST_ROOT_CONSTANT", nullptr, 0))
+        invoke(list, 40, 0, 1, arg(&export_word), 0);
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
@@ -315,6 +316,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (bc_chain) {
         extern int draw_bc_chain(void*, void*);
         if (const int result = draw_bc_chain(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CONSTANT", nullptr, 0)) {
+        extern int draw_root_constant(void*, std::uint32_t);
+        if (const int result = draw_root_constant(list, export_word)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_control(ID3D12Device*);
         extern int draw_root_cbv(void*);
