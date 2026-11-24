@@ -49,7 +49,7 @@ int main()
            "x2w-d3d12 Device::slot70 unsupported memory SRV arguments: reason=unsupported_description "
            "res{dim=1 fmt=0 size=4096x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0} "
            "view{dim=11 fmt=0 map=0x1688 raw=55667788,11223344,00000000,00000000,00000000,00000000 "
-           "(acceleration structure views are not supported)} dest=0x1000 dest_in_view_heap=1 address=0x2000 address_readable=0");
+           "(acceleration structure view)} dest=0x1000 dest_in_view_heap=1 address=0x2000 address_readable=0");
 
     auto b = view(D3D12_SRV_DIMENSION_BUFFER, DXGI_FORMAT_UNKNOWN);
     b.Buffer.FirstElement = 7;

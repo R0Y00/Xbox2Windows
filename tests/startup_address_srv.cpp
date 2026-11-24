@@ -347,7 +347,8 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     structured.view.Buffer.StructureByteStride = 4;
     structured.address = ptr(buf0);
     invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
-    // An acceleration-structure view is refused; draw(4) proves the structured descriptor stayed in place.
+    // An acceleration-structure view of a placed buffer that is not in the acceleration-structure state is
+    // refused (as_wrong_state); draw(4) proves the structured descriptor stayed in place.
     ViewAt as_view{};
     as_view.view.Format = DXGI_FORMAT_UNKNOWN;
     as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);

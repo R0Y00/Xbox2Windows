@@ -1102,9 +1102,14 @@ descriptions with:
   alignment and bounds, adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards
   to `CreateShaderResourceView` (slot 18).
 
-Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`) are not
-supported and are refused. A view needs an actual built structure with the placed AS role and
-lifecycle checks, which has no device test yet.
+Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
+`src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's
+address when `Location` is zero, and do not read the resource description. The view is published through
+slot 18 with no resource and the desktop GPU address of the same byte when the address is 256-byte aligned
+(`as_unaligned`), starts inside one live placed (slot 133) buffer (`as_not_placed`) and that buffer was
+created in `D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE` (`as_wrong_state`). Any other case
+leaves the destination descriptor unchanged and logs the reason. The pure checks run on any host
+(`ctest -R '^startup_memory_srv_as'`); publishing a view on a device has not been run yet.
 
 Typed element bytes come from the format (1 to 16 bytes). Formats that cannot back a typed buffer SRV
 (sRGB, BGRA, block-compressed, depth/stencil, typeless, planar) are refused with

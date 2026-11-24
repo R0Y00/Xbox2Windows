@@ -183,10 +183,17 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
 const char* memory_srv_refusal(const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
 {
     if (!destination) return "null_destination";
-    if (!x2w_local::readable(resource, sizeof(*resource))) return "unreadable_resource";
-    if (!x2w_local::readable(input, sizeof(*input))) return "unreadable_view";
-    if (!input->address) return "null_address";
-    if (!supports_memory_srv(*resource, input->view)) return "unsupported_description";
+    const bool readable_input = x2w_local::readable(input, sizeof(*input));
+    // An acceleration-structure view names its structure by address only; the resource description is not read.
+    const bool as_view = readable_input && x2w_startup::is_as_srv(input->view);
+    if (!as_view && !x2w_local::readable(resource, sizeof(*resource))) return "unreadable_resource";
+    if (!readable_input) return "unreadable_view";
+    if (as_view) {
+        if (!x2w_startup::as_srv_location(input->view, input->address)) return "null_address";
+    } else {
+        if (!input->address) return "null_address";
+        if (!supports_memory_srv(*resource, input->view)) return "unsupported_description";
+    }
     if (!memory_srv_destination(destination)) return "destination_outside_view_heaps";
     return nullptr;
 }
@@ -195,7 +202,7 @@ const char* memory_srv_refusal(const D3D12_RESOURCE_DESC* resource, const Memory
 void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
                             const MemoryShaderResourceView* input, u64 destination)
 {
-    const bool resource_ok = x2w_local::readable(resource, sizeof(*resource));
+    const bool resource_ok = resource && x2w_local::readable(resource, sizeof(*resource));
     const bool input_ok = x2w_local::readable(input, sizeof(*input));
     const u64 address = input_ok ? input->address : 0;
     char line[640];
@@ -205,12 +212,54 @@ void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RE
     log("%s", line);
 }
 
+// The placed buffer that holds `address`, as the pure resolver wants it; nothing found when no live one does.
+x2w_startup::PlacedAsBuffer placed_as_buffer(const Wrapper* device, u64 address)
+{
+    x2w_startup::PlacedAsBuffer result;
+    const auto placed = placed_buffer_range(device, address, 1);
+    if (placed.reject) {
+        result.ambiguous = true;
+        return result;
+    }
+    if (!placed.owner || InterlockedCompareExchange(&placed.owner->own().refs, 0, 0) <= 0) return result;
+    const auto* info = resource_info(placed.owner);
+    auto* real = static_cast<ID3D12Resource*>(placed.owner->own().real);
+    if (!info || !real) return result;
+    result.found = true;
+    result.title_base = reinterpret_cast<u64>(placed.owner->own().title_memory);
+    result.gpu_base = real->GetGPUVirtualAddress();
+    result.bytes = info->bytes;
+    result.initial_state = info->initial_state;
+    return result;
+}
+
+// Slot 70 with an acceleration-structure view: published through slot 18 with no resource and the
+// desktop address; a refusal leaves the destination descriptor as it was.
+void publish_as_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
+{
+    static LONG refused;
+    const u64 location = x2w_startup::as_srv_location(input->view, input->address);
+    D3D12_SHADER_RESOURCE_VIEW_DESC resolved{};
+    const auto refusal = x2w_startup::resolve_as_srv_desc(location, placed_as_buffer(self, location), input->view, resolved);
+    if (refusal != x2w_startup::AsSrvRefusal::none) {
+        if (first_calls(refused, 8))
+            log_refused_memory_srv("unavailable acceleration structure at the supplied address",
+                                   x2w_startup::as_srv_refusal_name(refusal), resource, input, destination);
+        return;
+    }
+    view_slot<18, 2>(self, 0, reinterpret_cast<u64>(&resolved), destination, 0);
+}
+
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
     static LONG refused;
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
+        return;
+    }
+    if (x2w_startup::is_as_srv(input->view)) {
+        publish_as_srv(self, resource, input, destination);
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {

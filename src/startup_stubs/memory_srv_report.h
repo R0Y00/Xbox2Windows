@@ -61,7 +61,7 @@ inline int report_view(char* out, std::size_t size, const D3D12_SHADER_RESOURCE_
         std::memcpy(words, &v->Buffer, sizeof(words));
         return std::snprintf(tail, room, "raw=%08x,%08x,%08x,%08x,%08x,%08x%s", words[0], words[1], words[2], words[3],
                              words[4], words[5],
-                             dimension == srv_dimension_acceleration_structure ? " (acceleration structure views are not supported)" : "");
+                             dimension == srv_dimension_acceleration_structure ? " (acceleration structure view)" : "");
     }
     }
 }
