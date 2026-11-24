@@ -150,6 +150,38 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 
+## Game saves
+
+With `X2W_FAKE_USER=1`, the game-save stand-in keeps containers and blobs below
+`X2W_STORAGE_PATH`, in `x2w-gamesave`: one directory per container, one file per blob
+([#1200](https://github.com/R0Y00/Xbox2Windows/issues/1200)). Opening a container whose directory
+exists succeeds. Names must be one plain path component of at most 128 bytes (no separators, `:`,
+`..`, control characters, device names or the reserved suffixes `.x2w-part` and `.x2w-old`, in any
+case) and a blob is at most 64 MiB. The storage root itself is trusted; a container directory or blob
+that is a symbolic link or, on Windows, a junction is refused by every operation.
+
+Blob writes and deletes are kept with the update and reach the disk only when the update is
+submitted (the public API makes the whole update atomic at submit). An update closed without a
+submit changes nothing. At submit every write goes to a staging file and every delete is checked
+first; then each old file is moved aside, the new one put in place and, on any failure, everything
+is put back, so a failing action publishes none of the update. This holds for failures inside this
+process; a crash in the middle of the replacement can still leave some blobs replaced and `.x2w-old`
+files behind, and a reader can see the blobs of a submit one after the other.
+
+The local provider supports create container (16), delete container (10, 11), create and close update (23, 24), staging blob writes and deletes (25, 26), and submit (27, 28 with its result in 29).
+
+For provider `704c3f58-e629-4cc2-b197-30511b996fe2` and interface `1bfff3af-f14a-40a3-8e35-9ada906593f9`, exact container lookup (13), container enumeration (14) and blob enumeration (18) call back with committed metadata. The local store uses the container name for its display name. Synchronous read (20) returns an array of records followed by names, NUL terminators and payloads in the caller's buffer. The count is in records, the capacity is in bytes, and each record reports the byte count of its own payload. Slots 15, 19, 21 and 22 remain unimplemented. [PC GDK thunk mapping](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L261-L270) · [Microsoft enumeration and sizing sample](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveenumerateblobinfo) · [Microsoft synchronous read contract](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavereadblobdata)
+
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_read$' -V` runs two source-built processes through the provider vtable. The writer commits two preferences under a generated name. The system variant, `startup_gamesave_read_async_system`, first rejects a null block and confirms that synchronous read still reports a missing blob. It retries through slots 28 and 29 on an immediate Windows gaming runtime queue. The restarted reader discovers the nonempty container, obtains the blob names and sizes, and reads six payload bytes from a 74-byte allocation. It also checks early enumeration stop, an unknown interface identity, a short buffer and a missing blob.
+
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` checks the storage code the
+slots call, not the slots: it writes in one process and reads in a second, including a close without
+submit, a failing second action, a second process that sees only committed state, and a redirected
+container directory.
+
+Slot 28 first asks the Windows gaming runtime to accept the caller's async block. On rejection it returns before taking staged actions. Once accepted it commits the files and calls `XAsyncComplete` with the status for that block. Slot 29 retrieves the status with the matching operation identity. File publication is synchronous within slot 28. The caller's completion routine can run inline or through its selected completion queue. [XAsyncBegin](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasyncbegin) · [XAsyncComplete](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasynccomplete) · [PC GDK async interface slots](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L57-L64)
+
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_submit_'` checks denied starts and retries, two overlapping blocks and completion that reads the file and slot 29 before slot 28 returns. The system variant uses the installed Windows gaming runtime with an immediate work/completion queue. It reports a capability skip when the runtime or queue is unavailable.
 
 ## Findings
 

@@ -313,6 +313,16 @@ target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_st
 
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
+# Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
+add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
+target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
+add_executable(startup_gamesave_read tests/startup_gamesave_read.cpp)
+target_include_directories(startup_gamesave_read PRIVATE src)
+target_compile_features(startup_gamesave_read PRIVATE cxx_std_17)
+add_executable(startup_gamesave_submit tests/startup_gamesave_submit.cpp)
+target_include_directories(startup_gamesave_submit PRIVATE src)
+target_compile_features(startup_gamesave_submit PRIVATE cxx_std_17)
 
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
@@ -1121,6 +1131,18 @@ if(FFX_UPSCALER_IMAGE)
 endif()
 if(EXISTS "${INTAKE_PYTHON}")
     # Startup stand-ins: exports, named traps and permissive answers (docs/startup-runtime.md).
+    add_test(NAME startup_gamesave_read COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_read_check.py"
+        "$<TARGET_FILE:startup_gamesave_read>")
+    set_tests_properties(startup_gamesave_read PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_gamesave_read_async_system COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_read_check.py" "$<TARGET_FILE:startup_gamesave_read>" write-async)
+    set_tests_properties(startup_gamesave_read_async_system PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    foreach(scheduler IN ITEMS controlled system)
+        add_test(NAME startup_gamesave_submit_${scheduler} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_submit_check.py" "$<TARGET_FILE:startup_gamesave_submit>" ${scheduler})
+        set_tests_properties(startup_gamesave_submit_${scheduler} PROPERTIES TIMEOUT 30)
+    endforeach()
+    set_tests_properties(startup_gamesave_submit_system PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME startup_stubs COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stub_check.py"
         "$<TARGET_FILE:startup_stub_consumer>" "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs"
         "$<TARGET_FILE:startup_stub_acphal>" "$<TARGET_FILE:startup_stub_chad>" "$<TARGET_FILE:startup_stub_xapu>"
