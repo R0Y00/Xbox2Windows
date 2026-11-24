@@ -526,6 +526,13 @@ These are measured on one executable; treat them as hypotheses for others.
   draw of a 4x4 texture of two slices with three mips whose cells all differ, with mutants that exchange
   slice and mip, ignore the mip, or shift it by one. The draw was written without a Windows run. Cube maps
   are still refused for `image_load_mip`.
+- **1D images.** `image_sample`, `image_sample_lz`, `image_sample_l`, `image_load` and `image_load_mip` with
+  `dim:SQ_RSRC_IMG_1D` use a `Texture1D<float4>` (manifest kind `tex1d`) addressed by one component, x; the
+  explicit-level and mip forms take the level or mip from the last address register (`Load(int2(x, mip))`,
+  `SampleLevel(smp, x, level)`). Before, only the implicit `image_sample` was lowered and the other forms were
+  refused. `python -B tests/startup_image_1d_check.py` translates the fixtures (words checked against `llvm-mc`).
+  No draw runs the load, mip and explicit-level forms yet, so they are not measured on WARP or hardware. Compare,
+  gather and offset forms on a 1D image stay refused.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
@@ -535,13 +542,6 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
   images are still refused. Not covered: binding a single-slice 2D view to an array declaration
   in the draw path.
-- **1D images.** `image_sample`, `image_sample_lz`, `image_sample_l`, `image_load` and `image_load_mip` with
-  `dim:SQ_RSRC_IMG_1D` use a `Texture1D<float4>` (manifest kind `tex1d`) addressed by one component, x; the
-  explicit-level and mip forms take the level or mip from the last address register (`Load(int2(x, mip))`,
-  `SampleLevel(smp, x, level)`). Before, only the implicit `image_sample` was lowered and the other forms were
-  refused. `python -B tests/startup_image_1d_check.py` translates the fixtures (words checked against `llvm-mc`).
-  No draw runs the load, mip and explicit-level forms yet, so they are not measured on WARP or hardware. Compare,
-  gather and offset forms on a 1D image stay refused.
 - **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
