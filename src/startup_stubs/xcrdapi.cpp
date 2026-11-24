@@ -14,6 +14,7 @@
 #include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
 #include "startup_stubs/bcpack_decoder.h"
+#include "startup_stubs/storage_chunk_window.h"
 
 #include <psapi.h>
 
@@ -543,6 +544,7 @@ int format_page_ends(char* out, std::size_t size, int second, const PageEndCount
 }
 
 LONG bcpack_requests[16], bcpack_blank[16];
+LONG requests_metadata_windows;
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 
 const char* format_counts(char* out, std::size_t size, LONG* counts)
@@ -607,6 +609,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
+    const unsigned char* data = nullptr;
+    std::size_t decode_length = source_size;
+    const std::size_t destination_capacity = destination_size;
+    bool written = false;
+    bool metadata_window = false;
     if (options & ~known) {
         outcome = "unknown option bits, not done";
     } else if (!destination || !source_size) {
@@ -615,7 +622,19 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
-        if (file_object && file_object->kind == file &&
+        static const bool windows = x2w_local::env_on("X2W_DSTORAGE_CHUNK_WINDOWS");
+        LARGE_INTEGER file_size{};
+        const bool bc_format = bcpack == 1 || bcpack == 3 || bcpack == 4 || bcpack == 5 || bcpack == 7;
+        if (windows && ((bc_format && !zlib) || (zlib && !bcpack)) && file_object && file_object->kind == file &&
+            GetFileSizeEx(file_object->handle, &file_size) && file_size.QuadPart > 0 &&
+            x2w_startup::decode_chunk_window([&](u64 start, std::size_t bytes, std::vector<unsigned char>& target) {
+                return x2w_startup::read_storage_file(file_object->handle, start, bytes, target);
+            }, static_cast<u64>(file_size.QuadPart), offset, source_size, destination_size, zlib ? 8 : bcpack, output)) {
+            data = output.data();
+            decode_length = output.size();
+            metadata_window = true;
+            outcome = zlib ? "inflated metadata window" : "bcpack decoded window";
+        } else if (file_object && file_object->kind == file &&
             x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
             input = packed.data();
         else {
@@ -623,14 +642,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             failure = read_failure_cause(file_object, offset, source_size);
         }
     }
-    const unsigned char* data = nullptr;
-    std::size_t decode_length = source_size;
-    const std::size_t destination_capacity = destination_size;
-    bool written = false;
 
-    if (input) {
-        data = input;
-        if (zlib) {
+    if (input || metadata_window) {
+        if (!metadata_window) data = input;
+        if (zlib && !metadata_window) {
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
@@ -741,8 +756,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
-        bool bcpack_decoded = false;
-        if (data && bcpack) {
+        bool bcpack_decoded = metadata_window;
+        if (data && bcpack && !metadata_window) {
             if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
                 std::vector<unsigned char> decoded(destination_size);
                 std::size_t produced = 0;
@@ -822,6 +837,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
             if (written) {
+                if (metadata_window) InterlockedIncrement(&requests_metadata_windows);
                 if (bcpack && !bcpack_decoded) {
                     InterlockedIncrement(&requests_bcpack_blank);
                     InterlockedIncrement(&bcpack_blank[bcpack]);
@@ -1528,9 +1544,9 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s; metadata-windows=%ld", second, requests_done, requests_compressed,
                     failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
-                    section_text);
+                    section_text, requests_metadata_windows);
                 char causes[384];
                 if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
                 char ends[384];
