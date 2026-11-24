@@ -1463,6 +1463,66 @@ class Stage:
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
         return None
 
+    def scalar_word_dest(self, base, tok):
+        """Destination of a whole-word scalar op that reads and writes a full 32-bit value: an SGPR or m0."""
+        if tok == 'm0':
+            return 'm0'
+        r = reg_range(tok)
+        if not r or r[0] != 's' or r[1] != r[2] or r[1] > 105:
+            raise Unsupported('%s destination %s' % (base, tok))
+        return r[1]
+
+    def scalar_word_sources(self, base, toks):
+        """uint expressions for whole-word sources: lane masks and descriptor data have no full word to read."""
+        out = []
+        for t in toks:
+            r = reg_range(t)
+            if t in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') or (r and r[0] == 's' and r[1] in self.masks):
+                raise Unsupported('%s on a lane mask' % base)
+            sym = self.sym.get(r[1]) if r and r[0] == 's' else None
+            if sym and sym[0] != 'const':
+                raise Unsupported('%s on descriptor data' % base)
+            out.append(self.u(t))
+        return out
+
+    def scalar_lshl_add(self, base, shift, ops, mods):
+        """D = (S0 << shift) + S1 on 32 bits; SCC is the carry out of the 64-bit sum."""
+        if mods or len(ops) != 3:
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        dest = self.scalar_word_dest(base, ops[0])
+        a, b = self.scalar_word_sources(base, ops[1:])
+        total = '((%s << %d) + %s)' % (a, shift, b)
+        # SCC first: the destination may be one of the sources. Bits shifted out of S0, or a wrapped add, carry.
+        self.emit('scc = ((%s >> %d) != 0u) || (%s < %s);' % (a, 32 - shift, total, b))
+        if dest == 'm0':
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % total)
+        else:
+            self.masks.discard(dest)
+            self.set_s(dest, total)
+        return None
+
+    def op_s_lshl2_add_u32(self, ops, mods):
+        return self.scalar_lshl_add('s_lshl2_add_u32', 2, ops, mods)
+
+    def op_s_lshl3_add_u32(self, ops, mods):
+        return self.scalar_lshl_add('s_lshl3_add_u32', 3, ops, mods)
+
+    def op_s_bitset0_b32(self, ops, mods):
+        """D[S0[4:0]] = 0: the destination is read and written; SCC is unchanged."""
+        if mods or len(ops) != 2:
+            raise Unsupported('s_bitset0_b32 with %d operands' % len(ops))
+        dest = self.scalar_word_dest('s_bitset0_b32', ops[0])
+        old, bit = self.scalar_word_sources('s_bitset0_b32', ops)
+        value = '(%s & ~(1u << (%s & 31)))' % (old, bit)
+        if dest == 'm0':
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % value)
+        else:
+            self.masks.discard(dest)
+            self.set_s(dest, value)
+        return None
+
     def op_s_load_dwordx8(self, ops, mods):
         self.op_s_load_dwordx4(ops, mods, 8)
 
@@ -2373,6 +2433,8 @@ SCA = {
     # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
     's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
     's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
+    # s_ff0_i32_b32: index of the lowest zero bit, -1 when every bit is set; SCC unchanged.
+    's_ff0_i32_b32': ('uint(firstbitlow(~{0}))', None),
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
