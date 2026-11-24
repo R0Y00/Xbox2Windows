@@ -1893,6 +1893,46 @@ class Stage:
         self.set_v(reg_range(ops[0])[1],
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
+    def carry_mask(self, tok, what):
+        """('vcc', None) or ('s', n) for a one-lane carry mask operand; anything else is refused."""
+        if tok in ('vcc', 'vcc_lo'):
+            return 'vcc', None
+        r = reg_range(tok)
+        if r and r[0] == 's' and r[1] <= r[2] <= r[1] + 1 and r[1] not in (106, 107):
+            return 's', r[1]
+        raise Unsupported('v_add_co_ci_u32 %s %s: expected vcc or an SGPR mask' % (what, tok))
+
+    def op_v_add_co_ci_u32(self, ops, mods):
+        # d = a + b + carry_in; the carry out is bit 0 of the destination mask (one lane).
+        if mods:
+            raise Unsupported('v_add_co_ci_u32 with %s' % mods)
+        if len(ops) != 5:
+            raise Unsupported('v_add_co_ci_u32 with %d operands, expected 5' % len(ops))
+        regs = reg_range(ops[0])
+        if not regs or regs[0] != 'v' or regs[1] != regs[2] or regs[1] > 255:
+            raise Unsupported('v_add_co_ci_u32 destination %s: expected a single VGPR' % ops[0])
+        out_kind, out_n = self.carry_mask(ops[1], 'carry out')
+        in_kind, in_n = self.carry_mask(ops[4], 'carry in')
+        if in_kind == 's' and in_n not in self.masks:
+            raise Unsupported('v_add_co_ci_u32 carry in s%d is not a known mask' % in_n)
+        carry_in = self.u(ops[4]) if in_kind == 'vcc' else self.S(in_n)
+        a, b = self.u(ops[2]), self.u(ops[3])
+        d = regs[1]
+        self.uniform_v.discard(d)
+        self.used_v.add(d)
+        guard = '' if self.exec_known else 'if (exec & 1) '
+        carry = '(ca > 0xffffffffu - cb || ca + cb > 0xffffffffu - ci) ? 1u : 0u'
+        if not self.exec_known:
+            carry = '(exec & %s)' % carry
+        if out_kind == 'vcc':
+            store = 'vcc = %s;' % carry
+        else:
+            self.used_s.add(out_n)
+            self.sym.pop(out_n, None)
+            self.masks.add(out_n)
+            store = 's%d = %s;' % (out_n, carry)
+        self.emit('{ uint ca = %s, cb = %s, ci = %s & 1u; %sv%d = ca + cb + ci; %s }' % (a, b, carry_in, guard, d, store))
+
     def op_v_interp_p1_f32(self, ops, mods):
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(reg_range(ops[0])[1])

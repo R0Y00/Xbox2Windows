@@ -2474,6 +2474,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_neg_operand COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_neg_operand_check.py")
     set_tests_properties(startup_gfx2hlsl_neg_operand PROPERTIES TIMEOUT 60)
+    # v_add_co_ci_u32: add with carry in and out (#1723).
+    add_test(NAME startup_gfx2hlsl_add_co_ci COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_add_co_ci_check.py")
     # Output modifiers on float-result conversions (#1705).
     add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vcvt_omod_check.py")
