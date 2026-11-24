@@ -1635,6 +1635,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     # draw of the translated pair with FXC 5_1 (the --pending path) and DXC 6_0.
     add_test(NAME startup_flat_param_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py")
+    # gfx2hlsl packed screen-position input for a fullscreen composite (#1629): PS input-mask source;
+    # five cases (one earlier word, one earlier pair, missing metadata, wrong register, disabled).
+    add_test(NAME startup_packed_screen_position_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py")
+    set_tests_properties(startup_packed_screen_position_controls PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_packed_screen_position_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py" "${DXC_EXECUTABLE}"
