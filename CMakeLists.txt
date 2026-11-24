@@ -4332,6 +4332,48 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_x87>" "$<TARGET_FILE:cpu_fuzz_x87_lifted>" "${cpu_fuzz_x87_o2}"
         --area x87 --mutant "$<TARGET_FILE:cpu_fuzz_x87_mutant>")
     set_tests_properties(cpu_aot_fuzz_x87 PROPERTIES TIMEOUT 60)
+
+    # Bit tests, counts, scans, byte swaps and immediate shifts with their defined flags, with BTS and BTR swapped planted.
+    set(CPU_FUZZ_BITS_SEED "0xB175" CACHE STRING "Seed for the CPU differential fuzz bit-operation test")
+    set(CPU_FUZZ_BITS_FUNCTIONS "40" CACHE STRING "Number of exported functions in the CPU differential fuzz bit-operation test")
+    set(cpu_fuzz_bits_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_bits.asm")
+    set(cpu_fuzz_bits_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_bits.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_bits_asm}" "${cpu_fuzz_bits_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_BITS_SEED}" "${CPU_FUZZ_BITS_FUNCTIONS}" "${cpu_fuzz_bits_asm}"
+            "${cpu_fuzz_bits_def}" --area bits
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_bits SHARED "${cpu_fuzz_bits_asm}" "${cpu_fuzz_bits_def}")
+    set_target_properties(cpu_fuzz_bits PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_bits PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_bits_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_bits_lifted.cpp")
+    set(cpu_fuzz_bits_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_bits_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_bits_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_BITS_SEED}" "${CPU_FUZZ_BITS_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_bits>"
+                "${cpu_fuzz_bits_${variant}}" --area bits ${mutant_flag}
+            DEPENDS cpu_fuzz_bits tools/fuzz_cpu.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py
+                tools/cpu_call_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_bits_${variant} SHARED "${cpu_fuzz_bits_${variant}}")
+        target_compile_features(cpu_fuzz_bits_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_bits_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_bits_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_bits_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_bits_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_bits_lifted_o2.obj" "/Fe${cpu_fuzz_bits_o2}"
+        DEPENDS "${cpu_fuzz_bits_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_bits_lifted_o2 ALL DEPENDS "${cpu_fuzz_bits_o2}")
+    add_test(NAME cpu_aot_fuzz_bits COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_BITS_SEED}" "${CPU_FUZZ_BITS_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_bits>" "$<TARGET_FILE:cpu_fuzz_bits_lifted>" "${cpu_fuzz_bits_o2}"
+        --area bits --mutant "$<TARGET_FILE:cpu_fuzz_bits_mutant>")
+    # A host without POPCNT, BMI1 or ABM cannot run the native exports as the translation describes them.
+    set_tests_properties(cpu_aot_fuzz_bits PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)

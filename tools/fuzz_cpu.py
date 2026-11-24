@@ -36,6 +36,9 @@ class Function:
     narrow: bool = False
     # A scalar float export: '<ret>:<slots>' as cpu_sse_aot names it, for example 'd:ffq'. None for three 64-bit integer slots.
     signature: str | None = None
+    # A native probe of the host processor: it is exported but neither translated nor compared, and the check
+    # calls it first and skips the test (exit 77) unless the RAX it returns has every bit of this mask set.
+    host_features: int | None = None
 
     def asm(self):
         head = [f"    {line}" for line in self.prolog]
@@ -1792,11 +1795,165 @@ def x87_translate(image, names):
     return "".join(parts), None
 
 
+# Bit operations: straight-line leaf functions made of steps, each a bit test, a bit count, a bit scan, a byte
+# swap or a shift by an immediate, whose flags are read only under the conditions that cpu_switch_aot defines
+# for that producer, through SETcc, CMOVcc or a short forward Jcc. RAX, R9 and R10 carry values from step to
+# step; RCX and RDX keep the arguments and R11 holds a source prepared from them, so that zero sources come
+# from the zero inputs. The output buffer keeps one qword per step from 0, a 32-byte bit string written from
+# the arguments at 128 that memory operands use, the SETcc bytes from 192 and the final R9, R10 and R11 at 224.
+BITS_TESTS = ("bt", "bts", "btr", "btc")
+BITS_COUNTS = ("popcnt", "lzcnt", "tzcnt")
+BITS_SCANS = ("bsf", "bsr")
+BITS_SHIFTS = ("shl", "shr", "sar")
+BITS_KINDS = ("test_register", "test_memory", "count", "scan", "swap", "shift")
+BITS_CARRIED = ("rax", "r9", "r10")
+BITS_SOURCES = ("rcx", "rdx", "r11")
+BITS_MEMORY, BITS_MEMORY_SIZE, BITS_FLAGS, BITS_FINAL = 128, 32, 192, 224
+BITS_STEPS = (8, 9, 10)
+# The conditions each producer defines: CF only after a bit test, ZF only after a bit scan, CF and ZF after
+# LZCNT and TZCNT, all of them after POPCNT and a shift by 1, and all but those that read OF after a larger shift.
+BITS_CONDITIONS = {
+    "test": ("b", "ae"), "scan": ("e", "ne"), "lzcnt": ("b", "ae", "e", "ne", "be", "a"),
+    "tzcnt": ("b", "ae", "e", "ne", "be", "a"), "popcnt": CMP_CONDITIONS, "shift1": CMP_CONDITIONS,
+    "shift": ("e", "ne", "s", "ns", "p", "np", "b", "ae", "be", "a"),
+}
+# CPUID bits that the host probe returns: POPCNT (bit 0), BMI1 for TZCNT (bit 1) and ABM for LZCNT (bit 2).
+# Without them the native exports would run LZCNT and TZCNT as BSR and BSF, or fault on POPCNT.
+BITS_HOST_FEATURES = 0b111
+# Negative controls: a body that the translator must refuse, and the reason it must give.
+BITS_CONTROLS = {
+    # A register bit offset into memory through a 32-bit base: the translator has no wrap proof for that address.
+    "bit_string": (["bt DWORD PTR [r8d], ecx", "setc al"], "unsupported bit-string operand"),
+    "test_zero": (["bt rcx, 5", "setz al"], "only CF is defined after BT"),
+    "count_sign": (["lzcnt rdx, rcx", "sets al"], "OF, SF and PF are undefined after LZCNT"),
+    "scan_carry": (["bsf rdx, rcx", "setc al"], "only ZF is defined after BSF"),
+    "shift_width": (["mov eax, ecx", "shl al, 8", "setc al"], "CF is undefined for SHL and SHR"),
+    "shift_overflow": (["mov eax, ecx", "shr eax, 3", "seto al"], "OF is undefined after a shift by more than 1"),
+}
+
+
+def bits_consumers(name, index, conditions, rng):
+    """One to three readers of the flags of step index, under the given conditions: SETcc into the step's two
+    flag bytes, CMOVcc into a carried register, and a forward Jcc around an update of one, which comes last."""
+    kinds = rng.sample(("set", "set", "cmov", "jump"), rng.choice((1, 2, 3)))
+    kinds.sort(key=lambda kind: kind == "jump")
+    lines, flag = [], BITS_FLAGS + 2 * index
+    for kind in kinds:
+        cc = rng.choice(conditions)
+        if kind == "set":
+            lines.append(f"set{cc} BYTE PTR [r8+{flag}]")
+            flag += 1
+        elif kind == "cmov":
+            width = rng.choice((4, 8))
+            lines.append(f"cmov{cc} {part(rng.choice(BITS_CARRIED), width)}, {part(rng.choice(BITS_SOURCES), width)}")
+        else:
+            skip = f"{name}_skip{index}"
+            update = rng.choice((f"xor {rng.choice(BITS_CARRIED)}, {rng.choice((0x5A5A, 0x1234567))}",
+                                 f"not {rng.choice(BITS_CARRIED)}", f"add {rng.choice(BITS_CARRIED)}, rdx"))
+            lines += [f"j{cc} {skip}", update, f"{skip}:"]
+    return lines
+
+
+def bits_source(rng, width):
+    """A source operand of the given width: an argument, R11 prepared from one, or the bit string."""
+    choice = rng.choice(("argument", "prepared", "prepared", "memory"))
+    if choice == "memory":
+        return [], f"{PTR[width]} [r8+{BITS_MEMORY + rng.randrange(BITS_MEMORY_SIZE - width + 1)}]"
+    if choice == "argument":
+        return [], part(rng.choice(("rcx", "rdx")), width)
+    # Masks and shifts that leave R11 zero for many inputs, not only for zero arguments.
+    prepare = [f"mov r11, {rng.choice(('rcx', 'rdx'))}"]
+    prepare += rng.choice(([], [f"and r11, {rng.choice((0xFF00, 0x7FFF0000, -0x10000, 0x10001))}"],
+                           [f"shr r11, {rng.choice((8, 16, 31, 33, 48))}"], [f"shl r11, {rng.choice((16, 32, 48))}"]))
+    return prepare, part("r11", width)
+
+
+def bits_step(name, index, kind, rng):
+    """The lines of one step, which leave its result in the step's qword or in the bit string."""
+    store = f"QWORD PTR [r8+{8 * index}]"
+    width = rng.choice((2, 4, 8))
+    bits = width * 8
+    if kind in ("test_register", "test_memory"):
+        operation = rng.choice(BITS_TESTS)
+        # Offsets past the operand width show that the processor and the translation both take them modulo it.
+        immediate = rng.randrange(bits) if rng.random() < 0.8 else rng.randrange(bits, 256)
+        if kind == "test_memory":
+            # A register offset into memory can address bytes outside the 32-byte string, so these take an immediate.
+            base = f"{PTR[width]} [r8+{BITS_MEMORY + rng.randrange(BITS_MEMORY_SIZE - width + 1)}]"
+            lines = [f"{operation} {base}, {immediate}"]
+        else:
+            base = rng.choice(BITS_CARRIED)
+            offset = str(immediate) if rng.random() < 0.5 else part(rng.choice(BITS_SOURCES), width)
+            lines = [f"{operation} {part(base, width)}, {offset}", f"mov {store}, {base}"]
+        return lines + bits_consumers(name, index, BITS_CONDITIONS["test"], rng)
+    if kind in ("count", "scan"):
+        operation = rng.choice(BITS_COUNTS if kind == "count" else BITS_SCANS)
+        prepare, source = bits_source(rng, width)
+        # A scan of a zero source leaves the whole destination as it was, so it must hold a defined value.
+        destination = rng.choice(BITS_CARRIED)
+        conditions = BITS_CONDITIONS[operation if kind == "count" else "scan"]
+        return [*prepare, f"{operation} {part(destination, width)}, {source}", f"mov {store}, {destination}",
+                *bits_consumers(name, index, conditions, rng)]
+    if kind == "swap":
+        register = rng.choice(BITS_CARRIED)
+        swap = f"bswap {part(register, rng.choice((4, 8)))}"
+        if rng.random() < 0.5:
+            return [swap, f"mov {store}, {register}"]
+        # BSWAP leaves the flags alone, so it may sit between a bit test and its readers.
+        tested = rng.choice([other for other in BITS_CARRIED if other != register])
+        return [f"bt {tested}, {rng.randrange(64)}", swap, f"mov {store}, {register}",
+                *bits_consumers(name, index, BITS_CONDITIONS["test"], rng)]
+    width = rng.choice((1, 2, 4, 8))
+    count = 1 if rng.random() < 0.4 else rng.randrange(2, width * 8)
+    register = rng.choice(BITS_CARRIED)
+    return [f"{rng.choice(BITS_SHIFTS)} {part(register, width)}, {count}", f"mov {store}, {register}",
+            *bits_consumers(name, index, BITS_CONDITIONS["shift1" if count == 1 else "shift"], rng)]
+
+
+def bits_function(name, rng):
+    """Every kind of step once and a few more, in a seeded order."""
+    kinds = [*BITS_KINDS, *(rng.choice(BITS_KINDS) for _ in range(rng.choice(BITS_STEPS) - len(BITS_KINDS)))]
+    rng.shuffle(kinds)
+    lines = ["mov rax, rcx", "mov r9, rdx", "lea r10, [rcx+rdx*4+51h]", "mov r11, rdx", "xor r11, rcx",
+             *(f"mov QWORD PTR [r8+{BITS_MEMORY + 8 * number}], {register}"
+               for number, register in enumerate(("rcx", "rdx", "r10", "r11")))]
+    for index, kind in enumerate(kinds):
+        lines += bits_step(name, index, kind, rng)
+    lines += [f"mov QWORD PTR [r8+{BITS_FINAL + 8 * number}], {register}"
+              for number, register in enumerate(("r9", "r10", "r11"))]
+    return Function(name, [*lines, "add rax, r9", "xor rax, r10", "ret"])
+
+
+def bits_host(name):
+    """The native probe of POPCNT, BMI1 and ABM (see BITS_HOST_FEATURES)."""
+    lines = ["xor eax, eax", "cpuid", "mov r9d, eax", "mov eax, 1", "cpuid", "shr ecx, 23", "and ecx, 1",
+             "mov r8d, ecx", "cmp r9d, 7", f"jb {name}_extended", "mov eax, 7", "xor ecx, ecx", "cpuid",
+             "shr ebx, 3", "and ebx, 1", "shl ebx, 1", "or r8d, ebx", f"{name}_extended:", "mov eax, 80000000h",
+             "cpuid", "cmp eax, 80000001h", f"jb {name}_done", "mov eax, 80000001h", "cpuid", "shr ecx, 5",
+             "and ecx, 1", "shl ecx, 2", "or r8d, ecx", f"{name}_done:", "mov eax, r8d", "pop rbx", "ret"]
+    return Function(name, lines, ["push rbx", ".pushreg rbx"], host_features=BITS_HOST_FEATURES)
+
+
+def bits_control(name, kind):
+    """A negative control: a bit operation or shift whose use the translator must refuse."""
+    body, reason = BITS_CONTROLS[kind]
+    return Function(name, [*body, "movzx eax, al", "mov QWORD PTR [r8], rax", "ret"], refused=reason)
+
+
+def generate_bits(seed, count):
+    """Exports made of bit-operation steps, then the host probe and six refused controls."""
+    rng = random.Random(seed)
+    functions = [bits_function(f"fuzz_bits_{index}", rng) for index in range(count)]
+    return [*functions, bits_host("fuzz_bits_host"), *(bits_control(f"fuzz_bits_refused_{kind}", kind)
+                                                       for kind in BITS_CONTROLS)]
+
+
 AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
          "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains"),
          "switches": (generate_switches, "cpu_fuzz_switches"),
          "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp"), "rsp": (generate_rsp, "cpu_fuzz_rsp"),
-         "loops": (generate_loops, "cpu_fuzz_loops"), "x87": (generate_x87, "cpu_fuzz_x87")}
+         "loops": (generate_loops, "cpu_fuzz_loops"), "x87": (generate_x87, "cpu_fuzz_x87"),
+         "bits": (generate_bits, "cpu_fuzz_bits")}
 
 
 def inputs_for(seed, area="leaf", signature=None):
@@ -1890,7 +2047,16 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
 
     functions = AREAS[area][0](seed, count)
     controls = [function for function in functions if function.refused]
-    functions = [function for function in functions if not function.refused and function.export]
+    probes = [function for function in functions if function.host_features is not None]
+    functions = [function for function in functions
+                 if not function.refused and function.export and function.host_features is None]
+    for probe in probes:
+        symbol = getattr(ctypes.CDLL(str(native)), probe.name)
+        symbol.restype = ctypes.c_uint64
+        features = symbol() & probe.host_features
+        if features != probe.host_features:
+            print(f"capability skip: {probe.name} reports {features:#b}, not {probe.host_features:#b}")
+            return 77
     libraries = [(native, ""), (lifted, "lifted_"), (o2, "lifted_")]
     if mutant is not None:
         libraries.append((mutant, "lifted_"))
@@ -2178,11 +2344,23 @@ def plant_subr_as_sub(lifter, image, functions):
     x87_lower.ARITHMETIC[M.FSUBR] = x87_lower.ARITHMETIC[M.FSUBRP] = "x87_sub"
 
 
+def plant_set_reset_swap(cpu_switch_aot, image, functions):
+    """Make BTS clear the selected bit and BTR set it.
+
+    This is a planted translator fault for the negative control: CF is still the selected bit before the
+    write, and BT and BTC are untouched, but the bit that BTS or BTR leaves in its base differs from native.
+    """
+    from iced_x86 import Mnemonic as M
+
+    tests = cpu_switch_aot.BIT_TESTS
+    tests[M.BTS], tests[M.BTR] = tests[M.BTR], tests[M.BTS]
+
+
 MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retarget", plant_call_retarget),
            "chains": ("swapped_arguments", plant_swapped_arguments),
            "switches": ("table_rotate", plant_table_rotate), "scalar_fp": ("minmax_swap", plant_minmax_swap),
            "rsp": ("stale_rsp", plant_stale_rsp), "loops": ("back_edge_exit", plant_back_edge_exit),
-           "x87": ("subr_as_sub", plant_subr_as_sub)}
+           "x87": ("subr_as_sub", plant_subr_as_sub), "bits": ("set_reset_swap", plant_set_reset_swap)}
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):
@@ -2193,7 +2371,8 @@ def translate(seed, count, image, output, area="leaf", mutant=False):
             raise SystemExit(f"no planted translator fault for --area {area}")
         MUTANTS[area][1](lifter, image, functions)
     # Negative controls stay in the image for the check to translate on their own.
-    functions = [function for function in functions if not function.refused and function.export]
+    functions = [function for function in functions
+                 if not function.refused and function.export and function.host_features is None]
     names = [export_name(function) for function in functions]
     try:
         source, _ = lifter.translate(Path(image), names)
