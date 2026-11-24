@@ -80,9 +80,10 @@ channels; the CPU decode is written from the format's bit fields and agrees with
 63,488 finite half-float patterns. The identity mapping (the old behaviour) fails the table; an sRGB view of the
 RGBA8 texture fails on the first texel (0x03 reads 0.0009, not 0.0118); a UNORM view of the half-float texture fails
 on the first texel (0x3c00 reads 0.2344, not 1.0). On origin/main the table fails for `R16G16B16A16_TYPELESS` (it
-maps to `UNKNOWN`) and for its surface check. Not covered: a presented 16-bit or 10-bit surface is shown but has
-no "Present mean" measure, and the device runs (`startup_present_view_warp`, `_hardware` and the three controls)
-have not been run on Windows for this change.
+maps to `UNKNOWN`) and for its surface check. Verified on Windows Server 2025 (WARP) in Debug and Release `/O2`
+(`startup_present_view`, `startup_present_view_warp`, and the three negative controls pass). Not covered: a
+presented 16-bit or 10-bit surface is shown but has no "Present mean" measure, and `startup_present_view_hardware`
+was skipped on the WARP-only runner.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_present_view' -V
