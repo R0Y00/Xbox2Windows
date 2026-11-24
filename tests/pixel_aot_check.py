@@ -2,6 +2,7 @@
 from fractions import Fraction
 from pathlib import Path
 import bisect
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -12455,7 +12456,25 @@ def f16_arith_detecting_program(mutation):
     raise AssertionError(f"No program separates {mutation}")
 
 
-def check_f16_arith_reference():
+def _check_f16_arith_reference_grid(slice_index=0, slice_count=1):
+    # One binary32 operation followed by one binary16 rounding equals the single rounding: the claim of the lowering.
+    # Every 97th finite value (plus the edges of each binade) against 48 boundary values, all four ops.
+    finite = [h for h in range(0x10000) if (h >> 10) & 31 != 31]
+    edges = [e << 10 | m for e in range(31) for m in (0, 1, 0x3ff)]
+    boundary = sorted({h | s for h in (0x0000, 0x0001, 0x0002, 0x0003, 0x03ff, 0x0400, 0x0401, 0x0800, 0x1000, 0x3bff,
+                                       0x3c00, 0x3c01, 0x4000, 0x6800, 0x7bff, 0x77ff, 0x0200, 0x0100, 0x2400, 0x5800,
+                                       0x1400, 0x0555, 0x0001 << 3, 0x01ff) for s in (0, 0x8000)})
+    half_a_values = [h for h in sorted({*finite[::97], *edges, *(e | 0x8000 for e in edges)})
+                     if (h >> 10) & 31 != 31]
+    for half_a in half_a_values[slice_index::slice_count]:
+        for half_b in boundary:
+            for op in F16_ARITH_OPS:
+                single = f16_arith_reference(op, half_a, half_b)
+                assert single == f16_arith_reference(op, half_a, half_b, double=True), (op, hex(half_a), hex(half_b))
+                assert single == pixel_aot.f16_vop2_result(op, half_a, half_b), (op, hex(half_a), hex(half_b))
+
+
+def check_f16_arith_reference(*, run_grid=True):
     """The Python side of the draw: the reference against pinned rows, double rounding and the translator's own copy."""
     assert F16_DENORM_MODE == pixel_aot.HALF_DENORM_PRESERVE
     assert len(F16_ARITH_PAIRS) == 40 and len(set(F16_ARITH_PAIRS)) == 40
@@ -12481,21 +12500,8 @@ def check_f16_arith_reference():
             assert result is not None and result & 0x7c00 != 0x7c00, (op, hex(half_a), hex(half_b))
             assert result == pixel_aot.f16_vop2_result(op, half_a, half_b), (op, hex(half_a), hex(half_b))
             assert result == f16_arith_reference(op, *words, double=True), (op, hex(half_a), hex(half_b))
-    # One binary32 operation followed by one binary16 rounding equals the single rounding: the claim of the lowering.
-    # Every 97th finite value (plus the edges of each binade) against 48 boundary values, all four ops.
-    finite = [h for h in range(0x10000) if (h >> 10) & 31 != 31]
-    edges = [e << 10 | m for e in range(31) for m in (0, 1, 0x3ff)]
-    boundary = sorted({h | s for h in (0x0000, 0x0001, 0x0002, 0x0003, 0x03ff, 0x0400, 0x0401, 0x0800, 0x1000, 0x3bff,
-                                       0x3c00, 0x3c01, 0x4000, 0x6800, 0x7bff, 0x77ff, 0x0200, 0x0100, 0x2400, 0x5800,
-                                       0x1400, 0x0555, 0x0001 << 3, 0x01ff) for s in (0, 0x8000)})
-    for half_a in sorted({*finite[::97], *edges, *(e | 0x8000 for e in edges)}):
-        if (half_a >> 10) & 31 == 31:
-            continue
-        for half_b in boundary:
-            for op in F16_ARITH_OPS:
-                single = f16_arith_reference(op, half_a, half_b)
-                assert single == f16_arith_reference(op, half_a, half_b, double=True), (op, hex(half_a), hex(half_b))
-                assert single == pixel_aot.f16_vop2_result(op, half_a, half_b), (op, hex(half_a), hex(half_b))
+    if run_grid:
+        _check_f16_arith_reference_grid(0, 1)
     assert [f16_widen_word(h) for h in (0x3c00, 0x0001, 0x8000, 0xbc00, 0x7bff)] == [
         0x3f800000, 0x33800000, 0x80000000, 0xbf800000, 0x477fe000]
 
@@ -12525,9 +12531,10 @@ def check_f16_arith_mutation_coverage():
     assert not differs("flush_in", "add", 0x3c00, 0x3c00) and not differs("ties_away", "add", 0x3c00, 0x3c00)
 
 
-def check_f16_arith_controls():
+def check_f16_arith_controls(*, run_reference=True):
     """Lowering, spelling, input proof, overflow, mode and reader refusals of the plain binary16 VOP2 forms."""
-    check_f16_arith_reference()
+    if run_reference:
+        check_f16_arith_reference()
     check_f16_arith_mutation_coverage()
     prefix = ["v_mov_b32_e32 v18, 0x35553c00", "v_mov_b32_e32 v19, 0xd1a74000", "s_mov_b32 s60, 0x3555c000"]
 
@@ -14416,25 +14423,7 @@ def check_unbound_operand_diagnostics():
             raise AssertionError(f"{key} was accepted")
 
 
-def check_controls(directory):
-    check_unbound_operand_diagnostics()
-    check_dpp_cvt_refusals()
-    check_dpp_f16_contract_controls()
-    check_smem_pointer_controls()
-    check_masked_controls()
-    check_masked_mov_close_controls()
-    check_masked_else_controls()
-    check_scc_skip_controls()
-    check_cmpx_controls()
-    check_shift64_controls()
-    check_region_body_controls()
-    check_region_wait_controls()
-    check_region_scalar_alu_controls()
-    check_region_scalar_load_controls()
-    check_pk_fmac_controls()
-    check_title_load_controls()
-    check_ds_swizzle_controls()
-    check_ds_nop_controls()
+def _check_controls_inline(directory):
     for mask in (0x3, 0xC, 0xF):
         program = compressed_export(mask)
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
@@ -14475,8 +14464,6 @@ def check_controls(directory):
     ]))
     assert dpp_ternary.count("QuadReadAcrossX(") == 1 and dpp_ternary.count("QuadReadLaneAt(") == 1
     assert not any("?" in line and "QuadRead" in line for line in dpp_ternary.splitlines())
-    check_f16_denorm_controls()
-    check_vopc_e32_destination()
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
                           ("0x00700000, v18, v19", "0x00700000, v18")):
@@ -14493,18 +14480,7 @@ def check_controls(directory):
     must_reject(lambda p: lower(p, 20, 24, None), assembly(False))
     must_reject(translate_buffer_color, [s for s in program if s != "s_waitcnt lgkmcnt(0)"])
     must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
-    check_bit_controls()
-    check_scheduling_hints()
-    check_mode_register_controls()
-    check_constant_descriptor_bounds()
-    check_scalar_constant_reads()
-    check_three_constant_buffers()
-    check_affine_coordinates()
-    check_scalar_helpers_with_vector_arithmetic()
     check_adapter_skip(directory)
-    check_scalar_pair_reads()
-    check_readfirstlane_controls()
-    check_flat_scratch_controls()
     # Whole-dword SDWA comparisons lower exactly as the e32 forms; byte and word selections are refused.
     for first in range(0, 16, 4):
         assert translate(predicate_group(first, sdwa=True)) == translate(predicate_group(first)), first
@@ -14623,19 +14599,6 @@ def check_controls(directory):
             f"{op} v12, s44, v18, s46 clamp",
         ):
             must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop3]))
-    check_nc_integer_lowering()
-    check_e64_integer_lowering()
-    check_carry_out_lowering()
-    check_carry_in_lowering()
-    check_mad64_lowering()
-    check_cvt_f64_int_lowering()
-    check_cvt_f64_f32_lowering()
-    check_cvt_int_f64_lowering()
-    check_sdwa_integer_lowering()
-    check_pack_int16_lowering()
-    check_sat_pack_u8_lowering()
-    check_pack_b32_lowering()
-    check_sad_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
     for expected in (
@@ -14727,7 +14690,6 @@ def check_controls(directory):
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
     must_reject(translate, with_constants(["v_cvt_f32_f16_e32 v12, 1.0"]))
     must_reject(translate, with_constants(["v_cvt_f32_f16_sdwa v12, s44 src0_sel:WORD_1"]))
-    check_scalar_controls()
     # v_cvt_f16_f32 keeps the destination's high half and narrows the modified source through narrow16.
     body = translate(with_constants(NARROW_BODY)).split("float4 main", 1)[1]
     assert body.count("narrow16(") == 3 and body.count("& 0xffff0000u) | narrow16(") == 3, body
@@ -15060,7 +15022,6 @@ def check_controls(directory):
     for old, new in (("v_sqrt_f32_e32 v18, v18", "v_sqrt_f32_e32 v18, v18, v18"),
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
-    check_three_way_templates()
     source = translate(three_way())
     for expected in ("max(min(params[1].z, sample16.y), min(max(params[1].z, sample16.y), sample16.x))",
                      "max(max(sample16.x, sample16.z), sample16.y)",
@@ -15200,7 +15161,6 @@ def check_controls(directory):
     # A partial UNUSED_PRESERVE result needs a tracked numeric destination, as for SDWA moves.
     for register in ("v0", "v8", "v20"):
         must_reject(translate, with_constants([sdwa_arith("floor", register, ["s44"], "BYTE_2", "UNUSED_PRESERVE")]))
-    check_sdwa_unary_lowering()
 
     program = assembly(False)
     for old, new in (("s_mov_b32 s21, 0", "s_mov_b32 s21, 1"),
@@ -15224,7 +15184,6 @@ def check_controls(directory):
     must_reject(translate, ["s_waitcnt_expcnt null, invalid"] + program)
     must_reject(translate, ["s_waitcnt expcnt(8)"] + program)
     check_sopk_waitcnt(program)
-    check_s_version()
 
     wait = program.index("s_waitcnt vmcnt(0)")
     overwrite = "v_floor_f32_e32 v13, 1.0"
@@ -15318,9 +15277,6 @@ def check_controls(directory):
     assert body.count("mad32(") == 4 and " mad(" not in body, body
     must_reject(translate, with_constants(["v_mad_f32 v12, s44, s45"]))
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
-    check_e64_approx_lowering()
-    check_mac_legacy_lowering()
-    check_dpp_vop3_only_refused()
     # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
     # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
     body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
@@ -15969,9 +15925,6 @@ def check_controls(directory):
     pos = base16.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, 0, 0"] + base16[pos:])
 
-    check_cmp64_controls()
-    check_cmpf64_controls()
-
     f16_hlsl = translate_int(uncompressed_export(f16_compares()))
     assert "uint class16(uint bits)" in f16_hlsl and "float widen16(uint word)" in f16_hlsl
     for words in F16_COMPARE_SETS:
@@ -16165,13 +16118,158 @@ def check_controls(directory):
     must_reject(translate, base_m24[:lgkm] + ["v_mul_u32_u24_e64 v20, s44, 2"] + base_m24[lgkm:])
     wqm = base_m24.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_m24[:wqm] + ["v_mul_hi_i32_i24_e64 v20, 1, 2"] + base_m24[wqm:])
-    check_int16_vop3_controls()
-    check_int16_ternary_controls()
-    check_f16_arith_controls()
-    check_f16_round_controls()
-    check_f16_fmac_ldexp_controls()
-    check_f16_cvt_int_controls()
-    check_f16_to_int_controls()
+
+
+_CONTROL_SUBCHECKS = (
+    "check_unbound_operand_diagnostics",
+    "check_dpp_cvt_refusals",
+    "check_dpp_f16_contract_controls",
+    "check_smem_pointer_controls",
+    "check_masked_controls",
+    "check_masked_mov_close_controls",
+    "check_masked_else_controls",
+    "check_scc_skip_controls",
+    "check_cmpx_controls",
+    "check_shift64_controls",
+    "check_region_body_controls",
+    "check_region_wait_controls",
+    "check_region_scalar_alu_controls",
+    "check_region_scalar_load_controls",
+    "check_pk_fmac_controls",
+    "check_title_load_controls",
+    "check_ds_swizzle_controls",
+    "check_ds_nop_controls",
+    "check_f16_denorm_controls",
+    "check_vopc_e32_destination",
+    "check_bit_controls",
+    "check_scheduling_hints",
+    "check_mode_register_controls",
+    "check_constant_descriptor_bounds",
+    "check_scalar_constant_reads",
+    "check_three_constant_buffers",
+    "check_affine_coordinates",
+    "check_scalar_helpers_with_vector_arithmetic",
+    "check_scalar_pair_reads",
+    "check_readfirstlane_controls",
+    "check_flat_scratch_controls",
+    "check_nc_integer_lowering",
+    "check_e64_integer_lowering",
+    "check_carry_out_lowering",
+    "check_carry_in_lowering",
+    "check_mad64_lowering",
+    "check_cvt_f64_int_lowering",
+    "check_cvt_f64_f32_lowering",
+    "check_cvt_int_f64_lowering",
+    "check_sdwa_integer_lowering",
+    "check_pack_int16_lowering",
+    "check_sat_pack_u8_lowering",
+    "check_pack_b32_lowering",
+    "check_sad_lowering",
+    "check_scalar_controls",
+    "check_three_way_templates",
+    "check_sdwa_unary_lowering",
+    "check_s_version",
+    "check_e64_approx_lowering",
+    "check_mac_legacy_lowering",
+    "check_dpp_vop3_only_refused",
+    "check_cmp64_controls",
+    "check_cmpf64_controls",
+    "check_int16_vop3_controls",
+    "check_int16_ternary_controls",
+    "check_f16_arith_controls",
+    "check_f16_round_controls",
+    "check_f16_fmac_ldexp_controls",
+    "check_f16_cvt_int_controls",
+    "check_f16_to_int_controls",
+)
+
+_PRIORITY_SUBCHECKS = (
+    "check_s_version",
+    "check_f16_round_controls",
+    "check_f16_fmac_ldexp_controls",
+    "check_f16_cvt_int_controls",
+    "check_f16_to_int_controls",
+)
+
+
+def _control_tasks():
+    """Return parallel control tasks ordered longest-first to avoid tail stragglers."""
+    grid_shards = 4
+    tasks = [("f16_arith_grid", (i, grid_shards)) for i in range(grid_shards)]
+    tasks.extend(("fn", name) for name in _PRIORITY_SUBCHECKS)
+    tasks.append(("f16_arith_controls_no_ref", None))
+    tasks.append(("f16_arith_ref_head", None))
+    special = set(_PRIORITY_SUBCHECKS) | {"check_f16_arith_controls"}
+    tasks.extend(("fn", name) for name in _CONTROL_SUBCHECKS if name not in special)
+    return tasks
+
+
+def _run_control_subcheck(task):
+    """Execute one independent control sub-task in a worker and return its accepted words."""
+    ACCEPTED.clear()
+    kind, arg = task
+    if kind == "fn":
+        globals()[arg]()
+    elif kind == "f16_arith_controls_no_ref":
+        check_f16_arith_controls(run_reference=False)
+    elif kind == "f16_arith_ref_head":
+        check_f16_arith_reference(run_grid=False)
+    elif kind == "f16_arith_grid":
+        slice_index, slice_count = arg
+        _check_f16_arith_reference_grid(slice_index, slice_count)
+    else:
+        raise ValueError(f"Unknown control sub-task: {kind!r}")
+    return set(ACCEPTED)
+
+
+def _run_controls_serial():
+    for name in _CONTROL_SUBCHECKS:
+        globals()[name]()
+
+
+def check_controls(directory, *, parallel=True):
+    tasks = _control_tasks()
+    cpu_count = os.cpu_count() or 1
+    # ProcessPoolExecutor on Windows enforces max_workers <= 61 (_MAX_WINDOWS_WORKERS).
+    workers = min(cpu_count, len(tasks), 61)
+    if not parallel or workers <= 1 or os.environ.get("X2W_SERIAL_CONTROLS") == "1":
+        _check_controls_inline(directory)
+        _run_controls_serial()
+        return
+    try:
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+    except (OSError, PermissionError, NotImplementedError):
+        _check_controls_inline(directory)
+        _run_controls_serial()
+        return
+    futures = []
+    with executor:
+        # Workers start lazily inside submit(), so a refusal to start a process or thread
+        # (for example RLIMIT_NPROC) surfaces here, not in the constructor. submit() runs no
+        # check, so any error from it is a startup failure and takes the serial fallback.
+        try:
+            for task in tasks:
+                futures.append((task, executor.submit(_run_control_subcheck, task)))
+        except Exception:
+            for _, pending in futures:
+                pending.cancel()
+            futures = None
+        if futures is not None:
+            try:
+                _check_controls_inline(directory)
+                for task, future in futures:
+                    try:
+                        ACCEPTED.update(future.result())
+                    except Exception as error:
+                        raise RuntimeError(f"Control sub-check {task!r} failed") from error
+            except BaseException:
+                for _, pending in futures:
+                    pending.cancel()
+                raise
+            return
+    # Leaving the with block waited for any task already started; its result is discarded.
+    _check_controls_inline(directory)
+    _run_controls_serial()
 
 
 def check_program_extent(directory, library):
