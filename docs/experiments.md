@@ -5777,6 +5777,13 @@ uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed 
 restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
 conversion's output modifier inside an SDWA form is still refused rather than dropped.
 
+**The high half of an unsigned product.** `v_mul_hi_u32` had no lowering, so the form refused - one of the
+remaining refused shaders in the first main-game loading-screen cache (#870, issue #1792). It now lowers to
+a halfword-product helper carried in the shader preamble: the helper computes the high 32 bits by carrying
+the low halfword product into the two cross products, because HLSL has no 64-bit multiply in these stages
+and the low half of `a * b` is not the high half. The register and literal forms both lower; `v_mul_lo_u32`
+is unchanged. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mul_hi$' -V`.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
