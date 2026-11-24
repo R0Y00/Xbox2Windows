@@ -225,11 +225,10 @@ def controls():
     refused('d16', 'image_sample_l modifier d16')  # half-precision result layout
     refused('r128', 'image_sample_l modifier r128')  # four-dword resource descriptor
     refused('dmask0', 'empty dmask')
-    refused('dim1d', 'unverified 1D image sample address or modifiers')
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
-    print('refused: offset, compare, gather, cube, 1D, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+    print('refused: offset, compare, gather, cube, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.
     for name in ('glc', 'slc', 'dlc'):

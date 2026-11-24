@@ -699,14 +699,19 @@ class Stage:
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
         three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY')
+        axes = 1 if one else 3 if three else 2  # address components before the level of the explicit-level forms
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
-            raise Unsupported('unverified 1D image sample address or modifiers')
+        # A 1D texture takes one address component (x), then the level for image_sample_l and image_load_mip.
+        # Only the cache-policy bits (glc, slc, dlc) are accepted next to dim and dmask; every other modifier would
+        # change the address or the result layout and is refused.
+        if one and (not dmask or any(not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')) for m in mods)
+                    or len(cs) != (2 if how in ('l', 'load_mip') else 1)):
+            raise Unsupported('unverified 1D image address or modifiers')
         lod = None
         if how == 'l':
             # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
@@ -719,14 +724,13 @@ class Stage:
                     raise Unsupported('image_sample_l modifier %s' % m)
             if dmask == 0:
                 raise Unsupported('image_sample_l with an empty dmask')
-            if len(cs) != (4 if three else 3):
+            if len(cs) != axes + 1:
                 raise Unsupported('image_sample_l with %d address registers' % len(cs))
             lod, cs = cs[-1], cs[:-1]
         tex = self.pipe.resource(self.descriptor(ops[2]), kinds[dim])
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
-            axes = 3 if three else 2
             mip = '0'
             if how == 'load_mip':
                 unsupported = [m for m in mods if not m.startswith(('dim:', 'dmask:'))
