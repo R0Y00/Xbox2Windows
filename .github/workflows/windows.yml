@@ -225,6 +225,7 @@ jobs:
       # per-PR copy, which filled the repository cache limit. The cache is saved right after the
       # build, before the tests, so a run that later times out still leaves a warm cache behind.
       - name: Restore compiler cache
+        id: sccache-restore
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -246,7 +247,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
       - name: Save compiler cache
-        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.build.outcome != 'skipped' }}
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.build.outcome != 'skipped' && steps.sccache-restore.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -349,6 +350,7 @@ jobs:
       # per-PR copy, which filled the repository cache limit. The cache is saved right after the
       # build, before the tests, so a run that later times out still leaves a warm cache behind.
       - name: Restore compiler cache
+        id: sccache-restore
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -370,7 +372,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
       - name: Save compiler cache
-        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.build.outcome != 'skipped' }}
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.build.outcome != 'skipped' && steps.sccache-restore.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
