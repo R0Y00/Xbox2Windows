@@ -4251,6 +4251,198 @@ def check_sdwa_predicate_draws(directory, compiler, renderer, backend):
             raise
 
 
+# Integer SDWA comparisons (v_cmp_*_{i32,u32,i16,u16}_sdwa). Each channel compares a selected field of A (s44, copied to
+# v20) with a selected field of B (s45, copied to v18) and selects 1.0 (s47) or 0 into its channel. The five selection
+# configurations are (src0_sel, src0 sext, src1_sel, src1 sext); channels cycle through them so every program mixes byte
+# and word fields, sign- and zero-extension, and a whole-dword source.
+SDWA_INT_CONFIGS = (
+    ("BYTE_1", True, "BYTE_2", False),
+    ("WORD_1", False, "WORD_0", True),
+    ("BYTE_3", True, "WORD_1", False),
+    ("WORD_0", True, "BYTE_0", False),
+    ("DWORD", False, "BYTE_3", True),
+)
+SDWA_INT_SEL = {"BYTE_0": (0, 8), "BYTE_1": (8, 8), "BYTE_2": (16, 8), "BYTE_3": (24, 8),
+                "WORD_0": (0, 16), "WORD_1": (16, 16), "DWORD": (0, 32)}
+INT16_PREDICATES = ("lt", "eq", "le", "gt", "ne", "ge")
+# Programs by kind: four relations each. gfx10 has no f/t forms at 16 bits, so the second 16-bit program repeats lt
+# and gt under other selection configurations.
+SDWA_INT_PROGRAMS = {
+    "i32": (INT_PREDICATES[:4], INT_PREDICATES[4:]),
+    "u32": (INT_PREDICATES[:4], INT_PREDICATES[4:]),
+    "i16": (INT16_PREDICATES[:4], (*INT16_PREDICATES[4:], "lt", "gt")),
+    "u16": (INT16_PREDICATES[:4], (*INT16_PREDICATES[4:], "lt", "gt")),
+}
+# (A, B) as normal binary32 words or +0.0, so no float move can flush or quiet them. Their byte and halfword fields
+# take both signs and equal values under several selections; the last three pairs put the high half of A below and at
+# the low half of B and make every field equal, and the last one puts it between B's low half zero-extended and
+# sign-extended. In the final pair A's high half equals B's low half as 16 bits but not once that half is
+# sign-extended to 32 bits.
+SDWA_INT_PAIRS = (
+    (0x3f80ff7f, 0xbf8001ff),
+    (0xc07f8000, 0x40ff7f80),
+    (0x3fff8001, 0x3fff8001),
+    (0xbf00807f, 0x3f7f0080),
+    (0x40017fff, 0xc0018000),
+    (0x3e80fffe, 0x3e81ffff),
+    (0xc0ff0040, 0x40400040),
+    (0x3f7f8080, 0xbf80807f),
+    (0x3f800000, 0x40007fff),
+    (0x3f800000, 0x40003f80),
+    (0x00000000, 0x00000000),
+    (0xc07f8000, 0x40ff9000),
+    (0xc07f8000, 0x40ffc07f),
+)
+
+
+def sdwa_int_configs(kind, program):
+    count = len(SDWA_INT_PROGRAMS[kind][program])
+    start = 4 * program
+    return tuple(SDWA_INT_CONFIGS[(start + channel) % len(SDWA_INT_CONFIGS)] for channel in range(count))
+
+
+def sdwa_int_predicate_group(kind, program):
+    body = ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s47", "v_mov_b32_e32 v20, s44"]
+    ops = SDWA_INT_PROGRAMS[kind][program]
+    for channel, (op, (sel0, sext0, sel1, sext1)) in enumerate(zip(ops, sdwa_int_configs(kind, program))):
+        src0 = "sext(v20)" if sext0 else "v20"
+        src1 = "sext(v18)" if sext1 else "v18"
+        body.extend([f"v_cmp_{op}_{kind}_sdwa vcc_lo, {src0}, {src1} src0_sel:{sel0} src1_sel:{sel1}",
+                     f"v_cndmask_b32_e32 v{12 + channel}, 0, v19, vcc_lo"])
+    return with_constants(body)
+
+
+def sdwa_int_field(word, sel, sext):
+    offset, width = SDWA_INT_SEL[sel]
+    value = (word >> offset) & ((1 << width) - 1)
+    if sext and width < 32 and value >> (width - 1):
+        value -= 1 << width
+    return value & 0xffffffff
+
+
+def sdwa_int_compare_value(word, kind):
+    if kind in ("i16", "u16"):
+        word &= 0xffff
+        return word - 0x10000 if kind == "i16" and word & 0x8000 else word
+    return word - (1 << 32) if kind == "i32" and word & 0x80000000 else word
+
+
+def sdwa_int_holds(op, left, right):
+    return {"f": False, "lt": left < right, "eq": left == right, "le": left <= right, "gt": left > right,
+            "ne": left != right, "ge": left >= right, "t": True}[op]
+
+
+def sdwa_int_expected(kind, program, a, b, *, selections=True, sext=True, compare_kind=None):
+    """The four channels as 0.0 or 1.0. The keyword arguments describe wrong models for the negative controls."""
+    compare_kind = compare_kind or kind
+    result = []
+    for op, (sel0, sext0, sel1, sext1) in zip(SDWA_INT_PROGRAMS[kind][program], sdwa_int_configs(kind, program)):
+        if not selections:
+            sel0 = sel1 = "DWORD"
+        left = sdwa_int_compare_value(sdwa_int_field(a, sel0, sext and sext0), compare_kind)
+        right = sdwa_int_compare_value(sdwa_int_field(b, sel1, sext and sext1), compare_kind)
+        result.append(1.0 if sdwa_int_holds(op, left, right) else 0.0)
+    return result
+
+
+SDWA_INT_SWAPPED_KIND = {"i32": "u32", "u32": "i32", "i16": "u16", "u16": "i16"}
+SDWA_INT_WIDE_KIND = {"i16": "i32", "u16": "u32"}
+
+
+def sdwa_int_wrong_models(kind):
+    """(label, keyword arguments for sdwa_int_expected) for the models a wrong lowering would follow."""
+    models = [("selections ignored", {"selections": False}), ("sext() ignored", {"sext": False}),
+              ("signedness swapped", {"compare_kind": SDWA_INT_SWAPPED_KIND[kind]})]
+    if kind in SDWA_INT_WIDE_KIND:
+        models.append(("whole selected word compared", {"compare_kind": SDWA_INT_WIDE_KIND[kind]}))
+    return models
+
+
+def check_sdwa_int_predicate_draws(directory, compiler, renderer, backend):
+    """Draw the 28 integer SDWA comparisons. Every program runs on each pair of SDWA_INT_PAIRS, and for each wrong
+    model the first pair on which that model gives other channels is drawn against the wrong reference, which must
+    report a mismatch. On a desktop GPU the draws establish that the translated shader computes the stated
+    comparisons, not what the console does."""
+    source = directory / "sdwa_int_predicates.hlsl"
+    shader = directory / "sdwa_int_predicates.cso"
+    for kind, programs in SDWA_INT_PROGRAMS.items():
+        for program in range(len(programs)):
+            source.write_text(translate(sdwa_int_predicate_group(kind, program)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            cases = []
+
+            def add_case(a, b, pixel, status, label):
+                constants = bytearray(256)
+                struct.pack_into("<IIff", constants, 12, a, b, 0.0, 1.0)
+                case = directory / f"sdwa_int_predicates-{kind}-{program}-{len(cases)}-{label}.case"
+                case.write_bytes(constants + struct.pack("<4f", *pixel) * 64)
+                cases.append((case, status))
+
+            for a, b in SDWA_INT_PAIRS:
+                add_case(a, b, sdwa_int_expected(kind, program, a, b), "pass", f"{a:08x}-{b:08x}")
+            for label, model in sdwa_int_wrong_models(kind):
+                pair = next(((a, b) for a, b in SDWA_INT_PAIRS
+                             if sdwa_int_expected(kind, program, a, b, **model) != sdwa_int_expected(kind, program, a, b)),
+                            None)
+                assert pair is not None, (kind, program, label)
+                add_case(*pair, sdwa_int_expected(kind, program, *pair, **model), "mismatch", label.replace(" ", "-"))
+            try:
+                run_pixel_batch(renderer, backend, shader, cases)
+            except AssertionError as error:
+                error.add_note(f"SDWA integer predicate draw on {backend}, {kind} program {program}")
+                raise
+    return 0
+
+
+def check_sdwa_int_compare_lowering():
+    """Static checks for the integer SDWA comparisons: the 28 forms, their field selections and the refusals."""
+    forms = {f"v_cmp_{op}_{kind}_sdwa" for kind, programs in SDWA_INT_PROGRAMS.items()
+             for ops in programs for op in ops}
+    assert len(forms) == 28, len(forms)
+    # Every relation sees both answers on the pairs, so no channel is constant over the draw.
+    for kind, programs in SDWA_INT_PROGRAMS.items():
+        for program in range(len(programs)):
+            columns = list(zip(*(sdwa_int_expected(kind, program, a, b) for a, b in SDWA_INT_PAIRS)))
+            for op, column in zip(programs[program], columns):
+                if op not in ("f", "t"):
+                    assert set(column) == {0.0, 1.0}, (kind, program, op, column)
+    # The field extraction and the comparison type in the emitted HLSL. v20 (A) is alu22 and v18 (B) is alu20.
+    a, b = "asuint(alu22)", "asuint(alu20)"
+    lines = translate(sdwa_int_predicate_group("i16", 0)).splitlines()
+    # BYTE_1 of A sign-extended, BYTE_2 of B zero-extended, then the low 16 bits of each compared as signed.
+    expected = (f"    bool cmp23 = (asint(asuint(asint({a} << 16u) >> 24u) << 16) >> 16) < "
+                f"(asint((({b} >> 16u) & 0xffu) << 16) >> 16);")
+    assert expected in lines, [line for line in lines if "cmp23" in line]
+    lines = translate(sdwa_int_predicate_group("u32", 0)).splitlines()
+    # BYTE_3 of A sign-extended, WORD_1 of B zero-extended, compared as unsigned words; f is constant false.
+    assert "    bool cmp23 = false;" in lines
+    expected = f"    bool cmp27 = asuint(asint({a} << 0u) >> 24u) == (({b} >> 16u) & 0xffffu);"
+    assert expected in lines, [line for line in lines if "cmp27" in line]
+    # The e32 comparison on whole dwords is the SDWA one with DWORD selections.
+    plain = translate(with_constants(["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v20, s44",
+                                      "v_cmp_lt_i32_e32 vcc_lo, v20, v18", "v_cndmask_b32_e32 v12, 0, v18, vcc_lo"]))
+    sdwa = translate(with_constants(["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v20, s44",
+                                     "v_cmp_lt_i32_sdwa vcc_lo, v20, v18 src0_sel:DWORD src1_sel:DWORD",
+                                     "v_cndmask_b32_e32 v12, 0, v18, vcc_lo"]))
+    assert plain == sdwa
+    setup = ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v20, s44"]
+    for bad in (
+        "v_cmp_f_i16_sdwa vcc_lo, v20, v18 src0_sel:WORD_0 src1_sel:WORD_0",
+        "v_cmp_t_u16_sdwa vcc_lo, v20, v18 src0_sel:WORD_0 src1_sel:WORD_0",
+        "v_cmp_lt_i32_sdwa vcc_lo, sext(v20, v18 src0_sel:BYTE_0 src1_sel:BYTE_0",
+        "v_cmp_lt_i32_sdwa vcc_lo, v20, 1 src0_sel:BYTE_0 src1_sel:DWORD",
+        "v_cmp_lt_i32_sdwa vcc_lo, -v20, v18 src0_sel:BYTE_0 src1_sel:DWORD",
+        "v_cmp_lt_u32_sdwa vcc_lo, v20, v18 src0_sel:BYTE_0",
+        "v_cmp_lt_u32_sdwa vcc_lo, v20, v18 src0_sel:BYTE_4 src1_sel:BYTE_0",
+        "v_cmp_lt_u32_sdwa vcc_lo, v20, v106 src0_sel:BYTE_0 src1_sel:BYTE_0",
+        "v_cmp_lt_u32_sdwa exec_lo, v20, v18 src0_sel:BYTE_0 src1_sel:BYTE_0",
+        "v_cmpx_lt_u32_sdwa v20, v18 src0_sel:BYTE_0 src1_sel:BYTE_0",
+        "v_cmp_lt_i64_sdwa vcc_lo, v20, v18 src0_sel:BYTE_0 src1_sel:BYTE_0",
+    ):
+        translate(with_constants([*setup, "v_cmp_lt_u32_sdwa vcc_lo, v20, v18 src0_sel:BYTE_0 src1_sel:BYTE_0"]))
+        must_reject(translate, with_constants([*setup, bad]))
+
+
 def half_rtz(x):
     bits, = struct.unpack("<H", struct.pack("<e", x))
     rounded, = struct.unpack("<e", struct.pack("<H", bits))
@@ -16291,6 +16483,7 @@ _CONTROL_SUBCHECKS = (
     "check_sat_pack_u8_lowering",
     "check_pack_b32_lowering",
     "check_sad_lowering",
+    "check_sdwa_int_compare_lowering",
     "check_scalar_controls",
     "check_three_way_templates",
     "check_sdwa_unary_lowering",
@@ -22139,7 +22332,7 @@ def main():
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-cvt-int-f64", "draw-pack-int16", "draw-pack-b32",
-                    "draw-sad",
+                    "draw-sad", "draw-sdwa-int-compare",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-cmpx-e64", "draw-scc-skip",
@@ -22172,6 +22365,7 @@ def main():
                         "draw-pack-int16": check_pack_int16_draws,
                         "draw-pack-b32": check_pack_b32_draw,
                         "draw-sad": check_sad_draws,
+                        "draw-sdwa-int-compare": check_sdwa_int_predicate_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-int16-ternary": check_int16_ternary_draw,
                         "draw-f16-arith": check_f16_arith_draw,

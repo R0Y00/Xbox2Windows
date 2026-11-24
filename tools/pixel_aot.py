@@ -5046,6 +5046,39 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    bool cmp{i} = {expr};")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32|i16|u16)_sdwa {LANE_MASK}, {SDWA_INT_SOURCE}, "
+                        rf"{SDWA_INT_SOURCE} src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD) src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # Integer SDWA comparisons: each source is its selected field, zero-extended or sign-extended under
+            # sext() (sdwa_source), and the comparison is the e32 one on those words. The 16-bit comparisons read
+            # the low 16 bits of the selected word, as their e32 forms read the low half of the register; gfx10
+            # has no f/t forms at that width. Sources are registers; constants, clamp and float modifiers are refused.
+            op, kind, dst, sext0, src0, close0, sext1, src1, close1, sel0, sel1 = m.groups()
+            if kind in ("i16", "u16") and op in ("f", "t"):
+                raise ValueError(f"Unsupported instruction: v_cmp_{op}_{kind}_sdwa")
+            if bool(sext0) != bool(close0) or bool(sext1) != bool(close1):
+                raise ValueError("Unbalanced sext() on an SDWA source")
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = []
+            for token, sel, sext in ((src0, sel0, sext0), (src1, sel1, sext1)):
+                if sel == "DWORD":
+                    # A whole-dword source (sext() changes nothing) is read exactly as the e32 form reads it.
+                    read = int16_operand if kind in ("i16", "u16") else int_operand
+                    values.append(read(token, scalar, vector, pending, sample_dest, signed=kind in ("i32", "i16")))
+                    continue
+                word = sdwa_source(int_operand(token, scalar, vector, pending, sample_dest, signed=False), sel, bool(sext))
+                if kind == "i32":
+                    values.append(f"asint({word})")
+                elif kind == "i16":
+                    values.append(f"(asint({word} << 16) >> 16)")
+                elif kind == "u16":
+                    values.append(f"({word} & 0xffffu)")
+                else:
+                    values.append(word)
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32_sdwa {LANE_MASK}, ([^,]+), ([^,]+) src0_sel:DWORD src1_sel:DWORD"):
             # With whole-dword selections the SDWA comparison is the e32/e64 one; byte and word selections
             # would compare zero-extended fields as binary32 and are refused.
