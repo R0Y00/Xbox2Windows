@@ -979,6 +979,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
 void discard_draw_sampler_heaps(Wrapper* self);
+void ensure_sampler_heap_for_root(Wrapper* self, ID3D12GraphicsCommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
 bool shader_dump_dir(wchar_t* out, DWORD size);
@@ -1415,6 +1416,20 @@ std::unordered_map<const Wrapper*, std::vector<RootParameter>>& root_infos()
     static std::unordered_map<const Wrapper*, std::vector<RootParameter>> map;
     return map;
 }
+std::unordered_map<const Wrapper*, UINT>& root_flag_map()
+{
+    static std::unordered_map<const Wrapper*, UINT> map;
+    return map;
+}
+// The D3D12_ROOT_SIGNATURE_FLAGS a title root signature was created with (0 when unknown).
+UINT root_flags_of(const Wrapper* root)
+{
+    AcquireSRWLockShared(&root_lock);
+    const auto found = root_flag_map().find(root);
+    const UINT flags = found == root_flag_map().end() ? 0 : found->second;
+    ReleaseSRWLockShared(&root_lock);
+    return flags;
+}
 const std::vector<RootParameter>* root_info(const Wrapper* root)
 {
     AcquireSRWLockShared(&root_lock);
@@ -1442,10 +1457,12 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     Wrapper* w = wrap(root, root_signature_kind);
     note_root_blob(w, blob, size);
     std::vector<RootParameter> parameters;
+    UINT flags = 0;
     ID3D12VersionedRootSignatureDeserializer* deserializer = nullptr;
     if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&deserializer)))) {
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
         if (SUCCEEDED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
+            flags = desc->Desc_1_1.Flags;
             for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
                 const auto& parameter = desc->Desc_1_1.pParameters[i];
                 RootParameter info{parameter.ParameterType, 0, 0};
@@ -1470,6 +1487,7 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     }
     AcquireSRWLockExclusive(&root_lock);
     root_infos()[w] = std::move(parameters);
+    root_flag_map()[w] = flags;
     ReleaseSRWLockExclusive(&root_lock);
     *out = w;
     return S_OK;
@@ -1717,8 +1735,12 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
         std::fill_n(pass.root_address, 16, 0);
     pass.root = params;
     pass.srv_bound = 0;
-    if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
+    if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real) {
+        // The desktop list never receives the title's heaps, so a sampler-heap-indexed root signature
+        // would be set with no sampler heap bound (debug layer ID 1419): give the list a default one first.
+        if (x2w_startup::root_indexes_sampler_heap(root_flags_of(w))) ensure_sampler_heap_for_root(self, list);
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
+    }
 }
 DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
 {

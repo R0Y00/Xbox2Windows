@@ -10652,3 +10652,12 @@ Command-list slot 42 records the address of a root parameter declared as a CBV, 
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_root_cbv_(warp|hardware)$" -V
 ```
+
+## Default sampler heap for sampler-heap-indexed root signatures
+
+A title root signature flagged `D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED` is set by command-list slot 34 with a one-entry default sampler heap bound first when the list has none, so the debug layer no longer reports message ID 1419 for it. The fixture (`tests/startup_root_sampler_heap.cpp`) is synthetic only: no title data, a root signature with no parameters, and a plain desktop list as the negative control that must produce the message. It checks the flagged root signature through the stand-in (0 messages), an unflagged one (0 messages) and the device state. The translated-draw and pipeline-creation occurrences of the message are not covered. Details are in [startup-runtime.md](startup-runtime.md#sampler-heap-indexed-root-signatures).
+
+```powershell
+cmake --build --preset dev --target startup_root_sampler_heap
+ctest --preset dev --no-tests=error -R "^startup_root_sampler_heap_(warp|hardware)$" -V
+```

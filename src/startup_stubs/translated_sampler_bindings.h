@@ -225,4 +225,38 @@ inline void bind_translated_heaps(ID3D12GraphicsCommandList* list, ID3D12Descrip
     list->SetDescriptorHeaps(samplers ? 2 : 1, heaps);
 }
 
+// D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED, spelled out so older headers build.
+constexpr UINT root_flag_sampler_heap_indexed = 0x800;
+
+inline bool root_indexes_sampler_heap(UINT root_flags)
+{
+    return (root_flags & root_flag_sampler_heap_indexed) != 0;
+}
+
+// One shader-visible sampler (the border sampler) for a list that sets a sampler-heap-indexed root
+// signature while no sampler heap is bound: the debug layer rejects that call (message ID 1419).
+inline HRESULT create_default_sampler_heap(ID3D12Device* device, ID3D12DescriptorHeap** out)
+{
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const HRESULT hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(out));
+    if (SUCCEEDED(hr)) {
+        const auto sampler = border_sampler();
+        device->CreateSampler(&sampler, (*out)->GetCPUDescriptorHandleForHeapStart());
+    }
+    return hr;
+}
+
+// Binds fallback as the list's sampler heap, keeping the view heap already bound (null: none).
+// A sampler heap that is already bound is never replaced: returns false and records nothing.
+inline bool bind_default_sampler_heap(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* views,
+                                      ID3D12DescriptorHeap* bound_samplers, ID3D12DescriptorHeap* fallback)
+{
+    if (bound_samplers || !fallback) return false;
+    ID3D12DescriptorHeap* heaps[]{views, fallback};
+    if (views) list->SetDescriptorHeaps(2, heaps);
+    else list->SetDescriptorHeaps(1, heaps + 1);
+    return true;
+}
+
 }  // namespace x2w_startup

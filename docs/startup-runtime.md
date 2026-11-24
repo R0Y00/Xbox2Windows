@@ -148,6 +148,14 @@ by reading a render log. The device prints the counts by cause value, so
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
+## Sampler-heap-indexed root signatures
+
+The desktop command list never receives the heaps a title sets with list slot 32: the stand-in only records the title's sampler source, and a translated draw binds heaps of its own. A title root signature created with `D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED` (`0x800`) was therefore set by slot 34 on a list with no sampler heap, which the debug layer reports as message ID 1419. A recent log set counted 394 of these (348 from the title's own root signatures, 43 on translated draws, 2 at translated pipeline creation).
+
+The stand-in records the root signature flags in `CreateRootSignature`. When slot 34 sets a flagged root signature on a list that has no sampler heap bound, it binds one shared one-entry shader-visible sampler heap (the border sampler) first, keeping the view heap a translated draw already bound, and logs one line per run start (at most four): `sampler-heap-indexed root signature set with no sampler heap bound: default sampler heap bound first`. A sampler heap already bound on the list is never replaced, and a translated draw rebinds its own heaps as before.
+
+Open scope: the translated root signature is created with no flags, so the 43 translated-draw and 2 pipeline-creation messages are not explained by this change and are not claimed fixed. No Windows run of this change has been made yet; `startup_root_sampler_heap_*` counts the ID 1419 messages through a debug layer message callback and skips (77) when the debug layer cannot report the control case.
+
 ## Root constant buffer views
 
 Command-list slot 42 (desktop `SetGraphicsRootConstantBufferView` plus four) records the title address for a root
