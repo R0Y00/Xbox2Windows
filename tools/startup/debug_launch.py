@@ -22,7 +22,7 @@ k32.SuspendThread.restype = wt.DWORD
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
-from hook_window import StepWindow, HELD, GONE, FAILED  # noqa: E402
+from hook_window import StepWindow, ReturnBook, HELD, GONE, FAILED  # noqa: E402
 
 
 class MemoryBasicInformation(ctypes.Structure):
@@ -425,7 +425,7 @@ def main():
     breakpoints = {}  # addr -> original byte
     retired = set()  # X2W_LOG_AT breakpoints removed at their hit limit
     late_hits = {}  # retired addr -> INT3 events that arrived after the removal
-    returns = {}  # addr -> list of (tid, rsp after return, description)
+    returns = ReturnBook()
     stepping = {}  # tid -> addr to re-arm
     file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace or log_at else None
     hook_entries = [0]
@@ -561,13 +561,11 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.setdefault(ret, []).append((tid, rsp + 8, desc))
+                returns.add(ret, tid, rsp + 8, desc)
                 arm(ret)
-        for item in list(returns.get(addr, [])):
-            if item[0] == tid and item[1] == rsp:
-                returns[addr].remove(item)
-                file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
-                file_log.flush()
+        for description in returns.take(addr, tid, rsp):
+            file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
+            file_log.flush()
         # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
         window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
