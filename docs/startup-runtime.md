@@ -456,17 +456,6 @@ from the desktop order and the console shift, not yet seen in a title log. The
 the shader reads, preserving an offset written through slot 40 while writing another through slot 38, the last stored slot
 (15, 7), four out-of-range calls, the same root signature again, a switched one and no call.
 
-## Root constant buffer views
-
-Command-list slot 42 (desktop `SetGraphicsRootConstantBufferView` plus four) records the title address for a root
-parameter that the root signature declares as a CBV. A translated shader that reads through its root pointer sees that
-address. The call is ignored when the parameter is out of range or is not a CBV (one log line, `root CBV N ignored`);
-a null or unreadable address clears the slot to zero so a previous binding is not left stale. It is not forwarded to the
-desktop list and does not set the vertex-fetch bit of `srv_bound`. The slot number is derived from the desktop order and
-the console shift, not yet seen in a title log; `startup_root_cbv_{warp,hardware}` checks the handler with a bound, an
-unbound, a null-overwrite and a wrong-type call. Rebinding the same root signature keeps
-the address. Switching to a different signature invalidates the stored root addresses.
-
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
