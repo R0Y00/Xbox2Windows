@@ -1004,6 +1004,9 @@ class Stage:
             lines.append('    uint %s;' % ', '.join('s%d = 0' % n for n in sorted(self.used_s)))
         if self.used_v:
             lines.append('    uint %s;' % ', '.join('v%d = 0' % n for n in sorted(self.used_v)))
+        packed = self.pipe.packed_position_vgpr
+        if self.kind == 'ps' and packed in self.used_v:
+            lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
         return lines
 
@@ -1122,8 +1125,18 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=()):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None):
         self.root = parse_root(root_blob)
+        self.packed_position_vgpr = None
+        if ps_hw_inputs is not None:
+            ena, addr = ps_hw_inputs
+            if ena != addr or not 0 <= ena <= 0xffff:
+                raise Unsupported('unverified pixel input enable/address combination')
+            if ena & (1 << 15):
+                # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
+                # line stipple through sample coverage each occupy one VGPR.
+                widths = (2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1)
+                self.packed_position_vgpr = sum(w for bit, w in enumerate(widths) if addr & (1 << bit))
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False

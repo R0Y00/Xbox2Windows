@@ -1,5 +1,15 @@
 # Experiment notes and reproduction commands
 
+### Packed pixel position in a source-built shader
+
+Run `ctest --preset dev --no-tests=error -R '^startup_packed_screen_position_(hardware|warp)$' -V`.
+The fixture supplies matching PS input-enable and input-address masks. One preceding scalar input
+places packed X/Y in v1; one preceding IJ pair places it in v2. Each draw exports the selected
+word, and readback checks all four channels at each of 91 pixel positions. Missing metadata,
+a different input register, and a disabled position input each produce a detectable mismatch.
+The fixture rejects differing enable/address masks. Production startup requests still omit these
+arguments. Identifying both masks for the affected pipeline remains open. [Refs #1629](https://github.com/R0Y00/Xbox2Windows/issues/1629)
+
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
 ## Offline store context forwarding

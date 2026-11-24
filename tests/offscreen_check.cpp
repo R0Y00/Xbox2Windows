@@ -1141,6 +1141,27 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_startup_packed_position(const OperationContext& ctx)
+{
+    constexpr UINT width = 13, height = 7;
+    std::uint32_t pixels[height * width * 4]{};
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels, width, height);
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            const UINT expected = x | (y << 16);
+            for (UINT component = 0; component < 4; ++component) {
+                const UINT value = pixels[(y * width + x) * 4 + component];
+                if (value != expected) {
+                    std::fprintf(stderr, "position mismatch (%u,%u): expected %08x actual %08x\n", x, y, expected, value);
+                    return {OutcomeKind::fail, "position readback differed"};
+                }
+            }
+        }
+    }
+    std::puts("all 91 packed positions matched");
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
 // pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
 // comma separated.
@@ -1262,6 +1283,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
