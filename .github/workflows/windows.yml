@@ -125,6 +125,7 @@ jobs:
               (["tests/startup_smem_address_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_ngg_slice_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/compute_dpp_row_shr_check.py", *COMMON_LLVM], {}),
           ]
           sys.exit(runpy.run_path("tools/run_checks_parallel.py",
                                   run_name="run_checks_parallel")["run_checks"](CHECKS))
@@ -186,6 +187,7 @@ jobs:
             tests/mesh_lane_spill_check.py \
             tests/mesh_join_descriptor_check.py \
             tests/mesh_loop_census_check.py \
+            tests/compute_dpp_row_shr_check.py \
             tests/pso_readiness_check.py \
             tests/xmem_attribute_scan_check.py \
             tests/xgameruntime_table_check.py \

@@ -3990,7 +3990,7 @@ With `--rsrc2 <COMPUTE_PGM_RSRC2>` (`rsrc2=` in `lower`), the translation places
 
 ### gfx1013 compute DPP16 quad permutation
 
-The compute profile lowers `v_or_b32_dpp` only when it has a 32-bit VGPR destination and sources, `quad_perm:[a,b,c,d]`, and both full masks (`row_mask:0xf bank_mask:0xf`). It selects the source from a logical four-thread quad using SV_GroupThreadID.x and group-shared staging. The other OR operand is local to the current thread. Only 1D groups with X divisible by four are accepted, and DPP inside a lane-guarded region is refused. Other DPP opcodes, row/bank shifts, partial masks and DPP8 remain unsupported.
+The compute profile lowers `v_or_b32_dpp` only when it has a 32-bit VGPR destination and sources, `quad_perm:[a,b,c,d]`, and both full masks (`row_mask:0xf bank_mask:0xf`). It selects the source from a logical four-thread quad using SV_GroupThreadID.x and group-shared staging. The other OR operand is local to the current thread. Only 1D groups with X divisible by four are accepted, and DPP inside a lane-guarded region is refused. Other DPP opcodes, partial masks and DPP8 remain unsupported; `row_shr` is described in [its own section](#gfx1013-compute-dpp16-row-shift-right), and the other row controls remain unsupported.
 
 The binary-mode check assembles and disassembles the source-built gfx1013 program through LLVM 15 in CI, then compares lowering of the disassembly with lowering of the assembly text.
 
@@ -4008,6 +4008,16 @@ The source-built gfx1013 fixture uses distinct input words and checks both one-w
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_store_aot_readlane_(warp|hardware)$' -V
+```
+
+### gfx1013 compute DPP16 row shift right
+
+The compute profile lowers `v_or_b32_dpp` and `v_add_nc_u32_dpp` with `row_shr:1` to `row_shr:15`, 32-bit VGPR operands and both full masks (`row_mask:0xf bank_mask:0xf`). Rows are 16 of the guest's logical 1D lanes: lane `x` reads src0 from lane `x - n` through group-shared staging indexed by `SV_GroupThreadID.x`, so the result does not depend on the desktop wave width. A lane whose source falls before the start of its row uses 0 as src0 when `BOUND_CTRL` is set and keeps its old destination when it is not; the old destination must then be a known word. LLVM 15 assembles `bound_ctrl:0` and `bound_ctrl:1` to the same set bit and prints `bound_ctrl:1`; the lowering accepts both spellings. Only 1D groups with X divisible by 16 are accepted, and uniform participation is required: DPP after a lane guard is refused. `row_shl`, `row_ror`, `row_share`, `row_xmask`, the other DPP16 controls, `fi:1`, partial masks and other opcodes remain unsupported.
+
+`tests/compute_dpp_row_shr_check.py` uses an original source-built gfx1013 program. One group of 64 threads (four rows) loads a word that is unique for each lane and row and stores four words per thread: OR and ADD, each with and without `BOUND_CTRL`. ADD shifts that word XOR a key, so a step that read another step's staged words would differ. Without `BOUND_CTRL` the old destination is the dispatch index XOR a key. The program runs with shifts 1, 8 and 15, and all 320 words are compared with a per-lane CPU reference, including the 64 sentinel words after the records. Two mutants of the generated HLSL must fail at a predicted first word: reading across the row boundary fails at word 64 (thread 16), and writing 0 instead of keeping the old destination fails at word 1 (thread 0). The binary mode assembles the program with LLVM 15 using both `bound_ctrl` spellings, requires identical encodings with bit 19 set, decodes them and requires the same translation.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_dpp_row_shr_(warp|hardware)$' -V
 ```
 
 ### gfx1030 MUBUF cache-invalidation rejection
