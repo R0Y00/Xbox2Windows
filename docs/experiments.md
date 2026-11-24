@@ -5621,6 +5621,14 @@ control mismatching. The D3D12 debug layer was unavailable.
 [Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
 [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+**Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
+dword and z and w in the second, and the typed-load format table had only the two-channel half-float
+form, so a load of this format was refused with `buffer format BUF_FMT_16_16_16_16_FLOAT` - 5 of the 29
+refused shaders in the first main-game loading-screen cache (#870, issue #1695). The x, xy and xyz forms
+now lower, each channel converted with `f16tof32` from its half of the element. A numeric format the table
+does not name stays refused, as do the `d16` typed-load forms, which have no lowering. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_tbuffer_16f$' -V`.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
