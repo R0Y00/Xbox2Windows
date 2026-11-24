@@ -10652,3 +10652,7 @@ Command-list slot 42 records the address of a root parameter declared as a CBV, 
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_root_cbv_(warp|hardware)$" -V
 ```
+
+## Startup translator: SMEM `off` zero-offset operand
+
+`tools/startup/gfx2hlsl.py` now accepts `off` as the offset operand of `s_buffer_load_dword*` and `s_load_dword*` (#1674). `off` is the SMEM encoding of no offset: no `m0` register and no immediate, so the byte offset is zero. `s_buffer_load_dword s0, s[4:7], off` lowers to `s0 = r0.Load(0u + 0);` and `s_load_dword s0, s[4:5], off` to `s0 = r0.Load(0);`, the same arithmetic a literal `0` produces. Accepted offset forms are unchanged elsewhere: `s_buffer_load_*` takes a dword-aligned immediate, `off` or an SGPR/`m0` register offset, and `s_load_dword*` takes an immediate or `off`. `s_load_dword*` still refuses a register offset, and an operand that is none of those forms is still refused. `tests/startup_gfx2hlsl_smem_off_check.py` feeds source text through `gfx2hlsl.Stage` and checks the four `off` translations, the literal and `m0` controls, and both refusal kinds. Test: `startup_gfx2hlsl_smem_off`.
