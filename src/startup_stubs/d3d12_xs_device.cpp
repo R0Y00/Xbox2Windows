@@ -36,6 +36,7 @@
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/placed_build.h"
 #include "startup_stubs/placed_buffer_range.h"
+#include "startup_stubs/root_view_store.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/memory_srv_buffer.h"
@@ -2149,6 +2150,8 @@ struct Pass {
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
+    x2w_startup::RootViewStore compute_views;                    // slots 41 / 43 / 45
+    x2w_startup::RootViewStore graphics_uav;                     // slot 46
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -2329,6 +2332,7 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
+    pass.compute_views.clear();
     if (pass.compute_root) {
         if (pass.desktop_compute_root.Get() != pass.compute_root)
             pass.desktop_compute_upload_srvs.fill(0);
@@ -2692,6 +2696,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
         std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
     pass.root = params;
+    pass.graphics_uav.clear();
     pass.srv_bound = 0;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real;
     pass.root_heap_flags = real ? root_heap_flags(w) : 0;
@@ -2945,21 +2950,6 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
         list->OMSetStencilRef(reference);
     }
 }
-// List slot 43 (desktop 39 + 4), set a compute root SRV backed by this recording's upload pages.
-void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 address)
-{
-    auto* list = recording(self);
-    auto& pass = pass_of(self);
-    const auto* params = pass.compute_params;
-    if (!list || !params || parameter >= params->size() || parameter >= pass.desktop_compute_upload_srvs.size() ||
-        (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
-    const auto gpu = list_upload_gpu(self, address, 1);
-    if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
-        pass.desktop_compute_upload_srvs[parameter] = gpu;
-        list->SetComputeRootShaderResourceView(parameter, gpu);
-    }
-}
-
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -3006,6 +2996,68 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
         return;
     }
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
+}
+// Declared type of a root parameter, or ~0u when the root signature has no such parameter.
+unsigned declared_root_type(const std::vector<RootParameter>* params, UINT parameter)
+{
+    return params && parameter < params->size() ? static_cast<unsigned>((*params)[parameter].type) : ~0u;
+}
+void log_root_view_refusal(const char* what, UINT parameter, x2w_startup::RootViewResult result)
+{
+    static LONG refused;
+    if (first_calls(refused, 6)) log("x2w-render %s %u ignored: %s", what, parameter, x2w_startup::root_view_reason(result));
+}
+// List slots 41 / 43 (desktop 37 / 39 + 4), SetComputeRootConstantBufferView / SetComputeRootShaderResourceView.
+// The bytes at the title address are copied to desktop memory and the copy is bound, as for slot 44. The
+// view is dropped from the store when no copy can be made.
+void compute_read_view(Wrapper* self, UINT parameter, u64 address, unsigned wanted, const char* what)
+{
+    auto* list = recording(self);
+    if (!list) return;
+    Pass& pass = pass_of(self);
+    const unsigned declared = declared_root_type(pass.compute_params, parameter);
+    const std::size_t bytes = address ? readable_window(address, 0x10000) : 0;
+    // An SRV address inside this recording's own upload pages already has a desktop address: bind it directly.
+    const UINT64 own_page = wanted == x2w_startup::root_type_srv ? list_upload_gpu(self, address, 1) : 0;
+    const bool direct = own_page && !(own_page % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+    const auto result = pass.compute_views.set(pass.compute_root, declared, wanted, parameter, bytes || direct ? address : 0);
+    if (result != x2w_startup::RootViewResult::stored) return log_root_view_refusal(what, parameter, result);
+    if (direct) {
+        list->SetComputeRootShaderResourceView(parameter, own_page);
+        return;
+    }
+    if (!bytes) return;
+    const D3D12_GPU_VIRTUAL_ADDRESS desktop = upload_from_title(address, bytes);
+    if (!desktop) return;
+    if (wanted == x2w_startup::root_type_cbv) list->SetComputeRootConstantBufferView(parameter, desktop);
+    else list->SetComputeRootShaderResourceView(parameter, desktop);
+}
+void __stdcall list_compute_root_cbv(Wrapper* self, UINT parameter, u64 address)
+{
+    compute_read_view(self, parameter, address, x2w_startup::root_type_cbv, "compute root CBV");
+}
+void __stdcall list_compute_root_srv(Wrapper* self, UINT parameter, u64 address)
+{
+    compute_read_view(self, parameter, address, x2w_startup::root_type_srv, "compute root SRV");
+}
+// List slots 45 / 46 (desktop 41 / 42 + 4), SetComputeRootUnorderedAccessView / SetGraphicsRootUnorderedAccessView.
+// Recorded only. A copy would lose the writes the shader makes, so nothing is forwarded until the address maps
+// to a placed desktop buffer.
+void __stdcall list_compute_root_uav(Wrapper* self, UINT parameter, u64 address)
+{
+    if (!recording(self)) return;
+    Pass& pass = pass_of(self);
+    const auto result = pass.compute_views.set(pass.compute_root, declared_root_type(pass.compute_params, parameter),
+                                               x2w_startup::root_type_uav, parameter, address);
+    if (result != x2w_startup::RootViewResult::stored) log_root_view_refusal("compute root UAV", parameter, result);
+}
+void __stdcall list_graphics_root_uav(Wrapper* self, UINT parameter, u64 address)
+{
+    if (!recording(self)) return;
+    Pass& pass = pass_of(self);
+    const auto result = pass.graphics_uav.set(pass.root != nullptr, declared_root_type(pass.root, parameter),
+                                              x2w_startup::root_type_uav, parameter, address);
+    if (result != x2w_startup::RootViewResult::stored) log_root_view_refusal("graphics root UAV", parameter, result);
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
@@ -4645,9 +4697,12 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
-        list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_upload_srv);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
+        list_typed[41] = reinterpret_cast<ListTyped>(&list_compute_root_cbv);
+        list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_root_srv);
+        list_typed[45] = reinterpret_cast<ListTyped>(&list_compute_root_uav);
+        list_typed[46] = reinterpret_cast<ListTyped>(&list_graphics_root_uav);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);

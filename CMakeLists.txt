@@ -1507,6 +1507,11 @@ add_test(NAME startup_translated_sampler_bindings COMMAND startup_translated_sam
 add_test(NAME startup_translated_sampler_bindings_shared_axis_control
     COMMAND startup_translated_sampler_bindings_check --mutate shared-axis)
 set_tests_properties(startup_translated_sampler_bindings_shared_axis_control PROPERTIES WILL_FAIL TRUE)
+# Root descriptor views set through list slots 41, 43, 45 and 46 (src/startup_stubs/root_view_store.h), host-only.
+add_executable(startup_root_view_store_check tests/startup_root_view_store.cpp)
+target_include_directories(startup_root_view_store_check PRIVATE src)
+target_compile_features(startup_root_view_store_check PRIVATE cxx_std_17)
+add_test(NAME startup_root_view_store COMMAND startup_root_view_store_check)
 # Real-draw decision for title root signatures that index descriptor heaps directly
 # (src/startup_stubs/heap_indexed_root.h), without a device. The mutated runs are the negative controls.
 # Limits of the slot 70 refusal and "token" null census (src/startup_stubs/memory_srv_census.h), without a device.
