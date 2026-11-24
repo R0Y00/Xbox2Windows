@@ -692,9 +692,9 @@ class Stage:
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
                  # Four half channels in one 8-byte element: x/y in the first dword, z/w in the second.
-                 'BUF_FMT_16_16_16_16_FLOAT': (None, ['U(f16tof32({0}.Load(a)))', 'U(f16tof32({0}.Load(a) >> 16))',
-                                                      'U(f16tof32({0}.Load(a + 4)))',
-                                                      'U(f16tof32({0}.Load(a + 4) >> 16))']),
+                 'BUF_FMT_16_16_16_16_FLOAT': (None, ['U(f16tof32(ldu({0}, a)))', 'U(f16tof32(ldu({0}, a) >> 16))',
+                                                      'U(f16tof32(ldu({0}, a + 4)))',
+                                                      'U(f16tof32(ldu({0}, a + 4) >> 16))']),
                  'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
                  'BUF_FMT_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', 'U(1.0)']),
                  'BUF_FMT_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '0u', 'U(1.0)']),

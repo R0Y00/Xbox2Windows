@@ -5753,10 +5753,13 @@ conversion's output modifier inside an SDWA form is still refused rather than dr
 **Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
 dword and z and w in the second, and the typed-load format table had only the two-channel half-float
 form, so a load of this format was refused with `buffer format BUF_FMT_16_16_16_16_FLOAT` - 5 of the 29
-refused shaders in the first main-game loading-screen cache (#870, issue #1695). The x, xy and xyz forms
-now lower, each channel converted with `f16tof32` from its half of the element. A numeric format the table
-does not name stays refused, as do the `d16` typed-load forms, which have no lowering. Run
-`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_tbuffer_16f$' -V`.
+refused shaders in the first loading-screen cache (#870, issue #1695). The x, xy, xyz and xyzw forms
+convert each selected half with `f16tof32`. Both dwords use the same alignment-safe reader as
+`BUF_FMT_16_16_FLOAT`. The vertex-fetch readback uses four distinct half values with an 18-byte
+stride and a 10-byte offset, so half of the vertices start at an address two bytes past dword
+alignment. An aligned-down second dword must change the fourth output. Unnamed formats and the
+`d16` forms remain refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_(gfx2hlsl_tbuffer_16f$|vertex_fetch_formats_)' -V`.
 
 ## Pixel color without a texture sample
 

@@ -106,21 +106,21 @@ check('encodes and decodes a typed xyz load',
       repr(asm))
 
 # 2. x and y come from the first dword, z from the second, all converted from binary16.
-check('x from the first dword', 'v1 = U(f16tof32(r0.Load(a)))' in emitted, emitted)
-check('y from the high half of the first dword', 'v2 = U(f16tof32(r0.Load(a) >> 16))' in emitted, emitted)
-check('z from the second dword', 'v3 = U(f16tof32(r0.Load(a + 4)))' in emitted, emitted)
+check('x from the first dword', 'v1 = U(f16tof32(ldu(r0, a)))' in emitted, emitted)
+check('y from the high half of the first dword', 'v2 = U(f16tof32(ldu(r0, a) >> 16))' in emitted, emitted)
+check('z from the second dword', 'v3 = U(f16tof32(ldu(r0, a + 4)))' in emitted, emitted)
 
 # 3. The four-channel form also lowers, and w comes from the high half of the second dword.
 code = encode_mtbuf(MTBUF_LOAD['xyzw'], MTBUF_FORMAT_16_16_16_16_FLOAT, vdata=1, vaddr=2, srsrc=4)
 asm, emitted = translate_bytes(code)
 check('encodes and decodes the xyzw form', asm[0].startswith('tbuffer_load_format_xyzw '), repr(asm))
-check('w from the high half of the second dword', 'v4 = U(f16tof32(r0.Load(a + 4) >> 16))' in emitted, emitted)
+check('w from the high half of the second dword', 'v4 = U(f16tof32(ldu(r0, a + 4) >> 16))' in emitted, emitted)
 
 # 4. The one-channel form lowers and reads only the first half.
 code = encode_mtbuf(MTBUF_LOAD['x'], MTBUF_FORMAT_16_16_16_16_FLOAT, vdata=1, vaddr=2, srsrc=4)
 asm, emitted = translate_bytes(code)
 check('encodes and decodes the x form', asm[0].startswith('tbuffer_load_format_x '), repr(asm))
-check('x form reads one channel', 'v1 = U(f16tof32(r0.Load(a)))' in emitted and 'v2 =' not in emitted, emitted)
+check('x form reads one channel', 'v1 = U(f16tof32(ldu(r0, a)))' in emitted and 'v2 =' not in emitted, emitted)
 
 
 # 5. Refusals that must not widen: a format the table does not name, and the d16 typed-load form.

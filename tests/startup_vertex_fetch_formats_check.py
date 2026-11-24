@@ -3,7 +3,7 @@
 usage: startup_vertex_fetch_formats_check.py <dxc> <offscreen_check> <adapter>
        startup_vertex_fetch_formats_check.py controls
 
-tools/startup/gfx2hlsl.py lowers tbuffer_load_format_* for ten buffer formats from a table of HLSL
+tools/startup/gfx2hlsl.py lowers tbuffer_load_format_* for eleven buffer formats from a table of HLSL
 expressions: the load of the word or words, the field each component takes and its conversion, and the
 values of the missing components. Only BUF_FMT_8_UINT and BUF_FMT_8_UNORM were run before
 (startup_r8_uint_check.py). This drives each table entry the way that check does: a source-built vertex
@@ -46,6 +46,7 @@ FORMATS = {
     'BUF_FMT_8_8_UNORM': (14, 3, 2, 8, 'unorm', 2),
     'BUF_FMT_16_16_UNORM': (23, 6, 2, 16, 'unorm', 2),
     'BUF_FMT_16_16_FLOAT': (29, 10, 10, 16, 'f16', 2),
+    'BUF_FMT_16_16_16_16_FLOAT': (71, 18, 10, 16, 'f16', 4),
     'BUF_FMT_8_8_8_8_UNORM': (56, 5, 3, 8, 'unorm', 4),
     'BUF_FMT_32_FLOAT': (22, 8, 4, 32, 'f32', 1),
     'BUF_FMT_32_32_FLOAT': (64, 12, 0, 32, 'f32', 2),
@@ -121,6 +122,8 @@ MUTATIONS = (
     ('BUF_FMT_8_8_UNORM', 'aligned load instead of ldu', 'ldu(r0, a)', 'r0.Load(a & ~3u)'),
     ('BUF_FMT_16_16_UNORM', 'high half over 65536', 'U((w >> 16) / 65535.0)', 'U((w >> 16) / 65536.0)'),
     ('BUF_FMT_16_16_FLOAT', 'low half from the high half', 'v4 = U(f16tof32(w));', 'v4 = U(f16tof32(w >> 16));'),
+    ('BUF_FMT_16_16_16_16_FLOAT', 'second dword aligned down',
+     'v7 = U(f16tof32(ldu(r0, a + 4) >> 16));', 'v7 = U(f16tof32(r0.Load((a + 4) & ~3u) >> 16));'),
     ('BUF_FMT_32_32_32_FLOAT', 'missing W as 0', 'U(1.0)', '0u'),
     ('BUF_FMT_32_32_32_32_FLOAT', 'W from the third word', 'r0.Load(a + 12)', 'r0.Load(a + 8)'),
 )
@@ -145,11 +148,15 @@ def controls():
         else:
             raise AssertionError('no wrong reference changes %s' % name)
     # 16-bit floats in the chosen elements are normal, so f16tof32 is exact on every adapter.
-    _, stride, offset, _, _, _ = FORMATS['BUF_FMT_16_16_FLOAT']
-    for vertex in range(16):
-        for i in range(2):
-            half = int.from_bytes(DATA[vertex * stride + offset + 2 * i:vertex * stride + offset + 2 * i + 2], 'little')
-            assert 0 < (half >> 10) & 31 < 31, (vertex, i, hex(half))
+    for name, (_, stride, offset, _, kind, count) in FORMATS.items():
+        if kind != 'f16':
+            continue
+        for vertex in range(16):
+            address = vertex * stride + offset
+            halves = struct.unpack_from('<' + 'H' * count, DATA, address)
+            assert all(0 < ((half >> 10) & 31) < 31 for half in halves), (name, vertex, halves)
+            if count == 4:
+                assert len(set(halves)) == 4, (name, vertex, halves)
     # The words of the 32-bit formats are finite and normal, so the position passes through unchanged.
     for name in ('BUF_FMT_32_FLOAT', 'BUF_FMT_32_32_FLOAT', 'BUF_FMT_32_32_32_FLOAT', 'BUF_FMT_32_32_32_32_FLOAT'):
         _, _, _, _, _, count = FORMATS[name]
