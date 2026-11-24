@@ -444,7 +444,12 @@ did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_
 runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
 script text only.
 
-`tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
+`tools/startup/live_view.py` follows a run in a second console. To attach a compact status view to an
+existing session, run `python -B tools/startup/live_view.py --status out/startup/<run>`.
+It reports DirectStorage completions, failures and presentation activity independently. After 30 seconds
+without an observed increase, the corresponding counter is marked quiet. Quiet storage can mean completed
+work or waiting. Frames presented and the mean of the last sampled surface provide no gameplay verdict.
+The view reads the log and can be closed independently of the run. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
 
 `tools/startup/triage_run.py` summarizes a log directory (and optional `--shader-cache <dir>`)
