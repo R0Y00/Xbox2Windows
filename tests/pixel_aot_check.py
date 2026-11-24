@@ -9290,6 +9290,13 @@ def e64_integer_group(group):
 # sign extension on either source, a selected shift count, and results placed into a byte or word with
 # UNUSED_PAD and UNUSED_PRESERVE.
 SDWA_INT_BODIES = {
+    "multiply24": [
+        *(f"v_mov_b32_e32 v{reg}, s47" for reg in range(12, 16)),
+        "v_mul_i32_i24_sdwa v12, sext(s44), v18 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1 src1_sel:DWORD",
+        "v_mul_u32_u24_sdwa v13, s44, v18 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1 src1_sel:DWORD",
+        "v_mul_hi_i32_i24_sdwa v14, s44, v18 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:DWORD",
+        "v_mul_hi_u32_u24_sdwa v15, s44, v18 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:DWORD",
+    ],
     "bit_scan": [
         "v_bfrev_b32_sdwa v12, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
         "v_ffbl_b32_sdwa v13, v18 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:WORD_1",
@@ -9342,7 +9349,15 @@ def _s32(word):
 
 
 # Reference words by group: the e32 operation on the selected fields, then the placement.
+def sdwa_mul24_words(a, b, c, d):
+    x, y = a & 0xffffff, b & 0xffffff
+    products = (_sext(_byte(a, 1), 8) * _sext(y, 24), _byte(a, 1) * y,
+                (_sext(x, 24) * _sext(y, 24)) >> 32, (x * y) >> 32)
+    return tuple((d & 0xffff0000) | (p & 0xffff) for p in products)
+
+
 SDWA_INT_RESULTS = {
+    "multiply24": sdwa_mul24_words,
     "bit_scan": lambda a, b, c, d: (
         plain_rev(_byte(a, 1)), (plain_ffbl(_word(b, 1)) & 0xff) << 24,
         (plain_ffbh_u(_byte(c, 2)) & 0xff) << 24,
@@ -9365,6 +9380,10 @@ SDWA_INT_RESULTS = {
 # Negative controls by group: (row, channel, word a wrong lowering would give, what went wrong). Each must
 # report a mismatch.
 SDWA_INT_WRONG = {
+    "multiply24": (
+        (0, 0, lambda a, b, c, d: sdwa_mul24_words(a, b, c, d)[1], "lost sign extension on the selected byte"),
+        (0, 2, lambda a, b, c, d: sdwa_mul24_words(a, b, c, d)[3], "unsigned high product for signed"),
+    ),
     "bit_scan": (
         (0, 0, lambda a, b, c, d: plain_rev(a), "ignored byte selection"),
         (0, 1, lambda a, b, c, d: plain_ffbl(_word(b, 1)), "ignored placement"),
@@ -9424,6 +9443,8 @@ SDWA_INT_WRONG = {
 # the draw). The selected bytes and words differ from their neighbours, the sign-extended fields are negative
 # in at least one row, and the shift counts (bytes of A in the shift group) exceed 31.
 SDWA_INT_ROWS = {
+    "multiply24": ((0x41c08023, 0x40345679, 0, 0x4100abcd),
+                   (0x4034fa45, 0x40f12345, 0, 0xc2021234)),
     "bit_scan": ((0x40300581, 0x41200000, 0x40420000, 0x41000000),
                  (0x400003ff, 0, 0x40000000, 0x42000001)),
     "bitwise": ((0x40D18A11, 0xC025B37E, 0, 0), (0x3E27F0C4, 0xBF62915A, 0, 0)),
@@ -10436,7 +10457,7 @@ def check_sdwa_integer_lowering():
         translate_int(uncompressed_export(sdwa_integer_group(group)))
         sdwa_integer_cases(group)
     assert set(SDWA_INT_OPS) <= ACCEPTED, set(SDWA_INT_OPS) - ACCEPTED
-    assert len(SDWA_INT_OPS) == 19 and set(SDWA_INT_OPS) == {f"v_{op}_sdwa" for op in pixel_aot.SDWA_INT}
+    assert len(SDWA_INT_OPS) == 23 and set(SDWA_INT_OPS) == {f"v_{op}_sdwa" for op in pixel_aot.SDWA_INT}
 
     def statement(*body):
         """The HLSL of the last instruction of body, with its own temporary renamed to `r`."""
@@ -10511,7 +10532,7 @@ def check_sdwa_integer_lowering():
         expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]), message)
     must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", good.replace("v18", "v106")]))
     # Operations outside the table keep their refusal in the SDWA spelling.
-    for bad in (f"v_bfi_b32_sdwa v12, s44, v18 {sdwa}", f"v_mul_u32_u24_sdwa v12, s44, v18 {sdwa}",
+    for bad in (f"v_bfi_b32_sdwa v12, s44, v18 {sdwa}", f"v_mul_lo_u32_sdwa v12, s44, v18 {sdwa}",
                 f"v_add_nc_i32_sdwa v12, s44, v18 {sdwa}", f"v_min3_u32_sdwa v12, s44, v18 {sdwa}"):
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 

@@ -2734,6 +2734,7 @@ SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", 
 SDWA_INT = {
     **{op: INTEGER[op] for op in ("and_b32", "or_b32", "xor_b32", "xnor_b32", "not_b32",
                                   "bfrev_b32", "ffbl_b32", "ffbh_u32", "ffbh_i32",
+                                  "mul_i32_i24", "mul_u32_u24", "mul_hi_i32_i24", "mul_hi_u32_u24",
                                   "lshlrev_b32", "lshrrev_b32", "ashrrev_i32")},
     "add_nc_u32": (2, "{0} + {1}"), "sub_nc_u32": (2, "{0} - {1}"), "subrev_nc_u32": (2, "{1} - {0}"),
     "min_u32": (2, "min({0}, {1})"), "max_u32": (2, "max({0}, {1})"),
@@ -4517,6 +4518,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             args = [sdwa_source(int_operand(token, scalar, vector, pending, sample_dest, signed=False), sel, bool(sext))
                     for token, sel, sext in ((src0, sel0, sext0), (src1, sel1, sext1))[:arity]]
             helpers.update(INTEGER_HELPERS.get(op, ()))
+            helpers.update(MUL24_HELPERS.get(op, ()))
             result = sdwa_dest(f"({template.format(*args)})", dst_sel, unused, vector.get(dst))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
