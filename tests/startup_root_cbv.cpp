@@ -51,6 +51,7 @@ int draw_root_cbv(void* list)
 //   set          root signature, then (parameter 0, word, offset 0)
 //   overwrite    a first value at (0, 0), then the word at (0, 0)
 //   offset3      the word at (0, 3)
+//   preserve     slot 40 sets (0, 0..1) with word at offset 0, then slot 38 writes (0, 3): both offsets stay intact
 //   corner       the word at the last stored slot, (15, 7)
 //   outside      (16, word, 0), (0xffffffff, word, 0), (0, word, 8) and (0, word, 0xffffffff): all dropped
 //   same_root    the word at (0, 0), then the same root signature again: kept
@@ -70,6 +71,10 @@ int draw_root_constant(void* list, std::uint32_t word)
         invoke(list, 38, 0, word, 0);
     } else if (!std::strcmp(mode, "offset3")) {
         invoke(list, 38, 0, word, 3);
+    } else if (!std::strcmp(mode, "preserve")) {
+        const std::uint32_t pair[2] = {word, 0x01000000u};
+        invoke(list, 40, 0, 2, reinterpret_cast<StreamWord>(pair), 0);
+        invoke(list, 38, 0, 0x01800000u, 3);
     } else if (!std::strcmp(mode, "corner")) {
         invoke(list, 38, 15, word, 7);
     } else if (!std::strcmp(mode, "outside")) {

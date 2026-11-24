@@ -451,10 +451,10 @@ word in the same per-list table as slot 40, which a translated shader reads thro
 of 16 or more or an offset of 8 or more has no storage and the call is dropped without a log line. Nothing is forwarded
 to the desktop list. Setting the graphics root signature to a different signature clears every stored constant, as it
 clears the root addresses; setting the same one again keeps them (this also applies to slot 40). The slot number is derived
-from the desktop order and the console shift (see the ABI notes for B1 and B2), not yet seen in a title log. The
-`startup_mrt_{fxc,dxc}_{warp,hardware}` tests drive it with nine cases: set, overwrite, an offset that is and is not the one
-the shader reads, the last stored slot (15, 7), four out-of-range calls, the same root signature again, a switched one
-and no call.
+from the desktop order and the console shift, not yet seen in a title log. The
+`startup_mrt_{fxc,dxc}_{warp,hardware}` tests drive it with eleven cases: set, overwrite, an offset that is and is not the one
+the shader reads, preserving an offset written through slot 40 while writing another through slot 38, the last stored slot
+(15, 7), four out-of-range calls, the same root signature again, a switched one and no call.
 
 ## Root constant buffer views
 

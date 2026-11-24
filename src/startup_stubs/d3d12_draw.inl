@@ -1949,7 +1949,7 @@ void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, co
 // more has no storage and the call is dropped. Nothing is forwarded to the desktop list.
 void __stdcall list_root_constant(Wrapper* self, UINT parameter, std::uint32_t value, UINT offset)
 {
-    if (parameter >= 16 || offset >= 8) return;
+    if (!self || parameter >= 16 || offset >= 8) return;
     pass_of(self).constants[parameter][offset] = value;
 }
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).

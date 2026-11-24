@@ -151,11 +151,14 @@ def check(work, consumer, backend, kind, dxc, fxc):
     # SetGraphicsRoot32BitConstant (list slot 38) feeds the same root constant words as slot 40. The manifest
     # names the (parameter, offset) the shader reads; the title call either lands there or it does not.
     flipped = struct.pack('<4I', *(value ^ word for value in FLOAT_WORDS))
+    preserved_offset3 = struct.pack('<4I', *(value ^ 0x01800000 for value in FLOAT_WORDS))
     cases = (
         ('set', '0 0', flipped),
         ('overwrite', '0 0', flipped),            # the second call replaces the first
         ('offset3', '0 3', flipped),
         ('offset3', '0 0', exact),                # a different offset does not reach word 0
+        ('preserve', '0 0', flipped),             # slot 38 at offset 3 keeps slot 40's word at offset 0
+        ('preserve', '0 3', preserved_offset3),   # and stores its own word at offset 3
         ('corner', '15 7', flipped),              # the last stored slot
         ('outside', '0 0', exact),                # parameter 16, parameter -1, offset 8 and offset -1 are dropped
         ('same_root', '0 0', flipped),            # the same root signature again keeps the word
