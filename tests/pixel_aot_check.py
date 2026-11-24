@@ -16886,6 +16886,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(pack_b32_group()), translate_int))
     fixtures.append((uncompressed_export(pack_b32_inline_group()), translate_int))
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
+    # The binary16 SDWA comparisons and class tests, assembled, disassembled and translated like their source text.
+    fixtures.append((uncompressed_export(sdwa_f16_compares()), translate_int))
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
     for restore in (MASKED_OR_RESTORE, MASKED_MOV_RESTORE):
