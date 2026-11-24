@@ -2558,6 +2558,85 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     red_producers().after(self, red_sample);
     InterlockedIncrement(&render_clears);
 }
+// True when the shader-visible handle lies on a descriptor of a known CBV/SRV/UAV heap.
+bool known_view_gpu_handle(u64 gpu)
+{
+    bool found = false;
+    AcquireSRWLockShared(&note_lock);
+    for (const HeapInfo& heap : heap_infos()) {
+        if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.desktop_gpu || gpu < heap.desktop_gpu) continue;
+        const u64 offset = gpu - heap.desktop_gpu;
+        if (heap.increment && offset < u64{heap.count} * heap.increment && offset % heap.increment == 0) {
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return found;
+}
+// List slots 53 and 54 (desktop 49/50 + 4), ClearUnorderedAccessViewUint/Float(view GPU handle, view CPU
+// handle, resource, values, rect count, rects). The CPU handle is read from its shadow record, like the
+// render-target clear, so a copied descriptor clears the resource it holds now. A GPU handle that is on no
+// known heap, a CPU handle that holds no unordered-access view, or a resource without unordered access is
+// refused (logged, counted) instead of reaching the desktop list. The target moves to UNORDERED_ACCESS
+// around the clear.
+template <bool Float>
+void __stdcall list_clear_uav(Wrapper* self, u64 gpu_handle, u64 cpu_handle, u64 title_resource, const void* values,
+                              UINT rect_count, const D3D12_RECT* rects)
+{
+    if (!self->own().list_open) return;
+    static LONG logged, refused;
+    const char* name = Float ? "ClearUnorderedAccessViewFloat" : "ClearUnorderedAccessViewUint";
+    const u64 desktop = desktop_cpu_handle(cpu_handle);
+    const ResolvedView view = desktop ? resolve_view(desktop, 19) : ResolvedView{};
+    ID3D12Resource* target = view.resource;
+    const char* why = nullptr;
+    if (!x2w_local::readable(values, 4 * sizeof(UINT))) why = "no clear values";
+    else if (rect_count && !x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT))) why = "unreadable rects";
+    else if (!target) why = view.wrong_kind ? "view is not an unordered-access view"
+                            : view.skipped ? "view was skipped at creation" : "view holds no known resource";
+    else if (!known_view_gpu_handle(gpu_handle)) why = "GPU handle is on no known descriptor heap";
+    else if (!(target->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) why = "resource lacks unordered access";
+    if (why) {
+        InterlockedIncrement(&render_target_unresolved);
+        if (first_calls(refused, 6)) log("x2w-d3d12 %s skipped: %s (view 0x%llx)", name, why, cpu_handle);
+        return;
+    }
+    if (first_calls(logged, 4)) log("x2w-render %s view=0x%llx target=%p rects=%u", name, cpu_handle, static_cast<void*>(target), rect_count);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    require_state(self, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu_handle};
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu{static_cast<SIZE_T>(desktop)};
+    if (Float) list->ClearUnorderedAccessViewFloat(gpu, cpu, target, static_cast<const float*>(values), rect_count, rect_count ? rects : nullptr);
+    else list->ClearUnorderedAccessViewUint(gpu, cpu, target, static_cast<const UINT*>(values), rect_count, rect_count ? rects : nullptr);
+    InterlockedIncrement(&render_clears);
+}
+// List slot 55 (desktop 51 + 4), DiscardResource(resource, region). Discard is only a hint, so a resource
+// that is not a render target, depth target or unordered-access resource (needs a state the list does not
+// track), an unreadable region or a region with unreadable rects is dropped; nothing reaches the desktop list.
+void __stdcall list_discard(Wrapper* self, u64 title_resource, const D3D12_DISCARD_REGION* region)
+{
+    auto* list = recording(self);
+    if (!list || !title_resource) return;
+    auto* resource = reinterpret_cast<ID3D12Resource*>(unwrap(title_resource));
+    if (!resource) return;
+    D3D12_DISCARD_REGION safe{};
+    if (region) {
+        if (!x2w_local::readable(region, sizeof(*region))) return;
+        safe = *region;
+        if (safe.NumRects && !x2w_local::readable(safe.pRects, std::size_t{safe.NumRects} * sizeof(D3D12_RECT))) return;
+    }
+    const D3D12_RESOURCE_FLAGS flags = resource->GetDesc().Flags;
+    D3D12_RESOURCE_STATES state;
+    if (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    else if (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    else if (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    else return;
+    require_state(self, resource, state);
+    list->DiscardResource(resource, region ? &safe : nullptr);
+    static LONG logged;
+    if (first_calls(logged, 4)) log("x2w-render DiscardResource resource=%p rects=%u", static_cast<void*>(resource), region ? safe.NumRects : 0);
+}
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
 // With single_range the title passes the first handle only and the rest follow it at the title's own
 // descriptor stride (also for one target). A descriptor of the wrong kind, a handle that holds no view, a
@@ -4225,6 +4304,9 @@ void build_tables()
         list_typed[15] = reinterpret_cast<ListTyped>(&list_copy_buffer_region);
         list_typed[17] = reinterpret_cast<ListTyped>(&list_copy_resource);
         list_typed[19] = reinterpret_cast<ListTyped>(&list_resolve_subresource);
+        list_typed[53] = reinterpret_cast<ListTyped>(&list_clear_uav<false>);
+        list_typed[54] = reinterpret_cast<ListTyped>(&list_clear_uav<true>);
+        list_typed[55] = reinterpret_cast<ListTyped>(&list_discard);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
