@@ -3259,6 +3259,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME runtime_startup_live_view_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_live_view_cli_check.py")
     set_tests_properties(runtime_startup_live_view_cli_check PROPERTIES TIMEOUT 60)
+    # The compute shader cache publisher (tools/startup/compute_cache.py) must derive the same key
+    # the stand-in computes for <key>.cs.cso, or every compute lookup silently misses (#1412).
+    add_test(NAME startup_compute_cache COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_cache_check.py")
     add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
     # NGG primitive-shader cases (#1723): identity triangle against single-change contrasts, reference model.
