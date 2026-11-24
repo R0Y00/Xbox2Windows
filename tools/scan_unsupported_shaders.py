@@ -104,6 +104,7 @@ SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
 F16_PLAIN = r"(?:-?(?:\d+\.\d+|\d+)|0x[0-9a-f]{1,4}|[vs]\d+)"
 F16_MOD = rf"-?(?:\|{F16_PLAIN}\||abs\({F16_PLAIN}\)|{F16_PLAIN})"
 SDWA_SEL_PATTERN = r"(?:BYTE_[0-3]|WORD_[01]|DWORD)"
+SDWA_INT_SOURCE = r"(?:sext\([vs]\d+\)|[vs]\d+)"
 CVT_F32_E64_BASE = r"(?:[vs]\d+|0x[0-9a-f]{1,8})"
 CVT_F32_E64_ABS = rf"(?:\|{CVT_F32_E64_BASE}\||abs\({CVT_F32_E64_BASE}\))"
 CVT_F32_E64_SOURCE = rf"(?:neg\((?:{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})\)|-(?:{CVT_F32_E64_ABS}|[vs]\d+)|{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})"
@@ -228,6 +229,10 @@ if PIXEL_INT_COMPARE:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16){PIXEL_VOPC_DST},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
     )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32)_sdwa\s+{PIXEL_LANE_MASK},\s+{SDWA_INT_SOURCE},\s+{SDWA_INT_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+    )
     # 64-bit comparisons are checked by supports_int64_compare() below: the pair and inline ranges are numeric.
     INT64_COMPARE_PATTERN = re.compile(
         rf"v_cmp_(?:{icmp_ops})_(?:i64|u64)(_e32|_e64)?\s+(vcc(?:_lo)?|s\d+|s\[\d+:\d+\]),\s+(\S+),\s+(\S+)"
@@ -294,7 +299,6 @@ for name, (arity, _) in PIXEL_INTEGER.items():
 
 # SDWA forms of the 32-bit integer operations: register sources, optionally under sext(), every field printed,
 # and no UNUSED_SEXT. As for the moves, UNUSED_PRESERVE onto an untracked destination is refused by the translator only.
-SDWA_INT_SOURCE = r"(?:sext\([vs]\d+\)|[vs]\d+)"
 for name, (arity, _) in PIXEL_SDWA_INT.items():
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_{name}_sdwa\s+v\d+" + rf",\s+{SDWA_INT_SOURCE}" * arity

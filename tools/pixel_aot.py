@@ -2810,6 +2810,9 @@ SDWA_INT_OPERANDS = re.compile(
     rf"(v\d+), {SDWA_INT_SOURCE}(?:, {SDWA_INT_SOURCE})? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
     r" dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
     r"(?: src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD))?")
+SDWA_INT_CMP_OPERANDS = re.compile(
+    rf"{LANE_MASK}, {SDWA_INT_SOURCE}, {SDWA_INT_SOURCE}"
+    r" src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD) src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
 
 
 class VectorRegisters(dict):
@@ -5295,6 +5298,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {expr};")
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)_sdwa (.+)"):
+            # The e32/e64 32-bit integer comparison on the SDWA-selected source words. Sources are
+            # registers, optionally sign-extended from a byte or word via sext(); inline constants,
+            # literals, float modifiers, clamp and incomplete spellings are refused.
+            op, kind, rest = m.groups()
+            parsed = SDWA_INT_CMP_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported SDWA integer comparison operands: v_cmp_{op}_{kind}_sdwa {rest}")
+            dst, sext0, src0, close0, sext1, src1, close1, sel0, sel1 = parsed.groups()
+            if bool(sext0) != bool(close0) or bool(sext1) != bool(close1):
+                raise ValueError("Unbalanced sext() on an SDWA source")
+            regs = lane_mask(dst)
+            if dst.startswith("s") and not dst.startswith("s["):
+                sgpr_name(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            words = [sdwa_source(int_operand(token, scalar, vector, pending, sample_dest, signed=False), sel, bool(sext))
+                     for token, sel, sext in ((src0, sel0, sext0), (src1, sel1, sext1))]
+            values = [f"asint({word})" for word in words] if kind == "i32" else words
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
         elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
             dst, unset, chosen, source = m.groups()
             regs = lane_mask(source)

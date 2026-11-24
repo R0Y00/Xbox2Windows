@@ -4636,10 +4636,11 @@ class TestRdna2Scanner(unittest.TestCase):
         """Issue #938: binary shaders with VOPC/VOPCX SDWA reach the scanner as decoded opcodes, not vopc_sdwa."""
         supported = bytes.fromhex(
             "f904027c01861606"  # v_cmp_lt_f32_sdwa s6, -v1, v2 src0_sel:DWORD src1_sel:DWORD
+            "f904887d01000506"  # v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
             "000081bf"          # s_endpgm
         )
         unlowered = bytes.fromhex(
-            "f904887d01000506"  # v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
+            "f904927d01000606"  # v_cmp_lt_f16_sdwa vcc_lo, v1, v2 src0_sel:DWORD src1_sel:DWORD
             "f904247c01001606"  # v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD
             "000081bf"          # s_endpgm
         )
@@ -4656,7 +4657,7 @@ class TestRdna2Scanner(unittest.TestCase):
 
         res_sup = results["ps_vopc_sdwa_supported.bin"]
         self.assertEqual((res_sup["total_instructions"], res_sup["supported_instructions"], res_sup["unsupported_count"]),
-                         (2, 2, 0), res_sup.get("unsupported_details"))
+                         (3, 3, 0), res_sup.get("unsupported_details"))
         self.assertTrue(res_sup["opcodes_recognized"])
         self.assertEqual(res_sup["unsupported_opcodes"], {})
 
@@ -4669,7 +4670,7 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(
             [d["raw"] for d in res_unl["unsupported_details"]],
             [
-                "v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
+                "v_cmp_lt_f16_sdwa vcc_lo, v1, v2 src0_sel:DWORD src1_sel:DWORD",
                 "v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD",
             ],
         )
@@ -4681,6 +4682,26 @@ class TestRdna2Scanner(unittest.TestCase):
             [d["raw"] for d in res_bad["unsupported_details"]],
             ["v_cmp_lt_f64_e32 <unsupported SDWA>"],
         )
+
+        # All 16 32-bit integer SDWA compares are recognized and supported; neighbours remain rejected.
+        for op in ("f", "lt", "eq", "le", "gt", "ne", "ge", "t"):
+            for kind in ("i32", "u32"):
+                self.assertTrue(is_instruction_supported(
+                    f"v_cmp_{op}_{kind}_sdwa vcc_lo, s44, v18 src0_sel:BYTE_0 src1_sel:WORD_1"))
+                self.assertTrue(is_instruction_supported(
+                    f"v_cmp_{op}_{kind}_sdwa s52, sext(v18), sext(s44) src0_sel:WORD_0 src1_sel:BYTE_3"))
+                self.assertTrue(is_instruction_supported(
+                    f"v_cmp_{op}_{kind}_sdwa s[52:53], v18, v19 src0_sel:DWORD src1_sel:DWORD"))
+        for bad in (
+            "v_cmp_lt_i32_sdwa vcc_lo, 0, v18 src0_sel:DWORD src1_sel:DWORD",
+            "v_cmp_lt_i32_sdwa vcc_lo, -s44, v18 src0_sel:DWORD src1_sel:DWORD",
+            "v_cmp_lt_i32_sdwa vcc_lo, s44, v18 src0_sel:DWORD",
+            "v_cmp_lt_i32_sdwa vcc_lo, s44, v18 dst_sel:DWORD src0_sel:DWORD src1_sel:DWORD",
+            "v_cmp_lt_i16_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD",
+            "v_cmp_eq_u16_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD",
+            "v_cmpx_lt_i32_sdwa s44, v18 src0_sel:DWORD src1_sel:DWORD",
+        ):
+            self.assertFalse(is_instruction_supported(bad), bad)
 
     def test_binary_scan_recognizes_vop1_vop2_sdwa(self):
         """Binary shaders with VOP1/VOP2 SDWA reach the scanner as decoded opcodes, not vop1_sdwa/vop2_sdwa."""
