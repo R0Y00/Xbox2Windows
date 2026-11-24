@@ -198,7 +198,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-3";
+    constexpr char revision[] = "x2w-startup-shader-5";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     auto& entry = translation_by_key()[key];
@@ -479,10 +479,10 @@ struct SubmittedDrawSamplerHeaps {
 };
 std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
 
-void discard_draw_sampler_heaps(Wrapper* self)
+void discard_draw_sampler_heaps(ID3D12CommandList* list)
 {
     AcquireSRWLockExclusive(&draw_lock);
-    recorded_draw_sampler_heaps.erase(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
+    recorded_draw_sampler_heaps.erase(list);
     ReleaseSRWLockExclusive(&draw_lock);
 }
 
@@ -1191,6 +1191,10 @@ void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
 {
+    static LONG dropped;
+    if (count && (parameter >= 16 || offset >= 8 || count > 8 - offset) && first_calls(dropped, 4))
+        log("x2w-render root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)",
+            parameter >= 16 || offset >= 8 ? "dropped" : "truncated", parameter, offset, count);
     if (parameter >= 16 || offset >= 8 || !count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
     for (UINT i = 0; i < count && offset + i < 8; ++i) pass_of(self).constants[parameter][offset + i] = data[i];
 }

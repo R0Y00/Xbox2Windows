@@ -106,7 +106,7 @@ bool check_dxr_placed_build(ID3D12Device* device);
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline);
 bool check_dxr_update(ID3D12Device* device, bool usePipeline);
 bool check_dxr_facing(ID3D12Device* device, bool usePipeline);
-bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline);
+bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline, float nearT);
 
 Microsoft::WRL::ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
     D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);

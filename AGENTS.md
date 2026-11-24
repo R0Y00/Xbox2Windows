@@ -145,6 +145,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_image_3d_check.py
 ./out/pe-env/bin/python -B tests/startup_image_load_mip_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_host_cpu_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_capture_check.py
@@ -152,6 +153,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
+./out/pe-env/bin/python -B tests/startup_buffer_address_check.py
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ```
 

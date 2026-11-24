@@ -309,7 +309,10 @@ long __stdcall factory_create_status_array(Object*, unsigned capacity, const cha
     Object* object = make(status);
     object->capacity = capacity;
     object->results = new LONG[capacity ? capacity : 1];
-    for (unsigned i = 0; i < capacity; ++i) object->results[i] = static_cast<LONG>(0x8000000A);  // E_PENDING
+    // A new slot is complete with S_OK until EnqueueStatus marks it pending (#1843), as in Microsoft's
+    // Win32 implementation of this API (Xbox-GDK-Samples, MIT: SimpleDirectStorageCombo/DirectStorageWin32/
+    // DirectStorageWin32WrapperStatusArray.cpp). A caller may poll IsComplete before a slot's first use.
+    for (unsigned i = 0; i < capacity; ++i) object->results[i] = S_OK;
     *out = object;
     return S_OK;
 }
@@ -362,6 +365,111 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
+
+// Failed requests by cause, for the heartbeat (#1198). Each failure site names its cause and
+// count_failure adds it to requests_failed as well, so the causes add up to that total. "other" holds
+// the failures without a cause of their own: unknown option bits, page grants and page writes, a page
+// array unreadable at run, an entry that threw, an entry never started. Fixed counters, no allocation.
+enum class StorageFailure : unsigned {
+    read_at_or_past_eof, read_crossing_eof, read_other, destination_capacity, destination_not_writable,
+    zlib, bcpack, other, count
+};
+using StorageFailureCounts = LONG[static_cast<unsigned>(StorageFailure::count)];
+StorageFailureCounts storage_failures;
+
+void count_failure(StorageFailure cause) noexcept
+{
+    InterlockedIncrement(&storage_failures[static_cast<unsigned>(cause)]);
+    InterlockedIncrement(&requests_failed);
+}
+
+// The cause of a refused file read, from its range against the file size. No end offset is formed, so
+// neither an offset nor a count near 2^64 can wrap: at or past the end is offset >= size, crossing it
+// is count > size - offset (evaluated only when offset < size).
+StorageFailure read_failure_cause(bool size_known, u64 file_size, u64 offset, u64 count) noexcept
+{
+    if (!size_known) return StorageFailure::read_other;
+    if (offset >= file_size) return StorageFailure::read_at_or_past_eof;
+    if (count > file_size - offset) return StorageFailure::read_crossing_eof;
+    return StorageFailure::read_other;
+}
+
+StorageFailure read_failure_cause(const Object* file_object, u64 offset, u64 count) noexcept
+{
+    LARGE_INTEGER length{};
+    const bool known = file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
+                       GetFileSizeEx(file_object->handle, &length) && length.QuadPart >= 0;
+    return read_failure_cause(known, known ? static_cast<u64>(length.QuadPart) : 0, offset, count);
+}
+
+// The heartbeat's line of failure causes. It is a line of its own after the totals line, whose text
+// stays as it was; it carries no "inflated=", "options=" or "commit peak=" text, which
+// tools/startup/live_view.py, tools/startup/triage_run.py and tests/startup_heartbeat_check.py match.
+LONG sample_failure_counts(StorageFailureCounts& counts) noexcept
+{
+    ULONG total = 0;
+    for (unsigned i = 0; i < static_cast<unsigned>(StorageFailure::count); ++i) {
+        counts[i] = InterlockedCompareExchange(&storage_failures[i], 0, 0);
+        total += static_cast<ULONG>(counts[i]);
+    }
+    return static_cast<LONG>(total);
+}
+
+int format_failure_causes(char* out, std::size_t size, int second, const StorageFailureCounts& n) noexcept
+{
+    return std::snprintf(out, size,
+                         "x2w-dstorage heartbeat %d s: failed requests by cause read-at-or-past-eof=%ld "
+                         "read-crossing-eof=%ld read-other=%ld destination-capacity=%ld destination-not-writable=%ld "
+                         "zlib=%ld bcpack=%ld other=%ld",
+                         second, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
+}
+
+// Page-destination requests (option bit 21) by where their destination ends against the first 64 KiB
+// page, each split into completed and failed, for the heartbeat (#1198). The end is page_offset (+0x10,
+// low 16 bits) plus destination_size (+0x18, u32), formed in 64 bits so it cannot wrap. A request is
+// counted once, when it runs: by execute_request for every outcome but "empty" (which is neither
+// completed nor failed), and as failed when its page array is unreadable at run or its run threw. An
+// entry that never started is not counted (it failed in Submit, without running). Fixed counters, no
+// allocation; nothing here changes an outcome.
+enum class PageEnd : unsigned { inside, at_page_end, past, count };
+using PageEndCounts = LONG[static_cast<unsigned>(PageEnd::count)][2];  // [end][0 completed, 1 failed]
+PageEndCounts page_end_counts;
+
+PageEnd page_end(unsigned page_offset, unsigned destination_size) noexcept
+{
+    const u64 end = u64{page_offset} + destination_size;
+    if (end < 0x10000) return PageEnd::inside;
+    if (end == 0x10000) return PageEnd::at_page_end;
+    return PageEnd::past;
+}
+
+void count_page_request(const unsigned char* request, bool failed) noexcept
+{
+    const u64 options = *reinterpret_cast<const u64*>(request);
+    if (!(options & (1ull << 21))) return;
+    const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
+    const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
+    InterlockedIncrement(&page_end_counts[static_cast<unsigned>(page_end(page_offset, destination_size))][failed ? 1 : 0]);
+}
+
+void sample_page_end_counts(PageEndCounts& counts) noexcept
+{
+    for (unsigned end = 0; end < static_cast<unsigned>(PageEnd::count); ++end)
+        for (unsigned failed = 0; failed < 2; ++failed)
+            counts[end][failed] = InterlockedCompareExchange(&page_end_counts[end][failed], 0, 0);
+}
+
+// The heartbeat's line of page-destination requests by end, after the failure causes. Like that line it
+// carries no "inflated=", "options=" or "commit peak=" text.
+int format_page_ends(char* out, std::size_t size, int second, const PageEndCounts& n) noexcept
+{
+    return std::snprintf(out, size,
+                         "x2w-dstorage heartbeat %d s: page requests by end against the first 64 KiB page "
+                         "inside-completed=%ld inside-failed=%ld at-page-end-completed=%ld at-page-end-failed=%ld "
+                         "past-completed=%ld past-failed=%ld",
+                         second, n[0][0], n[0][1], n[1][0], n[1][1], n[2][0], n[2][1]);
+}
+
 LONG bcpack_requests[16], bcpack_blank[16];
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 
@@ -423,6 +531,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
     const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
     const char* outcome = "done";
+    StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
     if (options & ~known) {
@@ -436,8 +545,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         if (file_object && file_object->kind == file &&
             x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
             input = packed.data();
-        else
+        else {
             outcome = "read failed";
+            failure = read_failure_cause(file_object, offset, source_size);
+        }
     }
     const unsigned char* data = nullptr;
     std::size_t decode_length = source_size;
@@ -542,6 +653,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
 
             if (!direct_decoded) {
                 outcome = "zlib failed";
+                failure = StorageFailure::zlib;
                 data = nullptr;
                 static LONG diagnosed;
                 if (InterlockedIncrement(&diagnosed) <= 12) {
@@ -565,6 +677,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     bcpack_decoded = true;
                 } else {
                     outcome = "bcpack failed";
+                    failure = StorageFailure::bcpack;
                     data = nullptr;
                 }
             } else {
@@ -582,6 +695,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             // and leave the destination memory completely unchanged.
             if (decode_length > destination_capacity) {
                 outcome = "destination capacity exceeded";
+                failure = StorageFailure::destination_capacity;
                 data = nullptr;
             } else if (page_destination) {
                 const ULONG_PTR needed_pages = (page_offset + decode_length + 0xFFFF) / 0x10000;
@@ -625,6 +739,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     std::memcpy(destination, data, decode_length);
                 } else {
                     outcome = "destination not writable";
+                    failure = StorageFailure::destination_not_writable;
                     data = nullptr;
                     written = false;
                 }
@@ -641,8 +756,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             }
         }
     }
-    const bool failed = (data == nullptr || !written) && std::strcmp(outcome, "empty") != 0;
-    if (failed) InterlockedIncrement(&requests_failed);
+    const bool empty = std::strcmp(outcome, "empty") == 0;
+    const bool failed = (data == nullptr || !written) && !empty;
+    if (failed) count_failure(failure);
+    if (!empty) count_page_request(request, failed);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
@@ -665,7 +782,8 @@ void run_entry(Object* self, Entry& entry)
             // no token captured at enqueue is ever used.
             const std::size_t bytes = entry.token_count * sizeof(ULONG_PTR);
             if (!title || !x2w_local::readable(title, bytes)) {
-                InterlockedIncrement(&requests_failed);
+                count_failure(StorageFailure::other);
+                count_page_request(entry.bytes, true);
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
                 if (InterlockedIncrement(&unreadable) <= 12)
@@ -708,7 +826,8 @@ void copy_reason(char (&reason)[96], const char* text) noexcept
 // Fails the entry that threw: the next status entry reports E_FAIL, the worker goes on with the queue.
 void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
 {
-    InterlockedIncrement(&requests_failed);
+    count_failure(StorageFailure::other);
+    if (entry.type == Entry::request) count_page_request(entry.bytes, true);
     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG reported;
     if (InterlockedIncrement(&reported) <= 12)
@@ -842,7 +961,7 @@ bool deferred_pending(const QueueWork& work)
 void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value)
 {
     if (type == Entry::request) {
-        InterlockedIncrement(&requests_failed);
+        count_failure(StorageFailure::other);
         InterlockedCompareExchange(&self->pending, static_cast<LONG>(E_OUTOFMEMORY), S_OK);
     } else if (type == Entry::status_entry) {
         const LONG pending = InterlockedExchange(&self->pending, S_OK);
@@ -1262,13 +1381,20 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     (void)bcpack_summary;
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
     // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
-    // what the run spends (#1199), including while requests are stalled.
+    // what the run spends (#1199), including while requests are stalled. A second line splits the
+    // failed requests by cause, a third the page-destination requests by end (#1198).
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         MemorySample last_memory;
         for (int second = 10;; second += 10) {
             Sleep(10000);
-            const LONG total = requests_done + requests_compressed + requests_failed;
+            // Sample the counters once for every line of this report, even while the worker is reporting
+            // new failures.
+            StorageFailureCounts failure_counts;
+            const LONG failed = sample_failure_counts(failure_counts);
+            PageEndCounts page_ends;
+            sample_page_end_counts(page_ends);
+            const LONG total = requests_done + requests_compressed + failed;
             const LONG total2 = total + requests_bcpack_blank;
             const MemorySample sample = memory_sample();
             const ULONGLONG peak_mib = sample.peak_commit >> 20;
@@ -1293,8 +1419,12 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
+                    failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
+                char causes[384];
+                if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
+                char ends[384];
+                if (format_page_ends(ends, sizeof(ends), second, page_ends) > 0) log("%s", ends);
                 last = total2;
                 last_memory = sample;
             }

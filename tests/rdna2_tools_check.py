@@ -4962,7 +4962,7 @@ class TestRdna2Scanner(unittest.TestCase):
             result = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}["ps_vop1_swap.bin"]
         self.assertTrue(result["opcodes_recognized"])
         self.assertEqual(result["unsupported_opcodes"], {})
-        # pixel_aot lowers the first three, so only v_swaprel_b32 is listed as untranslated.
+        # The scanner's static tables still list v_swaprel_b32 as untranslated; pixel_aot lowers it since #1795.
         self.assertEqual([d["raw"].split()[0] for d in result["unsupported_details"]], ["v_swaprel_b32"])
 
     def test_binary_scan_recognizes_vop2_carry_and_image_atomics(self):

@@ -4,10 +4,12 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,6 +22,7 @@
 #include "dispatch_index_cs.h"
 #include "group_index_cs.h"
 #include "desktop_gpu.h"
+#include "dxr_opacity_reference.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
@@ -982,14 +985,43 @@ OperationResult run_dxr_facing_pipeline(const OperationContext& ctx)
     return skip_if_false(check_dxr_facing(ctx.device, true));
 }
 
+std::optional<float> parse_dxr_opacity_tmin(int argc, char** argv)
+{
+    if (argc == 3) return dxr_opacity::defaultTMin;
+    if (argc != 5 || std::string_view(argv[3]) != "--tmin") return std::nullopt;
+
+    const std::string_view text = argv[4];
+    const char* const last = text.data() + text.size();
+    // Check the interval before rounding to the float stored in the ray buffer.
+    double value = 0;
+    const auto [end, error] = std::from_chars(text.data(), last, value);
+    if (error != std::errc{} || end != last || !std::isfinite(value) || value < 0 || value > dxr_opacity::maxTMin)
+        return std::nullopt;
+
+    const float nearT = static_cast<float>(value);
+    if (nearT == 0) return value == 0 ? std::optional<float>{0.0f} : std::nullopt;
+    return nearT;
+}
+
+bool validate_dxr_opacity_args(int argc, char** argv)
+{
+    return parse_dxr_opacity_tmin(argc, argv).has_value();
+}
+
+OperationResult run_dxr_opacity_fixture(const OperationContext& ctx, bool use_pipeline)
+{
+    const float nearT = parse_dxr_opacity_tmin(ctx.argc, ctx.argv).value();
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", use_pipeline, nearT));
+}
+
 OperationResult run_dxr_opacity(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", false));
+    return run_dxr_opacity_fixture(ctx, false);
 }
 
 OperationResult run_dxr_opacity_pipeline(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", true));
+    return run_dxr_opacity_fixture(ctx, true);
 }
 
 OperationResult run_ray_query(const OperationContext& ctx)
@@ -1240,9 +1272,14 @@ constexpr CapabilityGate kGateSm60CompareSampler{
 constexpr CapabilityGate kGateSm60SamplerIndexControl{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: sampler index control requires SM 6.0",
-    CapsDiagnostic::none};constexpr CapabilityGate kGateSm60RawUavDump{
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60RawUavDump{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: raw UAV dump requires SM 6.0",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm62RawUavDump{
+    D3D_SHADER_MODEL_6_2, false, false, 0,
+    "skip: denormal-preserving raw UAV dump requires SM 6.2",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_0, true, false, 0,
@@ -1305,6 +1342,7 @@ const OperationSpec kOperations[] = {
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
+    {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
@@ -1378,8 +1416,8 @@ const OperationSpec kOperations[] = {
     {"--dxr-update-pipeline", 3, 3, nullptr, kNoGate, run_dxr_update_pipeline},
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
     {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
-    {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
-    {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
+    {"--dxr-opacity", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity},
+    {"--dxr-opacity-pipeline", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
     {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
@@ -1555,7 +1593,7 @@ int run_self_test()
 
     // (a) CLI validation rejects unknown --*, bad argc, bad flags, and bad positional draw argc with usage_error (exit 2).
     auto check_cli = [&](std::vector<const char*> args, CliAction expected_action,
-                         std::string_view expected_err_substr = {}) {
+                         std::string_view expected_err_substr = {}, std::optional<float> expected_tmin = {}) {
         std::vector<char*> mut_argv;
         std::vector<std::string> storage;
         storage.reserve(args.size());
@@ -1568,8 +1606,24 @@ int run_self_test()
             !require(err.find(expected_err_substr) != std::string::npos, "expected stderr substring")) {
             return false;
         }
-        return true;
+        return !expected_tmin || require(parse_dxr_opacity_tmin(static_cast<int>(mut_argv.size()), mut_argv.data()) ==
+                                         expected_tmin, "effective opacity TMin");
     };
+
+    for (const char* op : {"--dxr-opacity", "--dxr-opacity-pipeline"}) {
+        if (!check_cli({"offscreen_check", "warp", op}, CliAction::operation, {}, 0.25f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0"}, CliAction::operation, {}, 0.0f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0.25"}, CliAction::operation, {}, 0.25f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0.5"}, CliAction::operation, {}, 0.5f)) return 1;
+        if (!check_cli({"offscreen_check", "warp", op, "--tmin"}, CliAction::usage_error) ||
+            !check_cli({"offscreen_check", "warp", op, "--other", "0.25"}, CliAction::usage_error) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0", "--tmin", "0.5"}, CliAction::usage_error))
+            return 1;
+        for (const char* value : {"", "-0.1", "0.51", "0.50000001", "1", "nan", "inf", "1e999", "1e-100", "0,25", "0.25x"}) {
+            if (!check_cli({"offscreen_check", "warp", op, "--tmin", value}, CliAction::usage_error)) return 1;
+        }
+    }
+    if (!check_cli({"offscreen_check", "warp", "--dual-uav", "--tmin", "0.25"}, CliAction::usage_error)) return 1;
 
     if (!check_cli({"offscreen_check", "warp", "--bvh-wave"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;

@@ -25,7 +25,8 @@ param(
     [switch]$Render,                           # draw through translated pipelines
     [switch]$FakeUser,                         # answer the user API for one local user
     [switch]$GpuMirror,                        # map CPU-view pages into the paired GPU-view reservation
-    [switch]$HostCpu                           # rewrite instructions the host processor lacks (X2W_HOST_CPU)
+    [switch]$HostCpu,                          # rewrite instructions the host processor lacks (X2W_HOST_CPU)
+    [switch]$StartupBelow40                    # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
 )
 $ErrorActionPreference = "Stop"
 $repo = Resolve-Path (Join-Path $PSScriptRoot "..\..")
@@ -46,6 +47,7 @@ if ($InputScript) { $env:X2W_INPUT_SCRIPT = $InputScript }
 if ($FakeUser) { $env:X2W_FAKE_USER = "1" }
 if ($GpuMirror) { $env:X2W_XMEM_GPU_MIRROR = "1" }
 if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
+if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" }
 if ($Render) {
     New-Item -ItemType Directory -Force $ShaderCache | Out-Null
     $env:X2W_D3D12_RENDER = "1"; $env:X2W_DRAW_NULL_IDENTITY = "1"

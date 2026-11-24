@@ -4,6 +4,7 @@
 
 #include "era_physical.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include "startup_stubs/local_log.h"
@@ -318,6 +319,32 @@ struct TestFault {
 };
 #endif
 
+// Test build only: X2W_XMEM_TEST_HOLD_WINDOW=<name> keeps an unmap in the window where the run is
+// unmapped and not yet mapped again. It sets the event "<name>.unmapped", then waits up to
+// five seconds for "<name>.release", so that a reader thread can reach the window every time.
+#ifdef X2W_XMEM_TEST_CONTROLS
+void hold_window()
+{
+    char name[96];
+    const DWORD length = GetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", name, sizeof(name) - 16);
+    if (!length || length >= sizeof(name) - 16) return;
+    char event_name[128];
+    std::snprintf(event_name, sizeof(event_name), "%s.unmapped", name);
+    HANDLE unmapped = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.release", name);
+    HANDLE release = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    if (unmapped && release) {
+        SetEvent(unmapped);
+        if (WaitForSingleObject(release, 5000) != WAIT_OBJECT_0)
+            x2w_local::logf("x2w-xmem test hold: nobody released the unmapped window within 5 s");
+    }
+    if (unmapped) CloseHandle(unmapped);
+    if (release) CloseHandle(release);
+}
+#else
+void hold_window() {}
+#endif
+
 // Drops a page that has no view any more from the registry, so that the registry never names a
 // page Windows does not show.
 void forget_page(ULONG_PTR address)
@@ -462,6 +489,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                     memory.views.erase(address);
                 }
             }
+            if (!refused && !unmapped.empty()) hold_window();
             ULONG_PTR lost = 0;
             for (const auto& [base, size] : unmapped)
                 lost += map_recorded(base, size, refused ? test.stage == 3 && test.hit(3) : test.hit(2));
@@ -769,6 +797,59 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
     return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); });
 }
 
+// Startup compatibility configuration (#1758, under #874): X2W_XMEM_STARTUP_BELOW_40=1 places the
+// large-page pool blocks with attribute 0x283 (protection 0x2004 or 0x2404) so that the whole block,
+// last byte included, lies below 2^40. The title passes the CPU address of such a block straight
+// through as a GPU address, and a package acceleration-structure builder refuses destinations with
+// more than 40 address bits. Off by default; every other shape keeps its placement. The low range is
+// a requirement, never a preference: an allocation that cannot be placed there fails with the host
+// error, and nothing is truncated, masked or retried higher.
+constexpr ULONG_PTR startup_low_limit = ULONG_PTR{1} << 40;  // exclusive
+constexpr SIZE_T startup_large_page = SIZE_T{2} << 20;
+
+#ifdef X2W_XMEM_TEST_CONTROLS
+// Test build only (tests/xmem_startup_below_40_check.cpp): X2W_XMEM_TEST_BELOW_40 names mutants
+// that drop the address limit ("no_limit"), the check after the allocation ("no_check") or the
+// release of a refused block ("no_release").
+static bool startup_below_40_mutant(const char* name) noexcept
+{
+    char text[64]{};
+    return GetEnvironmentVariableA("X2W_XMEM_TEST_BELOW_40", text, sizeof(text)) && std::strstr(text, name);
+}
+#else
+static bool startup_below_40_mutant(const char*) noexcept { return false; }
+#endif
+
+// Checks a block allocated with the 2^40 requirement: 2 MiB aligned and base + bytes - 1 < 2^40,
+// computed without overflow. A block outside that range is released and refused.
+static void* keep_startup_block_below_40(void* block, SIZE_T bytes, ULONGLONG attributes, DWORD protection) noexcept
+{
+    if (!block) {
+        const DWORD error = GetLastError();
+        x2w_local::logf("x2w-xmem startup block below 2^40 refused: size=0x%llx attr=0x%llx prot=0x%lx, no 2 MiB-aligned "
+                        "range ending below 2^40 (host error %lu)",
+                        static_cast<unsigned long long>(bytes), attributes, static_cast<unsigned long>(protection),
+                        static_cast<unsigned long>(error));
+        SetLastError(error);
+        return nullptr;
+    }
+    const auto base = reinterpret_cast<ULONG_PTR>(block);
+    const bool inside = base % startup_large_page == 0 && bytes <= startup_low_limit && base <= startup_low_limit - bytes;
+    if (!inside && !startup_below_40_mutant("no_check")) {
+        const BOOL released = startup_below_40_mutant("no_release") ? FALSE : VirtualFree(block, 0, MEM_RELEASE);
+        x2w_local::logf("x2w-xmem startup block below 2^40 refused: size=0x%llx attr=0x%llx prot=0x%lx, placed at %p "
+                        "outside the 2 MiB-aligned range below 2^40 (%s)",
+                        static_cast<unsigned long long>(bytes), attributes, static_cast<unsigned long>(protection), block,
+                        released ? "released" : "not released");
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    x2w_local::logf("x2w-xmem startup block below 2^40: %p size=0x%llx last=%p attr=0x%llx prot=0x%lx", block,
+                    static_cast<unsigned long long>(bytes), reinterpret_cast<void*>(base + (bytes - 1)), attributes,
+                    static_cast<unsigned long>(protection));
+    return block;
+}
+
 // Reserve+commit desktop profile for the startup blocks observed on #870: the pool loop asks
 // for type 0x20003000 with 0x183/0x22004, 0x283/0x2404 or 0x283/0x2004, and later startup code for type
 // 0x20403000 (64 KiB pages) with 0x181/PAGE_READWRITE, each with a null base. Proposed
@@ -777,7 +858,8 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
 // MEM_LARGE_PAGES type gets a 2 MiB-aligned base (the x64 large-page size); the
 // MEM_64K_PAGES type (MEM_LARGE_PAGES | MEM_PHYSICAL) keeps the 64 KiB allocation
 // granularity. Large pages themselves and the console protection bits above PAGE_READWRITE
-// are not reproduced. A host failure returns NULL with the host error.
+// are not reproduced. A host failure returns NULL with the host error. X2W_XMEM_STARTUP_BELOW_40
+// adds an address limit for the 0x283 blocks (keep_startup_block_below_40).
 static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
                                   DWORD protection) noexcept
 {
@@ -794,11 +876,16 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
     if (!large_pages) return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     MEM_ADDRESS_REQUIREMENTS requirements{};
     requirements.Alignment = SIZE_T{2} << 20;
+    // supported already limits attribute 0x283 to protection 0x2004 or 0x2404.
+    const bool below_40 = attributes == 0x283 && x2w_local::env_on("X2W_XMEM_STARTUP_BELOW_40");
+    if (below_40 && !startup_below_40_mutant("no_limit"))
+        requirements.HighestEndingAddress = reinterpret_cast<void*>(startup_low_limit - 1);
     MEM_EXTENDED_PARAMETER parameter{};
     parameter.Type = MemExtendedParameterAddressRequirements;
     parameter.Pointer = &requirements;
-    return VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
-                         &parameter, 1);
+    void* const block = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
+                                      &parameter, 1);
+    return below_40 ? keep_startup_block_below_40(block, bytes, attributes, protection) : block;
 }
 
 // The startup commit profile above, and the reserve-only desktop profile from the source-built

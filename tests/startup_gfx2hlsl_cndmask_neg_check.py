@@ -38,10 +38,12 @@ AND_B32 = 0x1b
 V30 = 256 + 30  # VGPR operands are encoded from 256 upwards
 
 
-def encode_vop2_e64(op, vdst, src0, src1, *, neg0=0, neg1=0, clamp=0, omod=0):
+def encode_vop2_e64(op, vdst, src0, src1, *, neg0=0, neg1=0, abs0=0, abs1=0, clamp=0, omod=0, neg_mask=0):
     """Encode a VOP2 instruction in its VOP3A (e64) form."""
-    w0 = ((0b110101 << 26) | ((VOP2_E64_BASE + op) << 16) | ((clamp & 1) << 15) | (vdst & 0xff))
-    w1 = ((src0 & 0x1ff) | ((src1 & 0x1ff) << 9) | ((omod & 0x3) << 27) | ((neg0 & 1) << 29) | ((neg1 & 1) << 30))
+    w0 = ((0b110101 << 26) | ((VOP2_E64_BASE + op) << 16) | ((clamp & 1) << 15)
+          | ((abs1 & 1) << 9) | ((abs0 & 1) << 8) | (vdst & 0xff))
+    w1 = ((src0 & 0x1ff) | ((src1 & 0x1ff) << 9) | ((omod & 0x3) << 27) | ((neg0 & 1) << 29)
+          | ((neg1 & 1) << 30) | ((neg_mask & 1) << 31))
     return struct.pack('<II', w0, w1)
 
 
@@ -131,6 +133,18 @@ check('plain 0.5 still translates',
 # 7. The select takes no output modifier; one that reaches it is refused rather than dropped from the text.
 check('a clamp on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, clamp=1)))
 check('a mul:2 on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, omod=1)))
+
+# 8. Source absolute values and a negated mask reach `u()`/`u_src()` as text they cannot model, and are
+#    refused. llvm-mc rejects all three spellings, so they are decoder-produced words only; the property
+#    under test is that production refuses the printed operand rather than translating it.
+check('an absolute value on the first source is refused',
+      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs0=1)))
+check('an absolute value on the second source is refused',
+      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs1=1)))
+check('absolute values on both sources are refused',
+      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs0=1, abs1=1)))
+check('a negated mask is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, neg_mask=1)))
+
 
 if failures:
     print('FAIL')

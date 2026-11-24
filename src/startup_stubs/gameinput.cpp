@@ -160,18 +160,31 @@ GamepadState sample()
     }
     // X2W_INPUT_SCRIPT=<mask hex>@<second>[,...]: one press of 0.3 s per entry (e.g. 4@60,1@70,20@80
     // presses A, then Menu, then Y), so one run can try several buttons at known times.
-    static const struct Script { std::uint32_t mask[32]; double at[32]; int count; ULONGLONG zero; } script = [] {
+    // A script longer than the buffer, extra entries and malformed entries are reported, not dropped silently.
+    static constexpr int max_entries = 256;
+    static const struct Script { std::uint32_t mask[max_entries]; double at[max_entries]; int count; ULONGLONG zero; } script = [] {
         Script sc{{}, {}, 0, GetTickCount64()};
-        char text[512]{};
-        if (GetEnvironmentVariableA("X2W_INPUT_SCRIPT", text, sizeof(text))) {
-            for (char* item = std::strtok(text, ","); item && sc.count < 32; item = std::strtok(nullptr, ",")) {
+        static char text[4096];
+        const DWORD length = GetEnvironmentVariableA("X2W_INPUT_SCRIPT", text, sizeof(text));
+        if (length >= sizeof(text)) {
+            x2w_local::logf("x2w-input X2W_INPUT_SCRIPT ignored: %lu characters, at most %u", static_cast<unsigned long>(length - 1),
+                            static_cast<unsigned>(sizeof(text) - 1));
+        } else if (length) {
+            int entries = 0, malformed = 0;
+            for (char* item = std::strtok(text, ","); item; item = std::strtok(nullptr, ",")) {
+                ++entries;
                 unsigned mask = 0;
                 double at = 0;
-                if (std::sscanf(item, "%x@%lf", &mask, &at) == 2) {
+                if (std::sscanf(item, "%x@%lf", &mask, &at) != 2) {
+                    ++malformed;
+                } else if (sc.count < max_entries) {
                     sc.mask[sc.count] = mask;
                     sc.at[sc.count++] = at;
                 }
             }
+            if (sc.count + malformed < entries || malformed)
+                x2w_local::logf("x2w-input X2W_INPUT_SCRIPT: %d of %d entries used (%d malformed, at most %d)", sc.count, entries,
+                                malformed, max_entries);
         }
         return sc;
     }();

@@ -69,6 +69,7 @@ jobs:
               (["tests/pixel_get_lod_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_shadow_check.py", *COMMON_LLVM], {}),
               (["tests/startup_sampler_heap_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
@@ -76,6 +77,7 @@ jobs:
               (["tests/startup_image_2d_array_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_flat_param_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_bit_alu_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
           ]
@@ -172,6 +174,7 @@ jobs:
             tests/startup_gfx2hlsl_operand_count_check.py \
             tests/startup_image_2d_array_check.py \
             tests/startup_host_cpu_check.py \
+            tests/startup_gfx2hlsl_cvt_alu_check.py \
             tests/startup_gfx2hlsl_capture_check.py \
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
@@ -179,7 +182,9 @@ jobs:
             tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
+            tests/startup_gfx2hlsl_mad_check.py \
             tests/startup_inline_sampler_check.py \
+            tests/startup_buffer_address_check.py \
             tests/compute_entry_layout_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:

@@ -305,6 +305,72 @@ bool dstorage_page_array_checks() {
     return true;
 }
 
+// #1843: a new status array's slots start complete with S_OK; EnqueueStatus makes one pending until
+// its turn, and the others are untouched.
+bool dstorage_status_initial_checks() {
+    _putenv("X2W_XMEM_PERMISSIVE=1");
+    HMODULE xcrdapi = LoadLibraryA("XCRDAPI.dll");
+    if (!xcrdapi) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(xcrdapi, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!get_factory || get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    const unsigned capacity = 4;
+    void* status_ptr = nullptr;
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, capacity, "InitialStatus", nullptr, &status_ptr) != 0 ||
+        !status_ptr)
+        return false;
+    auto* status = static_cast<Object*>(status_ptr);
+    auto complete = [&](unsigned i) { return reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, i); };
+    auto result = [&](unsigned i) { return reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i); };
+    const long e_pending = static_cast<long>(0x8000000A), e_invalidarg = static_cast<long>(0x80070057);
+
+    // A fresh array: every slot complete with S_OK. An index past the end stays refused.
+    for (unsigned i = 0; i < capacity; ++i) {
+        if (!complete(i) || result(i) != S_OK) {
+            std::printf("dstorage-status-initial: fresh slot %u complete=%d hr=0x%08lx\n", i, complete(i),
+                        static_cast<unsigned long>(result(i)));
+            return false;
+        }
+    }
+    if (complete(capacity) || result(capacity) != e_invalidarg) return false;
+
+    // Hold the queue's worker in a fence signal, then enqueue a status into slot 2 behind it.
+    void* queue_ptr = nullptr;
+    alignas(void*) unsigned char desc[40] = {};
+    *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
+        return false;
+    auto* queue = static_cast<Object*>(queue_ptr);
+    static SubmitGate gate;
+    static void* fence_vtable[11] = {};
+    fence_vtable[10] = reinterpret_cast<void*>(&hold_worker);
+    gate.vtable = fence_vtable;
+    gate.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    gate.resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!gate.entered || !gate.resume) return false;
+    reinterpret_cast<EnqueueSignalFn>(queue->vtable[5])(queue, &gate, 1);
+    reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+    reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+    if (WaitForSingleObject(gate.entered, 3000) != WAIT_OBJECT_0) {
+        SetEvent(gate.resume);
+        return false;
+    }
+    // Before its turn, slot 2 is pending and the other slots keep their S_OK.
+    bool held = !complete(2) && result(2) == e_pending;
+    for (unsigned i : {0u, 1u, 3u}) held = held && complete(i) && result(i) == S_OK;
+    SetEvent(gate.resume);
+    for (int i = 0; i < 200 && !complete(2); ++i) Sleep(10);
+    const bool done = complete(2) && result(2) == S_OK && InterlockedCompareExchange(&gate.resumed, 0, 0);
+    if (!held || !done) {
+        std::printf("dstorage-status-initial: held=%d done=%d slot2 hr=0x%08lx\n", held, done,
+                    static_cast<unsigned long>(result(2)));
+        return false;
+    }
+    return true;
+}
+
 bool dstorage_checks() {
     _putenv("X2W_XMEM_PERMISSIVE=1");
 
@@ -1646,6 +1712,11 @@ int main(int argc, char** argv)
     if (!std::strcmp(which, "dstorage-pages")) {
         if (!dstorage_page_array_checks()) return 9;
         std::puts("dstorage-pages ok");
+        return 0;
+    }
+    if (!std::strcmp(which, "dstorage-status-initial")) {
+        if (!dstorage_status_initial_checks()) return 10;
+        std::puts("dstorage-status-initial ok");
         return 0;
     }
     if (!std::strcmp(which, "dstorage")) {

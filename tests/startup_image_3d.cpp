@@ -53,11 +53,8 @@ std::vector<char> read_blob(const char* path)
     return bytes;
 }
 
-ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sampler_line)
+ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup::TranslatedSamplers& samplers)
 {
-    x2w_startup::TranslatedSamplers samplers;
-    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
-        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
     ComPtr<ID3D12RootSignature> root;
     check(x2w_startup::create_translated_root(device, entry_constants, 1, samplers, &root),
           "Create translated image 3D root signature");
@@ -67,7 +64,8 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sample
 
 // array: the same eight texels as two slices of a 2D array (dim:SQ_RSRC_IMG_2D_ARRAY); the default
 // view of a two-slice texture is a Texture2DArray over both. levels (array only, 1 or 3): the array is
-// 4x4 with that many mip levels, and the default view spans all of them.
+// 4x4 with that many mip levels, and the default view spans all of them. When sampler_line is a
+// comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional)
 {
@@ -76,7 +74,11 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
-    const auto root = create_root(device, sampler_line);
+    x2w_startup::TranslatedSamplers samplers;
+    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    const bool comparison = !samplers.comparison.empty() && samplers.comparison[0];
+    const auto root = create_root(device, samplers);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
@@ -100,7 +102,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     td.Height = one_dimensional ? 1 : base;
     td.DepthOrArraySize = one_dimensional ? 1 : side;
     td.MipLevels = levels;
-    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.Format = comparison ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     // A volume is one subresource of two slices; an array is two subresources of one slice each.
@@ -126,7 +128,8 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                     texel_value(tx, ty, tz, level, levels, texel);
                     if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
                     auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
-                    std::memcpy(slice + ty * place.Footprint.RowPitch + tx * sizeof(texel), texel, sizeof(texel));
+                    const UINT texel_bytes = comparison ? sizeof(float) : sizeof(texel);
+                    std::memcpy(slice + ty * place.Footprint.RowPitch + tx * texel_bytes, texel, texel_bytes);
                 }
         }
     upload->Unmap(0, nullptr);

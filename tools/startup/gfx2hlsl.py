@@ -135,9 +135,6 @@ def reg_range(tok):
     return None
 
 
-SAMPLER_CLAMP = {0: 'WRAP', 1: 'MIRROR', 2: 'CLAMP', 3: 'MIRROR_ONCE', 4: 'CLAMP', 5: 'MIRROR_ONCE', 6: 'BORDER', 7: 'BORDER'}
-
-
 def smem_offset(tok):
     """The SMEM offset operand as a token: 'off' (no offset operand) is the literal 0, anything else unchanged."""
     return '0' if tok == 'off' else tok
@@ -666,21 +663,58 @@ class Stage:
         self.op_s_buffer_load_dword(ops, mods, 16)
 
     def buffer_address(self, ops, mods):
+        # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
+        # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
+        # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
+        # and any other modifier change the destination or operand layout and are refused first.
+        offset = 0
+        for m in mods:
+            if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
+                offset += int(m[7:], 0)
+            elif m not in ('idxen', 'offen', 'glc', 'slc', 'dlc'):
+                raise Unsupported('buffer modifier %s' % m)
+        if len(ops) != 4:
+            raise Unsupported('buffer load with %d operands' % len(ops))
         key = self.descriptor(ops[2])
         buf = self.pipe.resource(key, 'buf')
-        offset = int(ops[3], 0)
-        for m in mods:
-            if m.startswith('offset:'):
-                offset += int(m[7:], 0)
-        if 'idxen' in mods:
+        soffset = None
+        if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
+            offset += int(ops[3], 0)
+        else:
+            sreg = reg_range(ops[3])
+            if not sreg or sreg[0] != 's' or sreg[1] != sreg[2] or sreg[1] > 105:
+                raise Unsupported('buffer soffset %s' % ops[3])
+            soffset = self.S(sreg[1])
+        idxen, offen = 'idxen' in mods, 'offen' in mods
+        terms = []
+        if idxen and offen:
             if key in self.pipe.modified:
                 raise Unsupported('indexed load through a modified descriptor')
-            address = '%s * ud%d + %d' % (self.u(ops[1]), self.pipe.ud(('stride',) + (self.pipe.resources[key]['index'],)), offset)
-        elif 'offen' in mods:
-            address = '%s + %d' % (self.u(ops[1]), offset)
-        else:
-            address = '%d' % offset
-        return buf, address
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[2] - r[1] != 1 or r[2] > 255:
+                raise Unsupported('buffer vaddr %s for idxen offen' % ops[1])
+            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            terms.append('%s * ud%d' % (self.u('v%d' % r[1]), stride))
+            terms.append(self.u('v%d' % r[2]))
+        elif idxen:
+            if key in self.pipe.modified:
+                raise Unsupported('indexed load through a modified descriptor')
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
+                raise Unsupported('buffer vaddr %s for idxen' % ops[1])
+            stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
+            terms.append('%s * ud%d' % (self.u(ops[1]), stride))
+        elif offen:
+            r = reg_range(ops[1])
+            if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
+                raise Unsupported('buffer vaddr %s for offen' % ops[1])
+            terms.append(self.u(ops[1]))
+        elif ops[1] != 'off':
+            raise Unsupported('buffer vaddr %s without idxen or offen' % ops[1])
+        if soffset is not None:
+            terms.append(soffset)
+        terms.append('%d' % offset)
+        return buf, ' + '.join(terms)
 
     def op_buffer_load_dword(self, ops, mods, count=1):
         dst = reg_range(ops[0])
@@ -710,6 +744,10 @@ class Stage:
                  'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
+                 # Four half channels in one 8-byte element: x/y in the first dword, z/w in the second.
+                 'BUF_FMT_16_16_16_16_FLOAT': (None, ['U(f16tof32(ldu({0}, a)))', 'U(f16tof32(ldu({0}, a) >> 16))',
+                                                      'U(f16tof32(ldu({0}, a + 4)))',
+                                                      'U(f16tof32(ldu({0}, a + 4) >> 16))']),
                  'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
                  'BUF_FMT_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', 'U(1.0)']),
                  'BUF_FMT_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '0u', 'U(1.0)']),
@@ -773,15 +811,21 @@ class Stage:
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
             axes = 3 if three else 2
-            mip = '0'
-            if how == 'load_mip':
-                unsupported = [m for m in mods if not m.startswith(('dim:', 'dmask:'))
-                               and m not in ('unorm', 'glc', 'slc', 'dlc')]
-                if unsupported or len(cs) != axes + 1 or not dmask:
-                    raise Unsupported('image_load_mip address or modifiers: %s' % ' '.join(mods))
-                mip = self.u(cs[axes])
-            address = [self.u(c) for c in cs[:axes]] + [mip]
-            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address))
+            packed_2d = how == 'load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+            allowed = ('unorm', 'glc', 'slc', 'dlc')
+            if packed_2d:
+                allowed += ('a16',)
+            unsupported = any(not m.startswith(('dim:', 'dmask:')) and m not in allowed for m in mods)
+            wrong_address = (packed_2d and len(cs) != 1) or (how == 'load_mip' and len(cs) != axes + 1)
+            if unsupported or wrong_address or not dmask:
+                raise Unsupported('image_%s address or modifiers: %s' % (how, ' '.join(mods)))
+            if packed_2d:
+                packed = self.u(cs[0])
+                address = ['%s & 0xffffu' % packed, '%s >> 16' % packed]
+            else:
+                address = [self.u(c) for c in cs[:axes]]
+            mip = self.u(cs[axes]) if how == 'load_mip' else '0'
+            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address + [mip]))
         else:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
@@ -802,10 +846,10 @@ class Stage:
                 n += 1
 
     def image_compare(self, ops, mods, how):
-        """image_sample_c and image_sample_c_lz: a 2D depth comparison returning one float.
+        """image_sample_c and image_sample_c_lz: a 2D or 2D-array depth comparison returning one float.
 
-        The address dwords are the reference, then u and v, which is what SampleCmp* takes as its third
-        argument and its location. The comparison function and the filter live in the sampler descriptor,
+        The address dwords are the reference, then u and v (and the slice of a 2D array), which is what
+        SampleCmp* takes as its third argument and its location. The comparison function and the filter live in the sampler descriptor,
         so they are read from its constant words by the decoder the pixel AOT path already checks against
         D3D12 (pixel_aot.comparison_sampler_state) and bound as a SamplerComparisonState. HLSL has no
         SampleCmpLevel before shader model 6.7 (the stages here compile as 5.1 and 6.0), so
@@ -822,8 +866,9 @@ class Stage:
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % base)
         dim, dmask = dims[0], int(masks[0], 0)
-        if dim != 'SQ_RSRC_IMG_2D':
+        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_2D_ARRAY'):
             raise Unsupported('%s on %s' % (base, dim))
+        array = dim == 'SQ_RSRC_IMG_2D_ARRAY'
         if dmask != 1:
             raise Unsupported('%s with dmask %#x: a comparison returns one channel' % (base, dmask))
         if len(ops) != 4:
@@ -834,7 +879,8 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        if len(cs) != 3:
+        # The reference, u and v; a 2D array adds the slice as the last address register.
+        if len(cs) != (4 if array else 3):
             raise Unsupported('%s with %d address registers' % (base, len(cs)))
         if self.heap_sampler(ops[3]):
             raise Unsupported('%s through a sampler heap' % base)
@@ -846,9 +892,12 @@ class Stage:
             pixel_aot.comparison_sampler_state(tuple(words))
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (base, error))
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2da' if array else 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
-        args = '%s, float2(%s, %s), %s' % (smp, self.f(cs[1]), self.f(cs[2]), self.f(cs[0]))
+        # Texture2DArray takes the slice as the third location component, like Sample and Load on the same type.
+        location = ('float3(%s, %s, %s)' % (self.f(cs[1]), self.f(cs[2]), self.f(cs[3])) if array
+                    else 'float2(%s, %s)' % (self.f(cs[1]), self.f(cs[2])))
+        args = '%s, %s, %s' % (smp, location, self.f(cs[0]))
         # MAX_LOD (word 1 bits 23:12) is not carried into the static sampler, and the comparison-state mapping ignores
         # the mip filter and uses level zero. Only a source limited to level zero is therefore exact for the implicit
         # form; any other limit would need mip selection and blending that is not lowered in this slice, so it is refused.
@@ -955,6 +1004,39 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, True)
 
+    def i64_words(self, tok):
+        """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
+        pair = reg_range(tok)
+        if pair and pair[2] == pair[1] + 1:
+            if pair[0] == 'v':
+                return self.u('v%d' % pair[1]), self.u('v%d' % pair[2])
+            return self.u('s%d' % pair[1]), self.u('s%d' % pair[2])
+        if re.fullmatch(r'-?\d+', tok) and -16 <= int(tok) <= 64:
+            value = int(tok) & 0xffffffffffffffff
+            return '%du' % (value & 0xffffffff), '%du' % (value >> 32)
+        raise Unsupported('64-bit source %s' % tok)
+
+    def shift64(self, ops, mods, helper):
+        if mods:
+            raise Unsupported('64-bit shift with %s' % mods)
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1:
+            raise Unsupported('64-bit shift destination %s' % ops[0])
+        amount = self.u(ops[1])
+        low, high = self.i64_words(ops[2])
+        body = '{ uint2 t = %s(%s, %s, %s); v%d = t.x; v%d = t.y; }' % (
+            helper, low, high, amount, dst[1], dst[2])
+        self.used_v.update((dst[1], dst[2]))
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
+    def op_v_lshlrev_b64(self, ops, mods):
+        self.shift64(ops, mods, 'shl64')
+
+    def op_v_lshrrev_b64(self, ops, mods):
+        self.shift64(ops, mods, 'shr64u')
+
+    def op_v_ashrrev_i64(self, ops, mods):
+        self.shift64(ops, mods, 'shr64i')
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
@@ -1088,10 +1170,11 @@ VEC_F = {
     'v_add_f32': (2, '{0} + {1}'), 'v_sub_f32': (2, '{0} - {1}'), 'v_subrev_f32': (2, '{1} - {0}'),
     'v_mul_f32': (2, '{0} * {1}'), 'v_mul_legacy_f32': (2, 'mul_legacy({0}, {1})'),
     'v_min_f32': (2, 'min({0}, {1})'), 'v_max_f32': (2, 'max({0}, {1})'),
-    'v_fmac_f32': (2, '{0} * {1} + {2}'), 'v_mac_f32': (2, '{0} * {1} + {2}'),
-    'v_fma_f32': (3, '{0} * {1} + {2}'), 'v_mad_f32': (3, '{0} * {1} + {2}'), 'v_mad_legacy_f32': (3, 'mul_legacy({0}, {1}) + {2}'),
+    'v_fmac_f32': (2, '{0} * {1} + {2}'), 'v_mac_f32': (2, 'mad32({0}, {1}, {2}, false)'),
+    'v_fma_f32': (3, '{0} * {1} + {2}'), 'v_mad_f32': (3, 'mad32({0}, {1}, {2}, false)'),
+    'v_mad_legacy_f32': (3, 'mad32({0}, {1}, {2}, true)'),
     'v_fmamk_f32': (3, '{0} * {1} + {2}'), 'v_fmaak_f32': (3, '{0} * {1} + {2}'),
-    'v_madmk_f32': (3, '{0} * {1} + {2}'), 'v_madak_f32': (3, '{0} * {1} + {2}'),
+    'v_madmk_f32': (3, 'mad32({0}, {1}, {2}, false)'), 'v_madak_f32': (3, 'mad32({0}, {1}, {2}, false)'),
     'v_rcp_f32': (1, '1.0 / {0}'), 'v_rcp_iflag_f32': (1, '1.0 / {0}'), 'v_rsq_f32': (1, 'rsqrt({0})'), 'v_sqrt_f32': (1, 'sqrt({0})'),
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
@@ -1269,7 +1352,32 @@ class Pipeline:
     def common(self):
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
+               # Match pixel_aot: round the product before adding and flush denormals to signed zero.
+               'float ftz32(float value) {',
+               '    uint bits = asuint(value);',
+               # Select the mask as an integer so FXC preserves the sign of a flushed zero.
+               '    uint mask = (bits & 0x7fffffffu) < 0x00800000u ? 0x80000000u : 0xffffffffu;',
+               '    return asfloat(bits & mask);',
+               '}',
+               'float mad32(float a, float b, float c, bool legacy) {',
+               '    a = ftz32(a);',
+               '    b = ftz32(b);',
+               '    precise float product = ftz32(legacy ? mul_legacy(a, b) : a * b);',
+               '    precise float sum = product + ftz32(c);',
+               '    return ftz32(sum);',
+               '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # The 64-bit shifts (issue #1815): a pair of words, so the count never reaches 32 in a 32-bit
+               # shift and an in-place destination keeps the original value (the caller passes both words in).
+               'uint2 shl64(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
+               ' uint cy = sb == 0u ? 0u : (lo >> sc);'
+               ' return uint2(sh < 32u ? (lo << sb) : 0u, sh < 32u ? ((hi << sb) | cy) : (lo << sb)); }',
+               'uint2 shr64u(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
+               ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = hi >> sb;'
+               ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : 0u); }',
+               'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
+               ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
+               ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
@@ -1361,7 +1469,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob):
     """Hash the startup translation revision and the three blobs in runtime order."""
-    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
+    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-5'))))
 
 
 DEFAULT_FXC = r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'

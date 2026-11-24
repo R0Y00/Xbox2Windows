@@ -8114,7 +8114,7 @@ def check_mode_register_controls():
     # The scratch base stays unobservable: s_getreg_b32 is not lowered, and flat_load_dword reads
     # only through the title ranges, so the writes translate like s_nop 0 before it.
     expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)"]),
-                       "Unsupported instruction")
+                       "Unsupported hardware register read")
     expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, "flat_load_dword v12, v[12:13]"]),
                        "Title memory is not bound")
     assert (translate_title(FLAT_SCRATCH_WRITES + title_program())
@@ -8125,9 +8125,11 @@ def check_mode_register_controls():
     for value in ("1", "2", "4", "7", "-1", "0x103"):
         expect_value_error(translate, [f"s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {value}"] + plain,
                            "Unsupported binary16 rounding mode")
-    # The register forms of the same access stay unsupported.
-    expect_value_error(translate, ["s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"] + plain, "Unsupported instruction")
-    expect_value_error(translate, ["s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)"] + plain, "Unsupported instruction")
+    # The register forms are lowered for the same targets (check_sopk_hwreg_controls). Without a bound SGPR, or a
+    # prior write of the field, they are still refused.
+    expect_value_error(translate, ["s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"] + plain, "Unbound scalar operand s48")
+    expect_value_error(translate, ["s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)"] + plain,
+                       "MODE rounding is read before the program writes it")
     # Like the hints, nothing may sit between the color export and s_endpgm.
     must_reject(translate, plain[:-1] + [HALF_RNE, plain[-1]])
     must_reject(translate, plain[:-1] + [FLAT_SCRATCH_WRITES[0], plain[-1]])
@@ -8147,6 +8149,253 @@ def check_mode_register_controls():
         expect_value_error(translate, with_constants([HALF_RTZ, operation]), "under round toward zero")
     # The exact widening and the pack that always truncates do not depend on the mode.
     assert translate([HALF_RTZ] + with_constants(HALF_BODY)) == translate(["s_nop 0"] + with_constants(HALF_BODY))
+
+
+# s_setreg_b32 and s_getreg_b32 (SOPK) take the same targets as s_setreg_imm32_b32. The source SGPR of a MODE[3:2]
+# write must hold a known integer that is exactly 0 or 3; a whole FLAT_SCR_LO or FLAT_SCR_HI write takes any bound
+# SGPR. A read of MODE[3:2] is lowered once the program has written the field, and returns it right-aligned.
+# s48 carries the value written, s49 to s55 the values read back. The body writes round toward zero by register,
+# reads it, writes round to nearest even, reads it, writes round toward zero by immediate and reads that, writes
+# both scratch base halves from SGPRs, mixes the read values with constant-buffer words and restores nearest even.
+SOPK_SET = "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"
+SOPK_GET = "s_getreg_b32 s49, hwreg(HW_REG_MODE, 2, 2)"
+SOPK_HWREG_BODY = [
+    "s_mov_b32 s48, 3",
+    "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48",
+    "s_getreg_b32 s49, hwreg(HW_REG_MODE, 2, 2)",
+    "s_mov_b32 s50, 0",
+    "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s50",
+    "s_getreg_b32 s51, hwreg(HW_REG_MODE, 2, 2)",
+    "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
+    "s_getreg_b32 s52, hwreg(HW_REG_MODE, 2, 2)",
+    "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s44",
+    "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s49",
+    "s_add_u32 s53, s52, s45",
+    "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s51",
+    "s_getreg_b32 s54, hwreg(HW_REG_MODE, 2, 2)",
+    "s_add_u32 s55, s54, s46",
+    "v_mov_b32_e32 v12, s49",
+    "v_mov_b32_e32 v13, s51",
+    "v_mov_b32_e32 v14, s53",
+    "v_mov_b32_e32 v15, s55",
+]
+# Constant words 0 to 2 (s44 to s46) per run: the scratch base, an addend for the third and one for the fourth channel.
+SOPK_HWREG_SETS = ((0x11111111, 0x00000010, 0x00abcdef), (0xffffffff, 0xfffffffe, 0x00000000))
+SOPK_NOT_READ = "MODE rounding is read before the program writes it"
+
+
+def sopk_hwreg_expected(words):
+    """Channels: the read after RTZ (3), after RNE (0), 3 plus s45 after the immediate RTZ, 0 plus s46."""
+    return (3, 0, (3 + words[1]) & 0xffffffff, words[2])
+
+
+def sopk_mov(value):
+    return f"s_mov_b32 s48, {value}"
+
+
+def sopk_read(*before):
+    """Run before, read MODE[3:2] into s49 and export it in channel 0."""
+    return uncompressed_export([*before, SOPK_GET, "v_mov_b32_e32 v12, s49"])
+
+
+def sopk_constant(value, *before):
+    """The same program with the read replaced by a move of the value it must return."""
+    return uncompressed_export([*before, f"s_mov_b32 s49, {value}", "v_mov_b32_e32 v12, s49"])
+
+
+def check_sopk_hwreg_controls():
+    """s_setreg_b32 and s_getreg_b32 of MODE[3:2] and the scratch base: the accepted forms and every refusal."""
+    plain = with_constants(NARROW_BODY)
+    # Writing by SGPR is the immediate write: nearest even is a no-op, round toward zero is refused under every
+    # rounding binary16 or binary64 form, the last write wins and restoring nearest even lowers like no write.
+    assert (translate([sopk_mov(0), SOPK_SET] + plain) == translate([sopk_mov(0), "s_nop 0"] + plain)
+            == translate([sopk_mov(0), HALF_RNE] + plain))
+    assert translate([sopk_mov(3), SOPK_SET, sopk_mov(0), SOPK_SET] + plain) == translate(
+        [sopk_mov(3), "s_nop 0", sopk_mov(0), "s_nop 0"] + plain)
+    assert translate([sopk_mov(3), SOPK_SET, HALF_RNE] + plain) == translate([sopk_mov(3), "s_nop 0", "s_nop 0"] + plain)
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET] + plain, "under round toward zero: v_cvt_f16_f32_e32")
+    expect_value_error(translate, [sopk_mov(0), SOPK_SET, sopk_mov(3), SOPK_SET] + plain,
+                       "under round toward zero: v_cvt_f16_f32_e32")
+    packed = with_constants(VOP3P_BODY)
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET] + packed, "under round toward zero: v_pk_add_f16")
+    assert translate([sopk_mov(3), SOPK_SET, sopk_mov(0), SOPK_SET] + packed) == translate(
+        [sopk_mov(3), "s_nop 0", sopk_mov(0), "s_nop 0"] + packed)
+    expect_value_error(translate, with_constants([sopk_mov(3), SOPK_SET, "v_cvt_f32_f64_e32 v12, v[12:13]"]),
+                       "under round toward zero: v_cvt_f32_f64_e32")
+    # The exact widening and the truncating pack do not depend on the mode.
+    assert translate([sopk_mov(3), SOPK_SET] + with_constants(HALF_BODY)) == translate(
+        [sopk_mov(3), "s_nop 0"] + with_constants(HALF_BODY))
+    # Only a known integer of exactly 0 or 3 is a rounding mode. The directed modes and every value with higher bits
+    # set are refused (the hardware would take the low two bits, which the translator does not rely on).
+    for value in ("1", "2", "4", "7", "0x103", "0xfffffffc", "0xffffffff", "0x80000003", "0x7fffffff"):
+        expect_value_error(translate, [sopk_mov(value), SOPK_SET] + plain, "Unsupported binary16 rounding mode")
+    # An SGPR that is not a known integer is refused, whatever it may hold at run time.
+    expect_value_error(translate, with_constants(["s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s44"] + NARROW_BODY),
+                       "the SGPR is not a known integer")
+    expect_value_error(translate, [sopk_mov("s20"), SOPK_SET] + plain, "the SGPR is not a known integer")
+    expect_value_error(translate, [SOPK_SET] + plain, "Unbound scalar operand s48")
+    expect_value_error(translate, [sopk_mov(0), "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s60"] + plain,
+                       "Unbound scalar operand s60")
+    # The scratch base takes the whole register from any bound SGPR and lowers to nothing, like the immediate form.
+    for register in ("LO", "HI"):
+        write = f"s_setreg_b32 hwreg(HW_REG_FLAT_SCR_{register}), s44"
+        assert translate(with_constants([write] + NARROW_BODY)) == translate(with_constants(["s_nop 0"] + NARROW_BODY))
+        for value in ("0", "0x400", "0xdeadbeef", "5"):
+            assert translate([sopk_mov(value), write.replace("s44", "s48")] + plain) == translate(
+                [sopk_mov(value), "s_nop 0"] + plain)
+        expect_value_error(translate, [write.replace("s44", "s60")] + plain, "Unbound scalar operand s60")
+    # Every other register, field and spelling of the write is refused, and the target is checked before the value.
+    for write in ("hwreg(HW_REG_FLAT_SCR_LO, 0, 16)", "hwreg(HW_REG_FLAT_SCR_HI, 16, 16)",
+                  "hwreg(HW_REG_FLAT_SCR_LO, 0, 32)", "hwreg(HW_REG_FLAT_SCR_HI, 4, 8)",
+                  "hwreg(HW_REG_MODE, 0, 2)", "hwreg(HW_REG_MODE, 2, 1)", "hwreg(HW_REG_MODE, 3, 2)",
+                  "hwreg(HW_REG_MODE, 6, 2)", "hwreg(HW_REG_MODE, 0, 4)", "hwreg(HW_REG_MODE, 4, 4)",
+                  "hwreg(HW_REG_MODE, 02, 2)", "hwreg(HW_REG_MODE)", "hwreg(HW_REG_STATUS, 2, 2)",
+                  "hwreg(HW_REG_STATUS)", "hwreg(HW_REG_TRAPSTS, 2, 2)", "hwreg(HW_REG_LDS_ALLOC)",
+                  "hwreg(HW_REG_SHADER_CYCLES)", "hwreg(HW_REG_GPR_ALLOC)", "hwreg(HW_REG_IB_STS)"):
+        for value in ("0", "3"):
+            expect_value_error(translate, [sopk_mov(value), f"s_setreg_b32 {write}, s48"] + plain,
+                               "Unsupported hardware register write")
+    # Malformed operands: an immediate, a special register, a pair, a vector register, a missing or extra operand,
+    # swapped operands and a raw simm16.
+    for operands in ("hwreg(HW_REG_MODE, 2, 2), 3", "hwreg(HW_REG_MODE, 2, 2), vcc_lo", "hwreg(HW_REG_MODE, 2, 2), m0",
+                     "hwreg(HW_REG_MODE, 2, 2), null", "hwreg(HW_REG_MODE, 2, 2), s[48:49]",
+                     "hwreg(HW_REG_MODE, 2, 2), exec_lo", "hwreg(HW_REG_MODE, 2, 2), v0", "hwreg(HW_REG_MODE, 2, 2)",
+                     "hwreg(HW_REG_MODE, 2, 2), s48, s49", "s48, hwreg(HW_REG_MODE, 2, 2)",
+                     "hwreg(HW_REG_MODE, 2), s48", "hwreg(HW_REG_FLAT_SCR_LO), 0", "hwreg(HW_REG_FLAT_SCR_LO), v0",
+                     "0x881, s48", ""):
+        expect_value_error(translate, [sopk_mov(0), f"s_setreg_b32 {operands}".rstrip()] + plain,
+                           "Malformed s_setreg_b32 operands")
+    expect_value_error(translate, [sopk_mov(0), "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s106"] + plain,
+                       "Scalar register out of range")
+    # The read returns a known integer: it translates like a move of that value, so the field is right-aligned
+    # (3, not 3 << 2) and every other bit is zero. Any other value gives a different translation.
+    for first, written in ((3, 3), (0, 0)):
+        for setter in (SOPK_SET, f"s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {first}"):
+            program = sopk_read(sopk_mov(first), setter)
+            assert translate_int(program) == translate_int(sopk_constant(written, sopk_mov(first), "s_nop 0")), (first, setter)
+            for wrong in (3 - written, 1, 2, 4, 12, 0xc, 0x80000003, 0xffffffff):
+                if wrong != written:
+                    assert translate_int(program) != translate_int(sopk_constant(wrong, sopk_mov(first), "s_nop 0")), wrong
+    # The last write wins, also across the immediate form, and a read changes no state.
+    last = uncompressed_export([sopk_mov(3), SOPK_SET, SOPK_GET, HALF_RNE, "s_getreg_b32 s50, hwreg(HW_REG_MODE, 2, 2)",
+                                "s_getreg_b32 s51, hwreg(HW_REG_MODE, 2, 2)", "v_mov_b32_e32 v12, s49",
+                                "v_mov_b32_e32 v13, s50", "v_mov_b32_e32 v14, s51"])
+    assert translate_int(last) == translate_int(uncompressed_export(
+        [sopk_mov(3), "s_nop 0", "s_mov_b32 s49, 3", "s_nop 0", "s_mov_b32 s50, 0", "s_mov_b32 s51, 0",
+         "v_mov_b32_e32 v12, s49", "v_mov_b32_e32 v13, s50", "v_mov_b32_e32 v14, s51"]))
+    # A value read back is a known integer and can be written again.
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET, SOPK_GET, sopk_mov(0), SOPK_SET,
+                                   "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s49"] + plain,
+                       "under round toward zero: v_cvt_f16_f32_e32")
+    assert translate([sopk_mov(0), SOPK_SET, SOPK_GET, sopk_mov(3), SOPK_SET,
+                      "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s49"] + plain) == translate(
+        [sopk_mov(0), "s_nop 0", "s_mov_b32 s49, 0", sopk_mov(3), "s_nop 0", "s_nop 0"] + plain)
+    # The first read needs a write of the field: the entry value is only assumed. A write of the scratch base, a read
+    # that precedes the write and a write that follows the read do not count.
+    expect_value_error(translate, [SOPK_GET] + plain, SOPK_NOT_READ)
+    expect_value_error(translate, [sopk_mov(0), "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s48", SOPK_GET] + plain, SOPK_NOT_READ)
+    expect_value_error(translate, ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0", SOPK_GET] + plain, SOPK_NOT_READ)
+    expect_value_error(translate, [SOPK_GET, sopk_mov(0), SOPK_SET] + plain, SOPK_NOT_READ)
+    # Every other register or field is refused for reading, with and without an earlier write of MODE[3:2].
+    for read in ("hwreg(HW_REG_MODE, 0, 2)", "hwreg(HW_REG_MODE, 2, 1)", "hwreg(HW_REG_MODE, 3, 2)",
+                 "hwreg(HW_REG_MODE, 6, 2)", "hwreg(HW_REG_MODE, 0, 4)", "hwreg(HW_REG_MODE)",
+                 "hwreg(HW_REG_FLAT_SCR_LO)", "hwreg(HW_REG_FLAT_SCR_HI)", "hwreg(HW_REG_FLAT_SCR_LO, 0, 16)",
+                 "hwreg(HW_REG_STATUS)", "hwreg(HW_REG_STATUS, 2, 2)", "hwreg(HW_REG_TRAPSTS)", "hwreg(HW_REG_LDS_ALLOC)",
+                 "hwreg(HW_REG_SHADER_CYCLES)", "hwreg(HW_REG_GPR_ALLOC)", "hwreg(HW_REG_IB_STS)",
+                 "hwreg(HW_REG_MODE, 02, 2)"):
+        for before in ([], [sopk_mov(3), SOPK_SET]):
+            expect_value_error(translate, [*before, f"s_getreg_b32 s49, {read}"] + plain, "Unsupported hardware register read")
+    for operands in ("vcc_lo, hwreg(HW_REG_MODE, 2, 2)", "m0, hwreg(HW_REG_MODE, 2, 2)", "null, hwreg(HW_REG_MODE, 2, 2)",
+                     "s[48:49], hwreg(HW_REG_MODE, 2, 2)", "exec_lo, hwreg(HW_REG_MODE, 2, 2)",
+                     "v0, hwreg(HW_REG_MODE, 2, 2)", "hwreg(HW_REG_MODE, 2, 2), s49", "hwreg(HW_REG_MODE, 2, 2)",
+                     "s49", "s49, 0x881", "s49, 5", "s49, hwreg(HW_REG_MODE, 2, 2), s50",
+                     "s49 hwreg(HW_REG_MODE, 2, 2)", ""):
+        expect_value_error(translate, [sopk_mov(3), SOPK_SET, f"s_getreg_b32 {operands}".rstrip()] + plain,
+                           "Malformed s_getreg_b32 operands")
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET, "s_getreg_b32 s106, hwreg(HW_REG_MODE, 2, 2)"] + plain,
+                       "Scalar register out of range")
+    # Neither form may sit between the color export and s_endpgm, in a masked region or in a uniform skip block.
+    for line in (SOPK_SET, SOPK_GET):
+        must_reject(translate, [sopk_mov(3), SOPK_SET] + plain[:-1] + [line, plain[-1]])
+        for opener in REGION_WAIT_OPENERS:
+            expect_value_error(translate, region_scalar_alu_program(opener=opener, body=(line,)),
+                               "Instruction cannot run in a masked region")
+        expect_value_error(translate, scc_skip(body=(*SCC_SKIP_BODY, line), before=[sopk_mov(3), SOPK_SET]),
+                           "Instruction cannot run in a uniform skip block")
+    # A write ahead of a skip is on every path, so a read after its join is the same value on all of them.
+    for value in (0, 3):
+        skip = scc_skip(before=[sopk_mov(value), SOPK_SET], after=(SOPK_GET, "v_mov_b32_e32 v15, s49"))
+        assert translate_int(skip) == translate_int(scc_skip(
+            before=[sopk_mov(value), "s_nop 0"], after=(f"s_mov_b32 s49, {value}", "v_mov_b32_e32 v15, s49")))
+
+
+def check_sopk_hwreg_draw(directory, compiler, renderer, backend):
+    """Read MODE[3:2] back after SGPR and immediate writes and export the values through the lossless integer
+    target, mixed with constant-buffer words. Each deviation of the lowering (a field read left in place, a stale
+    read, an immediate write that is not seen, a write that is not applied) must report a pixel_mismatch."""
+    source = directory / "sopk_hwreg.hlsl"
+    shader = directory / "sopk_hwreg.cso"
+    source.write_text(translate_int(uncompressed_export(SOPK_HWREG_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, words in enumerate(SOPK_HWREG_SETS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words, 0)
+        expected = sopk_hwreg_expected(words)
+        # The field left in place (3 << 2), the first write ignored, the restore not seen, the immediate write not
+        # seen (0 plus s45) and the last read stale (3 plus s46).
+        wrongs = ((0, 12), (0, 0), (1, 3), (2, words[1]), (3, (words[2] + 3) & 0xffffffff))
+        for channel, value in wrongs:
+            assert value != expected[channel]
+            wrong = list(expected)
+            wrong[channel] = value
+            path = directory / f"sopk_hwreg-{index}-{channel}-{len(cases)}.case"
+            write_case(path, bytes(constants), tuple(as_float(word) for word in wrong), integer_rt=True)
+            cases.append((path, "mismatch"))
+        path = directory / f"sopk_hwreg-{index}.case"
+        write_case(path, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+        cases.append((path, "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+
+def check_sopk_hwreg_binary(directory, assembler, objcopy, library):
+    """LLVM 15 gfx1013 encodings and spellings of the register forms: SIMM16 is the id in bits 5:0, the offset in 10:6
+    and the width minus one in 15:11 (MODE[3:2] is 0x0881); a full-width field prints as the bare register and a
+    numeric id prints by name. Only the printed spelling is lowered. An immediate, and a pair, do not assemble."""
+    source, obj, binary = directory / "sopk_hwreg.s", directory / "sopk_hwreg.o", directory / "sopk_hwreg.bin"
+
+    def assemble(line):
+        source.write_text(line + chr(10) + "s_endpgm" + chr(10), encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True,
+                       capture_output=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        code = binary.read_bytes()
+        return code[:-4].hex(), disassemble(code, library)[0]
+
+    for line, encoded, text in (
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0", "810880b9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48", "8108b0b9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"),
+            ("s_setreg_b32 hwreg(1, 2, 2), s0", "810880b9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0"),
+            ("s_getreg_b32 s0, hwreg(HW_REG_MODE, 2, 2)", "810800b9", "s_getreg_b32 s0, hwreg(HW_REG_MODE, 2, 2)"),
+            ("s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)", "810830b9", "s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)"),
+            ("s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s5", "14f885b9", "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s5"),
+            ("s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI, 0, 32), s5", "15f885b9", "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s5"),
+            ("s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI, 4, 8), s5", "153985b9", "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI, 4, 8), s5"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 0, 32), s0", "01f880b9", "s_setreg_b32 hwreg(HW_REG_MODE), s0"),
+            ("s_getreg_b32 s1, hwreg(HW_REG_FLAT_SCR_LO)", "14f801b9", "s_getreg_b32 s1, hwreg(HW_REG_FLAT_SCR_LO)"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), vcc_lo", "8108eab9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), vcc_lo"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), m0", "8108fcb9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), m0"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), null", "8108fdb9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), null"),
+            ("s_getreg_b32 vcc_lo, hwreg(HW_REG_MODE, 2, 2)", "81086ab9", "s_getreg_b32 vcc_lo, hwreg(HW_REG_MODE, 2, 2)"),
+            ("s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)", "81087cb9", "s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)")):
+        assert assemble(line) == (encoded, text), (line, assemble(line))
+    for line in ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), 3", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s[0:1]",
+                 "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s106"):
+        try:
+            assemble(line)
+        except subprocess.CalledProcessError:
+            continue
+        raise AssertionError(f"LLVM 15 assembled {line}")
 
 
 HINT_NAMES = ("s_clause", "s_setprio", "s_sleep", "s_inst_prefetch", "s_incperflevel", "s_decperflevel",
@@ -8402,6 +8651,7 @@ def e64_spelling_programs():
 
 def check_e64_spelling_lowering():
     """Static checks: each e64 spelling lowers exactly like the e32 form, and nothing wider is accepted."""
+    check_vop1_nop_lowering()
     for name, program, function, plain in e64_spelling_programs():
         assert sum(line.startswith("v_interp_") and "_e64 " in line for line in program) in (2, 4, 8), name
         assert program.count("v_nop_e64") == 1, name
@@ -8443,6 +8693,62 @@ def check_e64_spelling_lowering():
     must_reject(translate, plain[:-1] + ["v_nop_e64", plain[-1]])
     must_reject(translate, plain[:3] + ["v_nop_e64"] + plain[3:])
     must_reject(translate, plain[:3] + ["v_nop"] + plain[3:])
+
+
+# v_clrexcp and v_pipeflush, in both encodings, as no-ops in the entry mask (#1791).
+VOP1_NOPS = ("v_clrexcp", "v_clrexcp_e64", "v_pipeflush", "v_pipeflush_e64")
+
+
+def vop1_nop_program(*, clobber=False, plain=False):
+    """The standard sampled program with the four no-op spellings after the sample wait, where v12 to v15 are
+    live. clobber replaces v_pipeflush with a write to v13, the control that a lowered register write is visible;
+    plain puts v_nop in each place, so the temporaries, which are numbered by line, line up."""
+    program = assembly(False)
+    at = program.index("s_waitcnt vmcnt(0)") + 1
+    nops = ["v_mov_b32_e32 v13, 0" if clobber and op == "v_pipeflush" else "v_nop" if plain else op
+            for op in VOP1_NOPS]
+    return program[:at] + nops + program[at:]
+
+
+def check_vop1_nop_lowering():
+    """Static checks: the no-ops lower to nothing, and nothing wider is accepted."""
+    assert translate(vop1_nop_program()) == translate(vop1_nop_program(plain=True))
+    for op in VOP1_NOPS:
+        program = assembly(False)
+        at = program.index("s_wqm_b64 exec, exec") + 1
+        try:
+            translate(program[:at] + [op] + program[at:])
+        except ValueError as error:
+            assert "non-entry mask" in str(error), (op, error)
+        else:
+            raise AssertionError(f"{op} accepted in the whole-quad mask")
+        for wider in (f"{op} v0", f"{op} v0, v1"):
+            try:
+                translate(assembly(False)[:10] + [wider] + assembly(False)[10:])
+            except ValueError as error:
+                assert str(error).startswith("Unsupported instruction"), (wider, error)
+            else:
+                raise AssertionError(f"{wider} accepted")
+
+
+def check_vop1_nop_draws(directory, compiler, renderer, backend):
+    """Draw the no-op program against the sampled texture reference; the clobber control must mismatch."""
+    source = directory / "vop1_nops.hlsl"
+    shader = directory / "vop1_nops.cso"
+    draw = [renderer, backend, "--check-pixel", shader, "rgba"]
+    source.write_text(translate(vop1_nop_program()), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    result = subprocess.run(draw)
+    if result.returncode:
+        return result.returncode
+    print(f"vop1 no-ops: {', '.join(VOP1_NOPS)} matched the sampled reference")
+    source.write_text(translate(vop1_nop_program(clobber=True)), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A no-op lowered as a register write escaped detection")
+    print("control v_pipeflush as a write to v13: pixel mismatch, as required")
+    return 0
 
 
 def check_e64_spelling_draws(directory, compiler, renderer, backend):
@@ -8524,6 +8830,24 @@ def translate_buffer_color(instructions):
     return lower(instructions, 9, 24, None, 0)
 
 
+def min_num(*values):
+    """HLSL min, and V_MIN_F32 with IEEE mode off: a NaN operand gives the other operand."""
+    numbers = [v for v in values if v == v]
+    return min(numbers) if numbers else math.nan
+
+
+def max_num(*values):
+    numbers = [v for v in values if v == v]
+    return max(numbers) if numbers else math.nan
+
+
+def med3_f32(a, b, c):
+    """V_MED3_F32 (RDNA 2 ISA): the median, or V_MIN3_F32 of the three operands when any of them is NaN."""
+    if any(v != v for v in (a, b, c)):
+        return min_num(a, b, c)
+    return sorted((a, b, c))[1]
+
+
 def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     """Expected colors for three_way(); no rounding occurs before the half export."""
     case = bytearray(256)
@@ -8531,8 +8855,8 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     for y in RAMP:
         for x in RAMP:
             r, g, b = single(x / 255), single(y / 255), single(128 / 255)
-            clamped = sorted((r, low, high))[1]
-            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), sorted((middle, g, r))[1])
+            clamped = med3_f32(r, low, high)
+            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), med3_f32(middle, g, r))
             case.extend(struct.pack("<4f", *map(half_rtz, color)))
     path = directory / name
     path.write_bytes(case)
@@ -8540,15 +8864,24 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
 
 
 def check_three_way_templates():
-    """The HLSL forms must pick the expected operand for every operand order."""
-    values = (-1.5, 0.0, 0.25, 0.25, 3.0)
+    """The HLSL forms must pick the expected operand for every operand order, NaN operands included."""
+    names = {"min": min_num, "max": max_num, "asuint": lambda x: struct.unpack("<I", struct.pack("<f", x))[0]}
+    # Evaluate the med3_32 helper of the preamble: its NaN test on the encoding, then the selected form.
+    helper = (r"^float med3_32\(float a, float b, float c\) \{\n    uint top = (.+);\n"
+              r"    return top > (0x[0-9a-f]+)u \? (.+) : (.+);\n\}")
+    for top, limit, nan_form, finite_form in re.findall(helper, pixel_aot.PREAMBLE, re.M):
+        top = re.sub(r"(0x[0-9a-f]+)u\b", r"\1", top)
+        names["med3_32"] = lambda a, b, c: eval(
+            nan_form if eval(top, names, {"a": a, "b": b, "c": c}) > int(limit, 16) else finite_form,
+            names, {"a": a, "b": b, "c": c})
+    values = (-1.5, 0.0, 0.25, 0.25, 3.0, math.nan)
     for a in values:
         for b in values:
             for c in values:
-                pick = {name: eval(ALU[name][1].format("a", "b", "c"), {"min": min, "max": max},
-                                   {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
-                assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
-                                "med3": sorted((a, b, c))[1]}, (a, b, c)
+                for name, expected in (("min3", min_num(a, b, c)), ("max3", max_num(a, b, c)),
+                                       ("med3", med3_f32(a, b, c))):
+                    pick = eval(ALU[name][1].format("a", "b", "c"), names, {"a": a, "b": b, "c": c})
+                    assert pick == expected or pick != pick and expected != expected, (name, a, b, c, pick)
 # Give the four invocations lane IDs 0, 1, 2, 3, then gather the converted values
 # using the author's injective base-4 weights. This witnesses every routed lane.
 DPP_CVT_LANES = [
@@ -13211,7 +13544,7 @@ def check_f16_arith_controls(*, run_reference=True):
     for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), 15", "Unsupported hardware register write"),
-                           ("s_setreg_b32 hwreg(HW_REG_MODE, 6, 2), s48", "Unsupported instruction")):
+                           ("s_setreg_b32 hwreg(HW_REG_MODE, 6, 2), s48", "Unsupported hardware register write")):
         for lines in ([write, *prefix, "v_add_f16 v24, v18, v19"], [*prefix, "v_add_f16 v24, v18, v19", write]):
             expect_value_error(translate_f16, uncompressed_export(lines), message)
     # Readers. The audited ones read a binary16 result; every other reader of the tag refuses it.
@@ -15605,9 +15938,9 @@ def _check_controls_inline(directory):
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
     source = translate(three_way())
-    for expected in ("max(min(params[1].z, sample16.y), min(max(params[1].z, sample16.y), sample16.x))",
+    for expected in ("med3_32(params[1].z, sample16.y, sample16.x)",
                      "max(max(sample16.x, sample16.z), sample16.y)",
-                     "max(min(sample16.x, params[0].w), min(max(sample16.x, params[0].w), params[1].x))",
+                     "med3_32(sample16.x, params[0].w, params[1].x)",
                      "min(min(abs(params[1].y), sample16.y), alu"):
         assert expected in source, expected
     for old, new in (("v_med3_f32 v12, v12, s44, s45", "v_med3_f32 v12, v12, s44"),
@@ -16036,6 +16369,56 @@ def _check_controls_inline(directory):
     plain_hlsl = translate(assembly(False))
     for sym in ("dpp_frexp_mant_f32(", "dpp_frexp_exp_i32_f32(", "dpp_dot4c_i32_i8(", "QuadRead"):
         assert sym not in plain_hlsl, sym
+
+    # Plain VOP1/VOP3 v_movrel* (#1739): the same m0 rules as the DPP forms, without a quad swizzle. Overlapping
+    # source and destination banks are read before any write; the refusals match the DPP forms.
+    plain_hlsl = translate(with_constants(PLAIN_MOVREL_BODY))
+    assert "dpp_soff" in plain_hlsl and "dpp_doff" in plain_hlsl and "QuadRead" not in plain_hlsl
+    assert "dpp_doff" in translate(with_constants([
+        "s_mov_b32 s64, s44",
+        "s_mov_b32 s65, 0",
+        "s_and_b64 s[64:65], s[64:65], 0x30003",
+        "s_mov_b32 m0, s64",
+        "v_movrelsd_2_b32_e32 v12, v12",
+    ]))
+    plain_bank = ["v_mov_b32_e32 v24, 1.0", "v_mov_b32_e32 v25, 2.0"]
+    for bad_seq, message in (
+        (["v_movrels_b32_e32 v12, v12"], "Unsupported m0 value for v_movrels_b32"),
+        (plain_bank + ["s_mov_b32 m0, s44", "v_movrels_b32_e64 v12, v24"], "Unsupported m0 value"),
+        (plain_bank + ["s_mov_b32 m0, 0x100", "v_movreld_b32_e32 v12, v24"], "Static m0 offset out of range"),
+        (plain_bank + ["s_mov_b32 m0, 200", "v_movrels_b32_e32 v12, v100"], "Indexed VGPR exceeds 255"),
+        (plain_bank + ["s_mov_b32 m0, 5", "v_movrels_b32_e32 v12, v24"], "Expected a numeric VGPR at v29"),
+    ):
+        try:
+            translate(with_constants(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"Plain movrel accepted {bad_seq}")
+
+    # v_swaprel_b32 (#1795): bounded selects on both sides, and the movrel refusals.
+    assert "swap_doff" in translate(with_constants(SWAPREL_BODY))
+    # Dynamic offsets whose two banks overlap: v24..v27 is both the source and the destination range.
+    overlap = translate(with_constants(SWAPREL_BODY[:8] + [
+        "s_mov_b32 s64, s47", "s_mov_b32 s65, 0", "s_and_b64 s[64:65], s[64:65], 0x30003", "s_mov_b32 m0, s64",
+        "v_swaprel_b32 v24, v24"]))
+    assert all(f"_r{r} = " in overlap for r in range(24, 28)), "each register of the overlapping bank is selected"
+    swap_bank = ["v_mov_b32_e32 v24, 1.0", "v_mov_b32_e32 v25, 2.0"]
+    for bad_seq, message in (
+        (["v_swaprel_b32 v12, v12"], "Unsupported m0 value for v_swaprel_b32"),
+        (swap_bank + ["s_mov_b32 m0, s44", "v_swaprel_b32 v24, v25"], "Unsupported m0 value"),
+        (swap_bank + ["s_mov_b32 m0, 0x1000000", "v_swaprel_b32 v24, v25"], "Static m0 offset out of range"),
+        (swap_bank + ["s_mov_b32 m0, 0x00c8", "v_swaprel_b32 v24, v100"], "Indexed VGPR exceeds 255"),
+        (swap_bank + ["s_mov_b32 m0, 0x50000", "v_swaprel_b32 v24, v25"], "Expected a numeric VGPR at v29"),
+        (swap_bank + ["s_add_u32 s64, s47, 1", "s_mov_b32 m0, s64", "v_swaprel_b32 v24, v25"],
+         "Dynamic m0 offset is unbounded"),
+    ):
+        try:
+            translate(with_constants(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"v_swaprel_b32 accepted {bad_seq}")
 
     # Quad-local DPP16/DPP8 v_movrel* controls (static and bounded dynamic m0).
     movrel_prog = with_constants(DPP_MOVREL_BODY)
@@ -16727,6 +17110,7 @@ _CONTROL_SUBCHECKS = (
     "check_bit_controls",
     "check_scheduling_hints",
     "check_mode_register_controls",
+    "check_sopk_hwreg_controls",
     "check_constant_descriptor_bounds",
     "check_scalar_constant_reads",
     "check_three_constant_buffers",
@@ -16812,6 +17196,7 @@ def _run_controls_serial():
 
 
 def check_controls(directory, *, parallel=True):
+    check_sampler_descriptor_refusals()
     tasks = _control_tasks()
     cpu_count = os.cpu_count() or 1
     # ProcessPoolExecutor on Windows enforces max_workers <= 61 (_MAX_WINDOWS_WORKERS).
@@ -17240,6 +17625,7 @@ def check_binary(directory, assembler, objcopy, library):
     check_f16_fmac_ldexp_binary(directory, assembler, objcopy, library)
     check_f16_cvt_int16_binary(directory, assembler, objcopy, library)
     check_f16_to_int16_binary(directory, assembler, objcopy, library)
+    check_sopk_hwreg_binary(directory, assembler, objcopy, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (with_three_constant_buffers(), translate_three_buffers), (smem_pointer_loads(), translate_smem_pointers),
@@ -17314,6 +17700,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((with_constants(NARROW_BODY), translate))
     fixtures.append((mode_program(), translate))
+    fixtures.append((uncompressed_export(SOPK_HWREG_BODY), translate_int))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
     fixtures.append((with_constants(APPROX_E64_BODY), translate))
@@ -17332,10 +17719,14 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     fixtures.append((with_constants(DPP_MOVREL_BODY), translate))
+    fixtures.append((with_constants(PLAIN_MOVREL_BODY), translate))
+    fixtures.append((with_constants(swap_movrel_encodings(PLAIN_MOVREL_BODY)), translate))
+    fixtures.append((with_constants(SWAPREL_BODY), translate))
     fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
+    fixtures.append((vop1_nop_program(), translate))
     fixtures.extend((uncompressed_export(body), translate_int, "gfx1013")
                     for body in (DPP_CVT_FROM_FLOAT, DPP_CVT_TO_FLOAT))
     fixtures.append((with_constants(DPP_EXTRA_BODY), translate, "gfx1013"))
@@ -20020,10 +20411,20 @@ def check_three_way_draw(directory, compiler, renderer, backend):
     source.write_text(translate(three_way()), encoding="ascii")
     compile_shader(compiler, source, shader)
     cases = []
-    for idx, constants in enumerate(((.25, .75, .375, .5), (.625, .125, -.3125, .5))):
+    # The second case makes the bounds of the first med3 and the first operand of the second NaN.
+    for idx, constants in enumerate(((.25, .75, .375, .5), (math.nan, .75, .375, math.nan), (.625, .125, -.3125, .5))):
         case = three_way_case(directory, *constants, name=f"three_way-{idx}.case")
         cases.append((case, "pass"))
     run_pixel_batch(renderer, backend, shader, cases)
+    # Desktop min and max alone skip a NaN operand instead of taking V_MIN3_F32 of the rest.
+    text = source.read_text(encoding="ascii")
+    nan_ignored = text.replace("? min(min(a, b), c) :", "? max(min(a, b), min(max(a, b), c)) :")
+    assert nan_ignored != text
+    source.write_text(nan_ignored, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[1][0]], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A median that ignores a NaN operand escaped detection")
     draw = [renderer, backend, "--check-pixel-case", shader, cases[-1][0]]
     without_abs = [line.replace("|s46|", "s46") for line in three_way()]
     source.write_text(translate(without_abs), encoding="ascii")
@@ -20231,6 +20632,246 @@ def check_dpp_movrel_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
+    return 0
+
+# Plain VOP1 (e32) and VOP3 (e64) v_movrel* fixture (#1739): the same four moves as DPP_MOVREL_BODY without
+# the quad swizzle, each lane indexing its own VGPRs. Each channel runs the e32 form with a runtime-dynamic m0
+# (bounded by s_bfe_u32 or s_and_b64, changing across the two constant sets) and the e64 form with a static m0.
+PLAIN_MOVREL_BODY = [
+    # Source bank v24..v27 = 10, 20, 40, 80.
+    "v_mov_b32_e32 v24, 0x41200000",
+    "v_mov_b32_e32 v25, 0x41a00000",
+    "v_mov_b32_e32 v26, 0x42200000",
+    "v_mov_b32_e32 v27, 0x42a00000",
+    # Channel R (v12): v_movrels (dynamic m0 = word0 & 3, then static m0 = 2).
+    "s_bfe_u32 s60, s44, 0x20000",
+    "s_mov_b32 m0, s60",
+    "v_movrels_b32_e32 v32, v24",
+    "s_mov_b32 m0, 2",
+    "v_movrels_b32_e64 v33, v24",
+    "v_add_f32_e32 v12, v32, v33",
+    # Channel G (v13): v_movreld into the bank v28..v31 = 1, 2, 3, 4 (dynamic m0 = word1 & 3, then m0 = 1).
+    "v_mov_b32_e32 v28, 1.0",
+    "v_mov_b32_e32 v29, 2.0",
+    "v_mov_b32_e32 v30, 0x40400000",
+    "v_mov_b32_e32 v31, 4.0",
+    "s_bfe_u32 s61, s45, 0x20000",
+    "s_mov_b32 m0, s61",
+    "v_movreld_b32_e32 v28, v25",
+    "s_mov_b32 m0, 1",
+    "v_movreld_b32_e64 v28, v24",
+    "v_fma_f32 v34, 2.0, v29, v28",
+    "v_fma_f32 v34, 4.0, v30, v34",
+    "v_fma_f32 v13, 0x41000000, v31, v34",
+    # Channel B (v14): v_movrelsd into v36..v39 = 1, 2, 3, 4 (dynamic m0 = word2 & 3, then m0 = 2).
+    "v_mov_b32_e32 v36, 1.0",
+    "v_mov_b32_e32 v37, 2.0",
+    "v_mov_b32_e32 v38, 0x40400000",
+    "v_mov_b32_e32 v39, 4.0",
+    "s_bfe_u32 s62, s46, 0x20000",
+    "s_mov_b32 m0, s62",
+    "v_movrelsd_b32_e32 v36, v24",
+    "s_mov_b32 m0, 2",
+    "v_movrelsd_b32_e64 v36, v24",
+    "v_fma_f32 v35, 2.0, v37, v36",
+    "v_fma_f32 v35, 4.0, v38, v35",
+    "v_fma_f32 v14, 0x41000000, v39, v35",
+    # Channel A (v15): v_movrelsd_2 into v40..v43 = 1, 2, 3, 4 (source m0[9:0], destination m0[25:16];
+    # dynamic m0 = word3 & 0x30003, then static m0 = 0x20001).
+    "v_mov_b32_e32 v40, 1.0",
+    "v_mov_b32_e32 v41, 2.0",
+    "v_mov_b32_e32 v42, 0x40400000",
+    "v_mov_b32_e32 v43, 4.0",
+    "s_mov_b32 s64, s47",
+    "s_mov_b32 s65, 0",
+    "s_and_b64 s[64:65], s[64:65], 0x30003",
+    "s_mov_b32 m0, s64",
+    "v_movrelsd_2_b32_e32 v40, v24",
+    "s_mov_b32 m0, 0x20001",
+    "v_movrelsd_2_b32_e64 v40, v24",
+    "v_fma_f32 v44, 2.0, v41, v40",
+    "v_fma_f32 v44, 4.0, v42, v44",
+    "v_fma_f32 v15, 0x41000000, v43, v44",
+]
+
+
+def plain_movrel_reference(w0, w1, w2, w3):
+    """Independent per-lane reference for PLAIN_MOVREL_BODY (the same value in every pixel)."""
+    src = [10.0, 20.0, 40.0, 80.0]
+    weighted = lambda bank: bank[0] + 2.0 * bank[1] + 4.0 * bank[2] + 8.0 * bank[3]
+    r = src[w0 & 3] + src[2]
+    g_bank = [1.0, 2.0, 3.0, 4.0]
+    g_bank[w1 & 3] = src[1]
+    g_bank[1] = src[0]
+    b_bank = [1.0, 2.0, 3.0, 4.0]
+    b_bank[w2 & 3] = src[w2 & 3]
+    b_bank[2] = src[2]
+    a_bank = [1.0, 2.0, 3.0, 4.0]
+    a_bank[(w3 >> 16) & 3] = src[w3 & 3]
+    a_bank[2] = src[1]
+    expected = (r, weighted(g_bank), weighted(b_bank), weighted(a_bank))
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def swap_movrel_encodings(body):
+    """PLAIN_MOVREL_BODY with each move's _e32 and _e64 spellings exchanged, so every form runs with both m0 kinds."""
+    swap = {"_b32_e32 ": "_b32_e64 ", "_b32_e64 ": "_b32_e32 "}
+    return [re.sub(r"_b32_e(?:32|64) ", lambda m: swap[m.group(0)], line) if line.startswith("v_movrel") else line
+            for line in body]
+
+
+def check_plain_movrel_draw(directory, compiler, renderer, backend):
+    for label, body in (("e32 dynamic, e64 static", PLAIN_MOVREL_BODY),
+                        ("e64 dynamic, e32 static", swap_movrel_encodings(PLAIN_MOVREL_BODY))):
+        check_plain_movrel_body(directory, compiler, renderer, backend, body, label)
+    return 0
+
+
+def check_plain_movrel_body(directory, compiler, renderer, backend, body, variant):
+    program = with_constants(body)
+    source = directory / "plain_movrel.hlsl"
+    shader = directory / "plain_movrel.cso"
+    case = directory / "plain_movrel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    hlsl = translate(program)
+    if "QuadRead" in hlsl or "WaveGetLaneIndex" in hlsl:
+        raise AssertionError("A plain movrel was lowered with a quad swizzle")
+    source.write_text(hlsl, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    references = [plain_movrel_reference(*words) for words in DPP_MOVREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+    for words, expected in zip(DPP_MOVREL_SETS, references):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    print(f"plain movrel ({variant}): matched {references} for the two constant sets")
+    # Controls on set 1: a dynamic m0 the translation ignores (offset 0) and swapped v_movrelsd_2 halves.
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *DPP_MOVREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *references[0]) * 64)
+    for old, new, label in (
+        ("s_mov_b32 m0, s60", "s_mov_b32 m0, 0", "v_movrels_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s61", "s_mov_b32 m0, 0", "v_movreld_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s62", "s_mov_b32 m0, 0", "v_movrelsd_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "v_movrelsd_2_b32 with the static m0 halves swapped"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Control {label} ({variant}) escaped detection")
+        print(f"control {label} ({variant}): pixel mismatch, as required")
+
+
+# v_swaprel_b32 (#1795): VGPR[vdst + m0[25:16]] and VGPR[vsrc + m0[9:0]] exchange. R and G are the two banks of
+# a dynamic swap (m0 = word3 & 0x30003); B and A are the two banks of a static swap that follows an overlapping
+# swap inside one bank and a swap of a register with itself.
+SWAPREL_SETS = DPP_MOVREL_SETS
+SWAPREL_BODY = [
+    "v_mov_b32_e32 v24, 0x41200000",
+    "v_mov_b32_e32 v25, 0x41a00000",
+    "v_mov_b32_e32 v26, 0x42200000",
+    "v_mov_b32_e32 v27, 0x42a00000",
+    "v_mov_b32_e32 v28, 1.0",
+    "v_mov_b32_e32 v29, 2.0",
+    "v_mov_b32_e32 v30, 0x40400000",
+    "v_mov_b32_e32 v31, 4.0",
+    "s_mov_b32 s64, s47",
+    "s_mov_b32 s65, 0",
+    "s_and_b64 s[64:65], s[64:65], 0x30003",
+    "s_mov_b32 m0, s64",
+    "v_swaprel_b32 v24, v28",
+    "v_fma_f32 v32, 2.0, v25, v24",
+    "v_fma_f32 v32, 4.0, v26, v32",
+    "v_fma_f32 v12, 0x41000000, v27, v32",
+    "v_fma_f32 v33, 2.0, v29, v28",
+    "v_fma_f32 v33, 4.0, v30, v33",
+    "v_fma_f32 v13, 0x41000000, v31, v33",
+    "v_mov_b32_e32 v36, 0x41200000",
+    "v_mov_b32_e32 v37, 0x41a00000",
+    "v_mov_b32_e32 v38, 0x42200000",
+    "v_mov_b32_e32 v39, 0x42a00000",
+    "v_mov_b32_e32 v40, 1.0",
+    "v_mov_b32_e32 v41, 2.0",
+    "v_mov_b32_e32 v42, 0x40400000",
+    "v_mov_b32_e32 v43, 4.0",
+    "s_mov_b32 m0, 0x30001",
+    "v_swaprel_b32 v36, v36",
+    "s_mov_b32 m0, 0x20002",
+    "v_swaprel_b32 v36, v36",
+    "s_mov_b32 m0, 0x20001",
+    "v_swaprel_b32 v36, v40",
+    "v_fma_f32 v34, 2.0, v37, v36",
+    "v_fma_f32 v34, 4.0, v38, v34",
+    "v_fma_f32 v14, 0x41000000, v39, v34",
+    "v_fma_f32 v35, 2.0, v41, v40",
+    "v_fma_f32 v35, 4.0, v42, v35",
+    "v_fma_f32 v15, 0x41000000, v43, v35",
+]
+
+
+def swaprel_reference(w0, w1, w2, w3):
+    """Independent reference for SWAPREL_BODY: list swaps, read both sides before writing."""
+    weighted = lambda bank: bank[0] + 2.0 * bank[1] + 4.0 * bank[2] + 8.0 * bank[3]
+    regs = {24 + k: v for k, v in enumerate((10.0, 20.0, 40.0, 80.0, 1.0, 2.0, 3.0, 4.0))}
+    regs.update({36 + k: v for k, v in enumerate((10.0, 20.0, 40.0, 80.0, 1.0, 2.0, 3.0, 4.0))})
+
+    def swap(dst, src, m0):
+        d, s = dst + ((m0 >> 16) & 0x3ff), src + (m0 & 0x3ff)
+        regs[d], regs[s] = regs[s], regs[d]
+
+    swap(24, 28, w3 & 0x30003)
+    swap(36, 36, 0x30001)
+    swap(36, 36, 0x20002)
+    swap(36, 40, 0x20001)
+    expected = tuple(weighted([regs[b + k] for k in range(4)]) for b in (24, 28, 36, 40))
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def check_swaprel_draw(directory, compiler, renderer, backend):
+    program = with_constants(SWAPREL_BODY)
+    source = directory / "swaprel.hlsl"
+    shader = directory / "swaprel.cso"
+    case = directory / "swaprel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    hlsl = translate(program)
+    if "QuadRead" in hlsl or "swap_soff" not in hlsl:
+        raise AssertionError("v_swaprel_b32 was not lowered through the per-lane swap")
+    source.write_text(hlsl, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    references = [swaprel_reference(*words) for words in SWAPREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+    for words, expected in zip(SWAPREL_SETS, references):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    print(f"swaprel: dynamic, overlapping, equal-index and static swaps matched {references}")
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *SWAPREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *references[0]) * 64)
+    for old, new, label in (
+        ("v_swaprel_b32 v24, v28", "v_movrelsd_2_b32_e32 v24, v28", "a one-way move instead of the dynamic swap"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "the static m0 halves swapped"),
+        ("s_mov_b32 m0, s64", "s_mov_b32 m0, 0", "the dynamic m0 ignored"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Control {label} escaped detection")
+        print(f"control {label}: pixel mismatch, as required")
     return 0
 
 
@@ -22703,6 +23344,47 @@ def check_e64_render(directory, compiler, renderer, backend):
     return 0
 
 
+def check_sampler_descriptor_refusals():
+    """The two sampler-descriptor profiles refuse a field they cannot model."""
+    pixel_aot.check_gather_sampler((0x12, 0, 0x04500000, 0), 1, comparison=False)
+    for words in ((0x13, 0, 0x04500000, 0), (0x12, 0x800, 0x04500000, 0), (0x12, 0, 0x04500001, 0)):
+        try:
+            pixel_aot.check_gather_sampler(words, 1, comparison=False)
+        except ValueError as error:
+            assert "Unsupported gather sampler" in str(error), (words, error)
+        else:
+            raise AssertionError("gather sampler %s was accepted" % (words,))
+
+    magazine = min(pixel_aot.COMPARISON_FILTERS)
+    # Point filtering is the pair the translator accepts with TRUNC_COORD set (word 0 bit 27).
+    legal_w0 = 0x12 | (1 << 27)
+    legal_w2 = (magazine << 20) | (magazine << 22)
+    pixel_aot.comparison_sampler_state((legal_w0, 0, legal_w2, 0))
+    for mip, extra in ((3, 0), (0, 1 << 28)):
+        words = (legal_w0, 0, legal_w2 | (mip << 26) | extra, 0)
+        try:
+            pixel_aot.comparison_sampler_state(words)
+        except ValueError as error:
+            assert "Unsupported mip filter" in str(error), (words, error)
+        else:
+            raise AssertionError("comparison sampler %s was accepted" % (words,))
+
+    # A gather offset must be a static 6-bit X/Y pair: an absent operand and any bit outside
+    # 0x3f3f are refused, and a legal pair decodes with the sign centred on 32.
+    for bad in (None, 0x40, 0x4040):
+        try:
+            pixel_aot.gather_offset(bad)
+        except ValueError as error:
+            assert "static packed XY offset" in str(error), (bad, error)
+        else:
+            raise AssertionError("gather offset %r was accepted" % (bad,))
+    assert pixel_aot.gather_offset(0x0101) == (1, 1), pixel_aot.gather_offset(0x0101)
+    # 0x3f in X decodes to -1 and 0x1f in Y to +31: the pair is centred on 32, not truncated.
+    assert pixel_aot.gather_offset(0x1f3f) == (-1, 31), pixel_aot.gather_offset(0x1f3f)
+    # 0x20 in Y decodes to -32, the other end of the signed range.
+    assert pixel_aot.gather_offset(0x203f) == (-1, -32), pixel_aot.gather_offset(0x203f)
+
+
 def main():
     if len(sys.argv) == 1:
         with tempfile.TemporaryDirectory() as tmp:
@@ -22721,12 +23403,14 @@ def main():
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-cmpx-e64", "draw-scc-skip",
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
-                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg",
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
                         "draw-dpp-movrel": check_dpp_movrel_draw,
+                        "draw-plain-movrel": check_plain_movrel_draw,
+                        "draw-swaprel": check_swaprel_draw,
                         "draw-dpp-extra": check_dpp_extra_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
@@ -22775,6 +23459,7 @@ def main():
                         "draw-shift64": check_shift64_draw,
                         "draw-pk-fmac": check_pk_fmac_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
+                        "draw-sopk-hwreg": check_sopk_hwreg_draw,
                         "draw-smem-pointers": check_smem_pointer_draw,
                         "draw-dpp-f16": check_dpp_f16_draw}[mode]
                 return draw(directory, *args)
@@ -22833,6 +23518,8 @@ def main():
                 raise
         if mode == "draw-e64-spellings":
             return check_e64_spelling_draws(directory, *args)
+        if mode == "draw-vop1-nops":
+            return check_vop1_nop_draws(directory, *args)
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)

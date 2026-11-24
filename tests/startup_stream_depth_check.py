@@ -37,6 +37,7 @@ def check(directory, consumer, backend, pixel_depth):
         directory / name for name in ("pixels_pos", "pixels_neg", "pixels_depthonly", "pixels_readonly",
                                       "pixels_rtv_as_depth", "pixels_dsv_as_target", "pixels_bounds")
     )
+    out_stencil = [directory / f"pixels_stencil_{name}" for name in ("equal", "unequal", "zero", "ff")]
     vs_front.write_bytes(vertex(0x3e800000))  # z = 0.25f
     vs_back.write_bytes(vertex(0x3f400000))   # z = 0.75f
     ps_green.write_bytes(pixel(True) if pixel_depth is None else green_with_depth(pixel_depth))
@@ -55,7 +56,8 @@ def check(directory, consumer, backend, pixel_depth):
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
 
     run = subprocess.run(base_args + [str(out_pos), str(out_neg), str(out_depthonly), str(out_readonly),
-                                      str(out_rtv_depth), str(out_dsv_target), str(out_bounds)],
+                                      str(out_rtv_depth), str(out_dsv_target), str(out_bounds),
+                                      *map(str, out_stencil)],
                          env=env, capture_output=True, text=True)
     print(run.stdout, end="")
     for line in run.stderr.splitlines():
@@ -82,6 +84,12 @@ def check(directory, consumer, backend, pixel_depth):
     # Wrong descriptor kind and DepthBoundsTestEnable refuse the draw instead of drawing something else.
     for name, path in (("rtv as depth", out_rtv_depth), ("dsv as target", out_dsv_target), ("depth bounds", out_bounds)):
         assert path.read_bytes() == clear * 32, f"{name}: {path.read_bytes().hex()}"
+    # OMSetStencilRef (slot 24) reaches the desktop list: a pixel passes the EQUAL stencil test only when the
+    # reference was forwarded. A reference of 0 is also the list's default, so the other three references
+    # (0x5A, 0xFF, and 0x5B against a stored 0x5A) are what tell a forwarded value from no call.
+    for name, path, expected in zip(("equal 0x5A", "unequal", "zero", "0xFF"), out_stencil,
+                                    (expected_pos, clear * 32, expected_pos, expected_pos)):
+        assert path.read_bytes() == expected, f"stencil ref {name}: {path.read_bytes().hex()}"
     if pixel_depth is not None:
         winner = "red" if red_wins else "green"
         print(f"{backend}: exported green depth {pixel_depth} yielded {winner} in all 16 covered pixels")
