@@ -950,7 +950,11 @@ class Stage:
         if 'compr' in flags:
             if kind in ('uint', 'int'):
                 raise Unsupported('packed integer export %s' % name)
-            a, b = self.u(vals[0]), self.u(vals[2])
+            # A compressed export packs two channels into each source register. `off` in either pair means
+            # those channels are not written, so they contribute zero instead of being evaluated as an
+            # operand; the disassembler spells it that way for an export that writes only some channels.
+            a = '0u' if vals[0] == 'off' else self.u(vals[0])
+            b = '0u' if vals[2] == 'off' else self.u(vals[2])
             exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
             words = ['U(%s)' % e for e in exprs]
         elif kind in ('uint', 'int'):

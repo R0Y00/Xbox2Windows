@@ -5615,6 +5615,17 @@ control mismatching. The D3D12 debug layer was unavailable.
 [Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
 [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+**Compressed exports with `off` channels.** A `compr` export packs two channels into each source
+register, and an export that writes only some channels spells the unwritten pair `off`. The translator
+evaluated that token as an operand and refused the whole translation with `operand 'off'`; that was the
+largest single group - 7 of 29 - of refused shaders in the first main-game loading-screen cache (#870,
+issue #1674). Both pairs now contribute zero when they are `off`, the written pair still reads its
+register, and a compressed export into an integer MRT stays refused. An export with an explicit `en:`
+mask is also still refused: the parser does not read that mask yet, and exporting all four channels would
+silently disagree with it. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_export_off$' -V`. Re-running the cache with
+the change translated 7 more shaders and left no `operand 'off'` refusal.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
