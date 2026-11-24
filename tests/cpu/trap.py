@@ -30,6 +30,9 @@ EXPECT = {
     ("trap_ud2", 0): (ILLEGAL, 0, 1, FILL),
     ("trap_branch", 1): (BREAKPOINT, 0, 1, FILL),
     ("trap_branch", 0): (0, 7, 1, 2),
+    ("trap_ud1_reg", 0): (ILLEGAL, 0, 1, FILL),
+    ("trap_ud1_mem", PAGE): (ILLEGAL, 0, 1, FILL),
+    ("trap_ud1_disp", PAGE): (ILLEGAL, 0, 1, FILL),
 }
 # The trap instructions each export must keep in an optimized translation.
 # iced names UD1 once per operand size; the fixture exercises a 32-bit register destination.
@@ -104,7 +107,15 @@ harness.seh_call.argtypes = [ctypes.c_void_p] + [ctypes.c_uint64] * 3 + [ctypes.
 harness.seh_call.restype = ctypes.c_uint64
 state = (ctypes.c_uint64 * 2)(0xA5A5A5A5A5A5A5A5, 0xA5A5A5A5A5A5A5A5)
 code = ctypes.c_uint32()
-result = harness.seh_call(ctypes.cast(fn, ctypes.c_void_p), int(sys.argv[4]), 0, 0, ctypes.addressof(state),
+argument = sys.argv[4]
+if argument == "page":
+    kernel32 = ctypes.windll.kernel32
+    kernel32.VirtualAlloc.restype = ctypes.c_void_p
+    page = kernel32.VirtualAlloc(None, 0x1000, 0x3000, 0x01)  # MEM_COMMIT|MEM_RESERVE, PAGE_NOACCESS
+    if not page:
+        raise SystemExit("VirtualAlloc failed")
+    argument = page
+result = harness.seh_call(ctypes.cast(fn, ctypes.c_void_p), int(argument), 0, 0, ctypes.addressof(state),
                           ctypes.addressof(code))
 print(json.dumps([code.value, result, state[0], state[1]]), flush=True)
 """
@@ -164,8 +175,9 @@ def check(harness, native_path, lifted_path, *extra_paths):
     problem = violation(harness, native_path, lifted_path, "lifted")
     if problem:
         raise AssertionError(problem)
-    print("native and translated: INT3 raises 0x80000003 and UD2 0xc000001d after the earlier store, the guest "
-          "work after each trap does not run, and the untaken branch returns 7 with both stores")
+    print("native and translated: INT3 raises 0x80000003 and UD2 and UD1 0xc000001d after the earlier store, "
+          "the guest work after each trap does not run, the UD1 register form and both of its memory forms "
+          "trap without touching their operand, and the untaken branch returns 7 with both stores")
     for path in extra_paths:
         stem = Path(path).stem
         if stem.endswith("_o2"):
