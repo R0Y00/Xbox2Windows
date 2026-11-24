@@ -2177,8 +2177,8 @@ The resource description passes through `desktop_format()` before desktop D3D12 
 now does too (`src/startup_stubs/clear_value_format.h`): console format 118 (D16_UNORM_S8_UINT) becomes
 D24_UNORM_S8_UINT and 116 and 117 become R10G10B10A2_UNORM, so desktop accepts the clear value on the first attempt
 instead of storing debug layer messages 816 and 817 and succeeding only in the retry without a clear value. It applies to
-`CreatePlacedResource` stand-in textures (slot 133), `CreateCommittedResource` (slots 27 and 127) and
-`CreateReservedResource` (slot 29 and 30 shapes). The retry without a clear value stays as the fallback, and formats 119 and 120
+the stand-in textures of slot 133, `CreateCommittedResource3` (slot 127) and the three desktop-order creators
+(slot 27 committed, 29 placed, 30 reserved). The retry without a clear value stays as the fallback, and formats 119 and 120
 are left unchanged. `ctest -R '^startup_clear_value_format'` runs the pure mapping and its negative controls on any host;
 `startup_clear_format_{warp,hardware}` creates a format 118 depth texture with a clear value through slots 133 and 27 and
 reads the debug layer's stored messages (it reports a skip, 77, if the layer is not installed).
