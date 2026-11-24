@@ -39,7 +39,7 @@ with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / "synthetic.bcpack"
     path.write_bytes(output)
     zpath = Path(directory) / "synthetic.zlib"
-    zpath.write_bytes(zlib.compress(bytes((i * 17 + i // 31) & 255 for i in range(131072))))
+    zpath.write_bytes(zlib.compress(bytes((i * 17 + i // 31) & 255 for i in range(4 << 20))))
     command = [sys.argv[1], str(path), str(zpath), sys.argv[2]]
     subprocess.run(command, check=True)
     subprocess.run([*command, "disabled"], check=True)

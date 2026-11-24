@@ -116,17 +116,18 @@ int main(int argc, char** argv) {
     // The same validated windows for zlib must verify the whole checksum first.
     std::ifstream zfile(argv[2], std::ios::binary);
     std::vector<unsigned char> zpacked{std::istreambuf_iterator<char>(zfile), {}};
+    constexpr unsigned zdecoded_size = 4u << 20;
     const unsigned zend = start + static_cast<unsigned>((zpacked.size() + 255) & ~std::size_t{255});
     archive.assign(zend, 0);
-    std::memcpy(archive.data(), "RDS5", 4); word(archive, 4, 3); word(archive, 8, 4096 + decoded_size);
+    std::memcpy(archive.data(), "RDS5", 4); word(archive, 4, 3); word(archive, 8, 4096 + zdecoded_size);
     boundary(archive, 0, 4096, 0);
     boundary(archive, 1, start, 4096, 8, zend - start - static_cast<unsigned>(zpacked.size()));
-    boundary(archive, 2, zend, 4096 + decoded_size);
+    boundary(archive, 2, zend, 4096 + zdecoded_size);
     std::copy(zpacked.begin(), zpacked.end(), archive.begin() + start);
-    std::vector<unsigned char> zfull(decoded_size);
-    for (unsigned i = 0; i < decoded_size; ++i) zfull[i] = static_cast<unsigned char>(i * 17 + i / 31);
+    std::vector<unsigned char> zfull(zdecoded_size);
+    for (unsigned i = 0; i < zdecoded_size; ++i) zfull[i] = static_cast<unsigned char>(i * 17 + i / 31);
     if (!runtime(argv[3], std::filesystem::path(argv[2]).replace_extension(".rds5"), archive, zpacked.size(), 8, zfull, enabled)) return 14;
-    for (unsigned skip : {0u, destination}) {
+    for (unsigned skip : {0u, destination, zdecoded_size - destination}) {
         std::vector<unsigned char> out{0xcc};
         if (!x2w_startup::decode_chunk_window(read, archive.size(), start + skip, zpacked.size(), destination, 8, out)) return 10;
         for (unsigned i = 0; i < destination; ++i)
@@ -135,5 +136,8 @@ int main(int argc, char** argv) {
     archive[start + zpacked.size() - 1] ^= 1;
     if (!refused(start, zpacked.size(), 8, destination)) return 12;
     if (!runtime(argv[3], std::filesystem::path(argv[2]).replace_extension(".bad.rds5"), archive, zpacked.size(), 8, zfull, false)) return 15;
+    word(archive, 8, 4096 + x2w_startup::max_chunk_decoded_bytes + 4096);
+    boundary(archive, 2, zend, 4096 + x2w_startup::max_chunk_decoded_bytes + 4096);
+    if (!refused(start, zpacked.size(), 8, destination)) return 16;
     std::puts("BCPack windows: exact first/continuation bytes; malformed, corrupt, wrong-codec, out-of-range and ambiguous requests refused");
 }

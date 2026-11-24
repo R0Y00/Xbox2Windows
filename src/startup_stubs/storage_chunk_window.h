@@ -8,6 +8,7 @@
 
 namespace x2w_startup {
 constexpr unsigned max_chunk_boundaries = ((1u << 20) - 16) / 8;
+constexpr unsigned max_chunk_decoded_bytes = 16u << 20;
 struct ChunkBoundary { std::uint64_t stored, logical; unsigned codec, padding; };
 inline ChunkBoundary chunk_boundary(const unsigned char* p)
 {
@@ -38,7 +39,7 @@ inline bool find_chunk_window(const unsigned char* header, std::size_t size, std
             previous.padding >= next.stored - previous.stored) return false;
         const auto packed = next.stored - previous.stored - previous.padding;
         const auto decoded = next.logical - previous.logical;
-        if (previous.codec == format && packed == stored && decoded <= (1u << 20) &&
+        if (previous.codec == format && packed == stored && decoded <= max_chunk_decoded_bytes &&
             packed <= (1u << 20) && offset >= previous.stored) {
             const auto skip = offset - previous.stored;
             if (skip % 65536 == 0 && skip < decoded && destination <= decoded - skip &&
