@@ -1146,6 +1146,25 @@ add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw
 set_tests_properties(startup_indirect_counts_control_warp PROPERTIES TIMEOUT 30
     PASS_REGULAR_EXPRESSION "got +'x2w-render indirect: forwarded: drawindexed 3. refused graphics-pipeline: drawindexed 1. compute-pipeline: dispatch 1. placeholder-signature: other 1. other: drawindexed 3'")
 
+# A clear value of console format 118 on a depth texture is mapped like its resource (src/startup_stubs/clear_value_format.h):
+# the pure mapping with negative controls, and desktop D3D12 accepting the creation without debug layer messages.
+add_executable(startup_clear_value_format_check tests/startup_clear_value_format_check.cpp)
+target_include_directories(startup_clear_value_format_check PRIVATE src)
+target_compile_features(startup_clear_value_format_check PRIVATE cxx_std_17)
+add_test(NAME startup_clear_value_format COMMAND startup_clear_value_format_check)
+foreach(mutation IN ITEMS d16 values)
+    add_test(NAME startup_clear_value_format_${mutation}_control COMMAND startup_clear_value_format_check --mutate ${mutation})
+    set_tests_properties(startup_clear_value_format_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
+add_executable(startup_clear_format tests/startup_clear_format.cpp)
+target_compile_features(startup_clear_format PRIVATE cxx_std_17)
+target_link_libraries(startup_clear_format PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_clear_format_${backend} COMMAND startup_clear_format ${backend})
+    set_tests_properties(startup_clear_format_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
 # OMSetRenderTargets with a single descriptor range, handles that hold no view, and a cleared copied descriptor.
 add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
 target_compile_features(startup_rtv_bind PRIVATE cxx_std_17)

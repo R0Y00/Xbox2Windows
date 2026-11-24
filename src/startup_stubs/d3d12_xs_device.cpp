@@ -36,6 +36,7 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
+#include "startup_stubs/clear_value_format.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -729,11 +730,17 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     u64 args[8] = {a, b, c, d, e, f, g, h};
     for (int i = 0; i < R; ++i) args[i] = unwrap(args[i]);
     D3D12_RESOURCE_DESC desc_copy{};
+    D3D12_CLEAR_VALUE clear_copy{};
     DXGI_FORMAT requested_format = DXGI_FORMAT_UNKNOWN;
     if (Desc >= 0 && args[Desc]) {
         requested_format = desktop_format(reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc])->Format);
         desc_copy = sanitized(*reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]));
         args[Desc] = reinterpret_cast<u64>(&desc_copy);
+        // The clear value follows the state argument, which follows the description, in all three resource creators.
+        if (args[Desc + 2] && x2w_local::readable(reinterpret_cast<const void*>(args[Desc + 2]), sizeof(D3D12_CLEAR_VALUE))) {
+            clear_copy = x2w_startup::desktop_clear_value(*reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[Desc + 2]));
+            args[Desc + 2] = reinterpret_cast<u64>(&clear_copy);
+        }
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], args[4], args[5],
                                                 args[6], args[7]);
@@ -3312,7 +3319,11 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             texture.Height = surface.rows * x2w_startup::Bc16Surface::block_texels;
         }
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
-        const auto* clear_value = static_cast<const D3D12_CLEAR_VALUE*>(clear);
+        const auto* title_clear = static_cast<const D3D12_CLEAR_VALUE*>(clear);
+        D3D12_CLEAR_VALUE mapped_clear{};
+        const bool clear_readable = title_clear && x2w_local::readable(title_clear, sizeof(mapped_clear));
+        if (clear_readable) mapped_clear = x2w_startup::desktop_clear_value(*title_clear);
+        const auto* clear_value = clear_readable ? &mapped_clear : title_clear;
         ID3D12Resource* created = nullptr;
         HRESULT texture_hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
                                                                       D3D12_RESOURCE_STATE_COMMON, clear_value,
@@ -3688,6 +3699,10 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     if (!out || !props || !desc || !iid) return E_POINTER;
     *out = nullptr;
     const D3D12_RESOURCE_DESC copy = sanitized(*desc);
+    D3D12_CLEAR_VALUE mapped_clear{};
+    const bool clear_readable = clear && x2w_local::readable(clear, sizeof(mapped_clear));
+    if (clear_readable) mapped_clear = x2w_startup::desktop_clear_value(*clear);
+    const D3D12_CLEAR_VALUE* const forwarded_clear = clear_readable ? &mapped_clear : clear;
     const auto flags = static_cast<D3D12_HEAP_FLAGS>(heap_flags);
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(0, 1, &copy);
     check_device("Device before slot", 127);
@@ -3697,7 +3712,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
                                           : props->Type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
                                                                                     : D3D12_RESOURCE_STATE_COMMON;
     HRESULT hr = kind_for(*iid) == resource_kind
-        ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear, IID_PPV_ARGS(&resource))
+        ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, forwarded_clear, IID_PPV_ARGS(&resource))
         : E_NOINTERFACE;
     bool cleared = clear != nullptr;
     if (FAILED(hr) && clear && kind_for(*iid) == resource_kind) {
