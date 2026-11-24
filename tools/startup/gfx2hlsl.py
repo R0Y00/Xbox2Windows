@@ -700,12 +700,15 @@ class Stage:
         self.varying_s = set()
         self.scc_uniform = True
         self.has_branches = bool(targets)
+        self.entry_loop = 0 in targets
+        self.branch_proof, self.tainted_s = self.scan_branch_safety() if targets else (False, set())
         start = 0
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
                 self.blocks.append((start, self.lines, None))
                 self.lines, start = [], off
+                self.uniform_v.clear()  # a join point: no VGPR proof survives from the code above it
             self.pc = off
             # Before the first branch target or terminator every path has run exactly the instructions above, so
             # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
@@ -726,8 +729,48 @@ class Stage:
             if term:
                 self.blocks.append((start, self.lines, term))
                 self.lines, start = [], off + n
+                self.uniform_v.clear()
         if self.lines:
             self.blocks.append((start, self.lines, None))
+
+    def scan_branch_safety(self):
+        """-> (proof_ok, tainted_s) for a program with branches. VGPR uniformity is proven inside one basic block
+        only (see translate), and only when no instruction anywhere writes exec, so exec_known holds on every path.
+        tainted_s holds each scalar register that can carry a per-lane value (a compare or exec-derived mask),
+        found over the whole program because a loop can bring a later write back to an earlier read."""
+        lane_names = ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+        parsed = []
+        proof_ok = True
+        for _, _, name, asm in self.ins:
+            _, ops, _ = parse(asm)
+            parsed.append((name, ops))
+            if ops and (ops[0] in ('exec', 'exec_lo', 'exec_hi') or 'saveexec' in name or name.startswith('v_cmpx')):
+                proof_ok = False
+        tainted = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, ops in parsed:
+                dst = reg_range(ops[0]) if ops else None
+                if not dst or dst[0] != 's' or name.startswith('v_readfirstlane'):
+                    continue
+                hot = name.startswith('v_cmp') or any(op in lane_names for op in ops[1:])
+                for tok in ops[1:]:
+                    src = reg_range(tok)
+                    if src and src[0] == 's' and any(r in tainted for r in range(src[1], src[2] + 1)):
+                        hot = True
+                if hot and not all(r in tainted for r in range(dst[1], dst[2] + 1)):
+                    tainted.update(range(dst[1], dst[2] + 1))
+                    changed = True
+        return proof_ok, tainted
+
+    def proof_allowed(self):
+        """Entry-block code is exact in program order (merged entry proof). Later blocks need the branch scan to
+        pass and no branch back to offset 0, so an entry loop keeps refusing."""
+        if not getattr(self, 'past_entry', True):
+            return True
+        return (not getattr(self, 'entry_loop', True) and
+                (not getattr(self, 'has_branches', True) or getattr(self, 'branch_proof', False)))
 
     def tracks_uniformity(self):
         return all(hasattr(self, name) for name in ('uniform_v', 'varying_s', 'scc_uniform'))
@@ -740,7 +783,8 @@ class Stage:
                 return False
             if kind == 'v':
                 return lo in self.uniform_v
-            if lo in getattr(self, 'masks', ()):
+            if lo in getattr(self, 'masks', ()) or (getattr(self, 'has_branches', False) and
+                                                    lo in getattr(self, 'tainted_s', ())):
                 return False
             sym = self.sym.get(lo)
             if sym:
@@ -761,7 +805,7 @@ class Stage:
         dst = None
         # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
         if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
-                not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False) and
+                self.proof_allowed() and getattr(self, 'exec_known', False) and
                 (not mods or (base in VEC_F or base in VEC_U_TO_F) and
                  all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
             candidate = reg_range(ops[0])
@@ -1855,7 +1899,7 @@ class Stage:
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or not self.tracks_uniformity() or getattr(self, 'past_entry', True) or
+        if (mods or not self.tracks_uniformity() or not self.proof_allowed() or
                 not getattr(self, 'exec_known', False) or not dst or dst[0] != 's' or dst[1] != dst[2] or
                 not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')

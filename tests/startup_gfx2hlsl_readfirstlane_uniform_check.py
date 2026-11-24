@@ -170,6 +170,12 @@ EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
 for label, instructions in REFUSED:
     got = run(*instructions)
     check(f'{label} refused', got == EARLIER.get(label, REFUSAL), repr(got))
+# A branch later in the program no longer blocks a read whose source is proven in its own block.
+got = run('v_mov_b32_e32 v7, s2', READ, 's_branch label_000C', 's_endpgm')
+check('branch after read accepted', got == ['v7 = s2;', 's9 = v7;'], repr(got))
+# A proven chain inside one block stays accepted when a branch follows it.
+got = run('v_cvt_f32_u32_e32 v7, s3', 'v_rcp_f32_e32 v7, v7', READ, 's_cbranch_scc0 label_0010', 's_endpgm')
+check('chain before a branch accepted', got == ['v7 = U(float(s3));', 'v7 = U(1.0 / F(v7));', 's9 = v7;'], repr(got))
 # SCC written through m0 (#1931 review): a compare mask carried into m0 makes SCC varying, so the
 # select that reads it, and a VGPR copied from that select, stay unproven; EXEC is left unchanged.
 got = run('v_cmp_lt_f32_e32 vcc_lo, v0, v1', 's_and_b32 m0, vcc_lo, -1', 's_cselect_b32 s2, 1, 0',

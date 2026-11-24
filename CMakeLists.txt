@@ -2371,6 +2371,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_live_view PROPERTIES TIMEOUT 60)
     add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
+    # v_readfirstlane_b32 in a program with branches: proven inside one basic block, refused across a join or exec write.
+    add_test(NAME startup_readfirstlane_branch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_readfirstlane_branch_check.py")
     # NGG primitive-shader cases (#1723): identity triangle against single-change contrasts, reference model.
     add_test(NAME startup_ngg_slice COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_ngg_slice_check.py")
