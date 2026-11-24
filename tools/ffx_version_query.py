@@ -17,6 +17,9 @@ LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
 UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
 REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()}
 HIGH_BYTE = {R.AH, R.BH, R.CH, R.DH}
+# UD1 (0F B9 /r), which iced names once per operand size; each raises #UD and evaluates no operand.
+_UD1_CODES = frozenset((C.UD1_R16_RM16, C.UD1_R32_RM32, C.UD1_R64_RM64))
+
 UINT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 FRAME_WORDS = 16  # the lowered function's own frame array, at which RSP points on entry
 # String instructions by Code: the SSE2 scalar MOVSD and CMPSD share their mnemonics.
@@ -989,8 +992,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             # done. The exception address and registers are the host's. Other INT, INT1, INTO and fast-fail
             # encodings stay refused.
             stmt = "__debugbreak();"
-        elif i.code == C.UD2:
-            # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION; UD0 and UD1 stay refused.
+        elif i.code == C.UD2 or i.code in _UD1_CODES:
+            # UD2 (0F 0B) and UD1 (0F B9 /r) both raise the host's STATUS_ILLEGAL_INSTRUCTION, as the
+            # original instructions do. UD1's operand is not evaluated, so a memory form whose address is
+            # inaccessible still traps rather than raising an access violation. UD0 stays refused: iced's
+            # default decoder reads a ModRM for 0F FF while the APM gives no ModRM byte, so its decoded
+            # length would not match the target's.
             stmt = "__ud2();"
         elif op in (M.LDMXCSR, M.VLDMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             # VLDMXCSR (VEX.128, vvvv 1111; iced decodes every other VEX form as invalid) behaves the same.

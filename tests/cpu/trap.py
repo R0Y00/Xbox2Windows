@@ -1,4 +1,4 @@
-"""Compare native and translated INT3 and UD2 in the shared lowering.
+"""Compare native and translated INT3, UD2 and UD1 in the shared lowering.
 
 Each call runs in a child process, behind the native SEH boundary in trap_harness.cpp: the child reports the
 exception code, the export's result and the two state words. INT3 must raise EXCEPTION_BREAKPOINT and UD2
@@ -18,9 +18,12 @@ from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges
 from ffx_version_query import INTEGER_HEADER, lower, region
 
-EXPORTS = ("trap_int3", "trap_ud2", "trap_branch")
+EXPORTS = ("trap_int3", "trap_ud2", "trap_branch", "trap_ud1_reg", "trap_ud1_mem", "trap_ud1_disp")
 BREAKPOINT, ILLEGAL = 0x80000003, 0xC000001D
 FILL = 0xA5A5A5A5A5A5A5A5
+# The memory forms are called with a pointer to a PAGE_NOACCESS page instead of a literal argument; the child
+# allocates one and passes it in RCX.
+PAGE = "page"
 # (export, a) -> (exception code, result, state[0], state[1]).
 EXPECT = {
     ("trap_int3", 0): (BREAKPOINT, 0, 1, FILL),
@@ -29,11 +32,19 @@ EXPECT = {
     ("trap_branch", 0): (0, 7, 1, 2),
 }
 # The trap instructions each export must keep in an optimized translation.
-TRAPS = {"trap_int3": [Code.INT3], "trap_ud2": [Code.UD2], "trap_branch": [Code.INT3]}
+# iced names UD1 once per operand size; the fixture exercises a 32-bit register destination.
+UD1 = (Code.UD1_R16_RM16, Code.UD1_R32_RM32, Code.UD1_R64_RM64)
+TRAPS = {"trap_int3": [Code.INT3], "trap_ud2": [Code.UD2], "trap_branch": [Code.INT3],
+         "trap_ud1_reg": [Code.UD1_R32_RM32], "trap_ud1_mem": [Code.UD1_R32_RM32],
+         "trap_ud1_disp": [Code.UD1_R32_RM32]}
+# The translated build lowers UD1 to the host's __ud2(), so the instructions a walk of that binary finds are
+# UD2 for the UD1 exports as well.
+LIFTED_TRAPS = dict(TRAPS, **{"trap_ud1_reg": [Code.UD2], "trap_ud1_mem": [Code.UD2],
+                           "trap_ud1_disp": [Code.UD2]})
 # Encodings that stay refused: INT 3 in its two-byte form, the fast-fail interrupt, INT1, INTO (invalid in
-# 64-bit mode), UD0, UD1.
+# 64-bit mode) and UD0, whose decoded length differs between iced's default mode and the target.
 REFUSED = {"CD 03": "int 3 (imm8)", "CD 29": "int 29h (fast fail)", "F1": "int1", "CE": "into",
-           "0F FF C0": "ud0", "0F B9 C0": "ud1"}
+           "0F FF C0": "ud0"}
 CONTROLS = {
     # The trap is dropped, so the guest work after it runs.
     "drop": [("__debugbreak();", ";")],
@@ -41,6 +52,11 @@ CONTROLS = {
     "swap": [("__debugbreak();", "TRAP_SWAP_MARKER"), ("__ud2();", "__debugbreak();"), ("TRAP_SWAP_MARKER", "__ud2();")],
     # The store before each trap is dropped, so the caller does not see it.
     "nostore": [("store<uint64_t>(r9 + 0ull, 1ull);", ";")],
+    # UD1 is lowered as a load of its operand: the memory forms fault with an access violation instead of
+    # trapping. This is the control that separates "traps" from "touches its operand".
+    "load": [("__ud2();", "{ const volatile uint64_t operand = load<uint64_t>(rcx); (void)operand; }")],
+    # UD1 is lowered as a no-op, so the guest work after it runs and the result differs.
+    "noop": [("__ud2();", ";")],
 }
 
 
@@ -50,7 +66,7 @@ def emit(image, output, variant="lifted"):
         for name in EXPORTS:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
             body = region(pe, *bounds)
-            found = [i.code for i in body if i.code in (Code.INT3, Code.UD2)]
+            found = [i.code for i in body if i.code in (Code.INT3, Code.UD2) + UD1]
             if found != TRAPS[name]:
                 raise AssertionError(f"{name} contains {found}, expected {TRAPS[name]}")
             code = lower(body, ["rcx = a; rdx = b; r8 = c; r9 = state;"], {}, {}, {})
@@ -127,7 +143,7 @@ def traps_in(path):
                     if not base <= ip < base + len(image):
                         raise AssertionError(f"{Path(path).name} {name}: branch leaves the image at {ip:#x}")
                     instruction = Decoder(64, image[ip - base:ip - base + 15], ip=ip).decode()
-                    if instruction.code in (Code.INT3, Code.UD2):
+                    if instruction.code in (Code.INT3, Code.UD2) + UD1:
                         codes.append(instruction.code)
                     flow = instruction.flow_control
                     if flow in (FlowControl.RETURN, FlowControl.EXCEPTION, FlowControl.INTERRUPT):
@@ -154,7 +170,7 @@ def check(harness, native_path, lifted_path, *extra_paths):
         stem = Path(path).stem
         if stem.endswith("_o2"):
             traps = traps_in(path)
-            if any(traps[name] != sorted(set(codes)) for name, codes in TRAPS.items()):
+            if any(traps[name] != sorted(set(codes)) for name, codes in LIFTED_TRAPS.items()):
                 raise AssertionError(f"{stem}: traps {traps}, expected {TRAPS}")
             problem = violation(harness, native_path, path, stem)
             if problem:

@@ -4042,12 +4042,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${host_cpu_extras})
         set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
-    # INT3 and UD2: the lifted DLL, the drop, swap and nostore controls that must break a rule, an /O2 build,
+    # INT3, UD2 and UD1: the lifted DLL, the drop, swap, nostore, load and noop controls that must break a rule,
+    # an /O2 build,
     # and the native SEH boundary that the check's child processes call through.
     cpu_asm_fixture(cpu_trap trap)
     add_library(cpu_trap_harness SHARED tests/cpu/trap_harness.cpp)
     set(trap_controls)
-    foreach(variant IN ITEMS lifted drop swap nostore)
+    foreach(variant IN ITEMS lifted drop swap nostore load noop)
         set(trap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_${variant}.cpp")
         add_custom_command(OUTPUT "${trap_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
