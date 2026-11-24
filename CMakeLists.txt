@@ -620,6 +620,14 @@ add_test(NAME startup_placed_buffer_range_region_only_control COMMAND startup_pl
 add_test(NAME startup_placed_buffer_range_walk_only_control COMMAND startup_placed_buffer_range_check --mutate walk-only)
 set_tests_properties(startup_placed_buffer_range_region_only_control startup_placed_buffer_range_walk_only_control
     PROPERTIES SKIP_RETURN_CODE 77)
+# CopyTextureRegion (list slot 16): the argument checks refuse what the desktop would reject
+# (src/startup_stubs/list_copy_texture.h). The mutated run is the negative control.
+add_executable(startup_list_copy_texture_check tests/startup_list_copy_texture_check.cpp)
+target_compile_features(startup_list_copy_texture_check PRIVATE cxx_std_17)
+target_include_directories(startup_list_copy_texture_check PRIVATE src)
+add_test(NAME startup_list_copy_texture COMMAND startup_list_copy_texture_check)
+add_test(NAME startup_list_copy_texture_overflow_control COMMAND startup_list_copy_texture_check --mutate overflow)
+set_tests_properties(startup_list_copy_texture_overflow_control PROPERTIES WILL_FAIL TRUE)
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)
