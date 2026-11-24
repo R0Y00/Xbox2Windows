@@ -44,6 +44,7 @@ XSAVEOPT_EXPORTS = (
     "op_xrstor64_xsaveopt64_x87_avx",
     "op_xrstor64_xsaveopt64_avx",
 )
+AVX_XSAVE_EXPORT = "op_xrstor64_xsave64_avx"
 SSE_COMPACTED_CONTROL_EXPORT = "op_xrstor64_sse_compacted_avx_xsaveopt64_avx"
 XSAVEOPT_DYNMASK_EXPORT = "op_xsaveopt64_dynmask"
 
@@ -70,6 +71,7 @@ DEFINED_EXPORTS = (
     "op_xrstor64_mask_sse",
     "op_vzeroupper_xsave64",
     "op_pipeline",
+    AVX_XSAVE_EXPORT,
 ) + XSAVEC_EXPORTS + XSAVEOPT_EXPORTS
 
 EXPORTS = CANONICAL_EXPORTS + DEFINED_EXPORTS
@@ -99,6 +101,7 @@ EXPORT_MODES = {
     "op_xrstor64_mask_sse": (True, True, 2, 0),
     "op_vzeroupper_xsave64": (True, True, 7, 0),
     "op_pipeline": (True, True, 7, 0),
+    AVX_XSAVE_EXPORT: (True, True, 4, 0),
     "op_xrstor64_xsavec": (True, False, 7, 0),
     "op_xrstor64_xsavec64": (True, True, 7, 0),
     "op_xrstor64_xsavec64_sse": (True, True, 2, 0),
@@ -440,7 +443,8 @@ class XStateModel:
                 self.ymm_hi = [bytearray(16) for _ in range(16)]
                 self.xinuse &= ~4
 
-    def xsave(self, dst: bytearray, offset: int, rfbm: int, is64: bool) -> None:
+    def xsave(self, dst: bytearray, offset: int, rfbm: int, is64: bool, mxcsr_with_avx: bool = True) -> None:
+        """XSAVE stores MXCSR and MXCSR_MASK when RFBM selects SSE or AVX, XSAVEC only with SSE."""
         rfbm &= 7
         if rfbm & 1:
             hdr = bytearray(24)
@@ -459,8 +463,9 @@ class XStateModel:
                 phys = (top + i) & 7
                 st_area[i * 16 : i * 16 + 10] = self.st[phys][0:10]
             dst[offset + 32 : offset + 160] = st_area
-        if rfbm & 2:
+        if rfbm & (6 if mxcsr_with_avx else 2):
             struct.pack_into("<II", dst, offset + 24, self.mxcsr, self.mxcsr_mask)
+        if rfbm & 2:
             for i in range(16):
                 dst[offset + 160 + i * 16 : offset + 160 + i * 16 + 16] = self.xmm[i]
         old_bv = struct.unpack_from("<Q", dst, offset + 512)[0]
@@ -479,7 +484,7 @@ class XStateModel:
         rfbm &= 7
         sse_live = 2 if track_mxcsr and self.mxcsr != DEFAULT_MXCSR else 0
         used = rfbm & (self.xinuse | sse_live)
-        self.xsave(dst, offset, used, is64)
+        self.xsave(dst, offset, used, is64, mxcsr_with_avx=False)
         struct.pack_into("<QQ", dst, offset + 512, used, (1 << 63) | rfbm)
 
     def xsaveopt(self, dst: bytearray, offset: int, rfbm: int, is64: bool, track_mxcsr: bool = True) -> None:
@@ -491,7 +496,7 @@ class XStateModel:
         rfbm &= 7
         sse_live = 2 if track_mxcsr and self.mxcsr != DEFAULT_MXCSR else 0
         in_use = self.xinuse | sse_live
-        self.xsave(dst, offset, rfbm & in_use, is64)
+        self.xsave(dst, offset, rfbm & in_use, is64, mxcsr_with_avx=False)
         if rfbm & 6:
             struct.pack_into("<II", dst, offset + 24, self.mxcsr, self.mxcsr_mask)
         old_bv = struct.unpack_from("<Q", dst, offset + 512)[0]
@@ -561,6 +566,9 @@ def reference(
             m.xsave(out, 0, rfbm=7, is64=True)
         else:
             m.xsavec(out, 0, rfbm=7 if altered else rfbm, is64=name != "op_xrstor64_xsavec")
+    elif name == AVX_XSAVE_EXPORT:
+        m.xrstor(a, rfbm=7, is64=True)
+        m.xsave(out, 0, rfbm=4, is64=True)
     elif name == "op_xrstor64_avx_xsaveopt64_avx":
         m.xrstor(a, rfbm=4, is64=True)
         m.xsaveopt(out, 0, rfbm=4, is64=True)
@@ -1837,6 +1845,16 @@ def check_differential(
                     assert_equal_output("native", name, idx, got_n, want_native)
                 assert_equal_output("lifted", name, idx, got_l, want)
                 total += 1
+
+        # Negative control: XSAVE with RFBM = AVX alone stores MXCSR, so output that leaves it out must be caught.
+        a, b = xsave_pairs(mxcsr_mask)[0]
+        want = reference(AVX_XSAVE_EXPORT, a, b, mxcsr_mask, deprecates_cs_ds)
+        try:
+            assert_equal_output("lifted", AVX_XSAVE_EXPORT, 0, want[:24] + FILL[24:32] + want[32:], want)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("XSAVE output without MXCSR was not caught by the comparator")
 
         diverged = {}
         for name in ALTERED_DEFINED_EXPORTS + ALTERED_CANONICAL_EXPORTS:
