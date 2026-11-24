@@ -10,10 +10,14 @@
 // or silence by the power at the caller's tone frequency, so the report is transitions and timing, not
 // samples. Audio bytes stay in memory and are never stored or printed.
 //
-// Isolation: Windows has no API to create an audio endpoint, so the capture is of the shared endpoint the
-// provider renders to. The fixture reports the isolation it actually had (`shared`, since the real provider
-// uses the default endpoint) rather than assuming one, and skips (77) when there is no endpoint or the
-// loopback client is refused. Replacing the real provider is explicitly out of scope for this slice.
+// Isolation: the capture is a process loopback client scoped to this process tree
+// (AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE), so a
+// second client on the endpoint can neither supply the apparent tone nor break a valid silence window. The
+// isolation control makes that observable: a separate process plays 880 Hz for the whole run, and a capture
+// scoped to this process must never see it while our own 440 Hz blocks are classified by frequency share.
+// The report names the isolation it actually had (`process`). When the process-scoped activation is
+// unavailable on the host, the fixture reports a named capability skip (77) instead of falling back to a
+// shared endpoint capture. Replacing the real provider is explicitly out of scope for this slice.
 //
 // The caller keeps using the real provider exactly as the launch path does: no import patching, no
 // replacement voice, no change to provider selection.
@@ -143,7 +147,7 @@ HRESULT process_loopback_client(IAudioClient** client, std::string& reason)
                                              &property, handler, &operation);
     if (FAILED(hr) || !operation) {
         handler->Release();
-        { static char why[96]; std::snprintf(why, sizeof(why), "process loopback activation unavailable (0x%08lx)", static_cast<unsigned long>(hr)); reason = why; }
+        { static char why[96]; std::snprintf(why, sizeof(why), "process loopback capability unavailable (0x%08lx)", static_cast<unsigned long>(hr)); reason = why; }
         return FAILED(hr) ? hr : E_FAIL;
     }
     // Pump messages while waiting: the completion callback is dispatched on this apartment.
@@ -163,7 +167,7 @@ HRESULT process_loopback_client(IAudioClient** client, std::string& reason)
         if (iface) iface->Release();
         operation->Release();
         handler->Release();
-        { static char why[96]; std::snprintf(why, sizeof(why), "process loopback activation did not complete (0x%08lx)", static_cast<unsigned long>(status)); reason = why; }
+        { static char why[96]; std::snprintf(why, sizeof(why), "process loopback capability did not complete (0x%08lx)", static_cast<unsigned long>(status)); reason = why; }
         return FAILED(status) ? status : E_FAIL;
     }
     hr = iface->QueryInterface(IID_PPV_ARGS(client));
@@ -196,7 +200,7 @@ struct Capture {
     std::vector<double> window_share;
     std::vector<double> window_440;   // own signal (isolation control)
     std::vector<double> window_880;   // interfering process's signal (isolation control)
-    std::string isolation = "shared";
+    std::string isolation = "unknown";
     uint32_t buffer_frames = 0;  // shared-mode endpoint buffer: the latency floor
     uint64_t frames = 0;
     std::vector<float> pending;  // samples of the window being assembled across packet boundaries
@@ -700,7 +704,11 @@ int run()
 
 int main(int argc, char** argv)
 {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+    // Process-loopback activation (AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK) requires an MTA
+    // apartment; activating it from an STA fails with E_ILLEGAL_METHOD_CALL (0x8000000E). The completion
+    // callback is then delivered on a thread-pool thread and signals the event the wait below uses, so the
+    // message pump is only a fallback for hosts that still complete the operation in this apartment.
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
         std::printf("skip: COM initialisation failed\n");
         return skip_no_endpoint;
     }
