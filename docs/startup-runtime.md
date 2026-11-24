@@ -1109,13 +1109,16 @@ longer exhausts the heap. While nothing has been freed the offsets are the ones 
 - A block is aligned in address (a power of two, 16 at least; 0, anything below 16 and a value that is not a power of two
   all mean 16). Size and alignment are 32 bits. `ApuCreateHeap` creates and publishes the heap under one lock, so
   competing first calls cannot reset a heap that already has live blocks.
-- Null output is `E_POINTER`; size 0 is `E_INVALIDARG`; no
-  room, or a full extent table, is `E_OUTOFMEMORY`. A refused call leaves the heap and the optional
-  APU-address output as they were, and writes null to the virtual-address output when non-null.
+- Null or non-writable output (`virtual_address` or optional `apu_address`) is `E_POINTER` without
+  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, or a full extent table is
+  `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
+  and writes null to the virtual-address output when writable.
 - A block that is reused is zeroed, as fresh heap memory is.
 - `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
   already freed) is `E_INVALIDARG` and changes nothing.
-- `ApuIsVirtualAddressValid` and the two map calls still test the whole heap range, not live blocks.
+- `ApuIsVirtualAddressValid` and the two map calls read the published heap bounds under the heap lock and
+  test the allocatable 32-bit APU range `[0x10000, min(heap_bytes, 4 GiB))` (excluding the unused guard
+  range below `0x10000`), not live blocks.
 
 The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) returns `E_NOTIMPL`,
 rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built

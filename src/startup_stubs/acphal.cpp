@@ -43,6 +43,28 @@ void heap_reset() noexcept
     high_water = heap_start;
 }
 
+void heap_snapshot(unsigned char*& base, u64& bytes) noexcept
+{
+    AcquireSRWLockShared(&heap_lock);
+    base = heap_base;
+    bytes = heap_bytes;
+    ReleaseSRWLockShared(&heap_lock);
+}
+
+// The allocatable 32-bit APU range [heap_start, min(heap_bytes, 4 GiB)).
+bool in_apu_range(const void* virtual_address, u64& offset_out) noexcept
+{
+    unsigned char* base = nullptr;
+    u64 bytes = 0;
+    heap_snapshot(base, bytes);
+    const auto address = reinterpret_cast<std::uintptr_t>(virtual_address);
+    const auto base_addr = reinterpret_cast<std::uintptr_t>(base);
+    const u64 limit = bytes > 0x100000000ull ? 0x100000000ull : bytes;
+    if (!base || limit <= heap_start || address < base_addr + heap_start || address - base_addr >= limit) return false;
+    offset_out = static_cast<u64>(address - base_addr);
+    return true;
+}
+
 // bytes and alignment (a power of two) are checked by the callers; both stay far below 2^63.
 unsigned char* heap_take(u64 bytes, u64 alignment)
 {
@@ -210,7 +232,10 @@ extern "C" __declspec(noinline) long AcpHalAllocateShapeContexts(u64 rcx, u64 rd
             rollback();
             return static_cast<long>(0x8007000E);
         }
-        const u64 offset = static_cast<u64>(memory - heap_base);
+        unsigned char* base = nullptr;
+        u64 total_bytes = 0;
+        heap_snapshot(base, total_bytes);
+        const u64 offset = static_cast<u64>(memory - base);
         if (offset > 0xFFFFFFFFull) {
             heap_give(memory);
             rollback();
@@ -230,13 +255,12 @@ extern "C" __declspec(noinline) long AcpHalCreate(u64 rcx, u64 rdx, u64 r8, u64 
 {
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "AcpHalCreate", 1, rcx, rdx, r8, r9, _ReturnAddress());
-    static auto table = hal_table(std::make_index_sequence<48>{});
-    static bool ready = false;
-    if (!ready) {
-        table[0] = reinterpret_cast<void*>(&hal_connect);
-        table[2] = reinterpret_cast<void*>(&hal_submit);
-        ready = true;
-    }
+    static const auto table = [] {
+        auto slots = hal_table(std::make_index_sequence<48>{});
+        slots[0] = reinterpret_cast<void*>(&hal_connect);
+        slots[2] = reinterpret_cast<void*>(&hal_submit);
+        return slots;
+    }();
     static void* const* const object = table.data();
     if (!rcx || !x2w_local::writable(reinterpret_cast<void*>(rcx), sizeof(void*))) return static_cast<long>(0x80004003);
     *reinterpret_cast<void* const* const**>(rcx) = &object;
@@ -247,7 +271,9 @@ extern "C" __declspec(noinline) long AcpHalCreate(u64 rcx, u64 rdx, u64 r8, u64 
 // ApuAlloc(&virtualAddress, apuAddress* or null, size, alignment, flags) -> HRESULT (first call:
 // size 0x222e00, alignment 0x800, null APU-address output). Size and alignment are taken as 32 bits.
 // First fit; ApuFree returns blocks, and a reused block is zeroed as fresh heap memory is.
-// A null output is E_POINTER, size 0 is E_INVALIDARG; an alignment below 16 or not a power of two means 16, and no room is E_OUTOFMEMORY; a failure leaves the heap as it was.
+// A null or non-writable output is E_POINTER, size 0 is E_INVALIDARG; an alignment below 16 or not a
+// power of two means 16, and no room (or an offset past 32 bits) is E_OUTOFMEMORY; a failure leaves
+// the heap as it was.
 extern "C" __declspec(noinline) long ApuAlloc(void** virtual_address, std::uint32_t* apu_address, u64 size, u64 alignment,
                                               u64 flags)
 {
@@ -257,11 +283,33 @@ extern "C" __declspec(noinline) long ApuAlloc(void** virtual_address, std::uint3
     const u64 bytes = static_cast<std::uint32_t>(size);
     u64 align = static_cast<std::uint32_t>(alignment);
     if (align < 16 || (align & (align - 1))) align = 16;
-    const bool valid = bytes != 0;
-    unsigned char* memory = virtual_address && valid ? heap_take(bytes, align) : nullptr;
-    const long hr = memory ? 0 : static_cast<long>(!virtual_address ? 0x80004003 : valid ? 0x8007000E : 0x80070057);
-    if (virtual_address) *virtual_address = memory;
-    if (memory && apu_address) *apu_address = static_cast<std::uint32_t>(memory - heap_base);
+    const bool virtual_ok = virtual_address && x2w_local::writable(virtual_address, sizeof(void*));
+    const bool apu_ok = !apu_address || x2w_local::writable(apu_address, sizeof(std::uint32_t));
+    unsigned char* memory = nullptr;
+    u64 offset = 0;
+    long hr = 0;
+    if (!virtual_ok || !apu_ok) {
+        hr = static_cast<long>(0x80004003);  // E_POINTER
+    } else if (!bytes) {
+        hr = static_cast<long>(0x80070057);  // E_INVALIDARG
+    } else {
+        memory = heap_take(bytes, align);
+        if (memory) {
+            unsigned char* base = nullptr;
+            u64 total_bytes = 0;
+            heap_snapshot(base, total_bytes);
+            offset = static_cast<u64>(memory - base);
+            if (offset > 0xFFFFFFFFull) {
+                heap_give(memory);
+                memory = nullptr;
+                hr = static_cast<long>(0x8007000E);  // E_OUTOFMEMORY
+            }
+        } else {
+            hr = static_cast<long>(0x8007000E);  // E_OUTOFMEMORY
+        }
+    }
+    if (virtual_ok) *virtual_address = memory;
+    if (memory && apu_address) *apu_address = static_cast<std::uint32_t>(offset);
     static LONG calls;
     if (FAILED(hr) || x2w_local::first_calls(calls, 8))
         x2w_local::logf("x2w-audio ApuAlloc size=0x%llx align=0x%llx flags=0x%llx apu_out=%p -> 0x%08lx %p", bytes, align,
@@ -292,8 +340,8 @@ extern "C" __declspec(noinline) int ApuIsVirtualAddressValid(void* virtual_addre
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "ApuIsVirtualAddressValid", 6,
                        reinterpret_cast<u64>(virtual_address), 0, 0, 0, _ReturnAddress());
-    auto* p = static_cast<unsigned char*>(virtual_address);
-    const int valid = heap_base && p >= heap_base && p < heap_base + heap_bytes;
+    u64 offset = 0;
+    const int valid = in_apu_range(virtual_address, offset) ? 1 : 0;
     static LONG calls;
     if (x2w_local::first_calls(calls, 4)) x2w_local::logf("x2w-audio ApuIsVirtualAddressValid %p -> %d", virtual_address, valid);
     return valid;
@@ -303,8 +351,11 @@ extern "C" __declspec(noinline) void* ApuMapApuAddress(u64 apu_address)
 {
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "ApuMapApuAddress", 7, apu_address, 0, 0, 0, _ReturnAddress());
+    unsigned char* base = nullptr;
+    u64 bytes = 0;
+    heap_snapshot(base, bytes);
     const u64 offset = static_cast<std::uint32_t>(apu_address);
-    void* result = heap_base && offset && offset < heap_bytes ? heap_base + offset : nullptr;
+    void* result = base && offset >= heap_start && offset < bytes ? base + offset : nullptr;
     static LONG calls;
     if (x2w_local::first_calls(calls, 4)) x2w_local::logf("x2w-audio ApuMapApuAddress 0x%llx -> %p", offset, result);
     return result;
@@ -315,9 +366,8 @@ extern "C" __declspec(noinline) std::uint32_t ApuMapVirtualAddress(void* virtual
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "ApuMapVirtualAddress", 8, reinterpret_cast<u64>(virtual_address),
                        0, 0, 0, _ReturnAddress());
-    auto* p = static_cast<unsigned char*>(virtual_address);
-    const std::uint32_t result = heap_base && p >= heap_base && p < heap_base + heap_bytes
-        ? static_cast<std::uint32_t>(p - heap_base) : 0;
+    u64 offset = 0;
+    const std::uint32_t result = in_apu_range(virtual_address, offset) ? static_cast<std::uint32_t>(offset) : 0;
     static LONG calls;
     if (x2w_local::first_calls(calls, 4)) x2w_local::logf("x2w-audio ApuMapVirtualAddress %p -> 0x%x", virtual_address, result);
     return result;
