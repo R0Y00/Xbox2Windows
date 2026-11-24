@@ -21031,11 +21031,28 @@ def check_sdwa_f16_compare_lowering():
     sdwa = translate_int(uncompressed_export(
         [*setup, "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:DWORD src1_sel:DWORD", *tail]))
     assert plain == sdwa
-    # WORD_1 reads the high half, for the value and for the ordered test.
-    lines = translate_int(uncompressed_export(
-        [*setup, "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_1 src1_sel:WORD_0", *tail])).splitlines()
-    assert any("num16(((asuint(alu21) >> 16u) & 0xffffu))" in line and "widen16((asuint(alu21) >> 16u))" in line
-               for line in lines), [line for line in lines if "bool cmp" in line]
+    # WORD_1 reads the high half, for the value and for the ordered test, and only for the source it names. v18 (A)
+    # is alu21 and v16 (B) is alu20. These text checks guard each selection without a GPU; the draws check the values.
+    def comparison(instruction):
+        lines = translate_int(uncompressed_export([*setup, instruction, *tail])).splitlines()
+        found = [line for line in lines if line.startswith("    bool cmp")]
+        assert len(found) == 1, found
+        return found[0]
+
+    high_a, low_a = "(asuint(alu21) >> 16u)", "asuint(alu21)"
+    high_b, low_b = "(asuint(alu20) >> 16u)", "asuint(alu20)"
+    line = comparison("v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_1 src1_sel:WORD_0")
+    assert f"num16(({high_a} & 0xffffu))" in line and f"widen16({high_a})" in line, line
+    assert f"num16(({low_b} & 0xffffu))" in line and f"widen16({low_b})" in line and high_b not in line, line
+    line = comparison("v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_0 src1_sel:WORD_1")
+    assert f"num16(({low_a} & 0xffffu))" in line and f"widen16({low_a})" in line and high_a not in line, line
+    assert f"num16(({high_b} & 0xffffu))" in line and f"widen16({high_b})" in line, line
+    # The class test reads the selected half of its value, with the modifier applied after the selection; the mask
+    # register is read whole.
+    line = comparison("v_cmp_class_f16_sdwa vcc_lo, -v18, v16 src0_sel:WORD_1 src1_sel:DWORD")
+    assert line == f"    bool cmp22 = (class16((({high_a} & 0xffffu) ^ 0x8000u)) & {low_b}) != 0u;", line
+    line = comparison("v_cmp_class_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_0 src1_sel:DWORD")
+    assert line == f"    bool cmp22 = (class16(({low_a} & 0xffffu)) & {low_b}) != 0u;", line
     good = "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_1 src1_sel:WORD_0"
     for bad in (
         "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:BYTE_0 src1_sel:WORD_0",
