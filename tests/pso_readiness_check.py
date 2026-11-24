@@ -212,6 +212,56 @@ def check_compute():
     print("PSO compute probe passed (1 recognized, 1 unsupported opcode, 2 disassembly failures, 1 scan failure)")
 
 
+def check_invalid_input():
+    pixel = {"stage": "pixel", "sha256": "a" * 64}
+    manifest = {"shaders": [pixel]}
+
+    def entry(**changes):
+        return dict({"id": "p", "effective_root_signature": "present", "shaders": [pixel]}, **changes)
+
+    valid = report(manifest, {"pipelines": [entry()]}, Path("."))["pipelines"]
+    assert [row["status"] for row in valid] == ["needs_evidence"], valid
+    bad_inputs = (
+        ("duplicate ID", [entry(), entry()], "empty or duplicate pipeline ID 'p'"),
+        ("empty ID", [entry(id="")], "empty or duplicate pipeline ID ''"),
+        ("non-string ID", [entry(id=1)], "empty or duplicate pipeline ID 1"),
+        ("root status", [entry(effective_root_signature="yes")], "invalid root signature status for p"),
+        ("repeated stage", [entry(shaders=[pixel, pixel])], "pipeline p repeats stage pixel"),
+        ("no shaders", [entry(shaders=[])], "pipeline p has no shader references"),
+        ("short digest", [entry(shaders=[dict(pixel, sha256="ab")])],
+         "shader references require a stage and a full native SHA-256"),
+        ("empty stage", [entry(shaders=[dict(pixel, stage="")])],
+         "shader references require a stage and a full native SHA-256"),
+        ("shaders is a dict", [entry(shaders={"pixel": pixel})], "pipeline p shaders must be a list"),
+        ("shaders is an int", [entry(shaders=5)], "pipeline p shaders must be a list"),
+        ("shaders is a string", [entry(shaders="pixel")], "pipeline p shaders must be a list"),
+        ("shader reference is a string", [entry(shaders=["pixel"])],
+         "shader references require a stage and a full native SHA-256"),
+        ("shader reference is an int", [entry(shaders=[5])],
+         "shader references require a stage and a full native SHA-256"),
+        ("pipeline is a string", ["p"], "pipeline entries must be JSON objects"),
+        ("pipeline is a list", [[entry()]], "pipeline entries must be JSON objects"),
+    )
+    for name, pipelines, message in bad_inputs:
+        try:
+            report(manifest, {"pipelines": pipelines}, Path("."))
+        except ValueError as exc:
+            assert str(exc) == message, (name, str(exc))
+        else:
+            raise AssertionError(f"{name}: accepted invalid pipeline input")
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        tool = str(Path(__file__).resolve().parents[1] / "tools" / "pso_readiness.py")
+        (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        for name, pipelines, message in bad_inputs[:1] + bad_inputs[8:9]:
+            (root / "pipelines.json").write_text(json.dumps({"pipelines": pipelines}), encoding="utf-8")
+            completed = subprocess.run([sys.executable, "-B", tool, "manifest.json", "pipelines.json"],
+                                       cwd=root, capture_output=True, text=True)
+            assert completed.returncode == 1 and completed.stdout == "", (name, completed)
+            assert completed.stderr == f"PSO report: {message}\n", (name, completed.stderr)
+    print(f"PSO input validation passed ({len(bad_inputs)} rejected inputs, 2 CLI exits, 1 valid control)")
+
+
 def check():
     check_scanner_tracks_pixel_aot()
     code = b"synthetic native bytes"
@@ -292,4 +342,5 @@ def check():
 if __name__ == "__main__":
     check_mesh()
     check_compute()
+    check_invalid_input()
     check()

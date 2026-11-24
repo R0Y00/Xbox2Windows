@@ -36,9 +36,12 @@ The presenter only samples non-empty single-sample 2D surfaces without
 closing its command list fails.
 When a present cannot show its surface, the GDI fallback selects a visible,
 unowned guest window in the same process. If only the presenter is visible,
-the fallback leaves it alone. To exercise both z-orders with source-built
+the fallback leaves it alone. With two visible guests it draws into the upper
+one in z-order. To exercise both z-orders with source-built
 windows, build `startup_overlay_window` and run
 `ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
+The same run raises each of two guests in turn and checks that the raised one is
+selected.
 
 ## Null Texture2D descriptors
 
@@ -46,7 +49,7 @@ When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target sup
 B4G4R4A4_UNORM, the wrapper uses an R8G8B8A8_UNORM null descriptor if that format supports the
 requested view. This applies only to Texture2D views with no resource or counter. Run
 `ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
-directory to exercise both slots on hardware and WARP.
+directory to exercise both slots on hardware and WARP. On Windows 11 build 26300.9974 the fallback is live on the physical adapter and idle on WARP: an RTX 5080 Laptop (32.0.15.8142) reports `slot 19 format 86 -> 28; slot 20 format 115 -> 28`, while in-box WARP 10.0.26100.9818 reports `slot 19 format 86 -> 86; slot 20 format 115 -> 115`. This adapter therefore lacks the typed UAV and render-target support the rule keys on, and WARP does not.
 
 ## 16-bit packed targets
 
@@ -86,8 +89,12 @@ Checks:
 - `ctest --preset release --no-tests=error -R '^startup_packed_target$' -V`: the selection rule
   against adapters described by their support bits (B5G6R5_UNORM, arrays of 2, 6, 16 and 2048
   slices, and the refused 0, 2049, multisampled and 3D cases), and the view verdicts, without a
-  device. The four `startup_packed_target_*_control` runs perturb the helper's answer (wrong
-  stand-in format, arrays left alone, B5G6R5_UNORM left alone, view kept packed) and must fail.
+  device. It also tags fake resources: an R8G8B8A8_UNORM stand-in must read back the packed format it was
+  asked for, and a texture created in the packed format must carry no tag. The five
+  `startup_packed_target_*_control` runs perturb the helper's answer (wrong stand-in format, arrays
+  left alone, B5G6R5_UNORM left alone, view kept packed, tag read back as none) and must fail
+  (`ctest --preset release --no-tests=error -R '^startup_packed_target_.*_control$'`). On the WARP
+  build tested, all three packed formats were created as described, so the draw check below did not read a tag.
 - `ctest --preset release --no-tests=error -R '^startup_packed_target_draw_' -V`: through the
   wrapper, a texture of each packed format is created (slot 133), cleared through a render-target
   view, sampled in a draw and read back. The expected pixel follows the format this adapter
@@ -110,7 +117,9 @@ on each call. Heaps whose desktop start is an address are unchanged, so nothing 
 adapter whose handles are addresses.
 
 - `ctest --preset release --no-tests=error -R '^startup_title_heap(_tags_control)?$' -V`: the
-  rule, without a device.
+  rule, without a device. `ctest --preset release --no-tests=error -R '^startup_title_heap$' -V`
+  also checks that for an aligned view heap and a tagged sampler heap without memory of their own,
+  the allocator is asked for the whole heap's size and its address becomes the heap's memory.
 - `ctest --preset release --no-tests=error -R '^startup_title_heap_device_' -V`: through the
   wrapper, the starts of two sampler heaps, a render-target heap and a depth heap must be aligned
   addresses, a heap whose desktop start is tagged must have memory of its own, and three samplers
@@ -138,6 +147,37 @@ by reading a render log. The device prints the counts by cause value, so
 `ctest --preset dev --no-tests=error -R "^startup_null_cause_labels(_buffer_token_control)?$" -V`
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
+
+## Composite provenance fixture
+
+Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
+already there. `tests/startup_composite_provenance.cpp` is a source-built model of that question, not a trace
+of the title. One command list draws a 64×64 RGBA32F source:
+- a blue base;
+- a green centre block, `[16, 48)²`;
+- a red corner block, `[0, 8)²`.
+
+It then clears the destination to magenta and runs the composite, which `Load`s the exact source texel at
+`floor(position) × scale + offset`. The source, the destination immediately before the composite draw and the
+destination immediately after it are copied to readback buffers on the same list, behind one fence. A CPU
+model built from the first two readbacks predicts every pixel of the third.
+
+The three cases leave three different destination centres:
+
+| case | scissor | UV | centre after |
+|---|---|---|---|
+| drawn centre | full | identity | green |
+| clipped centre | top 16 rows | identity | magenta (retained) |
+| UV selects the corner | full | constant texel (2, 2) | red |
+
+Each case reports viewport, scissor, blend (off) and write mask. Two mutants run against the unchanged model
+and must mismatch: the corner case with its UV moved to the source centre, and the drawn case with a write
+mask of red and alpha only.
+
+On an AMD Radeon RX 9070 XT (driver 32.0.31044.16) and WARP 10.0.26100.9818, Windows 11 build 26300.9974,
+debug layer enabled, all 4,096 pixels of each case matched the model. The UV mutant mismatched 4,096 pixels
+and the mask mutant 1,088, with zero debug errors or warnings
+(`ctest --preset dev --no-tests=error -R '^startup_composite_provenance_(hardware|warp)$' -V`).
 
 ## What is measured
 
@@ -179,8 +219,22 @@ Then:
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
+`-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
+`PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
-socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:
+socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
+
+A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
+heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
+used, so every allocation and free costs more. The debugger starts the process with
+`_NO_DEBUG_HEAP=1` unless the environment already sets `_NO_DEBUG_HEAP`; set `_NO_DEBUG_HEAP=0` to
+keep the debug heap, for example to look for heap corruption. In one local startup run on Windows 11
+the debug heap spent about 8.9 s freeing the nodes of a 99,776-entry map built by a single
+`XMemMapPhysicalPages` call; without it the whole call took 0.46 s and the first DirectStorage batch
+completed about 20 s earlier. `startup_debug` checks both settings on its probe.
+
+It writes:
 
 | File | Content |
 |---|---|
@@ -188,6 +242,12 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 | `<log>/events.txt` | module loads and every exception with its time |
 | `<log>/stderr.txt` | the stand-ins' logs (`x2w-d3d12`, `x2w-dstorage`, `x2w-xmem`, `x2w-runtime`, ...) |
 | `<log>/files.txt` | every file the process opened |
+
+`run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
+the process could not be created, 0 when the debugger finished its report, whatever the process
+did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
+runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
+script text only.
 
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
@@ -262,11 +322,11 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
-| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. |
+| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
-| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is handed to the executable with a trailing separator, added when missing, because the executable appends names to it as it is; up to 258 characters, a longer value is refused with a log line and `S:\` is used (`src/startup_stubs/storage_root.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`) |
+| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
@@ -390,7 +450,7 @@ These are measured on one executable; treat them as hypotheses for others.
   so a fence never completes before the wait ends. Other queue slots that are given a fence are
   still treated as Signals. The slot numbers are inferred from that layout; no title call to slot
   17 has been logged yet. Run
-  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`.
+  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`. On Windows 11 build 26300.9974 both backends separate the two slots the way this mapping assumes: on the RTX 5080 Laptop (32.0.15.8142) and on the Microsoft Basic Render Driver, routing the wait through slot 15 leaves `G=1` before `F` is signalled because that slot acts as a Signal, while routing it through slot 17 leaves `G=0` until `F` reaches 1 from the CPU.
 - **Resubmitted lists.** In render mode a closed list can be submitted again until its own Reset.
   Each title allocator stands for a pool of desktop allocators. The title's Reset resets the current
   one only if no list holds a recording on it and every queue has passed its last submit; otherwise
@@ -450,6 +510,49 @@ These are measured on one executable; treat them as hypotheses for others.
   entire page detects the wrong stream. Moving the second request by the same distance reaches
   EOF and leaves the destination untouched. A subsequent request using its directory offset succeeds.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_directory_batch$' -V`.
+- **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
+  a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
+  field, into a failed request: the next status entry reports `E_FAIL`, the destination is
+  untouched and the worker serves the following entries. The handler only copies a short reason
+  into a fixed buffer; the log line is written after the handler has left and after the request's
+  buffers were freed, so no formatting or allocation runs while the exception is in flight. The
+  worker is a `CreateThread` thread whose stack is committed at creation (1 MiB, `worker_stack_commit`)
+  instead of growing on demand, because when the system is out of commit an untouched stack page
+  cannot be committed either. The original `0xc00000fd` (stack overflow) was not reproduced here,
+  and the stack-commit cause is a hypothesis from reading the code, not a measurement. The
+  `startup_storage_alloc_failure` check puts its own process under a job commit limit, submits
+  a request that declares a 1.5 GiB inflated size, expects a failure status within a timeout and
+  then a correct result for a normal request on the same queue. It returns 77 where the limit is
+  not enforced.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_alloc_failure$' -V`.
+  A queue builds its work (three `std::deque`s, whose constructors allocate and can throw
+  `std::bad_alloc` even under `new (std::nothrow)`) and starts its worker separately. Enqueue
+  only records an entry, in the work when it exists, otherwise in a small record that needs no
+  queue storage; it never completes a status entry or signals a fence. Submit retries the
+  construction and the worker start (a committed-stack attempt, then a default-stack one). If the
+  worker runs, the entries proceed as usual. If it cannot start, every recorded entry fails there:
+  its status entry takes the pending failure (`E_OUTOFMEMORY` when nothing worse is pending) and
+  its fence is signaled, so nothing is left at `E_PENDING`. An entry that could not even be
+  recorded loses its request bytes, so it fails at Submit even if the worker starts then; only when
+  the small record itself cannot be allocated is the entry failed inside Enqueue. No exception
+  leaves Enqueue or Submit: a request whose page tokens cannot be copied is recorded the same way,
+  and if Submit cannot grow the worker's list the entries still waiting fail there.
+  Entry order is kept: once an entry has been deferred, every later entry until the next Submit is
+  deferred too, so the stored entries are an in-order prefix and the deferred ones the in-order
+  suffix. Submit handles the prefix first (worker or failure), then fails the suffix, so a failure
+  reaches the next status entry after it and never stays pending behind a status entry that
+  completed. Limits: when the prefix runs on the worker, a suffix status entry fails synchronously
+  inside Submit and cannot see a failure the worker finds later in the prefix (a later status entry
+  will); after the first allocation failure the rest of the batch fails with `E_OUTOFMEMORY` even if
+  memory recovered, which is preferable to reordering.
+  `startup_storage_worker_start` compiles the stand-in into the test, redirects `CreateThread`
+  and replaces `operator new` with one that fails the N-th allocation once and then behaves
+  normally. It sweeps N over Enqueue and Submit, and checks pending status and an unsignaled fence
+  before Submit, then a request that completed with correct data or a failure, a fence signaled
+  once, and a correct request on the same queue afterwards. A second control fails the N-th allocation
+  of Enqueue and the M-th of Submit for 1 to 9 requests with the status entry before or after them
+  and checks that a failure is reported by one status entry only and that a later clean request and
+  status entry complete correctly. A crash names the stage it was in.
 
 ## Shortcuts that are known to be wrong
 
@@ -462,7 +565,7 @@ These are measured on one executable; treat them as hypotheses for others.
   graphics draws; other consumers need their own binding path. Drivers refuse the request
   with different codes for the same condition (`E_INVALIDARG` on a GTX 1660 SUPER, `E_OUTOFMEMORY` on
   an RTX 3060), so any failure of an oversized shader-visible view heap takes this path. The measured
-  limits so far are 1,000,000 descriptors on both adapters. Reproduce with
+  limits so far are 1,000,000 descriptors on both adapters. On Windows 11 build 26300.9974 an RTX 5080 Laptop (32.0.15.8142) also reports 1,000,000, so the fixtures' 1,245,184-descriptor request takes the shortcut above and the remaining 245,184 descriptors stay in title memory. Reproduce with
   `ctest --preset release --no-tests=error -R '^startup_(view_heap|logical_view)_' -V`, which skips (77) on an
   adapter that accepts the full request. WARP 10.0.26100.9818 and an RX 6600 (driver 32.0.21045.29003)
   accept it, so those draws do not reach the table bounds there. `ctest --preset dev --no-tests=error -R '^startup_logical_view_table$' -V` checks
@@ -605,9 +708,11 @@ longer exhausts the heap. While nothing has been freed the offsets are the ones 
   already freed) is `E_INVALIDARG` and changes nothing.
 - `ApuIsVirtualAddressValid` and the two map calls still test the whole heap range, not live blocks.
 
-The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) is unchanged. The source-built
-check loads the stub, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment, coalescing and every refused
-call, then runs 4 threads of 1000 rounds against an interval map of live blocks:
+The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) returns `E_NOTIMPL`,
+rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
+check loads the stub, checks non-permissive traps, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment,
+coalescing, every refused call, shape-context allocation and partial-failure rollback, `AcpHalCreate`, and the
+address validity/mapping exports, then runs 4 threads of 1000 rounds against an interval map of live blocks:
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
@@ -643,7 +748,7 @@ ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
 
 `ctest --preset dev --no-tests=error -R '^startup_slice_footprints' -V` checks
 `src/startup_stubs/slice_footprints.h` without a GPU. It covers NV12 descriptions refused for odd or zero
-sizes, mips, layers, samples or dimension; the one-frame R8 plane and 15-frame re-read intervals and the
+sizes, mips, layers, samples or dimension; the one-frame R8 and A8 plane and 15-frame re-read intervals and the
 inclusive 32 MiB cap; the footprint request for 15 and 16 mips and without a device; and the bytes up to
 the end of the last row. The padded-last-row control must fail.
 

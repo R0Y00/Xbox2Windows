@@ -213,6 +213,13 @@ void test_probe_and_access(bool guard_drop_mutate)
     check(x2w_local::readable(raw, kPages * kPage) && x2w_local::writable(raw, kPages * kPage),
           "4-page RW region is readable and writable");
 
+    // A size so large that start + bytes wraps around the address space is not a range.
+    check(!x2w_local::readable(raw, SIZE_MAX - 8) && !x2w_local::writable(raw, SIZE_MAX - 8),
+          "accessible rejects a size that wraps start + bytes");
+    check(!x2w_local::writable(raw, SIZE_MAX), "writable rejects SIZE_MAX bytes");
+    check(!x2w_local::writable(reinterpret_cast<const void*>(base + kPage - 1), SIZE_MAX - kPage),
+          "writable rejects a wrapping size from inside the region");
+
     // PAGE_READONLY on page 1: readable across page 0 -> page 1, writable stops at page 0 end.
     DWORD old_prot = 0;
     check(VirtualProtect(reinterpret_cast<void*>(base + kPage), kPage, PAGE_READONLY, &old_prot) != 0,

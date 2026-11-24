@@ -29,9 +29,12 @@ constexpr UINT texture_atomic_uint_flag = 1u << 25;
 constexpr UINT texture_atomic_sint_minmax_flag = 1u << 26;
 constexpr UINT texture_atomic_uint_minmax_flag = 1u << 27;
 constexpr UINT texture_atomic_exchange_flag = 1u << 28;
+constexpr UINT texture_atomic_cas_flag = 1u << 29;
 constexpr UINT texture_atomic_mask = texture_atomic_uint_flag | texture_atomic_sint_minmax_flag |
-                                     texture_atomic_uint_minmax_flag | texture_atomic_exchange_flag;
-constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask;
+                                     texture_atomic_uint_minmax_flag | texture_atomic_exchange_flag |
+                                     texture_atomic_cas_flag;
+constexpr UINT texture_rgba32_float_flag = 1u << 30;
+constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask | texture_rgba32_float_flag;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3;
 }
@@ -61,7 +64,8 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
                                              const std::vector<UINT>& texels,
                                              DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging, bool writable = false)
 {
-    const UINT words_per_texel = format == DXGI_FORMAT_R32G32B32A32_UINT ? texture_channels : 1;
+    const bool rgba32 = format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const UINT words_per_texel = rgba32 ? texture_channels : 1;
     const UINT base_words = texture_width * texture_height * words_per_texel;
     const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
@@ -423,6 +427,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     UINT required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
     switch (selector) {
     case 0: break;
+    case texture_rgba32_float_flag: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
     case texture_rgba8_flag: format = DXGI_FORMAT_R8G8B8A8_UINT; break;
     case texture_atomic_uint_flag:
         format = DXGI_FORMAT_R32_UINT;
@@ -442,14 +447,21 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
                    D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE;
         break;
+    case texture_atomic_cas_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE;
+        break;
     default: throw std::runtime_error("Invalid compute image store format selector");
     }
-    const UINT words_per_texel = selector ? 1 : texture_channels;
+    const bool float_image = selector == texture_rgba32_float_flag;
+    const UINT words_per_texel = (!selector || float_image) ? texture_channels : 1;
     const UINT base_words = texture_width * texture_height * words_per_texel;
     const UINT all_words = base_words + base_words / 4 + base_words / 16;
     std::vector<UINT> initial(all_words), expected(all_words);
     source.read(reinterpret_cast<char*>(initial.data()), all_words * sizeof(UINT));
     source.read(reinterpret_cast<char*>(expected.data()), all_words * sizeof(UINT));
+    std::vector<UINT> input_texels(float_image ? all_words : 0);
+    if (float_image) source.read(reinterpret_cast<char*>(input_texels.data()), all_words * sizeof(UINT));
     if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels
         || ((selector & texture_atomic_mask) && mip != 0))
         throw std::runtime_error("Invalid compute image store reference");
@@ -475,13 +487,14 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&pipeline)), "Create image store pipeline");
     ComputeCommands commands(device, pipeline.Get());
     auto* list = commands.list.Get();
-    ComPtr<ID3D12Resource> staging;
+    ComPtr<ID3D12Resource> staging, input_staging, input_image;
     auto texture = upload_texture(device, list, initial, format, staging, true);
+    if (float_image) input_image = upload_texture(device, list, input_texels, format, input_staging);
     auto constants_buffer = make_buffer(device, constants_offset + 4 * alignment, D3D12_HEAP_TYPE_UPLOAD,
                                         D3D12_RESOURCE_STATE_GENERIC_READ);
     fill_upload(constants_buffer.Get());
     list->SetComputeRootSignature(signature.Get());
-    auto heap = bind_tables(device, list, constants_buffer.Get(), texture.Get(), nullptr, 0, mip);
+    auto heap = bind_tables(device, list, constants_buffer.Get(), texture.Get(), input_image.Get(), 0, mip);
     list->Dispatch(groups, 1, 1);
 
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);

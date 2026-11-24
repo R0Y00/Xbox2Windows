@@ -34,7 +34,10 @@ int draw_logical_tables(ID3D12Device* desktop, void* guest, void* list)
         ComPtr<ID3D12DescriptorHeap> probe;
         return SUCCEEDED(desktop->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&probe)));
     };
-    if (accepts(count)) return 77;
+    if (accepts(count)) {
+        std::printf("adapter accepts %u descriptors directly; the logical view tables are not needed here\n", count);
+        return 77;
+    }
     UINT boundary = 0, upper = 1048577;
     while (upper - boundary > 1) {
         const UINT n = boundary + (upper - boundary) / 2;
@@ -266,6 +269,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (bc_chain) {
         extern int draw_bc_chain(void*, void*);
         if (const int result = draw_bc_chain(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_1D_SRV", nullptr, 0)) {
+        extern int draw_1d_srvs(void*, void*);
+        if (const int result = draw_1d_srvs(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;

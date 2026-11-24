@@ -612,6 +612,7 @@ void local_mirror(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* 
 
 bool to_pages(ULONG_PTR count, const ULONG_PTR* tokens, std::vector<ULONG_PTR>& pages)
 {
+    if (count > era_physical::capacity_pages) return false;  // as the strict path: no grant is larger
     pages.resize(count);
     for (ULONG_PTR i = 0; i < count; ++i) {
         if (tokens[i] & 0xF) return false;
@@ -734,6 +735,10 @@ extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const 
         return nullptr;
     }
     if (local_permissive()) {
+        if (count > era_physical::capacity_pages) {  // as the strict path; sizes the vectors below
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
         // A null array unmaps (seen on a cleanup path, also with a zero count).
         std::vector<ULONG_PTR> addresses(count), pages(count, 0);
         for (ULONG_PTR i = 0; i < count; ++i) addresses[i] = address + i * page_bytes;
