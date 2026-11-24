@@ -15732,7 +15732,7 @@ def check_controls(directory):
         "v_mul_u32_u24_e64 v23, s47, s44 clamp",
         "v_mul_hi_i32_i24_e64 v25, s46, s47 clamp",
         "v_mul_hi_u32_u24_e64 v27, s47, s44 clamp",
-        "v_mul_i32_i24_sdwa v21, s46, s47 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+        "v_mul_i32_i24_sdwa v21, s46, s47 clamp dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
         "v_mul_i32_i24_e64 v21, s46",
         "v_mul_u32_u24_e32 v256, s45, v29",
         "v_mul_hi_u32_u24_e64 v27, s47, 0x100000000",
