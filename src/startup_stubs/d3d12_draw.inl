@@ -1096,29 +1096,31 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     return drawn;
 }
 
-// One shared 1-entry sampler heap for lists that set a sampler-heap-indexed root signature with no sampler
-// heap bound. It lives as long as the startup render device: submitted lists may still reference it.
+// One shared 1-entry sampler heap per device for lists that set a sampler-heap-indexed root signature with no
+// sampler heap bound. Each heap lives for the lifetime of the process so submitted lists may still reference it.
 SRWLOCK default_sampler_lock = SRWLOCK_INIT;
-x2w_startup::ComPtr<ID3D12DescriptorHeap> default_sampler_heap;
-Wrapper* default_sampler_heap_device;
+std::unordered_map<Wrapper*, x2w_startup::ComPtr<ID3D12DescriptorHeap>>& default_sampler_heaps()
+{
+    static std::unordered_map<Wrapper*, x2w_startup::ComPtr<ID3D12DescriptorHeap>> map;
+    return map;
+}
 
 // Called before the real SetGraphicsRootSignature of a root signature that indexes the sampler heap. A
 // sampler heap already bound on this list (the title's snapshot, or a translated draw's) is kept.
 void ensure_sampler_heap_for_root(Wrapper* self, ID3D12GraphicsCommandList* list)
 {
     Pass& pass = pass_of(self);
-    if (pass.bound_sampler_heap || !the_device) return;
+    Wrapper* device = self->own().list_device;
+    if (pass.bound_sampler_heap || !device || !device_of(device)) return;
+    x2w_startup::ComPtr<ID3D12DescriptorHeap> fallback;
     AcquireSRWLockExclusive(&default_sampler_lock);
-    if (!default_sampler_heap || default_sampler_heap_device != the_device) {
-        default_sampler_heap.Reset();
-        if (SUCCEEDED(x2w_startup::create_default_sampler_heap(device_of(the_device), default_sampler_heap.GetAddressOf())))
-            default_sampler_heap_device = the_device;
-    }
-    ID3D12DescriptorHeap* fallback = default_sampler_heap.Get();
+    auto& slot = default_sampler_heaps()[device];
+    if (!slot) x2w_startup::create_default_sampler_heap(device_of(device), slot.GetAddressOf());
+    fallback = slot;
     ReleaseSRWLockExclusive(&default_sampler_lock);
-    ID3D12DescriptorHeap* views = pass.heap_set ? draw_heap : nullptr;
-    if (!x2w_startup::bind_default_sampler_heap(list, views, pass.bound_sampler_heap, fallback)) return;
-    pass.bound_sampler_heap = fallback;
+    ID3D12DescriptorHeap* views = pass.heap_set && device == draw_heap_device ? draw_heap : nullptr;
+    if (!x2w_startup::bind_default_sampler_heap(list, views, pass.bound_sampler_heap, fallback.Get())) return;
+    pass.bound_sampler_heap = fallback.Get();
     static LONG reports;
     if (first_calls(reports, 4))
         log("x2w-d3d12 sampler-heap-indexed root signature set with no sampler heap bound: default sampler heap bound first");

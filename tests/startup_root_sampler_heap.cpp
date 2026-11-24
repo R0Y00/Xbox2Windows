@@ -134,21 +134,27 @@ int main(int argc, char** argv)
     messages_other = 0;
 
     // The same two root signatures through the stand-in's list.
-    void *console_queue = nullptr, *allocator = nullptr, *list = nullptr, *flagged_root = nullptr, *plain_root = nullptr;
+    void *console_queue = nullptr, *console_fence = nullptr, *allocator = nullptr, *list = nullptr, *flagged_root = nullptr, *plain_root = nullptr;
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
     if (!ok(invoke(device, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&console_queue))) ||
+        !ok(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&console_fence))) ||
         !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)), arg(&allocator))) ||
         !ok(invoke(device, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list))) ||
         !ok(invoke(device, 16, 0, arg(flagged->GetBufferPointer()), flagged->GetBufferSize(), arg(&__uuidof(ID3D12RootSignature)), arg(&flagged_root))) ||
         !ok(invoke(device, 16, 0, arg(plain->GetBufferPointer()), plain->GetBufferSize(), arg(&__uuidof(ID3D12RootSignature)), arg(&plain_root))))
         return 6;
+    Word fence_value = 0;
     const auto record_and_submit = [&](void* root) {
         invoke(list, 34, arg(root));  // SetGraphicsRootSignature
         if (!ok(invoke(list, 9))) return false;
         void* submit[] = {list};
         invoke(console_queue, 10, 1, arg(submit));
-        wait_for(desktop.Get(), desktop_queue.Get());
-        Sleep(200);
+        if (!ok(invoke(console_queue, 14, arg(console_fence), ++fence_value))) return false;
+        const ULONGLONG deadline = GetTickCount64() + 10000;
+        while (invoke(console_fence, 8) < fence_value) {
+            if (GetTickCount64() > deadline) return false;
+            Sleep(1);
+        }
         if (!ok(invoke(allocator, 8)) || !ok(invoke(list, 139, arg(allocator)))) return false;
         return true;
     };
@@ -158,6 +164,9 @@ int main(int argc, char** argv)
     if (!record_and_submit(plain_root)) return 11;
     const int plain_messages = messages_1419.exchange(0);
     std::printf("plain root signature: %d messages with ID %d\n", plain_messages, sampler_heap_message);
+    if (!record_and_submit(flagged_root)) return 12;
+    const int second_flagged_messages = messages_1419.exchange(0);
+    std::printf("flagged root signature after reset: %d messages with ID %d\n", second_flagged_messages, sampler_heap_message);
 
     const HRESULT removed = desktop->GetDeviceRemovedReason();
     std::printf("control %d, device removed reason 0x%08lx, other debug layer errors %d\n", control,
@@ -165,5 +174,6 @@ int main(int argc, char** argv)
     queue1->UnregisterMessageCallback(cookie);
     if (flagged_messages) return 20;
     if (plain_messages) return 21;
+    if (second_flagged_messages) return 22;
     return removed == S_OK && messages_other == 0 ? 0 : 70;
 }

@@ -978,6 +978,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // when the desktop GPU finishes, and the presented surface is read back and shown in the window.
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
+void reset_pass(Wrapper* self);
 void discard_draw_sampler_heaps(Wrapper* self);
 void ensure_sampler_heap_for_root(Wrapper* self, ID3D12GraphicsCommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
@@ -1198,6 +1199,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         ReleaseSRWLockExclusive(&allocator_lock);
     }
     if (SUCCEEDED(hr)) {
+        reset_pass(self);
         self->own().list_ready = false;
         discard_draw_sampler_heaps(self);
         if (draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
@@ -1706,6 +1708,10 @@ void release_targets(Wrapper* self)
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
     pass = Pass{};
+}
+void reset_pass(Wrapper* self)
+{
+    pass_of(self) = Pass{};
 }
 
 // List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).

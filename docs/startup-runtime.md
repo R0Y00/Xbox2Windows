@@ -154,7 +154,7 @@ The desktop command list never receives the heaps a title sets with list slot 32
 
 The stand-in records the root signature flags in `CreateRootSignature`. When slot 34 sets a flagged root signature on a list that has no sampler heap bound, it binds one shared one-entry shader-visible sampler heap (the border sampler) first, keeping the view heap a translated draw already bound, and logs one line per run start (at most four): `sampler-heap-indexed root signature set with no sampler heap bound: default sampler heap bound first`. A sampler heap already bound on the list is never replaced, and a translated draw rebinds its own heaps as before.
 
-Open scope: the translated root signature is created with no flags, so the 43 translated-draw and 2 pipeline-creation messages are not explained by this change and are not claimed fixed. No Windows run of this change has been made yet; `startup_root_sampler_heap_*` counts the ID 1419 messages through a debug layer message callback and skips (77) when the debug layer cannot report the control case.
+Open scope: the translated root signature is created with no flags, so the 43 translated-draw and 2 pipeline-creation messages are not explained by this change and are not claimed fixed. `startup_root_sampler_heap_*` counts the ID 1419 messages through a debug layer message callback and skips (77) when the debug layer cannot report the control case.
 
 ## Root constant buffer views
 
