@@ -9290,6 +9290,13 @@ def e64_integer_group(group):
 # sign extension on either source, a selected shift count, and results placed into a byte or word with
 # UNUSED_PAD and UNUSED_PRESERVE.
 SDWA_INT_BODIES = {
+    "bit_scan": [
+        "v_bfrev_b32_sdwa v12, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+        "v_ffbl_b32_sdwa v13, v18 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:WORD_1",
+        "v_ffbh_u32_sdwa v14, s46 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:BYTE_2",
+        "v_mov_b32_e32 v15, s47",
+        "v_ffbh_i32_sdwa v15, sext(s44) dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0",
+    ],
     "bitwise": [
         "v_and_b32_sdwa v12, s44, sext(s45) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:BYTE_1",
         "v_or_b32_sdwa v13, s44, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1",
@@ -9336,6 +9343,10 @@ def _s32(word):
 
 # Reference words by group: the e32 operation on the selected fields, then the placement.
 SDWA_INT_RESULTS = {
+    "bit_scan": lambda a, b, c, d: (
+        plain_rev(_byte(a, 1)), (plain_ffbl(_word(b, 1)) & 0xff) << 24,
+        (plain_ffbh_u(_byte(c, 2)) & 0xff) << 24,
+        (d & 0xffffff00) | (plain_ffbh_i(_sext(_byte(a, 0), 8) & 0xffffffff) & 0xff)),
     "bitwise": lambda a, b, c, d: (
         a & _sext(_byte(b, 1), 8), a | _word(b, 1), ((_byte(a, 0) ^ _byte(b, 2)) & 0xff) << 24,
         ~(_sext(_word(a, 0), 16) ^ b)),
@@ -9354,6 +9365,12 @@ SDWA_INT_RESULTS = {
 # Negative controls by group: (row, channel, word a wrong lowering would give, what went wrong). Each must
 # report a mismatch.
 SDWA_INT_WRONG = {
+    "bit_scan": (
+        (0, 0, lambda a, b, c, d: plain_rev(a), "ignored byte selection"),
+        (0, 1, lambda a, b, c, d: plain_ffbl(_word(b, 1)), "ignored placement"),
+        (1, 2, lambda a, b, c, d: 0, "zero instead of the no-bit sentinel"),
+        (0, 3, lambda a, b, c, d: (d & 0xffffff00) | plain_ffbh_i(_byte(a, 0)), "lost sign extension"),
+    ),
     "bitwise": (
         (0, 0, lambda a, b, c, d: a & _byte(b, 1), "sign extension dropped on src1"),
         (0, 0, lambda a, b, c, d: a & _sext(_byte(b, 0), 8), "BYTE_0 for BYTE_1"),
@@ -9407,6 +9424,8 @@ SDWA_INT_WRONG = {
 # the draw). The selected bytes and words differ from their neighbours, the sign-extended fields are negative
 # in at least one row, and the shift counts (bytes of A in the shift group) exceed 31.
 SDWA_INT_ROWS = {
+    "bit_scan": ((0x40300581, 0x41200000, 0x40420000, 0x41000000),
+                 (0x400003ff, 0, 0x40000000, 0x42000001)),
     "bitwise": ((0x40D18A11, 0xC025B37E, 0, 0), (0x3E27F0C4, 0xBF62915A, 0, 0)),
     "shift": ((0x3F232425, 0xC1700000, 0x40C32A11, 0x41A00000), (0x40214263, 0x4C003A00, 0x3F00FF80, 0xC2480000)),
     "arith": ((0x40D18AF1, 0xC025B38E, 0, 0x41A00000), (0x3E27F0C4, 0xBF62915A, 0, 0xC2480000)),
@@ -10417,7 +10436,7 @@ def check_sdwa_integer_lowering():
         translate_int(uncompressed_export(sdwa_integer_group(group)))
         sdwa_integer_cases(group)
     assert set(SDWA_INT_OPS) <= ACCEPTED, set(SDWA_INT_OPS) - ACCEPTED
-    assert len(SDWA_INT_OPS) == 15 and set(SDWA_INT_OPS) == {f"v_{op}_sdwa" for op in pixel_aot.SDWA_INT}
+    assert len(SDWA_INT_OPS) == 19 and set(SDWA_INT_OPS) == {f"v_{op}_sdwa" for op in pixel_aot.SDWA_INT}
 
     def statement(*body):
         """The HLSL of the last instruction of body, with its own temporary renamed to `r`."""

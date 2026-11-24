@@ -312,11 +312,12 @@ def check_shader_records():
         "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_not_b32",
         "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_cvt_f32_ubyte2")}
     sdwa_integer_forms = {("SDWA", f"{form}_sdwa") for form in (
+        "v_bfrev_b32", "v_ffbl_b32", "v_ffbh_u32", "v_ffbh_i32",
         "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_not_b32",
         "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
         "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
         "v_min_i32", "v_max_i32", "v_min_u32", "v_max_u32")}
-    assert len(sdwa_integer_forms) == 15
+    assert len(sdwa_integer_forms) == 19
     # gfx10 encodes the carry-out add and subtracts as VOP3 only, under their plain names.
     carry_out_forms = {("VOP3", "v_add_co_u32"), ("VOP3", "v_sub_co_u32"), ("VOP3", "v_subrev_co_u32")}
     # The carry-in add and subtracts in both the VOP2 (e32) and the VOP3 (e64) encoding.
