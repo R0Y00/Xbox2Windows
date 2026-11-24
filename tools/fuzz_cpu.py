@@ -8,6 +8,7 @@ import random
 import re
 import struct
 import sys
+import types
 
 WIDTHS = {
     "b": ("al", "dl", "BYTE PTR", 1),
@@ -1566,16 +1567,243 @@ def generate_loops(seed, count):
     return [loop_function(f"fuzz_loop_{index}", rng, *shapes[index % len(shapes)]) for index in range(count)]
 
 
+# Straight-line x87 sequences for the x87 profile of the shared integer lowering (ffx_version_query.lower with
+# x87=True, tools/x87_lower.py). Each export is fn(x, y, out) with x in RCX, y in RDX and the output buffer in R8.
+# It first writes its operands to the buffer: x at 0 and y at 8 (read as m16, m32, m64 integers and m32 and m64
+# floats), and two m80 values, x with the top word of y at 16 and y with the top word of x at 32. FNSTCW then
+# stores the control word at 48, which the lowering fixes at 0x027F, so a native run under another control word
+# shows up as a mismatch there. Every later result goes to bytes 64 to 255: FST, FSTP, FIST, FISTP and FISTTP
+# stores, SETcc after FCOMI and SAHF, and C0, C2 and C3 after FNSTSW AX. RAX is the first result qword.
+# The generator tracks the stack depth, so every instruction finds the registers it reads occupied and no push
+# exceeds eight; it leaves the stack empty at the RET, and reads a flag only where the profile defines it (PF only
+# after FCOMI or SAHF). Values are not restricted: denormals, NaN payloads, infinities and the m80 encodings that
+# the processor treats as unsupported all occur, because x87_soft.h models them bit for bit.
+X87_INTEGERS = {"m16": ("WORD PTR", (0, 2, 8, 10)), "m32": ("DWORD PTR", (0, 4, 8, 12)), "m64": ("QWORD PTR", (0, 8))}
+X87_FLOATS = {"m32": ("DWORD PTR", (0, 4, 8, 12)), "m64": ("QWORD PTR", (0, 8)), "m80": ("TBYTE PTR", (16, 32))}
+X87_SIZES = {"m16": 2, "m32": 4, "m64": 8, "m80": 10}
+X87_CONSTANTS = ("fld1", "fldz", "fldpi", "fldl2t", "fldl2e", "fldlg2", "fldln2")
+X87_ARITHMETIC = ("fadd", "fsub", "fsubr", "fmul", "fdiv", "fdivr")
+X87_UNARY = ("fchs", "fabs", "fsqrt", "frndint")
+# FCOMI leaves ZF, CF and PF; CMP RCX, RDX leaves the integer flags, of which the profile models no PF.
+X87_SETS = ("e", "ne", "a", "ae", "b", "be", "p", "np")
+X87_FCMOV = ("b", "e", "be", "nb", "ne", "nbe", "u", "nu")
+X87_RESULTS = 64
+X87_END = 256
+X87_WEIGHTS = {"load": 5, "arith": 6, "unary": 2, "exchange": 1, "store": 3, "fcomi": 2, "status": 2, "fcmov": 1}
+X87_COUNT_OPERATIONS = (6, 14)
+# Negative controls: a body the profile must refuse and the reason it must give.
+X87_CONTROLS = {
+    "overflow": ([*["fld1"] * 9, *["fstp st(0)"] * 9, "ret"], "x87 stack overflow"),
+    "underflow": (["fstp QWORD PTR [r8+64]", "ret"], "x87 stack underflow"),
+    "live": (["fld1", "ret"], "x87 stack not empty at return"),
+    # FINCSTP and FDECSTP move TOP without a tag change, which the profile documents as outside its model.
+    "fincstp": (["fld1", "fincstp", "fdecstp", "fstp QWORD PTR [r8+64]", "ret"], "unsupported x87 operation"),
+}
+
+
+class X87Builder:
+    def __init__(self, rng):
+        self.rng = rng
+        self.depth = 0
+        self.cursor = X87_RESULTS
+        # The flags a reader may use: "fcomi" after FCOMI or SAHF (ZF, CF and PF), "integer" after CMP, or None.
+        self.flags = None
+        self.lines = ["mov QWORD PTR [r8], rcx", "mov QWORD PTR [r8+8], rdx", "mov QWORD PTR [r8+16], rcx",
+                      "mov rax, rdx", "shr rax, 48", "mov WORD PTR [r8+24], ax", "mov QWORD PTR [r8+32], rdx",
+                      "mov rax, rcx", "shr rax, 48", "mov WORD PTR [r8+40], ax", "fnstcw WORD PTR [r8+48]"]
+
+    def result(self, size):
+        """The next result slot of size bytes; past the end of the buffer the slots start again at 64."""
+        if self.cursor + size > X87_END:
+            self.cursor = X87_RESULTS
+        offset, self.cursor = self.cursor, self.cursor + size
+        return f"[r8+{offset}]"
+
+    def other(self):
+        return self.rng.randrange(1, self.depth)
+
+    def memory(self, table, kinds):
+        ptr, offsets = table[self.rng.choice(kinds)]
+        return f"{ptr} [r8+{self.rng.choice(offsets)}]"
+
+    def operation(self, kind):
+        """Emit one operation of kind if the stack depth allows it; return whether it did."""
+        rng, depth = self.rng, self.depth
+        if kind == "load" and depth < 8:
+            choice = rng.choice(("float", "float", "integer", "constant", "register"))
+            if choice == "register" and depth:
+                self.lines.append(f"fld st({rng.randrange(depth)})")
+            elif choice == "integer":
+                self.lines.append(f"fild {self.memory(X87_INTEGERS, ('m16', 'm32', 'm64'))}")
+            elif choice == "constant":
+                self.lines.append(rng.choice(X87_CONSTANTS))
+            else:
+                self.lines.append(f"fld {self.memory(X87_FLOATS, ('m32', 'm64', 'm80'))}")
+            self.depth += 1
+        elif kind == "arith" and depth:
+            op = rng.choice(X87_ARITHMETIC)
+            form = rng.choice(("memory", "integer") + (("st0", "sti", "pop", "pop") if depth > 1 else ()))
+            if form == "memory":
+                self.lines.append(f"{op} {self.memory(X87_FLOATS, ('m32', 'm64'))}")
+            elif form == "integer":
+                self.lines.append(f"fi{op[1:]} {self.memory(X87_INTEGERS, ('m16', 'm32'))}")
+            elif form == "st0":
+                self.lines.append(f"{op} st, st({self.other()})")
+            elif form == "sti":
+                self.lines.append(f"{op} st({self.other()}), st")
+            else:
+                self.lines.append(f"{op}p st({self.other()}), st")
+                self.depth -= 1
+        elif kind == "unary" and depth:
+            self.lines.append(rng.choice(X87_UNARY))
+        elif kind == "exchange" and depth > 1:
+            self.lines.append(f"fxch st({self.other()})")
+        elif kind == "store" and depth:
+            self.store(rng.random() < 0.6)
+        elif kind == "fcomi" and depth > 1:
+            pop = rng.random() < 0.4
+            self.lines.append(f"{rng.choice(('fcomi', 'fucomi'))}{'p' if pop else ''} st, st({self.other()})")
+            self.depth -= pop
+            self.flags = "fcomi"
+            self.lines.append(f"set{rng.choice(X87_SETS)} BYTE PTR {self.result(1)}")
+        elif kind == "status" and depth:
+            self.status()
+        elif kind == "fcmov" and depth > 1:
+            if self.flags is None or rng.random() < 0.3:
+                self.lines.append("cmp rcx, rdx")
+                self.flags = "integer"
+            conditions = X87_FCMOV if self.flags == "fcomi" else X87_FCMOV[:6]
+            self.lines.append(f"fcmov{rng.choice(conditions)} st, st({self.other()})")
+        else:
+            return False
+        return True
+
+    def store(self, pop):
+        rng = self.rng
+        choice = rng.choice(("float", "float", "integer", "truncate") + (("register",) if self.depth > 1 else ()))
+        if choice == "register":
+            self.lines.append(f"{'fstp' if pop else 'fst'} st({self.other()})")
+        elif choice == "float":
+            kind = rng.choice(("m32", "m64", "m80") if pop else ("m32", "m64"))
+            self.lines.append(f"{'fstp' if pop else 'fst'} {X87_FLOATS[kind][0]} {self.result(X87_SIZES[kind])}")
+        elif choice == "integer" and (pop or rng.random() < 0.5):
+            kind = rng.choice(("m16", "m32", "m64") if pop else ("m16", "m32"))
+            self.lines.append(f"{'fistp' if pop else 'fist'} {X87_INTEGERS[kind][0]} {self.result(X87_SIZES[kind])}")
+        else:
+            kind = rng.choice(("m16", "m32", "m64"))
+            self.lines.append(f"fisttp {X87_INTEGERS[kind][0]} {self.result(X87_SIZES[kind])}")
+            pop = True
+        self.depth -= pop
+
+    def status(self):
+        """A comparison into C0, C2 and C3, read through FNSTSW AX and then SAHF or AND AH, 45h."""
+        rng, depth = self.rng, self.depth
+        forms = ["fcom", "fcomp", "fucom", "fucomp", "fcom_memory", "fcomp_memory", "ftst", "ficom", "ficomp", "fxam"]
+        if depth > 1:
+            forms += ["fcompp", "fucompp"]
+        form = rng.choice(forms)
+        if form in ("fcom", "fcomp", "fucom", "fucomp"):
+            self.lines.append(f"{form} st({self.other()})" if depth > 1 else f"{form} st(0)")
+        elif form.endswith("_memory"):
+            self.lines.append(f"{form.split('_')[0]} {self.memory(X87_FLOATS, ('m32', 'm64'))}")
+        elif form in ("ficom", "ficomp"):
+            self.lines.append(f"{form} {self.memory(X87_INTEGERS, ('m16', 'm32'))}")
+        else:
+            self.lines.append(form)
+        self.depth -= {"fcomp": 1, "fucomp": 1, "fcomp_memory": 1, "ficomp": 1, "fcompp": 2, "fucompp": 2}.get(form, 0)
+        self.lines.append("fnstsw ax")
+        if rng.random() < 0.5:
+            self.lines += ["sahf", f"set{rng.choice(X87_SETS)} BYTE PTR {self.result(1)}"]
+            self.flags = "fcomi"
+        else:
+            # C1 (FXAM's sign), the exception flags, TOP and the busy bit are not known to the profile.
+            # AH cannot be addressed with an R8 base, so MOVZX moves it to AL first.
+            self.lines += ["and ah, 45h", "movzx eax, ah", f"mov BYTE PTR {self.result(1)}, al"]
+            self.flags = None
+
+    def finish(self):
+        while self.depth:
+            self.store(True)
+        # AX may still hold status-word bits that the profile does not know; RAX is overwritten before the RET.
+        self.lines += [f"mov rax, QWORD PTR [r8+{X87_RESULTS}]", "ret"]
+
+
+def x87_function(name, rng, first):
+    builder = X87Builder(rng)
+    builder.operation("load")
+    builder.operation("load")
+    builder.operation(first)
+    for _ in range(rng.randint(*X87_COUNT_OPERATIONS)):
+        for _ in range(12):
+            if builder.operation(rng.choices(list(X87_WEIGHTS), list(X87_WEIGHTS.values()))[0]):
+                break
+    builder.finish()
+    return Function(name, builder.lines)
+
+
+def generate_x87(seed, count):
+    """Exports of straight-line x87 code, each starting with an operation of every kind in turn, then four
+    refused controls."""
+    rng = random.Random(seed)
+    kinds = list(X87_WEIGHTS)
+    functions = [x87_function(f"fuzz_x87_{index}", rng, kinds[index % len(kinds)]) for index in range(count)]
+    return [*functions, *(Function(f"fuzz_x87_refused_{kind}", lines, refused=reason)
+                          for kind, (lines, reason) in X87_CONTROLS.items())]
+
+
+# Operand words for the x87 area: doubles at every edge (zeros, denormals, the largest finite value, infinities, a
+# quiet NaN with a payload and a signalling NaN, 2^63), words whose halves are two edge floats, and integer edges.
+X87_VALUES = (0x0000000000000000, 0x8000000000000000, 0x3ff0000000000000, 0xbff8000000000000, 0x0000000000000001,
+              0x800fffffffffffff, 0x7fefffffffffffff, 0x7ff0000000000000, 0xfff8000012345678, 0x7ff0000000000001,
+              0x43e0000000000000, 0xc1e0000000200000, 0x3f800000bf800000, 0x7f80000000000001, 0x7fc00000ff7fffff,
+              0x4b800001c7000000, 0x00008000ffff7fff)
+
+
+def x87_inputs(seed):
+    """313 pairs: every combination of the 17 operand words, then normal m80 values near 1 (x with its top bit set
+    and y with an exponent within 70 of the bias in its top word) and random bits."""
+    values = [(a, b) for a in X87_VALUES for b in X87_VALUES]
+    rng = random.Random(seed ^ 0x8087)
+    while len(values) < 313:
+        if len(values) % 2:
+            values.append((rng.getrandbits(64), rng.getrandbits(64)))
+            continue
+        exponents = [(0x3FFF + rng.randint(-70, 70)) | rng.choice((0, 0x8000)) for _ in range(2)]
+        x = 1 << 63 | rng.getrandbits(47) << 16 | exponents[0]
+        values.append((x, exponents[1] << 48 | rng.getrandbits(48)))
+    return values
+
+
+def x87_translate(image, names):
+    """Lower each export through ffx_version_query.lower with the x87 profile, as the cpu_aot_x87_* fixtures do,
+    to fn(x, y, out) with the lifted_ prefix of the other areas."""
+    import pefile
+    from cpu_leaf_aot import export_rva
+    from cpu_ranges import function_ranges
+    from ffx_version_query import INTEGER_HEADER, lower, region
+    from x87_lower import X87_HEADER
+
+    parts = [INTEGER_HEADER, X87_HEADER]
+    with pefile.PE(str(image), fast_load=True) as pe:
+        for name in names:
+            (bounds,) = function_ranges(pe, export_rva(pe, name))
+            code = lower(region(pe, *bounds), ["rcx = a; rdx = b; r8 = c;"], {}, {}, {}, x87=True)
+            parts.append(f'extern "C" __declspec(dllexport) word lifted_{name}(word a, word b, word c) {{\n{code}\n}}\n')
+    return "".join(parts), None
+
+
 AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
          "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains"),
          "switches": (generate_switches, "cpu_fuzz_switches"),
          "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp"), "rsp": (generate_rsp, "cpu_fuzz_rsp"),
-         "loops": (generate_loops, "cpu_fuzz_loops")}
+         "loops": (generate_loops, "cpu_fuzz_loops"), "x87": (generate_x87, "cpu_fuzz_x87")}
 
 
 def inputs_for(seed, area="leaf", signature=None):
     if area == "scalar_fp":
         return fp_inputs(seed, signature.split(":")[1][:2])
+    if area == "x87":
+        return x87_inputs(seed)
     boundary = [
         0, 1, 2, 3, 7, 0x0F, 0x10, 0x1F, 0x20, 0x3F, 0x40, 0x7F, 0x80, 0x81, 0xFF, 0x100,
         0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x100000000,
@@ -1622,12 +1850,15 @@ def call_symbol(symbol, function, x, y, out):
 
 
 def translator_module(area):
-    """The module that lifts the functions of an area: the scalar SSE lifter, or the shared one."""
+    """The module that lifts the functions of an area: the scalar SSE lifter, the x87 profile of the shared
+    integer lowering, or the shared one."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     if area == "scalar_fp":
         import cpu_sse_aot
 
         return cpu_sse_aot
+    if area == "x87":
+        return types.SimpleNamespace(translate=x87_translate)
     import cpu_switch_aot
 
     return cpu_switch_aot
@@ -1932,10 +2163,26 @@ def plant_back_edge_exit(cpu_switch_aot, image, functions):
     cpu_switch_aot.translate = translate
 
 
+def plant_subr_as_sub(lifter, image, functions):
+    """Lower FSUBR and FSUBRP like FSUB and FSUBP, so that they compute ST(0) minus the other operand.
+
+    This is a planted translator fault for the negative control: the stack, the other operations and FISUBR are
+    unchanged, but a reversed subtraction of two different values gives the negated difference. The code stays
+    straight-line, so every input still terminates.
+    """
+    from iced_x86 import Mnemonic as M
+    import x87_lower
+
+    if not any(re.search(r"^\s+fsubrp? ", function.asm(), re.M) for function in functions if not function.refused):
+        raise SystemExit("the subr_as_sub fault found no FSUBR or FSUBRP")
+    x87_lower.ARITHMETIC[M.FSUBR] = x87_lower.ARITHMETIC[M.FSUBRP] = "x87_sub"
+
+
 MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retarget", plant_call_retarget),
            "chains": ("swapped_arguments", plant_swapped_arguments),
            "switches": ("table_rotate", plant_table_rotate), "scalar_fp": ("minmax_swap", plant_minmax_swap),
-           "rsp": ("stale_rsp", plant_stale_rsp), "loops": ("back_edge_exit", plant_back_edge_exit)}
+           "rsp": ("stale_rsp", plant_stale_rsp), "loops": ("back_edge_exit", plant_back_edge_exit),
+           "x87": ("subr_as_sub", plant_subr_as_sub)}
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):

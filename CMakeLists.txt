@@ -2263,6 +2263,47 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_loops>" "$<TARGET_FILE:cpu_fuzz_loops_lifted>" "${cpu_fuzz_loops_o2}"
         --area loops --mutant "$<TARGET_FILE:cpu_fuzz_loops_mutant>")
     set_tests_properties(cpu_aot_fuzz_loops PROPERTIES TIMEOUT 60)
+
+    # Straight-line x87 code through the shared lowering's x87 profile, with FSUBR lowered as FSUB planted.
+    set(CPU_FUZZ_X87_SEED "0x8087" CACHE STRING "Seed for the CPU differential fuzz x87 test")
+    set(CPU_FUZZ_X87_FUNCTIONS "40" CACHE STRING "Number of exported functions in the CPU differential fuzz x87 test")
+    set(cpu_fuzz_x87_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87.asm")
+    set(cpu_fuzz_x87_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_x87_asm}" "${cpu_fuzz_x87_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_X87_SEED}" "${CPU_FUZZ_X87_FUNCTIONS}" "${cpu_fuzz_x87_asm}"
+            "${cpu_fuzz_x87_def}" --area x87
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_x87 SHARED "${cpu_fuzz_x87_asm}" "${cpu_fuzz_x87_def}")
+    set_target_properties(cpu_fuzz_x87 PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_x87 PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_x87_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_lifted.cpp")
+    set(cpu_fuzz_x87_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_x87_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_X87_SEED}" "${CPU_FUZZ_X87_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_x87>"
+                "${cpu_fuzz_x87_${variant}}" --area x87 ${mutant_flag}
+            DEPENDS cpu_fuzz_x87 tools/fuzz_cpu.py tools/ffx_version_query.py tools/x87_lower.py tools/x87_soft.h
+                tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_x87_${variant} SHARED "${cpu_fuzz_x87_${variant}}")
+        target_compile_features(cpu_fuzz_x87_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_x87_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_x87_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_x87_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_lifted_o2.obj" "/Fe${cpu_fuzz_x87_o2}"
+        DEPENDS "${cpu_fuzz_x87_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_x87_lifted_o2 ALL DEPENDS "${cpu_fuzz_x87_o2}")
+    add_test(NAME cpu_aot_fuzz_x87 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_X87_SEED}" "${CPU_FUZZ_X87_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_x87>" "$<TARGET_FILE:cpu_fuzz_x87_lifted>" "${cpu_fuzz_x87_o2}"
+        --area x87 --mutant "$<TARGET_FILE:cpu_fuzz_x87_mutant>")
+    set_tests_properties(cpu_aot_fuzz_x87 PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
