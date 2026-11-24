@@ -1912,6 +1912,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_smem_offset_check.py")
     add_test(NAME startup_triage_run COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_check.py")
+    # Sanitized decoder of the MSVC C++ exception record (0xE06D7363) from synthetic memory (#1758).
+    add_test(NAME startup_msvc_throw_info COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_msvc_throw_info_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py")
     add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B

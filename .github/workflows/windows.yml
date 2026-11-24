@@ -176,6 +176,7 @@ jobs:
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
             tests/startup_triage_run_check.py \
+            tests/startup_msvc_throw_info_check.py \
             tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
