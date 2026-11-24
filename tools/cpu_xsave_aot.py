@@ -15,7 +15,7 @@ Entry-state contract (`--entry-state`) and XRSTOR format contract (`--compacted-
     components from entry are rejected. MXCSR is tracked apart from the
     components: by default (standard-only XRSTOR), an xrstor whose RFBM selects
     SSE or AVX defines MXCSR, so vzeroupper alone does not, and a save that
-    stores MXCSR (xsaveopt with SSE or AVX selected, xsave/xsavec with SSE
+    stores MXCSR (xsave/xsaveopt with SSE or AVX selected, xsavec with SSE
     selected) is rejected without it.
   - --compacted-xrstor (opt-in): permits XRSTOR to accept compacted headers
     (XCOMP_BV[63] set) in addition to standard headers. Because the header
@@ -1028,6 +1028,7 @@ def lift_code(name, start, raw, *, entry_state="defined", compacted_xrstor=False
                 src_mm = read_mm(1, ins)
                 addr = flat_address(ins, ptr_origins, expected_bytes=8, write=True)
                 statements.append(f"store64({addr}, get_mm(state, {src_mm}));")
+                mmx_active = True
             elif ins.op1_kind == OpKind.MEMORY:
                 dst_mm = mm_index(ins.op0_register, ins)
                 addr = flat_address(ins, ptr_origins, expected_bytes=8)
@@ -1048,6 +1049,7 @@ def lift_code(name, start, raw, *, entry_state="defined", compacted_xrstor=False
                 used_gpr.add(dst_gpr)
                 statements.append(f"{dst_gpr} = get_mm(state, {src_mm});")
                 defined_gpr.add(dst_gpr)
+                mmx_active = True
             else:
                 raise ValueError(f"unsupported movq operand shape at RVA {ins.ip:#x}: {ins}")
 

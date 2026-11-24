@@ -2151,6 +2151,10 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         ("xsaveopt_outside_r8",
          _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.RCX)), ret_ins),
          "non-r8 store memory operand"),
+        ("vzeroupper_xsave64_avx_mxcsr_undefined",
+         _encode_seq(Instruction.create(Code.VEX_VZEROUPPER), mov_eax_4, xor_edx,
+                     Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "stores MXCSR before any restore defined it"),
         ("vzeroupper_xsaveopt64_avx_mxcsr_undefined",
          _encode_seq(Instruction.create(Code.VEX_VZEROUPPER), mov_eax_4, xor_edx,
                      Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
@@ -2193,6 +2197,14 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         # Unclosed MMX, undefined masks/registers, clobbered/non-argument/non-r8 bases
         ("unclosed_mmx", _encode_seq(
             Instruction.create_reg_mem(Code.MOVQ_MM_MMM64, R.MM0, MemoryOperand(R.RCX)), ret_ins),
+         "unclosed MMX state"),
+        ("unclosed_mmx_read_gpr", _encode_seq(
+            mov_eax_7, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+            Instruction.create_reg_reg(Code.MOVQ_RM64_MM, R.R9, R.MM3), ret_ins),
+         "unclosed MMX state"),
+        ("unclosed_mmx_read_mem", _encode_seq(
+            mov_eax_7, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+            Instruction.create_mem_reg(Code.MOVQ_MMM64_MM, MemoryOperand(R.R8), R.MM3), ret_ins),
          "unclosed MMX state"),
         ("undef_eax_xsave", _encode_seq(
             xor_edx, Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)), ret_ins),
