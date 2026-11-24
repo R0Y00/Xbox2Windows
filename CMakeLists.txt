@@ -562,8 +562,12 @@ target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
 target_include_directories(startup_overlay_window PRIVATE src)
 target_link_libraries(startup_overlay_window PRIVATE user32)
 add_test(NAME startup_overlay_window COMMAND startup_overlay_window)
-# WASAPI render sink (Refs #1145); exit 77 when the machine has no usable render endpoint.
-add_executable(startup_audio_output tests/startup_audio_output.cpp src/startup_stubs/audio_sink.cpp)
+# WASAPI render sink (Refs #1145); exit 77 when the machine has no usable render endpoint. The sink is
+# compiled once for this check and the pacing control below.
+add_library(startup_audio_sink_obj OBJECT src/startup_stubs/audio_sink.cpp)
+target_compile_features(startup_audio_sink_obj PRIVATE cxx_std_17)
+target_include_directories(startup_audio_sink_obj PRIVATE src)
+add_executable(startup_audio_output tests/startup_audio_output.cpp $<TARGET_OBJECTS:startup_audio_sink_obj>)
 target_compile_features(startup_audio_output PRIVATE cxx_std_17)
 target_include_directories(startup_audio_output PRIVATE src)
 target_link_libraries(startup_audio_output PRIVATE ole32)
@@ -571,7 +575,7 @@ add_test(NAME startup_audio_output COMMAND startup_audio_output)
 set_tests_properties(startup_audio_output PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 # Playback-timing control: the same sink and endpoint as startup_audio_output, fed steady and bursty,
 # recording first submission, frame counts, clock, drained interval and recovery for comparison.
-add_executable(startup_audio_pacing tests/startup_audio_pacing.cpp src/startup_stubs/audio_sink.cpp)
+add_executable(startup_audio_pacing tests/startup_audio_pacing.cpp $<TARGET_OBJECTS:startup_audio_sink_obj>)
 target_compile_features(startup_audio_pacing PRIVATE cxx_std_17)
 target_include_directories(startup_audio_pacing PRIVATE src)
 target_link_libraries(startup_audio_pacing PRIVATE ole32)
@@ -596,14 +600,17 @@ add_test(NAME startup_dump_fence_removed_control_warp COMMAND startup_dump_fence
 set_tests_properties(startup_dump_fence_removed_control_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=warp" TIMEOUT 45
     WILL_FAIL TRUE)
 
-add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp tests/startup_stream_setup.cpp tests/startup_stream_draw.cpp
+# tests/startup_stream_setup.cpp is compiled once for the consumer and the depth check.
+add_library(startup_stream_setup_obj OBJECT tests/startup_stream_setup.cpp)
+target_compile_features(startup_stream_setup_obj PRIVATE cxx_std_17)
+add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp $<TARGET_OBJECTS:startup_stream_setup_obj> tests/startup_stream_draw.cpp
     tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi)
 target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
 
-add_executable(startup_stream_depth tests/startup_stream_depth.cpp tests/startup_stream_setup.cpp)
+add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
 
@@ -1245,7 +1252,12 @@ add_custom_command(OUTPUT "${d3d12x_pso_header}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_pso.hlsl"
     DEPENDS tests/d3d12x_pso.hlsl
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso" VERBATIM)
-add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp src/d3d12x_struct_return.cpp "${d3d12x_pso_header}")
+# tests/d3d12x_device_check.cpp is compiled once for the check and its struct-return control (same flags,
+# same include directories in the same order).
+add_library(d3d12x_device_check_obj OBJECT tests/d3d12x_device_check.cpp "${d3d12x_pso_header}")
+target_include_directories(d3d12x_device_check_obj PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" src)
+target_compile_features(d3d12x_device_check_obj PRIVATE cxx_std_17)
+add_executable(d3d12x_device_check $<TARGET_OBJECTS:d3d12x_device_check_obj> src/d3d12x_struct_return.cpp "${d3d12x_pso_header}")
 add_dependencies(d3d12x_device_check d3d12_xs_shim)
 target_include_directories(d3d12x_device_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12x_device_check PRIVATE cxx_std_17)
@@ -1275,7 +1287,7 @@ if(d3d12x_struct_return_control_text STREQUAL d3d12x_struct_return_text)
 endif()
 set(d3d12x_struct_return_control "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_struct_return_control/d3d12x_struct_return.cpp")
 file(WRITE "${d3d12x_struct_return_control}" "${d3d12x_struct_return_control_text}")
-add_executable(d3d12x_device_struct_return_control tests/d3d12x_device_check.cpp
+add_executable(d3d12x_device_struct_return_control $<TARGET_OBJECTS:d3d12x_device_check_obj>
     "${d3d12x_struct_return_control}" "${d3d12x_pso_header}")
 add_dependencies(d3d12x_device_struct_return_control d3d12_xs_shim)
 target_include_directories(d3d12x_device_struct_return_control PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" src)
@@ -1329,8 +1341,12 @@ add_custom_command(OUTPUT "${d3d12x_compute_list_cs}"
     DEPENDS tests/d3d12x_compute_list.hlsl
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_compute_list_cs.cso" VERBATIM)
 add_custom_target(d3d12x_compute_list_shader DEPENDS "${d3d12x_compute_list_cs}")
+# tests/desktop_gpu.cpp again, with the include directory these two checks use.
+add_library(d3d12x_desktop_gpu_obj OBJECT tests/desktop_gpu.cpp)
+target_include_directories(d3d12x_desktop_gpu_obj PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(d3d12x_desktop_gpu_obj PRIVATE cxx_std_17)
 add_executable(d3d12x_compute_list_check tests/d3d12x_compute_list_check.cpp
-    tests/desktop_gpu.cpp "${d3d12x_compute_list_cs}")
+    $<TARGET_OBJECTS:d3d12x_desktop_gpu_obj> "${d3d12x_compute_list_cs}")
 add_dependencies(d3d12x_compute_list_check d3d12_xs_shim d3d12x_compute_list_shader)
 target_include_directories(d3d12x_compute_list_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12x_compute_list_check PRIVATE cxx_std_17)
@@ -1357,7 +1373,7 @@ endforeach()
 add_custom_target(d3d12x_graphics_shader DEPENDS
     "${d3d12x_graphics_vs}"
     "${d3d12x_graphics_ps}")
-add_executable(d3d12x_graphics_list_check tests/d3d12x_graphics_list_check.cpp tests/desktop_gpu.cpp
+add_executable(d3d12x_graphics_list_check tests/d3d12x_graphics_list_check.cpp $<TARGET_OBJECTS:d3d12x_desktop_gpu_obj>
     "${d3d12x_graphics_vs}" "${d3d12x_graphics_ps}")
 add_dependencies(d3d12x_graphics_list_check d3d12_xs_shim d3d12x_graphics_shader)
 target_include_directories(d3d12x_graphics_list_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
