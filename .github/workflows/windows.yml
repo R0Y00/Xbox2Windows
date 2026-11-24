@@ -195,7 +195,7 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+          cache: ${{ github.event_name != 'pull_request' && 'pip' || '' }}
           cache-dependency-path: 'requirements-dev.txt'
           architecture: x64
       - name: Install fixture dependencies
@@ -221,14 +221,36 @@ jobs:
         run: .\tools\setup-spirv-tools.ps1
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      # Only main saves the compiler cache; pull requests read it (restore-keys) and never write a
+      # per-PR copy, which filled the repository cache limit. The cache is saved right after the
+      # build, before the tests, so a run that later times out still leaves a warm cache behind.
       - name: Restore compiler cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
-          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ github.event_name == 'pull_request' && 'pr' || 'dev' }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
+          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
           restore-keys: |
-            sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ github.event_name == 'pull_request' && 'pr' || 'dev' }}-
             sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-
+      - name: Build on Windows
+        id: build
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          X2W_REQUIRE_SPIRV_TOOLS: '1'
+          X2W_USE_SCCACHE: '1'
+        run: |
+          .\tools\dev.ps1
+          cmake --preset dev @X2wSccacheCmakeArgs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset dev
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
+      - name: Save compiler cache
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.build.outcome != 'skipped' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
       - name: Configure, build and run PC tests
         shell: pwsh
         env:
@@ -297,7 +319,7 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+          cache: ${{ github.event_name != 'pull_request' && 'pip' || '' }}
           cache-dependency-path: 'requirements-dev.txt'
           architecture: x64
       - name: Install fixture dependencies
@@ -323,13 +345,36 @@ jobs:
         run: .\tools\setup-spirv-tools.ps1
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      # Only main saves the compiler cache; pull requests read it (restore-keys) and never write a
+      # per-PR copy, which filled the repository cache limit. The cache is saved right after the
+      # build, before the tests, so a run that later times out still leaves a warm cache behind.
       - name: Restore compiler cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
           key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
           restore-keys: |
             sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-
+      - name: Build on Windows at /O2
+        id: build
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          X2W_REQUIRE_SPIRV_TOOLS: '1'
+          X2W_USE_SCCACHE: '1'
+        run: |
+          .\tools\dev.ps1
+          cmake --preset release @X2wSccacheCmakeArgs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
+      - name: Save compiler cache
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.build.outcome != 'skipped' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
       - name: Configure, build and run PC tests at /O2
         shell: pwsh
         env:
