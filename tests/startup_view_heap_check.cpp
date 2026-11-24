@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
@@ -33,15 +34,31 @@ SIZE_T guest_cpu_base(ID3D12DescriptorHeap* heap)
     return reinterpret_cast<GetCpuBase>(table[9])(heap, nullptr);
 }
 
-int count_shortcut_lines(const wchar_t* path)
+// Counts the trap-log lines that report the shortcut, or returns -1 with the open error in `error`.
+// The stand-in keeps the log open for appending (append_log in src/startup_stubs/trap.h), so the
+// reader must share write access too: an open that denies write sharing, as _wfopen_s does, fails
+// with ERROR_SHARING_VIOLATION while the device is alive.
+int count_shortcut_lines(const wchar_t* path, DWORD& error)
 {
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"rb") != 0 || !file) return -1;
-    char line[1024];
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        return -1;
+    }
+    std::string text;
+    char buffer[4096];
+    DWORD got = 0;
+    while (ReadFile(file, buffer, sizeof(buffer), &got, nullptr) && got) text.append(buffer, got);
+    CloseHandle(file);
+
     int found = 0;
-    while (std::fgets(line, sizeof(line), file))
-        if (std::strstr(line, shortcut_text)) ++found;
-    std::fclose(file);
+    for (std::size_t start = 0; start < text.size();) {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        if (text.find(shortcut_text, start) < end) ++found;
+        start = end + 1;
+    }
     return found;
 }
 }  // namespace
@@ -134,8 +151,12 @@ int main(int argc, char** argv)
             std::puts("second oversized heap request failed");
             status = 1;
         } else if (log_path[0]) {
-            const int lines = count_shortcut_lines(log_path);
-            if (lines != 1) {
+            DWORD error = 0;
+            const int lines = count_shortcut_lines(log_path, error);
+            if (lines < 0) {
+                std::printf("cannot read the trap log: error %lu\n", static_cast<unsigned long>(error));
+                status = 1;
+            } else if (lines != 1) {
                 std::printf("shortcut logged %d times, expected 1\n", lines);
                 status = 1;
             } else {
