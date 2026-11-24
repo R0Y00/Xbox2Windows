@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -18,9 +19,17 @@ def vertex(z_bits):
     return container(1, words)
 
 
-def check(directory, consumer, backend):
+def green_with_depth(pixel_depth):
+    # Keep the green triangle's vertex depth at 0.25 in every variant.
+    depth_bits, = struct.unpack("<I", struct.pack("<f", pixel_depth))
+    color = [vop1(1, 0, 128), vop1(1, 1, 242)]
+    depth = [vop1(1, 2, 255), depth_bits, 0xf8000081, 2]
+    return container(0, color + depth + [0xf800180f, 0x01000100, 0xbf810000])
+
+
+def check(directory, consumer, backend, pixel_depth):
     cache = directory / "cache"
-    cache.mkdir()
+    cache.mkdir(parents=True)
     vs_front, vs_back, ps_green, ps_red, root, ps_empty = (
         directory / name for name in ("vs_front", "vs_back", "ps_green", "ps_red", "root", "ps_empty")
     )
@@ -30,7 +39,7 @@ def check(directory, consumer, backend):
     )
     vs_front.write_bytes(vertex(0x3e800000))  # z = 0.25f
     vs_back.write_bytes(vertex(0x3f400000))   # z = 0.75f
-    ps_green.write_bytes(pixel(True))
+    ps_green.write_bytes(pixel(True) if pixel_depth is None else green_with_depth(pixel_depth))
     ps_red.write_bytes(pixel(False))
     ps_empty.write_bytes(container(0, [0xbf810000]))  # exports nothing: the depth-only pass declares no SV_Target0
 
@@ -63,7 +72,9 @@ def check(directory, consumer, backend):
     expected_neg = (red * 4 + clear * 4) * 4
     expected_depthonly = clear * 32
 
-    assert out_pos.read_bytes() == expected_pos, f"pos: {out_pos.read_bytes().hex()}"
+    red_wins = pixel_depth is not None and pixel_depth > 0.75
+    expected_depth_test = expected_neg if red_wins else expected_pos
+    assert out_pos.read_bytes() == expected_depth_test, f"depth test: {out_pos.read_bytes().hex()}"
     assert out_neg.read_bytes() == expected_neg, f"neg: {out_neg.read_bytes().hex()}"
     assert out_depthonly.read_bytes() == expected_depthonly, f"depthonly: {out_depthonly.read_bytes().hex()}"
     # A read-only DSV tests but never writes: the far red triangle is not occluded by the near green one.
@@ -71,10 +82,17 @@ def check(directory, consumer, backend):
     # Wrong descriptor kind and DepthBoundsTestEnable refuse the draw instead of drawing something else.
     for name, path in (("rtv as depth", out_rtv_depth), ("dsv as target", out_dsv_target), ("depth bounds", out_bounds)):
         assert path.read_bytes() == clear * 32, f"{name}: {path.read_bytes().hex()}"
-    print(f"{backend}: depth LESS occluded far red (green), DepthEnable=FALSE overwrote (red), count=0 depth-only occluded far red (clear)")
+    if pixel_depth is not None:
+        winner = "red" if red_wins else "green"
+        print(f"{backend}: exported green depth {pixel_depth} yielded {winner} in all 16 covered pixels")
+    else:
+        print(f"{backend}: vertex green depth 0.25 occluded red (green), DepthEnable=FALSE overwrote (red), count=0 depth-only occluded red (clear)")
     return 0
 
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temp:
-        sys.exit(check(Path(temp), *sys.argv[1:]))
+        for name, depth in (("vertex-depth", None), ("pixel-near", 0.125), ("pixel-far", 0.875)):
+            result = check(Path(temp) / name, *sys.argv[1:], pixel_depth=depth)
+            if result:
+                sys.exit(result)

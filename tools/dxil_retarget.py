@@ -820,37 +820,7 @@ def validate_pe_containers(
     return report
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", nargs="?", type=Path, help="Input DXBC container or raw DXIL bitcode file")
-    parser.add_argument("output", nargs="?", type=Path, help="Output file path")
-    parser.add_argument("--pe", type=Path, help="Extract, retarget, and validate containers embedded in a PE image")
-    parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
-    parser.add_argument("--catalogue-dir", type=Path,
-                        help="Export signed, validated desktop compute containers by input SHA-256 in --pe mode")
-    parser.add_argument("--report", type=Path, help="Optional JSON report path in --pe mode")
-    parser.add_argument("--only-without-xbox-calls", action="store_true",
-                        help="In --pe mode, process only DXIL modules that neither call nor otherwise "
-                             "reach an xbox.* symbol")
-    parser.add_argument("--source-triple", default=SOURCE_TRIPLE,
-                        help=f"Source target triple to match (default: {SOURCE_TRIPLE}; '*' matches any)")
-    parser.add_argument("--target-triple", default=DESKTOP_TRIPLE,
-                        help=f"Replacement target triple (default: {DESKTOP_TRIPLE})")
-    parser.add_argument("--drop-metadata", action="append", default=None,
-                        help="Named metadata to remove (repeatable; default: xbox.compiler.options)")
-    parser.add_argument("--keep-root-flags", action="store_true",
-                        help="Leave RTS0 flags unmodified instead of clearing Xbox flags 0x03000000")
-    parser.add_argument("--extract-module", action="store_true",
-                        help="Write bare retargeted DXIL bitcode instead of a DXBC container")
-    parser.add_argument("--probe", type=Path, help="Optional root_probe.exe path to validate or sign the output")
-    parser.add_argument("--sign", action="store_true",
-                        help="Re-sign retargeted DXBC containers with dxil.dll via --probe")
-    parser.add_argument("--pso-probe", type=Path,
-                        help="Optional root_device_probe.exe path to test CreateComputePipelineState")
-    parser.add_argument("--warp-only", action="store_true",
-                        help="Use only the WARP adapter with --pso-probe")
-    args = parser.parse_args()
-
+def _run_cli(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if not args.pe:
         for dead in ("--output-dir", "--catalogue-dir", "--report", "--only-without-xbox-calls"):
             if getattr(args, dead[2:].replace("-", "_")):
@@ -992,8 +962,43 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """Parse CLI arguments and run dxil_retarget, reporting OSError/ValueError cleanly."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", nargs="?", type=Path, help="Input DXBC container or raw DXIL bitcode file")
+    parser.add_argument("output", nargs="?", type=Path, help="Output file path")
+    parser.add_argument("--pe", type=Path, help="Extract, retarget, and validate containers embedded in a PE image")
+    parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
+    parser.add_argument("--catalogue-dir", type=Path,
+                        help="Export signed, validated desktop compute containers by input SHA-256 in --pe mode")
+    parser.add_argument("--report", type=Path, help="Optional JSON report path in --pe mode")
+    parser.add_argument("--only-without-xbox-calls", action="store_true",
+                        help="In --pe mode, process only DXIL modules that neither call nor otherwise "
+                             "reach an xbox.* symbol")
+    parser.add_argument("--source-triple", default=SOURCE_TRIPLE,
+                        help=f"Source target triple to match (default: {SOURCE_TRIPLE}; '*' matches any)")
+    parser.add_argument("--target-triple", default=DESKTOP_TRIPLE,
+                        help=f"Replacement target triple (default: {DESKTOP_TRIPLE})")
+    parser.add_argument("--drop-metadata", action="append", default=None,
+                        help="Named metadata to remove (repeatable; default: xbox.compiler.options)")
+    parser.add_argument("--keep-root-flags", action="store_true",
+                        help="Leave RTS0 flags unmodified instead of clearing Xbox flags 0x03000000")
+    parser.add_argument("--extract-module", action="store_true",
+                        help="Write bare retargeted DXIL bitcode instead of a DXBC container")
+    parser.add_argument("--probe", type=Path, help="Optional root_probe.exe path to validate or sign the output")
+    parser.add_argument("--sign", action="store_true",
+                        help="Re-sign retargeted DXBC containers with dxil.dll via --probe")
+    parser.add_argument("--pso-probe", type=Path,
+                        help="Optional root_device_probe.exe path to test CreateComputePipelineState")
+    parser.add_argument("--warp-only", action="store_true",
+                        help="Use only the WARP adapter with --pso-probe")
+    args = parser.parse_args(argv)
     try:
-        sys.exit(main())
+        return _run_cli(args, parser)
     except (OSError, ValueError) as exc:
-        sys.exit(f"{Path(__file__).name}: {exc}")
+        print(f"{Path(__file__).name}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

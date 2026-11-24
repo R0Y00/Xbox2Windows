@@ -72,6 +72,16 @@ def decode(code):
                 raise Unsupported('image_load_mip tfe')
             if word1 & (1 << 30):
                 raise Unsupported('image_load_mip a16')
+        if name == 'v_cndmask_b32_e64':
+            # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
+            # Preserve plain immediates and refuse NEG on immediate data operands by encoding.
+            word1, = struct.unpack_from('<I', code, off + 4)
+            for i in range(2):
+                if not word1 & (1 << (29 + i)):
+                    continue
+                source = (word1 >> (9 * i)) & 0x1ff
+                if 128 <= source <= 208 or 240 <= source <= 248 or source == 255:
+                    raise Unsupported('v_cndmask_b32_e64 NEG on an immediate')
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
@@ -126,6 +136,11 @@ def reg_range(tok):
 
 
 SAMPLER_CLAMP = {0: 'WRAP', 1: 'MIRROR', 2: 'CLAMP', 3: 'MIRROR_ONCE', 4: 'CLAMP', 5: 'MIRROR_ONCE', 6: 'BORDER', 7: 'BORDER'}
+
+
+def smem_offset(tok):
+    """The SMEM offset operand as a token: 'off' (no offset operand) is the literal 0, anything else unchanged."""
+    return '0' if tok == 'off' else tok
 
 
 class Stage:
@@ -212,6 +227,15 @@ class Stage:
         except ValueError:
             raise Unsupported('operand %r' % tok)
 
+    def u_src(self, tok):
+        """uint expression for an integer-context source that the disassembler may print negated."""
+        # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
+        # pattern a float negation produces. Only handlers that model it ask for this; other integer
+        # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
+        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+            return '(%s ^ 0x80000000u)' % self.u(tok[1:])
+        return self.u(tok)
+
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
         neg = False
@@ -243,17 +267,26 @@ class Stage:
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
     def set_vf(self, n, expr, mods=()):
+        # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
+        # first, so the order of `mods` is not the order of the operations: scale first, saturate last.
+        scale = 1.0
+        clamp = False
         for m in mods:
             if m == 'clamp':
-                expr = 'saturate(%s)' % expr
+                clamp = True
             elif m in ('mul:2', 'mul:4'):
-                expr = '(%s) * %s.0' % (expr, m[-1])
+                scale *= float(m[-1])
             elif m == 'div:2':
-                expr = '(%s) * 0.5' % expr
+                scale *= 0.5
             elif m.startswith('op_sel'):
                 pass
             else:
                 raise Unsupported('modifier %s' % m)
+        if scale != 1.0:
+            factor = ('%d.0' % int(scale)) if scale == int(scale) else ('%g' % scale)
+            expr = '(%s) * %s' % (expr, factor)
+        if clamp:
+            expr = 'saturate(%s)' % expr
         self.set_v(n, 'U(%s)' % expr)
 
     def set_s(self, n, expr, sym=None, scc=None):
@@ -348,10 +381,23 @@ class Stage:
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
+            # A missing source used to raise IndexError and an extra one was dropped without a word.
+            if len(ops) != arity + 1:
+                raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
             args = [self.f(o) for o in ops[1:1 + arity]]
             if base in ('v_fmac_f32', 'v_mac_f32'):
                 args.append(self.f(ops[0]))
             return self.set_vf(reg_range(ops[0])[1], text.format(*args), mods)
+        if base in VEC_U_TO_F:
+            arity, text_f = VEC_U_TO_F[base]
+            if len(ops) != arity + 1:
+                raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
+            # Only the output modifiers a conversion can carry; op_sel and the source modifiers are not
+            # accepted here, because ignoring them would silently change the operand.
+            if any(m not in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods):
+                raise Unsupported('%s with %s' % (base, mods))
+            return self.set_vf(reg_range(ops[0])[1],
+                               text_f.format(*[self.u(o) for o in ops[1:1 + arity]]), mods)
         if base in VEC_U:
             arity, text = VEC_U[base]
             if mods:
@@ -374,9 +420,14 @@ class Stage:
                 fields[key] = value
             else:
                 raise Unsupported('%s with SDWA modifier %s' % (base, m))
-        if base not in VEC_U:
+        if base in VEC_U_TO_F:
+            arity, text = VEC_U_TO_F[base]
+            float_result = True
+        elif base in VEC_U:
+            arity, text = VEC_U[base]
+            float_result = False
+        else:
             raise Unsupported('SDWA form of %s' % base)
-        arity, text = VEC_U[base]
         sources = []
         for index in range(arity):
             token = ops[1 + index]
@@ -388,6 +439,9 @@ class Stage:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
             sources.append(sdwa_source(self.u(token), selection, sext))
         result = text.format(*sources)
+        if float_result:
+            # The table holds the float value; the destination selection writes its bit pattern.
+            result = 'U(%s)' % result
         select = fields.get('dst_sel')
         if not select:
             raise Unsupported('%s SDWA without dst_sel' % base)
@@ -530,7 +584,8 @@ class Stage:
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
         try:
-            off = int(ops[2], 0)
+            # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
+            off = int(smem_offset(ops[2]), 0)
         except ValueError:
             if p[1] == ('smpheap',) and self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
@@ -591,10 +646,11 @@ class Stage:
     def op_s_buffer_load_dword(self, ops, mods, count=1):
         dst = reg_range(ops[0])
         buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
-        offset = self.u(ops[2])
+        token = smem_offset(ops[2])
+        offset = self.u(token)
         for i in range(count):
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
-            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', ops[2]):
+            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', token):
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
@@ -682,18 +738,21 @@ class Stage:
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
         dmask = int([m for m in mods if m.startswith('dmask:')][0][6:], 0)
-        kinds = {'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
-        three = dim != 'SQ_RSRC_IMG_2D'
+        one = dim == 'SQ_RSRC_IMG_1D'
+        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY')
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
+            raise Unsupported('unverified 1D image sample address or modifiers')
         lod = None
         if how == 'l':
             # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
@@ -727,7 +786,7 @@ class Stage:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
-            uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
+            uv = (self.f(cs[0]) if one else 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
                   else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
@@ -843,8 +902,13 @@ class Stage:
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_cndmask_b32(self, ops, mods):
+        # The select takes no output modifier: a clamp or mul on it would change the value, so a
+        # modifier that reaches here is refused rather than dropped from the emitted text.
+        if mods:
+            raise Unsupported('v_cndmask_b32 with %s' % mods)
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
-        self.set_v(reg_range(ops[0])[1], '(%s & 1) ? %s : %s' % (mask, self.u(ops[2]), self.u(ops[1])))
+        self.set_v(reg_range(ops[0])[1],
+                   '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
         self.note_attr(ops[2], 'linear')
@@ -933,6 +997,14 @@ class Stage:
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+        if target == 'mrtz':
+            if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
+                    or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
+                    or vals[1:] != ['off', 'off', 'off']):
+                raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
+            self.exports['depth'] = True
+            self.emit('o.depth = %s;' % self.f(vals[0]))
+            return None
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
@@ -1026,6 +1098,15 @@ VEC_F = {
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
     'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
+# Conversions whose result is binary32. The expression is the float value, so an output modifier
+# (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
+# conversions stay in VEC_U.
+VEC_U_TO_F = {
+    'v_cvt_f32_u32': (1, 'float({0})'), 'v_cvt_f32_i32': (1, 'float(int({0}))'),
+    'v_cvt_f32_ubyte0': (1, 'float({0} & 255)'), 'v_cvt_f32_ubyte1': (1, 'float(({0} >> 8) & 255)'),
+    'v_cvt_f32_ubyte2': (1, 'float(({0} >> 16) & 255)'), 'v_cvt_f32_ubyte3': (1, 'float({0} >> 24)'),
+    'v_cvt_f32_f16': (1, 'f16tof32({0})'),
+}
 # operands are uints; the result is a uint expression
 VEC_U = {
     'v_add_nc_u32': (2, '{0} + {1}'), 'v_sub_nc_u32': (2, '{0} - {1}'), 'v_subrev_nc_u32': (2, '{1} - {0}'),
@@ -1033,11 +1114,8 @@ VEC_U = {
     'v_not_b32': (1, '~{0}'), 'v_lshlrev_b32': (2, '{1} << ({0} & 31)'), 'v_lshrrev_b32': (2, '{1} >> ({0} & 31)'),
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
-    'v_cvt_f32_u32': (1, 'U(float({0}))'), 'v_cvt_f32_i32': (1, 'U(float(int({0})))'),
     'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
-    'v_cvt_f32_ubyte0': (1, 'U(float({0} & 255))'), 'v_cvt_f32_ubyte1': (1, 'U(float(({0} >> 8) & 255))'),
-    'v_cvt_f32_ubyte2': (1, 'U(float(({0} >> 16) & 255))'), 'v_cvt_f32_ubyte3': (1, 'U(float({0} >> 24))'),
-    'v_cvt_f32_f16': (1, 'U(f16tof32({0}))'), 'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
+    'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
@@ -1196,7 +1274,7 @@ class Pipeline:
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
-            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:
@@ -1239,11 +1317,14 @@ class Pipeline:
     def hlsl_ps(self):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
+        depth = 'depth' in s.exports
         out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};']
-        if not targets:  # depth-only: no output struct, so the pipeline declares no SV_Target
+        if not targets and not depth:
             out += ['void main(PSIn i) {'] + s.declarations() + s.body() + ['}']
             return '\n'.join(out) + '\n'
         out.append('struct PSOut {')
+        if depth:
+            out.append('    float depth : SV_Depth;')
         for t in targets:
             kind = self.mrt_kind(t)
             out.append('    %s mrt%d : SV_Target%d;' % ({'int': 'int4', 'uint': 'uint4'}.get(kind, 'float4'), t, t))
@@ -1283,11 +1364,41 @@ def pipeline_key(vs_code, ps_code, root_blob):
     return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
 
 
-FXC = os.environ.get('X2W_FXC', r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe')
+DEFAULT_FXC = r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'
+KITS_BIN = r'C:\Program Files (x86)\Windows Kits\10\bin'
+
+
+def find_fxc():
+    """The fxc.exe to compile with, '' when X2W_FXC is the empty string (manifest only), or None when none exists.
+
+    Order: X2W_FXC, the 10.0.26100.0 SDK, the newest KITS_BIN/<version>/x64, then PATH."""
+    configured = os.environ.get('X2W_FXC')
+    if configured == '':
+        return ''
+    if configured and os.path.isfile(configured):
+        return configured
+    if os.path.isfile(DEFAULT_FXC):
+        return DEFAULT_FXC
+    versions = []
+    try:
+        for entry in os.listdir(KITS_BIN):
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', entry):
+                versions.append((tuple(map(int, entry.split('.'))), entry))
+    except OSError:
+        pass
+    for _, entry in sorted(versions, reverse=True):
+        candidate = os.path.join(KITS_BIN, entry, 'x64', 'fxc.exe')
+        if os.path.isfile(candidate):
+            return candidate
+    import shutil
+    return shutil.which('fxc.exe')
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request=''):
-    """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason."""
+    """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
+
+    With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
+    check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
         pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats)
@@ -1299,10 +1410,15 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         return 'unsupported: %s' % reason
     open(name + '.vs.hlsl', 'w').write(vs)
     open(name + '.ps.hlsl', 'w').write(ps)
-    if check and os.path.exists(FXC):
+    fxc = find_fxc() if check else ''
+    if fxc is None:
+        message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
+        open(name + '.fail', 'w').write(message + '\n')
+        return message
+    if fxc:
         import subprocess
         for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
-            r = subprocess.run([FXC, '/nologo', '/T', profile, '/E', 'main', '/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
+            r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
                                capture_output=True, text=True)
             if r.returncode:
                 open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, r.stderr[-2000:]))

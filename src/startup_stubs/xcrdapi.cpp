@@ -24,6 +24,8 @@
 #include <vector>
 
 #include <cstdarg>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -131,6 +133,31 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     if ((cmf & 0x0F) != 8) return false;
     if ((cmf >> 4) > 7) return false;
     if ((static_cast<unsigned>(cmf) * 256 + flg) % 31 != 0) return false;
+    return true;
+}
+
+// True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
+// no-access page in between. Walks the regions one VirtualQuery at a time, so a destination that spans
+// regions of different protection is judged page by page. Nothing is written or touched.
+static bool destination_writable(const void* destination, std::size_t bytes)
+{
+    if (bytes == 0) return true;
+    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    const std::uintptr_t end = cursor + bytes;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = region_end;
+    }
     return true;
 }
 
@@ -335,7 +362,40 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
+LONG bcpack_requests[16], bcpack_blank[16];
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
+
+const char* format_counts(char* out, std::size_t size, LONG* counts)
+{
+    out[0] = 0;
+    std::size_t used = 0;
+    for (unsigned format = 1; format < 16; ++format) {
+        const LONG count = InterlockedCompareExchange(&counts[format], 0, 0);
+        if (!count) continue;
+        if (used >= size) break;
+        const int n = std::snprintf(out + used, size - used, "%s%u:%ld", used ? " " : "", format, count);
+        if (n < 0 || static_cast<std::size_t>(n) >= size - used) {
+            out[size - 1] = 0;
+            break;
+        }
+        used += static_cast<std::size_t>(n);
+    }
+    return used ? out : "none";
+}
+
+void log_bcpack_summary()
+{
+    LONG total = 0;
+    for (unsigned format = 1; format < 16; ++format)
+        total += InterlockedCompareExchange(&bcpack_requests[format], 0, 0);
+    if (!total) return;
+
+    char requests[256], blank[256];
+    log("x2w-dstorage BCPack summary: requests formats=%s; zero-filled formats=%s",
+        format_counts(requests, sizeof(requests), bcpack_requests),
+        format_counts(blank, sizeof(blank), bcpack_blank));
+}
+
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
     if (!request) return;
@@ -358,6 +418,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     // tokens (+0x10 low 16 bits: offset into the first page), bit 22 a memory source.
     const bool zlib = (options & 1) != 0;
     const unsigned bcpack = static_cast<unsigned>((options >> 1) & 0xF);
+    if (bcpack) InterlockedIncrement(&bcpack_requests[bcpack]);
     const bool page_destination = (options & (1ull << 21)) != 0;
     const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
     const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
@@ -557,11 +618,21 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     data = nullptr;
                 }
             } else if (data != destination) {
-                std::memcpy(destination, data, decode_length);
+                // The title's destination can be smaller in memory than its declared capacity (#870:
+                // a write fault inside this copy). Judge the whole declared capacity before the first
+                // byte is written, so a refusal leaves every page untouched.
+                if (destination_writable(destination, destination_capacity)) {
+                    std::memcpy(destination, data, decode_length);
+                } else {
+                    outcome = "destination not writable";
+                    data = nullptr;
+                    written = false;
+                }
             }
             if (written) {
                 if (bcpack && !bcpack_decoded) {
                     InterlockedIncrement(&requests_bcpack_blank);
+                    InterlockedIncrement(&bcpack_blank[bcpack]);
                 } else if (zlib || bcpack) {
                     InterlockedIncrement(&requests_compressed);
                 } else {
@@ -1184,6 +1255,11 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     guid_text(riid, id, sizeof(id));
     log("x2w-dstorage DStorageGetFactory riid=%s", id);
     if (!out) return E_POINTER;
+    static const bool bcpack_summary = [] {
+        std::atexit(log_bcpack_summary);
+        return true;
+    }();
+    (void)bcpack_summary;
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
     // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
     // what the run spends (#1199), including while requests are stalled.
