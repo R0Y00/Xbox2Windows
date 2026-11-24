@@ -1750,6 +1750,38 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
 
 
+def _sopk_arith(self, base, scalar_op, ops, mods):
+    """s_mulk_i32 / s_addk_i32: SDST = SDST op sign_extend(SIMM16), through the two-source scalar lowering.
+
+    The decoder prints the 16-bit immediate as unsigned hex; it is sign-extended here. s_addk_i32 also sets SCC
+    to the signed overflow of the add, which the plain add lowering does not model."""
+    if mods or len(ops) != 2:
+        raise Unsupported('%s with %d operands' % (base, len(ops)))
+    reg = reg_range(ops[0])
+    if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
+        raise Unsupported('%s destination %s' % (base, ops[0]))
+    try:
+        imm = int(ops[1], 0)
+    except ValueError:
+        raise Unsupported('%s immediate %s' % (base, ops[1]))
+    if not -0x8000 <= imm <= 0xffff:
+        raise Unsupported('%s immediate %s outside 16 bits' % (base, ops[1]))
+    if imm >= 0x8000:
+        imm -= 0x10000
+    word = imm & 0xffffffff
+    if base == 's_addk_i32':
+        if self.sym.get(reg[1]):
+            raise Unsupported('scc from descriptor data')
+        old = self.u(ops[0])
+        self.emit('scc = ((%s ^ 0x%08xu) & 0x80000000u) == 0u && ((%s ^ (%s + 0x%08xu)) & 0x80000000u) != 0u;'
+                  % (old, word, old, old, word))
+    return self.scalar(scalar_op, [ops[0], ops[0], '0x%08x' % word])
+
+
+Stage.op_s_mulk_i32 = lambda self, ops, mods: _sopk_arith(self, 's_mulk_i32', 's_mul_i32', ops, mods)
+Stage.op_s_addk_i32 = lambda self, ops, mods: _sopk_arith(self, 's_addk_i32', 's_add_i32', ops, mods)
+
+
 def parse_root(blob):
     if not blob or blob[:4] != b'DXBC':
         raise Unsupported('root signature blob missing')
