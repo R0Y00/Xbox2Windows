@@ -211,6 +211,17 @@ if PIXEL_COMPARE:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f32_sdwa\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+\s+src0_sel:DWORD\s+src1_sel:DWORD"
     )
+    # Binary16 SDWA comparisons and class tests: register sources with -, |x| or -|x|, word or dword selections;
+    # the class mask is a plain register with a DWORD selection.
+    _f16_sdwa_source = r"-?(?:\|[vs]\d+\||[vs]\d+)"
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{cmp_ops})_f16_sdwa\s+{PIXEL_LANE_MASK},\s+{_f16_sdwa_source},\s+{_f16_sdwa_source}"
+        r"\s+src0_sel:(?:WORD_[01]|DWORD)\s+src1_sel:(?:WORD_[01]|DWORD)"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_class_f16_sdwa\s+{PIXEL_LANE_MASK},\s+{_f16_sdwa_source},\s+[vs]\d+"
+        r"\s+src0_sel:(?:WORD_[01]|DWORD)\s+src1_sel:DWORD"
+    )
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f16{PIXEL_VOPC_E32_DST},\s+{F16_PLAIN},\s+{F16_PLAIN}"
     )

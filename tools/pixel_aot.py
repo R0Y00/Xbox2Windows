@@ -2343,8 +2343,10 @@ def vop3p_f16_word(token, scalar, vector, pending, sample_dest):
     raise ValueError(f"Unsupported packed operand {token}")
 
 
-def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, as_bits):
-    """Return one binary16 comparison source as low-16-bit uint bits or a widened float."""
+def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, as_bits, high=False):
+    """Return one binary16 comparison source as low-16-bit uint bits or a widened float.
+
+    With high (an SDWA WORD_1 selection) the source is the high half of the register; modifiers apply after it."""
     neg = False
     use_abs = False
     if token not in INLINE_F16 and not re.fullmatch(r"-\d+", token):
@@ -2359,6 +2361,8 @@ def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, 
     if re.fullmatch(r"0x[0-9a-f]{1,8}", token) and int(token, 16) > 0xffff:
         raise ValueError(f"16-bit literal out of range: {token}")
     word = vop3p_f16_word(token, scalar, vector, pending, sample_dest)
+    if high:
+        word = f"({word} >> 16u)"
     if as_bits:
         expr = f"({word} & 0xffffu)"
         if use_abs:
@@ -2374,12 +2378,12 @@ def f16_cmp_operand(token, scalar, vector, pending, sample_dest, *, allow_mods, 
     return expr
 
 
-def f16_comparison(op, tokens, scalar, vector, pending, sample_dest, *, allow_mods):
+def f16_comparison(op, tokens, scalar, vector, pending, sample_dest, *, allow_mods, highs=(False, False)):
     """The predicate of a binary16 v_cmp or v_cmpx of `tokens`: ordered relations also require num16 of both."""
-    values = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=False)
-              for t in tokens]
-    raw = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
-           for t in tokens]
+    values = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=False, high=h)
+              for t, h in zip(tokens, highs)]
+    raw = [f16_cmp_operand(t, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True, high=h)
+           for t, h in zip(tokens, highs)]
     ordered = f"(num16({raw[0]}) && num16({raw[1]}))"
     direct = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge"}
     negated = {"nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "nlt": "lt", "neq": "eq"}
@@ -2394,15 +2398,17 @@ def f16_comparison(op, tokens, scalar, vector, pending, sample_dest, *, allow_mo
     return COMPARE[op]
 
 
-def f16_class(value, classes, scalar, vector, pending, sample_dest, *, allow_mods):
-    """The predicate of a binary16 v_cmp_class or v_cmpx_class: the class of the low 16 bits of `value` in the mask."""
+def f16_class(value, classes, scalar, vector, pending, sample_dest, *, allow_mods, high=False):
+    """The predicate of a binary16 v_cmp_class or v_cmpx_class: the class of the low 16 bits of `value` in the mask
+    (of the high 16 bits with high, an SDWA WORD_1 selection)."""
     if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
         bits = f"{int(classes, 0) & 0xffffffff}u"
     elif re.fullmatch(r"[vs]\d+", classes):
         bits = int_operand(classes, scalar, vector, pending, sample_dest, signed=False)
     else:
         raise ValueError("Unsupported class mask")
-    operand = f16_cmp_operand(value, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True)
+    operand = f16_cmp_operand(value, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=True,
+                              high=high)
     return f"(class16({operand}) & {bits}) != 0u"
 
 
@@ -4967,6 +4973,30 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
             expr = f32_comparison(op, tokens, scalar, vector, pending, sample_dest)
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {expr};")
+        elif m := match(rf"v_cmp_({'|'.join(COMPARE)}|class)_f16_sdwa {LANE_MASK}, ([^,]+), ([^,]+)"
+                        r" src0_sel:(WORD_[01]|DWORD) src1_sel:(WORD_[01]|DWORD)"):
+            # Binary16 SDWA comparisons and class tests. WORD_1 selects the high half of a source; WORD_0 and DWORD
+            # both leave the low half, which is what the e32 form reads. -, |x| and -|x| apply after the selection.
+            # Sources are registers. Byte selections, sext(), constants, and a class mask with a selection other than
+            # DWORD are refused.
+            op, dst, src0, src1, sel0, sel1 = m.groups()
+            for token in (src0, src1):
+                if not re.fullmatch(r"-?(?:\|[vs]\d+\||[vs]\d+)", token):
+                    raise ValueError(f"Unsupported binary16 SDWA source {token}")
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            if op == "class":
+                if sel1 != "DWORD" or not re.fullmatch(r"[vs]\d+", src1):
+                    raise ValueError("Unsupported binary16 SDWA class mask")
+                expr = f16_class(src0, src1, scalar, vector, pending, sample_dest, allow_mods=True,
+                                 high=sel0 == "WORD_1")
+            else:
+                expr = f16_comparison(op, [src0, src1], scalar, vector, pending, sample_dest, allow_mods=True,
+                                      highs=(sel0 == "WORD_1", sel1 == "WORD_1"))
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {expr};")

@@ -16291,6 +16291,7 @@ _CONTROL_SUBCHECKS = (
     "check_sat_pack_u8_lowering",
     "check_pack_b32_lowering",
     "check_sad_lowering",
+    "check_sdwa_f16_compare_lowering",
     "check_scalar_controls",
     "check_three_way_templates",
     "check_sdwa_unary_lowering",
@@ -20884,6 +20885,174 @@ def f16_compares_reference(words: tuple[int, int, int, int]) -> tuple[int, int, 
     return (w0, w1, w2, w3)
 
 
+# Binary16 SDWA comparisons and class tests (v_cmp_*_f16_sdwa, v_cmp_class_f16_sdwa). A (s44 -> v18), B (s45 -> v16),
+# C (s46 -> v20) and the class mask D (s47 -> v21) carry binary16 values in both halves, so a selection that reads the
+# wrong half changes the answer. Words 0..2 hold the 16 predicates under one (dst, src0, src1, src0_sel, src1_sel)
+# each; word 3 holds four class tests as (source, src0_sel).
+SDWA_F16_COMPARES = (
+    ("vcc_lo", "v18", "v16", "WORD_1", "WORD_0"),
+    ("s52", "-v16", "|v18|", "WORD_1", "DWORD"),
+    ("vcc_lo", "-|v18|", "v16", "DWORD", "WORD_1"),
+)
+SDWA_F16_CLASSES = (("v20", "WORD_1"), ("-v20", "WORD_0"), ("|v20|", "WORD_1"), ("-|v20|", "DWORD"))
+SDWA_F16_SETS = (  # (A, B, C, D), each half as high:low
+    (0x3c004000, 0x40003c00, 0x7e003c00, 0x3ff),  # 1:2 against 2:1; qNaN:1 against every class
+    (0x7e003c00, 0x3c007e00, 0x80000000, 0x060),  # qNaN:1 against 1:qNaN; -0:+0 against the zero classes
+    (0x80000000, 0x00008000, 0x7c00fc00, 0x204),  # -0:+0 against +0:-0; +inf:-inf against the infinities
+    (0x7c00fc00, 0xfc007c00, 0x00018001, 0x090),  # +inf:-inf against -inf:+inf; denormals against their classes
+    (0xc400c400, 0xc4004400, 0x7c013800, 0x101),  # -4:-4 against -4:4; sNaN:0.5 against sNaN and +normal
+    (0x00018001, 0x80010001, 0xbc003c00, 0x108),  # denormal pairs; -1:1 against the normal classes
+    (0x7c013800, 0x38007c01, 0x3c00bc00, 0x002),  # sNaN against 0.5; 1:-1 against qNaN only
+    (0x31183119, 0x31193118, 0xfe007e00, 0x3fc),  # adjacent values; -qNaN:qNaN against the non-NaN classes
+    (0x44003c00, 0xc4003c00, 0x3c007c00, 0x300),  # 4:1 against -4:1, so every word compares greater
+    (0x3c007e00, 0x7e003c00, 0x3c007c00, 0x200),  # 1:qNaN against qNaN:1, unordered for words 1 and 2
+)
+
+
+def sdwa_f16_compares() -> list[str]:
+    body = ["v_mov_b32_e32 v12, 0", "v_mov_b32_e32 v13, 0", "v_mov_b32_e32 v14, 0", "v_mov_b32_e32 v15, 0",
+            "v_mov_b32_e32 v16, s45", "v_mov_b32_e32 v18, s44", "v_mov_b32_e32 v20, s46", "v_mov_b32_e32 v21, s47"]
+
+    def emit_flag(acc, bit, cond, insn):
+        body.append(insn)
+        body.append(f"v_cndmask_b32_e64 v17, 0, 1, {cond}")
+        if bit:
+            body.append(f"v_lshlrev_b32_e32 v17, {bit}, v17")
+        body.append(f"v_or_b32_e32 {acc}, {acc}, v17")
+
+    for word, (dst, src0, src1, sel0, sel1) in enumerate(SDWA_F16_COMPARES):
+        for bit, pred in enumerate(PREDICATES):
+            emit_flag(f"v{12 + word}", bit, dst,
+                      f"v_cmp_{pred}_f16_sdwa {dst}, {src0}, {src1} src0_sel:{sel0} src1_sel:{sel1}")
+    for bit, (source, sel) in enumerate(SDWA_F16_CLASSES):
+        dst = "s52" if bit % 2 else "vcc_lo"
+        emit_flag("v15", bit, dst, f"v_cmp_class_f16_sdwa {dst}, {source}, v21 src0_sel:{sel} src1_sel:DWORD")
+    return body
+
+
+def sdwa_f16_operand(token, words, sel, *, selections=True, modifiers=True):
+    """The binary16 bits an SDWA source names: its register half, then |x| and -."""
+    neg = token.startswith("-")
+    name = token.lstrip("-")
+    use_abs = name.startswith("|")
+    word = words[{"v18": 0, "v16": 1, "v20": 2}[name.strip("|")]]
+    bits = (word >> 16) & 0xffff if selections and sel == "WORD_1" else word & 0xffff
+    if modifiers and use_abs:
+        bits &= 0x7fff
+    if modifiers and neg:
+        bits ^= 0x8000
+    return bits
+
+
+def sdwa_f16_reference(words, **model):
+    """The four words sdwa_f16_compares() exports. The keyword arguments describe wrong models."""
+    def half(bits):
+        return struct.unpack("<e", struct.pack("<H", bits))[0]
+
+    def half_class(h):
+        mag, neg = h & 0x7fff, h >= 0x8000
+        if mag > 0x7c00:
+            return 0x2 if h & 0x0200 else 0x1
+        if mag == 0x7c00:
+            return 0x4 if neg else 0x200
+        if mag >= 0x0400:
+            return 0x8 if neg else 0x100
+        if mag:
+            return 0x10 if neg else 0x80
+        return 0x20 if neg else 0x40
+
+    def holds(pred, a, b):
+        ordered = not math.isnan(a) and not math.isnan(b)
+        return {"f": False, "lt": ordered and a < b, "eq": ordered and a == b, "le": ordered and a <= b,
+                "gt": ordered and a > b, "lg": ordered and a != b, "ge": ordered and a >= b, "o": ordered,
+                "u": not ordered, "nge": not (ordered and a >= b), "nlg": not (ordered and a != b),
+                "ngt": not (ordered and a > b), "nle": not (ordered and a <= b), "neq": not (ordered and a == b),
+                "nlt": not (ordered and a < b), "tru": True}[pred]
+
+    out = []
+    for _, src0, src1, sel0, sel1 in SDWA_F16_COMPARES:
+        a = half(sdwa_f16_operand(src0, words, sel0, **model))
+        b = half(sdwa_f16_operand(src1, words, sel1, **model))
+        out.append(sum(1 << bit for bit, pred in enumerate(PREDICATES) if holds(pred, a, b)))
+    out.append(sum(1 << bit for bit, (source, sel) in enumerate(SDWA_F16_CLASSES)
+                   if half_class(sdwa_f16_operand(source, words, sel, **model)) & words[3]))
+    return tuple(out)
+
+
+SDWA_F16_WRONG_MODELS = (("selections ignored", {"selections": False}), ("modifiers ignored", {"modifiers": False}))
+
+
+def check_sdwa_f16_compare_draws(directory, compiler, renderer, backend):
+    """Draw the 16 binary16 SDWA predicates and the SDWA class test on SDWA_F16_SETS, and for each wrong model the
+    first set it changes against that model's words, which must report a mismatch. On a desktop GPU the draws
+    establish that the translated shader computes the stated comparisons, not what the console does."""
+    source = directory / "sdwa-f16-compare.hlsl"
+    shader = directory / "sdwa-f16-compare.cso"
+    source.write_text(translate_int(uncompressed_export(sdwa_f16_compares())), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, words in enumerate(SDWA_F16_SETS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = tuple(as_float(w) for w in sdwa_f16_reference(words))
+        cases.append((write_case(directory / f"sdwa-f16-cmp-{index}.case", constants, expected, integer_rt=True),
+                      "pass"))
+    for label, model in SDWA_F16_WRONG_MODELS:
+        words = next(w for w in SDWA_F16_SETS if sdwa_f16_reference(w, **model) != sdwa_f16_reference(w))
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        wrong = tuple(as_float(w) for w in sdwa_f16_reference(words, **model))
+        cases.append((write_case(directory / f"sdwa-f16-cmp-{label.replace(' ', '-')}.case", constants, wrong,
+                                 integer_rt=True), "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+    return 0
+
+
+def check_sdwa_f16_compare_lowering():
+    """Static checks for the binary16 SDWA comparisons: the 17 forms, the inputs and the refusals."""
+    forms = {line.split()[0] for line in sdwa_f16_compares() if "_sdwa" in line}
+    assert forms == {f"v_cmp_{pred}_f16_sdwa" for pred in PREDICATES} | {"v_cmp_class_f16_sdwa"}, forms
+    translate_int(uncompressed_export(sdwa_f16_compares()))
+    # Every predicate bit other than f and tru, and every class bit, takes both values over the sets, and every
+    # wrong model changes at least one set.
+    results = [sdwa_f16_reference(words) for words in SDWA_F16_SETS]
+    for word in range(3):
+        for bit, pred in enumerate(PREDICATES):
+            seen = {(result[word] >> bit) & 1 for result in results}
+            assert seen == ({0} if pred == "f" else {1} if pred == "tru" else {0, 1}), (word, pred, seen)
+    for bit in range(len(SDWA_F16_CLASSES)):
+        assert {(result[3] >> bit) & 1 for result in results} == {0, 1}, bit
+    for label, model in SDWA_F16_WRONG_MODELS:
+        assert any(sdwa_f16_reference(w, **model) != sdwa_f16_reference(w) for w in SDWA_F16_SETS), label
+    # With DWORD selections and no modifier the SDWA comparison is the e32 one.
+    setup = ["v_mov_b32_e32 v16, s45", "v_mov_b32_e32 v18, s44"]
+    tail = ["v_cndmask_b32_e64 v12, 0, 1, vcc_lo"]
+    plain = translate_int(uncompressed_export([*setup, "v_cmp_lt_f16_e32 vcc_lo, v18, v16", *tail]))
+    sdwa = translate_int(uncompressed_export(
+        [*setup, "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:DWORD src1_sel:DWORD", *tail]))
+    assert plain == sdwa
+    # WORD_1 reads the high half, for the value and for the ordered test.
+    lines = translate_int(uncompressed_export(
+        [*setup, "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_1 src1_sel:WORD_0", *tail])).splitlines()
+    assert any("num16(((asuint(alu21) >> 16u) & 0xffffu))" in line and "widen16((asuint(alu21) >> 16u))" in line
+               for line in lines), [line for line in lines if "bool cmp" in line]
+    good = "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_1 src1_sel:WORD_0"
+    for bad in (
+        "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:BYTE_0 src1_sel:WORD_0",
+        "v_cmp_lt_f16_sdwa vcc_lo, sext(v18), v16 src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_cmp_lt_f16_sdwa vcc_lo, 1.0, v16 src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_cmp_lt_f16_sdwa vcc_lo, 0x3c00, v16 src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_cmp_lt_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_1",
+        "v_cmp_lt_f16_sdwa exec_lo, v18, v16 src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_cmp_lt_f16_sdwa vcc_lo, v18, v106 src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_cmp_class_f16_sdwa vcc_lo, v18, v16 src0_sel:WORD_1 src1_sel:WORD_1",
+        "v_cmp_class_f16_sdwa vcc_lo, v18, -v16 src0_sel:WORD_1 src1_sel:DWORD",
+        "v_cmpx_lt_f16_sdwa v18, v16 src0_sel:WORD_1 src1_sel:WORD_0",
+    ):
+        translate_int(uncompressed_export([*setup, good, *tail]))
+        must_reject(translate_int, uncompressed_export([*setup, bad, *tail]))
+
+
 def check_f16_compare_draws(directory, compiler, renderer, backend):
     source = directory / "f16-compare.hlsl"
     shader = directory / "f16-compare.cso"
@@ -22139,7 +22308,7 @@ def main():
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-cvt-int-f64", "draw-pack-int16", "draw-pack-b32",
-                    "draw-sad",
+                    "draw-sad", "draw-sdwa-f16-compare",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-cmpx-e64", "draw-scc-skip",
@@ -22172,6 +22341,7 @@ def main():
                         "draw-pack-int16": check_pack_int16_draws,
                         "draw-pack-b32": check_pack_b32_draw,
                         "draw-sad": check_sad_draws,
+                        "draw-sdwa-f16-compare": check_sdwa_f16_compare_draws,
                         "draw-int16-vop3": check_int16_vop3_draw,
                         "draw-int16-ternary": check_int16_ternary_draw,
                         "draw-f16-arith": check_f16_arith_draw,

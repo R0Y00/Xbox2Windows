@@ -5373,6 +5373,27 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertIn("stages", json_content)
             self.assertIn("missing_opcodes_ranked", json_content)
 
+    def test_sdwa_f16_compare_instructions(self):
+        """The scanner accepts the binary16 SDWA comparisons pixel_aot lowers and refuses their neighbours."""
+        for line in (
+            "v_cmp_lt_f16_sdwa vcc_lo, v1, v2 src0_sel:DWORD src1_sel:DWORD",
+            "v_cmp_nlg_f16_sdwa s6, -v1, |v2| src0_sel:WORD_1 src1_sel:WORD_0",
+            "v_cmp_tru_f16_sdwa vcc_lo, -|v1|, v2 src0_sel:DWORD src1_sel:WORD_1",
+            "v_cmp_class_f16_sdwa s6, -v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_cmp_lt_f16_sdwa vcc_lo, v1, v2 src0_sel:BYTE_0 src1_sel:DWORD",
+            "v_cmp_lt_f16_sdwa vcc_lo, sext(v1), v2 src0_sel:WORD_1 src1_sel:DWORD",
+            "v_cmp_lt_f16_sdwa s6, neg(2.0), v2 src0_sel:DWORD src1_sel:DWORD",
+            "v_cmp_lt_f16_sdwa vcc_lo, v1, v2 src0_sel:WORD_1",
+            "v_cmp_lt_f16_sdwa exec_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
+            "v_cmp_class_f16_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:WORD_1",
+            "v_cmp_class_f16_sdwa vcc_lo, v1, -v2 src0_sel:WORD_1 src1_sel:DWORD",
+            "v_cmpx_lt_f16_sdwa v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_supported_shader_instructions(self):
         """Verify scanner patterns recognize subrev, mov_b32, waitcnt_expcnt as supported."""
         self.assertTrue(is_instruction_supported("s_waitcnt_expcnt null, 0x0"))
