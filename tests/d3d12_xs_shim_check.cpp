@@ -219,9 +219,12 @@ std::uint32_t rts0_flags(const unsigned char* data, std::size_t bytes)
 // produced a blob. All four blobs are alive at once, in both call orders; each goes through the
 // recording device's CreateRootSignature, and the copy that device keeps for shader translation must
 // carry exactly its own call's bits. A copy of the bytes in other memory gets none.
+// The flags command-list slot 34 acts on (src/startup_stubs/heap_indexed_root.h) come from the desktop
+// blob, which has no heap-indexing bits after a retry: the desktop root signature does not index heaps,
+// so slot 34 must set it directly (recorded flags 0), whatever the translation copy carries.
 bool provenance_checks(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& base, std::uint32_t(__cdecl* stripped_bits)(const void*, std::size_t))
 {
-    using TranslationBlob = std::size_t(__cdecl*)(void*, void*, std::size_t);
+    using TranslationBlob = std::size_t(__cdecl*)(void*, void*, std::size_t, UINT*);
     const auto translation_blob = reinterpret_cast<TranslationBlob>(
         GetProcAddress(GetModuleHandleW(L"d3d12_xs.dll"), "x2w_d3d12_root_translation_blob"));
     ComPtr<IDXGIFactory4> factory;
@@ -239,10 +242,12 @@ bool provenance_checks(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& base, std::uin
         using Slot = HRESULT(WINAPI*)(void*, UINT, const void*, SIZE_T, const GUID*, void**);
         return reinterpret_cast<Slot>((*static_cast<void***>(device))[16])(device, 0, blob, size, &__uuidof(ID3D12RootSignature), root);
     };
-    // The flags of the copy the recording device kept for translation, ~0u if it kept none.
-    const auto translation_flags = [translation_blob](void* root) {
+    // The flags of the copy the recording device kept for translation, ~0u if it kept none; desktop gets
+    // the heap-indexing flags slot 34 acts on.
+    const auto translation_flags = [translation_blob](void* root, UINT* desktop) {
         std::array<unsigned char, 4096> copy{};
-        const std::size_t bytes = translation_blob(root, copy.data(), copy.size());
+        *desktop = ~0u;
+        const std::size_t bytes = translation_blob(root, copy.data(), copy.size(), desktop);
         return bytes && bytes <= copy.size() ? rts0_flags(copy.data(), bytes) : ~0u;
     };
 
@@ -263,12 +268,14 @@ bool provenance_checks(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& base, std::uin
             ComPtr<IUnknown> root;
             const HRESULT hr = create_root(blobs[i]->GetBufferPointer(), blobs[i]->GetBufferSize(), reinterpret_cast<void**>(root.GetAddressOf()));
             const std::uint32_t lookup = stripped_bits(blobs[i]->GetBufferPointer(), blobs[i]->GetBufferSize());
-            const std::uint32_t used = SUCCEEDED(hr) && root ? translation_flags(root.Get()) : ~0u;
+            UINT desktop = ~0u;
+            const std::uint32_t used = SUCCEEDED(hr) && root ? translation_flags(root.Get(), &desktop) : ~0u;
             const bool same_bytes = same_blob(blobs[i].Get(), blobs[0].Get());
-            const bool good = SUCCEEDED(hr) && same_bytes && lookup == order[i] && used == (base_flags | order[i]);
-            std::printf("provenance order=%s input=0x%03x: create=0x%08lx same_bytes=%d lookup=0x%03x translation_flags=0x%08x %s\n",
+            const bool good = SUCCEEDED(hr) && same_bytes && lookup == order[i] && used == (base_flags | order[i]) && desktop == 0;
+            std::printf("provenance order=%s input=0x%03x: create=0x%08lx same_bytes=%d lookup=0x%03x translation_flags=0x%08x "
+                        "slot34_heap_flags=0x%x %s\n",
                         order[0] == 0 ? "baseline-first" : "both-first", order[i], static_cast<unsigned long>(hr), same_bytes ? 1 : 0,
-                        lookup, used, good ? "ok" : "WRONG");
+                        lookup, used, desktop, good ? "ok" : "WRONG");
             ok = ok && good;
         }
         // The same bytes copied elsewhere carry no provenance: the translation copy keeps the
@@ -277,9 +284,11 @@ bool provenance_checks(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& base, std::uin
                                           static_cast<const unsigned char*>(blobs[3]->GetBufferPointer()) + blobs[3]->GetBufferSize());
         ComPtr<IUnknown> root;
         const HRESULT hr = create_root(copied.data(), copied.size(), reinterpret_cast<void**>(root.GetAddressOf()));
-        const std::uint32_t used = SUCCEEDED(hr) && root ? translation_flags(root.Get()) : ~0u;
-        const bool good = SUCCEEDED(hr) && stripped_bits(copied.data(), copied.size()) == 0 && used == base_flags;
-        std::printf("provenance copy of 0x%03x: translation_flags=0x%08x %s\n", order[3], used, good ? "ok" : "WRONG");
+        UINT desktop = ~0u;
+        const std::uint32_t used = SUCCEEDED(hr) && root ? translation_flags(root.Get(), &desktop) : ~0u;
+        const bool good = SUCCEEDED(hr) && stripped_bits(copied.data(), copied.size()) == 0 && used == base_flags && desktop == 0;
+        std::printf("provenance copy of 0x%03x: translation_flags=0x%08x slot34_heap_flags=0x%x %s\n", order[3], used, desktop,
+                    good ? "ok" : "WRONG");
         ok = ok && good;
     }
     static_cast<IUnknown*>(device)->Release();

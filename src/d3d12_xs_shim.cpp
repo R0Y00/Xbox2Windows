@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #include "d3d12x_device_slots.h"
@@ -59,11 +60,24 @@ std::vector<StrippedBlob> stripped_blobs;
 
 class RetriedBlob final : public ID3DBlob {
 public:
-    RetriedBlob(ID3DBlob* inner, std::uint32_t bits) : inner_(inner)
+    // The blob to hand out for inner: a registered wrapper, or inner itself (no bits recorded) when the
+    // wrapper or its record cannot be allocated.
+    static ID3DBlob* wrap(ID3DBlob* inner, std::uint32_t bits) noexcept
     {
+        RetriedBlob* wrapper = new (std::nothrow) RetriedBlob(inner);
+        if (!wrapper) return inner;
+        bool registered = true;
         AcquireSRWLockExclusive(&stripped_lock);
-        stripped_blobs.push_back({inner_->GetBufferPointer(), inner_->GetBufferSize(), bits});
+        try {
+            stripped_blobs.push_back({inner->GetBufferPointer(), inner->GetBufferSize(), bits});
+        } catch (...) {
+            registered = false;
+        }
         ReleaseSRWLockExclusive(&stripped_lock);
+        if (registered) return wrapper;
+        wrapper->inner_ = nullptr;  // inner stays with the caller
+        delete wrapper;
+        return inner;
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
     {
@@ -85,8 +99,10 @@ public:
     SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return inner_->GetBufferSize(); }
 
 private:
+    explicit RetriedBlob(ID3DBlob* inner) : inner_(inner) {}
     ~RetriedBlob()
     {
+        if (!inner_) return;
         const void* data = inner_->GetBufferPointer();
         AcquireSRWLockExclusive(&stripped_lock);
         for (std::size_t i = 0; i < stripped_blobs.size(); ++i)
@@ -128,7 +144,7 @@ HRESULT serialize_for_runtime(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, I
         return hr;  // something else is wrong: keep the first answer and its error blob
     }
     if (retry_error) retry_error->Release();
-    if (*blob) *blob = new RetriedBlob(*blob, flags & heap_indexing_flags);
+    if (*blob) *blob = RetriedBlob::wrap(*blob, flags & heap_indexing_flags);
     if (error_blob && *error_blob) {
         (*error_blob)->Release();
         *error_blob = nullptr;
@@ -147,10 +163,20 @@ extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t b
 {
     if (!blob || !bytes) return 0;
     std::uint32_t bits = 0;
+    bool same_bytes_elsewhere = false;
     AcquireSRWLockShared(&stripped_lock);
     for (const StrippedBlob& entry : stripped_blobs)
         if (entry.data == blob && entry.bytes == bytes) bits = entry.bits;
+    // Live entries' buffers stay valid while the lock is held (the destructor unregisters first).
+    if (!bits)
+        for (const StrippedBlob& entry : stripped_blobs)
+            if (entry.bytes == bytes && std::memcmp(entry.data, blob, bytes) == 0) same_bytes_elsewhere = true;
     ReleaseSRWLockShared(&stripped_lock);
+    // The bytes alone cannot say which it is, so the answer stays 0; the line says why bits may be missing.
+    static LONG logged;
+    if (same_bytes_elsewhere && InterlockedIncrement(&logged) == 1)
+        std::fprintf(stderr, "x2w-d3d12 root signature blob %p has the bytes of a retried blob at another address: a copy "
+                             "(its heap-indexing bits are not restored for translation) or a call without them\n", blob);
     return bits;
 }
 
