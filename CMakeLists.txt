@@ -2165,6 +2165,27 @@ if(EXISTS "${INTAKE_PYTHON}")
     # 32-bit scalar complement logic: s_nand_b32, s_nor_b32 and s_xnor_b32 against an integer reference (#1919).
     add_test(NAME startup_gfx2hlsl_sop2_complement COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sop2_complement_check.py")
+    # gfx2hlsl natural loops: the simple and nested shapes lose the pc dispatcher, while an entry
+    # into the middle of a loop keeps it. The DXC arm compiles the generated vertex and pixel shaders.
+    add_test(NAME startup_gfx2hlsl_loops COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loops_check.py")
+    set_tests_properties(startup_gfx2hlsl_loops PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_gfx2hlsl_loops_dxc COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loops_check.py" compile "${DXC_EXECUTABLE}")
+    set_tests_properties(startup_gfx2hlsl_loops_dxc PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    # Same source-built pixel program through both loop forms: the dispatcher and the structured
+    # translation must read back the same value. The fixtures cover a zero-trip loop, a multi-trip
+    # loop and an inverted exit condition.
+    add_test(NAME startup_gfx2hlsl_loop_draw COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loop_draw_check.py")
+    set_tests_properties(startup_gfx2hlsl_loop_draw PROPERTIES TIMEOUT 30)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_loop_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loop_draw_check.py" draw
+            "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_loop_draw_${adapter} PROPERTIES TIMEOUT 120
+            SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")

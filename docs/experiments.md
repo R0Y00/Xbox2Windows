@@ -11847,3 +11847,28 @@ On an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`) and on in-bo
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^startup_range_provenance' -V
 ```
+## Structured natural loops in gfx2hlsl
+
+[`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) now emits structured loops for a conservative natural-loop shape. A loop must occupy consecutive blocks, have one back edge from its last block to its header, and have one forward exit edge to the block after the loop. The header must dominate every block in the range, and no edge from outside the loop may enter a block other than the header. A nested loop may occupy a consecutive subrange of its parent. These restrictions exclude irreducible control flow, overlapping loop ranges, conditional entry into a loop body, and loops with several latches or exits.
+
+The supported loops become `for (;;)` regions with a conditional `break` at the loop exit. Each block still starts with `if (guard >= 65536u) return ...; ++guard;`, so the translated path observes the same 65536-block budget as the old dispatcher. A block reached by an edge to `pc = 0xffff` still ends the function; a normal `s_endpgm` falls through to the existing function return. Unsupported shapes keep the `uint pc` dispatcher unchanged.
+
+The translator also drops constant symbols for registers read or written at a block boundary. A constant assigned in a preheader is not a property of a loop header or body that another path can enter: the old `Stage.translate()` folded `s_add_u32 s0, s0, 1` from a preheader `s0 = 0` into `s0 = 0 + 1`, so a counted loop never advanced. Pointer, descriptor and uniform symbols are preserved; only compile-time constants are invalidated.
+
+[`tests/startup_gfx2hlsl_loops_check.py`](../tests/startup_gfx2hlsl_loops_check.py) translates five source-built pixel fixtures. The simple fixture has three blocks and a bottom-tested loop; it must contain one `for (;;)`, no `uint pc`, one guard per block, and a run-time `s0 = s0 + 1` accumulator. The nested fixture has six blocks and an outer loop containing a self-loop; it must contain two structured loops and both counters must accumulate. The third fixture branches from the preheader into the loop body, so the header does not dominate the body and the `uint pc` dispatcher must remain. The fourth exits to a non-adjacent block, and the fifth has two forward exits; both must keep the dispatcher. The optional `binary <llvm-mc>` arm reassembles the fixtures, and `compile <dxc>` compiles the generated vertex and pixel pair for both structured and fallback shapes. DXC is required for that arm only, so it skips with return code 77 when the compiler is missing.
+
+[`tests/startup_gfx2hlsl_loop_draw_check.py`](../tests/startup_gfx2hlsl_loop_draw_check.py) closes the live-register gap. It translates the same source-built pixel program twice, once with the structured path and once with the dispatcher, compiles both with DXC, and draws each pair through `offscreen_check --startup-flat-param` on WARP. The zero-trip fixture reads 5.0, the three-pass fixture reads 3.0, and the inverted exit reads 1.0; the dispatcher and structured readbacks must match in every case. The hardware arm is registered with the usual capability skip.
+
+```powershell
+python -B tests/startup_gfx2hlsl_loops_check.py
+python -B tests/startup_gfx2hlsl_loops_check.py compile <dxc.exe>
+python -B tests/startup_gfx2hlsl_loop_draw_check.py
+python -B tests/startup_gfx2hlsl_loop_draw_check.py draw <dxc.exe> <offscreen_check.exe> warp
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_(loops(_dxc)?|loop_draw(_warp|_hardware)?)$' -V
+```
+
+The measured scope here is the five fixture CFGs, DXC compilation and one-pixel WARP readbacks for the three loop cases. No title shader was run, so the effect on a real shader corpus and on GPU compilation time is not measured. A loop with an acyclic conditional branch outside the supported straight tail still keeps the dispatcher, as do loops whose exit is not the immediately following block.
+
+Makto94 independently ran the WARP and hardware draw tests on an NVIDIA GeForce RTX 3070 Ti (driver 32.0.16.2101, Windows 11 build 26300.9974, DXC 1.9.2602.17): 5/5 passed, 0 skipped, debug layer enabled with no errors or warnings, and the hardware readbacks matched the three values above. That run used `5ee9790d`; the later heads rebase the same translator and draw checks, so the measured shader path is unchanged.
+
+Loops whose header or body writes `exec` (for example `v_cmpx`) inherit the existing `exec_known` limitation: the `exec` state established on the first pass is not recomputed at the loop header. The dispatcher form has the same limit, and no fixture covers that shape.

@@ -316,8 +316,9 @@ def smem_mods(mods):
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
-    def __init__(self, pipe, kind, code, refusals=None, decoded=None):
+    def __init__(self, pipe, kind, code, refusals=None, decoded=None, structured_loops=True):
         self.pipe, self.kind = pipe, kind
+        self.structured_loops = structured_loops
         self.refusals = refusals
         if refusals is None:
             self.ins = decode(strip_header(code))
@@ -515,20 +516,85 @@ class Stage:
         return None if any(w is None for w in words) else words
 
     # ---- instruction translation -------------------------------------------------------------
+    def scalars_written(self, name, asm):
+        """Scalar registers an instruction may write, for block-entry invalidation."""
+        base = re.sub(r'_e(32|64)$', '', name)
+        if not base.startswith('s_'):
+            return ()
+        if base.startswith(('s_cbranch', 's_cmp', 's_store', 's_atomic', 's_dcache', 's_icache',
+                            's_wait', 's_barrier', 's_sethalt', 's_setkill', 's_setprio',
+                            's_setpc', 's_swappc', 's_getpc', 's_sendmsg', 's_nop', 's_sleep',
+                            's_endpgm', 's_branch')):
+            return ()
+        if 'movreld' in base:
+            return ()
+        _, ops, _ = parse(asm)
+        if not ops:
+            return ()
+        r = reg_range(ops[0])
+        if not r or r[0] != 's':
+            return ()
+        return range(r[1], r[2] + 1)
+
+    def scalars_read(self, name, asm):
+        """Scalar registers an instruction reads, excluding its scalar destination."""
+        _, ops, _ = parse(asm)
+        dest = set(self.scalars_written(name, asm))
+        regs = set()
+        for tok in ops[1:] if dest else ops:
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                regs.update(range(r[1], r[2] + 1))
+        return regs
+
+    def block_symbols(self, targets):
+        """Per block: written registers and registers read before their first write.
+        A constant assigned on one path is not a property of a target block when another path
+        enters it, so those entries are dropped before the block is translated."""
+        blocks = {}
+        start = 0
+        writes, reads, written = set(), set(), set()
+        for off, n, name, asm in self.ins:
+            if off in targets and off != start:
+                blocks[start] = (writes, reads)
+                start = off
+                writes, reads, written = set(), set(), set()
+            dest = set(self.scalars_written(name, asm))
+            for reg in self.scalars_read(name, asm):
+                if reg not in written:
+                    reads.add(reg)
+            writes.update(dest)
+            written.update(dest)
+            if name.startswith('s_cbranch') or name in ('s_branch', 's_endpgm'):
+                blocks[start] = (writes, reads)
+                start = off + n
+                writes, reads, written = set(), set(), set()
+        if writes or reads or start is not None:
+            blocks[start] = (writes, reads)
+        return blocks
+
     def translate(self):
         targets = set()
         for off, n, name, asm in self.ins:
             if name.startswith('s_cbranch') or name == 's_branch':
                 targets.add(int(parse(asm)[1][0].split('_')[1], 16))
+        symbols = self.block_symbols(targets)
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()
         self.has_branches = bool(targets)
         start = 0
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
+        cleared = None
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
                 self.blocks.append((start, self.lines, None))
                 self.lines, start = [], off
+            if off == start and start and cleared != start:
+                writes, reads = symbols.get(start, ((), ()))
+                for reg in writes | reads:
+                    if self.sym.get(reg, ('',))[0] == 'const':
+                        self.sym.pop(reg, None)
+                cleared = start
             self.pc = off
             try:
                 term = self.one(name, asm)
@@ -1588,13 +1654,241 @@ class Stage:
         return None
 
     # ---- output ------------------------------------------------------------------------------
+    def _termination(self):
+        """The statement a structured block uses when the dispatcher would set pc = 0xffff."""
+        has_output = self.kind == 'vs' or any(k.startswith('mrt') for k in self.exports)
+        return 'return o;' if has_output else 'return;'
+
+    def _structured_body(self, index):
+        """Natural loops with one latch and one forward exit, or None for the dispatcher.
+
+        The supported shape is deliberately small: a loop occupies consecutive blocks, its header
+        dominates every block in that range, one edge returns to the header, and one edge leaves the
+        range for the block immediately after it. Nested loops may occupy a consecutive subrange. A
+        loop that is entered anywhere except its header, has several exits, or overlaps another loop
+        without being nested in it keeps the existing pc dispatcher.
+        """
+        n = len(self.blocks)
+        edges, preds = [], [set() for _ in range(n)]
+
+        def target(off):
+            if off not in index:
+                raise Unsupported('branch into the middle of a block (+0x%x)' % off)
+            return index[off]
+
+        for i, (_, _, term) in enumerate(self.blocks):
+            nxt = i + 1 if i + 1 < n else -1
+            if not term:
+                out = [(nxt, None)]
+            elif term[0] == 'end':
+                out = [(-1, None)]
+            elif term[0] == 'jump':
+                out = [(target(term[1]), None)]
+            else:
+                out = [(target(term[2]), term[1]), (nxt, '!(%s)' % term[1])]
+            if len({e[0] for e in out}) != len(out):
+                return None
+            edges.append(out)
+            for to, _ in out:
+                if to >= 0:
+                    preds[to].add(i)
+
+        reachable, stack = {0}, [0]
+        while stack:
+            for to, _ in edges[stack.pop()]:
+                if to >= 0 and to not in reachable:
+                    reachable.add(to)
+                    stack.append(to)
+        if len(reachable) != n:
+            return None
+
+        dom = [set(range(n)) for _ in range(n)]
+        dom[0] = {0}
+        changed = True
+        while changed:
+            changed = False
+            for i in range(1, n):
+                incoming = preds[i]
+                if not incoming:
+                    continue
+                common = set.intersection(*(dom[p] for p in incoming))
+                common.add(i)
+                if common != dom[i]:
+                    dom[i] = common
+                    changed = True
+
+        backs = {}
+        for u, out in enumerate(edges):
+            for v, cond in out:
+                if v >= 0 and v in dom[u] and v <= u:
+                    backs.setdefault(v, []).append((u, cond))
+        if not backs:
+            return None
+        if any(len(entries) != 1 for entries in backs.values()):
+            return None
+
+        loops = []
+        for header, ((latch, _),) in backs.items():
+            nodes, work = {header}, [latch]
+            while work:
+                node = work.pop()
+                if node == header or node in nodes:
+                    continue
+                nodes.add(node)
+                work.extend(preds[node])
+            first, last = min(nodes), max(nodes)
+            if header != first or latch != last or nodes != set(range(first, last + 1)):
+                return None
+            # The dominance check above already excludes a side entry into a natural loop.
+            # Keep this explicit test so a future relaxation of the range rule cannot admit one.
+            for node in nodes:
+                if node != header and any(p not in nodes for p in preds[node]):
+                    return None
+            exits = [(u, cond, to) for u in nodes for to, cond in edges[u] if to not in nodes]
+            if len(exits) != 1:
+                return None
+            exit_src, exit_cond, exit_to = exits[0]
+            if exit_to != last + 1 or exit_cond is None:
+                return None
+            loops.append(dict(header=header, latch=latch, nodes=nodes, exit=exit_to, exit_src=exit_src,
+                              exit_cond=exit_cond, children=[]))
+
+        # Natural loops are either disjoint or nested. A partial overlap is outside this shape.
+        for i, a in enumerate(loops):
+            for b in loops[i + 1:]:
+                if a['nodes'] & b['nodes'] and not (a['nodes'] <= b['nodes'] or b['nodes'] <= a['nodes']):
+                    return None
+        for loop in sorted(loops, key=lambda item: len(item['nodes'])):
+            parents = [p for p in loops if p is not loop and loop['nodes'] < p['nodes']]
+            if parents:
+                min(parents, key=lambda item: len(item['nodes']))['children'].append(loop)
+
+        def validate(loop):
+            header, latch, nodes, exit_src, exit_to = (loop['header'], loop['latch'], loop['nodes'],
+                                                      loop['exit_src'], loop['exit'])
+            covered = set()
+            for child in loop['children']:
+                if not (header < child['header'] and child['latch'] < latch
+                        and child['exit'] == child['latch'] + 1):
+                    return None
+                if covered & child['nodes']:
+                    return None
+                covered |= child['nodes']
+                if validate(child) is None:
+                    return None
+            chain, at = [], header
+            while at <= latch:
+                child = next((c for c in loop['children'] if c['header'] == at), None)
+                if child:
+                    chain.append(('loop', child))
+                    at = child['latch'] + 1
+                    continue
+                if at in covered:
+                    return None
+                chain.append(('block', at))
+                at += 1
+            loop['chain'] = chain
+            for kind, step in chain:
+                if kind == 'loop':
+                    continue
+                out = edges[step]
+                if step == header and header != latch:
+                    internal = [e for e in out if e[0] == header + 1]
+                    outside = [e for e in out if e[0] not in nodes and e[0] != exit_to]
+                    if len(internal) != 1 or outside or len(out) not in (1, 2):
+                        return None
+                    if len(out) == 2 and exit_src != header:
+                        return None
+                elif step == latch:
+                    back = [e for e in out if e[0] == header]
+                    outside = [e for e in out if e[0] not in nodes and e[0] != exit_to]
+                    if len(back) != 1 or outside:
+                        return None
+                    if len(out) == 2 and exit_src != latch:
+                        return None
+                    if len(out) == 1 and (exit_src == latch or out[0][1] is not None):
+                        return None
+                else:
+                    if len(out) != 1 or out[0][0] != step + 1:
+                        return None
+            if exit_src not in (header, latch):
+                return None
+            if exit_src == header and header != latch:
+                outside = [e for e in edges[header] if e[0] == exit_to]
+                if len(outside) != 1 or len(edges[header]) != 2:
+                    return None
+            if exit_src == latch:
+                if len(edges[latch]) != 2 or not any(e[0] == exit_to for e in edges[latch]):
+                    return None
+            if header == latch:
+                if len(edges[header]) != 2 or not any(e[0] == header for e in edges[header]):
+                    return None
+            return loop
+
+        top = [loop for loop in loops if not any(loop['nodes'] < p['nodes'] for p in loops)]
+        top_by_header = {loop['header']: loop for loop in top}
+        if any(validate(loop) is None for loop in top):
+            return None
+        # A loop may be nested only under a validated top-level loop.
+        if any(validate(loop) is None for loop in loops):
+            return None
+
+        out = ['    uint guard = 0;']
+
+        def block(i, indent):
+            pad = '    ' * indent
+            out.append('%sif (guard >= 65536u) %s' % (pad, self._termination()))
+            out.append('%s++guard;' % pad)
+            out.extend(pad + line for line in self.blocks[i][1])
+
+        def loop_code(loop, indent):
+            pad = '    ' * indent
+            out.append('%sfor (;;) {' % pad)
+            for kind, step in loop['chain']:
+                if kind == 'loop':
+                    loop_code(step, indent + 1)
+                else:
+                    block(step, indent + 1)
+                    if step == loop['exit_src']:
+                        out.append('%s    if (%s) break;' % (pad, loop['exit_cond']))
+            out.append('%s}' % pad)
+
+        at = 0
+        while at < n:
+            loop = top_by_header.get(at)
+            if loop:
+                loop_code(loop, 1)
+                at = loop['latch'] + 1
+                continue
+            if any(at in loop['nodes'] for loop in loops):
+                return None
+            term = self.blocks[at][2]
+            block(at, 1)
+            if term and term[0] == 'end':
+                if at != n - 1:
+                    return None
+                at += 1
+            elif term and term[0] == 'jump':
+                if target(term[1]) != at + 1:
+                    return None
+                at += 1
+            elif term and term[0] == 'branch':
+                return None
+            else:
+                at += 1
+        return out
+
     def body(self):
         """Statements of the whole program as structured HLSL."""
         out = []
         offsets = [b[0] for b in self.blocks]
         index = {off: i for i, off in enumerate(offsets)}
         loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
-        if len(self.blocks) == 1:
+        if loops and getattr(self, 'structured_loops', True):
+            structured = self._structured_body(index)
+            if structured is not None:
+                return structured
+        if len(self.blocks) == 1 and not loops:
             return ['    ' + line for line in self.blocks[0][1]]
 
         def goto(off):
@@ -1757,7 +2051,7 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 class Pipeline:
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
-                 refusals=None, decoded=None):
+                 refusals=None, decoded=None, structured_loops=True):
         self.root = parse_root(root_blob)
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
@@ -1779,13 +2073,16 @@ class Pipeline:
         self.notes = set()    # shortcuts taken (written to the manifest as comments)
         self.modified = set()
         self.rect = self.ud(('rect',))
+        self.structured_loops = structured_loops
         if refusals is None:
-            self.vs = Stage(self, 'vs', vs_code)
-            self.ps = Stage(self, 'ps', ps_code)
+            self.vs = Stage(self, 'vs', vs_code, structured_loops=structured_loops)
+            self.ps = Stage(self, 'ps', ps_code, structured_loops=structured_loops)
         else:
             decoded = {} if decoded is None else decoded
-            self.vs = Stage(self, 'vs', vs_code, refusals=refusals, decoded=decoded.get('vs'))
-            self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'))
+            self.vs = Stage(self, 'vs', vs_code, refusals=refusals, decoded=decoded.get('vs'),
+                            structured_loops=structured_loops)
+            self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'),
+                            structured_loops=structured_loops)
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
