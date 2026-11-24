@@ -1792,8 +1792,8 @@ class Pipeline:
                # High 32 bits of an unsigned 32x32 product (issue #1792). These stages have no 64-bit multiply and
                # the low half of a * b is not the high half, so it is built from 16-bit halfword products.
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
-               ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
-               ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
+               ' uint middle = (a >> 16u) * lb + ((la * lb) >> 16u);'
+               ' return (a >> 16u) * (b >> 16u) + (middle >> 16u) + (((middle & 0xffffu) + la * (b >> 16u)) >> 16u); }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
