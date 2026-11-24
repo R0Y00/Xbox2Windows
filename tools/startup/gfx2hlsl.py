@@ -901,6 +901,22 @@ class Stage:
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
+    def op_v_swap_b32(self, ops, mods):
+        # VOP1 only: VDST and SRC0 are both VGPRs and exchange values. It has no output or source modifier
+        # and no VOP3, SDWA or DPP form here, so anything extra is refused instead of dropped.
+        if mods or len(ops) != 2:
+            raise Unsupported('v_swap_b32 with %d operands and modifiers %s' % (len(ops), mods))
+        dst, src = reg_range(ops[0]), reg_range(ops[1])
+        if not dst or not src or dst[0] != 'v' or src[0] != 'v':
+            raise Unsupported('v_swap_b32 needs two VGPRs, got %s and %s' % (ops[0], ops[1]))
+        a, b = dst[1], src[1]
+        for n in (a, b):
+            self.uniform_v.discard(n)
+            self.used_v.add(n)
+        if a != b:
+            swap = '{ uint swap_tmp = v%d; v%d = v%d; v%d = swap_tmp; }' % (a, a, b, b)
+            self.emit(swap if self.exec_known else 'if (exec & 1) %s' % swap)
+
     def op_v_cndmask_b32(self, ops, mods):
         # The select takes no output modifier: a clamp or mul on it would change the value, so a
         # modifier that reaches here is refused rather than dropped from the emitted text.
