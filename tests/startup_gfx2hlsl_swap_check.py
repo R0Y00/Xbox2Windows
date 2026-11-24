@@ -11,12 +11,17 @@ against the bytes LLVM 19 assembles for `v_swap_b32 v1, v2` (02 cb 02 7e, gfx101
 """
 import os
 import struct
+import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, here)
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
 sys.path.insert(0, os.path.join(here, '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
+from startup_flat_param_check import VS_WORDS, root_blob  # noqa: E402
 
 failures = []
 
@@ -99,10 +104,14 @@ def main():
     check('uniform status is dropped for both swapped registers', stage.uniform_v == {6}, repr(stage.uniform_v))
 
     # Refusals: a scalar or constant source cannot be encoded by the hardware, so a hand-written line
-    # must not be accepted either; modifiers and extra operands are refused, not dropped.
+    # must not be accepted either; modifiers, register ranges, out-of-range VGPRs and extra operands are refused.
     for label, asm in (('scalar source', 'v_swap_b32 v1, s2'), ('constant source', 'v_swap_b32 v1, 0'),
                        ('scalar destination', 'v_swap_b32 s1, v2'), ('missing source', 'v_swap_b32 v1'),
-                       ('third operand', 'v_swap_b32 v1, v2, v3')):
+                       ('third operand', 'v_swap_b32 v1, v2, v3'),
+                       ('destination register range', 'v_swap_b32 v[1:2], v3'),
+                       ('source register range', 'v_swap_b32 v1, v[2:3]'),
+                       ('out-of-range destination VGPR', 'v_swap_b32 v256, v1'),
+                       ('out-of-range source VGPR', 'v_swap_b32 v1, v256')):
         stage = Stage()
         try:
             stage.one('v_swap_b32', asm)
@@ -118,15 +127,63 @@ def main():
         ok = True
     check('a modifier is refused', ok and stage.lines == [])
 
-    # The SDWA spelling (src0 field 249 plus a second dword) is not a swap the translator may run.
+    # The SDWA, DPP16 and VOP3A spellings are not swaps the translator may run.
     sdwa = struct.pack('<II', (VOP1_PREFIX << 25) | (1 << 17) | (V_SWAP_B32 << 9) | 249, 2 | (6 << 8) | (6 << 16) | (6 << 24))
     reason = refused(sdwa)
     check('the SDWA spelling is refused', reason is not None, repr(reason))
+
+    dpp = struct.pack('<II', (VOP1_PREFIX << 25) | (1 << 17) | (V_SWAP_B32 << 9) | 250, 0)
+    reason = refused(dpp)
+    check('the DPP16 spelling is refused', reason is not None, repr(reason))
+
+    vop3 = struct.pack('<II', (0b110101 << 26) | ((0x180 + V_SWAP_B32) << 16) | 1, 256 + 2)
+    reason = refused(vop3)
+    check('the VOP3A spelling is refused', reason is not None, repr(reason))
+
+    # Full pipeline translation with two sequential swaps and an exec-guarded swap.
+    ps_hlsl = pipeline_hlsl_ps()
+    check('pipeline HLSL contains two unguarded swaps and an exec-guarded swap',
+          '{ uint swap_tmp = v0; v0 = v1; v1 = swap_tmp; }' in ps_hlsl and
+          '{ uint swap_tmp = v2; v2 = v3; v3 = swap_tmp; }' in ps_hlsl and
+          'if (exec & 1) { uint swap_tmp = v1; v1 = v2; v2 = swap_tmp; }' in ps_hlsl,
+          ps_hlsl)
+
+    if len(sys.argv) > 1:
+        if sys.argv[1] != 'compile' or len(sys.argv) not in (3, 4):
+            raise SystemExit('usage: startup_gfx2hlsl_swap_check.py [compile <dxc> [fxc]]')
+        check_compile(ps_hlsl, sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
 
     if failures:
         print('\nFAILED: ' + ', '.join(failures))
         sys.exit(1)
     print('PASS')
+
+
+def pipeline_hlsl_ps():
+    prolog = bytes.fromhex('0203fcbe' '020002c8' '020106c8' '02020ac8' '02030ec8')
+    swaps = encode_vop1(V_SWAP_B32, 0, 256 + 1) + encode_vop1(V_SWAP_B32, 2, 256 + 3)
+    saveexec = struct.pack('<I', (0b101111101 << 23) | (0 << 16) | (0x24 << 8) | 106)
+    guarded = encode_vop1(V_SWAP_B32, 1, 256 + 2)
+    epilog = bytes.fromhex('0f1800f800010203' '000081bf')
+    return G.Pipeline(VS_WORDS, prolog + swaps + saveexec + guarded + epilog, root_blob()).hlsl_ps()
+
+
+def check_compile(ps_hlsl, dxc, fxc=None):
+    compilers = [('dxc', dxc, 'ps_6_0')] + ([('fxc', fxc, 'ps_5_1')] if fxc else [])
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        src = directory / 'swap_ps.hlsl'
+        src.write_text(ps_hlsl, encoding='ascii')
+        for kind, compiler, profile in compilers:
+            out = directory / ('swap_ps_%s.cso' % kind)
+            if kind == 'fxc':
+                args = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', str(out), str(src)]
+            else:
+                args = [compiler, '-T', profile, '-E', 'main', '-Fo', str(out), str(src)]
+            run = subprocess.run(args, capture_output=True, text=True)
+            ok = run.returncode == 0 and out.is_file() and out.stat().st_size > 0 and not run.stderr.strip()
+            check('%s (%s) compiles emitted swap HLSL cleanly' % (kind, profile), ok,
+                  'rc=%d stdout=%r stderr=%r' % (run.returncode, run.stdout, run.stderr))
 
 
 main()

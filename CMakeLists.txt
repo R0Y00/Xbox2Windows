@@ -1915,9 +1915,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: the SMEM offset 'off' is the literal 0; m0 and other operands keep their handling (#1674).
     add_test(NAME startup_gfx2hlsl_smem_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_smem_offset_check.py")
-    # v_swap_b32 exchanges two VGPRs in the translator (#1723).
+    # v_swap_b32 exchanges two VGPRs in the translator (#1723); compiles the emitted HLSL with DXC and FXC.
     add_test(NAME startup_gfx2hlsl_swap COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_swap_check.py")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_swap_check.py" compile "${DXC_EXECUTABLE}"
+        $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
     add_test(NAME startup_triage_run COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B

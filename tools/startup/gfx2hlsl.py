@@ -907,7 +907,9 @@ class Stage:
         if mods or len(ops) != 2:
             raise Unsupported('v_swap_b32 with %d operands and modifiers %s' % (len(ops), mods))
         dst, src = reg_range(ops[0]), reg_range(ops[1])
-        if not dst or not src or dst[0] != 'v' or src[0] != 'v':
+        if (not dst or not src or dst[0] != 'v' or src[0] != 'v' or
+                dst[1] != dst[2] or src[1] != src[2] or
+                not (0 <= dst[1] <= 255 and 0 <= src[1] <= 255)):
             raise Unsupported('v_swap_b32 needs two VGPRs, got %s and %s' % (ops[0], ops[1]))
         a, b = dst[1], src[1]
         for n in (a, b):
