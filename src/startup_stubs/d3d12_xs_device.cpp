@@ -35,6 +35,7 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
+#include "startup_stubs/list_copy.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -3404,6 +3405,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 }
 
 #include "d3d12_memory_srv.inl"
+#include "startup_stubs/list_copy.inl"
 
 // The title exports __XMemAllocationHooks__ = {alloc(size, attributes), free(ptr, attributes), ...}.
 // Its alloc routine selects a hook chain by allocatorId (attribute bits 16-23). Around the creation
@@ -4081,6 +4083,9 @@ void build_tables()
     if (render_mode()) {
         list_typed[9] = reinterpret_cast<ListTyped>(&list_close);
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
+        list_typed[15] = reinterpret_cast<ListTyped>(&list_copy_buffer_region);
+        list_typed[17] = reinterpret_cast<ListTyped>(&list_copy_resource);
+        list_typed[19] = reinterpret_cast<ListTyped>(&list_resolve_subresource);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
