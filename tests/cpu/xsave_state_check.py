@@ -45,6 +45,7 @@ XSAVEOPT_EXPORTS = (
     "op_xrstor64_xsaveopt64_avx",
 )
 AVX_XSAVE_EXPORT = "op_xrstor64_xsave64_avx"
+MMX_READ_EXPORT = "op_xrstor64_movq_read_xsave64"
 SSE_COMPACTED_CONTROL_EXPORT = "op_xrstor64_sse_compacted_avx_xsaveopt64_avx"
 XSAVEOPT_DYNMASK_EXPORT = "op_xsaveopt64_dynmask"
 
@@ -72,6 +73,7 @@ DEFINED_EXPORTS = (
     "op_vzeroupper_xsave64",
     "op_pipeline",
     AVX_XSAVE_EXPORT,
+    MMX_READ_EXPORT,
 ) + XSAVEC_EXPORTS + XSAVEOPT_EXPORTS
 
 EXPORTS = CANONICAL_EXPORTS + DEFINED_EXPORTS
@@ -102,6 +104,7 @@ EXPORT_MODES = {
     "op_vzeroupper_xsave64": (True, True, 7, 0),
     "op_pipeline": (True, True, 7, 0),
     AVX_XSAVE_EXPORT: (True, True, 4, 0),
+    MMX_READ_EXPORT: (True, True, 7, 0),
     "op_xrstor64_xsavec": (True, False, 7, 0),
     "op_xrstor64_xsavec64": (True, True, 7, 0),
     "op_xrstor64_xsavec64_sse": (True, True, 2, 0),
@@ -506,14 +509,19 @@ class XStateModel:
         self.ymm_hi = [bytearray(16) for _ in range(16)]
         self.xinuse &= ~4
 
-    def set_mm(self, idx: int, val: int) -> None:
-        struct.pack_into("<QH", self.st[idx], 0, val & 0xFFFFFFFFFFFFFFFF, 0xFFFF)
-        self.st[idx][10:16] = b"\x00" * 6
+    def enter_mmx(self) -> None:
+        """Every MMX instruction but EMMS, one that only reads an MM register included, clears TOP and tags all valid."""
         self.ftw = 0xFF
         self.fsw &= ~0x3800
         self.xinuse |= 1
 
+    def set_mm(self, idx: int, val: int) -> None:
+        struct.pack_into("<QH", self.st[idx], 0, val & 0xFFFFFFFFFFFFFFFF, 0xFFFF)
+        self.st[idx][10:16] = b"\x00" * 6
+        self.enter_mmx()
+
     def get_mm(self, idx: int) -> int:
+        self.enter_mmx()
         return struct.unpack_from("<Q", self.st[idx], 0)[0]
 
 
@@ -566,6 +574,10 @@ def reference(
             m.xsave(out, 0, rfbm=7, is64=True)
         else:
             m.xsavec(out, 0, rfbm=7 if altered else rfbm, is64=name != "op_xrstor64_xsavec")
+    elif name == MMX_READ_EXPORT:
+        m.xrstor(a, rfbm=7, is64=True)
+        m.get_mm(3)
+        m.xsave(out, 0, rfbm=7, is64=True)
     elif name == AVX_XSAVE_EXPORT:
         m.xrstor(a, rfbm=7, is64=True)
         m.xsave(out, 0, rfbm=4, is64=True)
@@ -1855,6 +1867,15 @@ def check_differential(
             pass
         else:
             raise AssertionError("XSAVE output without MXCSR was not caught by the comparator")
+        # Negative control: an MM read that leaves TOP, the tags and XINUSE[0] alone must be caught.
+        want = reference(MMX_READ_EXPORT, a, b, mxcsr_mask, deprecates_cs_ds)
+        unchanged = reference("op_xrstor64_xsave64", a, b, mxcsr_mask, deprecates_cs_ds)
+        try:
+            assert_equal_output("lifted", MMX_READ_EXPORT, 0, unchanged, want)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("an MM read that leaves the x87 state alone was not caught by the comparator")
 
         diverged = {}
         for name in ALTERED_DEFINED_EXPORTS + ALTERED_CANONICAL_EXPORTS:

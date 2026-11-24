@@ -447,7 +447,16 @@ static inline Vec128 op_paddd(const Vec128& a, const Vec128& b) {
     return out;
 }
 
-static inline std::uint64_t get_mm(const XState& state, unsigned idx) {
+// Every MMX instruction but EMMS, one that only reads an MM register included, clears TOP, marks all tags valid
+// and leaves the x87 component in use.
+static inline void enter_mmx(XState& state) {
+    state.ftw = 0xFFu;
+    state.fsw = static_cast<std::uint16_t>(state.fsw & ~0x3800u);
+    state.xinuse |= 1ull;
+}
+
+static inline std::uint64_t get_mm(XState& state, unsigned idx) {
+    enter_mmx(state);
     std::uint64_t v = 0ull;
     std::memcpy(&v, state.st[idx], 8);
     return v;
@@ -458,9 +467,7 @@ static inline void set_mm(XState& state, unsigned idx, std::uint64_t val) {
     state.st[idx][8] = 0xFFu;
     state.st[idx][9] = 0xFFu;
     std::memset(state.st[idx] + 10, 0, 6);
-    state.ftw = 0xFFu;
-    state.fsw = static_cast<std::uint16_t>(state.fsw & ~0x3800u);
-    state.xinuse |= 1ull;
+    enter_mmx(state);
 }
 
 static inline void op_emms(XState& state) {
