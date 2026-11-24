@@ -2425,6 +2425,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_bit_alu_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl v_interp_p1ll_f16 / v_interp_p2_f16 (#1996): translation controls with a high-half inversion
+    # control, then a desktop draw of the translated pair with DXC 6_0.
+    add_test(NAME startup_gfx2hlsl_interp_f16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_interp_f16_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_interp_f16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_interp_f16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_interp_f16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl v_cmpx_le_i32_sdwa on a sign-extended byte decides which of 16 x 16 pixels survive, checked
     # pixel by pixel (#1906); translations without the select or without sext() must fail the same draw.
     foreach(adapter IN ITEMS warp hardware)

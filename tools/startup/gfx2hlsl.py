@@ -431,6 +431,10 @@ UNIFORM_VALU = frozenset((
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
+    # pixel: VGPR -> (attr, channel, high) of the v_interp_p1ll_f16 that wrote it. Created on first use, because
+    # unit probes build a Stage without __init__.
+    interp_p1 = None
+
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
         self.refusals = refusals
@@ -444,7 +448,8 @@ class Stage:
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
-        self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
+        self.attrs = {}           # pixel: attr index -> 'linear' | 'flat' | 'f16'
+        self.compr_params = set() # vertex: param indices exported with the compr flag (packed binary16 pairs)
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
         self.fetched = False      # vertex: the entry call into the fetch routine was translated as loads
@@ -570,6 +575,8 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
+        if getattr(self, 'interp_p1', None):
+            self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
         self.used_v.add(n)
@@ -1680,6 +1687,49 @@ class Stage:
         attr, comp = self.note_attr(ops[2], 'flat')
         self.set_v(reg_range(ops[0])[1], 'i.fparam%d.%s' % (attr, comp))
 
+    def interp_f16(self, op, ops, mods, vsrc, n_ops):
+        """Common checks of v_interp_p1ll_f16 / v_interp_p2_f16: -> (attr, channel index, high).
+
+        The attribute word holds two binary16 values. The vertex stage's compr export (see export()) splits the
+        pair into float channels, so half h of attribute channel c is float channel 2 * c + h of the parameter:
+        attrN.x = (param.x, param.y), attrN.y = (param.z, param.w). Channels z and w have no such pair.
+        """
+        extra = [m for m in mods if m != 'high']
+        if extra:
+            raise Unsupported('%s with %s: only the plain form and high are lowered' % (op, ' '.join(extra)))
+        if len(ops) != n_ops:
+            raise Unsupported('%s with %d operands, expected %d' % (op, len(ops), n_ops))
+        for tok in (ops[0], ops[1]) + tuple(ops[3:]):
+            if not re.fullmatch(r'v\d+', tok):
+                raise Unsupported('%s operand %s: only plain VGPRs are lowered' % (op, tok))
+        m = re.fullmatch(r'attr(\d+)\.([xyzw])', ops[2])
+        chan = 'xyzw'.index(m.group(2))
+        if chan > 1:
+            raise Unsupported('%s on channel %s: a compr export fills only the x and y channels' % (op, m.group(2)))
+        high = int('high' in mods)
+        return int(m.group(1)), 2 * chan + high, high
+
+    def op_v_interp_p1ll_f16(self, ops, mods):
+        # P0 + I * P10 in f32 from a binary16 attribute. The rasterizer interpolates the float channel, so the
+        # statement itself emits nothing; p2 reads the interpolated value. The destination is remembered so that
+        # p2 can be checked to continue this very pass.
+        attr, idx, high = self.interp_f16('v_interp_p1ll_f16', ops, mods, 1, 3)
+        self.attrs.setdefault(attr, set()).add('f16')
+        if self.interp_p1 is None:
+            self.interp_p1 = {}
+        self.interp_p1[int(ops[0][1:])] = (attr, idx, high)
+
+    def op_v_interp_p2_f16(self, ops, mods):
+        # P1 + J * P20, converted to binary16 into the low half of the destination (LLVM: the result is f16, the
+        # high bit selects the attribute half only). The upper half is kept.
+        attr, idx, high = self.interp_f16('v_interp_p2_f16', ops, mods, 1, 4)
+        if (self.interp_p1 or {}).get(int(ops[3][1:])) != (attr, idx, high):
+            raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' % (ops[3], ops[2]))
+        self.attrs.setdefault(attr, set()).add('f16')
+        d = reg_range(ops[0])[1]
+        self.used_v.add(d)
+        self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.param%d.%s)' % (d, attr, 'xyzw'[idx]))
+
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
         attr, component = int(m.group(1)), m.group(2)
@@ -1970,6 +2020,8 @@ class Stage:
         # what it held there; the pipeline's write mask carries that (manifest 'wmask', #1674).
         mask = sum(1 << c for c, v in enumerate(vals) if v != 'off')
         if 'compr' in flags:
+            if name.startswith('param'):
+                self.compr_params.add(int(name[5:]))
             if kind in ('uint', 'int'):
                 raise Unsupported('packed integer export %s' % name)
             # Two binary16 channels per register: the low pair (0, 1) from the first, the high pair
@@ -2266,6 +2318,10 @@ class Pipeline:
             self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'))
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
+        for a, how in self.ps.attrs.items():
+            if 'f16' in how and (how != {'f16'} or a not in self.vs.compr_params):
+                raise Unsupported('attribute %d is read as binary16 by the pixel stage but not only so, or not exported '
+                                  'with compr by the vertex stage' % a)
         missing = [a for a in self.ps.attrs if a not in self.params]
         if missing:
             raise Unsupported('pixel stage reads attributes %s the vertex stage does not export' % missing)
