@@ -45,6 +45,8 @@ struct BoundPipeline {
     bool depth_from_registers = false;  // X2W_DEPTH_STATE: depth_stencil was decoded from state block A (slot 57)
     bool has_stencil_ref = false;       // ... and its stencil test is on: stencil_ref goes on the list with each draw
     std::uint8_t stencil_ref = 0;
+    bool has_rasterizer = false;
+    D3D12_RASTERIZER_DESC rasterizer{};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
 };
@@ -468,10 +470,26 @@ bool stream_input_layout(const unsigned char* subobject, std::string& text)
     return true;
 }
 
+// RASTERIZER1 stores DepthBias as a float. The desktop PSO takes an int, so only an integral value
+// in the int range is representable.
+bool integral_depth_bias(float bias, INT& out)
+{
+    if (!(bias == bias)) return false;
+    const double value = static_cast<double>(bias);
+    if (value < -2147483648.0 || value > 2147483647.0) return false;
+    const INT integral = static_cast<INT>(value);
+    if (static_cast<double>(integral) != value) return false;
+    out = integral;
+    return true;
+}
+
 // Resolve the shader pointers and wrapped root while the caller still owns the stream.
 Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend,
-                                D3D12_DEPTH_STENCIL_DESC& depth_stencil, bool& has_depth_stencil, DXGI_FORMAT& dsv_format)
+                                D3D12_DEPTH_STENCIL_DESC& depth_stencil, bool& has_depth_stencil, DXGI_FORMAT& dsv_format,
+                                D3D12_RASTERIZER_DESC& rasterizer, bool& has_rasterizer)
 {
+    // RASTERIZER1 (type 27) is the same width as RASTERIZER. The width comes from the table.
+    static_assert(stream_sizes[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER] == sizeof(unsigned) + sizeof(D3D12_RASTERIZER_DESC));
     const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
     if (!desc.SizeInBytes || desc.SizeInBytes > 0x2000 || desc.SizeInBytes % 8 ||
         !x2w_local::readable(stream, desc.SizeInBytes)) return nullptr;
@@ -483,8 +501,12 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     for (std::size_t at = 0; at < desc.SizeInBytes;) {
         unsigned type;
         std::memcpy(&type, stream + at, sizeof(type));
-        if (type >= std::size(stream_sizes) || stream_sizes[type] > desc.SizeInBytes - at || (seen & (1u << type)))
-            return nullptr;
+        // Type 27 is RASTERIZER1. It is outside the table; its width is the RASTERIZER entry.
+        const bool rasterizer1 = type == 27;
+        if (!rasterizer1 && type >= std::size(stream_sizes)) return nullptr;
+        if (type >= 32) return nullptr;
+        const std::size_t size = rasterizer1 ? stream_sizes[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER] : stream_sizes[type];
+        if (size > desc.SizeInBytes - at || (seen & (1u << type))) return nullptr;
         seen |= 1u << type;
         if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
             std::memcpy(&root, stream + at + 8, sizeof(root));
@@ -518,8 +540,22 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
             std::memcpy(&fmt, stream + at + sizeof(type), sizeof(fmt));
             dsv_format = desktop_format(fmt);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER || type == 27) {
+            // RASTERIZER (48B from stream_sizes) / RASTERIZER1 (same width, float depth bias).
+            D3D12_RASTERIZER_DESC parsed{};
+            if (sizeof(type) + sizeof(parsed) > size) return nullptr;
+            std::memcpy(&parsed, stream + at + sizeof(type), sizeof(parsed));
+            if (type == 27) {
+                float bias = 0;
+                std::memcpy(&bias, &parsed.DepthBias, sizeof(bias));
+                INT integral = 0;
+                if (!integral_depth_bias(bias, integral)) return nullptr;
+                parsed.DepthBias = integral;
+            }
+            rasterizer = parsed;
+            has_rasterizer = true;
         }
-        at += stream_sizes[type];
+        at += size;
     }
     if (!root || !stages[0].pShaderBytecode || !stages[1].pShaderBytecode) return nullptr;
     std::vector<unsigned char> root_blob;
@@ -596,6 +632,10 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         if (info->has_stream_depth_stencil) {
             bound->depth_stencil = info->stream_depth_stencil;
             bound->has_depth_stencil = true;
+        }
+        if (info->has_stream_rasterizer) {
+            bound->rasterizer = info->stream_rasterizer;
+            bound->has_rasterizer = true;
         }
         bound->dsv_format = info->stream_dsv_format;
     }
@@ -726,6 +766,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
     const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
+    if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
@@ -746,7 +787,8 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         desc.GS = {tr.indexed_rect_geometry->GetBufferPointer(), tr.indexed_rect_geometry->GetBufferSize()};
     }
     // Blend state as found in the pipeline's state block, else opaque. Depth-stencil state and
-    // DSVFormat come from the stream PSO (or bound DSV), else disabled. Raster state: no culling.
+    // DSVFormat come from the stream PSO (or bound DSV), else disabled. Raster state comes from
+    // the stream RASTERIZER / RASTERIZER1 subobject, else solid fill, no culling, depth clip on.
     for (auto& target : desc.BlendState.RenderTarget)
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
@@ -759,9 +801,13 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     }
     if (use_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
     desc.SampleMask = ~0u;
-    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    desc.RasterizerState.DepthClipEnable = TRUE;
+    if (bound.has_rasterizer) {
+        desc.RasterizerState = bound.rasterizer;
+    } else {
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+    }
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) desc.RTVFormats[i] = pass.target_formats[i];

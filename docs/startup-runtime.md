@@ -1954,7 +1954,12 @@ These are measured on one executable; treat them as hypotheses for others.
   pipeline, submits the wrapped list, waits for its fence and checks all 32 RGBA pixels on WARP and
   hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
-  Other stage combinations and full stream rasterizer/depth state remain open.
+  A stream `RASTERIZER` or `RASTERIZER1` subobject sets the translated pipeline's fill, cull and depth
+  clip. `RASTERIZER1` stores depth bias as a float; a value that is not an integer in the desktop range
+  refuses the pipeline. The cull check is
+  `ctest --preset release --no-tests=error -R "^startup_stream_rasterizer_"`.
+  The ignore control expects the no-cull readback and fails. Stream depth-stencil state is already
+  applied on this path. Geometry, hull, domain and compute stages remain open.
 - Translated draws use the bound typed RTV formats to request colour-export variants. The
   manifest's `targets` line lists exported slots. A separate `rtv1` line identifies the base
   shader and the ordered RTV formats, and the draw rejects a variant with a mismatched line.
