@@ -5411,6 +5411,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             helpers.add("cvt_u32_f32")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat(cvt_u32_f32(asuint({operand})));")
+        elif m := match(r"v_cvt_f32_ubyte([0-3])_sdwa (v\d+), ([vs]\d+)( clamp)? dst_sel:DWORD dst_unused:UNUSED_(?:PAD|PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            byte, dst, src, clamp, field = m.groups()
+            if mask != "entry" or int(dst[1:]) > 255:
+                raise ValueError("Invalid SDWA byte conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word = int_operand(src, scalar, vector, pending, sample_dest, signed=False)
+            selected = sdwa_source(word, field, False)
+            expression = f"float((({selected}) >> {8 * int(byte)}u) & 0xffu)"
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_cvt_f32_ubyte([0-3])(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Byte N of the source word as an unsigned integer. The source is read as bits,
             # so float modifiers do not apply and are rejected by the pattern.

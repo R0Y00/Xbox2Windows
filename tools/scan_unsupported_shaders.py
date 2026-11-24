@@ -159,6 +159,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"v_readfirstlane_b32(?:_e32)?\s+s\d+,\s+{INTEGER_SOURCE}",
     rf"v_mov_b32_sdwa\s+v\d+,\s+(?:sext\((?:[vs]\d+|-?\d+(?:\.\d+)?)\)|[vs]\d+|-?\d+(?:\.\d+)?)\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)\s+src0_sel:{SDWA_SEL_PATTERN}",
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
+    r"v_cvt_f32_ubyte[0-3]_sdwa\s+v\d+,\s+[vs]\d+(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:(?:BYTE_[0-3]|WORD_[01]|DWORD)",
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
     r"v_cvt_f16_f32(?:_e32|_e64)?\s+v\d+,\s+[^,\s]+",
     r"v_cvt_i32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",

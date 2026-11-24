@@ -7433,6 +7433,17 @@ SDWA_UNARY = (
        "ties rounded up, placed"),
       (0, 3, lambda a, b, c, d: half_rtz(math.frexp(d)[0]), "result not placed"),
       (0, 3, lambda a, b, c, d: sdwa_unary_place(d, 0, 24, 8) * 2.0, "wrong byte value placed"))),
+    ("sdwa_unsigned_bytes", [
+        "v_mov_b32_e32 v18, s44",
+        "v_cvt_f32_ubyte0_sdwa v12, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2",
+        "v_cvt_f32_ubyte1_sdwa v13, s45 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+        "v_cvt_f32_ubyte2_sdwa v14, s46 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+        "v_cvt_f32_ubyte3_sdwa v15, s47 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+    ], ((0x4180ff12, 0xc0123456, 0x40ff0000, 0x3f880000),
+        (0x400000ff, 0x3f128000, 0x40000001, 0xc0100000)),
+     lambda a, b, c, d: tuple(_byte(_f32_word(x), n) for x, n in zip((a, b, c, d), (2, 3, 2, 3))),
+     ((0, 0, lambda a, b, c, d: _byte(_f32_word(a), 0), "ignored BYTE_2 selection"),
+      (0, 1, lambda a, b, c, d: _byte(_f32_word(b), 1), "ignored WORD_1 selection"))),
 )
 
 
@@ -7452,6 +7463,12 @@ def check_sdwa_unary_lowering():
     """Static checks for SDWA_UNARY: each form reuses its e32/e64 lowering, and the refusals stay."""
     bodies = [translate(with_constants(body)).split("float4 main", 1)[1] for _, body, *_ in SDWA_UNARY]
     assert set(SDWA_UNARY_OPS) <= ACCEPTED, set(SDWA_UNARY_OPS) - ACCEPTED
+    byte_op = "v_cvt_f32_ubyte3_sdwa v12, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0"
+    clamped = translate(with_constants([byte_op.replace(" dst_sel", " clamp dst_sel")]))
+    assert "saturate(float(" in clamped
+    for invalid in (byte_op.replace("s44 ", "7 "), byte_op.replace("dst_sel:DWORD", "dst_sel:BYTE_1"),
+                    byte_op.replace("s44 ", "sext(s44) "), byte_op.replace("v12,", "v256,")):
+        must_reject(translate, with_constants([invalid]))
     for text in ("exp2((-params[0].w))", "log2(abs(params[1].x))", "(1.0f / params[1].y)",
                  "(1.0f / (-abs(params[1].z)))"):
         assert text in bodies[0], (text, bodies[0])
