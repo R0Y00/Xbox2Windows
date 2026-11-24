@@ -7434,6 +7434,17 @@ SDWA_UNARY = (
        "ties rounded up, placed"),
       (0, 3, lambda a, b, c, d: half_rtz(math.frexp(d)[0]), "result not placed"),
       (0, 3, lambda a, b, c, d: sdwa_unary_place(d, 0, 24, 8) * 2.0, "wrong byte value placed"))),
+    ("sdwa_unsigned_bytes", [
+        "v_mov_b32_e32 v18, s44",
+        "v_cvt_f32_ubyte0_sdwa v12, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2",
+        "v_cvt_f32_ubyte1_sdwa v13, s45 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+        "v_cvt_f32_ubyte2_sdwa v14, s46 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+        "v_cvt_f32_ubyte3_sdwa v15, s47 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+    ], ((0x4180ff12, 0xc0123456, 0x40ff0000, 0x3f880000),
+        (0x400000ff, 0x3f128000, 0x40000001, 0xc0100000)),
+     lambda a, b, c, d: tuple(_byte(_f32_word(x), n) for x, n in zip((a, b, c, d), (2, 3, 2, 3))),
+     ((0, 0, lambda a, b, c, d: _byte(_f32_word(a), 0), "ignored BYTE_2 selection"),
+      (0, 1, lambda a, b, c, d: _byte(_f32_word(b), 1), "ignored WORD_1 selection"))),
 )
 
 
@@ -7453,6 +7464,12 @@ def check_sdwa_unary_lowering():
     """Static checks for SDWA_UNARY: each form reuses its e32/e64 lowering, and the refusals stay."""
     bodies = [translate(with_constants(body)).split("float4 main", 1)[1] for _, body, *_ in SDWA_UNARY]
     assert set(SDWA_UNARY_OPS) <= ACCEPTED, set(SDWA_UNARY_OPS) - ACCEPTED
+    byte_op = "v_cvt_f32_ubyte3_sdwa v12, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0"
+    clamped = translate(with_constants([byte_op.replace(" dst_sel", " clamp dst_sel")]))
+    assert "saturate(float(" in clamped
+    for invalid in (byte_op.replace("s44 ", "7 "), byte_op.replace("dst_sel:DWORD", "dst_sel:BYTE_1"),
+                    byte_op.replace("s44 ", "sext(s44) "), byte_op.replace("v12,", "v256,")):
+        must_reject(translate, with_constants([invalid]))
     for text in ("exp2((-params[0].w))", "log2(abs(params[1].x))", "(1.0f / params[1].y)",
                  "(1.0f / (-abs(params[1].z)))"):
         assert text in bodies[0], (text, bodies[0])
@@ -7528,6 +7545,134 @@ def check_sdwa_unary_draws(directory, compiler, renderer, backend):
         assert cases[-1][1] == "pass" and len(cases) == len(rows) + len(wrongs), name
         try:
             run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+SDWA_CVT_UBYTE_OPS = tuple(f"v_cvt_f32_ubyte{i}_sdwa" for i in range(4))
+
+SDWA_CVT_UBYTE_PROGRAMS = [
+    # Program 0: All 4 byte indices, whole-dword, plain and clamp, SGPR and VGPR sources.
+    [
+        "v_mov_b32_e32 v18, s45",
+        "v_cvt_f32_ubyte0_sdwa v12, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2",
+        "v_cvt_f32_ubyte1_sdwa v13, v18 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+        "v_cvt_f32_ubyte2_sdwa v14, s46 clamp dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+        "v_cvt_f32_ubyte3_sdwa v15, s47 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+    ],
+]
+
+
+def sdwa_cvt_ubyte_ref0(a, b, c, d):
+    return [
+        float((a >> 16) & 0xff),
+        float((b >> 24) & 0xff),
+        min(1.0, float((c >> 16) & 0xff)),
+        float((d >> 24) & 0xff),
+    ]
+
+
+SDWA_CVT_UBYTE_TEST_SETS = (
+    (0x12345678, 0x9abcdef0, 0x00020000, 0x40000000),
+    (0x80000000, 0x0000007f, 0x00000000, 0x01000000),
+    (0xffffffff, 0x80808080, 0x00ff0000, 0x00000000),
+    (0x00000001, 0x0000ff00, 0x00010000, 0x80000000),
+)
+
+
+def check_sdwa_cvt_ubyte_lowering():
+    """Static checks for SDWA v_cvt_f32_ubyte[0-3]_sdwa lowering and refusals."""
+    for prog in SDWA_CVT_UBYTE_PROGRAMS:
+        hlsl = translate(with_constants(prog))
+        for i in range(4):
+            assert f">> {8 * i}u) & 0xffu)" in hlsl, (i, hlsl)
+    assert set(SDWA_CVT_UBYTE_OPS) <= ACCEPTED, set(SDWA_CVT_UBYTE_OPS) - ACCEPTED
+
+    hlsl0 = translate(with_constants(SDWA_CVT_UBYTE_PROGRAMS[0]))
+    assert "saturate(" in hlsl0
+
+    for mod in ("-s44", "|s44|", "-v18", "|v18|"):
+        must_reject(translate, with_constants([f"v_cvt_f32_ubyte0_sdwa v12, {mod} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+
+    must_reject(translate, with_constants(["v_cvt_f32_ubyte0_sdwa v256, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+    must_reject(translate, with_constants(["v_cvt_f32_ubyte0_sdwa v12, s106 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+    must_reject(translate, with_constants(["v_cvt_f32_ubyte0_sdwa v12, v256 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+    must_reject(translate, with_constants(["v_cvt_f32_ubyte0_sdwa v12, 7 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+    must_reject(translate, with_constants(["v_cvt_f32_ubyte0_sdwa v12, sext(s44) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+    must_reject(translate, with_constants(["v_cvt_f32_ubyte0_sdwa v12, s44 dst_sel:DWORD dst_unused:UNUSED_SEXT src0_sel:DWORD"]))
+
+    for partial in ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1"):
+        must_reject(translate, with_constants([f"v_cvt_f32_ubyte0_sdwa v12, s44 dst_sel:{partial} dst_unused:UNUSED_PAD src0_sel:DWORD"]))
+        must_reject(translate, with_constants([f"v_cvt_f32_ubyte0_sdwa v12, s44 dst_sel:{partial} dst_unused:UNUSED_PRESERVE src0_sel:DWORD"]))
+
+    low16_prog = [
+        "v_mov_b32_e32 v18, s45",
+        "v_add_nc_u16 v18, v18, 1",
+        "v_cvt_f32_ubyte0_sdwa v12, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1",
+    ]
+    expect_value_error(translate, with_constants(low16_prog), "Reads the undefined high half of a 16-bit result")
+
+
+def check_sdwa_cvt_ubyte_draws(directory, compiler, renderer, backend):
+    """Draw the SDWA unsigned byte conversions under whole-dword destination selection."""
+    programs = (
+        ("sdwa_cvt_ubyte_plain", SDWA_CVT_UBYTE_PROGRAMS[0], sdwa_cvt_ubyte_ref0),
+    )
+    for name, body, ref_func in programs:
+        source = directory / f"{name}.hlsl"
+        shader = directory / f"{name}.cso"
+        hlsl = translate(with_constants(body))
+        source.write_text(hlsl, encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+        cases = []
+        for index, row in enumerate(SDWA_CVT_UBYTE_TEST_SETS):
+            expected = ref_func(*row)
+            assert tuple(map(half_rtz, expected)) == tuple(expected), (name, expected)
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *row)
+
+            for channel in range(4):
+                wrong_values = list(expected)
+                wrong_values[channel] = expected[channel] + 1.0 if expected[channel] < 254.0 else 0.0
+                mismatch_path = directory / f"{name}-case{index}-bad{channel}.case"
+                mismatch_path.write_bytes(bytes(constants) + struct.pack("<4f", *wrong_values) * 64)
+                cases.append((mismatch_path, "mismatch"))
+
+            pass_path = directory / f"{name}-case{index}-pass.case"
+            pass_path.write_bytes(bytes(constants) + struct.pack("<4f", *expected) * 64)
+            cases.append((pass_path, "pass"))
+
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+
+    mutations = [
+        ("sdwa_cvt_ubyte_mut_op", SDWA_CVT_UBYTE_PROGRAMS[0], "v_cvt_f32_ubyte0_sdwa", "v_cvt_f32_ubyte1_sdwa", sdwa_cvt_ubyte_ref0),
+        ("sdwa_cvt_ubyte_mut_clamp", SDWA_CVT_UBYTE_PROGRAMS[0], "clamp dst_sel:DWORD", "dst_sel:DWORD", sdwa_cvt_ubyte_ref0),
+    ]
+    for mut_name, orig_body, old_tok, new_tok, ref_func in mutations:
+        mut_body = [line.replace(old_tok, new_tok) for line in orig_body]
+        assert mut_body != orig_body, mut_name
+        source = directory / f"{mut_name}.hlsl"
+        shader = directory / f"{mut_name}.cso"
+        source.write_text(translate(with_constants(mut_body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+        row = SDWA_CVT_UBYTE_TEST_SETS[0]
+        expected = ref_func(*row)
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *row)
+        mut_path = directory / f"{mut_name}.case"
+        mut_path.write_bytes(bytes(constants) + struct.pack("<4f", *expected) * 64)
+        try:
+            run_pixel_batch(renderer, backend, shader, [(mut_path, "mismatch")])
         except subprocess.CalledProcessError as error:
             if error.returncode == 77:
                 return 77
@@ -15161,6 +15306,8 @@ def _check_controls_inline(directory):
     # A partial UNUSED_PRESERVE result needs a tracked numeric destination, as for SDWA moves.
     for register in ("v0", "v8", "v20"):
         must_reject(translate, with_constants([sdwa_arith("floor", register, ["s44"], "BYTE_2", "UNUSED_PRESERVE")]))
+    check_sdwa_unary_lowering()
+    check_sdwa_cvt_ubyte_lowering()
 
     program = assembly(False)
     for old, new in (("s_mov_b32 s21, 0", "s_mov_b32 s21, 1"),
@@ -22019,7 +22166,8 @@ def main():
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac",
+                    "draw-sdwa-cvt-ubyte"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
@@ -22070,6 +22218,7 @@ def main():
                         "draw-cmp-f64": check_cmpf64_draw,
                         "draw-shift64": check_shift64_draw,
                         "draw-pk-fmac": check_pk_fmac_draw,
+                        "draw-sdwa-cvt-ubyte": check_sdwa_cvt_ubyte_draws,
                         "draw-flat-scratch": check_flat_scratch_draws,
                         "draw-smem-pointers": check_smem_pointer_draw,
                         "draw-dpp-f16": check_dpp_f16_draw}[mode]

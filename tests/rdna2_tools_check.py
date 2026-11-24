@@ -5470,6 +5470,14 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_mad_f32_sdwa v1, s2, v3, v4 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
+        for idx in range(4):
+            ubyte_line = f"v_cvt_f32_ubyte{idx}_sdwa v1, s2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"
+            self.assertTrue(is_instruction_supported(ubyte_line), ubyte_line)
+            self.assertTrue(is_instruction_supported(f"v_cvt_f32_ubyte{idx}_sdwa v1, v2 clamp dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1"), ubyte_line)
+            self.assertFalse(is_instruction_supported(ubyte_line.replace("UNUSED_PAD", "UNUSED_SEXT")), ubyte_line)
+            self.assertFalse(is_instruction_supported(ubyte_line.replace("dst_sel:DWORD", "dst_sel:WORD_0")), ubyte_line)
+            self.assertFalse(is_instruction_supported(ubyte_line.replace("s2", "sext(s2)")), ubyte_line)
+            self.assertTrue(is_opcode_recognized(f"v_cvt_f32_ubyte{idx}_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
         self.assertTrue(is_opcode_recognized("v_dot4_i32_i8"))
         self.assertTrue(is_instruction_supported("v_cvt_f32_u32_e32 v1, v2"))

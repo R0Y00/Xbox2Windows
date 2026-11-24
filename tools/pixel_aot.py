@@ -4458,6 +4458,34 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_cvt_f32_ubyte([0-3])_sdwa (v\d+), ([vs]\d+)( clamp)? dst_sel:DWORD dst_unused:UNUSED_(?:PAD|PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # Sub-dword unsigned byte extraction and conversion to float under SDWA with DWORD destination.
+            # The source sub-dword field is selected and zero-extended before byte N is extracted as an unsigned 8-bit integer.
+            byte_idx, dst, src, clamp, src_sel = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid SDWA byte conversion")
+            if src.startswith("s") and int(src[1:]) > 105:
+                raise ValueError(f"Register out of range: {src}")
+            if src.startswith("v") and int(src[1:]) > 255:
+                raise ValueError(f"Register out of range: {src}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if (src_name := low16_name(src, vector)) is not None:
+                if src_sel not in ("WORD_0", "BYTE_0", "BYTE_1"):
+                    raise ValueError("Reads the undefined high half of a 16-bit result")
+                word = f"asuint({src_name})"
+            elif (half_name := half16_name(src, vector)) is not None:
+                if src_sel != "WORD_0":
+                    raise ValueError("Reads the undefined high half of a 16-bit result")
+                word = f"asuint({half_name})"
+            else:
+                word = int_operand(src, scalar, vector, pending, sample_dest, signed=False)
+            selected = sdwa_source(word, src_sel, False)
+            expr = f"float((({selected}) >> {8 * int(byte_idx)}u) & 0xffu)"
+            if clamp:
+                expr = f"saturate({expr})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
         elif m := match(rf"v_({'|'.join(SDWA_ALU)})_f32_sdwa (v\d+), (.+?)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:DWORD( src1_sel:DWORD)?"):
             # SDWA forms of binary32 arithmetic take whole-dword sources, so the binary32 denormal mode never
             # applies to a zero-extended field; the result is placed like an SDWA move.
