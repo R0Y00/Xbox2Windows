@@ -1,11 +1,11 @@
-"""Reject explicit bidirectional text controls in tracked source, scripts and build/CI configuration.
+"""Reject explicit bidirectional text controls in tracked text files (source, scripts, data, configuration).
 
 The explicit controls are the embeddings and overrides U+202A..U+202E, the isolates
 U+2066..U+2069 and the Arabic letter mark U+061C. They reorder how text is displayed without
 changing what a compiler or an interpreter reads, so a reviewer can see different code from
 what runs. Each finding is reported as path:line: code point and name. Files are read as UTF-8
-with replacement, so the check does not enforce an encoding, and Markdown documentation is out
-of scope.
+with replacement, so the check does not enforce an encoding. Every tracked file is scanned
+except Markdown documentation and binary images (see EXCLUDED_SUFFIXES).
 """
 
 import argparse
@@ -16,20 +16,17 @@ import tempfile
 import unicodedata
 
 CONTROLS = frozenset([0x061C, *range(0x202A, 0x202F), *range(0x2066, 0x206A)])
-SOURCE_SUFFIXES = frozenset({
-    ".asm", ".c", ".cc", ".cpp", ".cxx", ".def", ".h", ".hh", ".hlsl", ".hlsli", ".hpp", ".inc",
-    ".inl", ".py",                                     # sources
-    ".bat", ".cmd", ".ps1", ".psm1", ".sh",            # scripts
-    ".cmake",                                          # build scripts
+# Everything tracked is scanned except these. A new file type is therefore covered by default,
+# and a new binary type fails loudly (as a false finding) until it is listed here.
+EXCLUDED_SUFFIXES = frozenset({
+    ".md",                                             # documentation, out of scope
+    ".png",                                            # binary images
 })
-CONFIG_NAMES = frozenset({"CMakeLists.txt", "CMakePresets.json", "requirements-dev.txt", ".gitattributes"})
 
 
 def in_scope(path):
-    """True for source files, scripts, and build or CI configuration."""
-    path = PurePosixPath(path)
-    return (path.suffix.lower() in SOURCE_SUFFIXES or path.name in CONFIG_NAMES
-            or (path.parts[:1] == (".github",) and path.suffix.lower() in {".yml", ".yaml"}))
+    """True for every tracked file except Markdown documentation and binary images."""
+    return PurePosixPath(path).suffix.lower() not in EXCLUDED_SUFFIXES
 
 
 def findings(root, paths):
@@ -66,18 +63,28 @@ def self_test():
             "docs/notes.md": f"Markdown is out of scope {override}\n",
             "CMakeLists.txt": "project(sample)\n",
             ".github/workflows/ci.yml": f"name: ci{override}\n",
+            "tests/cpu/archive/reader.zig": f"const a = 1;{override}\n",
+            "tests/spirv_window/case.spvasm": f"; note\n%1 = OpTypeVoid {isolate}\n",
+            "tools/patches/fix.patch": f"+int q = 0;{override}\n",
+            "docs/coverage/table.tsv": f"a\tb{arabic_letter_mark}\n",
+            "docs/ref.png": f"\x89PNG {override}\n",
             "tools/mark.py": f"label = 'r\u00e9sum\u00e9{arabic_letter_mark}'\n",
         }
         for name, text in files.items():
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_bytes(text.encode("utf-8"))  # exact bytes, no newline translation
         scoped = [name for name in files if in_scope(name)]
-        assert "docs/notes.md" not in scoped
+        assert "docs/notes.md" not in scoped and "docs/ref.png" not in scoped
+        assert in_scope("tools/new_type.xyz") and in_scope("LICENSE")
         assert list(findings(root, scoped)) == [
             ".github/workflows/ci.yml:1: U+202E RIGHT-TO-LEFT OVERRIDE",
+            "docs/coverage/table.tsv:1: U+061C ARABIC LETTER MARK",
+            "tests/cpu/archive/reader.zig:1: U+202E RIGHT-TO-LEFT OVERRIDE",
             "tests/isolate.cpp:2: U+2066 LEFT-TO-RIGHT ISOLATE",
+            "tests/spirv_window/case.spvasm:2: U+2066 LEFT-TO-RIGHT ISOLATE",
             "tools/hidden.py:2: U+202E RIGHT-TO-LEFT OVERRIDE",
             "tools/mark.py:1: U+061C ARABIC LETTER MARK",
+            "tools/patches/fix.patch:1: U+202E RIGHT-TO-LEFT OVERRIDE",
         ], list(findings(root, scoped))
     # Two ranges and one code point: the ten explicit controls, nothing more.
     assert sorted(CONTROLS) == [0x061C, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
@@ -98,7 +105,7 @@ def main():
     if found:
         print("\n".join(found))
         return 1
-    print(f"Checked {len(paths)} tracked source, script and build/CI files: no bidirectional controls.")
+    print(f"Checked {len(paths)} tracked text files: no bidirectional controls.")
     return 0
 
 
