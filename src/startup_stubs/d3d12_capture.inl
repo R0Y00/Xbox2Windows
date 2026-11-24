@@ -130,14 +130,13 @@ const PipelineInfo* pipeline_info(const Wrapper* w)
     ReleaseSRWLockShared(&note_lock);
     return info;
 }
-extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t bytes);
 void note_root_blob(Wrapper* w, const void* blob, std::size_t bytes)
 {
     if (!blob || !bytes || bytes > (1u << 20)) return;
     std::vector<unsigned char> copy(static_cast<const unsigned char*>(blob), static_cast<const unsigned char*>(blob) + bytes);
-    // A blob the d3d12_xs serializer produced without the title's heap-indexing flags (see
-    // serialize_for_runtime in src/d3d12_xs_shim.cpp): the copy kept for shader translation gets them
-    // back, because the title's shaders take the heap pointers in the registers those flags add.
+    // The blob the d3d12_xs serializer returned after removing the title's heap-indexing flags (see
+    // serialize_for_runtime in src/d3d12_xs_shim.cpp): the copy kept for shader translation gets that
+    // call's bits back, because the title's shaders take the heap pointers in the registers they add.
     if (const std::uint32_t stripped = x2w_stripped_root_flags(blob, bytes); stripped && bytes >= 32 && !std::memcmp(copy.data(), "DXBC", 4)) {
         std::uint32_t parts = 0;
         std::memcpy(&parts, copy.data() + 28, 4);

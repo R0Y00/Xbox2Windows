@@ -55,6 +55,12 @@
 #include <utility>
 #include <vector>
 
+// The heap-indexing bits src/d3d12_xs_shim.cpp removed for the blob it returned at exactly this
+// buffer. A build that compiles this file without the shim (offscreen_check) links the fallback, 0.
+extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t bytes);
+extern "C" std::uint32_t x2w_no_stripped_root_flags(const void*, std::size_t) { return 0; }
+#pragma comment(linker, "/alternatename:x2w_stripped_root_flags=x2w_no_stripped_root_flags")
+
 namespace {
 
 using u64 = std::uint64_t;
@@ -1473,6 +1479,20 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     ReleaseSRWLockExclusive(&root_lock);
     *out = w;
     return S_OK;
+}
+
+// Fixtures: the copy of a root signature's blob kept for shader translation (the .root request and the
+// translation key). Returns its size and copies up to capacity bytes to out; 0 for anything else.
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_root_translation_blob(void* root, void* out, std::size_t capacity)
+{
+    Wrapper* w = as_wrapper(root);
+    if (!w || w->own().kind != root_signature_kind) return 0;
+    AcquireSRWLockShared(&note_lock);
+    const auto found = root_blobs().find(w);
+    const std::size_t bytes = found == root_blobs().end() ? 0 : found->second.size();
+    if (bytes && out) std::memcpy(out, found->second.data(), bytes < capacity ? bytes : capacity);
+    ReleaseSRWLockShared(&note_lock);
+    return bytes;
 }
 
 ID3DBlob* compile_translation(const void* container, const std::vector<RootParameter>*, char* why, std::size_t why_size)

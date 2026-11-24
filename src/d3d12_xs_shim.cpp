@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "d3d12x_device_slots.h"
 
@@ -47,19 +48,59 @@ VmState vm_state;
 // signature still gets a blob. The result no longer declares direct heap indexing.
 constexpr std::uint32_t heap_indexing_flags = 0x00000C00u;
 
-// Blobs serialized without heap-indexing bits, by content hash, so that the recording device can give
-// the bits back to its copy for shader translation (x2w_stripped_root_flags).
-struct StrippedBlob { std::uint64_t hash; std::uint32_t bits; };
+// The serialized bytes do not say which input produced them: the legal baseline and inputs with only
+// 0x400, only 0x800 or both serialize to the same blob once the bits are removed. The removed bits are
+// therefore tied to the blob object a retry returns. That object registers its buffer while it lives
+// and unregisters it before the buffer can be freed and reused, so x2w_stripped_root_flags answers
+// for that exact buffer only. A copy of the bytes, or a blob from any other call, reports 0.
+struct StrippedBlob { const void* data; std::size_t bytes; std::uint32_t bits; };
 SRWLOCK stripped_lock = SRWLOCK_INIT;
-StrippedBlob stripped_blobs[4096];
-LONG stripped_count;
+std::vector<StrippedBlob> stripped_blobs;
 
-std::uint64_t blob_hash(const void* data, std::size_t bytes)
-{
-    std::uint64_t h = 1469598103934665603ull;
-    for (std::size_t i = 0; i < bytes; ++i) h = (h ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
-    return h ^ bytes;
-}
+class RetriedBlob final : public ID3DBlob {
+public:
+    RetriedBlob(ID3DBlob* inner, std::uint32_t bits) : inner_(inner)
+    {
+        AcquireSRWLockExclusive(&stripped_lock);
+        stripped_blobs.push_back({inner_->GetBufferPointer(), inner_->GetBufferSize(), bits});
+        ReleaseSRWLockExclusive(&stripped_lock);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
+    {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D10Blob)) return E_NOINTERFACE;
+        *out = static_cast<ID3DBlob*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        const LONG left = InterlockedDecrement(&refs_);
+        if (!left) delete this;
+        return static_cast<ULONG>(left);
+    }
+    LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return inner_->GetBufferPointer(); }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return inner_->GetBufferSize(); }
+
+private:
+    ~RetriedBlob()
+    {
+        const void* data = inner_->GetBufferPointer();
+        AcquireSRWLockExclusive(&stripped_lock);
+        for (std::size_t i = 0; i < stripped_blobs.size(); ++i)
+            if (stripped_blobs[i].data == data) {
+                stripped_blobs[i] = stripped_blobs.back();
+                stripped_blobs.pop_back();
+                break;
+            }
+        ReleaseSRWLockExclusive(&stripped_lock);
+        inner_->Release();  // only now may the buffer be reused
+    }
+    ID3DBlob* inner_;
+    LONG refs_ = 1;
+};
 
 bool permissive_switch()
 {
@@ -87,13 +128,7 @@ HRESULT serialize_for_runtime(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, I
         return hr;  // something else is wrong: keep the first answer and its error blob
     }
     if (retry_error) retry_error->Release();
-    if (*blob) {
-        const std::uint64_t hash = blob_hash((*blob)->GetBufferPointer(), (*blob)->GetBufferSize());
-        AcquireSRWLockExclusive(&stripped_lock);
-        if (stripped_count < static_cast<LONG>(sizeof(stripped_blobs) / sizeof(stripped_blobs[0])))
-            stripped_blobs[stripped_count++] = {hash, flags & heap_indexing_flags};
-        ReleaseSRWLockExclusive(&stripped_lock);
-    }
+    if (*blob) *blob = new RetriedBlob(*blob, flags & heap_indexing_flags);
     if (error_blob && *error_blob) {
         (*error_blob)->Release();
         *error_blob = nullptr;
@@ -106,15 +141,15 @@ HRESULT serialize_for_runtime(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, I
 }
 }
 
-// The heap-indexing bits serialize_for_runtime removed from this blob, 0 if it removed none.
+// The heap-indexing bits serialize_for_runtime removed for the live blob whose buffer is exactly
+// (blob, bytes), 0 for any other pointer or size.
 extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t bytes)
 {
     if (!blob || !bytes) return 0;
-    const std::uint64_t hash = blob_hash(blob, bytes);
     std::uint32_t bits = 0;
     AcquireSRWLockShared(&stripped_lock);
-    for (LONG i = 0; i < stripped_count; ++i)
-        if (stripped_blobs[i].hash == hash) bits = stripped_blobs[i].bits;
+    for (const StrippedBlob& entry : stripped_blobs)
+        if (entry.data == blob && entry.bytes == bytes) bits = entry.bits;
     ReleaseSRWLockShared(&stripped_lock);
     return bits;
 }
