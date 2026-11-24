@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 from pe_package_preflight import inspect
+from host_commit import read_host_commit, require_commit_budget
 
 # --trap-callable exit codes are TRAP_EXIT_BASE | trap number (1-based, in sorted dll!symbol order).
 TRAP_EXIT_BASE = 0xE7A00000
@@ -280,6 +281,9 @@ def main():
     parser.add_argument("--pin-shim", action="append", default=[], metavar="DLL",
                         help="keep a named external shim loaded until this process exits")
     parser.add_argument("--system", action="append", default=[], metavar="DLL")
+    parser.add_argument("--min-commit-mib", type=int, metavar="MIB",
+                        help="optional Windows system commit-headroom check before loading any DLL; "
+                             "0 reports headroom without imposing a minimum")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--preflight-only", action="store_true")
     mode.add_argument("--trap-callable", action="append", default=[], metavar="DLL!SYMBOL",
@@ -288,6 +292,13 @@ def main():
                            f"{TRAP_EXIT_BASE:#x} | trap number; any unlisted unresolved external is still refused")
     options = parser.parse_args()
     try:
+        # Perform the opt-in check before parsing the package or loading providers.
+        # A successful check does not reserve memory and cannot promise startup.
+        commit_report = None
+        if options.min_commit_mib is not None:
+            if not 0 <= options.min_commit_mib <= 1 << 20:
+                raise ValueError("--min-commit-mib must be between 0 and 1048576")
+            commit_report = require_commit_budget(options.min_commit_mib, read_host_commit())
         root = options.package.resolve(strict=True)
         shims = {name.casefold(): Path(path).resolve(strict=True) for name, path in options.shim}
         system = {name.casefold() for name in options.system}
@@ -298,6 +309,8 @@ def main():
                      preflight_only=options.preflight_only,
                      pin_shims={name.casefold() for name in options.pin_shim},
                      trap_callable=options.trap_callable)
+        if commit_report is not None:
+            result = {**result, "host_commit": commit_report}
     except (ValueError, OSError) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))

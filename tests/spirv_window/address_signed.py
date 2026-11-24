@@ -2,8 +2,9 @@
 
 Usage: address_signed.py <spirv-as> <spirv-val> <spirv-cross> [<dxc> <offscreen_check> <hardware|warp>]
 
-The fixture performs OpAtomicSMin, OpAtomicSMax and a load through signed physical pointers, then stores the
-three results through signed output pointers. With three arguments the test checks the lowering's shape and
+The fixture performs OpAtomicSMin, OpAtomicSMax and a load through signed physical pointers, then runs OpAtomicIAdd,
+OpAtomicExchange, OpAtomicAnd, OpAtomicOr, OpAtomicXor and two OpAtomicCompareExchange (one missing, one hitting) in
+sequence on one signed word, and stores the ten old values through signed output pointers. With three arguments the test checks the lowering's shape and
 that SPIRV-Cross emits a signed compare-exchange loop. With six it also runs the D3D12 readback, whose CPU
 model in readback.cpp shares no code with the lowering, and then each negative control: a mutation of the
 lowered module that must first diverge at a predicted case and word.
@@ -22,33 +23,54 @@ from spirv_address_window import lower
 SOURCE = Path(__file__).with_suffix(".spvasm").read_text(encoding="utf-8")
 FLAG = "--spirv-address-window-signed"
 MIN, MAX = "%x2w_signed_result_old_min", "%x2w_signed_result_old_max"
+ADD, EXCHANGE, AND, OR, XOR, MISS, HIT = (f"%x2w_signed_result_old_{name}" for name in (
+    "add", "exchange", "and", "or", "xor", "miss", "hit"))
+# stem, atomic, value operand, comparator operand: the sequence runs on one word, so each step feeds the next.
+SEQUENCE = ((ADD, "OpAtomicIAdd", "%operand", None), (EXCHANGE, "OpAtomicExchange", "%operand", None),
+            (AND, "OpAtomicAnd", "%mask_high", None), (OR, "OpAtomicOr", "%bits_low", None),
+            (XOR, "OpAtomicXor", "%xor_bits", None), (MISS, "OpAtomicCompareExchange", "%next_first", "%wrong"),
+            (HIT, "OpAtomicCompareExchange", "%next_second", "%expected"))
 
 # name, (old, new) edit of the lowered module, case, first diverging word
 CONTROLS = (
     ("SMin compared as unsigned", (f"{MIN}_pick = OpSLessThan", f"{MIN}_pick = OpULessThan"),
-     "signed positive operand", 3),
+     "signed positive operand", 2),
     ("SMax compared as unsigned", (f"{MAX}_pick = OpSGreaterThan", f"{MAX}_pick = OpUGreaterThan"),
-     "signed positive operand", 4),
-    ("SMin keeps the larger value", (f"{MIN}_pick = OpSLessThan", f"{MIN}_pick = OpSGreaterThan"),
      "signed positive operand", 3),
+    ("SMin keeps the larger value", (f"{MIN}_pick = OpSLessThan", f"{MIN}_pick = OpSGreaterThan"),
+     "signed positive operand", 2),
     ("SMax keeps the smaller value", (f"{MAX}_pick = OpSGreaterThan", f"{MAX}_pick = OpSLessThan"),
-     "signed positive operand", 4),
+     "signed positive operand", 3),
+    # The sequence's last word is word 5; an operation that changes it first diverges there.
+    ("Xor replaced by Add", ("OpAtomicXor %uint", "OpAtomicIAdd %uint"), "signed positive operand", 5),
+    ("Or replaced by And", ("OpAtomicOr %uint", "OpAtomicAnd %uint"), "signed positive operand", 5),
+    ("Exchange replaced by Add", ("OpAtomicExchange %uint", "OpAtomicIAdd %uint"), "signed positive operand", 5),
+    ("CompareExchange swaps value and comparator", (f"%c0 %c0 {HIT}_value {HIT}_cmp", f"%c0 %c0 {HIT}_cmp {HIT}_value"),
+     "signed positive operand", 5),
+    ("sequence alignment guard dropped", (f"OpBranchConditional %x2w_address_chain_target_checked {ADD}_issue",
+                                          f"OpBranchConditional %x2w_address_chain_target_range {ADD}_issue"),
+     "signed misaligned base", 5),
+    ("tail store alignment guard dropped", ("OpBranchConditional %x2w_address_tail_0_checked ",
+                                            "OpBranchConditional %x2w_address_tail_0_range "),
+     "signed misaligned write", 9),
     ("atomic wrap guard dropped", (f"OpBranchConditional %x2w_address_min_target_checked {MIN}_issue",
                                    f"OpBranchConditional %x2w_address_min_target_valid {MIN}_issue"),
-     "signed index addition wraps", 11),
+     "signed index addition wraps", 6),
     ("load alignment guard dropped", ("OpBranchConditional %x2w_address_load_target_checked ",
                                       "OpBranchConditional %x2w_address_load_target_range "),
-     "signed misaligned base", 13),
+     "signed misaligned base", 8),
     ("store alignment guard dropped", ("OpBranchConditional %x2w_address_output_first_valid ",
                                        "OpBranchConditional %x2w_address_output_first_range "),
-     "signed misaligned write", 11),
+     "signed misaligned write", 6),
 )
 # A guarded access: the branch condition that must precede its issue block.
 GUARDS = {MIN: "%x2w_address_min_target_checked", MAX: "%x2w_address_max_target_checked",
           "%x2w_signed_result_loaded": "%x2w_address_load_target_checked",
           "%x2w_signed_store_1": "%x2w_address_output_first_valid",
           "%x2w_signed_store_2": "%x2w_address_output_second_valid",
-          "%x2w_signed_store_3": "%x2w_address_output_third_valid"}
+          "%x2w_signed_store_3": "%x2w_address_output_third_valid",
+          **{stem: "%x2w_address_chain_target_checked" for stem, *_ in SEQUENCE},
+          **{f"%x2w_signed_store_{4 + n}": f"%x2w_address_tail_{n}_checked" for n in range(7)}}
 
 
 def shape_errors(lowered):
@@ -61,6 +83,14 @@ def shape_errors(lowered):
     for stem, compare in ((MIN, "OpSLessThan"), (MAX, "OpSGreaterThan")):
         if f"{stem}_pick = {compare} %bool {stem}_cur_int %operand" not in lines:
             errors.append(f"{stem} does not use {compare}")
+    for stem, atomic, value, comparator in SEQUENCE:
+        wiring = [f"{stem}_value = OpBitcast %uint {value}"]
+        if comparator:
+            wiring.append(f"{stem}_cmp = OpBitcast %uint {comparator}")
+        tail = f"{stem}_value" + (f" {stem}_cmp" if comparator else "")
+        if any(line not in lines for line in wiring) or not any(
+                line.startswith(f"{stem}_old = {atomic} %uint ") and line.endswith(" " + tail) for line in lines):
+            errors.append(f"{stem} is not {atomic} on {tail} with {value}")
     label = None
     for line in lines:
         if opened := re.fullmatch(r"(%\S+) = OpLabel", line):
@@ -132,10 +162,13 @@ with tempfile.TemporaryDirectory() as folder:
         sys.exit("lowered module: " + "; ".join(problems))
     hlsl = build(directory, "lowered", lowered).read_text(encoding="utf-8")
     # Both atomics become one signed compare-exchange loop each; no unsigned Interlocked min or max remains.
-    if hlsl.count("InterlockedCompareExchange") != 2 or "InterlockedMin" in hlsl or "InterlockedMax" in hlsl:
-        sys.exit("expected two compare-exchange loops and no InterlockedMin or InterlockedMax")
+    if hlsl.count("InterlockedCompareExchange") != 4 or "InterlockedMin" in hlsl or "InterlockedMax" in hlsl:
+        sys.exit("expected two compare-exchange loops, two compare-exchanges and no InterlockedMin or InterlockedMax")
+    for name in ("Add", "Exchange", "And", "Or", "Xor"):
+        if hlsl.count(f"Interlocked{name}(") != 1:
+            sys.exit(f"expected one Interlocked{name}")
     print("lowered module: validated, guarded, signed compare-exchange loops")
-    for name, (old, new) in (("a signed add", ("OpAtomicSMin %int %min_target", "OpAtomicIAdd %int %min_target")),
+    for name, (old, new) in (("a signed subtract", ("OpAtomicSMin %int %min_target", "OpAtomicISub %int %min_target")),
                              ("a volatile load", ("OpLoad %int %load_target Aligned 4", "OpLoad %int %load_target Volatile")),
                              ("an unaligned store", ("OpStore %output_first %old_min Aligned 4",
                                                      "OpStore %output_first %old_min Aligned 2")),

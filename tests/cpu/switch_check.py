@@ -319,7 +319,8 @@ def check_rejections(original_path):
         (sign_extend.ip, bytes.fromhex("4c 8b c9"), "is not the bounded value"),
         (case0.ip, bytes.fromhex("83 c3 0b"), "nonvolatile register rbx"),
         (copy.ip, bytes.fromhex("8b c0"), "undefined register rax"),
-        (invert.ip, bytes.fromhex("0f ca"), "unsupported instruction"),
+        # CPUID replaces the two-byte NOT: the translator lifts BSWAP since #1374, so it no longer refuses 0f ca.
+        (invert.ip, bytes.fromhex("0f a2"), "unsupported instruction"),
         (table + 12, struct.pack("<I", case0.ip + 1), "overlaps"),
         (table + 12, struct.pack("<I", neighbor), "outside owned ranges"),
         (load.ip + load.len - 4, struct.pack("<I", entry), "jump table at RVA"),

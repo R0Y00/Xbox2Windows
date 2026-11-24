@@ -24,6 +24,22 @@ def span(token):
     return range(int(m[1]), int(m[2]) + 1)
 
 
+# One-source binary32 forms and their HLSL lowering. round is round-half-even, like v_rndne_f32. The result of
+# rcp, rsq and sqrt is whatever the host computes; callers must only rely on inputs whose result is exact.
+UNARY_F32_EXPR = {
+    "v_rcp_f32": "(1.0f / {x})",
+    "v_rsq_f32": "rsqrt({x})",
+    "v_sqrt_f32": "sqrt({x})",
+    "v_floor_f32": "floor({x})",
+    "v_trunc_f32": "trunc({x})",
+    "v_rndne_f32": "round({x})",
+    # v_fract_f32 is x - floor(x) clamped to 0x3f7fffff: a tiny negative input must not round up to 1.0. The cap is a
+    # comparison, not min: D3D min returns its other operand for a NaN, and a NaN input must stay NaN.
+    "v_fract_f32": "(frac({x}) >= 1.0f ? asfloat(0x3f7fffffu) : frac({x}))",
+}
+UNARY_F32 = {f"{name}_e{width}": expr for name, expr in UNARY_F32_EXPR.items() for width in (32, 64)}
+
+
 # Inline raw descriptor constructed from the two bound entry SGPRs, a byte
 # stride, identity component selects, and the observed raw-buffer flags.
 VERTEX_DESCRIPTOR = [0x20000, 0x10000, U32, 0x11014FAC]
@@ -274,7 +290,10 @@ class Wave:
             "v_min_f32_e64",
             "v_max_f32_e32",
             "v_max_f32_e64",
+            *UNARY_F32,
         }
+        if op in UNARY_F32 and len(src) != 1:
+            raise ValueError(f"{op} takes one source")
         for lane in live:
             vals = [self.lane_value(t, lane) for t in src]
             if (
@@ -349,6 +368,8 @@ class Wave:
                     expr = f"float({word})" if "_u32_" in op else f"float(asint({word}))"
                 elif op.startswith(("v_min_f32_", "v_max_f32_")):
                     expr = f"{op[2:5]}({x}, {y})"
+                elif op in UNARY_F32:
+                    expr = UNARY_F32[op].format(x=x)
                 else:
                     expr = f"({x} + {y})"
                 if expr not in expressions:
@@ -620,8 +641,41 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     return "\n".join(lines) + "\n"
 
 
+STAGE_NAMES = {
+    0: "pixel",
+    1: "vertex",
+    2: "geometry",
+    3: "hull",
+    4: "domain",
+    5: "compute",
+    6: "library",
+    13: "mesh",
+    14: "amplification",
+}
+
+
+def require_mesh_stage(chunks):
+    """Reject any other stage by name before the mesh profile checks."""
+    psv = chunks[b"PSV0"]
+    program = chunks[b"DXIL"]
+    kind = struct.unpack_from("<H", program, 2)[0] if len(program) >= 4 else None
+    for stage in (psv[28] if len(psv) > 28 else None, kind):
+        if stage == 13:
+            continue
+        if stage == 14:
+            raise ValueError(
+                "Unsupported amplification stage: only the bounded mesh stage is translated"
+            )
+        if stage is not None:
+            name = STAGE_NAMES.get(stage, f"stage {stage}")
+            raise ValueError(
+                f"Unsupported {name} stage: only the bounded mesh stage is translated"
+            )
+
+
 def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
     chunks = parts(blob)
+    require_mesh_stage(chunks)
     p = chunks[b"PSV0"]
     if (
         len(p) < 52

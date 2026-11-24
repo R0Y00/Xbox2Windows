@@ -6,7 +6,8 @@
 Each fixture is a source-built gfx1013 pixel stage that sets up v0 = 0.5, v1 = 0.25, v2 = 1.0, v3 = 2.0 and then
 runs one image instruction on a texture from descriptor table 0 and an all-zero constant sampler. The lowering must
 sample the level held in the LAST address register as SampleLevel(..., level): the contiguous 2D form takes it from
-v2, the NSA form from v3 (so it is not just "the third register"), and the 3D form from v3. Forms the lowering does
+v2, the NSA form from v3 (so it is not just "the third register"), and the 3D and 2D array forms from v3 (a 2D array
+takes the slice from v2, where a volume takes z). Forms the lowering does
 not model are refused with their own message instead of being sampled at a wrong level.
 """
 import re
@@ -188,7 +189,7 @@ def refused(name, text):
 def level_register(ps, texture_kind):
     """The u, v, optional w and level registers named by the SampleLevel call."""
     m = re.search(r'\w+\.SampleLevel\(\w+, float%d\(F\((v\d+)\), F\((v\d+)\)(?:, F\((v\d+)\))?\), F\((v\d+)\)\);'
-                  % (3 if texture_kind == '3d' else 2), ps)
+                  % (2 if texture_kind == '2d' else 3), ps)
     assert m, ps
     return m.groups()
 
@@ -202,7 +203,10 @@ def controls():
     three = level_register(stage('three'), '3d')
     assert three == ('v0', 'v1', 'v2', 'v3'), three
     assert 'Texture3D' in stage('three')
-    print('plain 2D level v2; NSA 2D level v3; 3D level v3')
+    array = level_register(stage('array'), 'array')
+    assert array == ('v0', 'v1', 'v2', 'v3'), array  # u, v, slice, then the level
+    assert 'Texture2DArray' in stage('array') and 'Texture3D' not in stage('array')
+    print('plain 2D level v2; NSA 2D level v3; 3D level v3; 2D array slice v2, level v3')
 
     # The old level-zero form is a different lowering: its call has literal level 0 and no register level.
     lz = stage('lz')
@@ -221,11 +225,11 @@ def controls():
     refused('d16', 'image_sample_l modifier d16')  # half-precision result layout
     refused('r128', 'image_sample_l modifier r128')  # four-dword resource descriptor
     refused('dmask0', 'empty dmask')
-    for name in ('dim1d', 'array', 'msaa'):
+    for name in ('dim1d', 'msaa'):
         refused(name, 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
-    print('refused: offset, compare, gather, cube, 1D, array, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+    print('refused: offset, compare, gather, cube, 1D, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.
     for name in ('glc', 'slc', 'dlc'):

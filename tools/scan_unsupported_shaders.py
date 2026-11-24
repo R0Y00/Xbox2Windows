@@ -39,6 +39,27 @@ except ImportError:
     SCRATCH_OPS = {}
     disasm_rdna2 = None
 
+# Entry bindings passed to pixel_aot.lower() for every record. The scan carries no per-record binding contract,
+# so translator acceptance is measured under these bindings only. A read of a register lower() holds no value for
+# under these inputs is reported as an unbound operand rather than as an instruction the translator refuses.
+SCAN_BINDINGS = {"texture_sgpr": 20, "interp_sgpr": 24, "sampler": (1, 2, 3, 4), "constant_descriptor": None}
+SCAN_BINDINGS_TEXT = ("texture descriptor table at s20, interpolation base at s24, sampler words 1 2 3 4, "
+                      "no constant buffers")
+
+
+def lower_rejection_causes(results: list[dict]) -> dict:
+    """Split the records lower() rejected by cause: unbound scalar or vector operand, translator rejection
+    (any other ValueError) or an unexpected exception (a translator fault, never counted as a missing binding)."""
+    causes = {"unbound_scalar_operand": 0, "unbound_vector_operand": 0,
+              "translator_rejection": 0, "unexpected_error": 0}
+    for r in results:
+        kind = r.get("lower_error_kind")
+        if kind == "unbound_operand":
+            causes[f"unbound_{r['lower_unbound']['bank']}_operand"] += 1
+        elif kind in causes:
+            causes[kind] += 1
+    return causes
+
 
 # Known supported instructions and patterns in pixel_aot.py
 # Tables are imported from pixel_aot so the scanner stays aligned with the translator.
@@ -316,7 +337,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
     "s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32", "s_version",
     # VOP1
-    "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
+    "v_nop", "v_mov_b32", "v_swap_b32", "v_swaprel_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
     "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32", "v_ffbh_i32", "v_rcp_iflag_f32",
     "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
@@ -467,15 +488,33 @@ def classify_isa_category(opcode: str) -> str:
     return "Other / Unknown"
 
 
+_STAGE_TAGS = (
+    ("pixel", "pixel", "ps"),
+    ("compute", "compute", "cs"),
+    ("vertex", "vertex", "vs"),
+)
+_STAGE_DELIMITERS = re.compile(r"[_.\-]")
+
+
 def detect_shader_stage(name_or_path: str) -> str:
-    """Classify shader stage from path or filename."""
-    lower = name_or_path.lower().replace("\\", "/")
-    if "/pixel/" in lower or "/ps/" in lower or "ps_" in lower or lower.startswith("ps_") or "_ps" in lower:
-        return "pixel"
-    if "/compute/" in lower or "/cs/" in lower or "cs_" in lower or lower.startswith("cs_") or "_cs" in lower:
-        return "compute"
-    if "/vertex/" in lower or "/vs/" in lower or "vs_" in lower or lower.startswith("vs_") or "_vs" in lower:
-        return "vertex"
+    """Classify shader stage from path or filename.
+
+    A stage tag (`ps`, `cs`, `vs`) matches only as a whole token of a path
+    component, where tokens are delimited by `_`, `.` or `-` (`ps_draw.bin`,
+    `blur_cs.s`, `a/vs/x.s`), so a tag inside another word (`loops_cs`,
+    `bumps_vs`, `ps5`) does not match. The long names (`pixel`, `compute`,
+    `vertex`) match only as a whole directory component. Matching is case
+    insensitive. If one path carries tags of several stages, the first stage
+    in the order pixel, compute, vertex wins.
+    """
+    parts = [p for p in name_or_path.lower().replace("\\", "/").split("/") if p]
+    directories = set(parts[:-1])
+    tokens = set()
+    for part in parts:
+        tokens.update(t for t in _STAGE_DELIMITERS.split(part) if t)
+    for stage, long_name, short_name in _STAGE_TAGS:
+        if long_name in directories or short_name in tokens:
+            return stage
     return "other"
 
 
@@ -507,6 +546,9 @@ def make_failed_shader_record(shader_name: str, error_message: str) -> dict:
         "is_fully_supported": False,
         "lower_status": "decode_failed",
         "lower_error": error_message,
+        "lower_error_kind": None,
+        "lower_error_type": None,
+        "lower_unbound": None,
         "unsupported_opcodes": {"<decode_error>": 1},
         "unsupported_details": [{
             "line_number": 0,
@@ -619,23 +661,30 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
     supported_count = total - len(unsupported_translator_items)
     support_ratio = (supported_count / total * 100.0) if total > 0 else 0.0
 
-    # Test pixel_aot.lower() to determine translator acceptance
+    # Test pixel_aot.lower() to determine translator acceptance under the scan's fixed bindings
     lower_status = "untested"
     lower_error = None
+    lower_error_kind = None
+    lower_error_type = None
+    lower_unbound = None
     if pixel_aot is not None:
         try:
-            pixel_aot.lower(
-                instructions=instructions,
-                texture_sgpr=20,
-                interp_sgpr=24,
-                sampler=[1, 2, 3, 4],
-                constant_descriptor=None,
-                wave_size=wave_size,
-            )
+            pixel_aot.lower(instructions=instructions, wave_size=wave_size, **SCAN_BINDINGS)
             lower_status = "passed"
         except Exception as e:
             lower_status = "rejected"
             lower_error = str(e)
+            lower_error_type = type(e).__name__
+            if isinstance(e, pixel_aot.UnboundOperand):
+                # A register with no tracked value under the scanned inputs, not an instruction the translator refuses.
+                lower_error_kind = "unbound_operand"
+                lower_unbound = {"bank": e.bank, "register": e.register, "instruction_index": e.index,
+                                 "byte_offset": e.offset, "instruction": e.instruction}
+            elif isinstance(e, ValueError):
+                lower_error_kind = "translator_rejection"
+            else:
+                # Any other exception (a bare KeyError included) is a translator fault, not a missing binding.
+                lower_error_kind = "unexpected_error"
 
     opcodes_recognized = (len(unrecognized_opcodes) == 0)
     translator_accepted = (lower_status == "passed")
@@ -662,6 +711,9 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
         "is_fully_supported": opcodes_recognized and translator_accepted,
         "lower_status": lower_status,
         "lower_error": lower_error,
+        "lower_error_kind": lower_error_kind,
+        "lower_error_type": lower_error_type,
+        "lower_unbound": lower_unbound,
         "unsupported_opcodes": dict(unrecognized_opcodes),
         "unsupported_details": unsupported_translator_items,
         "opcode_distribution": dict(opcode_distribution),
@@ -984,6 +1036,7 @@ def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[
         f.write("### Methodology Notes\n\n")
         f.write("- **Shaders Blocked**: Count of distinct shaders that cannot be fully lowered because they contain this opcode.\n")
         f.write("- **Blocker Impact %**: Percentage of total scanned shaders unblocked or partially enabled by implementing this opcode.\n")
+        f.write(f"- **Fully Supported / Accepted**: Conditional on the fixed entry bindings the scan supplies to `pixel_aot.lower()` ({SCAN_BINDINGS_TEXT}).\n")
         f.write("- **Pure Python Pipeline**: Instruction disassembly is executed natively via `tools/disasm_rdna2.py` without requiring external toolchains.\n")
 
     return json_file, md_file
@@ -1009,6 +1062,7 @@ def generate_reports(results: list[dict], output_dir: Path):
     unsupported_opcodes_count = sum(1 for r in results if r["compatibility_category"] == "unsupported_opcodes")
     partially_supported = sum(1 for r in results if not r["is_fully_supported"] and r["supported_instructions"] > 0)
     unsupported_completely = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] == 0)
+    rejection_causes = lower_rejection_causes(results)
 
     # Aggregate all unsupported opcodes across all shaders
     global_unsupported_opcodes = Counter()
@@ -1029,6 +1083,11 @@ def generate_reports(results: list[dict], output_dir: Path):
             "partially_supported": partially_supported,
             "completely_unsupported": unsupported_completely,
             "unique_unsupported_opcodes_count": len(global_unsupported_opcodes),
+            # Every record lower() rejected, by cause; the unbound counts are reads of registers with no tracked value
+            # under the scanned inputs, not instructions the translator refuses.
+            "translator_rejections_by_cause": rejection_causes,
+            # translator_accepted and the rejection counts hold only under these fixed entry bindings.
+            "translator_bindings": dict(SCAN_BINDINGS, sampler=list(SCAN_BINDINGS["sampler"])),
         },
         "top_unsupported_opcodes": global_unsupported_opcodes.most_common(),
         "unsupported_by_category": dict(global_categories),
@@ -1048,6 +1107,12 @@ def generate_reports(results: list[dict], output_dir: Path):
         f.write(f"- **Full Shaders Accepted by Translator (`pixel_aot.py`):** {translator_accepted} ({round(translator_accepted/total_shaders*100, 1) if total_shaders else 0}%)\n")
         f.write(f"- **Opcodes Recognized by Scanner, but Rejected by Translator:** {opcodes_recognized_only}\n")
         f.write("  *(Valid RDNA 2 opcodes whose program structure, preamble, or bindings differ from `pixel_aot` straight-line single-texture template)*\n")
+        f.write("- **Translator Rejections by Cause** (every record `lower()` rejected):\n")
+        f.write(f"  - Unbound scalar operand under the scanned inputs: {rejection_causes['unbound_scalar_operand']}\n")
+        f.write(f"  - Unbound vector operand under the scanned inputs: {rejection_causes['unbound_vector_operand']}\n")
+        f.write(f"  - Other translator rejection: {rejection_causes['translator_rejection']}\n")
+        f.write(f"  - Unexpected translator error: {rejection_causes['unexpected_error']}\n")
+        f.write(f"  *(Acceptance and rejection totals are conditional on the fixed entry bindings this scan supplies to every record: {SCAN_BINDINGS_TEXT}.)*\n")
         f.write(f"- **Contains Unrecognized Opcodes:** {unsupported_opcodes_count}\n")
         f.write(f"- **Unique Missing Opcodes:** {len(global_unsupported_opcodes)}\n\n")
 
@@ -1127,6 +1192,10 @@ def main():
     print(f"Total Shaders Scanned:                     {total:,}")
     print(f"Full Shaders Accepted by Translator:       {accepted:,} ({(accepted/total)*100:.1f}%)")
     print(f"Opcodes Recognized, Translator-Rejected:   {recognized_only:,}")
+    causes = lower_rejection_causes(results)
+    print(f"Rejections, Unbound Scalar/Vector Operand: {causes['unbound_scalar_operand']:,} / {causes['unbound_vector_operand']:,}")
+    print(f"Rejections, Other Translator / Unexpected: {causes['translator_rejection']:,} / {causes['unexpected_error']:,}")
+    print(f"  (translator totals hold only under the scan's fixed bindings: {SCAN_BINDINGS_TEXT})")
     print(f"Contains Unrecognized Opcodes:             {unsupported_opcodes:,}")
     print(f"Total Decoded Instructions:                {total_insns:,}")
     print(f"Supported Instructions:                    {total_supp_insns:,}")

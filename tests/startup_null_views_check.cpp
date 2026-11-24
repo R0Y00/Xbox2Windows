@@ -1,5 +1,6 @@
 #include "xmem_test_device.h"
 #include "../src/startup_stubs/null_texture_view.h"
+#include "null_binding_cause_cases.h"
 
 #include <cstring>
 
@@ -14,6 +15,7 @@ HRESULT create_wrapper(IUnknown* adapter, REFIID iid, void** out)
 int main(int argc, char** argv)
 {
     if (argc != 2) return 1;
+    if (!null_binding_cause_cases()) return 1;
     const bool warp = std::strcmp(argv[1], "warp") == 0;
     bool unmatched = false;
     auto device = create_device(warp, unmatched);

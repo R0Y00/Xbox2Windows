@@ -38,6 +38,10 @@ ENC_ARRAY = 3
 ENC_CHAR6 = 4
 ENC_BLOB = 5
 
+# Real modules nest blocks a handful of levels deep; the limit only stops hostile nesting from
+# exhausting the interpreter stack.
+MAX_BLOCK_DEPTH = 32
+
 CHAR6_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._"
 CHAR6_INDEX = {ord(ch): idx for idx, ch in enumerate(CHAR6_ALPHABET)}
 
@@ -187,6 +191,10 @@ def _read_abbrev_record(reader: BitReader, ops: list[tuple]) -> tuple[int, list[
             if idx + 1 >= len(ops):
                 raise ValueError("Array abbreviation missing element encoding")
             count = reader.read_vbr(6)
+            # Every element takes at least one bit, except a zero-width one, which would otherwise
+            # let a few bytes ask for billions of values.
+            if count > reader.nbits - reader.bitpos:
+                raise ValueError("Array length exceeds the remaining bitcode stream")
             idx += 1
             elem_kind, elem_data = ops[idx]
             for _ in range(count):
@@ -224,7 +232,10 @@ def parse_bitcode_block(
     end_bit: int,
     blockinfo_abbrevs: dict[int, list[list[tuple]]],
     recurse_ids: set[int],
+    depth: int = 0,
 ) -> list[tuple]:
+    if depth > MAX_BLOCK_DEPTH:
+        raise ValueError(f"LLVM bitcode blocks nest deeper than {MAX_BLOCK_DEPTH} levels")
     abbrevs = list(blockinfo_abbrevs.get(block_id, ()))
     current_bi_block = None
     items = []
@@ -247,10 +258,10 @@ def parse_bitcode_block(
             if sub_end > len(reader.data) or sub_end * 8 > end_bit:
                 raise ValueError("Subblock extends past parent bitcode block")
             if sub_id == BLOCKINFO_BLOCK_ID:
-                parse_bitcode_block(reader, BLOCKINFO_BLOCK_ID, sub_aw, sub_end * 8, blockinfo_abbrevs, set())
+                parse_bitcode_block(reader, BLOCKINFO_BLOCK_ID, sub_aw, sub_end * 8, blockinfo_abbrevs, set(), depth + 1)
                 items.append(("RAW_BLOCK", sub_id, sub_aw, reader.data[sub_start:sub_end]))
             elif sub_id in recurse_ids:
-                sub_items = parse_bitcode_block(reader, sub_id, sub_aw, sub_end * 8, blockinfo_abbrevs, recurse_ids)
+                sub_items = parse_bitcode_block(reader, sub_id, sub_aw, sub_end * 8, blockinfo_abbrevs, recurse_ids, depth + 1)
                 items.append(("BLOCK", sub_id, sub_aw, sub_items))
             else:
                 items.append(("RAW_BLOCK", sub_id, sub_aw, reader.data[sub_start:sub_end]))

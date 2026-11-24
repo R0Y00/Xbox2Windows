@@ -1,3 +1,4 @@
+; coverage: record cpu_counted_clzero
 ; RCX=start, RDX=end, R8=pointer to three result bytes.
 ; The reference branch uses Win64 integer stores to the same aligned cache line.
 .code

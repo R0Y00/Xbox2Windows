@@ -470,16 +470,11 @@ neg_lzcnt_cmovns PROC FRAME
     ret
 neg_lzcnt_cmovns ENDP
 
-neg_bsr PROC FRAME
+neg_xlatb PROC FRAME
     .endprolog
-    bsr rax, rcx
+    mov rbx, rcx
+    xlatb
     ret
-neg_bsr ENDP
-
-neg_bsf PROC FRAME
-    .endprolog
-    bsf rax, rcx
-    ret
-neg_bsf ENDP
+neg_xlatb ENDP
 
 END

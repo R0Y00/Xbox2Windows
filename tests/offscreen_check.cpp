@@ -23,6 +23,9 @@
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_float(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_vec4(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_vec4_narrow(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path);
 void check_sampler_index_control(ID3D12Device* device,
@@ -510,6 +513,18 @@ OperationResult run_compute_texture_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_compute_texture_msaa_case(const OperationContext& ctx)
+{
+    return skip_if_false(check_compute_texture_msaa_file(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]),
+                         "R32_UINT 4x MSAA render target and load support unavailable");
+}
+
+OperationResult run_compute_texture_store_case(const OperationContext& ctx)
+{
+    return skip_if_false(check_compute_texture_store_file(ctx.device, ctx.argv[3], ctx.argv[4]),
+                         "Required typed UAV operations unavailable for the image case format");
+}
+
 OperationResult run_spirv_sampler_views(const OperationContext& ctx)
 {
     check_sampler_views(ctx.device, ctx.argv[3]);
@@ -556,6 +571,24 @@ OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
 OperationResult run_spirv_address_window_signed(const OperationContext& ctx)
 {
     check_spirv_window_signed(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_float(const OperationContext& ctx)
+{
+    check_spirv_window_float(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_vec4(const OperationContext& ctx)
+{
+    check_spirv_window_vec4(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_vec4_narrow(const OperationContext& ctx)
+{
+    check_spirv_window_vec4_narrow(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -608,9 +641,21 @@ OperationResult run_dual_uav(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_stream_root_srv(const OperationContext& ctx)
+{
+    check_stream_root_srv(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
 {
     check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::direct);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_cpu_srv_refresh(const OperationContext& ctx)
+{
+    check_cpu_srv_refresh(ctx.device, std::string_view(ctx.argv[2]) == "--cpu-srv-stale");
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -684,9 +729,16 @@ OperationResult run_check_pixel_compare(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_gather(const OperationContext& ctx)
+{
+    check_pixel_gather(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel_case(const OperationContext& ctx)
 {
-    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4]);
+    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4], D3D12_COLOR_WRITE_ENABLE_ALL,
+                           ctx.argc == 6 ? ctx.argv[5] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -717,7 +769,13 @@ OperationResult run_check_pixel_attribute_rg(const OperationContext& ctx)
 
 OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
 {
-    check_pixel_quad_lod(ctx.device, ctx.argv[3]);
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argc == 5 ? ctx.argv[4] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_get_lod_upper(const OperationContext& ctx)
+{
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argv[4], true);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -767,6 +825,12 @@ OperationResult run_mesh_entry(const OperationContext& ctx)
     if (ctx.argc == 7)
         binding = ctx.argv[6][0] == 'b' ? MeshConstantBinding::swapped_root_pair : MeshConstantBinding::root_pair;
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false, binding));
+}
+
+OperationResult run_mesh_amplified(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_amplified_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                                   ctx.argv[6]));
 }
 
 OperationResult run_mesh_indexed(const OperationContext& ctx)
@@ -927,6 +991,15 @@ OperationResult run_ray_query(const OperationContext& ctx)
     return skip_if_false(check_dxr_rays(ctx.device, false));
 }
 
+OperationResult run_dxr_address_ranges(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_address_ranges(ctx.device));
+}
+OperationResult run_dxr_placed_build(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_placed_build(ctx.device));
+}
+
 OperationResult run_dxr_pipeline(const OperationContext& ctx)
 {
     return skip_if_false(check_dxr_rays(ctx.device, true));
@@ -1042,23 +1115,46 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-3d <vs.cso> <ps.cso> <z> <expected rgba bits>: draws one pixel with a gfx2hlsl pixel
-// shader that samples a 2x2x2 Texture3D at (0.75, 0.25, z) (tests/startup_image_3d.cpp). The expected
-// value is four 8-digit hex words, comma separated.
+// --startup-image-3d <vs.cso> <ps.cso> <z> <expected rgba bits> [sampler manifest line]
+// The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
+// --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
+// third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
+// mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
+    const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
+    const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
     const float z = std::stof(ctx.argv[5]);
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color);
+    const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
-        std::fprintf(stderr, "startup_image_3d mismatch z=%s expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
+        std::fprintf(stderr, "startup_image mismatch z=%s expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
                      ctx.argv[5], expected[0], expected[1], expected[2], expected[3], bits[0], bits[1], bits[2], bits[3]);
         return {OutcomeKind::fail, "image 3D readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
+// pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
+// comma separated.
+OperationResult run_startup_flat_param(const OperationContext& ctx)
+{
+    std::uint32_t expected[4]{};
+    if (std::sscanf(ctx.argv[5], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::uint32_t words[4]{};
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], words);
+    if (std::memcmp(words, expected, sizeof(words)) != 0) {
+        std::fprintf(stderr, "startup_flat_param mismatch expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
+                     expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
+        return {OutcomeKind::fail, "flat parameter readback differs"};
     }
     return {OutcomeKind::pass, nullptr};
 }
@@ -1115,6 +1211,9 @@ constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_0, true, false, 0,
     "skip: address window fixture requires SM 6.0 and 64-bit shader integer operations",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateComputeAtomic64{
+    D3D_SHADER_MODEL_6_6, true, false, 0, "skip: 64-bit raw UAV atomics require SM 6.6 and Int64ShaderOps",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: ballot fixture requires SM 6.6",
@@ -1150,19 +1249,28 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
     {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
+    {"--compute-texture-msaa-case", 7, 7, nullptr, kNoGate, run_compute_texture_msaa_case},
+    {"--compute-texture-store-case", 5, 5, nullptr, kNoGate, run_compute_texture_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},
     // Two builds that differ only in the sampler descriptor index source (#1115): the
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
-    {"--startup-image-3d", 7, 7, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
+    {"--spirv-address-window-float", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_float},
+    {"--spirv-address-window-vec4", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_vec4},
+    {"--spirv-address-window-vec4-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_vec4_narrow},
     {"--spirv-address-window-qword", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword},
     {"--spirv-address-window-qword-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword_narrow},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
@@ -1173,7 +1281,10 @@ const OperationSpec kOperations[] = {
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
+    {"--stream-root-srv", 3, 3, nullptr, kGateSm60BufferOps, run_stream_root_srv},
     {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
+    {"--cpu-srv-refresh", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
+    {"--cpu-srv-stale", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
     {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
     {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
@@ -1184,12 +1295,14 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
-    {"--check-pixel-case", 5, 5, nullptr, kNoGate, run_check_pixel_case},
+    {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
+    {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
-    {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-quad-lod", 4, 5, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-get-lod-upper", 5, 5, nullptr, kNoGate, run_check_pixel_get_lod_upper},
     {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
     // Keep the fractional point-filter fixture on its existing gate (#809).
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
@@ -1199,6 +1312,7 @@ const OperationSpec kOperations[] = {
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
+    {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
@@ -1227,6 +1341,8 @@ const OperationSpec kOperations[] = {
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
     {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
+    {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
+    {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
     {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},
@@ -1438,6 +1554,10 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-amplified", "as", "ms", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-amplified")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-amplified", "as", "ms", "ps", "fixture"},
+                   CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-depth-pair-fallback", "cs", "vs", "ps"}, CliAction::usage_error,

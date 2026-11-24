@@ -1,8 +1,9 @@
 """Live debug console for a run: follows the run's logs and prints what the title is doing.
 
-usage: live_view.py <rundir>      (started in its own console window by debug_launch.py)
+usage: live_view.py <rundir> [<package root>]      (started in its own console window by debug_launch.py)
 
 It only reads the log files the debugger and the stand-in DLLs write; it does not touch the game.
+File opens are shown for paths on the G: mount and under the package root, if one is given.
 """
 import os
 import re
@@ -10,6 +11,9 @@ import sys
 import time
 
 rundir = sys.argv[1]
+# The package root the run uses as its working directory (run.ps1 -DataDir), next to the G:\ mount.
+roots = ["G:\\"] + [os.path.join(os.path.abspath(sys.argv[2]), "")] if len(sys.argv) > 2 else ["G:\\"]
+game_file = re.compile(r"Nt(?:CreateFile|OpenFile) (?:\\\?\?\\)?((?i:" + "|".join(map(re.escape, roots)) + r").+)(?= from (?:[^+]*\+)?0x[0-9a-fA-F]+ )")
 os.system("title Xbox2Windows debug log - " + os.path.basename(os.path.abspath(rundir)))
 start = time.time()
 counts = {"modules": 0, "files": 0, "refused": 0, "chunks": 0, "gpu calls first seen": 0}
@@ -60,7 +64,7 @@ def on_file(line):
     if " HIT " in line:
         say("hit", line.split(" HIT ", 1)[1].strip()[:140])
         return
-    m = re.search(r"Nt(?:CreateFile|OpenFile) (?:\\\?\?\\)?(G:\\[^ ]+|D:\\GTA6\\[^ ]+)", line)
+    m = game_file.search(line)
     if m:
         counts["files"] += 1
         result = line.rsplit("->", 1)[-1].strip()

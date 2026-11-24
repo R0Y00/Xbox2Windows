@@ -21,3 +21,4 @@ EXPORTS
     root_sd
     root_const_ss
     root_const_sd
+    round_cvt

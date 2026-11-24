@@ -481,4 +481,39 @@ ENDIF
     ret
 root_const_sd ENDP
 
+; uint64_t round_cvt(float f, double d, uint8_t* out)
+; CVTSS2SI and CVTSD2SI into 32-bit and 64-bit registers from a register and from memory; the 32-bit forms start from
+; all ones, so a destination that keeps its upper half shows. The words of out hold the results; f and d sit at +40
+; and +48. SWAP_OPERANDS converts d where the first conversion converts f.
+round_cvt PROC FRAME
+    .endprolog
+    mov rax, -1
+    mov rcx, -1
+    mov r9, -1
+    mov r10, -1
+    movss DWORD PTR [r8+40], xmm0
+    movsd QWORD PTR [r8+48], xmm1
+IFDEF SWAP_OPERANDS
+    cvtsd2si eax, xmm1
+ELSE
+    cvtss2si eax, xmm0
+ENDIF
+    cvtsd2si ecx, xmm1
+    cvtss2si rdx, xmm0
+    cvtsd2si r11, xmm1
+    cvtss2si r9d, DWORD PTR [r8+40]
+    cvtsd2si r10d, QWORD PTR [r8+48]
+    mov QWORD PTR [r8], rax
+    mov QWORD PTR [r8+8], rcx
+    mov QWORD PTR [r8+16], rdx
+    mov QWORD PTR [r8+24], r11
+    mov QWORD PTR [r8+32], r9
+    mov QWORD PTR [r8+56], r10
+    cvtss2si rdx, DWORD PTR [r8+40]
+    mov QWORD PTR [r8+64], rdx
+    cvtsd2si rdx, QWORD PTR [r8+48]
+    mov QWORD PTR [r8+72], rdx
+    ret
+round_cvt ENDP
+
 END

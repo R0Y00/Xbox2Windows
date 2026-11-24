@@ -9,3 +9,20 @@ EXPORTS
     op_pipeline
     op_discarded_read
     op_discarded_read64
+    op_vmovupd_xmm_load
+    op_vmovupd_ymm_load
+    op_vmovupd_xmm_store
+    op_vmovupd_ymm_store
+    op_vmovupd_xmm_reg
+    op_vmovupd_ymm_reg
+    op_vmovupd_xmm_regst
+    op_vmovupd_ymm_regst
+    op_vmovapd_xmm_load
+    op_vmovapd_ymm_load
+    op_vmovapd_xmm_store
+    op_vmovapd_ymm_store
+    op_vmovapd_xmm_reg
+    op_vmovapd_ymm_reg
+    op_vmovapd_xmm_regst
+    op_vmovapd_ymm_regst
+    op_pd_pipeline

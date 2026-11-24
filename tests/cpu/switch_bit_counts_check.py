@@ -26,8 +26,7 @@ REJECTIONS = (
     ("neg_popcnt_undef", "undefined register r10"),
     ("neg_tzcnt_setg", "OF, SF and PF are undefined after TZCNT"),
     ("neg_lzcnt_cmovns", "OF, SF and PF are undefined after LZCNT"),
-    ("neg_bsr", "unsupported instruction"),
-    ("neg_bsf", "unsupported instruction"),
+    ("neg_xlatb", "unsupported instruction"),
 )
 
 

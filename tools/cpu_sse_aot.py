@@ -5,7 +5,9 @@ letter is `f` (float), `d` (double) or `q` (a 64-bit integer or pointer). Slot N
 XMM0-XMM3 when it is floating point and in RCX, RDX, R8 or R9 otherwise; the result leaves in
 XMM0 or RAX. Control flow and the integer instructions are those of cpu_switch_aot.
 
-Scalar SQRT, MIN and MAX are lifted too. The generated code runs under the host MXCSR: a guest MXCSR write is not
+Scalar SQRT, MIN and MAX are lifted too. CVTSS2SI and CVTSD2SI (rounded by the MXCSR rounding control, DAZ read
+at run time, FTZ not involved) are lifted next to the truncating CVTTSS2SI and CVTTSD2SI; the invalid and precision
+exception flags they set are not observed. The generated code runs under the host MXCSR: a guest MXCSR write is not
 lifted, so the rounding mode, DAZ and FTZ are the host's and the exception flags are not observed. SQRT, MIN and
 MAX read their operands at run time, so a constant operand is not folded with the default environment; ADD, SUB,
 MUL and DIV have no such barrier.
@@ -39,13 +41,14 @@ ARITHMETIC = {M.ADDSS: ("+", 4), M.SUBSS: ("-", 4), M.MULSS: ("*", 4), M.DIVSS: 
               M.ADDSD: ("+", 8), M.SUBSD: ("-", 8), M.MULSD: ("*", 8), M.DIVSD: ("/", 8)}
 FROM_INTEGER = {M.CVTSI2SS: 4, M.CVTSI2SD: 8}
 TRUNCATIONS = {M.CVTTSS2SI: 4, M.CVTTSD2SI: 8}
+ROUNDINGS = {M.CVTSS2SI: 4, M.CVTSD2SI: 8}
 RESIZES = {M.CVTSS2SD: 4, M.CVTSD2SS: 8}
 COMPARES = {M.UCOMISS: 4, M.COMISS: 4, M.UCOMISD: 8, M.COMISD: 8}
 ROOTS = {M.SQRTSS: 4, M.SQRTSD: 8}
 # MIN and MAX with the comparison that keeps the destination operand.
 EXTREMA = {M.MINSS: ("<", 4), M.MAXSS: (">", 4), M.MINSD: ("<", 8), M.MAXSD: (">", 8)}
 ZEROING = {M.XORPS, M.XORPD, M.PXOR}
-SCALAR = {*MOVES, *COPIES, *ARITHMETIC, *ROOTS, *EXTREMA, *FROM_INTEGER, *TRUNCATIONS, *RESIZES, *COMPARES, *ZEROING,
+SCALAR = {*MOVES, *COPIES, *ARITHMETIC, *ROOTS, *EXTREMA, *FROM_INTEGER, *TRUNCATIONS, *ROUNDINGS, *RESIZES, *COMPARES, *ZEROING,
           M.MOVD, M.MOVQ}
 # fc holds ZF, PF and CF of the last compare as bits 2, 1 and 0. An unordered compare sets all three.
 CONDITIONS = {CC.E: "(fc & 4u) != 0", CC.NE: "(fc & 4u) == 0", CC.B: "(fc & 1u) != 0", CC.AE: "(fc & 1u) == 0",
@@ -162,14 +165,15 @@ class ScalarLifter(Lifter):
             # Loads, MOVD, MOVQ and MOVSD between registers define the whole low quadword.
             writes.update(parts(destination, 8))
             return f"{XMM[destination]} = {bits};", reads, writes
-        if mnemonic in TRUNCATIONS:
+        if mnemonic in TRUNCATIONS or mnemonic in ROUNDINGS:
             width = RegisterExt.size(ins.op0_register) if ins.op0_kind == OpKind.REGISTER else 0
             if width not in (4, 8) or not RegisterExt.is_gpr(ins.op0_register):
                 raise unsupported
-            source = TRUNCATIONS[mnemonic]
+            source = {**TRUNCATIONS, **ROUNDINGS}[mnemonic]
             bits = self.source(ins, 1, source, reads)
             writes.add(full(ins.op0_register))
-            value = f"truncate<{signed(width)}>(cast<{TYPES[source]}>({bits}))"
+            convert = "truncate" if mnemonic in TRUNCATIONS else "round_to_integer"
+            value = f"{convert}<{signed(width)}>(cast<{TYPES[source]}>({bits}))"
             return self.write(ins, width, value), reads, writes
 
         destination = self.xmm(ins, 0)
@@ -428,6 +432,18 @@ template <class Float, class Bits> static Bits extreme(Bits a, Bits b, char op) 
 template <class Integer, class Float> static Integer truncate(Float value) {
     const Float limit = -static_cast<Float>(std::numeric_limits<Integer>::min());
     return value >= -limit && value < limit ? static_cast<Integer>(value) : std::numeric_limits<Integer>::min();
+}
+// CVTSS2SI and CVTSD2SI round by the MXCSR rounding control and read a denormal as a zero under DAZ. They run on
+// the processor, through the intrinsics, and not through lrint or llrint of the host C library: that library does
+// not follow the instruction for a NaN or a value out of range and, on Windows, for a rounding control other than
+// the default. The processor gives the integer indefinite, the sign bit alone, for a NaN, an infinity or a result
+// that does not fit. The operand is read at run time, so a constant is not rounded by the compiler.
+static std::int32_t hardware_round(float value, std::int32_t) { return _mm_cvtss_si32(_mm_set_ss(value)); }
+static std::int64_t hardware_round(float value, std::int64_t) { return _mm_cvtss_si64(_mm_set_ss(value)); }
+static std::int32_t hardware_round(double value, std::int32_t) { return _mm_cvtsd_si32(_mm_set_sd(value)); }
+static std::int64_t hardware_round(double value, std::int64_t) { return _mm_cvtsd_si64(_mm_set_sd(value)); }
+template <class Integer, class Float> static Integer round_to_integer(Float value) {
+    return hardware_round(runtime(value), Integer());
 }
 // CVTSS2SD and CVTSD2SS: the volatile input keeps every conversion, so a pair is not folded to an
 // identity. Each one quiets a signalling NaN and, with DAZ or FTZ set, flushes denormals, as on hardware.

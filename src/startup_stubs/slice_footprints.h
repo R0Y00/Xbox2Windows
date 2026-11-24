@@ -38,18 +38,33 @@ struct SliceFootprints {
             device->GetCopyableFootprints(&desc, 0, count, 0, placed, rows, row_bytes, &size);
     }
 
+    // Bytes from the start of subresource i to the end of its last row; 0 when there is nothing to
+    // span: an index past the arrays, or a plan whose entry was never filled (no device, unsupported
+    // format) and so has no rows or depth. Callers treat 0 as an empty copy.
     UINT64 bytes(UINT i) const
     {
-        return UINT64{placed[i].Footprint.RowPitch} * (UINT64{placed[i].Footprint.Depth} * rows[i] - 1) + row_bytes[i];
+        if (i >= max_mips * 2) return 0;
+        const UINT64 depth = placed[i].Footprint.Depth, row_count = rows[i];
+        if (!depth || !row_count) return 0;
+        const UINT64 pitch = placed[i].Footprint.RowPitch;
+        const UINT64 preceding_rows = depth * row_count - 1;
+        if (pitch && preceding_rows > (UINT64_MAX - row_bytes[i]) / pitch) return 0;
+        return pitch * preceding_rows + row_bytes[i];
     }
 
     void upload(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, ID3D12Resource* upload_buffer,
                 UINT mips, UINT slices, UINT slice, UINT i, UINT64 offset) const
     {
+        // Nothing is copied for a missing object, a plan without footprints, or an invalid index.
+        if (!list || !texture || !upload_buffer || !mips || mips > max_mips || !slices || slice >= slices ||
+            i >= count || i >= max_mips * 2 || size == UINT64_MAX)
+            return;
+        const UINT64 subresource = i % mips + UINT64{slice} * mips + UINT64{i / mips} * slices * mips;
+        if (subresource > UINT32_MAX) return;
         D3D12_TEXTURE_COPY_LOCATION from{upload_buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         from.PlacedFootprint = {offset, placed[i].Footprint};
         D3D12_TEXTURE_COPY_LOCATION to{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-        to.SubresourceIndex = i % mips + slice * mips + (i / mips) * slices * mips;
+        to.SubresourceIndex = static_cast<UINT>(subresource);
         list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
     }
 };

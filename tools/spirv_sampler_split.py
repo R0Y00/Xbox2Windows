@@ -11,8 +11,14 @@ binding per sampler, in declaration order, and each gets its own new sampler var
 The pass first looks for a standalone UniformConstant sampler, loaded directly, whose sampled
 images feed both kinds of sampling. Modules without one, including indexed sampler tables and
 unrelated sampling, are returned byte-for-byte unchanged. For the sampler being split, the profile
-is limited to direct float32 Texture1D, Texture2D and TextureCube sampling, including their array
-forms, in a single compute entry point at constant LOD zero. The sampler must appear in the
+is limited to direct float32 Texture1D, Texture2D, TextureCube and Texture3D sampling, including the
+array forms of the first three, in a single compute entry point. The ordinary kind takes any LOD
+operand whose result type is the sampled float type (a constant of any value or a computed value); the
+depth-comparison kind stays at constant LOD zero, the only form SM 6.0 has for it (SampleCmpLevelZero). Texture3D is
+only sampled by the ordinary kind: depth comparison on it, and an arrayed 3D image, are refused.
+OpImageGather counts as an ordinary use and OpImageDrefGather as a comparison use, so a gather keeps its
+sampler kind. Both are accepted without image operands only, on 2D, 2D array, cube and cube array images
+(the forms D3D12 gathers), and OpImageGather needs an integer OpConstant component from 0 to 3. The sampler must appear in the
 entry-point interface. Any other use of that sampler is rejected with a specific diagnostic.
 """
 import argparse
@@ -23,6 +29,7 @@ import sys
 
 PREFIX = "%x2w_plain_sampler"
 ZERO = {"0", "0.0", "0x0p+0", "-0", "-0.0", "-0x0p+0"}
+GATHERS = {"OpImageGather": "ordinary", "OpImageDrefGather": "compare"}
 ANNOTATIONS = {"OpName", "OpMemberName", "OpDecorate", "OpMemberDecorate", "OpEntryPoint", "OpExecutionMode"}
 
 
@@ -48,6 +55,26 @@ def _standalone_sampler(definitions, loaded):
     return load[2]
 
 
+def _check_gather(image, use, texture, definitions):
+    """Accept OpImageGather/OpImageDrefGather %type %image %coord %component|%dref with no image operands."""
+    if len(use) != 5:
+        raise ValueError(f"{image}: {use[0]} with image operands is not supported")
+    if use[2] != image:
+        raise ValueError(f"{image}: {use[0]} must gather from the sampled image itself")
+    if texture[2] not in ("2D", "Cube"):
+        raise ValueError(f"{image}: {use[0]} is only supported on Texture2D, Texture2DArray, TextureCube "
+                         "and TextureCubeArray")
+    if use[0] == "OpImageGather":
+        component = definitions.get(use[4], [])
+        try:
+            value = int(component[2], 0)
+        except (IndexError, ValueError):
+            value = -1
+        if (len(component) != 3 or component[0] != "OpConstant"
+                or definitions.get(component[1], [])[:1] != ["OpTypeInt"] or not 0 <= value <= 3):
+            raise ValueError(f"{image}: OpImageGather requires an integer constant component from 0 to 3")
+
+
 def _ordinary_images(sampler, uses, definitions):
     """Apply the narrow profile to one sampler being split; return its ordinary-only sampled images."""
     images = []
@@ -66,19 +93,31 @@ def _ordinary_images(sampler, uses, definitions):
         # OpTypeImage <sampled type> <dim> <depth> <arrayed 0|1> <ms> <sampled> <format>
         if (len(texture) != 8 or texture[0] != "OpTypeImage"
                 or definitions.get(texture[1]) != ["OpTypeFloat", "32"]
-                or texture[2] not in ("1D", "2D", "Cube") or texture[4] not in ("0", "1")
+                or texture[2] not in ("1D", "2D", "Cube", "3D") or texture[4] not in ("0", "1")
+                or (texture[2] == "3D" and texture[4] != "0")
                 or texture[5:] != ["0", "1", "Unknown"]):
-            raise ValueError(f"{image}: only float32 Texture1D, Texture2D and TextureCube sampling "
-                             "(including their array forms) is supported")
+            raise ValueError(f"{image}: only float32 Texture1D, Texture2D, TextureCube and non-arrayed Texture3D "
+                             "sampling (including the array forms of the first three) is supported")
         kinds = set()
         for _, use in uses[image]:
+            if use[0] in GATHERS:
+                _check_gather(image, use, texture, definitions)
+                kinds.add(GATHERS[use[0]])
+                continue
             ordinary = use[0] == "OpImageSampleExplicitLod" and len(use) == 6
             compare = use[0] == "OpImageSampleDrefExplicitLod" and len(use) == 7
             if not (ordinary or compare) or use[2] != image or use[-2] != "Lod":
                 raise ValueError(f"{image}: only explicit-LOD ordinary and depth-comparison sampling is supported")
+            if compare and texture[2] == "3D":
+                raise ValueError(f"{image}: depth-comparison sampling is not supported on Texture3D")
             lod = definitions.get(use[-1], [])
-            if len(lod) != 3 or lod[:2] != ["OpConstant", texture[1]] or lod[2] not in ZERO:
-                raise ValueError(f"{image}: {use[0]} requires a constant LOD of zero")
+            if compare:
+                if len(lod) != 3 or lod[:2] != ["OpConstant", texture[1]] or lod[2] not in ZERO:
+                    raise ValueError(f"{image}: {use[0]} requires a constant LOD of zero")
+            elif len(lod) < 2 or lod[1] != texture[1]:
+                # An ordinary sample is a plain SampleLevel at any LOD: a constant or a computed value
+                # whose result type is the sampled float type (spirv-val also requires a float scalar).
+                raise ValueError(f"{image}: {use[0]} requires a LOD operand of the sampled float type")
             kinds.add("ordinary" if ordinary else "compare")
         if len(kinds) > 1:
             raise ValueError(f"{image}: one sampled image is used for both sampling kinds")

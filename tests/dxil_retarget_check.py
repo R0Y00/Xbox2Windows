@@ -761,6 +761,41 @@ define void @main() {
           "executable uses only while the archive filter treats every reachable form as reaching an "
           "intrinsic; a metadata string that spells a call and a ';' inside a metadata string still "
           "pass; without --probe the CLI records NOT_CHECKED and submits nothing")
+    # Malformed streams end in ValueError, not in a hang or an interpreter error.
+    # An array count larger than the bits left in the stream is refused, even when its elements
+    # are zero bits wide.
+    huge = rt.BitWriter()
+    huge.write_vbr(1 << 22, 6)
+    huge.align32()
+    for element in ((rt.ENC_FIXED, 0), (rt.ENC_FIXED, 8), (rt.ENC_VBR, 6), (rt.ENC_CHAR6, None)):
+        try:
+            rt._read_abbrev_record(rt.BitReader(huge.finish()), [("LIT", 4), (rt.ENC_ARRAY, None), element])
+        except ValueError as exc:
+            assert "Array length" in str(exc), exc
+        else:
+            raise AssertionError(f"array of {element} accepted a count beyond the stream")
+    # A legitimate zero-width array that fits the stream still reads.
+    small = rt.BitWriter()
+    small.write_vbr(3, 6)
+    small.align32()
+    code, values, _ = rt._read_abbrev_record(rt.BitReader(small.finish()), [("LIT", 4), (rt.ENC_ARRAY, None), (rt.ENC_FIXED, 0)])
+    assert (code, values) == (4, [0, 0, 0]), (code, values)
+
+    # Blocks nested beyond the limit are refused; blocks at the limit still parse.
+    def nested(levels: int) -> bytes:
+        items: list = []
+        for _ in range(levels):
+            items = [("BLOCK", rt.MODULE_BLOCK_ID, 3, items)]
+        return rt.serialize_bitcode(items)
+
+    rt.parse_bitcode(nested(rt.MAX_BLOCK_DEPTH))
+    try:
+        rt.parse_bitcode(nested(rt.MAX_BLOCK_DEPTH + 1))
+    except ValueError as exc:
+        assert "nest deeper" in str(exc), exc
+    else:
+        raise AssertionError("bitcode nested beyond the limit was accepted")
+
     print("pure-python dxil_retarget controls: ok")
 
 

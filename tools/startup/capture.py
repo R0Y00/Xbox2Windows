@@ -1,4 +1,5 @@
 """Reader for capture.bin written by the frame capture (startup tools; see docs/startup-runtime.md)."""
+import itertools
 import struct
 import sys
 from collections import defaultdict, Counter
@@ -55,19 +56,33 @@ class Capture:
         self.tables = defaultdict(list)   # seq -> [dict]
         self.targets = {}     # seq -> [view id + 1]
         self.presents = []
-        data = open(path, 'rb').read()
+        with open(path, 'rb') as stream:
+            data = stream.read()
         at = 0
-        while at + 16 <= len(data):
+        while at < len(data):
+            start = at
+            if at + 16 > len(data):
+                raise ValueError('truncated chunk header at offset %d' % start)
             tag, hsize, dsize = struct.unpack_from('<4sIQ', data, at)
             at += 16
+            if hsize + dsize > len(data) - at:
+                raise ValueError('truncated %r chunk at offset %d: declares %d header and %d data bytes, %d left' % (
+                    tag, start, hsize, dsize, len(data) - at))
             header = data[at:at + hsize]
             at += hsize
             body = data[at:at + dsize]
             at += dsize
-            getattr(self, 'on_' + tag.decode().strip())(header, body)
+            handler = getattr(self, 'on_' + tag.decode('ascii', 'replace').strip(), None)
+            if handler is None:
+                raise ValueError('unknown chunk tag %r at offset %d' % (tag, start))
+            try:
+                handler(header, body)
+            except struct.error as error:
+                raise ValueError('bad %r chunk at offset %d: %s' % (tag, start, error)) from error
 
     def on_FRAM(self, h, b):
-        pass
+        if len(h) < struct.calcsize('<II'):
+            raise struct.error('frame header requires the frame number and reserved word')
 
     def on_CALL(self, h, b):
         frame, seq, tid, slot, lst = struct.unpack_from('<IIIIQ', h, 0)
@@ -94,7 +109,6 @@ class Capture:
         wrapper, title_memory, size, gpu = struct.unpack_from('<4Q', h, 0)
 
         def desc(at):
-            dim, align, width, height, depth, mips, fmt, samples, quality, layout, flags = struct.unpack_from('<IQQIHHIIIII', h, at) if False else (None,) * 11
             # D3D12_RESOURCE_DESC: Dimension u32, pad, Alignment u64, Width u64, Height u32, Depth u16, Mips u16,
             # Format u32, SampleDesc {u32, u32}, Layout u32, Flags u32  = 56 bytes
             dim, = struct.unpack_from('<I', h, at)
@@ -153,7 +167,7 @@ def describe(cap, out=sys.stdout):
         w('%4d f%d L%03x %-30s %s | %s\n' % (c['seq'], c['frame'], c['list'] & 0xfff, LIST_SLOTS.get(c['slot'], 'slot%d' % c['slot']),
                                              ', '.join(args), ' '.join('0x%x' % a for a in c['args'][3:5])))
         for t in cap.tables.get(c['seq'], ()):
-            used = [(i, s, k) for i, (s, k) in enumerate(zip(t['shadow'], t['tokens'])) if s or k]
+            used = [(i, s, k) for i, (s, k) in enumerate(itertools.zip_longest(t['shadow'], t['tokens'], fillvalue=0)) if s or k]
             w('       table param %d heap index %d: %d of %d entries known\n' % (t['parameter'] if t['parameter'] != 0xffffffff else -1,
                                                                              t['index'], len(used), t['entries']))
             for i, s, k in used[:64]:

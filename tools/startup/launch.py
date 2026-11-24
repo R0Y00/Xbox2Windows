@@ -9,7 +9,9 @@ import os
 import sys
 import time
 
-k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32 = None
+if hasattr(ctypes, "WinDLL"):
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 class STARTUPINFOW(ctypes.Structure):
@@ -46,8 +48,54 @@ class SECURITY_ATTRIBUTES(ctypes.Structure):
     _fields_ = [("nLength", wt.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p), ("bInheritHandle", wt.BOOL)]
 
 
-k32.CreateFileW.restype = wt.HANDLE
-k32.CreateJobObjectW.restype = wt.HANDLE
+if k32 is not None:
+    k32.CreateFileW.restype = wt.HANDLE
+    k32.CreateJobObjectW.restype = wt.HANDLE
+
+
+def prepare_storage_path(env, logdir, default_storage="S:\\", exists_fn=os.path.exists, makedirs_fn=os.makedirs):
+    """Ensure X2W_STORAGE_PATH has a valid directory when unset and the default drive is absent."""
+    current = env.get("X2W_STORAGE_PATH", "").strip()
+    if current:
+        return None
+    if exists_fn(default_storage):
+        return None
+    fallback = os.path.join(logdir, "storage")
+    makedirs_fn(fallback, exist_ok=True)
+    env["X2W_STORAGE_PATH"] = fallback
+    return f"X2W_STORAGE_PATH unset and {default_storage} missing; created fallback storage: {fallback}"
+
+
+def check_shader_cache_warning(env, cwd=None):
+    """Warn if X2W_SHADER_CACHE points to an existing non-empty directory.
+
+    A relative value is resolved against the child's working directory, as the child sees it.
+    Inspection failures are advisory only and never stop the launch.
+    """
+    shader_cache = env.get("X2W_SHADER_CACHE", "").strip()
+    if not shader_cache:
+        return None
+    inspected = os.path.join(cwd, shader_cache) if cwd and not os.path.isabs(shader_cache) else shader_cache
+    try:
+        if not os.path.isdir(inspected):
+            return None
+        with os.scandir(inspected) as entries:
+            if any(entries):
+                return (f"warning: X2W_SHADER_CACHE ({shader_cache}) is non-empty; "
+                        "cached translated shaders from an older build may be stale")
+    except OSError:
+        return None
+    return None
+
+
+def format_fast_fail_diagnostic(exit_code, elapsed, trap_log, env):
+    """Return a concise diagnostic line when the child exits non-zero in under 1.0 second."""
+    if elapsed >= 1.0 or exit_code == 0:
+        return None
+    storage = env.get("X2W_STORAGE_PATH", "").strip() or "S:\\"
+    shader_cache = env.get("X2W_SHADER_CACHE", "").strip() or "(unset)"
+    return (f"fast-fail: exited with {exit_code:#010x} in {elapsed:.2f} s (< 1.0 s); "
+            f"check trap log={trap_log}, X2W_STORAGE_PATH={storage}, X2W_SHADER_CACHE={shader_cache}")
 
 
 def inheritable_file(path):
@@ -92,6 +140,12 @@ def main():
     si.dwFlags = 0x100  # STARTF_USESTDHANDLES
     si.hStdOutput, si.hStdError = out, err
     env = dict(os.environ, X2W_TRAP_LOG=trap_log)
+    storage_note = prepare_storage_path(env, logdir)
+    if storage_note:
+        print(storage_note)
+    shader_warning = check_shader_cache_warning(env, cwd)
+    if shader_warning:
+        print(shader_warning)
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
     cmdline = ctypes.create_unicode_buffer(" ".join(f'"{a}"' for a in [exe, *extra]))
     pi = PROCESS_INFORMATION()
@@ -119,6 +173,9 @@ def main():
         k32.CloseHandle(wt.HANDLE(h))
     print(f"pid {pi.dwProcessId} {ended} in {elapsed:.2f} s, exit code {code.value:#010x}, "
           f"peak job memory {info.PeakJobMemoryUsed / 2**20:.1f} MiB")
+    fast_fail = format_fast_fail_diagnostic(code.value, elapsed, trap_log, env)
+    if fast_fail:
+        print(fast_fail)
     for name in ("stdout.txt", "stderr.txt", "trap.log"):
         path = os.path.join(logdir, name)
         text = open(path, encoding="utf-8", errors="replace").read() if os.path.exists(path) else None

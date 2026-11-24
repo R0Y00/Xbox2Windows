@@ -52,6 +52,7 @@ int main()
 #include <vector>
 
 #include "addrinterface.h"
+#include "../src/startup_stubs/bc64_chain.h"
 
 namespace {
 // Mesa ac_fake_hw_db.h "navi21": family_id AMDGPU_FAMILY_NV, chip_external_rev 0x28, gb_addr_config 0x40 with
@@ -457,6 +458,90 @@ int run_factory(bool mutate)
     return ok ? 0 : 1;
 }
 
+bool block_addresses_match(ADDR_HANDLE lib, const ADDR2_COMPUTE_SURFACE_INFO_INPUT& surface)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Height = surface.height;
+    desc.MipLevels = static_cast<UINT16>(surface.numMipLevels);
+    desc.DepthOrArraySize = static_cast<UINT16>(surface.numSlices);
+    const x2w_startup::bc64::Chain chain(desc);
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT in{};
+    in.size = sizeof(in);
+    in.flags = surface.flags;
+    in.resourceType = surface.resourceType;
+    in.swizzleMode = surface.swizzleMode;
+    in.bpp = 128;
+    in.unalignedWidth = surface.width / 4;
+    in.unalignedHeight = surface.height / 4;
+    in.numMipLevels = surface.numMipLevels;
+    in.numSlices = surface.numSlices;
+    in.numSamples = in.numFrags = 1;
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT out{};
+    out.size = sizeof(out);
+    for (in.slice = 0; in.slice < in.numSlices; ++in.slice) {
+        for (in.mipId = 0; in.mipId < in.numMipLevels; ++in.mipId) {
+            const unsigned columns = ((surface.width >> in.mipId) + 3) / 4;
+            const unsigned rows = ((surface.height >> in.mipId) + 3) / 4;
+            for (in.y = 0; in.y < rows; ++in.y) {
+                for (in.x = 0; in.x < columns; ++in.x) {
+                    const auto expected = chain.address(in.mipId, in.x, in.y, in.slice);
+                    if (Addr2ComputeSurfaceAddrFromCoord(lib, &in, &out) != ADDR_OK ||
+                        out.bitPosition != 0 || out.addr != expected) {
+                        std::printf("BC block mismatch at slice %u mip %u (%u,%u): AddrLib %llu, XG %u\n",
+                                    in.slice, in.mipId, in.x, in.y, static_cast<unsigned long long>(out.addr), expected);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+int bc64_tiling_reference()
+{
+    ADDR_HANDLE lib = create_navi21();
+    if (!lib) return 1;
+    for (auto format : {ADDR_FMT_BC5, ADDR_FMT_BC7}) {
+        for (UINT_32 height : {512u, 1024u}) {
+            for (UINT_32 slices : {1u, 2u}) {
+                ADDR2_COMPUTE_SURFACE_INFO_INPUT in{};
+                ADDR2_COMPUTE_SURFACE_INFO_OUTPUT out{};
+                std::array<ADDR2_MIP_INFO, 9> mips{};
+                in.size = sizeof(in);
+                in.flags.texture = 1;
+                in.format = format;
+                in.swizzleMode = ADDR_SW_64KB_S;
+                in.resourceType = ADDR_RSRC_TEX_2D;
+                in.width = 1024;
+                in.height = height;
+                in.numMipLevels = static_cast<UINT_32>(mips.size());
+                in.numSlices = slices;
+                in.numSamples = in.numFrags = 1;
+                out.size = sizeof(out);
+                out.pMipInfo = mips.data();
+                constexpr unsigned tile = 65536;
+                const unsigned slice_tiles = height == 512 ? 12 : 22;
+                const std::array<unsigned, 3> starts{height == 512 ? 4u : 6u, 2u, 1u};
+                bool matches = Addr2ComputeSurfaceInfo(lib, &in, &out) == ADDR_OK &&
+                    out.sliceSize == slice_tiles * tile && out.surfSize == out.sliceSize * slices &&
+                    out.firstMipIdInTail == starts.size() && out.blockWidth == 64 && out.blockHeight == 64;
+                for (unsigned i = 0; i < mips.size(); ++i) {
+                    const unsigned block_offset = i < starts.size() ? starts[i] * tile : 0;
+                    matches &= mips[i].macroBlockOffset == block_offset;
+                }
+                std::printf("BC surface format=%u, 1024x%u, %u slice(s): %llu bytes per slice, first tail %u\n",
+                            static_cast<unsigned>(format), height, slices,
+                            static_cast<unsigned long long>(out.sliceSize), out.firstMipIdInTail);
+                expect(matches, "64 KiB standard block starts, packed tile and complete array size");
+                expect(block_addresses_match(lib, in), "all visible BC blocks match AddrLib");
+            }
+        }
+    }
+    AddrDestroy(lib);
+    return failures ? 1 : 0;
+}
+
 int run(bool mutate_linear_fallback)
 {
     std::printf("AddrLib observations from %s\n", addrlib_source);
@@ -574,11 +659,12 @@ int run(bool mutate_linear_fallback)
 // The mutation passes only if the comparison detects the expected fallback mismatches.
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::strcmp(argv[1], "--bc64-tiling") == 0) return bc64_tiling_reference();
     if (argc == 2 && std::strcmp(argv[1], "--factory") == 0) return run_factory(false);
     if (argc == 2 && std::strcmp(argv[1], "--mutate-factory-no-write") == 0) return run_factory(true);
     const bool mutate = argc == 2 && std::strcmp(argv[1], "--mutate-linear-fallback") == 0;
     if (argc > 2 || (argc == 2 && !mutate)) {
-        std::puts("usage: xg_swizzle_select_check [--mutate-linear-fallback|--factory|--mutate-factory-no-write]");
+        std::puts("usage: xg_swizzle_select_check [--mutate-linear-fallback|--factory|--mutate-factory-no-write|--bc64-tiling]");
         return 2;
     }
     const int result = run(mutate);

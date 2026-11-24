@@ -18,8 +18,8 @@ from exe_process import launch
 from native_map_check import Mapper, STATUS, kernel
 
 PASS = 0x870
-EXPECTED = {"original": PASS, "reserve_only": 0xF02, "misaligned": 0xF02, "dirty": 0xF03, "accepted_refusal": 0xF0F,
-            "host_fit": 0xF17, "skip_release": 0xF19}
+EXPECTED = {"original": PASS, "reserve_only": 0xF02, "misaligned": 0xF02, "dirty": 0xF03, "accepted_refusal": 0xF13,
+            "host_fit": 0xF1C, "skip_release": 0xF1E}
 EXPORT = "XMemVirtualAlloc"
 XMEM, IO = "xmem.dll", "cpu_exe_io.dll"
 REQUESTS = sorted([[XMEM, EXPORT], ["kernel32.dll", "VirtualQuery"], ["kernel32.dll", "VirtualFree"],

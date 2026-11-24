@@ -1,6 +1,7 @@
 """Differential checks and rejection controls for recompiled scalar SSE/SSE2 leaf functions."""
 
 import ctypes
+from fractions import Fraction
 import math
 from pathlib import Path
 import random
@@ -9,7 +10,7 @@ import sys
 from tempfile import TemporaryDirectory
 
 import pefile
-from iced_x86 import Decoder, Mnemonic as M
+from iced_x86 import Decoder, Mnemonic as M, OpKind
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva
@@ -21,7 +22,7 @@ SIGNATURES = {"blend_ss": "f:ffqf", "blend_sd": "d:ddqd", "convert": "q:fdq", "f
               "zero_xorps": "d:d", "zero_pxor": "d:d", "zero_xorpd": "d:d", "probe_ss": "q:qff",
               "neg_jcc": "q:q", "setcc_mix": "q:qqq", "cmovcc_mix": "q:qqq",
               "min_ss": "f:ffq", "max_ss": "f:ffq", "min_sd": "d:ddq", "max_sd": "d:ddq",
-              "root_ss": "f:fq", "root_sd": "d:dq", "root_const_ss": "f:", "root_const_sd": "d:"}
+              "root_ss": "f:fq", "root_sd": "d:dq", "root_const_ss": "f:", "root_const_sd": "d:", "round_cvt": "q:fdq"}
 # MIN, MAX and SQRT: the seed behind the pointer and how far each export writes into it.
 SEED = struct.pack("<II", 0x0badf00d, 0x1badcafe)
 EXTREMA = {"min_ss": ("min", 4), "max_ss": ("max", 4), "min_sd": ("min", 8), "max_sd": ("max", 8)}
@@ -55,7 +56,7 @@ DENORMAL_ANSWERS = [
 # The operands of the constant-source exports, as an integer built into the code: sqrt(2) as a float and
 # sqrt(3) as a double.
 CONSTANT_ROOTS = {"root_const_ss": (2, 4), "root_const_sd": (3, 8)}
-WINDOWS = {"min_ss": 40, "max_ss": 40, "min_sd": 48, "max_sd": 48, "root_ss": 40, "root_sd": 48}
+WINDOWS = {"min_ss": 40, "max_ss": 40, "min_sd": 48, "max_sd": 48, "root_ss": 40, "root_sd": 48, "round_cvt": 80}
 GUARD = bytes.fromhex("5a5a1234a5a54321")
 FILL = 0xa5
 MASK32 = 0xffffffff
@@ -239,6 +240,7 @@ def cases():
     for name, width in ROOTS.items():
         found += [(name, (a, None), SEED + bytes([FILL]) * (WINDOWS[name] - 8)) for a in (SINGLES if width == 4 else DOUBLES)]
     found += [("root_const_ss", (), b""), ("root_const_sd", (), b"")]
+    found += [("round_cvt", (f, d, None), bytes([FILL]) * WINDOWS["round_cvt"]) for f in ROUND_SINGLES for d in ROUND_DOUBLES]
     name, values, payload, _, _ = probe_answer(2.0, 1.0)
     found.append((name, values, payload))
     flag_values = [0, 1, 2, 0x7fffffff, 0x80000000, 0xffffffff, (1 << 63) - 1, 1 << 63, (1 << 64) - 1]
@@ -306,6 +308,92 @@ def single(value):
 
 def double(value):
     return struct.unpack("<Q", struct.pack("<d", value))[0]
+
+
+
+# CVTSS2SI and CVTSD2SI of round_cvt. Each word of the output, its source width and its integer size in bytes: the
+# 32-bit forms start from all ones, so a result that keeps the upper half or extends the sign shows.
+ROUND_WINDOW = 80
+ROUND_LAYOUT = {0: (4, 4), 8: (8, 4), 16: (4, 8), 24: (8, 8), 32: (4, 4), 56: (8, 4), 64: (4, 8), 72: (8, 8)}
+ROUND_32 = tuple(offset for offset, (_, size) in ROUND_LAYOUT.items() if size == 4)
+ROUND_CONTROL_WORDS = [DEFAULT_MXCSR | control << 13 | daz | ftz for control in range(4) for daz in (0, DAZ) for ftz in (0, FTZ)]
+INDEFINITE = {4: 1 << 31, 8: 1 << 63}
+ROUND_SINGLES = [single(v) for v in (
+    0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 3.5, 0.25, -0.75, 1.0, -1.0, 4.5, 5.5, 1 - 2.0**-24, 1 + 2.0**-23,
+    1.5 - 2.0**-23, 1.5 + 2.0**-23, 2.0**23 - 0.5, 2.0**23, 3e9, -3e9, 1e20, 2.0**31 - 128, 2.0**31, -2.0**31,
+    -2.0**31 - 256, 2.0**32, 2.0**63 - 2.0**39, 2.0**63, -2.0**63, -2.0**63 - 2.0**40)] + [
+    0x00000001, 0x007fffff, 0x807fffff, 0x80000001, 0x00800000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000,
+    0x7f800001, 0xffa00000, 0x7fc12345]
+ROUND_DOUBLES = [double(v) for v in (
+    0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 3.5, 0.5 - 2.0**-54, 0.5 + 2.0**-53, 1.0, -1.0, 2.0**31 - 0.5,
+    2.0**31 - 0.5 - 2.0**-22, -2.0**31 - 0.5, -2.0**31, -2.0**31 + 0.5, 2.0**31, 2.0**31 - 1, -2.0**31 - 1,
+    2.0**52 - 0.5, 3e9, 4.4e18, 2.0**63 - 1024, 2.0**63, -2.0**63, -2.0**63 - 2048, 1e300, -1e300)] + [
+    0x0000000000000001, 0x000fffffffffffff, 0x800fffffffffffff, 0x8000000000000001, 0x0010000000000000,
+    0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000000000, 0xfff8000000000000, 0x7ff0000000000001,
+    0xfff7ffffffffffff, 0x7ff8000012345678]
+# Wrong rules and the words they must break, as the guard of the test: a rule that rounds, narrows or extends
+# wrongly has to disagree with the processor on its own words and on no other.
+ROUND_MUTANTS = {"truncate": tuple(ROUND_LAYOUT), "ties-away": tuple(ROUND_LAYOUT), "indefinite-zero": tuple(ROUND_LAYOUT),
+                 "ignore-rc": tuple(ROUND_LAYOUT), "daz-ignored": tuple(ROUND_LAYOUT), "keep-upper": ROUND_32,
+                 "sign-extended": ROUND_32,
+                 "r64-narrowed": tuple(offset for offset in ROUND_LAYOUT if offset not in ROUND_32)}
+# Fixed from the instruction set reference: (MXCSR word, source, source bits, 32-bit result, 64-bit result).
+ROUND_ANSWERS = [(DEFAULT_MXCSR, kind, *answer) for kind, *answer in (
+    ("f", single(0.5), 0, 0), ("f", single(1.5), 2, 2), ("f", single(2.5), 2, 2), ("f", single(-0.5), 0, 0),
+    ("f", single(-1.5), 0xfffffffe, (1 << 64) - 2), ("f", single(-2.5), 0xfffffffe, (1 << 64) - 2),
+    ("f", 0x7fc00000, 1 << 31, 1 << 63), ("f", 0x7f800000, 1 << 31, 1 << 63), ("f", 0xff800000, 1 << 31, 1 << 63),
+    ("f", single(2.0**31), 1 << 31, 1 << 31), ("f", single(2.0**63), 1 << 31, 1 << 63),
+    ("f", single(-2.0**63), 1 << 31, 1 << 63), ("f", single(-2.0**31), 1 << 31, (1 << 64) - (1 << 31)),
+    ("d", double(2.0**31 - 0.5), 1 << 31, 1 << 31), ("d", double(-2.0**31 - 0.5), 1 << 31, (1 << 64) - (1 << 31)),
+    ("d", double(2.0**63 - 1024), 1 << 31, (1 << 63) - 1024), ("d", 0xfff8000000000000, 1 << 31, 1 << 63),
+    ("d", double(0.5 + 2.0**-53), 1, 1))] + [
+    (0x7f80, "d", double(2.0**31 - 0.5), 0x7fffffff, 0x7fffffff), (0x3f80, "f", single(-0.5), 0xffffffff, (1 << 64) - 1),
+    (0x5f80, "f", single(0.5), 1, 1), (0x5f80, "f", single(-0.5), 0, 0), (0x3f80, "d", double(2.5), 2, 2),
+    (0x7f80, "f", single(-2.5), 0xfffffffe, (1 << 64) - 2), (0x5f80, "d", double(2.5), 3, 3),
+    (DEFAULT_MXCSR, "f", 1, 0, 0), (0x5f80, "f", 1, 1, 1), (0x5f80 | DAZ, "f", 1, 0, 0), (0x3f80 | DAZ, "f", 0x80000001, 0, 0),
+    (0x3f80, "f", 0x80000001, 0xffffffff, (1 << 64) - 1), (0x5f80 | DAZ | FTZ, "d", 1, 0, 0), (0x5f80 | FTZ, "d", 1, 1, 1)]
+
+
+def rounded(bits, width, size, mxcsr, variant=None):
+    """CVTSS2SI or CVTSD2SI of one source, from exact rational arithmetic: the integer bits for the rounding control
+    of the MXCSR word (0 nearest even, 1 down, 2 up, 3 toward zero), the integer indefinite for a NaN, an infinity or
+    a result that does not fit, and zero for a denormal under DAZ. FTZ plays no part. A variant is a wrong rule."""
+    fraction_bits, exponent_mask = (23, 0xff) if width == 4 else (52, 0x7ff)
+    size = 4 if variant == "r64-narrowed" else size
+    indefinite = 0 if variant == "indefinite-zero" else INDEFINITE[size]
+    exponent = bits >> fraction_bits & exponent_mask
+    if exponent == exponent_mask:
+        return indefinite
+    if exponent == 0 and mxcsr & DAZ and variant != "daz-ignored":
+        return 0
+    x = Fraction(number(bits, width))
+    control = 3 if variant == "truncate" else 0 if variant == "ignore-rc" else mxcsr >> 13 & 3
+    floor = math.floor(x)
+    rest = x - floor
+    if control == 0 and variant == "ties-away":
+        result = (1 if x >= 0 else -1) * math.floor(abs(x) + Fraction(1, 2))
+    elif control == 0:
+        result = floor + (rest > Fraction(1, 2) or (rest == Fraction(1, 2) and floor % 2 == 1))
+    else:
+        result = floor if control == 1 or (control == 3 and x >= 0) else floor + (rest != 0)
+    if not -INDEFINITE[size] <= result < INDEFINITE[size]:
+        return indefinite
+    return result & (1 << 8 * size) - 1
+
+
+def rounded_answer(values, payload, mxcsr, variant=None):
+    """The result and the whole buffer of round_cvt for the slot values (f, d, pointer)."""
+    memory = bytearray(payload)
+    memory[40:44] = struct.pack("<I", values[0] & MASK32)
+    memory[48:56] = struct.pack("<Q", values[1])
+    for offset, (width, size) in ROUND_LAYOUT.items():
+        word = rounded(values[0] & MASK32 if width == 4 else values[1], width, size, mxcsr, variant)
+        if size == 4 and variant == "keep-upper":
+            word |= (1 << 64) - (1 << 32)
+        if size == 4 and variant == "sign-extended" and word >> 31:
+            word |= (1 << 64) - (1 << 32)
+        memory[offset:offset + 8] = struct.pack("<Q", word)
+    return struct.unpack_from("<Q", memory, 0)[0], bytes(memory)
 
 
 def probe_answer(a, b):
@@ -460,6 +548,10 @@ def check(original, lifted, swapped, swapped_lifted):
             expected = reference(name, values, payload)
             if native != (expected[0], GUARD + expected[1] + GUARD):
                 raise AssertionError(f"{name}{values}: the processor gave {native}, the reference {expected}")
+        if name == "round_cvt":
+            expected = rounded_answer(values, payload, DEFAULT_MXCSR)
+            if native != (expected[0], GUARD + expected[1] + GUARD):
+                raise AssertionError(f"{name}{values}: the processor gave {native}, the reference {expected}")
         control = run(swapped, name, values, payload)
         actual = run(swapped_lifted, name, values, payload)
         if actual != control:
@@ -569,6 +661,40 @@ def check_mxcsr(original, lifted, access):
           f"rounding controls, DAZ and FTZ; {len(MXCSR_MUTANTS)} wrong rules each disagree on a call")
 
 
+def check_rounding(original, lifted, access):
+    """round_cvt of the fixture and of its translation under the same host MXCSR word, for every rounding control with
+    and without DAZ and FTZ, against the reference and the fixed answers. The wrong rules must each break their own words."""
+    pairs = [(f, ROUND_DOUBLES[(7 * i + 11 * k) % len(ROUND_DOUBLES)]) for i, f in enumerate(ROUND_SINGLES) for k in range(6)]
+    payload = bytes([FILL]) * WINDOWS["round_cvt"]
+    broken = {variant: set() for variant in ROUND_MUTANTS}
+    for word in ROUND_CONTROL_WORDS:
+        for f, d in pairs:
+            values = (f, d, None)
+            native = under(access, word, original, "round_cvt", values, payload)
+            actual = under(access, word, lifted, "round_cvt", values, payload)
+            if actual != native:
+                raise AssertionError(f"translation mismatch under MXCSR {word:#x} for round_cvt{values}: {actual} != {native}")
+            expected = rounded_answer(values, payload, word)
+            if native != (expected[0], GUARD + expected[1] + GUARD):
+                raise AssertionError(f"round_cvt{values} under MXCSR {word:#x}: the processor gave {native}, the reference {expected}")
+            for variant in ROUND_MUTANTS:
+                wrong = rounded_answer(values, payload, word, variant)[1]
+                broken[variant].update(o for o in ROUND_LAYOUT if wrong[o:o + 8] != expected[1][o:o + 8])
+    for word, kind, bits, small, large in ROUND_ANSWERS:
+        values = (bits, 0, None) if kind == "f" else (0, bits, None)
+        for label, call in (("processor", original), ("translation", lifted)):
+            raw = under(access, word, call, "round_cvt", values, payload)[1][8:-8]
+            for offset, (width, size) in ROUND_LAYOUT.items():
+                if width == (4 if kind == "f" else 8) and struct.unpack_from("<Q", raw, offset)[0] != (small, large)[size == 8]:
+                    raise AssertionError(f"{label} round_cvt{values} under MXCSR {word:#x}: word {offset} is not "
+                                         f"{(small, large)[size == 8]:#x}")
+    for variant, offsets in ROUND_MUTANTS.items():
+        if broken[variant] != set(offsets):
+            raise AssertionError(f"wrong rule {variant!r} breaks words {sorted(broken[variant])}, not {sorted(offsets)}")
+    print(f"round_cvt matches the processor and the reference for {len(ROUND_CONTROL_WORDS)} MXCSR words; "
+          f"{len(ROUND_ANSWERS)} fixed answers; {len(ROUND_MUTANTS)} wrong rules each break their own words")
+
+
 def check_rejections(original_path):
     data = Path(original_path).read_bytes()
     with pefile.PE(data=data, fast_load=True) as pe:
@@ -592,6 +718,9 @@ def check_rejections(original_path):
     add, copy, multiply = first("blend_ss", M.ADDSS), first("blend_ss", M.MOVAPS), first("blend_ss", M.MULSS)
     load, subtract = first("blend_ss", M.MOVSS), first("blend_ss", M.SUBSS)
     truncate = next(i for i in code["convert"] if i.mnemonic == M.CVTTSS2SI and i.len == 5)
+    round_ss, round_sd = first("round_cvt", M.CVTSS2SI), first("round_cvt", M.CVTSD2SI)
+    round_mem = next(i for i in code["round_cvt"] if i.mnemonic == M.CVTSS2SI and i.op1_kind == OpKind.MEMORY)
+    round_mem_next = next(i for i in code["round_cvt"] if i.ip == round_mem.next_ip)
     compare, parity, below_equal = (first("classify_ss", m) for m in (M.UCOMISS, M.JP, M.JBE))
     classify_jne = first("classify_ss", M.JNE)
     min_reg, min_mem = (i for i in code["min_ss"] if i.mnemonic == M.MINSS)
@@ -624,7 +753,13 @@ def check_rejections(original_path):
         (patch(copy, "0f 28 f0"), "nonvolatile register xmm6", "write to XMM6"),
         (patch(multiply, "f3 0f 59 d5"), "undefined register xmm5", "read of an unwritten register"),
         (patch(load, "f3 0f 10 25 00 00 00 00", multiply), "unsupported memory operand", "RIP-relative load"),
-        (patch(truncate, "f3 48 0f 2d d0"), "unsupported instruction", "CVTSS2SI, which rounds by MXCSR"),
+        (patch(truncate, "0f 2d d0"), "unsupported instruction", "CVTPS2PI into an MMX register"),
+        (patch(round_ss, "66 0f 2d c0"), "unsupported instruction", "CVTPD2PI into an MMX register"),
+        (patch(round_ss, "c5 fa 2d c0"), "unsupported instruction", "VEX-encoded VCVTSS2SI"),
+        (patch(round_sd, "c5 fb 2d c1"), "unsupported instruction", "VEX-encoded VCVTSD2SI"),
+        (patch(round_ss, "f3 0f 2d c5"), "undefined register xmm5", "CVTSS2SI of an unwritten register"),
+        (patch(round_ss, "f3 0f 2d d8"), "nonvolatile register rbx", "CVTSS2SI into RBX"),
+        (patch(round_mem, "f3 0f 2d 0d 00 00 00 00", round_mem_next), "unsupported memory operand", "RIP-relative CVTSS2SI source"),
         (patch(truncate, "66 48 0f 7e c2"), "unsupported instruction", "MOVQ to an integer register"),
         ((below_equal.ip, b"\x7e"), "unsupported condition after a float compare", "JLE after COMISS"),
         (patch(below_equal, ""), "float compare without a conditional branch", "COMISS without a jump"),
@@ -662,6 +797,8 @@ def check_rejections(original_path):
         ("max_ss=f:fqq", "undefined register xmm1"),
         ("root_ss=f:qf", "undefined register rdx"),
         ("from_int=q:qq", "undefined register rax"),
+        ("round_cvt=q:fqq", "undefined register xmm1 at"),
+        ("round_cvt=q:ffq", "undefined register xmm1[63:32]"),
         ("blend_ss=f:ffqfq", "invalid signature"),
         ("blend_ss=i:ffqf", "invalid signature"),
     ]
@@ -681,4 +818,5 @@ if __name__ == "__main__":
     check(library_caller(original), library_caller(lifted, "lifted_"),
           library_caller(swapped), library_caller(swapped_lifted, "lifted_"))
     check_mxcsr(library_caller(original), library_caller(lifted, "lifted_"), mxcsr_access(harness))
+    check_rounding(library_caller(original), library_caller(lifted, "lifted_"), mxcsr_access(harness))
     check_rejections(original)

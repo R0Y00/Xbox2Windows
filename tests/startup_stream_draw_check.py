@@ -38,7 +38,8 @@ def check(directory, consumer, backend):
     vs.write_bytes(vertex())
     args = [consumer, vs, ps, root]
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
-               X2W_D3D12_DEBUG="0", X2W_SHADER_CACHE=str(cache))
+               X2W_SHADER_CACHE=str(cache))
+    env.setdefault("X2W_D3D12_DEBUG", "0")
     observations = []
     for green in (False, True):
         ps.write_bytes(pixel(green))
@@ -46,6 +47,9 @@ def check(directory, consumer, backend):
         subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
         result = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
         print(result.stdout, end="")
+        for line in result.stderr.splitlines():
+            if "debug layer:" in line or "x2w-d3d12-debug " in line:
+                print(line)
         if backend == "hardware" and result.returncode == 77:
             print("No D3D12 feature-level 12 hardware adapter")
             return 77
@@ -59,9 +63,30 @@ def check(directory, consumer, backend):
         if pixels != expected:
             raise AssertionError(f"actual {pixels.hex()} expected {expected.hex()}")
         observations.append(pixels)
+    # Hold back the last-published marker while keeping the generated shader bytecode in place.
+    key = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
+    manifest = cache / f"{key:016x}.txt"
+    manifest.rename(str(manifest) + ".pending")
+    run = subprocess.run(args + [backend, output], env=dict(env, X2W_TEST_PUBLISH_MANIFEST=str(manifest)),
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    assert Path(str(output) + ".first").read_bytes() == clear * 32
+    assert output.read_bytes() == observations[1], "same guest PSO remained clear after manifest publication"
     wrong = sum(observations[0][i:i+4] != observations[1][i:i+4] for i in range(0, 8 * 4 * 4, 4))
     assert wrong == 16, f"swapping the pixel shader produced {wrong} changed pixels"
     print(f"{backend}: red/green draws exact, 32 RGBA pixels each; swapped shader differs at {wrong} of 32")
+    # Green has red=0 and alpha=1. Red makes the R8 target nonzero as a separate control.
+    # A cut-down record, wrong ancestor or red/alpha swap changes at least one observation.
+    for mode, green, value in (("parent-a8", True, 0), ("child-a8", True, 255),
+                               ("child-r8", True, 0), ("child-r8", False, 255)):
+        ps.write_bytes(pixel(green))
+        result = subprocess.run(args + [backend, output, mode], env=env, capture_output=True, text=True)
+        if result.returncode or "-> drawn;" not in result.stderr:
+            raise RuntimeError(f"{mode} failed on {backend}: {result.returncode}\n{result.stderr}")
+        expected = (bytes([value]) * 4 + bytes(4)) * 4
+        if output.read_bytes() != expected:
+            raise AssertionError(f"{mode}: got {output.read_bytes().hex()} expected {expected.hex()}")
+        print(f"{backend} {mode} green={green}: 32 pixels exact, drawn byte {value}")
     return 0
 
 

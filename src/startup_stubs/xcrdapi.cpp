@@ -10,12 +10,17 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
+#include "startup_stubs/dstorage_file_read.h"
+#include "startup_stubs/bcpack_decoder.h"
+
+#include <psapi.h>
 
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
-#include <thread>
+#include <new>
 #include <vector>
 
 #include <cstdarg>
@@ -48,22 +53,32 @@ struct Object {
     LONG* results;      // StatusArray: one HRESULT per index, E_PENDING until a status is enqueued
     LONG pending;       // Queue: worst HRESULT of the requests since the last status
     struct QueueWork* work = nullptr;  // Queue: entries waiting for Submit and the worker running them
+    struct Unrecorded* unrecorded_head = nullptr;  // Queue: entries no queue storage could hold, see push()
+    struct Unrecorded* unrecorded_tail = nullptr;
 };
 
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
 // tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
 // like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
 // (titles fill those in after EnqueueRequest).
+//
+// An Entry is default-constructed, moved and move-assigned on the Enqueue/Submit path, where an
+// allocation may fail and nothing may escape. Those operations are implicitly noexcept, so no member
+// may allocate in them: std::vector does in MSVC's debug iterator mode (its default and move
+// constructors allocate a container proxy), and a bad_alloc there is std::terminate. The page tokens
+// are therefore a plain array, allocated once with new (std::nothrow) at EnqueueRequest.
 struct Entry {
     enum Type { request, status_entry, signal } type;
     unsigned char bytes[0x48];
-    std::vector<ULONG_PTR> tokens;
+    std::unique_ptr<ULONG_PTR[]> tokens;
+    std::size_t token_count = 0;
     Object* array;
     unsigned index;
     void* fence;
     u64 value;
     u64 id = 0;
     u64 submission_id = 0;
+    u64 after = 0;  // failing: entries the worker must have finished before this one completes
 };
 struct CachedStream {
     u64 source = 0;
@@ -78,6 +93,14 @@ struct QueueWork {
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<Entry> waiting, submitted;
+    std::deque<Entry> failing;   // snapshot of waiting entries a Submit could not move, completed in order
+    struct Unrecorded* deferred_head = nullptr;  // snapshot of unrecorded entries, in order; guarded by mutex
+    struct Unrecorded* deferred_tail = nullptr;
+    bool completing = false;     // a thread owns completion of snapshot entries, so they stay in order; guarded by mutex
+    std::condition_variable drained;  // signaled when the worker finishes an entry
+    u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
+    u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
+    bool worker_started = false;  // guarded by the setup mutex
     u64 next_entry_id = 0;
     u64 next_submission_id = 0;
     static constexpr std::size_t max_cached_streams = 16;
@@ -312,7 +335,7 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
-LONG zero_tokens_at_enqueue, zero_tokens_at_run;
+LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
     if (!request) return;
@@ -349,13 +372,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
-        packed.resize(source_size);
-        OVERLAPPED overlapped{};
-        overlapped.Offset = static_cast<DWORD>(offset);
-        overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
-        DWORD read = 0;
         if (file_object && file_object->kind == file &&
-            ReadFile(file_object->handle, packed.data(), source_size, &read, &overlapped) && read == source_size)
+            x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
             input = packed.data();
         else
             outcome = "read failed";
@@ -399,7 +417,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     bool cached_chunked = false;
                     // If the stream expanded beyond this request's destination and continuation chunks are queued
                     // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
-                    if (!memory_source && produced > destination_size && self && self->work) {
+                    // BCPack streams are atomic multi-lane rANS payloads; they are not chunk-split continuation streams (Refs #1139).
+                    if (!memory_source && !bcpack && produced > destination_size && self && self->work) {
                         auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
                         if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
@@ -472,13 +491,29 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
+        bool bcpack_decoded = false;
         if (data && bcpack) {
-            // shortcut: BCPack is not decoded yet; the texels are left zero (a blank texture) so the
-            // title's loading continues. Counted as bcpack_blank.
-            output.assign(destination_size, 0);
-            data = output.data();
-            decode_length = destination_size;
-            outcome = "BCPack not decoded: zero-filled";
+            if (bcpack == 7 || bcpack == 1) {
+                std::vector<unsigned char> decoded(destination_size);
+                std::size_t produced = 0;
+                if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
+                    output = std::move(decoded);
+                    data = output.data();
+                    decode_length = produced;
+                    outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
+                    bcpack_decoded = true;
+                } else {
+                    outcome = "bcpack failed";
+                    data = nullptr;
+                }
+            } else {
+                // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
+                // title's loading continues. Counted as bcpack_blank.
+                output.assign(destination_size, 0);
+                data = output.data();
+                decode_length = destination_size;
+                outcome = "BCPack not decoded: zero-filled";
+            }
         }
         if (data) {
             // Track decode length and destination capacity as separate values (Refs #1144).
@@ -525,9 +560,9 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 std::memcpy(destination, data, decode_length);
             }
             if (written) {
-                if (bcpack) {
+                if (bcpack && !bcpack_decoded) {
                     InterlockedIncrement(&requests_bcpack_blank);
-                } else if (zlib) {
+                } else if (zlib || bcpack) {
                     InterlockedIncrement(&requests_compressed);
                 } else {
                     InterlockedIncrement(&requests_done);
@@ -550,15 +585,32 @@ void run_entry(Object* self, Entry& entry)
 {
     if (entry.type == Entry::request) {
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
-        if ((options & (1ull << 21)) && !entry.tokens.empty()) {
+        if ((options & (1ull << 21)) && entry.token_count) {
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
-            for (std::size_t i = 0; i < entry.tokens.size(); ++i)
-                if (!entry.tokens[i] && title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
-                    entry.tokens[i] = title[i];
-                    if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run);
-                }
+            // The title's page array is read again in full when the request runs: entries are filled,
+            // and also replaced, after enqueue. Writing through a token captured at enqueue put data
+            // into a page the title had already reassigned. The caller has to keep the array readable
+            // until the request runs; if it is not, the request fails before any page is written, so
+            // no token captured at enqueue is ever used.
+            const std::size_t bytes = entry.token_count * sizeof(ULONG_PTR);
+            if (!title || !x2w_local::readable(title, bytes)) {
+                InterlockedIncrement(&requests_failed);
+                if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+                static LONG unreadable;
+                if (InterlockedIncrement(&unreadable) <= 12)
+                    log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
+                        static_cast<const void*>(title), entry.token_count);
+                return;
+            }
+            // Overwrite in place: the queue entry is kept free of allocations on this path.
+            for (std::size_t i = 0; i < entry.token_count; ++i) {
+                const ULONG_PTR now = title[i];
+                if (entry.tokens[i] && now != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
+                if (!now) InterlockedIncrement(&zero_tokens_at_run);
+                entry.tokens[i] = now;
+            }
         }
-        execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data(), entry.id, entry.submission_id);
+        execute_request(self, entry.bytes, entry.token_count ? entry.tokens.get() : nullptr, entry.id, entry.submission_id);
     } else if (entry.type == Entry::status_entry) {
         const LONG result = InterlockedExchange(&self->pending, S_OK);
         InterlockedExchange(&entry.array->results[entry.index], result);
@@ -567,70 +619,389 @@ void run_entry(Object* self, Entry& entry)
     }
 }
 
-QueueWork& work_of(Object* self)
+// Stack committed up front for a queue worker. The thread decodes request buffers sized from request
+// fields, and when one allocation fails it also runs the exception unwinder and the failure log. Once
+// the system is out of commit a stack page that was never touched cannot be committed either, so the
+// stack is committed at creation (CreateThread without STACK_SIZE_PARAMS_ARE_A_RESERVATION treats the
+// size as the committed size; the reserved size stays the image default or larger).
+constexpr SIZE_T worker_stack_commit = 1u << 20;
+
+// Failure text is held in caller-provided storage: nothing here allocates.
+void copy_reason(char (&reason)[96], const char* text) noexcept
 {
-    static std::mutex create;
-    const std::lock_guard guard(create);
-    if (!self->work) {
-        self->work = new QueueWork;
-        std::thread([self] {
-            QueueWork& work = *self->work;
-            for (;;) {
-                Entry entry;
-                {
-                    std::unique_lock lock(work.mutex);
-                    work.wake.wait(lock, [&] { return !work.submitted.empty(); });
-                    entry = std::move(work.submitted.front());
-                    work.submitted.pop_front();
-                }
-                // Buffers are sized from request fields; a failed allocation fails that request
-                // instead of ending the process (an exception leaving a thread calls terminate).
-                try {
-                    run_entry(self, entry);
-                } catch (const std::exception& error) {
-                    InterlockedIncrement(&requests_failed);
-                    InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
-                    static LONG reported;
-                    if (InterlockedIncrement(&reported) <= 12)
-                        log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), error.what(),
-                            entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
-                }
-                {
-                    const std::lock_guard guard(work.mutex);
-                    if (work.submitted.empty()) {
-                        work.cached_streams.clear();
-                    }
-                }
-            }
-        }).detach();
-    }
-    return *self->work;
+    std::size_t i = 0;
+    for (; text && text[i] && i + 1 < sizeof reason; ++i) reason[i] = text[i];
+    reason[i] = 0;
 }
 
+// Fails the entry that threw: the next status entry reports E_FAIL, the worker goes on with the queue.
+void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
+{
+    InterlockedIncrement(&requests_failed);
+    InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+    static LONG reported;
+    if (InterlockedIncrement(&reported) <= 12)
+        log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), reason,
+            entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
+}
+
+thread_local bool on_queue_worker = false;  // Submit from a worker must not wait for itself
+
+void complete_deferred(Object* self, QueueWork* work);
+
+bool deferred_pending(const QueueWork& work);
+
+DWORD WINAPI queue_worker(void* parameter)
+{
+    on_queue_worker = true;
+    auto* const self = static_cast<Object*>(parameter);
+    QueueWork& work = *self->work;
+    for (;;) {
+        Entry entry;
+        {
+            std::unique_lock lock(work.mutex);
+            work.wake.wait(lock, [&] { return !work.submitted.empty() && !deferred_pending(work); });
+            entry = std::move(work.submitted.front());
+            work.submitted.pop_front();
+        }
+        // Buffers are sized from request fields; a failed allocation fails that request instead of
+        // ending the process (an exception leaving a thread calls terminate). The handlers only note
+        // the reason in a fixed buffer: the request's buffers are already freed when a handler runs,
+        // and the log is written after the handler has left, so no formatting runs while the
+        // exception is in flight on this stack.
+        char reason[96] = "";
+        bool failed = false;
+        try {
+            run_entry(self, entry);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+            copy_reason(reason, "out of memory");
+        } catch (const std::exception& error) {
+            failed = true;
+            copy_reason(reason, error.what());
+        } catch (...) {
+            failed = true;
+            copy_reason(reason, "unknown exception");
+        }
+        if (failed) fail_entry(self, entry, reason);
+        {
+            const std::lock_guard guard(work.mutex);
+            if (work.submitted.empty()) {
+                work.cached_streams.clear();
+            }
+            ++work.finished_total;
+        }
+        work.drained.notify_all();
+        complete_deferred(self, &work);
+    }
+}
+
+// Guards queue setup: building a queue's work, starting its worker and the unrecorded list.
+std::mutex& setup_mutex()
+{
+    static std::mutex setup;
+    return setup;
+}
+
+// Builds the queue's work once. The three deques allocate in their constructors, so even
+// new (std::nothrow) can throw std::bad_alloc from here: that is treated like a null result, and
+// nothing escapes to the title. The failure is logged after the handler has left.
+QueueWork* ensure_work(Object* self)
+{
+    const std::lock_guard guard(setup_mutex());
+    if (self->work) return self->work;
+    QueueWork* work = nullptr;
+    try {
+        work = new (std::nothrow) QueueWork;
+    } catch (const std::bad_alloc&) {
+        work = nullptr;
+    }
+    if (!work) {
+        log("x2w-dstorage queue work allocation failed");
+        return nullptr;
+    }
+    self->work = work;
+    return work;
+}
+
+// Starts the queue's worker unless it runs. The worker is created suspended with a committed stack,
+// then once more with the default stack; false when neither thread could be created, which leaves
+// the queue as it was so a later call tries again.
+bool start_worker(Object* self, QueueWork* work)
+{
+    const std::lock_guard guard(setup_mutex());
+    if (work->worker_started) return true;
+    HANDLE worker = CreateThread(nullptr, worker_stack_commit, queue_worker, self, CREATE_SUSPENDED, nullptr);
+    if (!worker) worker = CreateThread(nullptr, 0, queue_worker, self, CREATE_SUSPENDED, nullptr);
+    if (!worker) {
+        log("x2w-dstorage queue worker not started: error %lu", GetLastError());
+        return false;
+    }
+    work->worker_started = true;
+    ResumeThread(worker);
+    CloseHandle(worker);
+    return true;
+}
+
+// What an entry that could not be stored needs in order to fail at Submit: no request bytes, since a
+// request only counts as failed.
+struct Unrecorded {
+    Unrecorded* next;
+    u64 submission_id;
+    u64 after;
+    Entry::Type type;
+    Object* array;
+    unsigned index;
+    void* fence;
+    u64 value;
+};
+
+// True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
+// worker starts no newer entry then, so a deferred completion and a normal one keep the same order.
+// The caller holds work.mutex.
+bool deferred_pending(const QueueWork& work)
+{
+    if (work.completing) return true;
+    if (!work.failing.empty() && work.failing.front().after <= work.finished_total) return true;
+    return work.deferred_head && work.deferred_head->after <= work.finished_total;
+}
+
+// Fails an entry that will not run: a request counts as failed, a status entry completes with the
+// pending failure (E_OUTOFMEMORY when nothing worse is pending), a fence is signaled.
+void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value)
+{
+    if (type == Entry::request) {
+        InterlockedIncrement(&requests_failed);
+        InterlockedCompareExchange(&self->pending, static_cast<LONG>(E_OUTOFMEMORY), S_OK);
+    } else if (type == Entry::status_entry) {
+        const LONG pending = InterlockedExchange(&self->pending, S_OK);
+        if (array && array->results && index < array->capacity) {
+            InterlockedExchange(&array->results[index],
+                                pending < 0 ? pending : static_cast<LONG>(E_OUTOFMEMORY));
+        }
+    } else {
+        signal_fence(fence, value);
+    }
+}
+
+// An entry the queue has no room for (its work could not be built or grown): remembered in a small
+// record that needs no queue storage, failed by the next Submit. Only when even that record cannot be
+// allocated is the entry failed here, because nothing is left to remember it with (a documented last
+// resort: that entry may then be failed ahead of the ones stored before it).
+//
+// Order. One accumulator (Object::pending) holds the worst failure since the previous status entry,
+// and a status entry consumes it, so an entry that lost its place in the queue order would leak a
+// failure past the status entry it belongs to. Therefore, once an entry of this queue has been
+// deferred, every later entry until the next Submit is deferred too, even if it could be stored:
+// the stored entries (`waiting`) are an in-order prefix and the deferred ones an in-order suffix.
+// Submit handles the prefix first (moves it to the worker, or fails it), then fails the suffix.
+// Submit snapshots the failing entries at its cutoff and the worker completes that snapshot right after
+// it finishes the prefix, so suffix completions are visible in queue order and see the prefix's failures,
+// a later batch cannot be completed by this Submit, and Submit never waits for the prefix. After the first allocation failure the rest of the batch fails with E_OUTOFMEMORY even if
+// memory has recovered, which is acceptable under out-of-memory and preferable to reordering.
+bool has_unrecorded(Object* self)
+{
+    const std::lock_guard guard(setup_mutex());
+    return self->unrecorded_head != nullptr;
+}
+
+void defer_unrecorded(Object* self, const Entry& entry)
+{
+    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value};
+    if (!node) {
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        return;
+    }
+    const std::lock_guard guard(setup_mutex());
+    (self->unrecorded_tail ? self->unrecorded_tail->next : self->unrecorded_head) = node;
+    self->unrecorded_tail = node;
+}
+
+void fail_unrecorded(Object* self)
+{
+    Unrecorded* node;
+    {
+        const std::lock_guard guard(setup_mutex());
+        node = self->unrecorded_head;
+        self->unrecorded_head = self->unrecorded_tail = nullptr;
+    }
+    while (node) {
+        Unrecorded* const next = node->next;
+        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+        delete node;
+        node = next;
+    }
+}
+
+// Fails every entry still waiting, in order; none of them will run.
+void fail_waiting(Object* self, QueueWork* work)
+{
+    for (;;) {
+        Entry entry{};
+        {
+            const std::lock_guard guard(work->mutex);
+            if (work->waiting.empty()) break;
+            entry = std::move(work->waiting.front());
+            work->waiting.pop_front();
+        }
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+    }
+}
+
+// Submit: waiting entries (the in-order prefix) go to the worker, which is started if it is not
+// running yet (resources may have recovered since Enqueue). If it still cannot be started, or the
+// worker's list cannot grow, the waiting entries fail. Only then do the entries that could not be
+// stored (the in-order suffix, see defer_unrecorded) fail, so every failure reaches the status entry
+// after it, in order. Their status entries and fences complete here, not earlier in Enqueue. No
+// exception leaves Submit.
 void submit(Object* self)
 {
-    QueueWork& work = work_of(self);
-    {
-        const std::lock_guard guard(work.mutex);
-        const u64 submission_id = ++work.next_submission_id;
-        for (auto& entry : work.waiting) {
-            entry.submission_id = submission_id;
-            work.submitted.push_back(std::move(entry));
-        }
-        work.waiting.clear();
+    QueueWork* work = ensure_work(self);
+    if (!work) {
+        fail_unrecorded(self);
+        return;
     }
-    work.wake.notify_one();
+    if (!start_worker(self, work)) {
+        fail_waiting(self, work);
+        fail_unrecorded(self);
+        return;
+    }
+    bool all_moved = true;
+    bool snapshot_ok = true;
+    bool snapshotted = false;
+    u64 prefix_end = 0;
+    {
+        const std::lock_guard guard(work->mutex);
+        const u64 submission_id = ++work->next_submission_id;
+        try {
+            // An entry leaves `waiting` only after it is in `submitted`, so a failed growth loses none.
+            while (!work->waiting.empty()) {
+                Entry& entry = work->waiting.front();
+                entry.submission_id = submission_id;
+                work->submitted.push_back(std::move(entry));
+                ++work->submitted_total;
+                work->waiting.pop_front();
+            }
+        } catch (const std::bad_alloc&) {
+            all_moved = false;
+        }
+        prefix_end = work->submitted_total;
+        // The cutoff: the entries that fail are snapshotted here, under the same lock, so a batch enqueued
+        // later cannot be completed by this Submit. The snapshot completes on the worker right after it
+        // finishes the prefix (see complete_deferred), so this call never waits for the prefix.
+        try {
+            while (!work->waiting.empty()) {
+                Entry& entry = work->waiting.front();
+                entry.submission_id = submission_id;
+                entry.after = prefix_end;
+                work->failing.push_back(std::move(entry));
+                work->waiting.pop_front();
+                snapshotted = true;
+            }
+        } catch (const std::bad_alloc&) {
+            snapshot_ok = false;
+        }
+        if (snapshot_ok) {
+            Unrecorded* node;
+            {
+                const std::lock_guard setup(setup_mutex());
+                node = self->unrecorded_head;
+                self->unrecorded_head = self->unrecorded_tail = nullptr;
+            }
+            for (Unrecorded* n = node; n; n = n->next) {
+                n->submission_id = submission_id;
+                n->after = prefix_end;
+                if (!n->next) {
+                    (work->deferred_tail ? work->deferred_tail->next : work->deferred_head) = node;
+                    work->deferred_tail = n;
+                }
+                snapshotted = true;
+            }
+        }
+    }
+    work->wake.notify_one();
+    if (!snapshot_ok) {
+        // Last resort when even the snapshot could not grow: wait for the prefix as before, then fail in order.
+        if (!on_queue_worker) {
+            std::unique_lock lock(work->mutex);
+            work->drained.wait(lock, [&] { return work->finished_total >= prefix_end; });
+        }
+        complete_deferred(self, work);
+        fail_waiting(self, work);
+        fail_unrecorded(self);
+        return;
+    }
+    if (snapshotted) complete_deferred(self, work);
 }
 
+// Completes the snapshot entries (failed entries of earlier Submits) whose prefix the worker has finished,
+// in Submit order and, within one Submit, stored entries before unrecorded ones. Called by the worker after
+// every entry and by Submit, so nothing waits on a calling thread. Nothing allocates.
+void complete_deferred(Object* self, QueueWork* work)
+{
+    // One owner completes at a time, but no lock is held while it does: a fence is a caller-supplied
+    // operation. A thread that finds an owner returns at once; the owner takes what it queued before
+    // it gives up ownership, so nothing is left behind and no Submit waits behind a fence.
+    {
+        const std::lock_guard guard(work->mutex);
+        if (work->completing) return;
+        work->completing = true;
+    }
+    for (;;) {
+        Entry entry{};
+        Unrecorded* node = nullptr;
+        {
+            const std::lock_guard guard(work->mutex);
+            bool take_entry = !work->failing.empty() && work->failing.front().after <= work->finished_total;
+            bool take_node = work->deferred_head && work->deferred_head->after <= work->finished_total;
+            if (take_entry && take_node) {
+                if (work->failing.front().submission_id <= work->deferred_head->submission_id) take_node = false;
+                else take_entry = false;
+            }
+            if (take_entry) {
+                entry = std::move(work->failing.front());
+                work->failing.pop_front();
+            } else if (take_node) {
+                node = work->deferred_head;
+                work->deferred_head = node->next;
+                if (!work->deferred_head) work->deferred_tail = nullptr;
+            } else {
+                work->completing = false;
+                work->wake.notify_all();  // the worker may be waiting for the owner to finish
+                return;
+            }
+        }
+        if (node) {
+            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+            delete node;
+        } else {
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        }
+    }
+}
+
+// Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.
 void push(Object* self, Entry&& entry)
 {
-    QueueWork& work = work_of(self);
-    bool full;
-    {
-        const std::lock_guard guard(work.mutex);
-        entry.id = ++work.next_entry_id;
-        work.waiting.push_back(std::move(entry));
-        full = self->capacity && work.waiting.size() >= self->capacity;
+    QueueWork* work = ensure_work(self);
+    if (!work || has_unrecorded(self)) {  // after a deferred entry every later one is deferred: order
+        defer_unrecorded(self, entry);
+        return;
+    }
+    start_worker(self, work);  // a failure shows at Submit
+    bool recorded = false;
+    bool full = false;
+    try {
+        const std::lock_guard guard(work->mutex);
+        entry.id = ++work->next_entry_id;
+        work->waiting.push_back(std::move(entry));
+        recorded = true;
+        full = self->capacity && work->waiting.size() >= self->capacity;
+    } catch (const std::bad_alloc&) {
+    }
+    if (!recorded) {
+        defer_unrecorded(self, entry);
+        return;
     }
     if (full) submit(self);  // a full queue submits itself, as on PC
 }
@@ -649,9 +1020,16 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
         const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
         const std::size_t pages = (std::size_t{page_offset} + destination_size + 0xFFFF) / 0x10000;
         if (title && pages && x2w_local::readable(title, pages * sizeof(ULONG_PTR))) {
-            entry.tokens.assign(title, title + pages);
-            for (ULONG_PTR token : entry.tokens)
-                if (!token) InterlockedIncrement(&zero_tokens_at_enqueue);
+            entry.tokens.reset(new (std::nothrow) ULONG_PTR[pages]);
+            if (!entry.tokens) {
+                defer_unrecorded(self, entry);  // fails at Submit; nothing leaves Enqueue
+                return;
+            }
+            entry.token_count = pages;
+            for (std::size_t i = 0; i < pages; ++i) {
+                entry.tokens[i] = title[i];
+                if (!title[i]) InterlockedIncrement(&zero_tokens_at_enqueue);
+            }
         }
     }
     push(self, std::move(entry));
@@ -769,6 +1147,35 @@ void** make_table(unsigned kind)
     return table;
 }
 
+// What the heartbeat reports about memory (#1199): this process's commit charge and the live
+// physical-page sections of the xmem stand-in, read through its probe export. The flags keep the
+// line's shape when a reading is unavailable.
+struct MemorySample {
+    ULONGLONG peak_commit = 0, commit = 0, sections = 0;
+    bool commit_known = false, sections_known = false;
+};
+
+MemorySample memory_sample() noexcept
+{
+    MemorySample sample;
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        sample.commit = counters.PagefileUsage;
+        sample.peak_commit = counters.PeakPagefileUsage;
+        sample.commit_known = true;
+    }
+    using PageStats = BOOL(WINAPI*)(ULONGLONG*);
+    HMODULE xmem = nullptr;
+    if (GetModuleHandleExW(0, L"xmem.dll", &xmem)) {
+        const auto page_stats = reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats"));
+        sample.sections_known = page_stats && page_stats(&sample.sections);
+        FreeLibrary(xmem);
+    }
+    return sample;
+}
+
 }  // namespace
 
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
@@ -778,18 +1185,43 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     log("x2w-dstorage DStorageGetFactory riid=%s", id);
     if (!out) return E_POINTER;
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
-    // after the per-call logs have gone quiet.
+    // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
+    // what the run spends (#1199), including while requests are stalled.
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
+        MemorySample last_memory;
         for (int second = 10;; second += 10) {
             Sleep(10000);
             const LONG total = requests_done + requests_compressed + requests_failed;
             const LONG total2 = total + requests_bcpack_blank;
-            if (total2 != last)
+            const MemorySample sample = memory_sample();
+            const ULONGLONG peak_mib = sample.peak_commit >> 20;
+            const ULONGLONG current_mib = sample.commit >> 20;
+            if (total2 != last || peak_mib != (last_memory.peak_commit >> 20) ||
+                current_mib != (last_memory.commit >> 20) || sample.sections != last_memory.sections ||
+                sample.commit_known != last_memory.commit_known || sample.sections_known != last_memory.sections_known) {
+                char memory[96];
+                if (sample.commit_known)
+                    std::snprintf(memory, sizeof(memory), "commit peak=%llu MiB current=%llu MiB",
+                                  static_cast<unsigned long long>(peak_mib),
+                                  static_cast<unsigned long long>(current_mib));
+                else
+                    std::snprintf(memory, sizeof(memory), "commit unknown");
+                char section_text[24];
+                if (sample.sections_known)
+                    std::snprintf(section_text, sizeof(section_text), "%llu",
+                                  static_cast<unsigned long long>(sample.sections));
+                else
+                    std::snprintf(section_text, sizeof(section_text), "unknown");
+                // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
+                // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_failed, requests_bcpack_blank,
-                    zero_tokens_at_enqueue, zero_tokens_at_run);
-            last = total2;
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
+                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
+                    section_text);
+                last = total2;
+                last_memory = sample;
+            }
         }
     }, nullptr, 0, nullptr);
     (void)heartbeat;

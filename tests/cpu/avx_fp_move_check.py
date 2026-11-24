@@ -29,10 +29,36 @@ EXPORTS = (
     "op_pipeline",
 )
 
+# vmovupd/vmovapd exports: op_<mnemonic>_<width>_<load|store|reg|regst>, plus a mixed pipeline.
+PD_EXPORTS = (
+    "op_vmovupd_xmm_load",
+    "op_vmovupd_ymm_load",
+    "op_vmovupd_xmm_store",
+    "op_vmovupd_ymm_store",
+    "op_vmovupd_xmm_reg",
+    "op_vmovupd_ymm_reg",
+    "op_vmovupd_xmm_regst",
+    "op_vmovupd_ymm_regst",
+    "op_vmovapd_xmm_load",
+    "op_vmovapd_ymm_load",
+    "op_vmovapd_xmm_store",
+    "op_vmovapd_ymm_store",
+    "op_vmovapd_xmm_reg",
+    "op_vmovapd_ymm_reg",
+    "op_vmovapd_xmm_regst",
+    "op_vmovapd_ymm_regst",
+    "op_pd_pipeline",
+)
+
+EXPORTS = EXPORTS + PD_EXPORTS
+
 ALTERED_EXPORTS = (
     "op_vmovq_xmm_xmm",
     "op_vmovq_xmm_m64",
     "op_vmaskmovdqu",
+    "op_vmovupd_xmm_load",
+    "op_vmovupd_xmm_reg",
+    "op_vmovapd_ymm_load",
 )
 
 
@@ -44,8 +70,49 @@ def ref_vmaskmovdqu(src: bytes, mask: bytes, base: bytes) -> bytes:
     return bytes(out)
 
 
+def ref_pd(name: str, a: bytes, b: bytes, altered: bool) -> bytes:
+    """Byte model of the vmovupd/vmovapd exports: raw bytes move, VEX.128 register writes zero [255:128]."""
+    out = bytearray(FILL)
+    if name == "op_pd_pipeline":
+        out[0:16] = a[0:16]
+        out[16:24] = b[1:9]
+        out[24:32] = b"\x00" * 8
+        return bytes(out)
+    _, mnemonic, width, form = name.split("_")
+    unaligned = mnemonic == "vmovupd"
+    wide = width == "ymm"
+    if form == "load":
+        if wide and not (altered and not unaligned):
+            out[:] = b
+        elif wide:
+            # ALTER_OP builds the aligned ymm load as a VEX.128 load.
+            out[0:16] = b[0:16]
+            out[16:32] = b"\x00" * 16
+        else:
+            offset = (9 if altered else 1) if unaligned else 16
+            out[0:16] = b[offset : offset + 16]
+            out[16:32] = b"\x00" * 16
+    elif form == "store":
+        if wide:
+            out[:] = a
+        else:
+            offset = 5 if unaligned else 16
+            out[offset : offset + 16] = a[0:16]
+    elif form in ("reg", "regst"):
+        if wide or (altered and unaligned and form == "reg"):
+            out[:] = b
+        else:
+            out[0:16] = b[0:16]
+            out[16:32] = b"\x00" * 16
+    else:
+        raise ValueError(f"unknown export {name}")
+    return bytes(out)
+
+
 def reference(name: str, a: bytes, b: bytes, altered: bool = False) -> bytes:
     """Expected 32-byte output region; unwritten bytes keep the FILL pattern."""
+    if name in PD_EXPORTS:
+        return ref_pd(name, a, b, altered)
     out = bytearray(FILL)
     if name == "op_vmovq_xmm_xmm":
         src = a[0:8] if altered else b[0:8]
@@ -112,9 +179,31 @@ def maskmov_pairs():
     return pairs
 
 
+def fp_pattern_pairs():
+    """Double and float bit patterns that a value-converting move would change."""
+    specials = [
+        0x7FF0000000000001,  # signalling NaN with payload
+        0xFFF8DEADBEEF0001,  # negative quiet NaN with payload
+        0x8000000000000000,  # -0.0
+        0x7FF0000000000000,  # +inf
+        0xFFF0000000000000,  # -inf
+        0x0000000000000001,  # smallest subnormal
+        0x7FA000017FC00002,  # two single-precision NaNs
+        0x3FF0000000000000,  # 1.0
+    ]
+    pairs = []
+    for shift in range(len(specials)):
+        a = b"".join(struct.pack("<Q", specials[(shift + i) % len(specials)]) for i in range(4))
+        b = b"".join(struct.pack("<Q", specials[(shift * 3 + 5 + i) % len(specials)]) for i in range(4))
+        pairs.append((a, b))
+    return pairs
+
+
 def inputs_for(name: str):
     if name in ("op_vmaskmovdqu", "op_pipeline"):
         return maskmov_pairs()
+    if name in PD_EXPORTS:
+        return move_pairs() + fp_pattern_pairs()
     return move_pairs()
 
 
@@ -398,7 +487,26 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
             Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R9),
             ret_ins)),
     ]
+    alt_accept += [
+        # vmovupd/vmovapd: loads, stores, and the store-form (0F 11 / 0F 29) register copies.
+        ("vmovpd_load_store", (
+            Instruction.create_reg_mem(Code.VEX_VMOVUPD_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, displ=1, displ_size=1)),
+            Instruction.create_reg_mem(Code.VEX_VMOVAPD_YMM_YMMM256, R.YMM1, MemoryOperand(R.RDX, displ=32, displ_size=1)),
+            Instruction.create_mem_reg(Code.VEX_VMOVUPD_XMMM128_XMM, MemoryOperand(R.R8, displ=1, displ_size=1), R.XMM0),
+            Instruction.create_mem_reg(Code.VEX_VMOVAPD_YMMM256_YMM, MemoryOperand(R.R8, displ=32, displ_size=1), R.YMM1),
+            ret_ins)),
+        ("vmovpd_alt_reg_reg", (
+            ld_ymm4,
+            Instruction.create_reg_reg(Code.VEX_VMOVUPD_XMMM128_XMM, R.XMM0, R.XMM4),
+            Instruction.create_reg_reg(Code.VEX_VMOVAPD_YMMM256_YMM, R.YMM1, R.YMM4),
+            Instruction.create_reg_reg(Code.VEX_VMOVAPD_XMMM128_XMM, R.XMM2, R.XMM0),
+            Instruction.create_reg_reg(Code.VEX_VMOVUPD_YMM_YMMM256, R.YMM3, R.YMM1),
+            Instruction.create_mem_reg(Code.VEX_VMOVUPD_YMMM256_YMM, MemoryOperand(R.R8), R.YMM3),
+            ret_ins)),
+    ]
     alt_expected = {
+        "vmovpd_load_store": "ymm0 = load128((rcx + 0x1ull));",
+        "vmovpd_alt_reg_reg": "ymm2 = copy128(ymm0);",
         "vmovq_f3_m64": "ymm0 = {{load64((rdx + 0x8ull)), 0ull, 0ull, 0ull}};",
         "vmovq_6e_m64": "ymm0 = {{load64((rdx + 0x8ull)), 0ull, 0ull, 0ull}};",
         "vmovq_d6_reg": "ymm0 = {{ymm1.q[0], 0ull, 0ull, 0ull}};",
@@ -423,7 +531,44 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
     seg_load = Instruction.create_reg_mem(Code.VEX_VMOVUPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX))
     seg_load.segment_prefix = R.GS
 
+    evex_vmovapd = Instruction.create_reg_mem(
+        Code.EVEX_VMOVAPD_YMM_K1Z_YMMM256, R.YMM0, MemoryOperand(R.RCX))
+    evex_vmovupd = Instruction.create_mem_reg(
+        Code.EVEX_VMOVUPD_XMMM128_K1Z_XMM, MemoryOperand(R.R8), R.XMM0)
+
     unit_cases = [
+        # vmovupd/vmovapd rejections mirror the vmovups/vmovaps ones
+        ("evex_vmovapd", encode_seq(evex_vmovapd, ret_ins), "unsupported EVEX instruction"),
+        ("evex_vmovupd_store", encode_seq(ld_xmm0, evex_vmovupd, ret_ins), "unsupported EVEX instruction"),
+        ("nonvolatile_xmm6_vmovapd", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVAPD_XMM_XMMM128, R.XMM6, MemoryOperand(R.RCX)), ret_ins), "nonvolatile vector register"),
+        ("store_outside_r8_vmovapd", encode_seq(ld_xmm0, Instruction.create_mem_reg(
+            Code.VEX_VMOVAPD_YMMM256_YMM, MemoryOperand(R.RDX), R.YMM0), ret_ins), "non-r8 store memory operand"),
+        ("store_outside_r8_vmovupd", encode_seq(ld_xmm0, Instruction.create_mem_reg(
+            Code.VEX_VMOVUPD_XMMM128_XMM, MemoryOperand(R.RCX), R.XMM0), ret_ins), "non-r8 store memory operand"),
+        ("non_arg_base_rax_vmovapd", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVAPD_XMM_XMMM128, R.XMM0, MemoryOperand(R.RAX)), ret_ins), "unsupported memory base"),
+        ("nonvolatile_base_rbx_vmovupd", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVUPD_YMM_YMMM256, R.YMM0, MemoryOperand(R.RBX)), ret_ins), "nonvolatile GPR base"),
+        ("rip_rel_vmovapd", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVAPD_XMM_XMMM128, R.XMM0, MemoryOperand(R.RIP, displ=0x1020, displ_size=1)),
+            ret_ins), "unsupported memory operand"),
+        ("indexed_vmovupd", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVUPD_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, R.RDX, 4)), ret_ins), "unsupported memory operand"),
+        ("indexed_vmovapd_store", encode_seq(ld_xmm0, Instruction.create_mem_reg(
+            Code.VEX_VMOVAPD_XMMM128_XMM, MemoryOperand(R.R8, R.RDX, 2), R.XMM0), ret_ins), "unsupported memory operand"),
+        ("unaligned_vmovapd_xmm_load", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVAPD_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, displ=1, displ_size=1)), ret_ins),
+            "unaligned 16-byte memory operand"),
+        ("unaligned_vmovapd_ymm_load", encode_seq(Instruction.create_reg_mem(
+            Code.VEX_VMOVAPD_YMM_YMMM256, R.YMM0, MemoryOperand(R.RCX, displ=16, displ_size=1)), ret_ins),
+            "unaligned 32-byte memory operand"),
+        ("unaligned_vmovapd_xmm_store", encode_seq(ld_xmm0, Instruction.create_mem_reg(
+            Code.VEX_VMOVAPD_XMMM128_XMM, MemoryOperand(R.R8, displ=8, displ_size=1), R.XMM0), ret_ins),
+            "unaligned 16-byte memory operand"),
+        ("unaligned_vmovapd_ymm_store", encode_seq(ld_xmm0, Instruction.create_mem_reg(
+            Code.VEX_VMOVAPD_YMMM256_YMM, MemoryOperand(R.R8, displ=16, displ_size=1), R.YMM0), ret_ins),
+            "unaligned 32-byte memory operand"),
         # Legacy SSE rejections
         ("legacy_movq_xmm", encode_seq(ld_xmm1, Instruction.create_reg_reg(
             Code.MOVQ_XMM_XMMM64, R.XMM0, R.XMM1), ret_ins), "unsupported legacy SSE encoding"),
@@ -558,6 +703,9 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
         ("pe_unrestored_rdi", unit_map["vmaskmovdqu_unrestored_rdi"], "unrestored nonvolatile GPR rdi"),
         ("pe_store_outside_r8", unit_map["store_outside_r8_vmovq"], "non-r8 store memory operand"),
         ("pe_rip_rel", unit_map["rip_rel_mem"], "unsupported memory operand"),
+        ("pe_evex_vmovapd", unit_map["evex_vmovapd"], "unsupported EVEX instruction"),
+        ("pe_unaligned_vmovapd", unit_map["unaligned_vmovapd_ymm_load"], "unaligned 32-byte memory operand"),
+        ("pe_non_arg_vmovapd", unit_map["non_arg_base_rax_vmovapd"], "unsupported memory base"),
         ("pe_trailing_after_ret", unit_map["trailing_after_ret"], "unreachable instruction after ret"),
     ]
     with TemporaryDirectory() as folder:

@@ -22,6 +22,15 @@
 // two-layer Texture2DArray resources for the arrayed module (shared_sampler_array.spvasm). Layer 0
 // holds the texels above; layer 1 holds a different top-left texel in each texture (depth 0.875, so
 // both comparisons pass; ordinary 0.3125; mip 1 0.5625), so a read of the wrong layer shows.
+//
+// The "gather" variant reads back the OpImageGather and OpImageDrefGather modules. Its reference file holds the
+// 16 expected words followed by the case's texels as 12 floats: t0's four depth texels (rows top to bottom, left
+// to right), then t1's eight R, G values in the same order. t1 is then a one-mip R32G32_FLOAT 2x2 texture, so
+// the host holds no texel values of its own for the case and the Python side models the words it expects.
+//
+// A "volume" prefix (volume, volume-comparison-greater, volume-ordinary-min-lod1) keeps t0 a Texture2D and
+// makes t1 a 2x2x2 Texture3D for the module with a 3D value image, which samples at w = 0.75 (slice 1).
+// Slice 0 holds the texels above; slice 1 holds 0.3125 at its top-left texel. Mip 1 is 1x1x1 (0.625).
 #include "../desktop_gpu.h"
 #include <array>
 #include <cstdio>
@@ -40,6 +49,7 @@ constexpr UINT comparison_register = 2;
 constexpr UINT second_comparison_register = 6;
 constexpr UINT output_words = 16;
 constexpr UINT guard = 0xc5c5c5c5u;
+constexpr UINT gather_texel_floats = 12;
 
 std::vector<char> read_file(const char* path, const char* what)
 {
@@ -76,8 +86,10 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     }
     // "array" alone is the arrayed baseline; "array-<v>" is variant v on the arrayed textures.
     const bool arrayed = variant == "array" || variant.substr(0, 6) == "array-";
-    const std::string_view samplers_variant = variant == "array" || variant == "multi" ? "baseline"
-                                              : arrayed || multi ? variant.substr(variant.find('-') + 1) : variant;
+    const bool volume = variant == "volume" || variant.substr(0, 7) == "volume-";
+    const bool gather = variant == "gather";
+    const std::string_view samplers_variant = variant == "array" || variant == "multi" || variant == "volume" || gather ? "baseline"
+                                              : arrayed || multi || volume ? variant.substr(variant.find('-') + 1) : variant;
     if (multi) {
         if (samplers_variant != "baseline" && samplers_variant != "comparison-a-greater" &&
             samplers_variant != "comparison-b-greater" && samplers_variant != "ordinary-a-min-lod1" &&
@@ -87,15 +99,18 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     } else if (samplers_variant != "baseline" && samplers_variant != "comparison-greater" &&
                samplers_variant != "ordinary-min-lod1") {
         throw std::runtime_error("Descriptor variant must be baseline, comparison-greater or ordinary-min-lod1, "
-                                 "optionally as array or array-<variant>, or a multi variant");
+                                 "optionally as array, array-<variant>, volume or volume-<variant>, or a multi variant");
     }
-    const UINT layers = arrayed ? 2 : 1;
+    const UINT layers = arrayed || volume ? 2 : 1;
     const auto shader = read_file(shader_path, "comparison-sampler shader");
     const auto reference_bytes = read_file(reference_path, "comparison-sampler reference");
-    if (reference_bytes.size() != output_words * sizeof(UINT))
-        throw std::runtime_error("Comparison-sampler reference must hold 16 words");
+    if (reference_bytes.size() != output_words * sizeof(UINT) + (gather ? gather_texel_floats * sizeof(float) : 0))
+        throw std::runtime_error(gather ? "Gather case file must hold 16 words and 12 texel floats"
+                                        : "Comparison-sampler reference must hold 16 words");
     std::array<UINT, output_words> expected;
     std::memcpy(expected.data(), reference_bytes.data(), sizeof(expected));
+    std::array<float, gather_texel_floats> case_texels{};
+    if (gather) std::memcpy(case_texels.data(), reference_bytes.data() + sizeof(expected), sizeof(case_texels));
 
     D3D12_DESCRIPTOR_RANGE textures{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
     D3D12_ROOT_PARAMETER parameters[2]{};
@@ -145,10 +160,20 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     // Upload layout: mip 0 of each (texture, layer), then t1's mip 1 per layer, then the output guards.
     const UINT mip1_offset = 2 * layers * texture_bytes;
     const UINT guards_offset = mip1_offset + layers * texture_bytes;
-    const float texels[2][2][2][2] = {
+    float texels[2][2][2][2] = {
         {{{0.5f, 0.75f}, {0.25f, 1.0f}}, {{0.875f, 0.75f}, {0.25f, 1.0f}}},
         {{{0.375f, 0.875f}, {0.625f, 0.125f}}, {{0.3125f, 0.875f}, {0.625f, 0.125f}}}};
     const float mip1[2] = {0.625f, 0.5625f};
+    // The gather case replaces t0's texels and gives t1 two channels (R, G) per texel, all from the case file.
+    float value_rg[2][4]{};
+    if (gather)
+        for (UINT row = 0; row < 2; ++row) {
+            for (UINT column = 0; column < 2; ++column) {
+                texels[0][0][row][column] = case_texels[row * 2 + column];
+                value_rg[row][column * 2] = case_texels[4 + row * 4 + column * 2];
+                value_rg[row][column * 2 + 1] = case_texels[4 + row * 4 + column * 2 + 1];
+            }
+        }
     const auto mip0_offset = [&](UINT texture, UINT layer) { return (texture * layers + layer) * texture_bytes; };
     std::array<UINT, output_words> initial;
     initial.fill(guard);
@@ -162,9 +187,11 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     check(upload->Map(0, &empty, reinterpret_cast<void**>(&mapped)), "Map comparison-sampler upload");
     for (UINT i = 0; i < 2; ++i)
         for (UINT layer = 0; layer < layers; ++layer)
-            for (UINT row = 0; row < 2; ++row)
-                std::memcpy(mapped + mip0_offset(i, layer) + row * row_pitch, texels[i][layer][row],
-                            sizeof(texels[i][layer][row]));
+            for (UINT row = 0; row < 2; ++row) {
+                BYTE* destination = mapped + mip0_offset(i, layer) + row * row_pitch;
+                if (gather && i == 1) std::memcpy(destination, value_rg[row], sizeof(value_rg[row]));
+                else std::memcpy(destination, texels[i][layer][row], sizeof(texels[i][layer][row]));
+            }
     for (UINT layer = 0; layer < layers; ++layer)
         std::memcpy(mapped + mip1_offset + layer * texture_bytes, &mip1[layer], sizeof(mip1[layer]));
     std::memcpy(mapped + guards_offset, initial.data(), sizeof(initial));
@@ -182,15 +209,20 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     std::array<ComPtr<ID3D12Resource>, 2> inputs;
     for (UINT i = 0; i < 2; ++i) {
         D3D12_RESOURCE_DESC texture_desc{};
-        texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        const bool is_volume = volume && i == 1;
+        const UINT depth = arrayed || is_volume ? layers : 1;
+        texture_desc.Dimension = is_volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         texture_desc.Width = texture_desc.Height = 2;
-        texture_desc.DepthOrArraySize = static_cast<UINT16>(layers);
-        texture_desc.MipLevels = i == 0 ? 1 : 2;
-        texture_desc.Format = DXGI_FORMAT_R32_FLOAT;
+        texture_desc.DepthOrArraySize = static_cast<UINT16>(depth);
+        texture_desc.MipLevels = i == 0 || gather ? 1 : 2;
+        const DXGI_FORMAT format = gather && i == 1 ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R32_FLOAT;
+        texture_desc.Format = format;
         texture_desc.SampleDesc.Count = 1;
         inputs[i] = resource(device, texture_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
         transition(list.Get(), inputs[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        for (UINT layer = 0; layer < layers; ++layer) {
+        // A 3D resource has one subresource per mip: its slices follow each other in the upload at one
+        // slice pitch (2 rows), which equals texture_bytes here.
+        for (UINT layer = 0; layer < (is_volume ? 1 : depth); ++layer) {
             for (UINT mip = 0; mip < texture_desc.MipLevels; ++mip) {
                 D3D12_TEXTURE_COPY_LOCATION to{};
                 to.pResource = inputs[i].Get();
@@ -201,7 +233,7 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
                 from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 const UINT size = mip == 0 ? 2 : 1;
                 from.PlacedFootprint = {mip == 0 ? mip0_offset(i, layer) : mip1_offset + layer * texture_bytes,
-                                        {DXGI_FORMAT_R32_FLOAT, size, size, 1, row_pitch}};
+                                        {format, size, size, is_volume && mip == 0 ? 2u : 1u, row_pitch}};
                 list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
             }
         }
@@ -210,9 +242,12 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
         // The default view of a two-layer resource is a Texture2DArray over both layers; of a one-layer
         // resource, a Texture2D.
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-        view.Format = DXGI_FORMAT_R32_FLOAT;
+        view.Format = format;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (arrayed) {
+        if (is_volume) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Texture3D.MipLevels = texture_desc.MipLevels;
+        } else if (arrayed) {
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             view.Texture2DArray.MipLevels = texture_desc.MipLevels;
             view.Texture2DArray.ArraySize = layers;

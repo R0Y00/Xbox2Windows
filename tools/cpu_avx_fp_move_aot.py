@@ -20,14 +20,15 @@ Supported AVX instructions (docs/coverage/x64_zen2.tsv group AVX):
     bytes whose mask MSB is set ((mask[i] & 0x80) != 0) and does not model
     implementation-dependent partial-fault or all-zero-mask page-edge faults.
 
-Transport/ABI glue: vmovups, vmovaps, vmovdqu, vmovdqa (128/256-bit load, store
-and register copy), vzeroupper, 64-bit mov (volatile GPR <-> [base + disp],
+Transport/ABI glue: vmovups, vmovaps, vmovupd, vmovapd, vmovdqu, vmovdqa
+(128/256-bit load, store and register copy; the pd forms move raw bytes exactly
+like the ps forms), vzeroupper, 64-bit mov (volatile GPR <-> [base + disp],
 volatile GPR reg-reg, and rdi save/set-to-r8/restore), and terminal ret.
 
 Legacy SSE forms (movq, maskmovdqu), EVEX encodings, FP arithmetic
 (vaddsubps/vaddsubpd), nonvolatile registers (XMM6..15, YMM6..15,
 RBX/RBP/RSI/R12..R15/RSP and unrestored, non-r8, or leaked RDI), non-argument
-memory bases, stores outside r8, unaligned vmovaps/vmovdqa memory operands,
+memory bases, stores outside r8, unaligned vmovaps/vmovapd/vmovdqa memory operands,
 prefixes, RIP-relative addressing, branches, and trailing bytes after ret are
 rejected.
 """
@@ -86,6 +87,10 @@ FULL_VEC_LOAD_CODES = {
     Code.VEX_VMOVDQU_YMM_YMMM256: (True, False),
     Code.VEX_VMOVAPS_XMM_XMMM128: (False, True),
     Code.VEX_VMOVAPS_YMM_YMMM256: (True, True),
+    Code.VEX_VMOVUPD_XMM_XMMM128: (False, False),
+    Code.VEX_VMOVUPD_YMM_YMMM256: (True, False),
+    Code.VEX_VMOVAPD_XMM_XMMM128: (False, True),
+    Code.VEX_VMOVAPD_YMM_YMMM256: (True, True),
     Code.VEX_VMOVDQA_XMM_XMMM128: (False, True),
     Code.VEX_VMOVDQA_YMM_YMMM256: (True, True),
 }
@@ -97,6 +102,10 @@ FULL_VEC_STORE_CODES = {
     Code.VEX_VMOVDQU_YMMM256_YMM: (True, False),
     Code.VEX_VMOVAPS_XMMM128_XMM: (False, True),
     Code.VEX_VMOVAPS_YMMM256_YMM: (True, True),
+    Code.VEX_VMOVUPD_XMMM128_XMM: (False, False),
+    Code.VEX_VMOVUPD_YMMM256_YMM: (True, False),
+    Code.VEX_VMOVAPD_XMMM128_XMM: (False, True),
+    Code.VEX_VMOVAPD_YMMM256_YMM: (True, True),
     Code.VEX_VMOVDQA_XMMM128_XMM: (False, True),
     Code.VEX_VMOVDQA_YMMM256_YMM: (True, True),
 }

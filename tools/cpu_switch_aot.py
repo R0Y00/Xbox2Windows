@@ -26,7 +26,7 @@ fifth and later) and floating-point arguments are not supported.
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
 parity conditions use the producer operand width, including narrow arithmetic.
-Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
+Instructions that leave the flags unchanged (moves, LEA, NOT, BSWAP, SETcc, CMOVcc, and
 CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
 
 SHL, SHR and SAR produce flags only with an immediate count whose masked value
@@ -53,6 +53,22 @@ source and ZF for a zero result and leave OF, SF, AF and PF undefined, so only
 B, AE, E, NE, BE and A may read them. The host must support the instructions
 whose results the original computes: without ABM and BMI1 a processor runs
 LZCNT and TZCNT as BSR and BSF.
+
+BSF and BSR take a 16-, 32- or 64-bit register destination and a register or
+memory source of the same width. A nonzero source gives the index of its lowest
+(BSF) or highest (BSR) set bit and clears ZF. For a zero source ZF is set and
+the destination is left unchanged. The Intel SDM calls that destination
+undefined; AMD documents it as unchanged, and the translation follows the
+unchanged behaviour of the processors measured, 32-bit destinations included:
+a zero source does not clear bits 63:32. A nonzero source zero-extends a 32-bit
+result and keeps bits 63:16 of a 16-bit destination. CF, OF, SF, PF and AF are
+undefined, so only the E and NE conditions may read them and every other
+condition is refused. The destination is read, so it must be defined.
+
+BSWAP takes a 32- or 64-bit register and reverses its bytes in place; no flag changes.
+A 32-bit BSWAP zero-extends its result into the 64-bit register like any other 32-bit
+write. The 16-bit form (operand-size prefix) is refused: the Intel SDM leaves its
+result undefined.
 
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
@@ -209,6 +225,8 @@ SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
 # Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
 BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
+# Bit scans, by the PRELUDE helper that computes the index of the bit found in a nonzero source.
+BIT_SCANS = {M.BSF: "trailing_zeros", M.BSR: "highest_bit"}
 # Bit counts, by the PRELUDE helper that computes each.
 BIT_COUNTS = {M.POPCNT: "count_ones", M.LZCNT: "leading_zeros", M.TZCNT: "trailing_zeros"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
@@ -229,9 +247,16 @@ STRING_TRANSFERS = {
 }
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
-                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS}
+FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, M.BSWAP, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE,
+                M.RDFSBASE, M.RDGSBASE, M.RDPID}
+HOST_CPU_READ_BASE_CODES = {
+    Code.RDFSBASE_R32: ("_readfsbase_u32", 4),
+    Code.RDFSBASE_R64: ("_readfsbase_u64", 8),
+    Code.RDGSBASE_R32: ("_readgsbase_u32", 4),
+    Code.RDGSBASE_R64: ("_readgsbase_u64", 8),
+}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS, *BIT_SCANS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -865,9 +890,10 @@ def image_target(pe, ins):
 
 
 class Lifter:
-    def __init__(self, image=None):
+    def __init__(self, image=None, *, host_cpu=False):
         self.used = set()
         self.flags = False
+        self.host_cpu = host_cpu
         # The input image when RIP-relative operands address the bound mapping, and whether one does.
         self.image = image
         self.image_used = False
@@ -973,6 +999,13 @@ class Lifter:
             if code not in ("b", "ae"):
                 raise ValueError(f"only CF is defined after {str(producer).split()[0].upper()} at RVA {jcc.ip:#x}")
             return "fb != 0" if code == "b" else "fb == 0"
+        if producer.mnemonic in BIT_SCANS:
+            # fa is the source. ZF is set for a zero source; CF, OF, SF, PF and AF are undefined.
+            if code not in ("e", "ne"):
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"only ZF is defined after {name} at RVA {jcc.ip:#x}")
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            return source_zero if code == "e" else f"!({source_zero})"
         if producer.mnemonic in BIT_COUNTS:
             # fa is the source and fb the result.
             source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
@@ -1081,6 +1114,28 @@ class Lifter:
             # even when a following iteration or caller overwrites the same line.
             return (f"{{ auto* line = reinterpret_cast<volatile unsigned char*>({address} & ~63ull); "
                     "for (unsigned i = 0; i < 64; ++i) line[i] = 0; }", {R.RAX: 8}, {})
+        if mnemonic in (M.RDFSBASE, M.RDGSBASE, M.RDPID):
+            if not self.host_cpu:
+                raise ValueError(f"{str(ins).split()[0].upper()} requires host_cpu=True (--host-cpu) at RVA {ins.ip:#x}")
+            if (ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix
+                    or ins.has_segment_prefix or ins.has_xacquire_prefix or ins.has_xrelease_prefix):
+                raise ValueError(f"unsupported instruction prefix at RVA {ins.ip:#x}")
+            if ins.op_count != 1 or ins.op0_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported operand at RVA {ins.ip:#x}: {ins}")
+            dest_reg = ins.op0_register
+            if full(dest_reg) == R.RSP:
+                raise ValueError(f"unsupported use of rsp at RVA {ins.ip:#x}")
+            if mnemonic == M.RDPID:
+                if ins.code != Code.RDPID_R64:
+                    raise ValueError(f"unsupported RDPID encoding at RVA {ins.ip:#x}: {ins}")
+                line = f"{{ const volatile std::uint32_t pid = _rdpid_u32(); {self.write(ins, 8, 'pid')} }}"
+                return line, {}, {full(dest_reg): 8}
+            if ins.code not in HOST_CPU_READ_BASE_CODES:
+                raise ValueError(f"unsupported FSGSBASE encoding at RVA {ins.ip:#x}: {ins}")
+            intrinsic, op_width = HOST_CPU_READ_BASE_CODES[ins.code]
+            u = unsigned(op_width)
+            line = f"{{ const volatile {u} base = {intrinsic}(); {self.write(ins, op_width, 'base')} }}"
+            return line, {}, {full(dest_reg): op_width}
         if ins.code in STRING_TRANSFERS:
             kind, width = STRING_TRANSFERS[ins.code]
             if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
@@ -1207,6 +1262,26 @@ class Lifter:
             else:
                 lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
             return " ".join(lines), reads, writes
+        if mnemonic == M.BSWAP:
+            if width not in (4, 8) or ins.op0_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported BSWAP operands at RVA {ins.ip:#x}: the 16-bit form is undefined")
+            note(0)
+            return self.write(ins, width, f"byte_swap<{unsigned(width)}>({self.operand(ins, 0, width)})"), reads, writes
+        if mnemonic in BIT_SCANS:
+            if width not in (2, 4, 8) or ins.op0_kind != OpKind.REGISTER or ins.op1_kind not in (OpKind.REGISTER, OpKind.MEMORY):
+                raise ValueError(f"unsupported {str(ins).split()[0].upper()} operands at RVA {ins.ip:#x}")
+            note(1)
+            # A zero source leaves the whole destination register as it was, so it is read: 16 bits for a
+            # 16-bit destination, all 64 otherwise (a 32-bit result zero-extends only for a nonzero source).
+            destination = full(ins.op0_register)
+            reads[destination] = max(reads.get(destination, 0), 2 if width == 2 else 8)
+            u = unsigned(width)
+            source = self.operand(ins, 1, width)
+            found = self.write(ins, width, f"{BIT_SCANS[mnemonic]}<{u}>(source)")
+            if sets_flags:
+                self.flags = True
+                return f"fa = {source}; {{ const {u} source = static_cast<{u}>(fa); if (source != 0) {{ {found} }} }}", reads, writes
+            return f"{{ const {u} source = {source}; if (source != 0) {{ {found} }} }}", reads, writes
         if mnemonic in BIT_COUNTS:
             note(1)
             source = self.operand(ins, 1, width)
@@ -1689,14 +1764,14 @@ def prove_direction(function):
                 work.append(target)
 
 
-def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False):
+def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False, host_cpu=False):
     """Translate one export that takes the given number of integer arguments, 3 or 4.
 
     Functions it reaches through direct calls and tail jumps are translated into program."""
     if not isinstance(arguments, int) or arguments not in ARGUMENT_COUNTS:
         raise ValueError(f"unsupported argument count {arguments!r} for export {name}: expected 3 or 4")
     entry = export_rva(pe, name)
-    program = program or Program(pe, image_data=image_data)
+    program = program or Program(pe, image_data=image_data, host_cpu=host_cpu)
     return program.lift(entry, f"lifted_{name}", ARGUMENT_REGISTERS[:arguments])
 
 
@@ -1726,9 +1801,10 @@ class Program:
     """The functions of one image reached from the requested exports through direct calls and tail
     jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
 
-    def __init__(self, pe, bindings=None, *, image_data=False, imports=None):
+    def __init__(self, pe, bindings=None, *, image_data=False, imports=None, host_cpu=False):
         self.pe = pe
         self.image_data = image_data
+        self.host_cpu = host_cpu
         self.imports = imports or {}
         self.entries = Entries(pe, bindings)
         self.active = []
@@ -1810,7 +1886,7 @@ def lift_function(program, entry, symbol, arguments, internal):
                              "(an indirect jump through memory)")
     edges = function.explore(program.imports, import_resolver=program.import_resolver)
     image_data = program.image_data
-    lifter = Lifter(pe if image_data else None)
+    lifter = Lifter(pe if image_data else None, host_cpu=program.host_cpu)
     # A RIP-relative LEA that loads a recognised table base stays a guest address, with or without image data.
     bases = {(base, anchor) for *_, (_, _, base, anchor) in function.dispatches.values()}
     order = sorted(function.instructions)
@@ -2016,6 +2092,7 @@ def lift_function(program, entry, symbol, arguments, internal):
 PRELUDE = """#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <intrin.h>
 using word = std::uint64_t;
 static inline bool even_parity(word value) {
@@ -2046,6 +2123,16 @@ template <class T> static inline T trailing_zeros(T value) {
     unsigned count = 0;
     while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> count) & 1u) == 0) ++count;
     return static_cast<T>(count);
+}
+// BSR of a nonzero value: the index of its highest set bit.
+template <class T> static inline T highest_bit(T value) {
+    return static_cast<T>(sizeof(T) * 8 - 1 - leading_zeros<T>(value));
+}
+// BSWAP: reverse the bytes of a 32- or 64-bit value.
+template <class T> static inline T byte_swap(T value) {
+    T result = 0;
+    for (unsigned i = 0; i < sizeof(T); ++i) result = static_cast<T>((result << 8) | ((static_cast<word>(value) >> (8 * i)) & 0xffu));
+    return result;
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
@@ -2195,13 +2282,13 @@ def import_identities(pe):
             for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in desc.imports}
 
 
-def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
+def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None, host_cpu=False):
     """binding is one Binding or a sequence of them; with several, each binds the IAT slot of the import it names."""
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
     if image_data and {"bind_image", "unbind_image"} & {parse_entry(name)[0] for name in names}:
         raise ValueError("an export named bind_image or unbind_image collides with the image binding functions")
-    program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
+    program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data, host_cpu=host_cpu)
     bound = () if binding is None else (binding,) if isinstance(binding, Binding) else tuple(binding)
     for item in bound:
         if item.arguments not in IMPORT_ARGUMENT_COUNTS or item.return_bytes not in IMPORT_RETURN_WIDTHS:
@@ -2312,9 +2399,9 @@ def parse_binding_options(options):
     return found[0] if len(found) == 1 else tuple(found)
 
 
-def translate(image, names, bindings=None, *, image_data=False, binding=None):
+def translate(image, names, bindings=None, *, image_data=False, binding=None, host_cpu=False):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names, bindings, image_data=image_data, binding=binding)
+        return translate_pe(pe, names, bindings, image_data=image_data, binding=binding, host_cpu=host_cpu)
 
 
 if __name__ == "__main__":
@@ -2323,6 +2410,8 @@ if __name__ == "__main__":
     parser.add_argument("exports", help='comma-separated export names; "name:4" translates that export with a '
                                         "fourth integer argument in R9, and the host must pass four")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--host-cpu", action="store_true",
+                        help="opt into read-only host-CPU instructions (rdfsbase, rdgsbase, rdpid)")
     parser.add_argument("--image-data", action="store_true",
                         help="translate RIP-relative data against a live mapping of the image that the host "
                              "binds at run time with lifted_bind_image; the generated source states the contract")
@@ -2351,7 +2440,8 @@ if __name__ == "__main__":
     except ValueError as error:
         parser.error(str(error))
     try:
-        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data, binding=binding)
+        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges,
+                                      image_data=args.image_data, binding=binding, host_cpu=args.host_cpu)
         args.output.write_text(source, encoding="utf-8")
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "

@@ -39,6 +39,11 @@ The full build, Windows runtime tests, D3D12 tests, MASM fixtures and GPU tests
 require x64 Windows with Visual Studio's Desktop development with C++ workload,
 the Windows SDK, CMake/Ninja, DXC and Python 3.11 or newer.
 
+`dxc_compile_time_gvn` measures pass attribution through `-ftime-report`, which
+arrived in DXC 1.7.2212 (December 2022). The 1.6 build that ships with Windows
+SDK 10.0.22621 has no such flag, so that test reports a capability skip (77)
+instead of failing.
+
 The Ubuntu CI job assembles and translates gfx1013 fixtures with LLVM 15. The
 pure-Python checks listed below also run on Linux and macOS. Do not stub D3D12,
 MASM or `cl` to make the CMake configure succeed on another platform.
@@ -102,6 +107,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/resource_root_check.py
 ./out/pe-env/bin/python -B tests/bcpack_check.py
 ./out/pe-env/bin/python -B tests/bcpack_symbols_check.py
+./out/pe-env/bin/python -B tests/bcpack_tables_check.py
 ./out/pe-env/bin/python -B tests/bc7_blocks_check.py
 ./out/pe-env/bin/python -B tests/bc7_tiles_check.py
 ./out/pe-env/bin/python -B tests/gfx10_texture_roundtrip_check.py
@@ -115,6 +121,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/layout_chunks_check.py
 ./out/pe-env/bin/python -B tests/dependency_paths_check.py
 ./out/pe-env/bin/python -B tests/pe_package_preflight_check.py
+./out/pe-env/bin/python -B tests/host_commit_check.py
 ./out/pe-env/bin/python -B tests/pe_package_ordinal_plan_check.py
 ./out/pe-env/bin/python -B tests/compat_report_check.py
 ./out/pe-env/bin/python -B tests/intake/paths_check.py
@@ -134,7 +141,15 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
 ./out/pe-env/bin/python -B tests/rectlist_topology_check.py
 ./out/pe-env/bin/python -B tests/startup_sampler_heap_check.py
+./out/pe-env/bin/python -B tests/startup_image_sample_l_check.py
 ./out/pe-env/bin/python -B tests/startup_image_3d_check.py
+./out/pe-env/bin/python -B tests/startup_image_load_mip_check.py
+./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
+./out/pe-env/bin/python -B tests/startup_host_cpu_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_capture_check.py
+./out/pe-env/bin/python -B tests/startup_translator_check.py
+./out/pe-env/bin/python -B tests/startup_flat_param_check.py
+./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support

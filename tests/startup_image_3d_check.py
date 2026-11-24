@@ -101,7 +101,7 @@ def controls():
     assert 'srv 0 tex2d table 0 0' in manifest, manifest
     print('dim 2D (same words, dim field changed): Texture2D r0, float2(F(v0), F(v1)); manifest srv 0 tex2d')
 
-    # Other dimensions are refused rather than sampled as 2D.
+    # Other dimensions are refused rather than sampled as 2D (2D arrays: tests/startup_image_2d_array_check.py).
     try:
         translate(WORDS_1D)
     except G.Unsupported as error:
