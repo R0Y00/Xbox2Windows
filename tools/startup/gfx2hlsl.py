@@ -955,6 +955,56 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, True)
 
+    def class_f16(self, base, ops, mods):
+        """v_cmp_class_f16 and v_cmpx_class_f16: does the binary16 value in the low half of SRC0 fall in a class
+        named by the mask in SRC1? Bit 0 signalling NaN, 1 quiet NaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0,
+        7 +denormal, 8 +normal, 9 +inf. The test reads the encoding, so a denormal is a denormal whatever the
+        denormal mode, and a NaN keeps its signalling bit."""
+        if mods:
+            raise Unsupported('%s with %s' % (base, mods))
+        writes_exec = base == 'v_cmpx_class_f16'
+        if len(ops) == 3:
+            dst, value, mask = ops
+        elif len(ops) == 2:
+            dst, (value, mask) = ('exec' if writes_exec else 'vcc'), ops
+        else:
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        # A register source, with the neg and abs the instruction encodes: abs clears the sign bit, then neg flips it.
+        m = re.fullmatch(r'(-?)(\|?)([vs]\d+)(\|?)', value)
+        if not m or m.group(2) != m.group(4):
+            raise Unsupported('%s with source %s' % (base, value))
+        bits = '(%s & 0xffffu)' % self.u(m.group(3))
+        if m.group(2):
+            bits = '(%s & 0x7fffu)' % bits
+        if m.group(1):
+            bits = '(%s ^ 0x8000u)' % bits
+        predicate = '((c16c & %s) != 0u)' % self.u(mask)
+        predicate = '(%s ? 1u : 0u)' % predicate
+        if not self.exec_known:
+            predicate = '(exec & %s)' % predicate
+        self.emit('{ uint c16h = %s, c16m = c16h & 0x7fffu; bool c16n = c16h >= 0x8000u;' % bits)
+        self.emit('  uint c16c = c16m > 0x7c00u ? ((c16h & 0x0200u) != 0u ? 0x2u : 0x1u)'
+                  ' : c16m == 0x7c00u ? (c16n ? 0x4u : 0x200u)'
+                  ' : c16m >= 0x0400u ? (c16n ? 0x8u : 0x100u)'
+                  ' : c16m != 0u ? (c16n ? 0x10u : 0x80u) : (c16n ? 0x20u : 0x40u);')
+        if writes_exec or dst in ('exec', 'exec_lo'):
+            self.exec_known = False
+            self.emit('  exec = %s; }' % predicate)
+        elif dst in ('vcc', 'vcc_lo'):
+            self.emit('  vcc = %s; }' % predicate)
+        else:
+            d = reg_range(dst)[1]
+            self.set_s(d, predicate)
+            self.masks.add(d)
+            self.emit('}')
+        return None
+
+    def op_v_cmp_class_f16(self, ops, mods):
+        return self.class_f16('v_cmp_class_f16', ops, mods)
+
+    def op_v_cmpx_class_f16(self, ops, mods):
+        return self.class_f16('v_cmpx_class_f16', ops, mods)
+
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 

@@ -10754,6 +10754,16 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
 ```
 
+## Startup translator: binary16 class comparison
+
+`tools/startup/gfx2hlsl.py` lowers `v_cmp_class_f16` and `v_cmpx_class_f16` (#1723, #870). The instruction tests whether the binary16 value in the low half of SRC0 falls in one of ten classes named by the mask in SRC1: bit 0 signalling NaN, 1 quiet NaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf. The translation reads the encoding (sign, the 5-bit exponent and the top mantissa bit), so a denormal stays a denormal whatever the denormal mode and a NaN keeps its signalling bit. The `abs` and `neg` the instruction encodes act on the sign bit of the half (abs clears it, then neg flips it); the `_e32` and `_e64` spellings, a vector-condition, scalar or exec destination and a narrowed EXEC follow the other comparisons. `op_sel`, `clamp`, a source that is not a register, an SDWA spelling and a wrong operand count are refused.
+
+`tests/startup_gfx2hlsl_cmp_class_f16_check.py` compiles the emitted statements as C++ (when a compiler is found) and runs eight forms over all 65,536 binary16 values and 25 masks, against a reference that classifies through Python's own binary16 conversion; six planted faults in the emitted text must each be detected. `binary <llvm-mc>` checks that the spellings assemble to the recorded encodings. Limits: written and run on Linux only; no draw on a GPU was made, and the C++ stands in for the HLSL compiler (`uint` as `unsigned`).
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_cmp_class_f16$' -V
+```
+
 ## Startup translator: SMEM offset operands
 
 `tools/startup/gfx2hlsl.py` accepts these offset operands for the scalar memory loads ([issue #1674](https://github.com/R0Y00/Xbox2Windows/issues/1674)):
