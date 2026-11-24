@@ -1078,9 +1078,11 @@ class Stage:
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
         word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
-        if shift_add or word_complement or word_pack:
-            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
-            # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
+        if shift_add or base == 's_xnor_b32' or word_pack:
+            # The per-lane mask cannot supply the full word needed by these operations. s_nand_b32 and
+            # s_nor_b32 on a lane mask act on each lane's own bit, like s_and_b32 and s_or_b32.
+            # s_mul_hi_u32 into an SGPR that held a mask replaces it with a plain word (set_s drops the
+            # mark), so only vcc/exec count as a mask destination there.
             mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
                          else self.is_lane_mask(dname))
             if mask_dest or any(self.is_lane_mask(t) for t in srcs):
