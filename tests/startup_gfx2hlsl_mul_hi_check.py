@@ -11,6 +11,7 @@ The instruction bytes are **constructed here** from the field layout the checked
 src0 in `w1[8:0]`, src1 in `w1[17:9]`, and source 255 followed by a literal dword.
 """
 import os
+import re
 import struct
 import sys
 
@@ -101,6 +102,114 @@ check('the helper uses halfword products, not a 64-bit multiply',
 VOP3A_MUL_LO_U32 = 0x169
 asm, emitted = translate(encode_vop3a(VOP3A_MUL_LO_U32, 1, [V1, V2]))
 check('the low multiply is unchanged', emitted == 'v1 = v1 * v2;', emitted)
+
+# ---- value-level check of the emitted helper --------------------------------------------------------------
+# The reference is the exact product, so a wrong carry in the helper must fail even though the emitted text is
+# unchanged. The evaluator covers the integer operators this helper uses, with C precedence.
+TOKEN = re.compile(r'\s*(0x[0-9a-fA-F]+u?|\d+u?|[A-Za-z_]\w*|>>|<<|[&|^()*+-])')
+
+
+def tokens(source):
+    out, position = [], 0
+    while position < len(source):
+        match = TOKEN.match(source, position)
+        if not match:
+            raise ValueError('cannot tokenise %r' % source[position:position + 20])
+        out.append(match.group(1))
+        position = match.end()
+    return out
+
+
+class Expr:
+    """A recursive-descent evaluator for the 32-bit integer HLSL the mul_hi helper emits."""
+
+    LEVELS = [('|',), ('^',), ('&',), ('>>', '<<'), ('+', '-'), ('*',)]
+
+    def __init__(self, source, variables):
+        self.items, self.at, self.vars = tokens(source), 0, variables
+
+    def peek(self):
+        return self.items[self.at] if self.at < len(self.items) else ''
+
+    def take(self):
+        item = self.peek()
+        self.at += 1
+        return item
+
+    def value(self):
+        return self.binary(0)
+
+    def binary(self, level):
+        if level == len(self.LEVELS):
+            return self.unary()
+        left = self.binary(level + 1)
+        while self.peek() in self.LEVELS[level]:
+            operator = self.take()
+            right = self.binary(level + 1)
+            if operator == '*':
+                left = (left * right) & 0xFFFFFFFF
+            elif operator == '+':
+                left = (left + right) & 0xFFFFFFFF
+            elif operator == '-':
+                left = (left - right) & 0xFFFFFFFF
+            elif operator == '&':
+                left &= right
+            elif operator == '^':
+                left ^= right
+            elif operator == '|':
+                left |= right
+            elif operator == '>>':
+                left >>= right
+            elif operator == '<<':
+                left = (left << right) & 0xFFFFFFFF
+        return left
+
+    def unary(self):
+        item = self.take()
+        if item == '(':
+            value = self.value()
+            if self.take() != ')':
+                raise ValueError('missing )')
+            return value
+        if re.fullmatch(r'0x[0-9a-fA-F]+u?', item):
+            return int(item.rstrip('u'), 16)
+        if re.fullmatch(r'\d+u?', item):
+            return int(item.rstrip('u'))
+        return self.vars[item]
+
+
+def evaluate_mul_hi(helper, a, b):
+    """Run the emitted helper body for one pair, so what is checked is the value it returns."""
+    body = helper[helper.index('{') + 1:helper.rindex('}')]
+    variables = {'a': a, 'b': b}
+    for statement in (piece.strip() for piece in body.split(';')):
+        if not statement:
+            continue
+        if statement.startswith('uint '):
+            for part in statement[4:].split(','):
+                name, expr = (piece.strip() for piece in part.split('=', 1))
+                variables[name] = Expr(expr, variables).value() & 0xFFFFFFFF
+        elif statement.startswith('return '):
+            return Expr(statement[7:], variables).value() & 0xFFFFFFFF
+    raise ValueError('the helper returned nothing for %#x %#x' % (a, b))
+
+
+_pipe = object.__new__(G.Pipeline)
+_pipe.uds, _pipe.resources, _pipe.samplers, _pipe.uses_sampler_heap = [], {}, {}, False
+mul_hi_text = [entry for entry in _pipe.common() if 'uint mul_hi_u32(' in entry][0]
+edges = [0, 1, 2, 0xFFFF, 0x10000, 0x10001, 0x7FFFFFFF, 0x80000000,
+         0x80000001, 0xFFFEFFFF, 0xFFFF0000, 0xFFFFFFFF, 0x12345678]
+pairs = [(a, b) for a in edges for b in edges]
+state = 0x2545F491
+for _ in range(20000):
+    state = (state * 1103515245 + 12345) & 0xFFFFFFFF
+    first = state
+    state = (state * 1103515245 + 12345) & 0xFFFFFFFF
+    pairs.append((first, state))
+mismatches = [(a, b, (a * b) >> 32, evaluate_mul_hi(mul_hi_text, a, b)) for a, b in pairs
+              if evaluate_mul_hi(mul_hi_text, a, b) != ((a * b) >> 32)]
+check('the emitted helper agrees with the exact product on %d pairs' % len(pairs), not mismatches,
+      repr(mismatches[:4]))
 
 if failures:
     print('FAIL')
