@@ -1956,13 +1956,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: the SMEM offset 'off' is the literal 0; m0 and other operands keep their handling (#1674).
     add_test(NAME startup_gfx2hlsl_smem_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_smem_offset_check.py")
-    # Startup shader translator: v_cmp_class_f16 and v_cmpx_class_f16 against a binary16 class reference (#1723).
-    add_test(NAME startup_gfx2hlsl_cmp_class_f16 COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cmp_class_f16_check.py")
     add_test(NAME startup_triage_run COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py")
+    # Startup shader translator: v_cmp_class_f16 and v_cmpx_class_f16 against a binary16 class reference (#1723).
+    add_test(NAME startup_gfx2hlsl_cmp_class_f16 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cmp_class_f16_check.py")
     add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
     # Large batches: pages as slots of shared sections, adjacent pages in one view.
