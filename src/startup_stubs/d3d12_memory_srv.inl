@@ -190,6 +190,7 @@ const char* memory_srv_refusal(const D3D12_RESOURCE_DESC* resource, const Memory
     if (!readable_input) return "unreadable_view";
     if (as_view) {
         if (!x2w_startup::as_srv_location(input->view, input->address)) return "null_address";
+        if (!x2w_startup::supports_as_memory_srv(input->view)) return "unsupported_description";
     } else {
         if (!input->address) return "null_address";
         if (!supports_memory_srv(*resource, input->view)) return "unsupported_description";

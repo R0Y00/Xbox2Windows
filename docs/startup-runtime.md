@@ -1104,7 +1104,8 @@ descriptions with:
 
 Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
 `src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's
-address when `Location` is zero, and do not read the resource description. The view is published through
+address when `Location` is zero, do not read the resource description, and require `DXGI_FORMAT_UNKNOWN`
+with `D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING` (`unsupported_description`). The view is published through
 slot 18 with no resource and the desktop GPU address of the same byte when the address is 256-byte aligned
 (`as_unaligned`), starts inside one live placed (slot 133) buffer (`as_not_placed`) and that buffer was
 created in `D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE` (`as_wrong_state`). Any other case

@@ -110,6 +110,27 @@ int main(int argc, char** argv)
     check("both zero", as_srv_location(as_view(0), 0) == 0);
     check("dimension", is_as_srv(as_view(0)) && !is_as_srv(D3D12_SHADER_RESOURCE_VIEW_DESC{}));
 
+    // Format must be UNKNOWN and Shader4ComponentMapping must be default.
+    check("supported desc", supports_as_memory_srv(as_view(location)));
+    auto bad_fmt = as_view(location);
+    bad_fmt.Format = DXGI_FORMAT_R32_UINT;
+    check("bad format refused", !supports_as_memory_srv(bad_fmt));
+    auto bad_map = as_view(location);
+    bad_map.Shader4ComponentMapping = 0;
+    check("bad mapping refused", !supports_as_memory_srv(bad_map));
+    check("non-as refused", !supports_as_memory_srv(D3D12_SHADER_RESOURCE_VIEW_DESC{}));
+
+    // Trailing union bytes after Location are cleared in the resolved descriptor.
+    auto dirty_tail = as_view(location);
+    std::uint32_t words[6]{};
+    std::memcpy(words, &dirty_tail.Buffer, sizeof(words));
+    words[2] = 0xdeadbeefu;
+    std::memcpy(&dirty_tail.Buffer, words, sizeof(words));
+    D3D12_SHADER_RESOURCE_VIEW_DESC clean{};
+    check("dirty tail accepted", resolve_as_srv_desc(location, placed(), dirty_tail, clean) == AsSrvRefusal::none);
+    std::memcpy(words, &clean.Buffer, sizeof(words));
+    check("tail cleared", words[2] == 0 && words[3] == 0 && words[4] == 0 && words[5] == 0);
+
     check("names", std::strcmp(as_srv_refusal_name(AsSrvRefusal::as_unaligned), "as_unaligned") == 0 &&
                        std::strcmp(as_srv_refusal_name(AsSrvRefusal::as_not_placed), "as_not_placed") == 0 &&
                        std::strcmp(as_srv_refusal_name(AsSrvRefusal::as_wrong_state), "as_wrong_state") == 0);
