@@ -41,6 +41,7 @@
 
 #include <d3d12.h>
 #include "command_list_slot_names.h"
+#include "predication_args.h"
 #include "command_signature_filter.h"
 #include "console_plane_size.h"
 #include "descriptor_heap_type.h"
@@ -2596,6 +2597,38 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) list->SetComputeRootShaderResourceView(parameter, gpu);
 }
 
+// List slot 59 (desktop 55 + 4), SetPredication(buffer, offset, operation). A null buffer turns predication off.
+// A buffer must be a COMMON-tracked desktop buffer; it is moved to the predication state before the call.
+void __stdcall list_set_predication(Wrapper* self, void* buffer_arg, u64 offset, UINT operation)
+{
+    const auto refuse = [](const char* reason) {
+        static LONG refusals;
+        if (first_calls(refusals, 16)) log("x2w-render SetPredication refused: %s", reason);
+    };
+    auto* list = recording(self);
+    if (!list) return refuse("list is closed");
+    Wrapper* buffer = as_wrapper(buffer_arg);
+    const bool has_buffer = buffer_arg != nullptr;
+    if (has_buffer && (!buffer || buffer->own().kind != resource_kind || !buffer->own().real))
+        return refuse("buffer has no desktop resource");
+    auto* resource = has_buffer ? static_cast<ID3D12Resource*>(buffer->own().real) : nullptr;
+    const auto desc = has_buffer ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
+    if (has_buffer && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return refuse("predication needs a buffer");
+    switch (x2w_predication::check(has_buffer, offset, operation, desc.Width)) {
+    case x2w_predication::Verdict::clear:
+        list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        return;
+    case x2w_predication::Verdict::set: break;
+    case x2w_predication::Verdict::bad_operation: return refuse("operation is not 0 or 1");
+    case x2w_predication::Verdict::bad_offset: return refuse("offset is not a multiple of 8");
+    case x2w_predication::Verdict::outside_buffer: return refuse("value is outside the buffer");
+    }
+    const auto* info = resource_info(buffer);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return refuse("buffer does not use COMMON state tracking");
+    require_state(self, resource, D3D12_RESOURCE_STATE_PREDICATION);
+    list->SetPredication(resource, offset, static_cast<D3D12_PREDICATION_OP>(operation));
+}
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -4102,6 +4135,7 @@ void build_tables()
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        list_typed[59] = reinterpret_cast<ListTyped>(&list_set_predication);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
         // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
         // bindings are opt-in. Unset, the slots stay no-ops.
