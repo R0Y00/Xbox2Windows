@@ -63,43 +63,24 @@ double frames_to_ms(uint64_t frames, uint32_t rate)
 // depending on where the window falls against the tone's phase. A frequency-share metric was tried first
 // and made a steady tone read anywhere between 0.06 and 0.32, so it crossed the threshold at random.
 // Share of a window's energy at one frequency, used only by the isolation control: our own signal is
-
 // 440 Hz and the interfering process plays 880 Hz, so the captured tone can be attributed.
-
 double frequency_share(const std::vector<float>& mono, uint32_t rate, double hz)
-
 {
-
     if (mono.empty() || rate == 0) return 0.0;
-
     const double omega = 2.0 * 3.14159265358979323846 * hz / rate;
-
     const double coeff = 2.0 * std::cos(omega);
-
     double s1 = 0, s2 = 0, energy = 0;
-
     for (double sample : mono) {
-
         const double s0 = sample + coeff * s1 - s2;
-
         s2 = s1;
-
         s1 = s0;
-
         energy += sample * sample;
-
     }
-
     const double n = static_cast<double>(mono.size());
-
     if (energy <= 1e-12) return 0.0;
-
     const double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
-
     return (power / (n * n)) / (energy / n);
-
 }
-
 double window_level(const std::vector<float>& mono)
 {
     if (mono.empty()) return 0.0;
@@ -107,122 +88,64 @@ double window_level(const std::vector<float>& mono)
     for (double sample : mono) energy += sample * sample;
     return std::sqrt(energy / static_cast<double>(mono.size()));
 }
-
 // Process-scoped capture: the loopback client is activated for this process tree, so other clients on
-
 // the endpoint cannot supply the tone or turn a silence window into a failure. Unavailable activation is
-
 // a capability skip with a named reason, never an assertion failure.
-
 class ActivationHandler : public IActivateAudioInterfaceCompletionHandler
-
 {
-
 public:
-
     ActivationHandler() : done_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
-
     ~ActivationHandler() { if (done_) CloseHandle(done_); }
-
     HANDLE done() const { return done_; }
     HANDLE& done_handle() { return done_; }
-
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
-
     {
-
         if (!object) return E_POINTER;
-
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
-
             *object = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
-
             AddRef();
-
             return S_OK;
-
         }
-
         *object = nullptr;
-
         return E_NOINTERFACE;
-
     }
-
     ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
-
     ULONG STDMETHODCALLTYPE Release() override
-
     {
-
         const LONG left = InterlockedDecrement(&refs_);
-
         if (!left) delete this;
-
         return static_cast<ULONG>(left);
-
     }
-
     HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation*) override
-
     {
-
         SetEvent(done_);
-
         return S_OK;
-
     }
-
 private:
-
     LONG refs_ = 1;
-
     HANDLE done_ = nullptr;
-
 };
 
-
-
 // Activates the process-loopback client for this process tree and returns a named reason on failure.
-
 HRESULT process_loopback_client(IAudioClient** client, std::string& reason)
-
 {
-
     AUDIOCLIENT_ACTIVATION_PARAMS params{};
-
     params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-
     params.ProcessLoopbackParams.TargetProcessId = GetCurrentProcessId();
-
     params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
-
     PROPVARIANT property{};
-
     property.vt = VT_BLOB;
-
     property.blob.cbSize = sizeof(params);
-
     property.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
-
     auto* handler = new ActivationHandler();
-
     IActivateAudioInterfaceAsyncOperation* operation = nullptr;
-
     HRESULT hr = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient),
-
                                              &property, handler, &operation);
-
     if (FAILED(hr) || !operation) {
-
         handler->Release();
-
         { static char why[96]; std::snprintf(why, sizeof(why), "process loopback activation unavailable (0x%08lx)", static_cast<unsigned long>(hr)); reason = why; }
-
         return FAILED(hr) ? hr : E_FAIL;
-
     }
-
     // Pump messages while waiting: the completion callback is dispatched on this apartment.
     DWORD waited = WAIT_TIMEOUT;
     for (const ULONGLONG deadline = GetTickCount64() + 5000; GetTickCount64() < deadline;) {
@@ -234,45 +157,25 @@ HRESULT process_loopback_client(IAudioClient** client, std::string& reason)
             DispatchMessageW(&message);
         }
     }
-
     HRESULT status = E_FAIL;
-
     IUnknown* iface = nullptr;
-
     if (waited != WAIT_OBJECT_0 || FAILED(operation->GetActivateResult(&status, &iface)) || FAILED(status) || !iface) {
-
         if (iface) iface->Release();
-
         operation->Release();
-
         handler->Release();
-
         { static char why[96]; std::snprintf(why, sizeof(why), "process loopback activation did not complete (0x%08lx)", static_cast<unsigned long>(status)); reason = why; }
-
         return FAILED(status) ? status : E_FAIL;
-
     }
-
     hr = iface->QueryInterface(IID_PPV_ARGS(client));
-
     iface->Release();
-
     operation->Release();
-
     handler->Release();
-
     if (FAILED(hr) || !*client) {
-
         reason = "process loopback client unavailable";
-
         return FAILED(hr) ? hr : E_NOINTERFACE;
-
     }
-
     return S_OK;
-
 }
-
 struct Plan {
     int tone_blocks = 8;          // known tone
     int silence_blocks = 4;       // intentional silence
@@ -468,6 +371,66 @@ struct Caller {
         release(engine);
     }
 };
+
+
+// Device-free self-test of the metric the isolation control uses. It runs on hosts where process loopback is
+// unavailable, so the classification is still checked when the endpoint arm skips. The discrimination check is
+// the control: a 440 Hz tone must score high at 440 and low at 880, otherwise "our tone was present" would be
+// an unfalsifiable statement.
+int classifier_self_test()
+{
+    const uint32_t rate = 48000;
+    const std::size_t samples = 4800;  // 100 ms
+    auto tone = [&](double hz) {
+        std::vector<float> mono(samples);
+        for (std::size_t i = 0; i < samples; ++i)
+            mono[i] = static_cast<float>(0.5 * std::sin(2.0 * 3.14159265358979323846 * hz * i / rate));
+        return mono;
+    };
+    int failures = 0;
+    auto require = [&](bool condition, const char* what) {
+        if (!condition) {
+            std::printf("FAIL: %s\n", what);
+            ++failures;
+        }
+    };
+
+    const auto at440 = tone(440.0);
+    const auto at880 = tone(880.0);
+    const double own = frequency_share(at440, rate, 440.0);
+    const double own_other = frequency_share(at440, rate, 880.0);
+    const double other = frequency_share(at880, rate, 880.0);
+    const double other_own = frequency_share(at880, rate, 440.0);
+    std::printf("classifier: 440 tone -> 440 share %.3f, 880 share %.3f\n", own, own_other);
+    std::printf("classifier: 880 tone -> 880 share %.3f, 440 share %.3f\n", other, other_own);
+    require(own > 0.30, "a 440 Hz tone does not score high at 440 Hz");
+    require(other > 0.30, "an 880 Hz tone does not score high at 880 Hz");
+    require(own > own_other * 8.0, "a 440 Hz tone is not separated from 880 Hz");
+    require(other > other_own * 8.0, "an 880 Hz tone is not separated from 440 Hz");
+
+    const std::vector<float> silence(samples, 0.0f);
+    const double silent = frequency_share(silence, rate, 440.0);
+    std::printf("classifier: silence -> 440 share %.3f\n", silent);
+    require(silent <= 0.01, "silence scores as tone energy, so the gap check could never pass");
+
+    // White noise must not be mistaken for a tone; otherwise the control would accept any capture.
+    std::vector<float> noise(samples);
+    uint32_t seed = 12345;
+    for (auto& sample : noise) {
+        seed = seed * 1664525u + 1013904223u;
+        sample = static_cast<float>(((seed >> 8) & 0xFFFF) / 65536.0) - 0.5f;
+    }
+    const double noisy = frequency_share(noise, rate, 440.0);
+    std::printf("classifier: white noise -> 440 share %.3f\n", noisy);
+    require(noisy < 0.05, "white noise scores as a tone");
+
+    require(frequency_share({}, rate, 440.0) == 0.0, "an empty window scores non-zero");
+    require(frequency_share(at440, 0, 440.0) == 0.0, "a zero sample rate scores non-zero");
+
+    if (failures) return 1;
+    std::printf("PASS: 440 and 880 tones separated, silence and noise do not score as tone\n");
+    return 0;
+}
 
 int run()
 {
@@ -740,6 +703,10 @@ int main(int argc, char** argv)
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         std::printf("skip: COM initialisation failed\n");
         return skip_no_endpoint;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--self-test") == 0) {
+        CoUninitialize();
+        return classifier_self_test();
     }
     if (argc > 1 && std::strcmp(argv[1], "noise") == 0) {
         // Interference process for the isolation control: a second process on the endpoint playing a

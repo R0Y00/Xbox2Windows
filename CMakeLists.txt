@@ -1232,6 +1232,10 @@ target_compile_features(startup_audio_output_validation PRIVATE cxx_std_17)
 target_include_directories(startup_audio_output_validation PRIVATE src)
 target_link_libraries(startup_audio_output_validation PRIVATE ole32 xaudio2 mmdevapi)
 add_test(NAME startup_audio_output_validation COMMAND startup_audio_output_validation)
+# Device-free half of the same fixture: the metric the isolation control classifies with, checked on hosts
+# where process loopback is unavailable and the endpoint arm skips.
+add_test(NAME startup_audio_output_validation_classifier COMMAND startup_audio_output_validation --self-test)
+set_tests_properties(startup_audio_output_validation_classifier PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_audio_output_validation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 # Voice-lifecycle control: one client, two explicit providers (a diagnostic recorder and the system
 # XAudio2 called directly), verifying the diagnostic window observes the same lifecycle before any
