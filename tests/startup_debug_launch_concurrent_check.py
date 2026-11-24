@@ -1,0 +1,75 @@
+"""A hooked byte stays patched for every thread except the one stepping over it."""
+
+from pathlib import Path
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "startup"))
+from step_gate import StepGate  # noqa: E402
+
+
+class Machine:
+    """Fake process: threads run unless suspended; the hook byte is patched or restored."""
+
+    def __init__(self, threads):
+        self.live = set(threads)
+        self.suspended = {}
+        self.patched = True
+        self.missed = []
+
+    def suspend(self, tid):
+        self.suspended[tid] = self.suspended.get(tid, 0) + 1
+        return True
+
+    def resume(self, tid):
+        self.suspended[tid] -= 1
+
+    def enter(self, tid):
+        """A thread calls the hooked function; it is missed when it can run through a restored byte."""
+        if self.suspended.get(tid, 0) == 0 and not self.patched:
+            self.missed.append(tid)
+
+
+class StepGateTest(unittest.TestCase):
+    def setUp(self):
+        self.machine = Machine({1, 2, 3})
+        self.gate = StepGate(self.machine.suspend, self.machine.resume, lambda: self.machine.live)
+
+    def hit(self, tid):
+        self.machine.patched = False
+        self.gate.begin(tid, 0x1000)
+
+    def end(self, tid):
+        addr = self.gate.finish(tid)
+        if addr is not None:
+            self.machine.patched = True
+
+    def test_other_threads_cannot_run_through_a_step(self):
+        self.hit(1)
+        self.machine.enter(2)
+        self.machine.enter(3)
+        self.end(1)
+        self.assertEqual(self.machine.missed, [])
+        self.assertTrue(self.machine.patched)
+        self.assertEqual({t: c for t, c in self.machine.suspended.items() if c}, {})
+
+    def test_byte_stays_open_until_the_last_stepper_finishes(self):
+        self.hit(1)
+        self.assertTrue(self.gate.begin(2, 0x1000))  # a hit already in flight on another thread
+        self.end(1)
+        self.assertFalse(self.machine.patched)
+        self.end(2)
+        self.assertTrue(self.machine.patched)
+        self.assertEqual(self.gate.dropped, 1)
+        self.assertEqual({t: c for t, c in self.machine.suspended.items() if c}, {})
+
+    def test_exited_thread_is_not_resumed(self):
+        self.hit(1)
+        self.machine.live.discard(3)
+        self.gate.forget(3)
+        self.end(1)
+        self.assertEqual(self.gate.stepping, {})
+
+
+if __name__ == "__main__":
+    unittest.main()
