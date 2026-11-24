@@ -46,6 +46,12 @@ inline bool is_as_srv(const D3D12_SHADER_RESOURCE_VIEW_DESC& view)
     return view.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
 }
 
+inline bool supports_as_memory_srv(const D3D12_SHADER_RESOURCE_VIEW_DESC& view)
+{
+    return is_as_srv(view) && view.Format == DXGI_FORMAT_UNKNOWN &&
+           view.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+}
+
 // The title address of the structure: the view's Location, or the call's separate address when the
 // Location is zero.
 inline std::uint64_t as_srv_location(const D3D12_SHADER_RESOURCE_VIEW_DESC& view, std::uint64_t address)
@@ -70,7 +76,10 @@ inline AsSrvRefusal resolve_as_srv_desc(std::uint64_t location, const PlacedAsBu
     if (offset > UINT64_MAX - placed.gpu_base) return AsSrvRefusal::as_not_placed;
     const std::uint64_t gpu = placed.gpu_base + offset;
     if (gpu % alignment != 0) return AsSrvRefusal::as_unaligned;
-    resolved = view;
+    resolved = {};
+    resolved.Format = view.Format;
+    resolved.ViewDimension = view.ViewDimension;
+    resolved.Shader4ComponentMapping = view.Shader4ComponentMapping;
     resolved.RaytracingAccelerationStructure.Location = gpu;
     return AsSrvRefusal::none;
 }
