@@ -165,6 +165,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
+        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1") {
+            // Version 2 adds `uav` lines for vertex-stage stores. This runtime does not bind them,
+            // so it must not draw a translation whose stores it would silently skip (#1723).
+            log("x2w-draw unsupported manifest version for %016llx", tr.key);
+            return;
+        } else if (line.compare(0, 4, "uav ") == 0) {
+            log("x2w-draw unsupported uav line for %016llx", tr.key);
+            return;
         } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
