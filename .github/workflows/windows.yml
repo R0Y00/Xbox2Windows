@@ -229,7 +229,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
-          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
+          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm', '!out/**') }}
           restore-keys: |
             sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-
       - name: Build on Windows
@@ -251,7 +251,7 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
-          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
       - name: Configure, build and run PC tests
         shell: pwsh
         env:
@@ -354,7 +354,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
-          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
+          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm', '!out/**') }}
           restore-keys: |
             sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-
       - name: Build on Windows at /O2
@@ -376,7 +376,7 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
-          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
       - name: Configure, build and run PC tests at /O2
         shell: pwsh
         env:
