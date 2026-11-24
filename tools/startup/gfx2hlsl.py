@@ -154,7 +154,8 @@ def starts_with_fetch_call(code):
 def parse_input_layout(text):
     """'ia1 <n>' then one '<semantic> <index> <format> <slot> <offset> <class> <step>' line per element."""
     lines = text.split('\n')
-    if not re.fullmatch(r'ia1 ([1-9]|[12][0-9]|3[0-2])', lines[0]) or lines[-1] != '' or len(lines) != int(lines[0][4:]) + 2:
+    # 'ia1 0' is a layout the pipeline declares with no elements: no fetched input has a source.
+    if not re.fullmatch(r'ia1 (0|[1-9]|[12][0-9]|3[0-2])', lines[0]) or lines[-1] != '' or len(lines) != int(lines[0][4:]) + 2:
         raise Unsupported('invalid input layout request')
     elements, ends = [], {}
     for line in lines[1:-1]:
@@ -206,6 +207,12 @@ def stream_fetch(vs_container, layout_text):
         if register not in inputs:
             raise Unsupported('vertex fetch record for input register %d outside the signature' % register)
         name, index, _ = inputs[register]
+        if not layout:
+            # Declared layout without elements: the input has no vertex buffer; its registers read as zero
+            # (shortcut: the zero default is an assumption, not a measurement).
+            fetch.append(dict(vgpr=vgpr, count=count, empty=True))
+            at += 5
+            continue
         match = [e for e in layout if (e['name'], e['index']) == (name, index)]
         if len(match) != 1:
             raise Unsupported('input layout has %d elements for vertex input register %d' % (len(match), register))
@@ -2201,6 +2208,10 @@ class Stage:
             raise Unsupported('vertex stage calls a fetch routine and the pipeline declares no input layout')
         base = self.pipe.ud(('basevertex',))
         for e in self.pipe.vs_fetch:
+            if e.get('empty'):
+                for i in range(e['count']):
+                    self.set_v(e['vgpr'] + i, '0u')
+                continue
             key = (('vbtab',), 16 * e['slot'])
             buf = self.pipe.resource(key, 'buf')
             stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))

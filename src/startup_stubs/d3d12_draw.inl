@@ -439,7 +439,10 @@ bool stream_input_layout(const unsigned char* subobject, std::string& text)
 {
     D3D12_INPUT_LAYOUT_DESC layout;
     std::memcpy(&layout, subobject + 8, sizeof(layout));
-    if (!layout.NumElements) return true;
+    if (!layout.NumElements) {
+        text = "ia1 0\n";  // declared without elements: the translation reads every fetched input as zero
+        return true;
+    }
     if (layout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT ||
         !x2w_local::readable(layout.pInputElementDescs, sizeof(D3D12_INPUT_ELEMENT_DESC) * layout.NumElements)) return false;
     text = "ia1 " + std::to_string(layout.NumElements) + "\n";

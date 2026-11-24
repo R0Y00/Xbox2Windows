@@ -252,6 +252,14 @@ def translate_cases(directory):
     for line in ("w = ldu(r0, a);", "v4 = w & 255u;", "v5 = (w >> 8) & 255u;", "v6 = (w >> 16) & 255u;"):
         assert "    %s\n" % line in vs, line + "\n" + vs
 
+    # A layout declared with no elements translates: no vertex-buffer load, every fetched register reads zero.
+    status, vs, manifest = translate(directory / "empty_layout", vertex(), "ia1 0\n")
+    assert status == "ok", status
+    for line in ("v4 = 0u;", "v6 = 0u;", "v8 = 0u;", "v10 = 0u;"):
+        assert "    %s\n" % line in vs, line + "\n" + vs
+    assert "r0.Load(" not in vs and "buf vb" not in manifest, vs + manifest
+    print("translate: an empty declared layout reads every fetched input as zero")
+
     # Refused: no layout; a register nothing defines; the only write masked off by exec, or bypassed by a branch.
     for label, words, layout, want in (
             ("no layout", None, None, NO_LAYOUT),
