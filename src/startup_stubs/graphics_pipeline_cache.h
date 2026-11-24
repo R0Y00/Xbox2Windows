@@ -74,6 +74,36 @@ inline std::uint64_t hash_depth_stencil_key(const D3D12_DEPTH_STENCIL_DESC& dept
     return hash_stencil_ops_key(depth.BackFace, key);
 }
 
+// The translated shader bytes are part of the cache name. Two translations with the same title
+// words but different desktop VS/PS output must not share a driver pipeline.
+inline std::uint64_t translated_code_key(std::uint64_t translation_key, const void* vs,
+                                         std::size_t vs_bytes, const void* ps,
+                                         std::size_t ps_bytes)
+{
+    return fnv_bytes(ps, ps_bytes, fnv_bytes(vs, vs_bytes, translation_key));
+}
+
+// Shared key for the title state and the translated code. Kept here so the device-free test can
+// exercise the same formula as the draw path, including the code_key fallback.
+inline std::uint64_t pipeline_key(std::uint64_t translation_key, std::uint64_t code_key,
+                                  const DXGI_FORMAT* target_formats, std::uint32_t target_count,
+                                  DXGI_FORMAT dsv_format, bool has_blend,
+                                  const D3D12_BLEND_DESC* blend, bool has_depth_stencil,
+                                  const D3D12_DEPTH_STENCIL_DESC* depth_stencil)
+{
+    const unsigned char schema = 3;
+    std::uint64_t key = fnv_bytes(&schema, sizeof(schema), code_key ? code_key : translation_key);
+    key = fnv_bytes(&target_count, sizeof(target_count), key);
+    for (std::uint32_t i = 0; i < target_count; ++i)
+        key = fnv_bytes(&target_formats[i], sizeof(target_formats[i]), key);
+    key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
+    const unsigned char states = (has_blend ? 1u : 0u) | (has_depth_stencil ? 2u : 0u);
+    key = fnv_bytes(&states, sizeof(states), key);
+    if (has_blend) key = hash_blend_key(*blend, key);
+    if (has_depth_stencil) key = hash_depth_stencil_key(*depth_stencil, key);
+    return key;
+}
+
 // Stable adapter/driver identity. The LUID locates the DXGI adapter but is not
 // hashed: it can change across boots. Vendor, device, subsystem, revision and
 // the UMD version identify a pipeline cache the driver can still consume.

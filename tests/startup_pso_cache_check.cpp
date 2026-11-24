@@ -338,6 +338,45 @@ bool hash_fields_covered()
     return ok;
 }
 
+bool code_key_changes_pipeline_name()
+{
+    using namespace x2w_startup::graphics_pipeline_cache_detail;
+    const DXGI_FORMAT formats[] = {DXGI_FORMAT_R8G8B8A8_UNORM};
+    const std::uint64_t translation = 0x0123456789abcdefull;
+    const std::uint64_t code_a = translated_code_key(translation, "vs-a", 4, "ps-a", 4);
+    const std::uint64_t vs_changed = translated_code_key(translation, "vs-b", 4, "ps-a", 4);
+    const std::uint64_t ps_changed = translated_code_key(translation, "vs-a", 4, "ps-b", 4);
+    const std::uint64_t key_a = pipeline_key(translation, code_a, formats, 1, DXGI_FORMAT_UNKNOWN,
+                                             false, nullptr, false, nullptr);
+    const std::uint64_t key_vs = pipeline_key(translation, vs_changed, formats, 1,
+                                              DXGI_FORMAT_UNKNOWN, false, nullptr, false, nullptr);
+    const std::uint64_t key_ps = pipeline_key(translation, ps_changed, formats, 1,
+                                              DXGI_FORMAT_UNKNOWN, false, nullptr, false, nullptr);
+    const std::uint64_t key_old_wiring = pipeline_key(translation, 0, formats, 1,
+                                                      DXGI_FORMAT_UNKNOWN, false, nullptr, false,
+                                                      nullptr);
+    const std::uint64_t key_a_again = pipeline_key(translation, code_a, formats, 1,
+                                                   DXGI_FORMAT_UNKNOWN, false, nullptr, false,
+                                                   nullptr);
+    if (code_a == vs_changed || code_a == ps_changed) {
+        std::puts("FAIL: translated VS/PS bytes do not change the code key");
+        return false;
+    }
+    if (key_a == key_vs || key_a == key_ps) {
+        std::puts("FAIL: translated VS/PS bytes do not change the pipeline name");
+        return false;
+    }
+    if (key_a == key_old_wiring) {
+        std::puts("FAIL: dropping code_key still produces the old pipeline name");
+        return false;
+    }
+    if (key_a != key_a_again) {
+        std::puts("FAIL: the same code key does not produce a stable pipeline name");
+        return false;
+    }
+    return true;
+}
+
 void remove_cache(const wchar_t* directory)
 {
     wchar_t pattern[MAX_PATH + 8]{};
@@ -396,6 +435,10 @@ int main()
     }
     if (!hash_fields_covered()) {
         std::puts("FAIL: at least one blend/depth field is missing from the key");
+        ok = false;
+    }
+    if (!code_key_changes_pipeline_name()) {
+        std::puts("FAIL: the translated code bytes are not part of the pipeline name");
         ok = false;
     }
     std::uint32_t cold_pixel[4]{};

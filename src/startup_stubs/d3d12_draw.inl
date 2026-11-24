@@ -180,8 +180,9 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32) return;
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
     if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
-    tr.code_key = fnv_bytes(tr.vs->GetBufferPointer(), tr.vs->GetBufferSize(), tr.key);
-    tr.code_key = fnv_bytes(tr.ps->GetBufferPointer(), tr.ps->GetBufferSize(), tr.code_key);
+    tr.code_key = x2w_startup::graphics_pipeline_cache_detail::translated_code_key(
+        tr.key, tr.vs->GetBufferPointer(), tr.vs->GetBufferSize(), tr.ps->GetBufferPointer(),
+        tr.ps->GetBufferSize());
     const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
         static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root);
     if (FAILED(hr)) {
@@ -485,26 +486,16 @@ void flush_pipeline_cache()
     if (auto cache = pipeline_cache_for(device_of(the_device), false)) cache->Flush();
 }
 
-using x2w_startup::graphics_pipeline_cache_detail::hash_blend_key;
-using x2w_startup::graphics_pipeline_cache_detail::hash_depth_stencil_key;
-
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
 {
     const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
-    // The name keys the shared desktop pipeline library. It includes the
-    // translation revision, every output format, the depth format and the
-    // presence of the title's blend/depth blocks. The cache helper adds the
-    // adapter and driver identity before it names the serialized library.
-    const unsigned char schema = 3;
-    u64 key = fnv_bytes(&schema, sizeof(schema), tr.code_key ? tr.code_key : tr.key);
-    key = fnv_bytes(&pass.target_count, sizeof(pass.target_count), key);
-    for (UINT i = 0; i < pass.target_count; ++i)
-        key = fnv_bytes(&pass.target_formats[i], sizeof(pass.target_formats[i]), key);
-    key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
-    const unsigned char states = (bound.has_blend ? 1u : 0u) | (bound.has_depth_stencil ? 2u : 0u);
-    key = fnv_bytes(&states, sizeof(states), key);
-    if (bound.has_blend) key = hash_blend_key(bound.blend, key);
-    if (bound.has_depth_stencil) key = hash_depth_stencil_key(bound.depth_stencil, key);
+    // The name keys the shared desktop pipeline library. It includes the translated code,
+    // every output format, the depth format and the presence of the title's blend/depth blocks.
+    // The cache helper adds the adapter and driver identity before it names the library.
+    const u64 key = x2w_startup::graphics_pipeline_cache_detail::pipeline_key(
+        tr.key, tr.code_key, pass.target_formats, pass.target_count, dsv_format, bound.has_blend,
+        bound.has_blend ? &bound.blend : nullptr, bound.has_depth_stencil,
+        bound.has_depth_stencil ? &bound.depth_stencil : nullptr);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
