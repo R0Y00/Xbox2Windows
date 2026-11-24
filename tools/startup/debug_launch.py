@@ -1,6 +1,6 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
-usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1]
+usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--suspend-others 0]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
@@ -18,9 +18,11 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
+k32.SuspendThread.restype = wt.DWORD
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
+from hook_window import StepWindow, HELD, GONE, FAILED  # noqa: E402
 
 
 class MemoryBasicInformation(ctypes.Structure):
@@ -426,6 +428,35 @@ def main():
     returns = {}  # addr -> list of (tid, rsp after return, description)
     stepping = {}  # tid -> addr to re-arm
     file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace or log_at else None
+    hook_entries = [0]
+    held_threads = {}  # tid -> handle of a thread held for the current step window
+    sync_raw = (ctypes.c_ubyte * (1232 + 16))()
+    sync_addr = (ctypes.addressof(sync_raw) + 15) & ~15
+
+    def hold_thread(tid):
+        handle = k32.OpenThread(0x0002 | 0x0008, False, tid)  # SUSPEND_RESUME | GET_CONTEXT
+        if not handle:
+            return GONE if ctypes.get_last_error() == 87 else FAILED  # 87: no such thread
+        # SuspendThread returns before the thread has stopped; GetThreadContext waits until it has.
+        struct.pack_into("<I", (ctypes.c_ubyte * 1232).from_address(sync_addr), 0x30, 0x100001)
+        if (k32.SuspendThread(wt.HANDLE(handle)) == 0xFFFFFFFF
+                or not k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr))):
+            k32.ResumeThread(wt.HANDLE(handle))
+            k32.CloseHandle(wt.HANDLE(handle))
+            return FAILED
+        held_threads[tid] = handle
+        return HELD
+
+    def release_thread(tid):
+        handle = held_threads.pop(tid, None)
+        if handle:
+            k32.ResumeThread(wt.HANDLE(handle))
+            k32.CloseHandle(wt.HANDLE(handle))
+
+    # A hook step-over restores the original byte for one instruction. Every other thread is held
+    # for that step (--suspend-others 0 turns this off to measure what the window costs).
+    window = StepWindow(hold_thread, release_thread, protect=opts.get("--suspend-others", "1") != "0")
+    file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace else None
 
     def arm(addr, *, skip_int3=False):
         if addr not in breakpoints:
@@ -438,6 +469,12 @@ def main():
         thread, ctx = get_ctx(tid)
         if not thread:
             return False
+        if window.defer(tid):
+            # This thread trapped before it was held. Back to the hook address: it traps again, and
+            # is traced, once the window is closed and the byte is patched again.
+            struct.pack_into("<Q", ctx, 0xF8, addr)
+            set_ctx(thread)
+            return True
         regs = dict(zip(REGS, struct.unpack_from("<16Q", ctx, 0x78) + struct.unpack_from("<Q", ctx, 0xF8)))
         rva = addr - main_base if log_at else None
         point = log_at.get(rva)
@@ -453,6 +490,7 @@ def main():
             file_log.flush()
         rsp = regs["Rsp"]
         if addr in hooks:
+            hook_entries[0] += 1
             name, arg = hooks[addr]
             ret = read_qword(read, rsp) or 0
             if arg == "valloc":
@@ -530,6 +568,8 @@ def main():
                 returns[addr].remove(item)
                 file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
                 file_log.flush()
+        # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
         # After the final logged hit, let the restored instruction run at full speed unless
         # another hook still owns this breakpoint.
@@ -616,6 +656,8 @@ def main():
         if watches and time.time() >= watch_next:
             watch_next = time.time() + 1.0
             poll_watches()
+        if window.expire(time.monotonic()):
+            log(f"{time.time() - start:7.3f} hook step window expired, held threads resumed")
         if not k32.WaitForDebugEvent(event, 200):
             continue
         code, pid, tid = struct.unpack_from("<III", event, 0)
@@ -667,8 +709,10 @@ def main():
         elif code == CREATE_THREAD:
             log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            window.finish(tid)
         elif code == EXIT_PROCESS:
             exit_code = struct.unpack_from("<I", event, 16)[0]
             log(f"{time.time() - start:7.3f} exit {exit_code:#010x}")
@@ -704,6 +748,7 @@ def main():
                 addr = stepping.pop(tid)
                 if addr in breakpoints:
                     write(addr, b"\xcc")
+                window.finish(tid)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 continue
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
@@ -755,6 +800,7 @@ def main():
                 status = DBG_EXCEPTION_NOT_HANDLED
         k32.ContinueDebugEvent(pid, tid, status)
 
+    window.abandon()
     elapsed = time.time() - start
     if stop and stop_at:
         dump_threads(os.path.join(logdir, "threads_stop.txt"))
@@ -862,6 +908,11 @@ def main():
         if late_hits:
             print("  LOG_AT late hits resumed after the limit: " +
                   ", ".join(f"+{addr - main_base:x} x{n}" for addr, n in sorted(late_hits.items())))
+    report = window.summary(hook_entries[0])
+    print("  " + report)
+    if file_log:
+        file_log.write(report + "\n")
+        file_log.flush()
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))
