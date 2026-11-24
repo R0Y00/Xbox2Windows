@@ -2758,6 +2758,17 @@ void restore_compute_root(const Pass& pass, ID3D12GraphicsCommandList* list)
     }
 }
 
+// X2W_COMPUTE_DISPATCH=1 turns on the compute-dispatch experiment: device slot 62 loads a validated
+// <key>.cs.cso and builds a real desktop compute pipeline, and command-list slot 14 Dispatch (installed
+// unconditionally by main) forwards it. Without the variable no module is loaded, so the default
+// placeholder path is exactly as inert as before and the source-built readback fixture is what turns
+// this on explicitly.
+bool compute_dispatch_enabled()
+{
+    char value[8];
+    const DWORD n = GetEnvironmentVariableA("X2W_COMPUTE_DISPATCH", value, sizeof(value));
+    return n == 1 && value[0] == '1';
+}
 void __stdcall list_compute_root(Wrapper* self, void* root)
 {
     auto* list = recording(self);
@@ -6012,10 +6023,10 @@ void dump_containers(const char* what, const void* desc, std::size_t bytes)
 HRESULT __stdcall placeholder_ok(Wrapper*, u64, u64, u64) { return S_OK; }
 
 // Device slot 62 (Xbox order): (D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, ppv); first seen from
-// XboxBvhBuilder.dll, followed by SetName on the result. With render mode a validated module published
-// under the container's hash in the shader cache is loaded, so the result is a real desktop pipeline;
-// without one it stays a placeholder PipelineState. Logs the root signature, bytecode address, length
-// and first 32 bytes.
+// XboxBvhBuilder.dll, followed by SetName on the result. With X2W_COMPUTE_DISPATCH=1 and render mode a
+// validated module published under the container's hash in the shader cache is loaded, so the result is a
+// real desktop pipeline; without one it stays a placeholder PipelineState. Logs the root signature,
+// bytecode address, length and first 32 bytes.
 HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u64 extra0,
                                                    u64 extra1, const GUID* iid, void** out)
 {
@@ -6027,12 +6038,16 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_CO
     dump_containers("compute", desc, sizeof(*desc));
     char bytes[3 * 32 + 1];
     hex_text(desc->CS.pShaderBytecode, desc->CS.BytecodeLength < 32 ? desc->CS.BytecodeLength : 32, bytes, sizeof(bytes));
-    // A validated compute module is loaded by key from the shader cache, exactly as graphics
-    // translations are: the offline retarget/sign/gate step decides usability, so there is no
-    // runtime byte inspection here, and the placeholder is kept when no validated module exists.
+    // With X2W_COMPUTE_DISPATCH=1 a validated compute module is loaded by key from the shader cache,
+    // exactly as graphics translations are: the offline retarget/sign/gate step decides usability, so
+    // there is no runtime byte inspection here, and the placeholder is kept when no validated module
+    // exists.
     ID3D12PipelineState* real_pipeline = nullptr;
+    ID3D12RootSignature* pipeline_root = nullptr;  // the root the desktop module was built against
     char why[128] = "";
-    if (render_mode()) {
+    if (!compute_dispatch_enabled()) {
+        std::snprintf(why, sizeof(why), "compute dispatch is off");
+    } else if (render_mode()) {
         wchar_t path[MAX_PATH];
         const u64 compute_key = desc->CS.pShaderBytecode && desc->CS.BytecodeLength
             ? fnv_bytes(desc->CS.pShaderBytecode, desc->CS.BytecodeLength) : 0;
@@ -6044,6 +6059,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_CO
             D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
             compute.pRootSignature =
                 reinterpret_cast<ID3D12RootSignature*>(unwrap(reinterpret_cast<u64>(desc->pRootSignature)));
+            pipeline_root = compute.pRootSignature;
             compute.CS.pShaderBytecode = blob->GetBufferPointer();
             compute.CS.BytecodeLength = blob->GetBufferSize();
             compute.NodeMask = desc->NodeMask;
@@ -6071,6 +6087,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_CO
     }
     auto* pipeline = static_cast<Wrapper*>(*out);
     pipeline->own().compute_pipeline = real_pipeline != nullptr;
+    pipeline->own().pipeline_root = real_pipeline ? pipeline_root : nullptr;
     note_pipeline(pipeline, 62, nullptr, desc, sizeof(*desc));
     note_compute_binding_pipeline(pipeline, *desc);
     return S_OK;
