@@ -1715,7 +1715,8 @@ class Stage:
         if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
             raise Unsupported('unverified 1D image sample address or modifiers')
         lod = None
-        if how == 'l':
+        if how in ('l', 'b'):
+            op_name = 'image_sample_' + how
             # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
             # would add dwords or modifiers this lowering does not read, so they are refused. Only the cache-policy
             # bits (glc, slc, dlc), which never change the sampled value, are accepted next to dim and dmask;
@@ -1723,11 +1724,12 @@ class Stage:
             # layout and are refused by name.
             for m in mods:
                 if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
-                    raise Unsupported('image_sample_l modifier %s' % m)
+                    raise Unsupported('%s modifier %s' % (op_name, m))
             if dmask == 0:
-                raise Unsupported('image_sample_l with an empty dmask')
+                raise Unsupported('%s with an empty dmask' % op_name)
             if len(cs) != (4 if three else 3):
-                raise Unsupported('image_sample_l with %d address registers' % len(cs))
+                raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
+            # image_sample_b carries the bias where image_sample_l carries the level: the last address register.
             lod, cs = cs[-1], cs[:-1]
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
@@ -1791,6 +1793,12 @@ class Stage:
                 uv = 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1]))
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
+            elif how == 'b':
+                # The bias is added to the implicit level, which needs derivatives: only a pixel stage whose
+                # lane is known active can ask for them. A level-zero fallback would drop the bias silently.
+                if not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+                    raise Unsupported('image_sample_b outside straight-line pixel code: the implicit level is not defined')
+                call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
@@ -1892,6 +1900,9 @@ class Stage:
 
     def op_image_sample_l(self, ops, mods):
         self.image(ops, mods, 'l')
+
+    def op_image_sample_b(self, ops, mods):
+        self.image(ops, mods, 'b')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
