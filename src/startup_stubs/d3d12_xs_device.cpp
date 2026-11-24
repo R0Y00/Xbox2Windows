@@ -6047,7 +6047,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_CO
             compute.CS.pShaderBytecode = blob->GetBufferPointer();
             compute.CS.BytecodeLength = blob->GetBufferSize();
             compute.NodeMask = desc->NodeMask;
-            compute.CachedPSO = desc->CachedPSO;
+            compute.CachedPSO = {};  // A console cached-PSO blob must not reach the desktop runtime.
             compute.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
             const HRESULT built = device_of(self)->CreateComputePipelineState(&compute, IID_PPV_ARGS(&real_pipeline));
             blob->Release();
