@@ -134,7 +134,7 @@ check("a callback that returns nothing", m.decode_throw(CODE, params, lambda a, 
 check("a callback that returns too few bytes", m.decode_throw(CODE, params, lambda a, n: b"\0" * (n - 1))["status"] == "unreadable")
 
 
-def raising(address, size):
+def raising(_address, _size):
     raise OSError("read failed")
 
 
