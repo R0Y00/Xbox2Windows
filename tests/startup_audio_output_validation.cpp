@@ -20,6 +20,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <audioclient.h>
+#include <audioclientactivationparams.h>
 #include <mmdeviceapi.h>
 #include <xaudio2.h>
 
@@ -61,12 +62,215 @@ double frames_to_ms(uint64_t frames, uint32_t rate)
 // Level of a window: RMS, which separates a submitted tone from the endpoint's numeric silence without
 // depending on where the window falls against the tone's phase. A frequency-share metric was tried first
 // and made a steady tone read anywhere between 0.06 and 0.32, so it crossed the threshold at random.
+// Share of a window's energy at one frequency, used only by the isolation control: our own signal is
+
+// 440 Hz and the interfering process plays 880 Hz, so the captured tone can be attributed.
+
+double frequency_share(const std::vector<float>& mono, uint32_t rate, double hz)
+
+{
+
+    if (mono.empty() || rate == 0) return 0.0;
+
+    const double omega = 2.0 * 3.14159265358979323846 * hz / rate;
+
+    const double coeff = 2.0 * std::cos(omega);
+
+    double s1 = 0, s2 = 0, energy = 0;
+
+    for (double sample : mono) {
+
+        const double s0 = sample + coeff * s1 - s2;
+
+        s2 = s1;
+
+        s1 = s0;
+
+        energy += sample * sample;
+
+    }
+
+    const double n = static_cast<double>(mono.size());
+
+    if (energy <= 1e-12) return 0.0;
+
+    const double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+
+    return (power / (n * n)) / (energy / n);
+
+}
+
 double window_level(const std::vector<float>& mono)
 {
     if (mono.empty()) return 0.0;
     double energy = 0;
     for (double sample : mono) energy += sample * sample;
     return std::sqrt(energy / static_cast<double>(mono.size()));
+}
+
+// Process-scoped capture: the loopback client is activated for this process tree, so other clients on
+
+// the endpoint cannot supply the tone or turn a silence window into a failure. Unavailable activation is
+
+// a capability skip with a named reason, never an assertion failure.
+
+class ActivationHandler : public IActivateAudioInterfaceCompletionHandler
+
+{
+
+public:
+
+    ActivationHandler() : done_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+
+    ~ActivationHandler() { if (done_) CloseHandle(done_); }
+
+    HANDLE done() const { return done_; }
+    HANDLE& done_handle() { return done_; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
+
+    {
+
+        if (!object) return E_POINTER;
+
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+
+            *object = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+
+            AddRef();
+
+            return S_OK;
+
+        }
+
+        *object = nullptr;
+
+        return E_NOINTERFACE;
+
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+
+    ULONG STDMETHODCALLTYPE Release() override
+
+    {
+
+        const LONG left = InterlockedDecrement(&refs_);
+
+        if (!left) delete this;
+
+        return static_cast<ULONG>(left);
+
+    }
+
+    HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation*) override
+
+    {
+
+        SetEvent(done_);
+
+        return S_OK;
+
+    }
+
+private:
+
+    LONG refs_ = 1;
+
+    HANDLE done_ = nullptr;
+
+};
+
+
+
+// Activates the process-loopback client for this process tree and returns a named reason on failure.
+
+HRESULT process_loopback_client(IAudioClient** client, std::string& reason)
+
+{
+
+    AUDIOCLIENT_ACTIVATION_PARAMS params{};
+
+    params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+
+    params.ProcessLoopbackParams.TargetProcessId = GetCurrentProcessId();
+
+    params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+
+    PROPVARIANT property{};
+
+    property.vt = VT_BLOB;
+
+    property.blob.cbSize = sizeof(params);
+
+    property.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
+
+    auto* handler = new ActivationHandler();
+
+    IActivateAudioInterfaceAsyncOperation* operation = nullptr;
+
+    HRESULT hr = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient),
+
+                                             &property, handler, &operation);
+
+    if (FAILED(hr) || !operation) {
+
+        handler->Release();
+
+        { static char why[96]; std::snprintf(why, sizeof(why), "process loopback activation unavailable (0x%08lx)", static_cast<unsigned long>(hr)); reason = why; }
+
+        return FAILED(hr) ? hr : E_FAIL;
+
+    }
+
+    // Pump messages while waiting: the completion callback is dispatched on this apartment.
+    DWORD waited = WAIT_TIMEOUT;
+    for (const ULONGLONG deadline = GetTickCount64() + 5000; GetTickCount64() < deadline;) {
+        waited = MsgWaitForMultipleObjects(1, &handler->done_handle(), FALSE, 50, QS_ALLINPUT);
+        if (waited == WAIT_OBJECT_0) break;
+        MSG message;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    HRESULT status = E_FAIL;
+
+    IUnknown* iface = nullptr;
+
+    if (waited != WAIT_OBJECT_0 || FAILED(operation->GetActivateResult(&status, &iface)) || FAILED(status) || !iface) {
+
+        if (iface) iface->Release();
+
+        operation->Release();
+
+        handler->Release();
+
+        { static char why[96]; std::snprintf(why, sizeof(why), "process loopback activation did not complete (0x%08lx)", static_cast<unsigned long>(status)); reason = why; }
+
+        return FAILED(status) ? status : E_FAIL;
+
+    }
+
+    hr = iface->QueryInterface(IID_PPV_ARGS(client));
+
+    iface->Release();
+
+    operation->Release();
+
+    handler->Release();
+
+    if (FAILED(hr) || !*client) {
+
+        reason = "process loopback client unavailable";
+
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+
+    }
+
+    return S_OK;
+
 }
 
 struct Plan {
@@ -87,6 +291,8 @@ struct Capture {
     bool float32_samples = false;  // validated in open(): float32, otherwise PCM16
     std::vector<double> window_ms_at;  // arrival time of each classified window, relative to playback start
     std::vector<double> window_share;
+    std::vector<double> window_440;   // own signal (isolation control)
+    std::vector<double> window_880;   // interfering process's signal (isolation control)
     std::string isolation = "shared";
     uint32_t buffer_frames = 0;  // shared-mode endpoint buffer: the latency floor
     uint64_t frames = 0;
@@ -104,15 +310,14 @@ struct Capture {
         hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
         enumerator->Release();
         if (FAILED(hr) || !device) return "no default render endpoint";
+        // The endpoint client is used only to learn the mix format; the capture stream itself is activated
+        // for this process tree below.
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
         if (FAILED(hr) || !client) return "endpoint refuses IAudioClient";
         hr = client->GetMixFormat(&format);
         if (FAILED(hr) || !format) return "endpoint has no mix format";
-        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10000000, 0, format, nullptr);
-        // Validate the sample representation before decoding. A 32-bit mix format is not necessarily
-        // IEEE float, WAVE_FORMAT_EXTENSIBLE carries the real subformat in a GUID, and 8/24-bit PCM would
-        // be misread here. Anything not float32 or PCM16 skips with a reason instead of being decoded
-        // as if it were.
+        // Validate the sample representation before decoding: a 32-bit mix format is not necessarily IEEE
+        // float, WAVE_FORMAT_EXTENSIBLE carries the subformat in a GUID, and 8/24-bit PCM would be misread.
         const bool extensible = format->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
                                 format->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
         static const GUID float_subformat = {0x00000003, 0x0000, 0x0010,
@@ -134,7 +339,21 @@ struct Capture {
             return why;
         }
         float32_samples = float32;
-        if (FAILED(hr)) { static char why[64]; std::snprintf(why, sizeof(why), "loopback capture refused (0x%08lx)", static_cast<unsigned long>(hr)); return why; }
+        // Release the endpoint client and activate the capture stream for this process tree: another client
+        // on the endpoint can then neither supply the apparent tone nor break a silence window.
+        client->Release();
+        client = nullptr;
+        std::string reason;
+        hr = process_loopback_client(&client, reason);
+        if (FAILED(hr) || !client) return reason;
+        isolation = "process";
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10000000, 0, format, nullptr);
+        if (FAILED(hr)) {
+            static char why[96];
+            std::snprintf(why, sizeof(why), "process loopback capture refused (0x%08lx)",
+                          static_cast<unsigned long>(hr));
+            return why;
+        }
         hr = client->GetService(IID_PPV_ARGS(&capture));
         if (FAILED(hr) || !capture) return "no capture client";
         UINT32 buffer = 0;
@@ -163,6 +382,8 @@ struct Capture {
                 window_ms_at.push_back(
                     frames_to_ms(window_start >= begin_frames ? window_start - begin_frames : 0, format->nSamplesPerSec));
                 window_share.push_back(window_level(pending));
+                window_440.push_back(frequency_share(pending, format->nSamplesPerSec, 440.0));
+                window_880.push_back(frequency_share(pending, format->nSamplesPerSec, 880.0));
                 pending.clear();
             }
         };
@@ -256,6 +477,22 @@ int run()
         std::printf("skip: %s\n", capture_error.c_str());
         return skip_no_endpoint;
     }
+    // Isolation control: a second process on the endpoint plays 880 Hz for the whole run. A capture scoped
+    // to this process must not see it; a shared capture would show it during our silence.
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION interference{};
+    wchar_t self[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) {
+        std::printf("skip: own path unavailable for the isolation control\n");
+        return skip_no_endpoint;
+    }
+    std::wstring command = std::wstring(L"\"") + self + L"\" noise";
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup,
+                        &interference)) {
+        std::printf("skip: interference process unavailable for the isolation control\n");
+        return skip_no_endpoint;
+    }
     Caller caller;
     const std::string caller_error = caller.open();
     if (!caller_error.empty()) {
@@ -344,6 +581,8 @@ int run()
         serve(now_ms() + 3 * block_ms);
         capture.window_ms_at.clear();
         capture.window_share.clear();
+        capture.window_440.clear();
+        capture.window_880.clear();
         capture.begin_frames = capture.appended;
         begin = now_ms();  // the capture windows were rebased above, so the plan must be scheduled
                             // from the same instant or a slow endpoint starts the plan with expired
@@ -464,6 +703,31 @@ int run()
     }
     // Same for the resumption delay: reported above, not asserted, for the same reason.
     (void)resume_delay_ms;
+    // Isolation: while our own process withheld audio, the only sound on the endpoint was the
+    // interference process at 880 Hz. A process-scoped capture must show silence there, and the captured
+    // tone must be our own signal rather than the interferer's.
+    double gap_level = 0, tone_440 = 0, tone_880 = 0;
+    for (size_t i = silence_at; i < resume_index && i < shares.size(); ++i)
+        gap_level = (std::max)(gap_level, shares[i]);
+    for (size_t i = first_tone; i < silence_at && i < shares.size(); ++i) {
+        tone_440 = (std::max)(tone_440, capture.window_440[i]);
+        tone_880 = (std::max)(tone_880, capture.window_880[i]);
+    }
+    std::printf("isolation(%s): gap_level=%.4f tone_440=%.4f tone_880=%.4f\n", capture.isolation.c_str(), gap_level,
+                tone_440, tone_880);
+    if (gap_level > 0.01) {
+        std::printf("FAIL: the interfering process reached the capture (gap level %.4f); the capture is not "
+                    "scoped to this process\n", gap_level);
+        return 1;
+    }
+    if (tone_440 < 0.05 || tone_440 <= tone_880) {
+        std::printf("FAIL: the captured tone is not the fixture's own signal (440 share %.4f, 880 share %.4f)\n",
+                    tone_440, tone_880);
+        return 1;
+    }
+    TerminateProcess(interference.hProcess, 0);
+    CloseHandle(interference.hProcess);
+    CloseHandle(interference.hThread);
     std::printf("PASS: tone, intentional silence and resumption all observed at the endpoint (isolation=%s)\n",
                 capture.isolation.c_str());
     return 0;
@@ -471,11 +735,30 @@ int run()
 
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         std::printf("skip: COM initialisation failed\n");
         return skip_no_endpoint;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "noise") == 0) {
+        // Interference process for the isolation control: a second process on the endpoint playing a
+        // distinguishable tone. A capture scoped to the fixture's process tree must not see it.
+        Caller noise;
+        if (!noise.open().empty()) {
+            CoUninitialize();
+            return 3;
+        }
+        std::vector<int16_t> pcm(480);
+        for (int i = 0; i < 480; ++i)
+            pcm[i] = static_cast<int16_t>(3200.0 * std::sin(2.0 * 3.14159265358979323846 * 880.0 * i / 48000.0));
+        noise.voice->Start(0);
+        for (int block = 0; block < 2500; ++block) {  // ~25 s, longer than the fixture run
+            if (!noise.submit(pcm)) break;
+            Sleep(10);
+        }
+        CoUninitialize();
+        return 0;
     }
     const int result = run();
     CoUninitialize();
