@@ -84,6 +84,7 @@ struct Capture {
     IAudioCaptureClient* capture = nullptr;
     WAVEFORMATEX* format = nullptr;
     bool started = false;
+    bool float32_samples = false;  // validated in open(): float32, otherwise PCM16
     std::vector<double> window_ms_at;  // arrival time of each classified window, relative to playback start
     std::vector<double> window_share;
     std::string isolation = "shared";
@@ -108,6 +109,31 @@ struct Capture {
         hr = client->GetMixFormat(&format);
         if (FAILED(hr) || !format) return "endpoint has no mix format";
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10000000, 0, format, nullptr);
+        // Validate the sample representation before decoding. A 32-bit mix format is not necessarily
+        // IEEE float, WAVE_FORMAT_EXTENSIBLE carries the real subformat in a GUID, and 8/24-bit PCM would
+        // be misread here. Anything not float32 or PCM16 skips with a reason instead of being decoded
+        // as if it were.
+        const bool extensible = format->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                                format->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+        static const GUID float_subformat = {0x00000003, 0x0000, 0x0010,
+                                             {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+        static const GUID pcm_subformat = {0x00000001, 0x0000, 0x0010,
+                                           {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+        const GUID subformat = extensible
+            ? reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format)->SubFormat : GUID{};
+        const bool float32 = (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT && format->wBitsPerSample == 32) ||
+                             (extensible && std::memcmp(&subformat, &float_subformat, sizeof(GUID)) == 0 &&
+                              format->wBitsPerSample == 32);
+        const bool pcm16 = (format->wFormatTag == WAVE_FORMAT_PCM && format->wBitsPerSample == 16) ||
+                           (extensible && std::memcmp(&subformat, &pcm_subformat, sizeof(GUID)) == 0 &&
+                            format->wBitsPerSample == 16);
+        if (!float32 && !pcm16) {
+            static char why[96];
+            std::snprintf(why, sizeof(why), "unsupported mix format tag=%u bits=%u", format->wFormatTag,
+                          format->wBitsPerSample);
+            return why;
+        }
+        float32_samples = float32;
         if (FAILED(hr)) { static char why[64]; std::snprintf(why, sizeof(why), "loopback capture refused (0x%08lx)", static_cast<unsigned long>(hr)); return why; }
         hr = client->GetService(IID_PPV_ARGS(&capture));
         if (FAILED(hr) || !capture) return "no capture client";
@@ -126,7 +152,7 @@ struct Capture {
         if (!capture || !format) return;
         const auto per_window = static_cast<uint32_t>(format->nSamplesPerSec * window_ms / 1000.0);
         const UINT32 channels = format->nChannels ? format->nChannels : 1;
-        const bool is_float = format->wBitsPerSample == 32;
+        const bool is_float = float32_samples;
         auto append = [&](float sample) {
             if (pending.empty()) window_start = appended;
             pending.push_back(sample);
@@ -319,6 +345,9 @@ int run()
         capture.window_ms_at.clear();
         capture.window_share.clear();
         capture.begin_frames = capture.appended;
+        begin = now_ms();  // the capture windows were rebased above, so the plan must be scheduled
+                            // from the same instant or a slow endpoint starts the plan with expired
+                            // deadlines and the resumption is queued early.
         capture.pending.clear();
     }
     for (int i = 0; i < plan.tone_blocks; ++i) {
