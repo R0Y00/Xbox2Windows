@@ -181,6 +181,9 @@ Then:
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
+`-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
+`PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:
 
