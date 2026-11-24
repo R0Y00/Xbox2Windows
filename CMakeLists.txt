@@ -936,6 +936,11 @@ endforeach()
 # The same header without a GPU (src/startup_stubs/slice_footprints.h): accepted NV12 descriptions,
 # re-read intervals and size cap, the footprint request and the bytes up to the end of the last row.
 # The mutated run is the negative control.
+add_executable(startup_stream_output_targets_check tests/startup_stream_output_targets_check.cpp)
+target_include_directories(startup_stream_output_targets_check PRIVATE src)
+target_compile_features(startup_stream_output_targets_check PRIVATE cxx_std_17)
+add_test(NAME startup_stream_output_targets COMMAND startup_stream_output_targets_check)
+
 add_executable(startup_slice_footprints_check tests/startup_slice_footprints_check.cpp)
 target_include_directories(startup_slice_footprints_check PRIVATE src)
 target_compile_features(startup_slice_footprints_check PRIVATE cxx_std_17)

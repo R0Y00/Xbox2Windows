@@ -30,6 +30,7 @@
 #include "startup_stubs/memory_srv_buffer.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/stream_output_targets.h"
 #include "startup_stubs/present_signature_sampler.h"
 
 #include <d3d12.h>
@@ -1856,6 +1857,7 @@ struct Pass {
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
+    x2w_startup::StreamOutputTargets stream_output;  // set by slot 49; recorded, not yet written by draws
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     UINT target_count = 0;
@@ -3772,6 +3774,7 @@ void build_tables()
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        list_typed[49] = reinterpret_cast<ListTyped>(&list_stream_output_targets);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
