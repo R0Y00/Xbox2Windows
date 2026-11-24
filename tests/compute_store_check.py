@@ -2551,17 +2551,19 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
-def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix, group=32):
+def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix, group=32, *, cpu="gfx1030",
+                   features=DS_FEATURES):
     dims = aot.checked_group(group)
+    attributes = [f"-mattr={features}"] if features else []
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
-        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", f"-mcpu={cpu}", *attributes,
                         "-filetype=obj", src, "-o", obj], check=True)
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
         code = raw.read_bytes()
-        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
-                                          features=DS_FEATURES.encode()))
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=cpu.encode(),
+                                          features=(features or "").encode()))
         assert [line for line in decoded if line.startswith(prefix)] == [
             line for line in lines if line.startswith(prefix)]
         expected = aot.lower(lines, dims, **binding)
@@ -2852,6 +2854,214 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
             bad = subprocess.run(run, capture_output=True, text=True)
             if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
                 raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
+        accepted.update(line.split()[0] for line in lines)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
+    return 0
+
+
+# Group-shared LDS on gfx1013 (issue #1541): one 64-thread group per program, LDS words written by one lane and
+# read by another. Lane l of group g has tid = 64 * g + l; v5 = l * 4 is its word address, v8 its index.
+SHARED_PREFIX = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0", "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+                 "v_lshl_add_u32 v8, s11, 6, v0", "s_waitcnt lgkmcnt(0)", "v_lshlrev_b32_e32 v5, 2, v0"]
+SHARED_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=8, cpu="gfx1013", lds_bytes=1024)
+SHARED_WIDE_BINDING = SHARED_BINDING | {"stride": 16}
+SHARED_MIRROR = "v_sub_nc_u32_e32 v9, 0xfc, v5"  # (63 - l) * 4
+SHARED_DATA = ["v_add_nc_u32_e32 v6, 0x10000000, v8", "v_add_nc_u32_e32 v7, 0x20000000, v8"]
+# The atomic operand: an odd multiplier spreads the lanes' bits over the word.
+SHARED_MIX = 0x9e3779b1
+SHARED_PROGRAMS = {
+    # Own word, then the next lane's word and the mirrored lane's word.
+    "shared_exchange": (SHARED_BINDING, [
+        "v_add_nc_u32_e32 v6, 0x12340000, v8", "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        "v_add_nc_u32_e32 v7, 4, v5", "v_and_b32_e32 v7, 0xfc, v7", "ds_read_b32 v10, v7", "s_waitcnt lgkmcnt(0)",
+        SHARED_MIRROR, "ds_read_b32 v11, v9", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # Two words per lane, 64 words apart, written and read as pairs of the mirrored lane.
+    "shared_pair_b32": (SHARED_BINDING, [
+        *SHARED_DATA, "ds_write2_b32 v5, v6, v7 offset1:64", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        SHARED_MIRROR, "ds_read2_b32 v[10:11], v9 offset1:64", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # The same layout through st64: offset 1 is 64 elements.
+    "shared_pair_st64_b32": (SHARED_BINDING, [
+        *SHARED_DATA, "ds_write2st64_b32 v5, v6, v7 offset1:1", "s_waitcnt lgkmcnt(0)",
+        SHARED_MIRROR, "ds_read2st64_b32 v[10:11], v9 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # A qword per lane at l * 8, read back from the mirrored lane.
+    "shared_b64": (SHARED_BINDING, [
+        *SHARED_DATA, "v_lshlrev_b32_e32 v4, 3, v0", "ds_write_b64 v4, v[6:7]", "s_waitcnt lgkmcnt(0)",
+        "v_sub_nc_u32_e32 v9, 0x1f8, v4", "ds_read_b64 v[10:11], v9", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # Two qwords per lane 64 qwords apart, written with write2 and read with read2st64, and the other way round.
+    "shared_pair_b64": (SHARED_WIDE_BINDING, [
+        *SHARED_DATA, "v_add_nc_u32_e32 v12, 0x30000000, v8", "v_add_nc_u32_e32 v13, 0x50000000, v8",
+        "v_lshlrev_b32_e32 v4, 3, v0", "ds_write2_b64 v4, v[6:7], v[12:13] offset1:64", "s_waitcnt lgkmcnt(0)",
+        "v_sub_nc_u32_e32 v9, 0x1f8, v4", "ds_read2st64_b64 v[14:17], v9 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[14:17], v8, s[20:23], 0 idxen"]),
+    "shared_pair_st64_b64": (SHARED_WIDE_BINDING, [
+        *SHARED_DATA, "v_add_nc_u32_e32 v12, 0x30000000, v8", "v_add_nc_u32_e32 v13, 0x50000000, v8",
+        "v_lshlrev_b32_e32 v4, 3, v0", "ds_write2st64_b64 v4, v[6:7], v[12:13] offset1:1", "s_waitcnt lgkmcnt(0)",
+        "v_sub_nc_u32_e32 v9, 0x1f8, v4", "ds_read2_b64 v[14:17], v9 offset1:64", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[14:17], v8, s[20:23], 0 idxen"]),
+    # Four words per lane at l * 16, read back from the next lane.
+    "shared_b128": (SHARED_WIDE_BINDING, [
+        "v_add_nc_u32_e32 v10, 0x10000000, v8", "v_add_nc_u32_e32 v11, 0x20000000, v8",
+        "v_add_nc_u32_e32 v12, 0x30000000, v8", "v_add_nc_u32_e32 v13, 0x50000000, v8",
+        "v_lshlrev_b32_e32 v4, 4, v0", "ds_write_b128 v4, v[10:13]",
+        "s_waitcnt lgkmcnt(0)", "v_add_nc_u32_e32 v9, 16, v4", "v_and_b32_e32 v9, 0x3f0, v9",
+        "ds_read_b128 v[14:17], v9", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[14:17], v8, s[20:23], 0 idxen"]),
+    # Every lane sets the seven counters (same values, so the overlapping writes agree), then updates them; lane l
+    # reports counters l & 7 and (l + 1) & 7, where counter 7 holds a constant.
+    "shared_atomics": (SHARED_BINDING, [
+        "v_mov_b32_e32 v4, 0", "v_mov_b32_e32 v20, 0", "v_mov_b32_e32 v21, -1", "v_mov_b32_e32 v23, 0x5a5a5a5a",
+        "ds_write2_b32 v4, v20, v20 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "ds_write2_b32 v4, v21, v20 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "ds_write2_b32 v4, v20, v21 offset0:4 offset1:5", "s_waitcnt lgkmcnt(0)",
+        "ds_write2_b32 v4, v20, v23 offset0:6 offset1:7", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        f"v_mul_lo_u32 v22, 0x{SHARED_MIX:08x}, v8",
+        "ds_add_u32 v4, v8", "s_waitcnt lgkmcnt(0)", "ds_sub_u32 v4, v8 offset:4", "s_waitcnt lgkmcnt(0)",
+        "ds_and_b32 v4, v22 offset:8", "s_waitcnt lgkmcnt(0)", "ds_or_b32 v4, v22 offset:12", "s_waitcnt lgkmcnt(0)",
+        "ds_xor_b32 v4, v22 offset:16", "s_waitcnt lgkmcnt(0)", "ds_min_u32 v4, v22 offset:20", "s_waitcnt lgkmcnt(0)",
+        "ds_max_u32 v4, v22 offset:24", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        "v_and_b32_e32 v24, 28, v5", "ds_read_b32 v10, v24", "s_waitcnt lgkmcnt(0)",
+        "v_add_nc_u32_e32 v25, 4, v5", "v_and_b32_e32 v25, 28, v25", "ds_read_b32 v11, v25", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+}
+SHARED_CASES = [(name, SHARED_PREFIX + lines + ["s_endpgm"], binding)
+                for name, (binding, lines) in SHARED_PROGRAMS.items()]
+SHARED_FORMS = {"ds_write_b32", "ds_read_b32", "ds_write_b64", "ds_read_b64", "ds_write_b128", "ds_read_b128",
+                "ds_write2_b32", "ds_read2_b32", "ds_write2st64_b32", "ds_read2st64_b32", "ds_write2_b64",
+                "ds_read2_b64", "ds_write2st64_b64", "ds_read2st64_b64", "ds_add_u32", "ds_sub_u32", "ds_and_b32",
+                "ds_or_b32", "ds_xor_b32", "ds_min_u32", "ds_max_u32", "s_barrier"}
+
+
+def shared_counters(group):
+    tids = [64 * group + lane for lane in range(64)]
+    mixed = [tid * SHARED_MIX & 0xffffffff for tid in tids]
+    total = sum(tids) & 0xffffffff
+    a = mixed[0]
+    for value in mixed[1:]:
+        a &= value
+    o = x = 0
+    for value in mixed:
+        o |= value
+        x ^= value
+    return [total, -total & 0xffffffff, a, o, x, min(mixed), max(mixed), 0x5a5a5a5a]
+
+
+def shared_reference(name, groups):
+    words = []
+    for group in range(groups):
+        def tid(lane):
+            return 64 * group + lane
+        counters = shared_counters(group)
+        for lane in range(64):
+            mirror = 63 - lane
+            if name == "shared_exchange":
+                words += [0x12340000 + tid((lane + 1) % 64), 0x12340000 + tid(mirror)]
+            elif name in ("shared_pair_b32", "shared_pair_st64_b32", "shared_b64"):
+                words += [0x10000000 + tid(mirror), 0x20000000 + tid(mirror)]
+            elif name in ("shared_pair_b64", "shared_pair_st64_b64"):
+                words += [base + tid(mirror) for base in (0x10000000, 0x20000000, 0x30000000, 0x50000000)]
+            elif name == "shared_b128":
+                words += [base + tid((lane + 1) % 64) for base in (0x10000000, 0x20000000, 0x30000000, 0x50000000)]
+            else:
+                words += [counters[lane & 7], counters[(lane + 1) & 7]]
+    return words
+
+
+def shared_mutants(name, lines, binding):
+    """Assembly changes the reference must catch, with the first word they change."""
+    if name == "shared_exchange":
+        # The next-but-one lane instead of the next one.
+        yield variant(lines, ("v_add_nc_u32_e32 v7, 4, v5", "v_add_nc_u32_e32 v7, 8, v5")), 0
+    elif name == "shared_pair_st64_b32":
+        # offset1:1 as 4 bytes instead of 64 elements reads the next word, the mirrored lane's neighbour.
+        yield variant(lines, ("ds_read2st64_b32 v[10:11], v9 offset1:1", "ds_read2_b32 v[10:11], v9 offset1:1")), 1
+    elif name == "shared_atomics":
+        # min in place of max: lane 5 reports counter 6 as its second word.
+        yield variant(lines, ("ds_max_u32 v4, v22 offset:24", "ds_min_u32 v4, v22 offset:24")), 11
+
+
+def shared_controls():
+    for name, lines, binding in SHARED_CASES:
+        source = aot.lower(lines, 64, **binding)
+        assert f"groupshared uint lds[{binding['lds_bytes'] // 4}];" in source, name
+        # Every DS instruction is followed by one group barrier; s_barrier adds none after it.
+        steps = sum(line.startswith("ds_") for line in lines)
+        assert source.count("GroupMemoryBarrierWithGroupSync();") == steps, name
+        assert "uint3 local : SV_GroupThreadID" in source, name
+    programs = {name: lines for name, lines, _ in SHARED_CASES}
+    atomics = aot.lower(programs["shared_atomics"], 64, **SHARED_BINDING)
+    for method in ("Add", "And", "Or", "Xor", "Min", "Max"):
+        assert f"Interlocked{method}(lds[" in atomics, method
+    assert "(0u - tid.x)" in atomics
+    lines = programs["shared_exchange"]
+    # A barrier with no DS instruction before it is kept.
+    assert aot.lower(SHARED_PREFIX + ["s_barrier"] + lines[len(SHARED_PREFIX):], 64,
+                     **SHARED_BINDING).count("GroupMemoryBarrierWithGroupSync();") == 4
+    write = "ds_write_b32 v5, v6"
+    for wrong, message in (
+            ("ds_add_rtn_u32 v10, v5, v6", "Unsupported shared LDS instruction"),
+            ("ds_write_b96 v5, v[6:8]", "Unsupported shared LDS instruction"),
+            ("ds_write_b8 v5, v6", "Unsupported shared LDS instruction"),
+            ("ds_min_i32 v5, v6", "Unsupported shared LDS instruction"),
+            ("ds_write_b32 v5, v6 offset:65536", "Unverified shared LDS offset"),
+            ("ds_write_b32 v0, v6", "Unverified shared LDS address"),
+            ("ds_write_b32 v5, v0", "Shared LDS data is not a known word"),
+            ("ds_write_b64 v5, v[6:8]", "Unverified shared LDS register range"),
+            ("ds_write2_b32 v5, v6, v6 offset0:3 offset1:3", "Unverified shared LDS pair offsets"),
+            ("ds_write2_b32 v5, v6, v6 offset1:256", "Unverified shared LDS pair offsets")):
+        rejects(message, aot.lower, variant(lines, (write, wrong)), 64, **SHARED_BINDING)
+    # Barriers need uniform control flow: no DS instruction after a lane guard.
+    i = lines.index(write)
+    guarded = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Shared LDS access under a lane guard", aot.lower, guarded, 64, **SHARED_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 64, **SHARED_BINDING)
+    for size in (0x10004 // 2, 2, 6, 32772):
+        rejects("Invalid shared LDS allocation", aot.lower, lines, 64, **SHARED_BINDING | {"lds_bytes": size})
+    # Without an allocation gfx1013 keeps refusing the local-ID address, DS and s_barrier.
+    rejects("Unverified dispatch byte offset", aot.lower, lines, 64, **SHARED_BINDING | {"lds_bytes": 0})
+    rejects("Unverified private LDS write", aot.lower, SHARED_PREFIX[:5] + lines[len(SHARED_PREFIX):], 64,
+            **SHARED_BINDING | {"lds_bytes": 0})
+    rejects("Unsupported compute instruction: s_barrier", aot.lower,
+            SHARED_PREFIX[:5] + ["s_barrier", "buffer_store_dword v8, v8, s[20:23], 0 idxen", "s_endpgm"], 64,
+            **SHARED_BINDING | {"lds_bytes": 0, "stride": 4})
+    # The CPU references differ from the mutants'.
+    for name, lines, binding in SHARED_CASES:
+        for _, first in shared_mutants(name, lines, binding):
+            assert first < len(shared_reference(name, 1)), name
+    assert {line.split()[0] for _, lines, _ in SHARED_CASES for line in lines} >= SHARED_FORMS
+
+
+def shared_draw(directory, compiler, renderer, backend):
+    shared_controls()
+    accepted = set()
+    for name, lines, binding in SHARED_CASES:
+        source = aot.lower(lines, 64, **binding)
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        src.write_text(source, encoding="ascii")
+        compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile, check=True)
+        run = [renderer, backend, "--compute-store-case", cso, case]
+        # Two groups show that each group has its own LDS; four words per lane leave room for one.
+        for groups in (1,) if binding["stride"] == 16 else (1, 2):
+            words = shared_reference(name, groups)
+            case.write_bytes(struct.pack("<321I", groups, *(words + [SENTINEL] * (320 - len(words)))))
+            execution = subprocess.run(run)
+            if execution.returncode:
+                return execution.returncode
+        for mutated, mismatched_word in shared_mutants(name, lines, binding):
+            src.write_text(aot.lower(mutated, 64, **binding), encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
+                raise AssertionError(f"{name}: shared LDS mutation escaped detection\n{bad.stderr}")
             print(bad.stderr, end="")
         accepted.update(line.split()[0] for line in lines)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
@@ -3379,6 +3589,8 @@ def binary(directory, assembler, objcopy, library):
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
+    shared_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, SHARED_CASES, "ds_", 64, cpu="gfx1013", features=None)
     mtbuf_load_controls()
     mimg_load_binary(directory, assembler, objcopy, library)
     mimg_resinfo_controls()
@@ -5802,6 +6014,7 @@ if __name__ == "__main__":
                  "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),
                  "draw-lds-f32": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_FLOAT_CASES),
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
+                 "draw-lds-shared": shared_draw,
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),

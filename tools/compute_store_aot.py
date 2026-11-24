@@ -93,6 +93,107 @@ LDS_RMW = {
     "ds_max_u32": "max({0}, {1})",
 }
 
+# Group-shared LDS on gfx1013 (issue #1541): the D3D12 groupshared limit, the barrier after every DS step, and the
+# non-returning updates as HLSL Interlocked methods on `lds` (all are order-independent within an instruction).
+LDS_SHARED_LIMIT = 32768
+LDS_BARRIER = "    GroupMemoryBarrierWithGroupSync();"
+LDS_SHARED_ATOMICS = {"add_u32": "Add", "sub_u32": "Add", "and_b32": "And", "or_b32": "Or", "xor_b32": "Xor",
+                      "min_u32": "Min", "max_u32": "Max"}
+LDS_SHARED_FORMS = (
+    r"ds_(?P<op>write|read)_b(?P<bits>32|64|128) (?P<a>v\d+|v\[\d+:\d+\]), (?P<b>v\d+|v\[\d+:\d+\])"
+    r"(?: offset:(?P<offset>\d+))?",
+    r"ds_(?P<op>write2|write2st64)_b(?P<bits>32|64) (?P<a>v\d+), (?P<b>v\d+|v\[\d+:\d+\]), (?P<c>v\d+|v\[\d+:\d+\])"
+    r"(?: offset0:(?P<offset0>\d+))?(?: offset1:(?P<offset1>\d+))?",
+    r"ds_(?P<op>read2|read2st64)_b(?P<bits>32|64) (?P<b>v\[\d+:\d+\]), (?P<a>v\d+)"
+    r"(?: offset0:(?P<offset0>\d+))?(?: offset1:(?P<offset1>\d+))?",
+    rf"ds_(?P<op>{'|'.join(LDS_SHARED_ATOMICS)}) (?P<a>v\d+), (?P<b>v\d+)(?: offset:(?P<offset>\d+))?",
+)
+
+
+def vgpr_range(token, count):
+    """The VGPR numbers of `token` (vN or v[a:b]), which must name exactly `count` registers below v256."""
+    m = re.fullmatch(r"v(\d+)|v\[(\d+):(\d+)\]", token)
+    first, last = (int(m[1]), int(m[1])) if m[1] else (int(m[2]), int(m[3]))
+    if last - first + 1 != count or last > 255 or (m[1] is None and count == 1):
+        raise ValueError("Unverified shared LDS register range")
+    return list(range(first, last + 1))
+
+
+def shared_lds_step(line, step, vector, words):
+    """HLSL statements for one gfx1013 DS instruction on `groupshared uint lds[]`; updates `vector` for reads.
+
+    The byte address is the address VGPR plus the instruction offset (offset0/offset1 in elements of the access
+    size, times 64 for st64), and word i of the access is lds[(address >> 2) + i]. A word outside the allocation
+    reads as zero and is not written. The low two address bits are dropped: the caller keeps b32 accesses
+    4-byte aligned and wider ones aligned to their size, which is not checked.
+    """
+    m = next((m for form in LDS_SHARED_FORMS if (m := re.fullmatch(form, line))), None)
+    if m is None:
+        raise ValueError(f"Unsupported shared LDS instruction: {line}")
+    op = m["op"]
+    # ds_read_bNN names its destination first; every other form names the address first.
+    addr, data = (m["b"], m["a"]) if op == "read" else (m["a"], m["b"])
+    address = vector.get(int(addr[1:])) if re.fullmatch(r"v\d+", addr) else None
+    if not is_word(address) or int(addr[1:]) > 255:
+        raise ValueError("Unverified shared LDS address")
+    base = f"lds_a{step}"
+    statements = []
+
+    def place(offset):
+        statements.append(f"    uint {base} = ({hlsl_word(address)} + {offset}u) >> 2u;")
+
+    def words_of(token, count):
+        values = [vector.get(reg) for reg in vgpr_range(token, count)]
+        if not all(map(is_word, values)):
+            raise ValueError("Shared LDS data is not a known word")
+        return list(map(hlsl_word, values))
+
+    def write(index, word):
+        statements.append(f"    if ({index} < {words}u) lds[{index}] = {word};")
+
+    def read(index, reg, name):
+        statements.append(f"    uint {name} = {index} < {words}u ? lds[{index}] : 0u;")
+        vector[reg] = ("alu", name)
+
+    single = int(m["offset"] or 0) if "offset" in m.groupdict() else 0
+    if single > 65535:
+        raise ValueError("Unverified shared LDS offset")
+    if op in LDS_SHARED_ATOMICS:
+        place(single)
+        (value,) = words_of(data, 1)
+        if op == "sub_u32":
+            value = f"(0u - {value})"
+        method = LDS_SHARED_ATOMICS[op]
+        statements.append(f"    if ({base} < {words}u) Interlocked{method}(lds[{base}], {value});")
+        return "\n".join(statements)
+    count = int(m["bits"]) // 32
+    if op in ("write", "read"):
+        place(single)
+        indices = [f"{base} + {i}u" if i else base for i in range(count)]
+        if op == "write":
+            for index, word in zip(indices, words_of(data, count)):
+                write(index, word)
+        else:
+            for i, (index, reg) in enumerate(zip(indices, vgpr_range(data, count))):
+                read(index, reg, f"lds_r{step}_{i}")
+        return "\n".join(statements)
+    # Paired forms: two elements of `count` words at offset0 and offset1, in elements (64 elements for st64).
+    offsets = [int(m["offset0"] or 0), int(m["offset1"] or 0)]
+    if max(offsets) > 255 or offsets[0] == offsets[1]:
+        raise ValueError("Unverified shared LDS pair offsets")
+    scale = count * (64 if op.endswith("st64") else 1)
+    place(0)
+    indices = [f"{base} + {offset * scale + i}u" if offset * scale + i else base
+               for offset in offsets for i in range(count)]
+    if op.startswith("write"):
+        for index, word in zip(indices, words_of(m["b"], count) + words_of(m["c"], count)):
+            write(index, word)
+    else:
+        for i, (index, reg) in enumerate(zip(indices, vgpr_range(m["b"], 2 * count))):
+            read(index, reg, f"lds_r{step}_{i}")
+    return "\n".join(statements)
+
+
 MUBUF_ATOMIC_METHODS = {
     "add": "Add", "sub": "Add", "and": "And", "or": "Or", "xor": "Xor",
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
@@ -296,6 +397,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     ds_step_count = 0
     image_step_count = 0
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
+    # gfx1013 has no private LDS profile; an allocation there selects group-shared LDS.
+    shared_lds = cpu == "gfx1013" and lds_bytes != 0
+    if shared_lds and not (4 <= lds_bytes <= LDS_SHARED_LIMIT and lds_bytes % 4 == 0):
+        raise ValueError("Invalid shared LDS allocation")
     lds_word = None
     lds_strided_words = {}
     lds_strided_width = None
@@ -529,6 +634,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
               and not alu_data_word(vector.get(int(m[3])))):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
+            if shared_lds and dst <= 255 and shift <= 31 and isinstance(tag, tuple) and tag[0] == "local":
+                # A shared LDS byte address from the local ID; it is data only to the DS instructions below.
+                vector[dst] = ("alu", f"(local.{AXES[tag[1]]} << {shift}u)")
+                continue
             if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
                 vector[dst] = ("ds_address", tag[1])
                 continue
@@ -546,6 +655,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
             vector[dst] = ("thread_bytes", tag[1], shift)
+        elif shared_lds and (line == "s_barrier" or line.startswith("ds_")):
+            # Group-shared LDS (issue #1541). Each DS instruction becomes HLSL statements on `lds`, followed by a
+            # group barrier, so the group observes DS operations in program order, as one wave does; s_barrier
+            # adds nothing beyond that and becomes the same barrier. Barriers need uniform control flow, so no
+            # DS instruction may follow a lane guard.
+            if guard_span is not None or guard is not None:
+                raise ValueError("Shared LDS access under a lane guard")
+            if line == "s_barrier":
+                if not staged_steps or not staged_steps[-1][1].endswith(LDS_BARRIER):
+                    staged_steps.append((None, LDS_BARRIER))
+                continue
+            text = shared_lds_step(line, ds_step_count, vector, lds_bytes // 4)
+            ds_step_count += 1
+            staged_steps.append((None, text + "\n" + LDS_BARRIER))
+            ds_wait = True
         elif m := re.fullmatch(r"ds_(b?permute)_b32 v(\d+), v(\d+), v(\d+)", line):
             op, dst, addr, src = m[1], *map(int, m.groups()[1:])
             address = vector.get(addr)
@@ -1567,6 +1691,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot in shared)
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
+    if "local." in body:
+        local = ", uint3 local : SV_GroupThreadID"
+    if shared_lds and ds_step_count:
+        cbuffer += f"groupshared uint lds[{lds_bytes // 4}];\n"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     uav = f"RWTexture2D<{image_atomic_type or 'uint4'}>" if image_output else "RWByteAddressBuffer"
