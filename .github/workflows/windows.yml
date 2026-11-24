@@ -44,6 +44,7 @@ jobs:
           SPIRV = ["spirv-as", "spirv-val", "spirv-cross"]
           CHECKS = [
               (["tests/compute_store_check.py", *COMMON_LLVM], {}),
+              (["tests/compute_alu_negabs_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_aot_check.py", *COMMON_LLVM], {}),
               (["tests/sampled_coverage_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_gather_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
