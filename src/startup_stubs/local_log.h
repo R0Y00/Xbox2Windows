@@ -94,7 +94,8 @@ inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexc
                           protect == PAGE_EXECUTE_WRITECOPY;
     const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
     const auto end = begin + info.RegionSize;
-    if (start + bytes > end || (write && !writable)) return false;
+    // start lies inside the queried region, so end - start cannot wrap; start + bytes could.
+    if (bytes > end - start || (write && !writable)) return false;
     return true;
 }
 inline bool readable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, false); }

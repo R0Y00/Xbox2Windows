@@ -340,6 +340,8 @@ bool key_checks()
         {"key_nothing_written", terminated, size, 0, 0},
         {"key_empty", L"\0"s, 1, 1, 0},
         {"key_past_buffer", terminated + L'\0', size, size + 1, 0},
+        // A well-formed key whose reported length ends one past the buffer: only the capacity bound rejects it.
+        {"key_terminator_past_buffer", terminated, size - 1, size, 0},
         {"key_unterminated", key, size - 1, size - 1, 0},
         {"key_embedded_terminator", L"PCI\0VEN_10DE\0"s, 13, 13, 0},
     };

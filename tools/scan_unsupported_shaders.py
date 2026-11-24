@@ -118,6 +118,12 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_clause\s+(?:0x[0-3]?[0-9a-f]|[0-5]?[0-9]|6[0-3])",
     r"s_setprio\s+(?:0x[0-3]|[0-3])",
     r"s_sleep\s+(?:0x[0-7]?[0-9a-f]|[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])",
+    # Performance-level and trace hints, as in pixel_aot: a 4-bit counter, a 16-bit field, or no operand.
+    r"s_(?:inc|dec)perflevel\s+(?:0x[0-9a-f]|[0-9]|1[0-5])",
+    r"s_ttracedata_imm\s+(?:0x0*[0-9a-f]{1,4}|0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d\d|655[0-2]\d|6553[0-5])",
+    r"s_icache_inv",
+    r"s_ttracedata",
+    r"s_wakeup",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
@@ -161,8 +167,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
     r"v_cvt_f16_f32(?:_e32|_e64)?\s+v\d+,\s+[^,\s]+",
-    r"v_cvt_i32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
-    rf"v_cvt_(?:i32|u32)_f32_e64 v\d+, {CVT_F32_E64_SOURCE}",
+    r"v_cvt_(?:i32|flr_i32|rpi_i32)_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
+    rf"v_cvt_(?:i32|u32|flr_i32|rpi_i32)_f32_e64 v\d+, {CVT_F32_E64_SOURCE}",
     r"v_cvt_f32_ubyte[0-3](?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_off_f32_i4(?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_(?:u32|i32)_e32\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+)",
@@ -337,7 +343,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
     "s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32", "s_version",
     # VOP1
-    "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
+    "v_nop", "v_mov_b32", "v_swap_b32", "v_swaprel_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
     "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32", "v_ffbh_i32", "v_rcp_iflag_f32",
     "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
@@ -388,6 +394,9 @@ KNOWN_RDNA2_BASE_OPCODES |= {
     "s_decperflevel", "s_ttracedata", "s_ttracedata_imm", "s_endpgm_saved", "s_endpgm_ordered_ps_done",
     "s_wait_idle", "s_waitcnt_depctr", "s_denorm_mode", "s_call_b64",
 }
+
+# VOP1 forms the disassembler decodes that no translator lowers: recognition only.
+KNOWN_RDNA2_BASE_OPCODES |= {"v_pipeflush", "v_clrexcp", "v_frexp_exp_i32_f32"}
 
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
@@ -488,15 +497,33 @@ def classify_isa_category(opcode: str) -> str:
     return "Other / Unknown"
 
 
+_STAGE_TAGS = (
+    ("pixel", "pixel", "ps"),
+    ("compute", "compute", "cs"),
+    ("vertex", "vertex", "vs"),
+)
+_STAGE_DELIMITERS = re.compile(r"[_.\-]")
+
+
 def detect_shader_stage(name_or_path: str) -> str:
-    """Classify shader stage from path or filename."""
-    lower = name_or_path.lower().replace("\\", "/")
-    if "/pixel/" in lower or "/ps/" in lower or "ps_" in lower or lower.startswith("ps_") or "_ps" in lower:
-        return "pixel"
-    if "/compute/" in lower or "/cs/" in lower or "cs_" in lower or lower.startswith("cs_") or "_cs" in lower:
-        return "compute"
-    if "/vertex/" in lower or "/vs/" in lower or "vs_" in lower or lower.startswith("vs_") or "_vs" in lower:
-        return "vertex"
+    """Classify shader stage from path or filename.
+
+    A stage tag (`ps`, `cs`, `vs`) matches only as a whole token of a path
+    component, where tokens are delimited by `_`, `.` or `-` (`ps_draw.bin`,
+    `blur_cs.s`, `a/vs/x.s`), so a tag inside another word (`loops_cs`,
+    `bumps_vs`, `ps5`) does not match. The long names (`pixel`, `compute`,
+    `vertex`) match only as a whole directory component. Matching is case
+    insensitive. If one path carries tags of several stages, the first stage
+    in the order pixel, compute, vertex wins.
+    """
+    parts = [p for p in name_or_path.lower().replace("\\", "/").split("/") if p]
+    directories = set(parts[:-1])
+    tokens = set()
+    for part in parts:
+        tokens.update(t for t in _STAGE_DELIMITERS.split(part) if t)
+    for stage, long_name, short_name in _STAGE_TAGS:
+        if long_name in directories or short_name in tokens:
+            return stage
     return "other"
 
 

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include "startup_stubs/bc64_chain.h"
+#include "startup_stubs/tile64_plan.h"
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -221,7 +222,9 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
 
 // Slot 10: the desktop ID3D12Device::GetResourceTiling shape without the resource:
 // (tile count*, packed mip info*, tile shape*, tiling count in/out*, first subresource, tilings*).
-// Answered from a desktop reserved resource with the same description.
+// A two-dimensional texture with the 64 KiB standard layout 0x10a and a format with a known
+// tile shape is answered from tile64_plan.h. Anything else is answered from a desktop reserved
+// resource with the same description.
 void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape,
                                UINT* count, UINT first, D3D12_SUBRESOURCE_TILING* tilings)
 {
@@ -230,6 +233,34 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
     if (shape) *shape = {};
     const UINT capacity = count ? *count : 0;
     if (count) *count = 0;
+    if (x2w_startup::tile64::Plan::supports(self->desc)) {
+        // A 64 KiB standard layout: the shared tile comes first in each slice, then the mips from
+        // the smallest to the largest. Entries keep their position in the requested range; the
+        // returned count covers the standard mips only.
+        const x2w_startup::tile64::Plan plan(self->desc);
+        if (tiles) *tiles = plan.slice_tiles * plan.slices;
+        if (packed)
+            *packed = {static_cast<UINT8>(plan.standard), static_cast<UINT8>(plan.mips - plan.standard), plan.shared_tiles, 0};
+        if (shape) *shape = {plan.tile_width, plan.tile_height, 1};
+        const UINT subresources = plan.mips * plan.slices;
+        const UINT available = first < subresources ? subresources - first : 0;
+        UINT written = 0;
+        for (UINT i = 0; i < (std::min)(capacity, available); ++i) {
+            const UINT mip = (first + i) % plan.mips, slice = (first + i) / plan.mips;
+            if (mip >= plan.standard) continue;
+            if (tilings)
+                tilings[i] = {plan.wide[mip], static_cast<UINT16>(plan.high[mip]), 1, slice * plan.slice_tiles + plan.start[mip]};
+            ++written;
+        }
+        if (count) *count = written;
+        static LONG planned;
+        if (x2w_local::first_calls(planned, 6))
+            x2w_local::logf("x2w-xg TextureComputer::slot10(tiling) dim=%d %llux%ux%u mips=%u fmt=%d layout=0x%x -> 64 KiB plan: tiles=%u "
+                            "standard=%u packed=%u", self->desc.Dimension, self->desc.Width, self->desc.Height,
+                            self->desc.DepthOrArraySize, self->desc.MipLevels, self->desc.Format, static_cast<UINT>(self->desc.Layout),
+                            plan.slice_tiles * plan.slices, plan.standard, plan.mips - plan.standard);
+        return;
+    }
     ID3D12Device* device = layout_device();
     HRESULT hr = E_FAIL;
     if (device) {

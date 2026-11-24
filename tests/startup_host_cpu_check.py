@@ -53,6 +53,25 @@ ARENA = Arena()
 CALL = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
 
 
+def plan_ranges(failures):
+    """plan_replacement refuses a site whose jmp rel32 fields would not fit.
+
+    Both offsets are computed from the site, the stub address and the moved bytes; with a site
+    more than 2 GiB away from the stub either field wraps, so the plan must be refused rather
+    than encoded.
+    """
+    # clzero (3 bytes) followed by two nops, so the 5-byte jmp has instructions to move.
+    code = bytes.fromhex("0f01fc9090")
+    near = 0x1000
+    plan = host_cpu.plan_replacement(code, near, 3, b"\x90" * 8, near + 0x100)
+    if plan is None:
+        failures.append("plan_replacement refused a near site")
+    # A site more than 2 GiB from the stub cannot be encoded as a rel32 jump. The second range
+    # check (the jump back from the moved instructions) needs a stub larger than 2 GiB to reach,
+    # so it stays uncovered rather than being asserted with an input no caller produces.
+    far = 0x7FFF0000_0000
+    if host_cpu.plan_replacement(code, far, 3, b"\x90" * 8, 0x1000) is not None:
+        failures.append("plan_replacement encoded an out-of-range forward offset")
 def build(before, instruction, after, stub=None, patch=True):
     """A function `PROLOGUE before instruction after`; with patch, the instruction is replaced."""
     code = PROLOGUE + before + instruction + after
@@ -463,6 +482,10 @@ def main():
         return 77
     features = host_features()
     rewrites()
+
+    planned = []
+    plan_ranges(planned)
+    assert not planned, "; ".join(planned)
 
     assert clzero_case(), "clzero stub"
     assert clzero_moves_rip_relative(), "an instruction moved behind the clzero stub lost its rip-relative operand"

@@ -142,6 +142,11 @@ def masm_mnemonics(text):
             # the reference's int3.
             found.add("int3")
             continue
+        if words[0] == "fsetpm":
+            # ML64 has no FNSETPM spelling and assembles FSETPM as DB E4 without a WAIT (9B), the
+            # reference's fnsetpm. Its other WAIT spellings (FCLEX, FINIT, FSTSW, ...) do emit the 9B.
+            found.add("fnsetpm")
+            continue
         found.add(x64_canonical(words[0]))
     return found
 

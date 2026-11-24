@@ -181,22 +181,44 @@ extern "C" __declspec(noinline) long AcpHalAllocateShapeContexts(u64 rcx, u64 rd
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "AcpHalAllocateShapeContexts", 0, rcx, rdx, r8, r9,
                        _ReturnAddress());
     auto* block = reinterpret_cast<unsigned char*>(rcx);
-    if (!block) return static_cast<long>(0x80004003);
+    if (!block || !x2w_local::writable(block, 0x60)) return static_cast<long>(0x80004003);
     const auto* counts = reinterpret_cast<const std::uint32_t*>(block);
     auto** arrays = reinterpret_cast<unsigned char**>(block + 0x18);
     auto* apu = reinterpret_cast<std::uint32_t*>(block + 0x48);
     x2w_local::logf("x2w-audio AcpHalAllocateShapeContexts counts=%u,%u,%u,%u,%u,%u", counts[0], counts[1], counts[2],
                     counts[3], counts[4], counts[5]);
+    bool allocated[6]{};
+    auto rollback = [&]() {
+        for (int j = 0; j < 6; ++j) {
+            if (!allocated[j]) continue;
+            heap_give(arrays[j]);
+            arrays[j] = nullptr;
+            apu[j] = 0;
+            allocated[j] = false;
+        }
+    };
     for (int i = 0; i < 6; ++i) {
         if (!counts[i]) continue;
         if (i != 4) {
             x2w_local::logf("x2w-audio   context type %d requested (%u): element size unknown -> E_NOTIMPL", i, counts[i]);
+            rollback();
             return static_cast<long>(0x80004001);
         }
-        unsigned char* memory = heap_take(u64{counts[i]} * 64, 64);
-        if (!memory) return static_cast<long>(0x8007000E);
+        const u64 bytes = u64{counts[i]} * 64;
+        unsigned char* memory = heap_take(bytes, 64);
+        if (!memory) {
+            rollback();
+            return static_cast<long>(0x8007000E);
+        }
+        const u64 offset = static_cast<u64>(memory - heap_base);
+        if (offset > 0xFFFFFFFFull) {
+            heap_give(memory);
+            rollback();
+            return static_cast<long>(0x8007000E);
+        }
         arrays[i] = memory;
-        apu[i] = static_cast<std::uint32_t>(memory - heap_base);
+        apu[i] = static_cast<std::uint32_t>(offset);
+        allocated[i] = true;
         x2w_local::logf("x2w-audio   XMA contexts: %u x 64 bytes at %p (apu 0x%x)", counts[i], static_cast<void*>(memory),
                         apu[i]);
     }
@@ -216,7 +238,7 @@ extern "C" __declspec(noinline) long AcpHalCreate(u64 rcx, u64 rdx, u64 r8, u64 
         ready = true;
     }
     static void* const* const object = table.data();
-    if (!rcx) return static_cast<long>(0x80004003);
+    if (!rcx || !x2w_local::writable(reinterpret_cast<void*>(rcx), sizeof(void*))) return static_cast<long>(0x80004003);
     *reinterpret_cast<void* const* const**>(rcx) = &object;
     x2w_local::logf("x2w-audio AcpHalCreate -> stand-in object %p", static_cast<const void*>(&object));
     return 0;

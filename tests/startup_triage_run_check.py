@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -188,6 +189,31 @@ def check_review_regressions(failures: list[str]) -> None:
         failures.append(f"failed/untraced slots missing from unhandled: {dict(unhandled)}")
 
 
+def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
+    # Each reason the producer can log keeps its own row; none is folded into "other".
+    cases = [
+        ("unsupported memory SRV arguments", "null_destination"),
+        ("unsupported memory SRV arguments", "unreadable_resource"),
+        ("unsupported memory SRV arguments", "unreadable_view"),
+        ("unsupported memory SRV arguments", "null_address"),
+        ("unsupported memory SRV arguments", "unsupported_description"),
+        ("unsupported memory SRV arguments", "destination_outside_view_heaps"),
+        ("unavailable buffer at the supplied address", "buffer_unavailable"),
+        ("unavailable texture at the supplied base and layout", "texture_unavailable"),
+    ]
+    reasons = [reason for _, reason in cases]
+    lines = [
+        f"x2w-d3d12 Device::slot70 {what}: reason={reason} "
+        "res{dim=3 fmt=98 size=128x128x2 mips=6 layout=0x105 flags=0x300000 align=65536 samples=1/0} "
+        "view{dim=5 fmt=98 map=0x1688} dest=0x1 dest_in_view_heap=1 address=0x2 address_readable=1\n"
+        for what, reason in cases
+    ]
+    refusals = triage_run.summarize_lines(lines)["slot70_refusals"]
+    reported = sorted(key[0] for key in refusals)
+    if reported != sorted(reasons):
+        failures.append(f"slot70 reasons reported as {reported}, expected {sorted(reasons)}")
+
+
 def check_empty_and_missing_dirs(failures: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -201,6 +227,43 @@ def check_empty_and_missing_dirs(failures: list[str]) -> None:
                 failures.append(f"expected 0 scanned files for {target}")
             if "_None observed._" not in report:
                 failures.append(f"expected '_None observed._' for {target}")
+
+
+def check_slot133_outcomes(failures: list[str]) -> None:
+    # Device::slot133 logs every handled placement with a trailing "aliased|not aliased gpuva=..." field.
+    prefix = "x2w-d3d12 Device::slot133(CreatePlacedResourceX?) "
+    lines = [
+        prefix + "address=0x1000 base=0x1000 offset=0x0 width=0x100 flags=0x0 state=0x0 clear=0x0 riid=ID3D12Resource -> 0x00000000 aliased gpuva=0x2000\n",
+        prefix + "address=0x3000 base=0x3000 offset=0x0 width=0x100 flags=0x0 state=0x0 clear=0x0 riid=ID3D12Resource -> 0x00000000 not aliased gpuva=0x4000\n",
+        prefix + "address=0x5000 base=0x5000 offset=0x0 width=0x100 flags=0x0 state=0x0 clear=0x0 riid=ID3D12Resource -> 0x80070057 not aliased gpuva=0x0\n",
+        prefix + "texture address=0x6000 dim=3 64x64x1 mips=1 fmt=28 samples=1 flags=0x0 layout=0x0 state=0x0 clear=0x0 -> 0x00000000 not aliased []\n",
+        prefix + "address=0x7000 not committed -> E_INVALIDARG\n",
+        "x2w-d3d12 Device::slot15 not implemented\n",
+    ]
+    summary = triage_run.summarize_lines(lines)
+    outcomes = dict(summary["slot133_outcomes"])
+    if outcomes != {"aliased": 1, "not_aliased": 2, "failed": 2}:
+        failures.append(f"slot133 outcomes wrong: {outcomes}")
+    unhandled = dict(summary["d3d12_unhandled"])
+    if unhandled != {"Device::slot133": 2, "Device::slot15": 1}:
+        failures.append(f"slot133 successes counted as unhandled, or failures dropped: {unhandled}")
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "stderr.txt").write_text("".join(lines), encoding="utf-8")
+        report = triage_run.triage_run(Path(tmp))
+    if "| 2 | not_aliased |" not in report or "| 1 | aliased |" not in report or "| 2 | failed |" not in report:
+        failures.append("slot133 outcome table missing from the report:\n" + report)
+    if "gpuva" in report or "0x4000" in report:
+        failures.append("slot133 addresses leaked into the report:\n" + report)
+    # Control: with the old classification (no slot133 rule) the same log counts the successes as unhandled.
+    saved = (triage_run.RE_D3D12_SLOT133, triage_run.RE_D3D12_SLOT133_UNCOMMITTED)
+    never = re.compile(r"(?!)")
+    triage_run.RE_D3D12_SLOT133 = triage_run.RE_D3D12_SLOT133_UNCOMMITTED = never
+    try:
+        old = triage_run.summarize_lines(lines)["d3d12_unhandled"]
+    finally:
+        triage_run.RE_D3D12_SLOT133, triage_run.RE_D3D12_SLOT133_UNCOMMITTED = saved
+    if old.get("Device::slot133") != 5:
+        failures.append(f"control did not reproduce the old unhandled noise: {dict(old)}")
 
 
 def check_cli_invocation(failures: list[str]) -> None:
@@ -228,8 +291,10 @@ def main() -> int:
     check_aggregation_and_redaction(failures)
     check_private_text_never_echoed(failures)
     check_review_regressions(failures)
+    check_every_slot70_reason_is_reported(failures)
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
+    check_slot133_outcomes(failures)
     for item in failures:
         print("FAIL", item)
     print(f"startup triage_run checks: {len(failures)} failed")

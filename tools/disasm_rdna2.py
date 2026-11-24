@@ -593,6 +593,7 @@ VOP1_OPS = {
     0x0b: ("v_cvt_f32_f16_e32", "Convert float16 to float32"),
     0x0c: ("v_cvt_rpi_i32_f32_e32", "Convert float32 to int32 (round to +inf)"),
     0x0d: ("v_cvt_flr_i32_f32_e32", "Convert float32 to int32 (floor)"),
+    0x0e: ("v_cvt_off_f32_i4_e32", "Convert 4-bit signed offset to float32"),
     0x0f: ("v_cvt_f32_f64_e32", "Convert float64 to float32"),
     0x10: ("v_cvt_f64_f32_e32", "Convert float32 to float64"),
     0x11: ("v_cvt_f32_ubyte0_e32", "Convert unsigned byte 0 to float32"),
@@ -601,6 +602,11 @@ VOP1_OPS = {
     0x14: ("v_cvt_f32_ubyte3_e32", "Convert unsigned byte 3 to float32"),
     0x15: ("v_cvt_u32_f64_e32", "Convert float64 to uint32"),
     0x16: ("v_cvt_f64_u32_e32", "Convert uint32 to float64"),
+    0x17: ("v_trunc_f64_e32", "Truncate toward zero float64"),
+    0x18: ("v_ceil_f64_e32", "Ceiling float64"),
+    0x19: ("v_rndne_f64_e32", "Round to nearest even float64"),
+    0x1a: ("v_floor_f64_e32", "Floor float64"),
+    0x1b: ("v_pipeflush", "Flush the pipeline (no operands)"),
     0x20: ("v_fract_f32_e32", "Fractional part float32"),
     0x21: ("v_trunc_f32_e32", "Truncate toward zero float32"),
     0x22: ("v_ceil_f32_e32", "Ceiling float32"),
@@ -622,6 +628,12 @@ VOP1_OPS = {
     0x39: ("v_ffbh_u32_e32", "Find first bit high uint32"),
     0x3a: ("v_ffbl_b32_e32", "Find first bit low uint32"),
     0x3b: ("v_ffbh_i32_e32", "Find first bit high int32"),
+    0x3c: ("v_frexp_exp_i32_f64_e32", "Exponent of float64 as int32"),
+    0x3d: ("v_frexp_mant_f64_e32", "Mantissa of float64"),
+    0x3e: ("v_fract_f64_e32", "Fractional part float64"),
+    0x3f: ("v_frexp_exp_i32_f32_e32", "Exponent of float32 as int32"),
+    0x40: ("v_frexp_mant_f32_e32", "Mantissa of float32"),
+    0x41: ("v_clrexcp", "Clear the floating-point exception flags (no operands)"),
     0x42: ("v_movreld_b32_e32", "Vector copy with relative destination"),
     0x43: ("v_movrels_b32_e32", "Vector copy with relative source"),
     0x44: ("v_movrelsd_b32_e32", "Vector copy with relative source and destination"),
@@ -635,8 +647,11 @@ VOP1_OPS = {
     0x5d: ("v_trunc_f16_e32", "Truncate toward zero float16"),
     0x5e: ("v_rndne_f16_e32", "Round to nearest even float16"),
     0x5f: ("v_fract_f16_e32", "Fractional part float16"),
+    0x62: ("v_sat_pk_u8_i16_e32", "Saturate int16 pair to packed uint8"),
     0x63: ("v_cvt_norm_i16_f16_e32", "Convert float16 to normalized int16"),
     0x64: ("v_cvt_norm_u16_f16_e32", "Convert float16 to normalized uint16"),
+    0x65: ("v_swap_b32", "Swap the 32-bit values of two VGPRs"),
+    0x68: ("v_swaprel_b32", "Swap two VGPRs, relative to M0"),
 }
 
 VOPC_OPS = {
@@ -1296,6 +1311,7 @@ SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "D
 SDWA_DST_UNUSED_NAMES = ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE")
 SDWA_OMOD_NAMES = ("", " mul:2", " mul:4", " div:2")
 VOP1_SDWA_UNSUPPORTED = frozenset(("v_readfirstlane_b32", "v_pipeflush", "v_clrexcp", "v_swap_b32", "v_swaprel_b32"))
+VOP1_NO_OPERAND_OPS = frozenset(("v_pipeflush", "v_clrexcp"))
 VOP1_SDWA_VGPR_ONLY_SRC0 = frozenset(("v_movrels_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"))
 VOP2_SDWA_UNSUPPORTED_OPS = frozenset((0x02, 0x06, 0x0d, 0x1f, 0x20, 0x21, 0x2b, 0x2c, 0x2d, 0x36, 0x37, 0x38, 0x3c))
 # Scalar source codes 209-234 are outside the supported LLVM 15 decoder subset for GFX10 SDWA: LLVM 15
@@ -2372,7 +2388,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         length = 4
         is_64 = op_name.endswith(("_b64", "_u64", "_i64"))
         dst_64 = (is_64 and not op_name.startswith(("s_bcnt0_i32_", "s_bcnt1_i32_", "s_ff0_i32_", "s_ff1_i32_", "s_flbit_i32_"))) or op_name == "s_bitreplicate_b64_b32"
-        src0_64 = is_64 and op_name != "s_bitreplicate_b64_b32"
+        src0_64 = is_64 and op_name not in ("s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64")
         if ssrc0 == 255:
             if offset + 8 > len(data):
                 return (4, "sop1_truncated", f"{op_name} <truncated>", "Incomplete SOP1 literal")
@@ -2489,9 +2505,15 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             return _decode_vop1_dpp(w1, vdst, src0, op_name, comment)
         if src0 in VOP_EXTENSION_FORMS:
             return _vop_extension(data, offset, "vop1", op_name, src0)
+        if op_name in VOP1_NO_OPERAND_OPS:
+            # LLVM prints the bare mnemonic and takes no literal dword even when SRC0 is 255.
+            return (4, op_name, op_name, comment)
         length = 4
-        wide_dst = op_name.startswith(("v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32")) or op_name.endswith(("_f64_e32", "_f64"))
-        wide_src0 = op_name.startswith(("v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64")) or op_name.endswith(("_f64_e32", "_f64"))
+        # A 32-bit result from a binary64 source: the name ends in _f64 but the destination is one VGPR.
+        narrow_dst = op_name.startswith(("v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64"))
+        wide_dst = op_name.startswith(("v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32")) or (
+            op_name.endswith(("_f64_e32", "_f64")) and not narrow_dst)
+        wide_src0 = narrow_dst or op_name.endswith(("_f64_e32", "_f64"))
         if src0 == 255:
             if offset + 8 > len(data):
                 return (4, "vop1_truncated", f"{op_name} <truncated>", "Incomplete VOP1 literal")
@@ -2705,6 +2727,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         elif op not in MIMG_DERIV_OPS:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
+        a16 = (w1 >> 30) & 1
+        packed_load_2d = a16 and op_name == "image_load" and dim_name == "SQ_RSRC_IMG_2D"
+        if packed_load_2d:
+            addr_count = 1  # The two unsigned coordinates share a VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.
         n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
@@ -2743,10 +2769,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("tfe")
         if (w0 >> 17) & 1:
             mods.append("lwe")
-        if (w1 >> 30) & 1:
+        if a16:
             mods.append("a16")
         if d16:
             mods.append("d16")
+        if packed_load_2d and nsize:
+            mods.append("invalid_nsa")  # A single address VGPR requires no NSA extension.
         # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
         # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
         if (w0 & 0x4040) or (w1 >> 26) & 0xf:
@@ -2968,7 +2996,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             base_info = VOP1_OPS.get(vop1_op, (f"v_vop1_{vop1_op:02x}", "Unknown VOP1"))
             op_name = base_info[0].replace("_e32", "_e64")
             comment = f"{base_info[1]} (VOP3A)"
-            if op_name == "v_nop":
+            if op_name == "v_nop" or op_name in VOP1_NO_OPERAND_OPS:
                 arity = 0
                 dst_width = 0
                 src_widths = ()
@@ -3026,8 +3054,15 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                     "v_readfirstlane_b32 <unsupported VOP3A encoding>",
                     "VOP3A encoding of v_readfirstlane_b32 is not available on gfx1013")
 
+        if op_name in ("v_swap_b32", "v_swaprel_b32"):
+            # These two exist only as 32-bit VOP1: llvm-mc rejects the e64 spelling. Keep the eight-byte boundary.
+            return (8, f"{op_name}_unsupported", f"{op_name} <unsupported VOP3A encoding>",
+                    f"{op_name} has no VOP3A encoding on gfx1013")
+
         if op_name == "v_nop":
             return (8, "v_nop", "v_nop", "Vector no-op (VOP3A)")
+        if op_name in VOP1_NO_OPERAND_OPS:
+            return (8, op_name, op_name, comment)
 
         restricted = op_name in VOP3_RESTRICTED_MODIFIERS
         if restricted:

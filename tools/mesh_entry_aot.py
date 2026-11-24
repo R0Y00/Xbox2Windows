@@ -673,7 +673,7 @@ def require_mesh_stage(chunks):
             )
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+def decode_mesh(blob, library):
     chunks = parts(blob)
     require_mesh_stage(chunks)
     p = chunks[b"PSV0"]
@@ -689,15 +689,12 @@ def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=F
     if any(not 0 < n <= 256 for n in limits):
         raise ValueError("Invalid mesh declaration")
     code = container_code(chunks[b"DXIL"], stage=13)
-    return lower(
-        disassemble(
-            code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"
-        ),
-        geometry,
-        limits,
-        vertex_header,
-        compute_fallback=compute_fallback,
-    )
+    return disassemble(code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"), limits
+
+
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+    decoded, limits = decode_mesh(blob, library)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
 
 
 if __name__ == "__main__":

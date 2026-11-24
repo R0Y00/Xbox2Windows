@@ -13,6 +13,7 @@
 #include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
 #include "startup_stubs/storage_root.h"
+#include "startup_stubs/storage_root_utf8.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -151,6 +152,16 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
     }
     if (!handled && self->provider == save_provider && N >= 3 && fake_user()) handled = save_call(N, args, &result);
     if (!handled && N >= 3 && fake_user()) handled = area_call(provider_ids[self->provider], N, args, &result);
+    if (!handled && N >= 3 && fake_user()) {
+        // The offline context is our token, never a desktop runtime object. Unimplemented
+        // methods must fail here rather than let the real runtime dereference it.
+        for (int i = 0; i < 4 && !handled; ++i) {
+            if (args[i] == store_context_handle) {
+                handled = true;
+                result = 0x80004005;
+            }
+        }
+    }
     if (!handled && self->provider != user_provider && N >= 3 && fake_user()) {
         // Other API families cannot resolve the local user's handle: fail the call instead of passing it on.
         for (int i = 0; i < 4 && !handled; ++i) {
@@ -940,6 +951,22 @@ int store_method3_check()
     const u64 missing = forward<3>(&proxy, local_user_handle, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     if (missing != 0x80070057) return 6;
 
+    const auto desktop = +[](void*, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 {
+        return 0x1234;
+    };
+    void* methods[5] = {};
+    methods[4] = reinterpret_cast<void*>(desktop);
+    void** real = methods;
+    proxy.real = &real;
+    for (int position = 0; position < 4; ++position) {
+        u64 arguments[4] = {};
+        arguments[position] = context;
+        const u64 blocked = forward<4>(&proxy, arguments[0], arguments[1], arguments[2], arguments[3], 0, 0, 0, 0, 0, 0, 0);
+        if (blocked != 0x80004005) return 8;
+    }
+    // A foreign value still reaches the desktop implementation: the guard is token-specific.
+    if (forward<4>(&proxy, context ^ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) != 0x1234) return 9;
+
     std::printf("store context %016llx\n", static_cast<unsigned long long>(context));
     std::printf("store refused %08llx\n", static_cast<unsigned long long>(refused & 0xffffffffu));
     std::printf("store user refused %08llx\n", static_cast<unsigned long long>(foreign & 0xffffffffu));
@@ -957,13 +984,14 @@ const char* storage_path()
     static char path[x2w_startup::storage_root_capacity];
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
     InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
-        char value[x2w_startup::storage_root_capacity + 1];
-        const DWORD length = GetEnvironmentVariableA("X2W_STORAGE_PATH", value, sizeof(value));
-        if (length >= sizeof(value))
+        wchar_t value[x2w_startup::storage_root_capacity + 1];
+        const DWORD capacity = static_cast<DWORD>(sizeof(value) / sizeof(*value));
+        const DWORD length = GetEnvironmentVariableW(L"X2W_STORAGE_PATH", value, capacity);
+        if (length >= capacity)
             x2w_local::logf("x2w-runtime X2W_STORAGE_PATH has %lu characters, more than the %zu supported: using S:\\",
                             static_cast<unsigned long>(length - 1), x2w_startup::storage_root_capacity - 2);
-        else if (length && !x2w_startup::storage_root(value, path))
-            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH does not fit with its trailing separator: using S:\\");
+        else if (length && !x2w_startup::storage_root_utf8(value, path))
+            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH is invalid UTF-16 or does not fit as UTF-8 with its trailing separator: using S:\\");
         if (!path[0]) std::strcpy(path, "S:\\");
         return TRUE;
     }, nullptr, nullptr);

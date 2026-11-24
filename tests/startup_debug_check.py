@@ -2,8 +2,9 @@
 
 X2W_STOP_AT stops at a chosen main-image breakpoint while --continue-asserts steps over the
 others, X2W_DUMP_AT writes thread stacks at a time during the run, and X2W_VALLOC_MIN logs large
-virtual-memory allocations with their callers. tests/startup_debug_probe.cpp is the only input: it
-hits two breakpoints, reserves 256 MiB, waits 3 s and exits 0.
+virtual-memory allocations with their callers. The launcher also keeps the debug heap off unless
+the caller sets _NO_DEBUG_HEAP=0. tests/startup_debug_probe.cpp is the only input: it hits two
+breakpoints, reserves 256 MiB, prints its debug-heap flags, waits 3 s and exits 0.
 """
 import os
 from pathlib import Path
@@ -16,9 +17,21 @@ REPO = Path(__file__).resolve().parents[1]
 DEBUG = REPO / "tools/startup/debug_launch.py"
 
 
+def missing_heap_flags(logdir):
+    """Explain a missing flag line rather than dumping stdout alone.
+
+    The probe prints one line per state. A probe built before the flag line existed prints only
+    "debug-probe reserved ok", which looks like a heap-flag regression; name that possibility here.
+    """
+    printed = text(logdir / "stdout.txt")
+    if "debug-probe heap flags" in printed:
+        return printed
+    return ("no heap-flags line in the probe output; rebuild startup_debug_probe if it predates this "
+            "check. Output was:\n" + printed)
+
 def run(probe, work, name, variables, options=("--continue-asserts", "10")):
     logdir = work / name
-    env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_") and k.upper() != "_NO_DEBUG_HEAP"}
     env.update(variables)
     command = [sys.executable, "-B", str(DEBUG), str(probe), str(work), str(logdir), "--timeout", "30", "--console", "0", *options]
     result = subprocess.run(command, capture_output=True, text=True, timeout=120, env=env)
@@ -49,6 +62,12 @@ def main(probe):
                                                 text(logdir / "events.txt"))]
         assert len(sites) == 2 and sites[0] != sites[1], text(logdir / "events.txt")
         assert not (logdir / "threads_stop.txt").exists() and "VALLOC" not in text(logdir / "files.txt")
+        # The launcher keeps the debug heap off by default ...
+        assert "debug-probe heap flags 0x0\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
+        # ... and a caller who sets _NO_DEBUG_HEAP=0 gets it back (control: the loader's three heap bits).
+        out, logdir = run(probe, work, "debug-heap", {"_NO_DEBUG_HEAP": "0"})
+        assert "process exited with 0x00000000" in out, out
+        assert "debug-probe heap flags 0x70\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
 
         # X2W_STOP_AT on the second site: the first is still stepped over, the run stops at the second.
         out, logdir = run(probe, work, "stop", {"X2W_STOP_AT": f"{sites[1]:x}"})
@@ -82,7 +101,7 @@ def main(probe):
         out, logdir = run(probe, work, "valloc-empty", {"X2W_VALLOC_MIN": ""})
         assert "process exited with 0x00000000" in out and " VALLOC " not in text(logdir / "files.txt"), out
 
-    print("startup_debug: PASS (stop at a chosen assert, timed thread dump, large-allocation log; 5 controls)")
+    print("startup_debug: PASS (stop at a chosen assert, timed thread dump, large-allocation log, debug heap off; 6 controls)")
     return 0
 
 

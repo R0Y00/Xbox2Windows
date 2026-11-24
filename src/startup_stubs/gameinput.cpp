@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 8
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/qpc_microseconds.h"
 
 #include <cmath>
 #include <cstdio>
@@ -58,7 +59,7 @@ u64 now_microseconds()
     LARGE_INTEGER frequency, counter;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&counter);
-    return static_cast<u64>(counter.QuadPart) * 1000000 / static_cast<u64>(frequency.QuadPart);
+    return x2w_startup::qpc_microseconds(static_cast<u64>(counter.QuadPart), static_cast<u64>(frequency.QuadPart));
 }
 
 bool process_has_focus()
@@ -159,18 +160,31 @@ GamepadState sample()
     }
     // X2W_INPUT_SCRIPT=<mask hex>@<second>[,...]: one press of 0.3 s per entry (e.g. 4@60,1@70,20@80
     // presses A, then Menu, then Y), so one run can try several buttons at known times.
-    static const struct Script { std::uint32_t mask[32]; double at[32]; int count; ULONGLONG zero; } script = [] {
+    // A script longer than the buffer, extra entries and malformed entries are reported, not dropped silently.
+    static constexpr int max_entries = 256;
+    static const struct Script { std::uint32_t mask[max_entries]; double at[max_entries]; int count; ULONGLONG zero; } script = [] {
         Script sc{{}, {}, 0, GetTickCount64()};
-        char text[512]{};
-        if (GetEnvironmentVariableA("X2W_INPUT_SCRIPT", text, sizeof(text))) {
-            for (char* item = std::strtok(text, ","); item && sc.count < 32; item = std::strtok(nullptr, ",")) {
+        static char text[4096];
+        const DWORD length = GetEnvironmentVariableA("X2W_INPUT_SCRIPT", text, sizeof(text));
+        if (length >= sizeof(text)) {
+            x2w_local::logf("x2w-input X2W_INPUT_SCRIPT ignored: %lu characters, at most %u", static_cast<unsigned long>(length - 1),
+                            static_cast<unsigned>(sizeof(text) - 1));
+        } else if (length) {
+            int entries = 0, malformed = 0;
+            for (char* item = std::strtok(text, ","); item; item = std::strtok(nullptr, ",")) {
+                ++entries;
                 unsigned mask = 0;
                 double at = 0;
-                if (std::sscanf(item, "%x@%lf", &mask, &at) == 2) {
+                if (std::sscanf(item, "%x@%lf", &mask, &at) != 2) {
+                    ++malformed;
+                } else if (sc.count < max_entries) {
                     sc.mask[sc.count] = mask;
                     sc.at[sc.count++] = at;
                 }
             }
+            if (sc.count + malformed < entries || malformed)
+                x2w_local::logf("x2w-input X2W_INPUT_SCRIPT: %d of %d entries used (%d malformed, at most %d)", sc.count, entries,
+                                malformed, max_entries);
         }
         return sc;
     }();
@@ -231,7 +245,7 @@ u64 __stdcall add_ref(Object* self) { return static_cast<u64>(InterlockedIncreme
 u64 __stdcall release_static(Object* self) { return static_cast<u64>(InterlockedDecrement(&self->refs)); }
 HRESULT __stdcall query_interface(Object* self, const GUID*, void** out)
 {
-    if (!out) return E_POINTER;
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
     InterlockedIncrement(&self->refs);
     *out = self;
     return S_OK;
@@ -322,7 +336,7 @@ u64 __stdcall reading_sequence(Reading* self, std::uint32_t kind)
 u64 __stdcall reading_timestamp(Reading* self) { return self->timestamp; }
 void __stdcall reading_device(Reading* self, Object** device)
 {
-    if (device) {
+    if (device && x2w_local::writable(device, sizeof(*device))) {
         DeviceObj* d = (self->kind == kind_keyboard) ? &the_keyboard_device : &the_device;
         InterlockedIncrement(&d->refs);
         *device = d;
@@ -341,7 +355,8 @@ std::uint32_t __stdcall reading_key_state(Reading* self, std::uint32_t state_arr
     note("Reading::GetKeyState", calls, state_array_count);
     if ((self->kind & kind_keyboard) == 0 || !state_array || state_array_count == 0) return 0;
     const std::uint32_t count = self->key_count < state_array_count ? self->key_count : state_array_count;
-    std::memcpy(state_array, self->keys, count * sizeof(KeyState));
+    if (count == 0 || !x2w_local::writable(state_array, static_cast<std::size_t>(count) * sizeof(KeyState))) return 0;
+    std::memcpy(state_array, self->keys, static_cast<std::size_t>(count) * sizeof(KeyState));
     return count;
 }
 const ULONGLONG loaded_at = GetTickCount64();
@@ -349,7 +364,8 @@ bool __stdcall reading_gamepad(Reading* self, GamepadState* out)
 {
     static LONG calls, presses;
     note("Reading::GetGamepadState", calls);
-    if (!out || (self->kind & (kind_gamepad | kind_controller_bits)) == 0) return false;
+    if (!out || !x2w_local::writable(out, sizeof(*out)) || (self->kind & (kind_gamepad | kind_controller_bits)) == 0)
+        return false;
     *out = self->state;
     // Each new button combination the title reads is logged once per change (at most 64 lines).
     static volatile LONG last_logged;
@@ -419,7 +435,7 @@ std::uint32_t history_mask(std::uint32_t reading_kind)
 
 // Finds the nearest entry before or after the reference position in one kind's ring.
 // Returns 0 on hit, -1 if there is none (not found), -2 if the wanted entry was already evicted (too old).
-int find_in_ring(const KindRing& ring, u64 ref_sequence, u64 ref_order, int step, HistoryEntry& out)
+int find_in_ring(const KindRing& ring, u64 ref_sequence, u64 ref_order, int step, bool same_kind_only, HistoryEntry& out)
 {
     if (ring.count == 0) return -1;
     const u64 oldest = ring.latest - ring.count + 1;
@@ -428,8 +444,9 @@ int find_in_ring(const KindRing& ring, u64 ref_sequence, u64 ref_order, int step
         if (ref_sequence == 0) return -1;
         if (ref_sequence < oldest) return -2;
         target = ref_sequence;
-        // A different kind may have advanced the stream since this kind last changed.
-        if (ring.entries[target % history_capacity].order == ref_order) --target;
+        // Step past ref_sequence when the reference already carries this kind exclusively,
+        // or when this kind changed at ref_order.
+        if (same_kind_only || ring.entries[target % history_capacity].order == ref_order) --target;
     }
     if (target == 0 || target > ring.latest) return -1;
     if (target < oldest) return -2;
@@ -441,14 +458,17 @@ int find_in_ring(const KindRing& ring, u64 ref_sequence, u64 ref_order, int step
 int find_history(const Reading& ref, int step, std::uint32_t mask, HistoryEntry& out)
 {
     AcquireSRWLockShared(&state_lock);
+    const std::uint32_t ref_mask = history_mask(ref.kind);
     int result = -1;
     bool have = false;
     for (int i = 0; i < 2; ++i) {
         const std::uint32_t bit = i == 0 ? history_pad : history_keys;
         if (!(mask & bit)) continue;
         const KindRing& ring = i == 0 ? pad_ring : key_ring;
+        const bool same_kind_only = (mask == bit) && (ref_mask == bit);
         HistoryEntry candidate{};
-        const int found = find_in_ring(ring, i == 0 ? ref.pad_sequence : ref.key_sequence, ref.order, step, candidate);
+        const int found = find_in_ring(ring, i == 0 ? ref.pad_sequence : ref.key_sequence, ref.order, step,
+                                       same_kind_only, candidate);
         if (found == -2) {
             result = -2;
             have = false;
@@ -500,7 +520,7 @@ HRESULT __stdcall input_current_reading(Object*, std::uint32_t kind, Object* dev
 {
     static LONG calls;
     note("GameInput::GetCurrentReading", calls, kind, reinterpret_cast<u64>(device));
-    if (!out) return E_POINTER;
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
     *out = nullptr;
     const HRESULT check_hr = validate_kind_and_device(kind, device);
     if (FAILED(check_hr)) return check_hr;
@@ -511,7 +531,7 @@ HRESULT __stdcall input_next_reading(Object*, Reading* reference, std::uint32_t 
 {
     static LONG calls;
     note("GameInput::GetNextReading", calls, reinterpret_cast<u64>(reference), kind);
-    if (!out) return E_POINTER;
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
     *out = nullptr;
     if (!reference) return E_INVALIDARG;
     const HRESULT check_hr = validate_kind_and_device(kind, device);
@@ -528,7 +548,7 @@ HRESULT __stdcall input_previous_reading(Object*, Reading* reference, std::uint3
 {
     static LONG calls;
     note("GameInput::GetPreviousReading", calls, reinterpret_cast<u64>(reference), kind);
-    if (!out) return E_POINTER;
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
     *out = nullptr;
     if (!reference) return E_INVALIDARG;
     const HRESULT check_hr = validate_kind_and_device(kind, device);
@@ -546,6 +566,7 @@ HRESULT __stdcall input_register_device_callback(Object*, Object* device, std::u
 {
     static LONG calls, tokens;
     note("GameInput::RegisterDeviceCallback", calls, kind, status_filter, enumeration);
+    if (token && !x2w_local::writable(token, sizeof(*token))) return E_POINTER;
     const u64 value = static_cast<u64>(InterlockedIncrement(&tokens));
     if (token) *token = value;
     // Any enumeration request reports matching virtual devices at once (connected).
@@ -564,7 +585,8 @@ HRESULT __stdcall input_register_callback(Object*, u64 a, u64 b, u64 c, u64 d, u
     note("GameInput::Register*Callback(other)", calls, a, b, c);
     (void)d;
     (void)e;
-    if (token && x2w_local::writable(token, 8)) *token = 0x1000 + static_cast<u64>(InterlockedIncrement(&tokens));
+    if (token && !x2w_local::writable(token, sizeof(*token))) return E_POINTER;
+    if (token) *token = 0x1000 + static_cast<u64>(InterlockedIncrement(&tokens));
     return S_OK;
 }
 // RegisterGuideButtonCallback / RegisterKeyboardLayoutCallback(device, context, callback, token).
@@ -572,6 +594,7 @@ HRESULT __stdcall input_register_short_callback(Object*, Object*, void*, void*, 
 {
     static LONG calls, tokens;
     note("GameInput::Register{GuideButton,KeyboardLayout}Callback", calls);
+    if (token && !x2w_local::writable(token, sizeof(*token))) return E_POINTER;
     if (token) *token = 0x2000 + static_cast<u64>(InterlockedIncrement(&tokens));
     return S_OK;
 }
@@ -581,9 +604,10 @@ HRESULT __stdcall input_find_device_by_id(Object*, const void* id, Object** devi
 {
     static LONG calls;
     note("GameInput::FindDeviceFromId", calls);
-    if (!device) return E_POINTER;
-    if (id && (std::memcmp(id, keyboard_device_info + 0x20, 32) == 0 ||
-               std::memcmp(id, keyboard_device_info + 0x40, 32) == 0)) {
+    if (!device || !x2w_local::writable(device, sizeof(*device))) return E_POINTER;
+    if (id && x2w_local::readable(id, 32) &&
+        (std::memcmp(id, keyboard_device_info + 0x20, 32) == 0 ||
+         std::memcmp(id, keyboard_device_info + 0x40, 32) == 0)) {
         InterlockedIncrement(&the_keyboard_device.refs);
         *device = &the_keyboard_device;
         return S_OK;
@@ -597,7 +621,7 @@ HRESULT __stdcall input_find_device_by_handle(Object*, void*, Object** device)
 {
     static LONG calls;
     note("GameInput::FindDeviceFromPlatformHandle", calls);
-    if (!device) return E_POINTER;
+    if (!device || !x2w_local::writable(device, sizeof(*device))) return E_POINTER;
     *device = nullptr;
     return device_not_found;
 }
@@ -606,7 +630,7 @@ HRESULT __stdcall input_find_device_other(Object*, const void*, Object** device)
 {
     static LONG calls;
     note("GameInput::FindDeviceFrom{Object,PlatformString}", calls);
-    if (!device) return E_POINTER;
+    if (!device || !x2w_local::writable(device, sizeof(*device))) return E_POINTER;
     InterlockedIncrement(&the_device.refs);
     *device = &the_device;
     return S_OK;
@@ -619,10 +643,8 @@ void __stdcall input_set_focus_policy(Object*, std::uint32_t policy)
 
 void build()
 {
-    static bool built = false;
-    if (built) return;
-    built = true;
-    fill_unknown<0>(input_table.slots, std::make_index_sequence<32>{});
+    static const bool built = [] {
+        fill_unknown<0>(input_table.slots, std::make_index_sequence<32>{});
     fill_unknown<1>(device_table.slots, std::make_index_sequence<32>{});
     fill_unknown<2>(reading_table.slots, std::make_index_sequence<32>{});
     for (void** slots : {input_table.slots, device_table.slots, reading_table.slots}) {
@@ -674,8 +696,11 @@ void build()
     std::memcpy(keyboard_device_info + 4, kbd_ids, 4);
     for (int i = 0; i < 32; ++i) keyboard_device_info[0x20 + i] = static_cast<unsigned char>(0xB0 + i);
     for (int i = 0; i < 32; ++i) keyboard_device_info[0x40 + i] = static_cast<unsigned char>(0xB0 + i);
-    const std::uint32_t kbd_tail[4] = {0 /* family: unknown/PC */, 0, kind_keyboard, 0};
-    std::memcpy(keyboard_device_info + 0x60, kbd_tail, sizeof(kbd_tail));
+        const std::uint32_t kbd_tail[4] = {0 /* family: unknown/PC */, 0, kind_keyboard, 0};
+        std::memcpy(keyboard_device_info + 0x60, kbd_tail, sizeof(kbd_tail));
+        return true;
+    }();
+    (void)built;
 }
 }  // namespace
 
@@ -684,7 +709,7 @@ extern "C" __declspec(noinline) HRESULT GameInputCreate(void** out)
 {
     build();
     x2w_local::logf("x2w-input GameInputCreate(%p): virtual gamepad stand-in (keyboard + XInput pad 0)", static_cast<void*>(out));
-    if (!out) return E_POINTER;
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
     InterlockedIncrement(&the_input.refs);
     *out = &the_input;
     return S_OK;

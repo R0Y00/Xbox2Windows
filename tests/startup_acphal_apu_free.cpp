@@ -4,15 +4,20 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -22,14 +27,35 @@ using AllocFn = long(__cdecl*)(void**, std::uint32_t*, u64, u64, u64);
 using FreeFn = long(__cdecl*)(void*);
 using CreateFn = long(__cdecl*)(u64, u64);
 using MapFn = std::uint32_t(__cdecl*)(void*);
+using MapApuFn = void*(__cdecl*)(u64);
+using ValidFn = int(__cdecl*)(void*);
+using HalCreateFn = long(__cdecl*)(void**);
+using ShapeAllocFn = long(__cdecl*)(void*);
+using ShapeReleaseFn = long(__cdecl*)(void*);
+using HalConnectFn = long(__stdcall*)(void*, unsigned, unsigned);
+using HalSubmitFn = long(__stdcall*)(void*, unsigned, u64, unsigned, const unsigned*, u64);
 
 constexpr long ok = 0, invalid = static_cast<long>(0x80070057), no_memory = static_cast<long>(0x8007000E),
-               no_pointer = static_cast<long>(0x80004003);
+               no_pointer = static_cast<long>(0x80004003), not_impl = static_cast<long>(0x80004001);
 constexpr u64 heap_size = 0x200000, first_offset = 0x10000, usable = heap_size - first_offset;
+
+struct ShapeContexts {
+    std::uint32_t counts[6]{};
+    unsigned char* arrays[6]{};
+    std::uint32_t apu[6]{};
+};
+static_assert(sizeof(ShapeContexts) == 0x60, "ShapeContexts layout");
+static_assert(offsetof(ShapeContexts, arrays) == 0x18, "arrays offset");
+static_assert(offsetof(ShapeContexts, apu) == 0x48, "apu offset");
 
 AllocFn alloc_fn;
 FreeFn free_fn;
 MapFn map_fn;
+MapApuFn map_apu_fn;
+ValidFn valid_fn;
+HalCreateFn hal_create_fn;
+ShapeAllocFn shape_alloc_fn;
+ShapeReleaseFn shape_release_fn;
 int failures;
 
 void check(bool condition, const char* what)
@@ -283,10 +309,177 @@ void first_creation(CreateFn create)
     check(free_fn(extra) == ok, "free extra");
     check_empty("first creation");
 }
+
+void shape_contexts()
+{
+    check(shape_alloc_fn(nullptr) == no_pointer, "AcpHalAllocateShapeContexts(null) returns E_POINTER");
+    if (void* ro = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)) {
+        check(shape_alloc_fn(ro) == no_pointer, "AcpHalAllocateShapeContexts(read-only) returns E_POINTER");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    } else {
+        check(false, "VirtualAlloc PAGE_READONLY for shape_contexts negative control");
+    }
+
+    ShapeContexts zero_ctx{};
+    check(shape_alloc_fn(&zero_ctx) == ok, "AcpHalAllocateShapeContexts with all-zero counts succeeds");
+    check(!zero_ctx.arrays[4] && zero_ctx.apu[4] == 0, "all-zero counts leaves outputs zero");
+    check_empty("shape contexts zero counts");
+
+    ShapeContexts happy{};
+    happy.counts[4] = 350;
+    check(shape_alloc_fn(&happy) == ok, "AcpHalAllocateShapeContexts XMA-only happy path succeeds");
+    check(happy.arrays[4] != nullptr, "XMA array pointer is populated");
+    check(reinterpret_cast<std::uintptr_t>(happy.arrays[4]) % 64 == 0, "XMA array pointer is 64-byte aligned");
+    check(happy.apu[4] != 0, "XMA APU address is populated");
+    check(map_fn(happy.arrays[4]) == happy.apu[4], "XMA APU address matches ApuMapVirtualAddress");
+    check(map_apu_fn(happy.apu[4]) == happy.arrays[4], "ApuMapApuAddress round-trips XMA array pointer");
+    check(valid_fn(happy.arrays[4]) != 0, "XMA array pointer is valid APU virtual address");
+    std::memset(happy.arrays[4], 0x5A, 350 * 64);
+    check(free_fn(happy.arrays[4]) == ok, "XMA array frees via ApuFree");
+    check_empty("shape contexts happy path");
+
+    // Partial failure: i == 4 allocates, then counts[5] != 0 triggers E_NOTIMPL and must roll back.
+    ShapeContexts partial{};
+    partial.counts[4] = 350;
+    partial.counts[5] = 1;
+    check(shape_alloc_fn(&partial) == not_impl, "AcpHalAllocateShapeContexts with counts[5] != 0 returns E_NOTIMPL");
+    check(partial.arrays[4] == nullptr && partial.apu[4] == 0,
+          "partial-failure rollback zeroes arrays[4] and apu[4]");
+    check_empty("shape contexts partial failure rollback");
+
+    // Early unsupported type: i == 0 fails before i == 4.
+    ShapeContexts early{};
+    early.counts[0] = 1;
+    early.counts[4] = 350;
+    check(shape_alloc_fn(&early) == not_impl, "AcpHalAllocateShapeContexts with counts[0] != 0 returns E_NOTIMPL");
+    check(early.arrays[4] == nullptr && early.apu[4] == 0, "early failure leaves arrays[4] and apu[4] zero");
+    check_empty("shape contexts early failure");
+
+    // Overflow / out-of-memory counts.
+    for (std::uint32_t huge_count : {0x04000000u, 0xFFFFFFFFu}) {
+        ShapeContexts oom{};
+        oom.counts[4] = huge_count;
+        check(shape_alloc_fn(&oom) == no_memory, "AcpHalAllocateShapeContexts huge count returns E_OUTOFMEMORY");
+        check(oom.arrays[4] == nullptr && oom.apu[4] == 0, "OOM leaves arrays[4] and apu[4] zero");
+        check_empty("shape contexts oom");
+    }
+}
+
+void hal_and_address_mapping()
+{
+    check(hal_create_fn(nullptr) == no_pointer, "AcpHalCreate(null) returns E_POINTER");
+    if (void* ro = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)) {
+        check(hal_create_fn(static_cast<void**>(ro)) == no_pointer, "AcpHalCreate(read-only) returns E_POINTER");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    } else {
+        check(false, "VirtualAlloc PAGE_READONLY for AcpHalCreate negative control");
+    }
+    void* hal = nullptr;
+    check(hal_create_fn(&hal) == ok && hal != nullptr, "AcpHalCreate returns stand-in object");
+    if (hal) {
+        auto* const* vtable = *reinterpret_cast<void* const* const*>(hal);
+        auto connect = reinterpret_cast<HalConnectFn>(vtable[0]);
+        auto submit = reinterpret_cast<HalSubmitFn>(vtable[2]);
+        const unsigned command_val = 0x12345678u;
+        check(connect(hal, 0x1000, 0x1000) == ok, "AcpHal::slot0(connect) returns S_OK");
+        check(submit(hal, 1, 0x1234, 2, &command_val, 0) == ok, "AcpHal::slot2(submit) returns S_OK");
+    }
+
+    std::uint32_t apu = 0;
+    void* block = nullptr;
+    check(take(&block, 0x100, 64, &apu) == ok && block && apu, "allocate block for mapping checks");
+    auto* inner = static_cast<unsigned char*>(block) + 0x80;
+    check(valid_fn(block) != 0, "ApuIsVirtualAddressValid accepts block start");
+    check(valid_fn(inner) != 0, "ApuIsVirtualAddressValid accepts interior pointer");
+    check(map_fn(block) == apu, "ApuMapVirtualAddress maps block start");
+    check(map_fn(inner) == apu + 0x80, "ApuMapVirtualAddress maps interior pointer");
+    check(map_apu_fn(apu) == block, "ApuMapApuAddress maps block APU address");
+    check(map_apu_fn(apu + 0x80) == inner, "ApuMapApuAddress maps interior APU address");
+
+    // Negative controls for address validity and mapping.
+    auto* heap_base = static_cast<unsigned char*>(block) - apu;
+    check(valid_fn(nullptr) == 0, "ApuIsVirtualAddressValid(null) is 0");
+    check(valid_fn(&failures) == 0, "ApuIsVirtualAddressValid(foreign) is 0");
+    check(valid_fn(heap_base - 1) == 0, "ApuIsVirtualAddressValid(before heap) is 0");
+    check(valid_fn(heap_base + heap_size) == 0, "ApuIsVirtualAddressValid(at heap end) is 0");
+    check(map_fn(nullptr) == 0, "ApuMapVirtualAddress(null) is 0");
+    check(map_fn(&failures) == 0, "ApuMapVirtualAddress(foreign) is 0");
+    check(map_fn(heap_base - 1) == 0, "ApuMapVirtualAddress(before heap) is 0");
+    check(map_fn(heap_base + heap_size) == 0, "ApuMapVirtualAddress(at heap end) is 0");
+    check(map_apu_fn(0) == nullptr, "ApuMapApuAddress(0) is null");
+    check(map_apu_fn(heap_size) == nullptr, "ApuMapApuAddress(heap_size) is null");
+    check(map_apu_fn(heap_size + 0x1000) == nullptr, "ApuMapApuAddress(past end) is null");
+
+    check(free_fn(block) == ok, "free mapping test block");
+    check_empty("address mapping");
+}
+
+int run_trap_control(const char* dll_path, const char* export_name)
+{
+    SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", nullptr);
+    SetEnvironmentVariableA("X2W_TRAP_CONTINUE", nullptr);
+    SetEnvironmentVariableA("X2W_TRAP_FAIL", nullptr);
+    HMODULE module = LoadLibraryA(dll_path);
+    if (!module) return 2;
+    FARPROC proc = GetProcAddress(module, export_name);
+    if (!proc) return 3;
+    if (std::strcmp(export_name, "AcpHalAllocateShapeContexts") == 0) {
+        ShapeContexts ctx{};
+        reinterpret_cast<ShapeAllocFn>(proc)(&ctx);
+    } else if (std::strcmp(export_name, "AcpHalReleaseShapeContexts") == 0) {
+        reinterpret_cast<ShapeReleaseFn>(proc)(nullptr);
+    } else if (std::strcmp(export_name, "AcpHalCreate") == 0) {
+        void* out = nullptr;
+        reinterpret_cast<HalCreateFn>(proc)(&out);
+    } else if (std::strcmp(export_name, "ApuIsVirtualAddressValid") == 0) {
+        reinterpret_cast<ValidFn>(proc)(nullptr);
+    } else if (std::strcmp(export_name, "ApuMapApuAddress") == 0) {
+        reinterpret_cast<MapApuFn>(proc)(0);
+    } else if (std::strcmp(export_name, "ApuMapVirtualAddress") == 0) {
+        reinterpret_cast<MapFn>(proc)(nullptr);
+    } else {
+        return 5;
+    }
+    return 4;
+}
+
+void check_trap_case(const char* self_exe, const char* dll_path, const char* export_name, DWORD expected_exit)
+{
+    std::string cmd = std::string("\"") + self_exe + "\" --trap-control \"" + dll_path + "\" " + export_name;
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        check(false, "CreateProcessA for non-permissive trap control");
+        return;
+    }
+    const DWORD wait_rc = WaitForSingleObject(pi.hProcess, 10000);
+    DWORD exit_code = 0;
+    const BOOL got_code = GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    check(wait_rc == WAIT_OBJECT_0, "non-permissive trap child exited within timeout");
+    if (!got_code || exit_code != expected_exit) {
+        std::printf("FAIL: %s trap expected 0x%08lx got 0x%08lx\n", export_name, static_cast<unsigned long>(expected_exit),
+                    static_cast<unsigned long>(exit_code));
+        ++failures;
+    }
+}
+
+void check_non_permissive_traps(const char* self_exe, const char* dll_path)
+{
+    check_trap_case(self_exe, dll_path, "AcpHalAllocateShapeContexts", 0xE2570100u);
+    check_trap_case(self_exe, dll_path, "AcpHalCreate", 0xE2570101u);
+    check_trap_case(self_exe, dll_path, "ApuIsVirtualAddressValid", 0xE2570106u);
+    check_trap_case(self_exe, dll_path, "ApuMapApuAddress", 0xE2570107u);
+    check_trap_case(self_exe, dll_path, "ApuMapVirtualAddress", 0xE2570108u);
+    check_trap_case(self_exe, dll_path, "AcpHalReleaseShapeContexts", 0xE2570102u);
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
+    if (argc == 4 && std::strcmp(argv[1], "--trap-control") == 0) return run_trap_control(argv[2], argv[3]);
     if (argc != 2) return std::printf("usage: startup_acphal_apu_free <AcpHal.dll>\n"), 2;
     SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", "1");
     HMODULE module = LoadLibraryA(argv[1]);
@@ -294,17 +487,29 @@ int main(int argc, char** argv)
     alloc_fn = reinterpret_cast<AllocFn>(GetProcAddress(module, "ApuAlloc"));
     free_fn = reinterpret_cast<FreeFn>(GetProcAddress(module, "ApuFree"));
     map_fn = reinterpret_cast<MapFn>(GetProcAddress(module, "ApuMapVirtualAddress"));
+    map_apu_fn = reinterpret_cast<MapApuFn>(GetProcAddress(module, "ApuMapApuAddress"));
+    valid_fn = reinterpret_cast<ValidFn>(GetProcAddress(module, "ApuIsVirtualAddressValid"));
+    hal_create_fn = reinterpret_cast<HalCreateFn>(GetProcAddress(module, "AcpHalCreate"));
+    shape_alloc_fn = reinterpret_cast<ShapeAllocFn>(GetProcAddress(module, "AcpHalAllocateShapeContexts"));
+    shape_release_fn = reinterpret_cast<ShapeReleaseFn>(GetProcAddress(module, "AcpHalReleaseShapeContexts"));
     auto create = reinterpret_cast<CreateFn>(GetProcAddress(module, "ApuCreateHeap"));
-    if (!alloc_fn || !free_fn || !map_fn || !create) return std::printf("FAIL: missing export\n"), 2;
+    if (!alloc_fn || !free_fn || !map_fn || !map_apu_fn || !valid_fn || !hal_create_fn || !shape_alloc_fn ||
+        !shape_release_fn || !create)
+        return std::printf("FAIL: missing export\n"), 2;
     void* none = nullptr;
     check(take(&none, 64) == no_memory && !none, "no heap yet");
+    check(valid_fn(nullptr) == 0 && map_apu_fn(first_offset) == nullptr && map_fn(nullptr) == 0,
+          "address queries fail cleanly before ApuCreateHeap");
     first_creation(create);
     churn_beyond_capacity();
     reuse_and_alignment();
     coalescing();
     bad_requests();
+    shape_contexts();
+    hal_and_address_mapping();
     table_full();
     concurrent();
+    check_non_permissive_traps(argv[0], argv[1]);
     std::printf(failures ? "startup_acphal_apu_free: %d failure(s)\n" : "startup_acphal_apu_free: ok\n", failures);
     return failures ? 1 : 0;
 }

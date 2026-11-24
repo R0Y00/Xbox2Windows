@@ -4,10 +4,12 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,6 +22,7 @@
 #include "dispatch_index_cs.h"
 #include "group_index_cs.h"
 #include "desktop_gpu.h"
+#include "dxr_opacity_reference.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
@@ -505,6 +508,12 @@ OperationResult run_compute_store_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_compute_store_dpp_case(const OperationContext& ctx)
+{
+    check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // The image-load readback extends the store case with the source texture words and uses the
 // descriptor-table signature, because a texture SRV cannot be a root descriptor.
 OperationResult run_compute_texture_case(const OperationContext& ctx)
@@ -976,14 +985,43 @@ OperationResult run_dxr_facing_pipeline(const OperationContext& ctx)
     return skip_if_false(check_dxr_facing(ctx.device, true));
 }
 
+std::optional<float> parse_dxr_opacity_tmin(int argc, char** argv)
+{
+    if (argc == 3) return dxr_opacity::defaultTMin;
+    if (argc != 5 || std::string_view(argv[3]) != "--tmin") return std::nullopt;
+
+    const std::string_view text = argv[4];
+    const char* const last = text.data() + text.size();
+    // Check the interval before rounding to the float stored in the ray buffer.
+    double value = 0;
+    const auto [end, error] = std::from_chars(text.data(), last, value);
+    if (error != std::errc{} || end != last || !std::isfinite(value) || value < 0 || value > dxr_opacity::maxTMin)
+        return std::nullopt;
+
+    const float nearT = static_cast<float>(value);
+    if (nearT == 0) return value == 0 ? std::optional<float>{0.0f} : std::nullopt;
+    return nearT;
+}
+
+bool validate_dxr_opacity_args(int argc, char** argv)
+{
+    return parse_dxr_opacity_tmin(argc, argv).has_value();
+}
+
+OperationResult run_dxr_opacity_fixture(const OperationContext& ctx, bool use_pipeline)
+{
+    const float nearT = parse_dxr_opacity_tmin(ctx.argc, ctx.argv).value();
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", use_pipeline, nearT));
+}
+
 OperationResult run_dxr_opacity(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", false));
+    return run_dxr_opacity_fixture(ctx, false);
 }
 
 OperationResult run_dxr_opacity_pipeline(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", true));
+    return run_dxr_opacity_fixture(ctx, true);
 }
 
 OperationResult run_ray_query(const OperationContext& ctx)
@@ -1091,6 +1129,15 @@ OperationResult run_startup_cb_blend(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-composite-provenance: source, destination before and destination after a composite draw on one
+// list distinguish a drawn centre, a clipped centre and a UV that selects the source corner (#1628).
+OperationResult run_startup_composite_provenance(const OperationContext& ctx)
+{
+    if (check_startup_composite_provenance(ctx.device) != 0)
+        return {OutcomeKind::fail, "composite provenance differs from the model or a mutant matched"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 template<bool Swapped>
 OperationResult run_startup_sampler_x(const OperationContext& ctx)
 {
@@ -1130,7 +1177,8 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1);
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1,
+                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1138,6 +1186,69 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
                      ctx.argv[5], expected[0], expected[1], expected[2], expected[3], bits[0], bits[1], bits[2], bits[3]);
         return {OutcomeKind::fail, "image 3D readback differs"};
     }
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_startup_packed_position(const OperationContext& ctx)
+{
+    constexpr UINT width = 13, height = 7;
+    std::uint32_t pixels[height * width * 4]{};
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels, width, height);
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            const UINT expected = x | (y << 16);
+            for (UINT component = 0; component < 4; ++component) {
+                const UINT value = pixels[(y * width + x) * 4 + component];
+                if (value != expected) {
+                    std::fprintf(stderr, "position mismatch (%u,%u): expected %08x actual %08x\n", x, y, expected, value);
+                    return {OutcomeKind::fail, "position readback differed"};
+                }
+            }
+        }
+    }
+    std::puts("all 91 packed positions matched");
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
+// width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
+// value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
+// row by row. Reports the first differing pixel and the number of differing pixels.
+OperationResult run_startup_pixel_words(const OperationContext& ctx)
+{
+    unsigned long width = 0, height = 0;
+    try {
+        width = std::stoul(ctx.argv[5]);
+        height = std::stoul(ctx.argv[6]);
+    } catch (const std::exception&) {
+        return {OutcomeKind::fail, "width and height must be numbers"};
+    }
+    if (width == 0 || height == 0 || width > 64 || height > 64)
+        return {OutcomeKind::fail, "width and height must be 1..64"};
+    std::vector<std::uint32_t> expected(size_t(width) * height * 4);
+    std::ifstream file(ctx.argv[7], std::ios::binary);
+    file.read(reinterpret_cast<char*>(expected.data()), std::streamsize(expected.size() * sizeof(std::uint32_t)));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return {OutcomeKind::fail, "expected file does not hold width * height * 4 words"};
+    std::vector<std::uint32_t> pixels(expected.size());
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    unsigned long differing = 0;
+    for (unsigned long y = 0; y < height; ++y) {
+        for (unsigned long x = 0; x < width; ++x) {
+            const std::uint32_t* want = &expected[(y * width + x) * 4];
+            const std::uint32_t* got = &pixels[(y * width + x) * 4];
+            if (std::memcmp(want, got, 4 * sizeof(std::uint32_t)) == 0) continue;
+            if (differing++ == 0) {
+                std::fprintf(stderr, "pixel mismatch (%lu,%lu): expected %08x,%08x,%08x,%08x actual %08x,%08x,%08x,%08x\n",
+                             x, y, want[0], want[1], want[2], want[3], got[0], got[1], got[2], got[3]);
+            }
+        }
+    }
+    if (differing) {
+        std::fprintf(stderr, "%lu of %lu pixels differ\n", differing, width * height);
+        return {OutcomeKind::fail, "pixel readback differs"};
+    }
+    std::printf("all %lu pixels matched\n", width * height);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1203,9 +1314,14 @@ constexpr CapabilityGate kGateSm60CompareSampler{
 constexpr CapabilityGate kGateSm60SamplerIndexControl{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: sampler index control requires SM 6.0",
-    CapsDiagnostic::none};constexpr CapabilityGate kGateSm60RawUavDump{
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60RawUavDump{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: raw UAV dump requires SM 6.0",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm62RawUavDump{
+    D3D_SHADER_MODEL_6_2, false, false, 0,
+    "skip: denormal-preserving raw UAV dump requires SM 6.2",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_0, true, false, 0,
@@ -1249,6 +1365,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
     {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
     {"--compute-texture-msaa-case", 7, 7, nullptr, kNoGate, run_compute_texture_msaa_case},
@@ -1259,12 +1376,16 @@ const OperationSpec kOperations[] = {
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
+    {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
+    {"--startup-pixel-words", 8, 8, nullptr, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
+    {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
@@ -1338,8 +1459,8 @@ const OperationSpec kOperations[] = {
     {"--dxr-update-pipeline", 3, 3, nullptr, kNoGate, run_dxr_update_pipeline},
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
     {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
-    {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
-    {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
+    {"--dxr-opacity", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity},
+    {"--dxr-opacity-pipeline", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
     {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
@@ -1356,6 +1477,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
+    {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
@@ -1514,7 +1636,7 @@ int run_self_test()
 
     // (a) CLI validation rejects unknown --*, bad argc, bad flags, and bad positional draw argc with usage_error (exit 2).
     auto check_cli = [&](std::vector<const char*> args, CliAction expected_action,
-                         std::string_view expected_err_substr = {}) {
+                         std::string_view expected_err_substr = {}, std::optional<float> expected_tmin = {}) {
         std::vector<char*> mut_argv;
         std::vector<std::string> storage;
         storage.reserve(args.size());
@@ -1527,8 +1649,24 @@ int run_self_test()
             !require(err.find(expected_err_substr) != std::string::npos, "expected stderr substring")) {
             return false;
         }
-        return true;
+        return !expected_tmin || require(parse_dxr_opacity_tmin(static_cast<int>(mut_argv.size()), mut_argv.data()) ==
+                                         expected_tmin, "effective opacity TMin");
     };
+
+    for (const char* op : {"--dxr-opacity", "--dxr-opacity-pipeline"}) {
+        if (!check_cli({"offscreen_check", "warp", op}, CliAction::operation, {}, 0.25f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0"}, CliAction::operation, {}, 0.0f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0.25"}, CliAction::operation, {}, 0.25f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0.5"}, CliAction::operation, {}, 0.5f)) return 1;
+        if (!check_cli({"offscreen_check", "warp", op, "--tmin"}, CliAction::usage_error) ||
+            !check_cli({"offscreen_check", "warp", op, "--other", "0.25"}, CliAction::usage_error) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0", "--tmin", "0.5"}, CliAction::usage_error))
+            return 1;
+        for (const char* value : {"", "-0.1", "0.51", "0.50000001", "1", "nan", "inf", "1e999", "1e-100", "0,25", "0.25x"}) {
+            if (!check_cli({"offscreen_check", "warp", op, "--tmin", value}, CliAction::usage_error)) return 1;
+        }
+    }
+    if (!check_cli({"offscreen_check", "warp", "--dual-uav", "--tmin", "0.25"}, CliAction::usage_error)) return 1;
 
     if (!check_cli({"offscreen_check", "warp", "--bvh-wave"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;
