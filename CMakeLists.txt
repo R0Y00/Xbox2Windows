@@ -1224,6 +1224,15 @@ target_include_directories(startup_audio_pacing PRIVATE src)
 target_link_libraries(startup_audio_pacing PRIVATE ole32)
 add_test(NAME startup_audio_pacing COMMAND startup_audio_pacing)
 set_tests_properties(startup_audio_pacing PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+# Output validation for the real XAudio2 provider: a source-built caller plays tone, intentional
+# silence and a drained-then-resumed queue, and WASAPI loopback classifies what the endpoint produced
+# (exit 77 when there is no endpoint or loopback is refused). Refs #1145.
+add_executable(startup_audio_output_validation tests/startup_audio_output_validation.cpp)
+target_compile_features(startup_audio_output_validation PRIVATE cxx_std_17)
+target_include_directories(startup_audio_output_validation PRIVATE src)
+target_link_libraries(startup_audio_output_validation PRIVATE ole32 xaudio2)
+add_test(NAME startup_audio_output_validation COMMAND startup_audio_output_validation)
+set_tests_properties(startup_audio_output_validation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 # Voice-lifecycle control: one client, two explicit providers (a diagnostic recorder and the system
 # XAudio2 called directly), verifying the diagnostic window observes the same lifecycle before any
 # timing number from it is used.
