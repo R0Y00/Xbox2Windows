@@ -920,6 +920,39 @@ class Stage:
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
         return None
 
+    def op_s_bfm_b64(self, ops, mods):
+        """64-bit bitfield mask: D = ((1 << S0[5:0]) - 1) << S1[5:0]; both sources are 32-bit, SCC is untouched."""
+        if mods or len(ops) != 3:
+            raise Unsupported('s_bfm_b64 with %d operands and modifiers %s' % (len(ops), mods))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[2] > 105:
+            raise Unsupported('s_bfm_b64 destination %s' % ops[0])
+        vals = []
+        for o in ops[1:3]:
+            r = reg_range(o)
+            if r and r[0] == 's':
+                vals.append(self.is_const(r[1]))
+            else:
+                try:
+                    vals.append(int(o, 0))
+                except ValueError:
+                    vals.append(None)
+        d = dst[1]
+        if None not in vals:
+            value = (((1 << (vals[0] & 63)) - 1) << (vals[1] & 63)) & 0xffffffffffffffff
+            self.set_s(d, '0x%08xu' % (value & 0xffffffff), ('const', value & 0xffffffff))
+            self.set_s(d + 1, '0x%08xu' % (value >> 32), ('const', value >> 32))
+            return None
+        # The mask words are built so no 32-bit shift sees a count of 32 or more, then shl64 moves them;
+        # both sources are read before either destination register is written (D may overlap S0/S1).
+        width, offset = self.u(ops[1]), self.u(ops[2])
+        self.emit('{ uint bw = (%s) & 63u; uint2 t = shl64(bw >= 32u ? 0xffffffffu : ((1u << (bw & 31u)) - 1u),'
+                  ' bw > 32u ? ((1u << ((bw - 32u) & 31u)) - 1u) : 0u, %s); s%d = t.x; s%d = t.y; }' % (width, offset, d, d + 1))
+        for r in (d, d + 1):
+            self.sym.pop(r, None)
+            self.used_s.add(r)
+        return None
+
     def op_s_load_dwordx8(self, ops, mods):
         self.op_s_load_dwordx4(ops, mods, 8)
 
