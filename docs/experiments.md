@@ -204,7 +204,10 @@ file names are never printed. The check is
 For each pixel shader the tool reads only the disassembly and records a contract: the vector
 registers read before any write (live-in), the I/J register pairs that feed attribute
 interpolation, and the live-in registers split into low and high 16-bit halves. Compare forms give
-no half evidence. A first read is a live-in register unless a backward branch spans it and the
+no half evidence. A read is a first read when the register is not written earlier in program
+order or not written on every path to the read: at each join the definitions of the incoming edges
+are intersected, so a write that a forward branch can skip does not hide a live-in read after the
+join. A first read is a live-in register unless a backward branch spans it and the
 register is written later in program order: that value can be loop-carried, so the register is
 reported as ambiguous and takes no part in any rule, and evidence taken from such a read is
 dropped. Aliases made by `v_mov_b32` do not cross a branch or a branch target. A branch whose
