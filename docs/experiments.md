@@ -11194,6 +11194,16 @@ old lowering used as y. Full-width loads still accept cache-policy flags. Plain 
 patched 2D `a16` instruction carrying an unexpected NSA extension are refused, and that the runtime
 and offline cache keys use the same revision. The check verifies translation on the CPU.
 
+## Startup translator: v_swap_b32
+
+The VOP1 `v_swap_b32 vdst, vsrc` exchanges two VGPRs. The translator refused it with `Unsupported: v_swap_b32`; in the offline shader-archive census of #1723, 2 of the 1,171 pixel and vertex program pairs stop there. The handler (`op_v_swap_b32` in `tools/startup/gfx2hlsl.py`) emits `{ uint swap_tmp = vA; vA = vB; vB = swap_tmp; }`, guarded by `if (exec & 1)` when the exec mask is not known, emits nothing when both registers are the same, and drops the proven-uniform status of both registers. The instruction has no output or source modifier and no VOP3 form (LLVM 19 rejects `v_swap_b32_e64` for gfx1010 and gfx1030); two VGPR operands are required, so a scalar or constant source, a modifier or an extra operand is refused, and the SDWA spelling stays refused by the decoder. The operation follows the [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) (VOP1 opcode 101).
+
+The fixture (`tests/startup_gfx2hlsl_swap_check.py`) is synthetic only: it builds the instruction words from the public VOP1 field layout and checks them against the bytes LLVM 19 assembles (`02 cb 02 7e` for `v_swap_b32 v1, v2`). It checks the emitted exchange, the exec guard, the same-register case, a later read of the swapped register, the uniform status, five refusals, a modifier and the SDWA spelling. It was not run on Windows: the emitted text is compared, not compiled or drawn. The pixel path lowers the same instruction in `tools/pixel_aot.py`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_swap$' -V
+```
+
 ## Startup translator: pixel depth export
 
 The startup translator emits `SV_Depth` for an uncompressed `exp mrtz vN, off, off, off` in a straight-line pixel shader that still uses its entry execution mask. Color exports in the same shader keep their `SV_Target` outputs. Additional MRTZ channels, packed exports, multiple depth exports, branches and changes to the execution mask before the depth export are refused.
