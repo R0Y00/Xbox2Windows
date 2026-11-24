@@ -4560,10 +4560,10 @@ class TestRdna2Scanner(unittest.TestCase):
         """Issue #938: binary shaders with VOPC/VOPCX SDWA reach the scanner as decoded opcodes, not vopc_sdwa."""
         supported = bytes.fromhex(
             "f904027c01861606"  # v_cmp_lt_f32_sdwa s6, -v1, v2 src0_sel:DWORD src1_sel:DWORD
+            "f904887d01000506"  # v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
             "000081bf"          # s_endpgm
         )
         unlowered = bytes.fromhex(
-            "f904887d01000506"  # v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
             "f904247c01001606"  # v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD
             "000081bf"          # s_endpgm
         )
@@ -4580,7 +4580,7 @@ class TestRdna2Scanner(unittest.TestCase):
 
         res_sup = results["ps_vopc_sdwa_supported.bin"]
         self.assertEqual((res_sup["total_instructions"], res_sup["supported_instructions"], res_sup["unsupported_count"]),
-                         (2, 2, 0), res_sup.get("unsupported_details"))
+                         (3, 3, 0), res_sup.get("unsupported_details"))
         self.assertTrue(res_sup["opcodes_recognized"])
         self.assertEqual(res_sup["unsupported_opcodes"], {})
 
@@ -4589,13 +4589,10 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(res_unl["unsupported_opcodes"], {})
         self.assertFalse(res_unl["translator_accepted"])
         self.assertEqual(res_unl["compatibility_category"], "opcode_recognized_translator_rejected")
-        self.assertEqual(res_unl["unsupported_count"], 2)
+        self.assertEqual(res_unl["unsupported_count"], 1)
         self.assertEqual(
             [d["raw"] for d in res_unl["unsupported_details"]],
-            [
-                "v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
-                "v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD",
-            ],
+            ["v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD"],
         )
 
         res_bad = results["ps_vopc_sdwa_f64_fallback.bin"]
@@ -5372,6 +5369,28 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertIn("overall", json_content)
             self.assertIn("stages", json_content)
             self.assertIn("missing_opcodes_ranked", json_content)
+
+    def test_sdwa_int_compare_instructions(self):
+        """The scanner accepts the integer SDWA comparisons pixel_aot lowers and refuses their neighbours."""
+        for line in (
+            "v_cmp_lt_i32_sdwa vcc_lo, sext(v20), v18 src0_sel:BYTE_1 src1_sel:BYTE_2",
+            "v_cmp_f_u32_sdwa s6, v1, v2 src0_sel:DWORD src1_sel:DWORD",
+            "v_cmp_t_i32_sdwa vcc_lo, v1, sext(v2) src0_sel:WORD_1 src1_sel:WORD_0",
+            "v_cmp_ge_u16_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:BYTE_0",
+            "v_cmp_ne_i16_sdwa s[6:7], sext(v1), sext(v2) src0_sel:BYTE_3 src1_sel:DWORD",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_cmp_f_i16_sdwa vcc_lo, v1, v2 src0_sel:WORD_0 src1_sel:WORD_0",
+            "v_cmp_t_u16_sdwa vcc_lo, v1, v2 src0_sel:WORD_0 src1_sel:WORD_0",
+            "v_cmp_lt_i32_sdwa vcc_lo, v1, 1 src0_sel:BYTE_0 src1_sel:DWORD",
+            "v_cmp_lt_i32_sdwa vcc_lo, -v1, v2 src0_sel:BYTE_0 src1_sel:DWORD",
+            "v_cmp_lt_u32_sdwa vcc_lo, v1, v2 src0_sel:BYTE_0",
+            "v_cmp_lt_u32_sdwa exec_lo, v1, v2 src0_sel:BYTE_0 src1_sel:BYTE_0",
+            "v_cmpx_lt_u32_sdwa v1, v2 src0_sel:BYTE_0 src1_sel:BYTE_0",
+            "v_cmp_lt_i64_sdwa vcc_lo, v1, v2 src0_sel:BYTE_0 src1_sel:BYTE_0",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
 
     def test_supported_shader_instructions(self):
         """Verify scanner patterns recognize subrev, mov_b32, waitcnt_expcnt as supported."""

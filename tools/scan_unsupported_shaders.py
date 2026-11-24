@@ -222,6 +222,14 @@ if PIXEL_INT_COMPARE:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16){PIXEL_VOPC_DST},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
     )
+    # Integer SDWA comparisons: register sources, optionally under sext(), with both selections printed. gfx10 has
+    # no f/t forms at 16 bits.
+    _sdwa_cmp_source = r"(?:sext\([vs]\d+\)|[vs]\d+)"
+    for _ops, _kinds in ((icmp_ops, "i32|u32"), ("lt|eq|le|gt|ne|ge", "i16|u16")):
+        SUPPORTED_INSTRUCTIONS_REGEX.append(
+            rf"v_cmp_(?:{_ops})_(?:{_kinds})_sdwa\s+{PIXEL_LANE_MASK},\s+{_sdwa_cmp_source},\s+{_sdwa_cmp_source}"
+            rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+        )
     # 64-bit comparisons are checked by supports_int64_compare() below: the pair and inline ranges are numeric.
     INT64_COMPARE_PATTERN = re.compile(
         rf"v_cmp_(?:{icmp_ops})_(?:i64|u64)(_e32|_e64)?\s+(vcc(?:_lo)?|s\d+|s\[\d+:\d+\]),\s+(\S+),\s+(\S+)"
