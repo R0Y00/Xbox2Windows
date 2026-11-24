@@ -16394,6 +16394,7 @@ def _check_controls_inline(directory):
         (plain_bank + ["s_mov_b32 m0, 0x100", "v_movreld_b32_e32 v12, v24"], "Static m0 offset out of range"),
         (plain_bank + ["s_mov_b32 m0, 200", "v_movrels_b32_e32 v12, v100"], "Indexed VGPR exceeds 255"),
         (plain_bank + ["s_mov_b32 m0, 5", "v_movrels_b32_e32 v12, v24"], "Expected a numeric VGPR at v29"),
+
     ):
         try:
             translate(with_constants(bad_seq))
@@ -16401,6 +16402,16 @@ def _check_controls_inline(directory):
             assert message in str(error), (bad_seq, error)
         else:
             raise AssertionError(f"Plain movrel accepted {bad_seq}")
+    # The plain forms keep the entry-mask refusal of their own branch: inside the whole-quad region it must fire.
+    quad = assembly(False)
+    at = quad.index("s_wqm_b64 exec, exec") + 1
+    for op in ("v_movrels_b32_e32", "v_movreld_b32_e64"):
+        try:
+            translate(quad[:at] + ["s_mov_b32 m0, 0", f"{op} v20, v8"] + quad[at:])
+        except ValueError as error:
+            assert f"Invalid {op.rsplit('_', 1)[0]} outside entry mask" in str(error), (op, error)
+        else:
+            raise AssertionError(f"{op} accepted outside the entry mask")
 
     # Scalar s_movrel* (#1882): a static move keeps a tracked descriptor pointer, and the refusals.
     moved, copied = smovrel_descriptor_programs()
@@ -16467,6 +16478,7 @@ def _check_controls_inline(directory):
 
     # v_swaprel_b32 (#1795): bounded selects on both sides, and the movrel refusals.
     assert "swap_doff" in translate(with_constants(SWAPREL_BODY))
+    check_swaprel_exact()
     # Dynamic offsets whose two banks overlap: v24..v27 is both the source and the destination range.
     overlap = translate(with_constants(SWAPREL_BODY[:8] + [
         "s_mov_b32 s64, s47", "s_mov_b32 s65, 0", "s_and_b64 s[64:65], s[64:65], 0x30003", "s_mov_b32 m0, s64",
@@ -21175,6 +21187,66 @@ def check_smovrel_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Control {label} escaped detection")
         print(f"control {label}: pixel mismatch, as required")
     return 0
+
+
+def canonical_swap_lines(hlsl):
+    """The v_swaprel_b32 lines of a translation with each temporary renamed in order of first appearance (V0, V1,
+    ...), so the expected text does not depend on how many lines precede the swap. A register suffix such as
+    _r25 is kept, and bank values defined from a literal are named by it (v1.0, v2.0, v3.0, v4.0)."""
+    values = {}
+    for line in hlsl.splitlines():
+        if m := re.fullmatch(r"\s*precise float (alu\d+) = (1\.0f|2\.0f|asfloat\(1077936128u\)|4\.0f);", line):
+            values[m.group(1)] = {"1.0f": "v1.0", "2.0f": "v2.0", "asfloat(1077936128u)": "v3.0", "4.0f": "v4.0"}[m.group(2)]
+    names = {}
+
+    def rename(match):
+        word = match.group(0)
+        if word in values:
+            return values[word]
+        if word.startswith("swap_"):
+            return re.sub(r"\d+$", "", word)
+        return names.setdefault(word, f"V{len(names)}")
+
+    lines = [line.strip() for line in hlsl.splitlines() if "swap_" in line]
+    return [re.sub(r"\b(?:swap_[a-z]+\d+|s?alu\d+)(?!\d)", rename, line) for line in lines]
+
+
+# A static swap of v25 (vdst v24 + m0[25:16] = 1) with v26 (vsrc v24 + m0[9:0] = 2): each side reads the other's
+# old value, and the destination offset is tested before the source offset (#1795).
+SWAPREL_STATIC_LINES = [
+    "uint swap_soff = 2u;",
+    "uint swap_doff = 1u;",
+    "uint swap_sval = asuint(v3.0);",
+    "uint swap_dval = asuint(v2.0);",
+    "precise float V0_r25 = (swap_doff == 1u ? asfloat(swap_sval) : v2.0);",
+    "precise float V0_r26 = (swap_soff == 2u ? asfloat(swap_dval) : v3.0);",
+]
+# A dynamic swap inside one bank with m0 masked to 0x30001: the source offset (m0[9:0]) reaches v24 and v25, the
+# destination offset (m0[25:16]) reaches v24 to v27, so only v24 and v25 carry both selects.
+SWAPREL_DYNAMIC_LINES = [
+    "uint swap_soff = (V0.x & 0x3ffu);",
+    "uint swap_doff = ((V0.x >> 16) & 0x3ffu);",
+    "uint swap_sval = (swap_soff == 0u ? asuint(v1.0) : asuint(v2.0));",
+    "uint swap_dval = (swap_doff == 0u ? asuint(v1.0) : (swap_doff == 1u ? asuint(v2.0) : "
+    "(swap_doff == 2u ? asuint(v3.0) : asuint(v4.0))));",
+    "precise float V1_r24 = (swap_doff == 0u ? asfloat(swap_sval) : (swap_soff == 0u ? asfloat(swap_dval) : v1.0));",
+    "precise float V1_r25 = (swap_doff == 1u ? asfloat(swap_sval) : (swap_soff == 1u ? asfloat(swap_dval) : v2.0));",
+    "precise float V1_r26 = (swap_doff == 2u ? asfloat(swap_sval) : v3.0);",
+    "precise float V1_r27 = (swap_doff == 3u ? asfloat(swap_sval) : v4.0);",
+]
+
+
+def check_swaprel_exact():
+    """Device-free pins of the swap's selects, which the draw-only value checks otherwise cover alone: which side
+    reads which old value, which m0 half each side uses, and that both sides are selected."""
+    bank = ["v_mov_b32_e32 v24, 1.0", "v_mov_b32_e32 v25, 2.0", "v_mov_b32_e32 v26, 0x40400000",
+            "v_mov_b32_e32 v27, 4.0"]
+    static = canonical_swap_lines(translate(with_constants(bank + ["s_mov_b32 m0, 0x10002", "v_swaprel_b32 v24, v24"])))
+    assert static == SWAPREL_STATIC_LINES, static
+    dynamic = canonical_swap_lines(translate(with_constants(bank + [
+        "s_mov_b32 s64, s47", "s_mov_b32 s65, 0", "s_and_b64 s[64:65], s[64:65], 0x30001", "s_mov_b32 m0, s64",
+        "v_swaprel_b32 v24, v24"])))
+    assert dynamic == SWAPREL_DYNAMIC_LINES, dynamic
 
 
 def check_swaprel_draw(directory, compiler, renderer, backend):

@@ -1368,6 +1368,36 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  "    GroupMemoryBarrierWithGroupSync();\n"
                                  f"    uint {value} = {source} | {hlsl_word(values[1])};"))
             vector[dst] = ("alu", value)
+        elif m := re.fullmatch(r"v_(or_b32|add_nc_u32)_dpp v(\d+), v(\d+), v(\d+) row_shr:(\d+) "
+                               r"row_mask:0xf bank_mask:0xf( bound_ctrl:[01])?", line):
+            op, dst, src0, src1, shift = m[1], *map(int, m.groups()[1:5])
+            # LLVM 15 assembles bound_ctrl:0 and bound_ctrl:1 to the same set BOUND_CTRL bit and prints :1.
+            bound = m[6] is not None
+            # Rows are 16 of the guest's logical 1D lanes, indexed through group-shared memory.
+            if (cpu != "gfx1013" or max(dst, src0, src1) > 255 or not 1 <= shift <= 15
+                    or guard_span is not None or dims[1] != 1 or dims[2] != 1 or dims[0] % 16):
+                raise ValueError("Unsupported or masked DPP16 row shift")
+            # Without BOUND_CTRL a lane whose source is before its row start keeps its old destination.
+            values = [vector.get(reg) for reg in (src0, src1) + (() if bound else (dst,))]
+            if not all(is_word(value) for value in values):
+                raise ValueError("Unverified DPP16 operand")
+            step = dpp_step_count
+            dpp_step_count += 1
+            row_lane, inside = f"dpp{step}_row_lane", f"dpp{step}_inside"
+            source_thread = f"dpp{step}_source_thread"
+            source, value = f"dpp{step}_source", f"dpp{step}_value"
+            result = f"({source} {'|' if op == 'or_b32' else '+'} ({hlsl_word(values[1])}))"
+            slot = "dpp_stage"
+            staged_steps.append((slot, f"    uint {row_lane} = local.x & 15u;\n"
+                                 f"    bool {inside} = {row_lane} >= {shift}u;\n"
+                                 f"    {slot}[local.x] = {hlsl_word(values[0])};\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {source_thread} = {inside} ? local.x - {shift}u : local.x;\n"
+                                 f"    uint {source} = {inside} ? {slot}[{source_thread}] : 0u;\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {value} = "
+                                 + (f"{result};" if bound else f"{inside} ? {result} : ({hlsl_word(values[2])});")))
+            vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
