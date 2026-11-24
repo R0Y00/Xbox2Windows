@@ -1048,6 +1048,10 @@ class Stage:
             if hasattr(self, 'scc_uniform'):
                 self.scc_uniform = False  # the hardware SCC result is not modelled
             return None
+        # The identity controls read the lane's own value; every other quad_perm reaches the exchange
+        # lowerings in dpp() below.
+        if base.endswith('_dpp') and any(m in ('quad_perm:[0,1,2,3]', 'dpp8:[0,1,2,3,4,5,6,7]') for m in mods):
+            base, mods = self.dpp_form(base[:-len('_dpp')], mods)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
@@ -1230,6 +1234,28 @@ class Stage:
                [self.f(o) if kind == 'f' else self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
+
+    # VOP1/VOP2 with data-parallel primitives. The model is one lane, so only the forms that read the lane's own
+    # value are lowered: quad_perm:[0,1,2,3] (or dpp8 with the identity select), row_mask and bank_mask 0xf (every
+    # lane enabled; a disabled lane keeps its old destination) and no bound_ctrl/fi (they only matter for lanes
+    # read from outside the row). Every other control reads a neighbouring lane and is refused by name.
+    def dpp_form(self, base, mods):
+        """-> (base, remaining modifiers) for a DPP spelling that is the plain VOP1/VOP2 operation."""
+        if base not in VEC_F and base not in VEC_U:
+            raise Unsupported('DPP form of %s' % base)
+        control, rest = None, []
+        for m in mods:
+            if m in ('row_mask:0xf', 'bank_mask:0xf'):
+                continue
+            if m in ('quad_perm:[0,1,2,3]', 'dpp8:[0,1,2,3,4,5,6,7]'):
+                control = m
+            elif m.startswith(('quad_perm:', 'dpp8:', 'row_', 'wave_', 'row_mask:', 'bank_mask:', 'bound_ctrl', 'fi:')):
+                raise Unsupported('%s_dpp with %s: reads another lane or masks this one' % (base, m))
+            else:
+                rest.append(m)
+        if control is None:
+            raise Unsupported('%s_dpp without a lane-local control' % base)
+        return base, rest
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
