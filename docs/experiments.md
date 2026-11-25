@@ -13037,8 +13037,9 @@ modified. A count that would not fit 32 bits becomes 0 vertices. The model is
 The scratch record belongs to the recording, not the device: it is created on the recording's first conversion and
 retained by the recording's desktop allocator, which is reused only after every queue that ran the recording has
 passed its fence. Two recordings on two queues therefore never read each other's converted count. The compute pass
-replaces the list's compute root signature and pipeline, which drops compute root arguments, so the draw is refused
-before anything is recorded when the title has set a compute root argument since its last compute root signature.
+replaces the list's compute root signature and pipeline. The draw is refused while a forwarded desktop compute
+root SRV is still bound. Rebinding the same root or receiving a guest root that is not forwarded does not clear that
+binding. The fixture checks both cases with an untouched rectangle target and a subsequent compute readback.
 An indexed draw with `0x11` is still refused, as in the direct draw. Other console-only topologies are not handled.
 
 ```powershell

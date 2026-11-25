@@ -501,7 +501,7 @@ enum class Refusal { none, index_upload_cross, index_upload_foreign, index_uploa
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count };
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
 enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
@@ -950,6 +950,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         *input = retained_value;
         slot<Srv>(wrapped, 43)(wrapped, 0, reinterpret_cast<UINT64>(input));
         if (draw_right) slot<Root>(wrapped, 33)(wrapped, nullptr);
+        else if (kind == DrawKind::rect) slot<Root>(wrapped, 33)(wrapped, retained_compute_root.Get());
     }
     const UINT64 offset = refusal == Refusal::short_argument
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
@@ -1721,6 +1722,12 @@ int main(int argc, char** argv) try
         !run(device.Get(), guest.Get(), writer.Get(), overflow.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
              false, Refusal::overflowing_count, "overflowing rectangle count")) return 1;
     if (kind == DrawKind::rect) {
+        if (!run(device.Get(), guest.Get(), writer.Get(), left.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
+                 false, Refusal::rect_live_compute, "rectangle with rebound compute root", nullptr, false, nullptr,
+                 false, false, 0, false, true) ||
+            !run(device.Get(), guest.Get(), writer.Get(), right.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
+                 true, Refusal::rect_live_compute, "rectangle with retained desktop compute root", nullptr, false, nullptr,
+                 false, false, 0, false, true)) return 1;
         // Check that the closed recordings own distinct scratch before releasing both submissions. Then each
         // queue must draw its own argument count even if the GPU overlaps the two conversions.
         std::atomic<bool> concurrent_ok{true};

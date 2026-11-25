@@ -2210,7 +2210,6 @@ struct Pass {
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
-    bool compute_args_live = false;  // a compute root argument was set on the desktop list since slot 33
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -2393,7 +2392,6 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
-    pass.compute_args_live = false;
     if (pass.compute_root) {
         if (pass.desktop_compute_root.Get() != pass.compute_root)
             pass.desktop_compute_upload_srvs.fill(0);
@@ -2717,18 +2715,18 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     ID3D12Resource* draw_arguments = resource;
     u64 draw_offset = offset;
     if (rect_list) {
+        if (std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(),
+                        [](u64 address) { return address != 0; }))
+            return refuse("rectangle-list conversion would drop live compute root arguments");
         // The producer's count names three vertices per rectangle; the desktop draw needs six. Convert on the GPU
         // into a scratch record and draw from that. The compute root signature and bindings of the list are replaced.
         // The four words are copied into the scratch first (the pass never reads the title's buffer), so the source only
         // needs COPY_SOURCE next to its argument state.
         require_state(self, resource, argument_state | D3D12_RESOURCE_STATE_COPY_SOURCE);
-        // The conversion replaces the compute root signature, which drops the title's compute root arguments; they
-        // cannot be restored, so a live set is refused before anything is recorded.
-        if (pass.compute_args_live) return refuse("rectangle-list conversion would drop live compute root arguments");
         scratch = recording_rect_scratch(self);
         if (!scratch || !x2w_startup::rect_indirect_arguments().convert(list, resource, offset, scratch))
             return refuse("rectangle-list argument conversion is unavailable");
-        if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
+        if (pass.desktop_compute_root) list->SetComputeRootSignature(pass.desktop_compute_root.Get());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         draw_arguments = scratch;
         draw_offset = 0;
@@ -3055,7 +3053,6 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
         pass.desktop_compute_upload_srvs[parameter] = gpu;
         list->SetComputeRootShaderResourceView(parameter, gpu);
-        pass.compute_args_live = true;
     }
 }
 
