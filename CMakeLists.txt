@@ -1461,6 +1461,23 @@ add_test(NAME startup_indirect_other_refusal_census_control_warp
 set_tests_properties(startup_indirect_other_refusal_census_control_warp PROPERTIES TIMEOUT 60
     PASS_REGULAR_EXPRESSION "got +'x2w-d3d12 indirect-other refusals: total 3. distinct keys 2, distinct pairs 2 \\(overflow calls 0\\)'")
 
+# Teardown of the two per-device caches that keep desktop D3D12 objects (#2572): the built d3d12_xs.dll is
+# loaded by explicit path, warmed through its own probe, then unloaded -- the caches must release what they
+# own and the module must go -- and a second load is left to process termination, where the caches must
+# release nothing because the display driver is already stopped. This check runs the built DLL itself, so
+# unlike the Python-driven startup_* tests it needs no INTAKE_PYTHON guard.
+add_executable(startup_teardown_unload tests/startup_teardown_unload.cpp)
+target_compile_features(startup_teardown_unload PRIVATE cxx_std_17)
+target_link_libraries(startup_teardown_unload PRIVATE d3d12 dxgi)
+add_dependencies(startup_teardown_unload d3d12_xs_shim)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_teardown_unload_${backend} COMMAND startup_teardown_unload
+             "$<TARGET_FILE:d3d12_xs_shim>" ${backend})
+    set_tests_properties(startup_teardown_unload_${backend} PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "startup_teardown_unload ${backend}: PASS")
+endforeach()
+set_tests_properties(startup_teardown_unload_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
 # OMSetRenderTargets with a single descriptor range, handles that hold no view, and a cleared copied descriptor.
 add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
 target_compile_features(startup_rtv_bind PRIVATE cxx_std_17)

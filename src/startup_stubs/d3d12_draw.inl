@@ -1597,6 +1597,21 @@ struct IndexedValidationPipeline {
     x2w_startup::ComPtr<ID3D12Device> device;
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+
+    // Lifetime boundary: this record owns the device it was built for, its root signature and its
+    // pipeline, from the first validation that asked for them until the module that holds it is
+    // unloaded. It is a function-local static in indexed_validation_pipeline() below, so it is destroyed
+    // during that module's CRT teardown (startup_stubs/d3d12_teardown.h). On process exit the display
+    // driver may already be stopped and releasing a pipeline state then fails inside it (amdxc64, #2572),
+    // so the three references are detached and nothing reaches the driver. FreeLibrary keeps the process
+    // and the driver alive: no flag, and the members above release their objects normally.
+    ~IndexedValidationPipeline()
+    {
+        if (!x2w_startup::d3d12_process_terminating) return;
+        device.Detach();
+        root.Detach();
+        pipeline.Detach();
+    }
 };
 
 IndexedValidationPipeline& indexed_validation_pipeline(ID3D12Device* device)
