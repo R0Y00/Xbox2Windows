@@ -8,6 +8,7 @@ instruction through Stage.one() and runs the emitted statement with a small Pyth
 result is compared as bits, not as text.
 """
 import math
+from fractions import Fraction
 import os
 import re
 import struct
@@ -37,22 +38,36 @@ def f2h(value):
     return struct.unpack('<H', struct.pack('<e', value))[0]
 
 
-def r32(x):
-    return struct.unpack('<f', struct.pack('<f', x))[0]
-
-
 def fma16o(a, b, c):
-    """Python model of the HLSL fma16o helper: every operation rounded to binary32, round to odd on the sum."""
-    p = r32(a * b)
-    s = r32(p + c)
-    t = r32(s - p)
-    e = r32(r32(p - r32(s - t)) + r32(c - t))
-    if not math.isfinite(s) or e == 0.0:
-        return s
-    u = struct.unpack('<I', struct.pack('<f', s))[0]
-    if u & 1 == 0:
-        u = u + 1 if (e > 0.0) == (s > 0.0) else u - 1
-    return struct.unpack('<f', struct.pack('<I', u))[0]
+    """Model of the HLSL fma16o contract: finite binary16 operands give a*b+c rounded once, ties to even (the HLSL
+    does it in 32-bit integer arithmetic, #2073); non-finite operands use binary32 arithmetic."""
+    if not all(math.isfinite(v) for v in (a, b, c)):
+        with_nan = a * b + c if not (math.isinf(a * b) and math.isinf(c) and (a * b > 0) != (c > 0)) else math.nan
+        return with_nan
+    exact = Fraction(a) * Fraction(b) + Fraction(c)
+    return h2f(f2h_exact(exact))
+
+
+def f2h_exact(x):
+    """Binary16 encoding of a rational, rounded to nearest even, overflow to infinity."""
+    sign = 0x8000 if x < 0 else 0
+    x = abs(x)
+    if x == 0:
+        return sign
+    e = max(x.numerator.bit_length() - x.denominator.bit_length() - 1, -14)
+    if Fraction(2) ** (e + 1) <= x:
+        e += 1
+    while Fraction(2) ** e > x and e > -14:
+        e -= 1
+    q = x / Fraction(2) ** (e - 10)
+    n = int(q)
+    if q - n > Fraction(1, 2) or (q - n == Fraction(1, 2) and n & 1):
+        n += 1
+    if n == 0x800:
+        n, e = 0x400, e + 1
+    if e > 15:
+        return sign | 0x7c00
+    return sign | (n if e == -14 and n < 0x400 else ((e + 15) << 10) | (n & 0x3ff))
 
 
 def stage():

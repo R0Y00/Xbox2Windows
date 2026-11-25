@@ -3352,6 +3352,7 @@ class Pipeline:
         return 'q%d' % self.samplers.setdefault(key, len(self.samplers))
 
     def common(self):
+        import pixel_aot
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                # Match pixel_aot: round the product before adding and flush denormals to signed zero.
@@ -3373,18 +3374,14 @@ class Pipeline:
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
                ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
-               # a * b + c for binary16 inputs with one rounding (#2073): the product is exact in binary32, TwoSum recovers
-               # the error of the binary32 sum, and an inexact even result moves to the odd neighbour toward the true
-               # value (round to odd), so the f16rn that follows is the only rounding that can change the result.
+               # a * b + c for binary16 inputs with one rounding (#2073). The first form recovered the binary32 sum error
+               # with a floating-point TwoSum; an NVIDIA driver (RTX 3070 Ti, 32.0.16.2101) simplified that error term to
+               # zero despite `precise`, so ties rounded the wrong way. fma16_rne works on the encodings in 32-bit integer
+               # arithmetic, so no driver floating-point rewrite can reach it. Infinities and NaNs keep float semantics.
+               pixel_aot.SALU_HELPERS['fma16_rne'],
                'float fma16o(float a, float b, float c) {',
-               '    precise float p = a * b;',
-               '    precise float s = p + c;',
-               '    precise float t = s - p;',
-               '    precise float e = (p - (s - t)) + (c - t);',
-               '    if (!isfinite(s) || e == 0.0) return s;',
-               '    uint u = asuint(s);',
-               '    if ((u & 1u) == 0u) u = ((e > 0.0) == (s > 0.0)) ? u + 1u : u - 1u;',
-               '    return asfloat(u);',
+               '    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) return a * b + c;',
+               '    return f16tof32(fma16_rne(f32tof16(a), f32tof16(b), f32tof16(c)));',
                '}',
                # binary32 to binary16 rounded to nearest even: f32tof16 truncates, a binary16 result must round (#1723).
                'uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
