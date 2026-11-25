@@ -17,6 +17,7 @@
 #include "xmem_page_batch.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
+#include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
@@ -47,6 +48,7 @@
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/list_copy.h"
+#include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/rect_indirect_args.h"
 #include "startup_stubs/profile_zone.h"
 
@@ -2357,6 +2359,7 @@ struct Pass {
     const std::vector<RootParameter>* requested_mesh_root = nullptr;
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
+    x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
@@ -2560,6 +2563,7 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Pass& pass = pass_of(self);
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
+    pass.compute_tables.set_signature(w ? root_info(w) : nullptr);  // a different signature leaves no table bound
     pass.compute_params = real ? root_info(w) : nullptr;
     if (compute_binding_trace_enabled() && (!pass.compute_trace || pass.compute_trace->root != w)) {
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
@@ -5182,6 +5186,48 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
     return TRUE;
 }
 
+// Fixture probe (startup_teardown_unload, #2572) for the two caches that keep desktop objects for a
+// device: the indexed-validation pipeline (d3d12_draw.inl, bit 0) and the rectangle-list argument
+// converter (rect_indirect_args.h, bit 1). Warms the selected caches the way their first real call
+// would -- the validation pipeline directly, the converter through one record-only conversion, nothing
+// executed -- and answers how many objects they now hold for `device`: the validation entry's device,
+// root signature and pipeline (3), plus the converter entry's root signature and pipeline (2). The
+// caller can warm one cache at a time to see each one release what it owns when the module is unloaded.
+extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches)
+{
+    if (!device || !caches || (caches & ~3u)) return 0;
+    UINT owned = 0;
+    if (caches & 1u) {
+        const auto& validation = indexed_validation_pipeline(device);
+        if (validation.device) ++owned;
+        if (validation.root) ++owned;
+        if (validation.pipeline) ++owned;
+    }
+    if (!(caches & 2u)) return owned;
+
+    x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
+    x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                        IID_PPV_ARGS(&list))))
+        return owned;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 256;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // convert() copies its 16 source words; an uninitialised buffer in the state it requires is enough.
+    x2w_startup::ComPtr<ID3D12Resource> source;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                               nullptr, IID_PPV_ARGS(&source))))
+        return owned;
+    const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
+    if (scratch && x2w_startup::rect_indirect_arguments().convert(list.Get(), source.Get(), 0, scratch.Get()))
+        owned += 2;  // the converter's root signature and pipeline for this device
+    return owned;
+}
+
 // Fixture probes (startup_resource_retire_title) for state the retire bookkeeping maintains for one resource. They read
 // the same maps the shim reads and never change them; the address index and the upload cache exist with and without
 // the switch, so these answer in both modes.
@@ -6063,6 +6109,7 @@ void build_tables()
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
+        list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);

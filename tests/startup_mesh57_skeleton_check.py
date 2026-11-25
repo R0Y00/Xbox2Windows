@@ -3,6 +3,7 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -43,6 +44,13 @@ MESH = (
 PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\nv_interp_mov_f32 v2, p0, attr0.z\n'
              'v_interp_mov_f32 v3, p0, attr0.w\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n')
 PIXEL = 'c8020002 c8060102 c80a0202 c80e0302 f800180f 03020100 bf810000'.split()
+
+# Overwrite red after the raw colour load; green, blue and alpha still come from its other three words.
+COLOUR_LOAD = 'buffer_load_dwordx4 v[20:23], v4, s[16:19], 0 offen offset:192'
+FORMAT_LOAD = 'buffer_load_format_x v20, v4, s[16:19], 0 offen offset:192'
+AFTER_COLOUR_LOAD = MESH.index('e03810c0') + 2
+FORMATTED_MESH = MESH[:AFTER_COLOUR_LOAD] + ['e00010c0', '80041404'] + MESH[AFTER_COLOUR_LOAD:]
+REWRITTEN_FORMAT = FORMATTED_MESH[:AFTER_COLOUR_LOAD] + ['be930380'] + FORMATTED_MESH[AFTER_COLOUR_LOAD:]  # s_mov_b32 s19, 0
 
 
 def code(words):
@@ -148,6 +156,8 @@ def expect(what, got, want):
 
 
 REFUSALS = (
+    ('formatted load with descriptor word 3 overwritten', REWRITTEN_FORMAT,
+     'formatted buffer load through a descriptor whose words were rewritten'),
     # The request must carry the two stored counts, in this order.
     ('a request that publishes another count', mutate('887c0e04', '887c0d04'),
      'slot 57 mesh count exchange: instruction 15 of the accepted shape (s_or_b32) is absent'),
@@ -301,6 +311,14 @@ def controls():
                 expect(what + ' uses forward block dispatch', ('if (pc ==' in text, '[loop]' in text), (True, False))
                 expect(what + ' guards the position export', bool(re.search(
                     r'if \(exec & 1\) \{[^\n]*o\.pos = [^\n]*mesh_vertex = true;', text)), True)
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, FORMATTED_MESH)
+        expect('formatted mesh translates', result, 'ok')
+        if result == 'ok':
+            manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+            expect('formatted mesh reads word 3 from its bound SRV',
+                   [s.split()[2:] for s in manifest if s.startswith('udsrc ') and 'descword3' in s], [['descword3', '0']])
+            expect('formatted mesh SRV', [s for s in manifest if s.startswith('srv ')], ['srv 0 buf table 1 0'])
     for what, mesh, reason in REFUSALS:
         with tempfile.TemporaryDirectory() as tmp:
             key, result = request(tmp, mesh)
@@ -361,7 +379,12 @@ def assemble(mc, text):
 
 
 def binary(mc):
-    expect('mesh words match llvm-mc', assemble(mc, (HERE / 'startup_mesh57_skeleton.s').read_text()), MESH)
+    mesh = (HERE / 'startup_mesh57_skeleton.s').read_text()
+    expect('mesh words match llvm-mc', assemble(mc, mesh), MESH)
+    expect('formatted mesh words match llvm-mc', assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\n' + FORMAT_LOAD)),
+           FORMATTED_MESH)
+    expect('rewritten descriptor words match llvm-mc',
+           assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\ns_mov_b32 s19, 0\n' + FORMAT_LOAD)), REWRITTEN_FORMAT)
     expect('pixel words match llvm-mc', assemble(mc, PIXEL_ASM), PIXEL)
 
 
@@ -539,12 +562,57 @@ def draw(dxc, renderer, adapter, publisher=None):
     return 0
 
 
+def draw_formatted(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    words = [a | b << 10 | c << 20 for a, b, c in indices]
+    data = buffer(points, colours, words)
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, FORMATTED_MESH)
+        if result != 'ok':
+            raise AssertionError(result)
+        name = str(Path(tmp) / ('%016x' % key))
+        manifest = Path(name + '.ms57.txt').read_text().splitlines()
+        uds = {tuple(fields[2:]): int(fields[1]) for fields in map(str.split, manifest) if fields and fields[0] == 'udsrc'}
+        constants = bytearray(1024)
+        struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '0'], len(indices))
+        struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '1'], len(points))
+        # gfx10 descriptor word 3: FORMAT in bits 12..18, DST_SEL_X in bits 0..2. Decode the same
+        # four bytes at each vertex as either its original float or an individual UNORM8 component.
+        float_x, unorm_x, unorm_z = (22 << 12) | 4, (56 << 12) | 4, (56 << 12) | 6
+        images = {}
+        for word3, byte in ((float_x, None), (unorm_x, 0), (unorm_z, 2)):
+            shaded = [(r if byte is None else data[192 + 16 * slot + byte], g, b, a)
+                      for slot, (r, g, b, a) in enumerate(colours)]
+            images[word3] = rasterise(points, shaded, indices, len(points), len(indices))
+        path = Path(tmp) / 'formatted.bin'
+        args = [renderer, adapter, '--mesh-indexed', name + '.ms57.cso', name + '.ps57.cso', str(path)]
+        for word3, reference in ((float_x, float_x), (unorm_x, unorm_x), (unorm_z, unorm_z),
+                                 (float_x, unorm_x), (unorm_x, unorm_z)):
+            struct.pack_into('<I', constants, 4 * uds['descword3', '0'], word3)
+            path.write_bytes(bytes(constants) + data + b'\xcd' * 80 + b''.join(map(bytes, images[reference])))
+            mismatches = sum(a != b for a, b in zip(images[word3], images[reference]))
+            assert (word3 == reference) == (mismatches == 0)
+            run = subprocess.run(args, capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            if (run.returncode != int(bool(mismatches))
+                    or not re.search(rf'\bpixels={SIDE * SIDE} mismatches={mismatches}\b', run.stdout)):
+                raise AssertionError(f'descriptor {word3:#x}, reference {reference:#x}: {run.stdout}{run.stderr}')
+            print(f'descriptor {word3:#x}, reference {reference:#x}: {mismatches} differing pixels')
+    return 0
+
+
 def main(argv):
     status = 0
     if argv[1:2] == ['binary'] and len(argv) == 3:
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
         status = draw(*argv[2:])
+    elif argv[1:2] == ['formatted'] and len(argv) == 5:
+        status = draw_formatted(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
     elif len(argv) == 1:

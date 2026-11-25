@@ -1597,6 +1597,21 @@ struct IndexedValidationPipeline {
     x2w_startup::ComPtr<ID3D12Device> device;
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+
+    // Lifetime boundary: this record owns the device it was built for, its root signature and its
+    // pipeline, from the first validation that asked for them until the module that holds it is
+    // unloaded. It is a function-local static in indexed_validation_pipeline() below, so it is destroyed
+    // during that module's CRT teardown (startup_stubs/d3d12_teardown.h). On process exit the display
+    // driver may already be stopped and releasing a pipeline state then fails inside it (amdxc64, #2572),
+    // so the three references are detached and nothing reaches the driver. FreeLibrary keeps the process
+    // and the driver alive: no flag, and the members above release their objects normally.
+    ~IndexedValidationPipeline()
+    {
+        if (!x2w_startup::d3d12_process_terminating) return;
+        device.Detach();
+        root.Detach();
+        pipeline.Detach();
+    }
 };
 
 IndexedValidationPipeline& indexed_validation_pipeline(ID3D12Device* device)
@@ -2388,17 +2403,17 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     }
     auto& pass = pass_of(self);
     if (pass.source_view_heap != view_heap)
+    {
         for (auto& table : pass.view_tables) table = {};
+        pass.compute_tables.clear();
+    }
     pass.source_view_heap = view_heap;
     pass.title_samplers = source;
 }
 
-// List slot 36 (desktop 32 + 4), SetGraphicsRootDescriptorTable(parameter, GPU handle): the table's
-// address in the title's descriptor memory is kept for the draw.
-void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+// The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).
+x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
 {
-    if (parameter >= 16) return;
-    auto& pass = pass_of(self);
     x2w_startup::ViewTable table;
     AcquireSRWLockShared(&note_lock);
     for (const HeapInfo& heap : heap_infos()) {
@@ -2409,7 +2424,27 @@ void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
         if (table.address) break;
     }
     ReleaseSRWLockShared(&note_lock);
-    pass.view_tables[parameter] = table;
+    return table;
+}
+
+// List slot 36 (desktop 32 + 4), SetGraphicsRootDescriptorTable(parameter, GPU handle): the table's
+// address in the title's descriptor memory is kept for the draw.
+void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+{
+    if (parameter >= 16) return;
+    auto& pass = pass_of(self);
+    pass.view_tables[parameter] = resolve_title_table(pass, gpu_handle);
+}
+// List slot 35 (desktop 31 + 4), SetComputeRootDescriptorTable(parameter, GPU handle). Recorded only for a later
+// Dispatch; slot 33 keeps the desktop compute root bind.
+void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+{
+    static LONG dropped;
+    if (!self->own().list_open) return;
+    auto& pass = pass_of(self);
+    if (!pass.compute_tables.set_table(parameter, resolve_title_table(pass, gpu_handle)) && first_calls(dropped, 4))
+        log("x2w-render compute descriptor table dropped: parameter %u (%u parameters are kept)", parameter,
+            x2w_startup::ComputeTables::max_parameters);
 }
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)

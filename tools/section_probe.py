@@ -49,6 +49,12 @@ def scan_window(data, base, first, last):
 
 
 def inspect(path, first, last):
+    if not path.is_file():
+        if path.is_dir():
+            raise ValueError(f"archive path is a directory, not a file: {path}")
+        if not path.exists():
+            raise FileNotFoundError(f"archive file not found: {path}")
+        raise ValueError(f"archive path is not a regular file: {path}")
     size = path.stat().st_size
     window = 8 << 20
     # Merge overlapping windows on small files so a stream is counted only once.
@@ -77,14 +83,18 @@ def section_tag(value):
     return value
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     """Run the section probe CLI and return the process exit code."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archives", type=Path, nargs="+")
     parser.add_argument("--first", required=True, type=section_tag)
     parser.add_argument("--last", required=True, type=section_tag)
     args = parser.parse_args(argv)
-    print(json.dumps([inspect(p, args.first, args.last) for p in args.archives], indent=2))
+    try:
+        reports = [inspect(p, args.first, args.last) for p in args.archives]
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
+        parser.exit(1, f"section_probe: {exc}\n")
+    print(json.dumps(reports, indent=2))
     return 0
 
 
