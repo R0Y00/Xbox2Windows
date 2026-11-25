@@ -1088,12 +1088,16 @@ class Stage:
         targets = set()
         skipped = []  # compute: (branch, target) of each s_cbranch_execz
         targets.update(target for target in self.calculated_pc.values() if target is not None)
+        # (branch, target) of every branch, the proven s_setpc_b64 jumps included
+        branches = [(pc, target) for pc, target in self.calculated_pc.items() if target is not None]
         for off, n, name, asm in self.ins:
             if name.startswith('s_cbranch') or name == 's_branch':
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
+                branches.append((off, target))
                 if name == 's_cbranch_execz' and self.kind == 'cs':
                     skipped.append((off, target))
+        join_writes = self.join_writes(branches)
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()
         self.varying_s = set()
@@ -1119,6 +1123,12 @@ class Stage:
                 # A join: another path can reach here with other VGPR, SGPR and SCC values, so no proof survives.
                 self.uniform_v.clear()
                 self.since_join, self.scc_uniform = set(), False
+                # A constant is only known here if no other path into the join writes the register: a loop counter
+                # set before the loop and incremented in it reaches the loop head with a new value on every pass.
+                # set_s also assigns constants at run time, so the register reads its real value once it is dropped.
+                for reg in join_writes.get(off, ()):
+                    if (self.sym.get(reg) or ('',))[0] == 'const':
+                        del self.sym[reg]
             try:
                 if any(branch < off < target or target <= off < branch for branch, target in skipped) and (
                         name.startswith(('s_', 'v_readlane', 'v_readfirstlane', 'v_writelane'))
@@ -1151,6 +1161,26 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
+
+    def join_writes(self, branches):
+        """Branch target -> the scalar registers another path can write before it reaches the target: the loop body
+        [target, branch] for a backward branch, and the skipped instructions (branch, target) for a forward one."""
+        writes = {}
+        for branch, target in branches:
+            regs = writes.setdefault(target, set())
+            for off, _n, name, asm in self.ins:
+                if not (target <= off <= branch if target <= branch else branch < off < target):
+                    continue
+                _, ops, _ = parse(asm)
+                if name.startswith('s_movreld'):
+                    regs.update(range(128))  # M0 picks the destination
+                for tok in destinations(name, ops):
+                    r = reg_range(tok)
+                    if r and r[0] == 's':
+                        regs.update(range(r[1], r[2] + 1))
+                    elif tok == 'm0':
+                        regs.add('m0')
+        return writes
 
     def tracks_uniformity(self):
         return all(hasattr(self, name) for name in ('uniform_v', 'varying_s', 'scc_uniform'))
