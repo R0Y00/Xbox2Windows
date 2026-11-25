@@ -3075,8 +3075,8 @@ def _mul24_hi(signed):
     """High 32 bits of the 48-bit product of two 24-bit fields, in 32-bit integer arithmetic.
 
     With a = ah * 2^12 + al (al in 0..4095, ah the top 12 bits, sign-extended for the signed form) the product is
-    hh * 2^24 + mid * 2^12 + lo, so p >> 12 = hh * 2^12 + (mid + (lo >> 12)) exactly, and the result is that value
-    shifted right by 20 once hh * 2^12 is split into (hh >> 8) * 2^20 and (hh & 255) * 2^12 to stay inside 32 bits.
+    hh * 2^24 + mid * 2^12 + lo, so p >> 12 = hh * 2^12 + t with t = mid + (lo >> 12), and
+    p >> 32 = (hh + (t >> 12)) >> 8 exactly (floor division nests), which stays inside 32 bits.
     """
     if signed:
         def top(n):
@@ -3084,18 +3084,18 @@ def _mul24_hi(signed):
 
         def low(n):
             return 'asint({%d} & 0xfffu)' % n
-        mask, wrap = '255', 'asuint(%s)'
+        wrap = 'asuint(%s)'
     else:
         def top(n):
             return '(({%d} << 8) >> 20)' % n
 
         def low(n):
             return '({%d} & 0xfffu)' % n
-        mask, wrap = '255u', '%s'
+        wrap = '%s'
     hh = '(%s * %s)' % (top(0), top(1))
     mid = '(%s * %s + %s * %s)' % (top(0), low(1), low(0), top(1))
-    r = '(%s + ((%s * %s) >> 12))' % (mid, low(0), low(1))
-    return wrap % ('((%s >> 8) + (((((%s & %s) << 12) + %s)) >> 20))' % (hh, hh, mask, r))
+    t = '(%s + ((%s * %s) >> 12))' % (mid, low(0), low(1))
+    return wrap % ('((%s + (%s >> 12)) >> 8)' % (hh, t))
 
 
 VEC_U.update({
