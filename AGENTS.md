@@ -237,6 +237,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_brev_fold_check.py
 ./out/pe-env/bin/python -B tests/run_checks_parallel_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_handler_arity_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_getpc_refusal_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_arity_check.py
 ```
 
