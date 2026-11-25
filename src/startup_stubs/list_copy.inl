@@ -196,11 +196,19 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
-    if (mesh_xmem_handoff()) {
+    if (mesh_xmem_tracking()) {
         D3D12_HEAP_TYPE source_heap;
         const bool upload = fixed_heap(from.resource, source_heap) && source_heap == D3D12_HEAP_TYPE_UPLOAD;
+        const bool srv_word = mesh_xmem_handoff() && bytes == sizeof(UINT) && upload;
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+        D3D12_HEAP_PROPERTIES source_properties{};
+        const bool mesh_record = mesh_xmem_indirect() && bytes == sizeof(D3D12_DISPATCH_MESH_ARGUMENTS) &&
+            list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+            (from_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            SUCCEEDED(from.resource->GetHeapProperties(&source_properties, nullptr)) &&
+            source_properties.Type == D3D12_HEAP_TYPE_DEFAULT;
         note_mesh_xmem_write(self, to.wrapper, destination_offset, bytes,
-                             upload ? from.resource : nullptr, source_offset);
+                             srv_word || mesh_record ? from.resource : nullptr, source_offset);
     }
     if (indirect_copy_ranges()) {
         const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;

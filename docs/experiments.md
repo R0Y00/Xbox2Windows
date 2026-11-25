@@ -8785,6 +8785,38 @@ a pixel program under the same tag leaves the target clear. The amplified
 fixture passes a group index through an amplification payload and checks the
 same pixels. Adapters without mesh shader support report a capability skip.
 
+With `X2W_MESH_INDIRECT_XMEM=1`, the desktop mesh path can consume one
+12-byte indirect record from a mirrored XMem placement. A COMPUTE list uses
+slot 15 to copy the record from a default-heap UAV buffer into the XMem lease.
+Submission publishes the exact range with a completion fence. The runtime
+checks the live physical page and byte range at slot 61 and again at submission.
+A different queue waits on the writer's fence before executing and retains
+the lease through its own completion fence. This uses the page lease from
+[#2280](https://github.com/R0Y00/Xbox2Windows/pull/2280) and the queue handoff
+from [#2303](https://github.com/R0Y00/Xbox2Windows/pull/2303).
+
+The source-built check reuses the desktop mesh pipeline and compute shader
+from [#1916](https://github.com/R0Y00/Xbox2Windows/pull/1916). The shader writes
+two groups into a scratch UAV. The mirrored XMem record starts with one group.
+With the wait, the DIRECT consumer paints eight pixels. Omitting the wait
+while the COMPUTE queue is held back paints four. Without a submitted writer,
+from a different page in the same placement, or at a different byte offset,
+the runtime refuses the record and all eight pixels stay clear. The CPU view
+shows the three group counts and unchanged guard words after the writer fence.
+A second gated consumer paints eight pixels after the guest mappings are
+removed. XMem can reuse the original slot once that consumer completes.
+
+Release on Windows 10 build 19045.6456 with app-local WARP 1.0.22 and Agility
+SDK 1.620.2 passed both cases with zero D3D12 debug warnings or errors. The
+physical GPU cases returned 77 because the available GTX 1080 Ti lacks mesh
+shader support. The producer behind the application calls in
+[#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412) remains open.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed xmem_shim
+ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_xmem_arguments' -V
+```
+
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
 empty vertex slot, and a recorded root signature that matches the bound

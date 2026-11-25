@@ -2691,7 +2691,13 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
-    require_state(self, resource, argument_state);
+    if (mesh && !pass.indirect_graphics.cached_mesh && mesh_xmem_indirect() &&
+        info->placement == Placement::copied_buffer) {
+        if (const char* failure = record_mesh_xmem_read(self, base + offset, bytes, argument_state, resource, offset))
+            return refuse(failure);
+    } else {
+        require_state(self, resource, argument_state);
+    }
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, counts,
                           counts ? count_offset : 0);
@@ -3123,7 +3129,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             InterlockedIncrement(&render_executes);
         };
         bool split = false;
-        if (mesh_xmem_handoff()) {
+        if (mesh_xmem_tracking()) {
             const std::lock_guard lock(mesh_xmem_mutex);
             reap_mesh_xmem_flights();
             split = std::any_of(ready.begin(), ready.end(), mesh_xmem_needs_submission);
