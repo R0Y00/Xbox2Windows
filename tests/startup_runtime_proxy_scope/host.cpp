@@ -72,10 +72,19 @@ int main()
 
     const HMODULE carrier = load_beside(dir, L"startup_runtime_proxy_carrier.dll");
     check("load proxy carrier", carrier != nullptr);
+    if (!carrier) return 1;
+    check("release the caller's carrier reference", FreeLibrary(carrier) != FALSE);
+    check("enabled proxy stays live through process exit",
+          GetModuleHandleW(L"startup_runtime_proxy_carrier.dll") == carrier);
+    if (failures) return 1;
 
     // Host GetProcAddress is rewritten on attach; xgameruntime lookups become the proxy.
     const FARPROC host_xgr = xgr ? GetProcAddress(xgr, "QueryApiImpl") : nullptr;
     check("host GetProcAddress(xgameruntime) is proxied", host_xgr && host_xgr != xgr_query);
+    check("release the caller's runtime reference", xgr && FreeLibrary(xgr) != FALSE);
+    check("the cached provider stays live", GetModuleHandleW(L"xgameruntime.dll") == xgr);
+    if (failures) return 1;
+
     const FARPROC host_decoy = decoy ? GetProcAddress(decoy, "QueryApiImpl") : nullptr;
     check("host GetProcAddress(decoy) stays original", host_decoy == decoy_query);
 

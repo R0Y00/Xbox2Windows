@@ -5,9 +5,9 @@
 // into the GameInput stand-in, which the title imports) rewrites GetProcAddress and a direct
 // xgameruntime.dll!QueryApiImpl import on the main EXE and on DLLs that share the EXE's directory
 // (package helpers). Dynamic QueryApiImpl is wrapped only when the provider module's basename is
-// xgameruntime.dll. Later loads are noticed with LdrRegisterDllNotification, but the callback only
-// enqueues the base — patching runs after linking on a worker that pins the module first (the
-// notification is pre-link and must not call into other modules). Delay-import IAT slots are not
+// xgameruntime.dll. The pre-link load notification only requests another scan. A worker scans
+// and rewrites linked modules outside the notification, keeping each module live while it is patched.
+// Enabled proxies remain loaded until process exit. Delay-import IAT slots are not
 // rewritten. The wrapper hands out proxy objects whose methods log their first calls ("x2w-runtime")
 // and forward to the real object.
 //
@@ -56,14 +56,26 @@ SRWLOCK proxy_lock = SRWLOCK_INIT;
 void* slot_table[max_slots];
 
 using QueryApi = HRESULT(__stdcall*)(const GUID*, const GUID*, void**);
-// Written from the GPA hook, the IAT patch thread, and LdrDllNotification; first non-null wins.
+// Written from the GPA hook and the post-link scan; first non-null wins.
 std::atomic<QueryApi> real_query{nullptr};
 
-void remember_real_query(QueryApi query) noexcept
+bool keep_forward_target(FARPROC target) noexcept
 {
-    if (!query) return;
-    QueryApi expected = nullptr;
-    real_query.compare_exchange_strong(expected, query, std::memory_order_acq_rel);
+#if defined(X2W_RUNTIME_PROXY_FIXTURE)
+    return target != nullptr;
+#else
+    HMODULE module = nullptr;
+    return target && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                        reinterpret_cast<LPCWSTR>(target), &module);
+#endif
+}
+
+bool remember_real_query(QueryApi query) noexcept
+{
+    QueryApi expected = real_query.load(std::memory_order_acquire);
+    if (expected) return expected == query;
+    if (!keep_forward_target(reinterpret_cast<FARPROC>(query))) return false;
+    return real_query.compare_exchange_strong(expected, query, std::memory_order_acq_rel) || expected == query;
 }
 
 QueryApi load_real_query() noexcept { return real_query.load(std::memory_order_acquire); }
@@ -430,7 +442,9 @@ const wchar_t* path_basename(const wchar_t* path) noexcept
 bool module_basename_is(HMODULE module, const char* expect) noexcept
 {
     wchar_t path[MAX_PATH]{};
-    if (!module || !GetModuleFileNameW(module, path, MAX_PATH)) return false;
+    if (!module) return false;
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return false;
     return wide_eq_ascii_ci(path_basename(path), expect);
 }
 
@@ -448,7 +462,9 @@ bool module_is_exe_or_package_helper(HMODULE module) noexcept
     const HMODULE exe = GetModuleHandleW(nullptr);
     if (module == exe) return true;
     wchar_t exe_path[MAX_PATH]{}, mod_path[MAX_PATH]{};
-    if (!GetModuleFileNameW(exe, exe_path, MAX_PATH) || !GetModuleFileNameW(module, mod_path, MAX_PATH)) return false;
+    const DWORD exe_length = GetModuleFileNameW(exe, exe_path, MAX_PATH);
+    const DWORD mod_length = GetModuleFileNameW(module, mod_path, MAX_PATH);
+    if (!exe_length || exe_length >= MAX_PATH || !mod_length || mod_length >= MAX_PATH) return false;
     wchar_t* exe_slash = nullptr;
     for (wchar_t* p = exe_path; *p; ++p)
         if (*p == L'\\' || *p == L'/') exe_slash = p;
@@ -475,14 +491,13 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
         static LONG logged;
         if (x2w_local::first_calls(logged, 40)) x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name, static_cast<void*>(real));
         // Wrap gaming-runtime exports only when the provider module is xgameruntime.dll.
-        if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0) {
-            remember_real_query(reinterpret_cast<QueryApi>(real));
+        if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0 &&
+            remember_real_query(reinterpret_cast<QueryApi>(real)))
             return reinterpret_cast<FARPROC>(&proxy_query);
-        }
         if (runtime_local() && fake_user() && module_is_xgameruntime(module)) {
             static constexpr InitApi wrappers[3] = {&proxy_init<0>, &proxy_init<1>, &proxy_init<2>};
             for (int k = 0; k < 3; ++k) {
-                if (std::strcmp(name, init_names[k]) != 0) continue;
+                if (std::strcmp(name, init_names[k]) != 0 || !keep_forward_target(real)) continue;
                 real_init[k] = reinterpret_cast<InitApi>(real);
                 return reinterpret_cast<FARPROC>(wrappers[k]);
             }
@@ -532,8 +547,8 @@ int patch_module(HMODULE module)
             }
         } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {
             // Regular import: slot holds the real export after the loader bound it.
-            if (*slot && *slot != reinterpret_cast<ULONGLONG>(&proxy_query)) {
-                remember_real_query(reinterpret_cast<QueryApi>(*slot));
+            if (*slot != reinterpret_cast<ULONGLONG>(&proxy_query) &&
+                remember_real_query(reinterpret_cast<QueryApi>(*slot))) {
                 *slot = reinterpret_cast<ULONGLONG>(&proxy_query);
                 ++patched;
             }
@@ -554,7 +569,8 @@ int patch_module_pinned(void* dll_base)
     if (n > 0) {
         char name[64] = "?";
         wchar_t path[MAX_PATH]{};
-        if (GetModuleFileNameW(pinned, path, MAX_PATH)) {
+        const DWORD length = GetModuleFileNameW(pinned, path, MAX_PATH);
+        if (length && length < MAX_PATH) {
             const wchar_t* base = path_basename(path);
             const int keep = 60;
             int i = 0;
@@ -573,48 +589,15 @@ int patch_module_pinned(void* dll_base)
 using LdrDllNotification = void(CALLBACK*)(ULONG reason, const void* data, void* context);
 using LdrRegisterDllNotificationFn = LONG(NTAPI*)(ULONG flags, LdrDllNotification callback, void* context, void** cookie);
 constexpr ULONG ldr_dll_notification_reason_loaded = 1;
-// Layout matches ntdll's LDR_DLL_NOTIFICATION_DATA / UNICODE_STRING without winternl.h.
-struct LdrUnicodeString {
-    USHORT length;
-    USHORT maximum_length;
-    PWSTR buffer;
-};
-struct LdrDllNotificationData {
-    ULONG flags;
-    const LdrUnicodeString* full_dll_name;
-    const LdrUnicodeString* base_dll_name;
-    void* dll_base;
-    ULONG size_of_image;
-};
+// Keep the pre-link notification inside this module. One scan covers all still-loaded helpers,
+// so a burst needs no storage for module addresses and cannot overwrite pending work.
+std::atomic<bool> rescan_package_modules{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
 
-// Static ring only — the load callback must not call into any other module (MSDN LdrDllNotification).
-constexpr unsigned pending_cap = 256;
-void* pending_bases[pending_cap];
-std::atomic<unsigned> pending_read{0};
-std::atomic<unsigned> pending_published{0};
-
-void CALLBACK dll_loaded(ULONG reason, const void* data, void*)
+void CALLBACK dll_loaded(ULONG reason, const void*, void*)
 {
-    // Pre-link, and must not call into any other module. Loader holds its lock, so notices are serial.
-    if (reason != ldr_dll_notification_reason_loaded || !data) return;
-    const auto* note = static_cast<const LdrDllNotificationData*>(data);
-    if (!note->dll_base) return;
-    const unsigned slot = pending_published.load(std::memory_order_relaxed);
-    pending_bases[slot % pending_cap] = note->dll_base;
-    pending_published.store(slot + 1, std::memory_order_release);
-}
-
-void drain_pending_loads()
-{
-    unsigned read = pending_read.load(std::memory_order_relaxed);
-    const unsigned published = pending_published.load(std::memory_order_acquire);
-    if (published > read && published - read > pending_cap)
-        x2w_local::logf("x2w-runtime proxy: pending load queue wrapped; some modules may need a rescan");
-    while (read < published) {
-        void* base = pending_bases[read % pending_cap];
-        pending_read.store(++read, std::memory_order_relaxed);
-        patch_module_pinned(base);
-    }
+    if (reason == ldr_dll_notification_reason_loaded)
+        rescan_package_modules.store(true, std::memory_order_release);
 }
 
 void patch_package_modules()
@@ -653,8 +636,8 @@ void patch_package_modules()
                         considered, count);
 }
 
-// Patch the main EXE immediately, register a load notice that only enqueues bases, then a worker
-// pins and patches after linking. Package-directory helpers are in scope; other modules are not.
+// Patch the main EXE immediately. The load notice only requests another worker scan.
+// The worker pins and patches modules after linking. Package-directory helpers are in scope; other modules are not.
 void patch_imports()
 {
     const HMODULE exe = GetModuleHandleW(nullptr);
@@ -674,14 +657,20 @@ void patch_imports()
         const LONG status = register_dll(0, &dll_loaded, nullptr, &dll_cookie);
         if (status != 0) x2w_local::logf("x2w-runtime proxy: LdrRegisterDllNotification failed 0x%08lx", static_cast<unsigned long>(status));
     }
-    CreateThread(nullptr, 0, [](void*) -> DWORD {
-        // Outside DllMain / outside the pre-link notification: pin, rewrite, drop the pin.
-        patch_package_modules();
+    if (HANDLE worker = CreateThread(nullptr, 0, [](void*) -> DWORD {
+        // Outside DllMain and the pre-link notification. Clear the request before each scan so
+        // loads that arrive during the scan are picked up on the next pass.
+        rescan_package_modules.store(true, std::memory_order_release);
         for (;;) {
-            drain_pending_loads();
+            if (rescan_package_modules.exchange(false, std::memory_order_acq_rel))
+                patch_package_modules();
             Sleep(25);
         }
-    }, nullptr, 0, nullptr);
+    }, nullptr, 0, nullptr)) {
+        CloseHandle(worker);
+    } else {
+        x2w_local::logf("x2w-runtime proxy: package-module worker unavailable (%lu)", GetLastError());
+    }
 }
 
 // ---- the local user -------------------------------------------------------------------------
@@ -1485,13 +1474,18 @@ int x2w_store_method3_check() { return store_method3_check(); }
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, void*)
 {
     if (reason == DLL_PROCESS_ATTACH && x2w_local::env_on("X2W_RUNTIME_PROXY")) {
+        // Published IAT entries, the loader callback and both workers reference this module.
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                reinterpret_cast<LPCWSTR>(self), &pinned))
+            return FALSE;
         proxy_module = self;
         fill_slots(std::make_index_sequence<max_slots>{});
         patch_imports();
         // Heartbeat: every 10 s, the runtime methods called since the last report and how often, so
         // a title that keeps polling one call (waiting for something) shows it after the first-call
         // logs have gone quiet.
-        CreateThread(nullptr, 0, [](void*) -> DWORD {
+        if (HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
             static LONG seen[max_providers][max_slots];
             for (int second = 10;; second += 10) {
                 Sleep(10000);
@@ -1509,7 +1503,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, void*)
                     }
                 if (any) x2w_local::logf("%s", line);
             }
-        }, nullptr, 0, nullptr);
+        }, nullptr, 0, nullptr)) CloseHandle(heartbeat);
     }
     return TRUE;
 }
