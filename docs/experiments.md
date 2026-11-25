@@ -11960,7 +11960,7 @@ For plain 2D `image_load`, the startup translator reads `a16` coordinates from t
 halves of one VGPR and emits `Texture2D.Load` at mip zero. The synthetic case in
 `python -B tests/startup_image_load_mip_check.py` packs x=1 and y=2 into v0 and assigns 63 to v1, which the
 old lowering used as y. Full-width loads still accept cache-policy flags. Plain loads refuse an empty
-`dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits. The fixture also checks that 3D `a16` and a
+`dmask`, `r128`, `lwe`, `tfe` and reserved bits. The fixture also checks that 3D `a16` and a
 patched 2D `a16` instruction carrying an unexpected NSA extension are refused, and that the runtime
 and offline cache keys use the same revision. The check verifies translation on the CPU.
 
@@ -11973,6 +11973,17 @@ Verified on commit base `82c07000` on Windows 11 26H2 (build `26300.9974`) with 
 ```powershell
 cmake --build --preset dev --target offscreen_check d3d12_xs_shim
 ctest --preset dev --no-tests=error -R '^startup_image_sample_a16_(controls|warp|hardware)$' -V
+```
+
+## Startup translator: level-zero D16 image loads
+
+For level-zero `image_load` with `d16` on 2D (including `a16` and NSA), 3D and 2D-array resources, `tools/startup/gfx2hlsl.py` narrows each enabled `dmask` component of the `Load` result to IEEE binary16 with an integer round-to-nearest-even helper (`pack16_rne`) and packs the halves pairwise into `ceil(popcount(dmask) / 2)` consecutive VGPRs (low half first, high half second; an odd final component clears bits `31:16`). Using `pack16_rne` avoids adapter-dependent `f32tof16` rounding: WARP's `f32tof16` truncates toward zero, which lowers 31,740 of the 65,536 `DXGI_FORMAT_R16_UNORM` depth values by 1 ULP relative to RDNA hardware's nearest-even conversion (while narrowing the binary32 `Load` value with `pack16_rne` matches all 65,536 values on WARP and 65,534 of 65,536 on RDNA hardware, differing by 1 ULP only at `0xffaf` and `0xffef` where intermediate binary32 rounding lands on a binary16 tie). Pipelines that do not use `image_load` with `d16` omit `pack16_rne`. Explicit-mip `image_load_mip` with `d16`, sampler-based MIMG operations with `d16`, 1D and cube dimensions, 3D or 2D-array `a16`, `tfe`, `lwe`, `r128`, set reserved MIMG bits, an empty `dmask`, and mismatched destination or address register counts remain refused with `Unsupported`.
+
+Verified on commit base `246a875d` on Windows 11 26H2 (build `26300.9974`) with `offscreen_check --startup-image-load-d16`, DXC (`ps_6_0`) and FXC (`ps_5_1`), D3D12 debug layer enabled (`debug_errors=0 debug_warnings=0`), across Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.9818`) and AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`): two pixel fixtures covering `dmask` values `0x1`, `0x2`, `0x5` (`a16 + d16`), `0x7` (NSA with `glc slc dlc`), `0xc` and `0xf` (`unorm`) match all 128 output words (32 pixels) against both `8x2` `DXGI_FORMAT_R16_UNORM` and `8x2` `DXGI_FORMAT_R32G32B32A32_FLOAT` source textures, while six mutated HLSL controls (truncation toward zero, unpacked 32-bit `U(t.x)`, swapped low/high halves, dropped `<< 16` shift, dropped `a16` coordinate unpack, and ignored NSA register list) each fail against the reference and match their mutated models.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_image_load_d16_(controls|warp|hardware)$' -V
 ```
 
 ## Startup translator: pixel depth export

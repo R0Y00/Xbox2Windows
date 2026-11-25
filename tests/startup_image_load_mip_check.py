@@ -68,7 +68,11 @@ def check_plain_load_layouts(llvm_mc):
     # Patch the length field and append a fake NSA word to check that the decoder preserves the refusal.
     invalid_nsa = '0a0f00f00004044001000000'
 
-    for flag, encoded in (('d16', '080f00f000040480'), ('tfe', '080f01f000040400'),
+    d16_ps = shader(bytes.fromhex('080f00f000040480')).hlsl_ps()
+    assert 'v4 = pack16_rne(t.x) | (pack16_rne(t.y) << 16);' in d16_ps, d16_ps
+    assert 'v5 = pack16_rne(t.z) | (pack16_rne(t.w) << 16);' in d16_ps, d16_ps
+
+    for flag, encoded in (('tfe', '080f01f000040400'),
                           ('r128', '088f00f000040400'), ('lwe', '080f02f000040400'),
                           ('reserved', '084f00f000040400'), ('dmask:0x0', '080000f000040400'),
                           ('a16', '100f00f000040440'), ('invalid_nsa', invalid_nsa)):

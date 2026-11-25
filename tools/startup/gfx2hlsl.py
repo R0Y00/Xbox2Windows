@@ -1669,13 +1669,21 @@ class Stage:
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
             axes = 3 if three else 2
             packed_2d = how == 'load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+            packed_d16 = how == 'load' and 'd16' in mods
             allowed = ('unorm', 'glc', 'slc', 'dlc')
             if packed_2d:
                 allowed += ('a16',)
+            if packed_d16:
+                allowed += ('d16',)
             unsupported = any(not m.startswith(('dim:', 'dmask:')) and m not in allowed for m in mods)
-            wrong_address = (packed_2d and len(cs) != 1) or (how == 'load_mip' and len(cs) != axes + 1)
+            expected_addr = 1 if packed_2d else (axes + 1 if how == 'load_mip' else axes)
+            wrong_address = len(cs) != expected_addr
             if unsupported or wrong_address or not dmask:
                 raise Unsupported('image_%s address or modifiers: %s' % (how, ' '.join(mods)))
+            if packed_d16:
+                expected_dst = (bin(dmask).count('1') + 1) // 2
+                if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != expected_dst or dst[2] > 255:
+                    raise Unsupported('image_load d16 destination %s for dmask %#x' % (ops[0], dmask))
             if packed_2d:
                 packed = self.u(cs[0])
                 address = ['%s & 0xffffu' % packed, '%s >> 16' % packed]
@@ -1716,11 +1724,19 @@ class Stage:
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)
-        n = dst[1]
-        for bit, comp in enumerate('xyzw'):
-            if dmask & (1 << bit):
-                self.set_v(n, 'U(t.%s)' % comp)
-                n += 1
+        if how == 'load' and 'd16' in mods:
+            if getattr(self, 'pipe', None) is not None:
+                self.pipe.uses_pack16_rne = True
+            halves = ['pack16_rne(t.%s)' % comp for bit, comp in enumerate('xyzw') if dmask & (1 << bit)]
+            for i in range(0, len(halves), 2):
+                expr = halves[i] if i + 1 == len(halves) else '%s | (%s << 16)' % (halves[i], halves[i + 1])
+                self.set_v(dst[1] + i // 2, expr)
+        else:
+            n = dst[1]
+            for bit, comp in enumerate('xyzw'):
+                if dmask & (1 << bit):
+                    self.set_v(n, 'U(t.%s)' % comp)
+                    n += 1
 
     def image_compare(self, ops, mods, how):
         """image_sample_c and image_sample_c_lz: a 2D or 2D-array depth comparison returning one float.
@@ -2479,6 +2495,7 @@ class Pipeline:
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
+        self.uses_pack16_rne = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -2593,6 +2610,24 @@ class Pipeline:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
             out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
                        % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
+        if getattr(self, 'uses_pack16_rne', False):
+            # IEEE binary32 to binary16 round-to-nearest-even, independent of driver f32tof16 rounding.
+            out.extend((
+                'uint pack16_rne(float value) {',
+                '    uint bits = asuint(value), sign = (bits >> 16) & 0x8000u, abs_bits = bits & 0x7fffffffu;',
+                '    if (abs_bits > 0x7f800000u) return 0x7e00u;',
+                '    if (abs_bits >= 0x477ff000u) return sign | 0x7c00u;',
+                '    if (abs_bits >= 0x38800000u) {',
+                '        uint shifted = abs_bits - 0x38000000u;',
+                '        return sign | ((shifted + 0x00000fffu + ((shifted >> 13) & 1u)) >> 13);',
+                '    }',
+                '    if (abs_bits < 0x33000000u) return sign;',
+                '    uint sig = 0x00800000u | (abs_bits & 0x007fffffu), shift = 126u - (abs_bits >> 23);',
+                '    uint half_m = sig >> shift, rem = sig & ((1u << shift) - 1u), mid = 1u << (shift - 1u);',
+                '    if (rem > mid || (rem == mid && (half_m & 1u) != 0u)) half_m += 1u;',
+                '    return sign | half_m;',
+                '}',
+            ))
         return out
 
     def interface(self, for_pixel):
