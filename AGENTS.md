@@ -97,8 +97,14 @@ Windows build, commit and debug-layer status.
 
 ## Pure-Python checks
 
-These checks do not need Windows, D3D12 or game files. The list matches the
-platform-independent Python job in `.github/workflows/windows.yml`:
+These checks do not need Windows, D3D12 or game files. From the repository
+root, run the first two commands below to set up the environment, then choose
+individual checks as needed.
+
+The full Linux CI list is in the `Run Python checks` step of the `python-linux`
+job in the [CI workflow](.github/workflows/windows.yml). To run it locally,
+copy the step's `tools/run_checks_parallel.py` command with all its arguments
+and replace the leading `python` with `./out/pe-env/bin/python`.
 
 ```bash
 python3 -m venv out/pe-env
