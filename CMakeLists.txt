@@ -3284,6 +3284,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: scalar constants are dropped at a branch join that another path writes (loop counters).
     add_test(NAME startup_gfx2hlsl_loop_constants COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loop_constants_check.py")
+    # Startup shader translator: s_load with a register offset holding a known constant reaches the heap descriptor (#1723).
+    add_test(NAME startup_gfx2hlsl_sload_const_offset COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sload_const_offset_check.py")
     # Startup shader translator: uniform sources of v_readfirstlane_b32 in straight-line code and entry blocks (#1723).
     add_test(NAME startup_gfx2hlsl_readfirstlane_uniform COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_uniform_check.py")
