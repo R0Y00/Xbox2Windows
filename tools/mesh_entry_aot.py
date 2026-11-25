@@ -344,6 +344,10 @@ class Wave:
             raise ValueError("Pending scalar destination")
         self.s[scalar_reg] = self.spill_slots[slot]
 
+    def image_op(self, op, tail, expressions):
+        # Only the runtime lowerer's opt-in sampler heap path samples images.
+        raise ValueError(f"Unsupported mesh instruction {op}")
+
     def vector_op(self, op, args, expressions):
         d, *src = args
         live = [i for i in range(64) if self.exec & (1 << i)]
@@ -620,6 +624,8 @@ class Wave:
                         self.attributes[i] = [self.lane_value(t, lane) for t in operands]
                     else:
                         raise ValueError("Unsupported live export")
+            elif op.startswith("image_"):
+                self.image_op(op, tail, expressions)
             elif op.startswith("s_"):
                 self.scalar_op(op, args)
             elif op.startswith("v_"):
@@ -627,6 +633,12 @@ class Wave:
             else:
                 raise ValueError(f"Unsupported mesh instruction {op}")
         raise ValueError("No program exit")
+
+
+def live_barriers_agree(first, second):
+    # Wave.run only returns at S_ENDPGM. RDNA 2 ISA section 4.3 drops a retired
+    # wave from later barriers. While both waves are live their PCs must match.
+    return all(a == b for a, b in zip(first.barriers, second.barriers))
 
 
 def float4(values):
@@ -683,7 +695,7 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     for wave in waves:
         wave.run(decoded, expressions)
     if (
-        waves[0].barriers != waves[1].barriers
+        not live_barriers_agree(*waves)
         or len(waves[0].counts) != 1
         or waves[1].counts
     ):

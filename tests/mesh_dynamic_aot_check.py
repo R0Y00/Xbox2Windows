@@ -5,10 +5,12 @@ import struct
 import sys
 from unittest.mock import patch
 
-from mesh_dynamic_geometry_check import CASES, CODE, MESH_LIMITS, decode, words
+from mesh_dynamic_geometry_check import CASES, CODE, MESH_LIMITS, RETIRED_PREFIX, SECOND, Wave, decode, words
+from mesh_dynamic_geometry_check import WIDE_COUNTS, WIDE_SECOND, surviving_wave_code
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from mesh_dynamic_aot import enumerate_variants, lower
+from mesh_entry_aot import lower as lower_static
 
 
 def select(variants, geometry):
@@ -25,6 +27,56 @@ def expect_refusal(decoded, geometry_word_count, text, limits=MESH_LIMITS):
         assert text in str(error), error
     else:
         raise AssertionError(f"Expected refusal: {text}")
+
+
+def check_retired_wave():
+    body = decode(CODE)
+    decoded = decode(RETIRED_PREFIX + CODE)
+    geometry = [0x1003, SECOND]
+    body_barrier, = [pc + len(RETIRED_PREFIX) for pc, op in body if op == "s_barrier"]
+    # Source schedule: both arrive at 0; wave 1 branches to S_ENDPGM at 28; wave 0
+    # alone arrives at 20 and the body barrier, then exports the triangle.
+    def arrivals(program):
+        waves = [Wave(i, geometry) for i in range(2)]
+        for wave in waves:
+            wave.run(program, {})
+        return [wave.barriers for wave in waves]
+
+    assert arrivals(decoded) == [[0, 20, body_barrier], [0]]
+    assert lower_static(decoded, geometry, MESH_LIMITS) == lower_static(body, geometry, MESH_LIMITS)
+    assert lower(decoded, 2, MESH_LIMITS) == lower(body, 2, MESH_LIMITS)
+
+    # Replace wave 1's branch to the exit with a barrier. Both traces now have the same
+    # length, but the second rendezvous has two live waves at different PCs.
+    assert dict(decoded)[28].startswith("s_branch ")
+    divergent = [(pc, "s_barrier" if pc == 28 else op) for pc, op in decoded]
+    assert arrivals(divergent) == [[0, 20, body_barrier], [0, 28, body_barrier]]
+    # Wave 1 can also retire at the allocation skip, after the conflicting
+    # rendezvous. The shorter trace must still agree on the common phases.
+    exit_pc = decoded[-1][0]
+    short = [(pc, f"s_cbranch_execz {(exit_pc - pc - 4) // 4}" if op.startswith("s_cbranch_execz ") else op)
+             for pc, op in divergent]
+    assert arrivals(short) == [[0, 20, body_barrier], [0, 28]]
+    for program in (divergent, short):
+        for lowering, binding in ((lower_static, geometry), (lower, 2)):
+            try:
+                lowering(program, binding, MESH_LIMITS)
+            except ValueError as error:
+                assert "Inconsistent mesh synchronization" in str(error), error
+            else:
+                raise AssertionError("Live waves at different barrier PCs were accepted")
+
+    wide = decode(surviving_wave_code())
+    for order in ((0, 1), (1, 0)):
+        waves = [Wave(i, [WIDE_COUNTS, WIDE_SECOND]) for i in range(2)]
+        for i in order:
+            waves[i].run(wide, {})
+        first, survivor = waves
+        assert first.barriers == [172] and survivor.barriers == [172, 184]
+        assert first.counts == [(68, 2)] and first.indices[1] == [2, 1, 67]
+        assert set(first.positions) == set(range(64))
+        assert set(survivor.positions) == {64, 65, 66, 67}
+        assert tuple(survivor.positions[67]) == words((1, 1, 0, 1))
 
 
 def insert_scalar(decoded, after_pc, lines, skip_pc=None):
@@ -53,6 +105,7 @@ def check_skipped_scalars(decoded):
 
 
 def check():
+    check_retired_wave()
     decoded = decode(CODE)
     variants = enumerate_variants(decoded, 2, MESH_LIMITS)
     for name, packed_counts, second_index, vertex_count, triangles in CASES:

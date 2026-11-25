@@ -3191,6 +3191,10 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 D16_FLOAT_EXACT_SRV_FORMATS = frozenset((2, 6, 16, 21, 28, 41, 49, 61, 65, 87, 88))
 D16_UNORM16_SRV_FORMATS = frozenset((11, 35, 56))
 D16_EXACT_SRV_FORMATS = D16_FLOAT_EXACT_SRV_FORMATS | D16_UNORM16_SRV_FORMATS
+# The formats whose channels are all 32 bits wide: the export words are the stored words, so one integer
+# signature serves them. Narrower integer formats stay refused until a readback shows how they truncate.
+VERIFIED_UINT_RTVS = frozenset((3, 17, 42))   # R32G32B32A32, R32G32, R32
+VERIFIED_SINT_RTVS = frozenset((4, 18, 43))
 
 
 class Pipeline:
@@ -3263,11 +3267,11 @@ class Pipeline:
             return 'float'
         fmt = self.rtv_formats[slot]
         if fmt in UINT_RTVS:
-            if fmt != 42:
+            if fmt not in VERIFIED_UINT_RTVS:
                 raise Unsupported('unverified UINT RTV format %d' % fmt)
             return 'uint'
         if fmt in SINT_RTVS:
-            if fmt != 43:
+            if fmt not in VERIFIED_SINT_RTVS:
                 raise Unsupported('unverified SINT RTV format %d' % fmt)
             return 'int'
         return 'bits' if fmt in FLOAT32_RTVS else 'float'

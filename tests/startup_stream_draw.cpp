@@ -284,9 +284,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const bool console_gate = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_GATE", nullptr, 0) != 0;
     const bool bc = console_view || console_gate || GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
-    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    StreamMrtFormat mrt{};
+    const bool typed = stream_mrt_format(format, mrt);
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
-    const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const bool single = typed;
     const bool legacy = !single;
     const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;

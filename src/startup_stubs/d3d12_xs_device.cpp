@@ -36,6 +36,7 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
+#include "startup_stubs/list_copy.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -1099,6 +1100,8 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 void release_targets(Wrapper* self);
 void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
 void reset_list_dynamic_state(Wrapper* self);
+void discard_list_gpu_writes(Wrapper* self);
+void commit_list_gpu_writes(Wrapper* self);
 void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void discard_address_uploads(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
@@ -1153,6 +1156,7 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
 }
 
 LONG draw_dump_frame();
+void discard_red_producer(ID3D12GraphicsCommandList* list);
 x2w_startup::DrawReadbacks& draw_dumps()
 {
     static x2w_startup::DrawReadbacks tracker;
@@ -1425,9 +1429,11 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     ReleaseSRWLockExclusive(&allocator_lock);
     if (SUCCEEDED(hr)) {
         reset_list_dynamic_state(self);
+        discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(previous);
         discard_address_uploads(previous);
         if (draw_dump_frame()) draw_dumps().discard(previous);
+        discard_red_producer(previous);
     }
     InterlockedIncrement(SUCCEEDED(hr) ? &render_resets : &render_reset_failures);
     static LONG failures;
@@ -1459,9 +1465,11 @@ HRESULT __stdcall list_close(Wrapper* self)
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&render_closes);
     if (FAILED(hr)) {
+        discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(list);
         discard_address_uploads(list);
         if (draw_dump_frame()) draw_dumps().discard(list);
+        discard_red_producer(list);
         static LONG failures;
         if (first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
     }
@@ -2016,6 +2024,8 @@ std::size_t readable_window(u64 address, std::size_t wanted)
 
 // Per-list state while recording.
 struct Pass {
+    struct CopyRange { ID3D12Resource* resource; u64 offset, bytes; };
+    std::vector<CopyRange> copied_gpu_ranges; // exact CopyBufferRegion destinations on this recording
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
     ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
@@ -2047,6 +2057,8 @@ struct Pass {
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
+    ID3D12Resource* trace_targets[8]{};
+    ID3D12Resource* trace_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
@@ -2077,6 +2089,38 @@ Pass& pass_of(Wrapper* self)
     if (!self->own().pass) self->own().pass = new Pass;
     return *static_cast<Pass*>(self->own().pass);
 }
+
+bool indirect_copy_ranges()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_COPY_RANGES");
+    return enabled;
+}
+
+bool list_copied_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u64 bytes)
+{
+    if (!indirect_copy_ranges()) return false;
+    const auto& ranges = pass_of(self).copied_gpu_ranges;
+    return std::any_of(ranges.begin(), ranges.end(), [&](const Pass::CopyRange& range) {
+        return range.resource == resource && offset >= range.offset && bytes <= range.bytes &&
+            offset - range.offset <= range.bytes - bytes;
+    });
+}
+
+void note_copy_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u64 bytes, bool authoritative)
+{
+    if (!indirect_copy_ranges()) return;
+    auto& ranges = pass_of(self).copied_gpu_ranges;
+    ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [&](const Pass::CopyRange& range) {
+        if (range.resource != resource) return false;
+        return range.offset <= offset ? offset - range.offset < range.bytes : range.offset - offset < bytes;
+    }), ranges.end());
+    if (authoritative && ranges.size() < 64) {
+        try { ranges.push_back({resource, offset, bytes}); }
+        catch (const std::bad_alloc&) { return; }
+        static LONG reports;
+        if (first_calls(reports, 16)) log("x2w-render recorded GPU buffer copy range: offset 0x%llx, %llu bytes", offset, bytes);
+    }
+}
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
@@ -2102,6 +2146,10 @@ D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
     return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 }
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
+
+#include "startup_stubs/red_producer_diagnostic.inl"
+
+void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().discard(list); }
 void release_targets(Wrapper* self)
 {
     Pass& pass = pass_of(self);
@@ -2418,8 +2466,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
     require_state(self, resource, argument_state);
+    const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, counts,
                           counts ? count_offset : 0);
+    red_producer_draw_after(self, red_samples);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
@@ -2536,8 +2586,10 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     use_as_target(self, target);
+    const auto red_sample = red_producers().before(self, list, target, "clear-rtv", 0, 0);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
                                 rect_count ? rects : nullptr);
+    red_producers().after(self, red_sample);
     InterlockedIncrement(&render_clears);
 }
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
@@ -2635,6 +2687,10 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         }
     }
     if (!count && !dsv_ptr) return;
+    if (red_producers().enabled()) {
+        std::copy_n(targets, 8, pass.trace_targets);
+        pass.trace_depth = dsv_target;
+    }
     for (UINT i = 0; i < count; ++i) {
         use_as_target(self, targets[i]);
         pass.target_formats[i] = formats[i];
@@ -2766,7 +2822,9 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
+        const auto red_samples = red_producer_draw_before(self, list, "native-draw", 0);
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
+        red_producer_draw_after(self, red_samples);
         const LONG n = InterlockedIncrement(&render_draws);
         if (n > 0 && n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
@@ -2806,15 +2864,18 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (!ready.empty()) {
             auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
             const UINT ready_count = static_cast<UINT>(ready.size());
-            if (draw_dump_frame()) {
-                const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
-                if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
-            } else {
-                queue->ExecuteCommandLists(ready_count, ready.data());
-            }
+            red_producers().execute(queue, ready, [&] {
+                if (draw_dump_frame()) {
+                    const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
+                    if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
+                } else {
+                    queue->ExecuteCommandLists(ready_count, ready.data());
+                }
+            });
             retire_address_uploads(queue, ready);
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
+            for (Wrapper* w : submitted) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
         }
         ReleaseSRWLockExclusive(&allocator_lock);
@@ -3415,7 +3476,11 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     }
     // The allocation holding the address, and whether every byte from its base to the end of the
     // buffer is committed in it: one region-information call for a fully committed private
-    // allocation, otherwise a region walk that stops at the end of the buffer.
+    // allocation, otherwise a region walk that stops at the end of the buffer. The GPU cannot fault in a lazily
+    // mapped physical page (X2W_XMEM_LAZY_COMMIT), so the buffer's pages are committed first; a lazy startup
+    // block (X2W_XMEM_LAZY_STARTUP) is committed whole, as the heap opened on it is reused for the block.
+    x2w_local::commit_lazy(address, static_cast<std::size_t>(desc->Width));
+    x2w_local::commit_lazy_block(address);
     x2w_startup::PlacedBufferRange range;
     const bool committed = x2w_startup::measure_placed_buffer(address, desc->Width, range);
     InterlockedIncrement64(&placed_buffer_calls);
@@ -3494,6 +3559,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 }
 
 #include "d3d12_memory_srv.inl"
+#include "startup_stubs/list_copy.inl"
 
 // The title exports __XMemAllocationHooks__ = {alloc(size, attributes), free(ptr, attributes), ...}.
 // Its alloc routine selects a hook chain by allocatorId (attribute bits 16-23). Around the creation
@@ -3919,10 +3985,22 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
         return created;
     }();
     // Kept until the process ends, so a copy in flight never loses the objects it uses.
-    static auto* const sampler = new x2w_present_signature::Sampler(every, explicit_every > 0);
+    static auto* const sampler = new x2w_present_signature::Sampler(every, explicit_every > 0, red_producers().enabled());
     ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
     static LONG first, refused, failed;
+    if (published && red_producers().enabled() && sampler->last_format() == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        const auto* rgba = sampler->last_rgba();
+        const bool red = rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0;
+        const bool matched = red_producers().matches(rgba);
+        red_producers().observe(sampler->last_present(), frame, sampler->last_surface(), matched);
+        static bool was_matched;
+        if (matched != was_matched || red_producers().interested()) {
+            log("x2w-red sample present=%lld published_at=%ld target=%p rgba=%u,%u,%u,%u red=%u match=%u tick=%llu",
+                sampler->last_present(), frame, sampler->last_surface(), rgba[0], rgba[1], rgba[2], rgba[3], red, matched, GetTickCount64());
+            was_matched = matched;
+        }
+    }
     if (published && first_calls(first, 1))
         log("x2w-present picture signature: first sample published at present %ld in Local\\x2w_present_signature_%lu (every %d presents)",
             frame, static_cast<unsigned long>(GetCurrentProcessId()), every);
@@ -3943,6 +4021,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     const LONG frame = InterlockedIncrement(&frames);
     frame_number = frame;
     draw_dump_flush();
+    red_producers().flush();
     {
         static const LONG wanted = [] {
             char value[16]{};
@@ -3964,6 +4043,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
         capture::present(frame, surface);
+        if (surface && surface->own().kind == resource_kind)
+            red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
         // Render mode: the presented surface goes to the title's window through a swap chain.
         if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
             shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
@@ -4172,6 +4253,9 @@ void build_tables()
     if (render_mode()) {
         list_typed[9] = reinterpret_cast<ListTyped>(&list_close);
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
+        list_typed[15] = reinterpret_cast<ListTyped>(&list_copy_buffer_region);
+        list_typed[17] = reinterpret_cast<ListTyped>(&list_copy_resource);
+        list_typed[19] = reinterpret_cast<ListTyped>(&list_resolve_subresource);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
