@@ -1378,6 +1378,16 @@ foreach(backend IN ITEMS warp hardware)
 endforeach()
 set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware startup_indirect_count_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
+# GPU-written indirect Dispatch through a translated slot 67 pipeline (#2492).
+# Source-built fixture: one placed argument buffer, one GPU-written 3-DWORD record,
+# one translated consumer word per group, one queue fence. Positive GPU execution
+# needs #2470 plus the slot 61 translated-compute binding; until then the e2e
+# script checks the oracle and reports a capability skip (exit 77).
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_slot67_indirect_dispatch_${backend} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot67_indirect_dispatch_check.py" e2e ${backend})
+    set_tests_properties(startup_slot67_indirect_dispatch_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
+
 # Occlusion queries recorded through command-list slots 28 to 30 reach the readback buffer (#870).
 add_executable(startup_list_queries tests/startup_list_queries.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_list_queries PRIVATE cxx_std_17)
