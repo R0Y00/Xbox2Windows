@@ -192,6 +192,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             "--trace-files", "1", "--continue-asserts", "4", *passed]
     record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
+    if "-Render" in switches or translate:
+        want.extend(["--managed-window", "1"])
     expected = [want, "1" if "-TraceApi" in switches else trace_api_env]
     if got != expected:
         found.append(f"stub exit {code}: debugger [argv, X2W_TRACE_API] was {got}, expected {expected}")

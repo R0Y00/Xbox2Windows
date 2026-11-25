@@ -16,10 +16,12 @@ import re
 import struct
 import sys
 import time
+import uuid
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
+k32.CreateEventW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
@@ -154,11 +156,17 @@ def main():
 
     k32.SetErrorMode(0x8003)
     job = k32.CreateJobObjectW(None, None)
+    if not job:
+        print("CreateJobObject failed", ctypes.get_last_error())
+        return 2
     info = EXTENDED_LIMIT()
     info.Basic.LimitFlags = 0x2000 | 0x200 | 0x8
     info.Basic.ActiveProcessLimit = 1
     info.JobMemoryLimit = memory
-    k32.SetInformationJobObject(wt.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info))
+    if not k32.SetInformationJobObject(wt.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info)):
+        print("SetInformationJobObject failed", ctypes.get_last_error())
+        k32.CloseHandle(wt.HANDLE(job))
+        return 2
 
     out = inheritable_file(os.path.join(logdir, "stdout.txt"))
     err = inheritable_file(os.path.join(logdir, "stderr.txt"))
@@ -167,6 +175,15 @@ def main():
     si.dwFlags = 0x100
     si.hStdOutput, si.hStdError = out, err
     env = dict(os.environ, X2W_TRAP_LOG=trap_log)
+    env.pop("X2W_SESSION_CLOSE_EVENT", None)
+    close_event = None
+    if opts.get("--managed-window") == "1":
+        name = "Local\\X2W-session-close-" + uuid.uuid4().hex
+        close_event = k32.CreateEventW(None, True, False, name)
+        if not close_event:
+            print("CreateEvent for output window failed", ctypes.get_last_error())
+            return 2
+        env["X2W_SESSION_CLOSE_EVENT"] = name
     # A process started under a debugger gets the debug heap: no low-fragmentation heap and checks on
     # every allocation and free. That multiplies the cost of each free, and a startup run frees a lot.
     # _NO_DEBUG_HEAP=1 keeps the ordinary heap; a caller who wants the checks sets _NO_DEBUG_HEAP=0.
@@ -178,7 +195,10 @@ def main():
                               ctypes.create_unicode_buffer(block), cwd, ctypes.byref(si), ctypes.byref(pi)):
         print("CreateProcess failed", ctypes.get_last_error())
         return 2
-    k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess))
+    if not k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess)):
+        print("AssignProcessToJobObject failed", ctypes.get_last_error())
+        k32.TerminateProcess(wt.HANDLE(pi.hProcess), 2)
+        return 2
     k32.DebugSetProcessKillOnExit(True)
     k32.ResumeThread(wt.HANDLE(pi.hThread))
     if opts.get("--console", "1") == "1":
@@ -618,8 +638,20 @@ def main():
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
     stop_requested = False
+    window_close = False
+    close_deadline = None
     stop_next = 0.0
-    while not timeout or time.time() - start < timeout:
+    while close_deadline is not None or not timeout or time.time() - start < timeout:
+        if close_deadline is not None:
+            if time.monotonic() >= close_deadline:
+                break
+        elif close_event and k32.WaitForSingleObject(wt.HANDLE(close_event), 0) == 0:
+            window_close = True
+            log(f"{time.time() - start:7.3f} output window closed: ending the run")
+            if not k32.TerminateJobObject(wt.HANDLE(job), 0):
+                log(f"TerminateJobObject failed: {ctypes.get_last_error()}")
+                break
+            close_deadline = time.monotonic() + 10
         if time.time() >= stop_next:
             stop_next = time.time() + 0.5
             if os.path.exists(stop_file):
@@ -848,6 +880,8 @@ def main():
             print(f"  code at rip-32: {code_bytes.hex(' ')}")
         if thread:
             k32.CloseHandle(wt.HANDLE(thread))
+    elif window_close:
+        print(f"stopped by output window close after {elapsed:.2f} s")
     elif exit_code is not None:
         print(f"process exited with {exit_code:#010x} after {elapsed:.2f} s")
     else:
@@ -944,14 +978,18 @@ def main():
         user32.GetWindowTextW(wt.HWND(hwnd), title, 128)
         print(f"  window capture: {width}x{height} -> window.png (client area as on screen; title text length {len(title.value)})")
 
-    if exit_code is None:
+    if exit_code is None and not window_close:
         try:
             capture_window()
         except Exception as error:  # diagnostics only
             print(f"  window capture failed: {error}")
     k32.TerminateJobObject(wt.HANDLE(job), 0xDEAD0002)
-    for h in (out, err, pi.hThread, pi.hProcess):
-        k32.CloseHandle(wt.HANDLE(h))
+    child_stopped = not window_close or k32.WaitForSingleObject(wt.HANDLE(pi.hProcess), 2000) == 0
+    if not child_stopped:
+        print("output window close: process did not signal exit")
+    for h in (out, err, pi.hThread, pi.hProcess, close_event, job):
+        if h:
+            k32.CloseHandle(wt.HANDLE(h))
     events.close()
     print(f"modules loaded: {len(modules)}")
     with open(os.path.join(logdir, "finished.txt"), "w", encoding="utf-8") as handle:
@@ -960,7 +998,7 @@ def main():
         path = os.path.join(logdir, name)
         if os.path.exists(path) and os.path.getsize(path):
             print(f"--- {name}\n" + open(path, encoding="utf-8", errors="replace").read()[-3000:])
-    return 0
+    return 0 if child_stopped else 2
 
 
 if __name__ == "__main__":

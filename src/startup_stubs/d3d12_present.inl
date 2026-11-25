@@ -29,6 +29,7 @@ LONG window_presents;
 // With X2W_HIDE_TITLE_WINDOW=1, a timer on this thread hides the title's own window while frames
 // are shown here (x2w_startup::TitleWindowHider, docs/startup-runtime.md#switches).
 HWND output_handle;
+LONG output_closed;
 LONG last_frame_shown;  // whether the latest present reached this window (set by queue_present)
 x2w_startup::TitleWindowHider title_hider;  // used on the output window's thread only
 DWORD WINAPI output_window_thread(void* ready)
@@ -36,7 +37,19 @@ DWORD WINAPI output_window_thread(void* ready)
     WNDCLASSW cls{};
     cls.lpfnWndProc = [](HWND window, UINT message, WPARAM w, LPARAM l) -> LRESULT {
         if (message == WM_CLOSE) {
-            ShowWindow(window, SW_MINIMIZE);
+            wchar_t name[96]{};
+            const DWORD length = GetEnvironmentVariableW(L"X2W_SESSION_CLOSE_EVENT", name, ARRAYSIZE(name));
+            if (length && length < ARRAYSIZE(name)) {
+                if (HANDLE request = OpenEventW(EVENT_MODIFY_STATE, FALSE, name)) {
+                    const BOOL sent = SetEvent(request);
+                    CloseHandle(request);
+                    if (sent) return 0;
+                }
+            }
+            InterlockedExchange(&output_closed, 1);
+            KillTimer(window, x2w_startup::hide_title_timer);
+            title_hider.step(window, 0, 0);
+            ShowWindow(window, SW_HIDE);
             return 0;
         }
         if (message == WM_TIMER && w == x2w_startup::hide_title_timer) {
@@ -191,7 +204,7 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 {
     X2W_ZONE("window present (blit + fence wait)");
     WindowPresenter& p = window_presenter;
-    if (p.failed || !queue || !surface) return false;
+    if (p.failed || !queue || !surface || InterlockedCompareExchange(&output_closed, 0, 0)) return false;
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();
     if (!x2w_startup::present_surface_supported(desc)) {
         static LONG refused;
