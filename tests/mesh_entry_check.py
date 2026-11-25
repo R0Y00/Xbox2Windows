@@ -838,8 +838,13 @@ def skipped_refusals():
         program[at:at] = lines
         try:
             lower(enumerate_pcs(program), [0x1003], (3, 1))
+        except KeyError:
+            # A register no instruction writes is an unknown operand, refused by its number.
+            if name != "never written anywhere":
+                raise
+            continue
         except ValueError as error:
-            if "not written on this wave" not in str(error) and "Undefined" not in str(error):
+            if "not written on this wave" not in str(error):
                 raise AssertionError(f"{name}: refused for another reason: {error}")
             continue
         raise AssertionError(f"{name}: accepted")

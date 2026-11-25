@@ -90,6 +90,7 @@ class Wave:
         self.attributes = {}
         self.indices = {}
         self.m0 = None
+        self.written = set()
 
     def scalar(self, t, allow_undef=False):
         if t.startswith("s["):
@@ -104,7 +105,8 @@ class Wave:
             i = int(t[1:])
             if i in self.pending:
                 raise ValueError("Scalar load used before wait")
-            value = self.s.get(i, UNDEF)
+            # A register no instruction ever writes is a bad operand, not a skipped write.
+            value = self.s.get(i, UNDEF) if i in self.written else self.s[i]
             if value is UNDEF and not allow_undef:
                 raise ValueError(UNDEFINED_SCALAR)
             return value
@@ -469,6 +471,12 @@ class Wave:
 
     def run(self, decoded, expressions):
         jumps = {offset: i for i, (offset, _) in enumerate(decoded)}
+        for _, line in decoded:
+            dest = line.partition(" ")[2].split(", ")[0]
+            if re.fullmatch(r"s\d+", dest):
+                self.written.add(int(dest[1:]))
+            elif dest.startswith("s["):
+                self.written.update(span(dest))
         pc = 0
         while pc < len(decoded):
             offset, line = decoded[pc]
