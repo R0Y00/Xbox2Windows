@@ -331,7 +331,7 @@ def run_variant(decoded, geometry, limits, conditions):
     expressions = {}
     first, second = RuntimeWave(0, geometry), RuntimeWave(1, geometry)
     run_group([first, second], decoded, expressions)
-    if first.barriers != second.barriers or len(first.counts) != 1 or second.counts:
+    if len(first.counts) != 1 or second.counts:
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = first.counts[0]
     pos = first.positions | second.positions

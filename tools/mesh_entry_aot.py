@@ -102,6 +102,7 @@ class Wave:
         self.staged = {}
         self.reads = set()
         self.pending_ds = set()
+        self.pending_lds_sources = set()
         self.ds_writes_pending = False
         self.counts = []
         self.positions = {}
@@ -167,6 +168,10 @@ class Wave:
     def vector_pending(self, lane, reg):
         """True while a vector load or LDS read still owes this register."""
         return (lane, reg) in self.pending_v or (lane, reg) in self.pending_ds
+
+    def check_vector_write(self, lane, reg):
+        if (lane, reg) in self.pending_lds_sources:
+            raise ValueError("LDS source overwritten before VM_VSRC or LGKM wait")
 
     def lane_value(self, t, lane):
         if re.fullmatch(r"v\d+", t):
@@ -336,7 +341,8 @@ class Wave:
         reg = int(vgpr[1:])
         slot = (reg, lane)
         if writing:
-            if any(int(token[1:]) == reg for _, token in self.pending_v):
+            self.check_vector_write(lane, vgpr)
+            if any(int(token[1:]) == reg for _, token in self.pending_v | self.pending_ds):
                 raise ValueError(f"{op} overlaps a pending vector load into {vgpr}")
             if source in ("exec_lo", "exec_hi"):
                 value = self.exec >> (32 if source == "exec_hi" else 0)
@@ -504,6 +510,7 @@ class Wave:
                 raise ValueError(f"Unsupported lane instruction {op}")
             if self.vector_pending(lane, d):
                 raise ValueError("Pending vector destination")
+            self.check_vector_write(lane, d)
             self.v[lane][int(d[1:])] = v & U32 if isinstance(v, int) else v
 
     def lds_op(self, op, tail):
@@ -544,10 +551,14 @@ class Wave:
                     raise ValueError("LDS load of a dword no wave published")
                 if self.vector_pending(lane, dest):
                     raise ValueError("LDS load overwrites a pending result")
+                self.check_vector_write(lane, dest)
                 self.reads.add(address)
                 self.v[lane][int(dest[1:])] = self.lds[address]
                 self.pending_ds.add((lane, dest))
-        if write:
+            self.pending_lds_sources.add((lane, address_reg))
+            if write:
+                self.pending_lds_sources.add((lane, data_reg))
+        if writes:
             for address, data in writes.items():
                 if self.staged.setdefault(address, data) != data:
                     raise ValueError("Conflicting LDS stores before a barrier")
@@ -581,14 +592,21 @@ class Wave:
                     for reg in self.spill_vgprs.intersection(regs):
                         self.spill_vector_uses.setdefault(reg, (offset, op))
             if op == "s_endpgm":
+                if self.ds_writes_pending:
+                    raise ValueError("LDS store not waited before wave retirement")
                 return
             if op in ("s_inst_prefetch", "s_nop"):
                 continue
             if op == "s_barrier":
                 if self.ds_writes_pending:
-                    raise ValueError("LDS store not waited before the barrier")
+                    raise ValueError(f"LDS store not waited before the barrier at +0x{offset:x}")
                 self.barriers.append(offset)
-                yield
+                yield offset
+            elif op == "s_waitcnt_depctr":
+                if tail != "0xffe3" or self.pending_v:
+                    raise ValueError("Unsupported mesh dependency-counter wait")
+                # 0xffe3 drains VM_VSRC. LDS operations still track LGKM completion.
+                self.pending_lds_sources.clear()
             elif op == "s_waitcnt":
                 if not re.fullmatch(
                     r"(?:vmcnt\(0\)|expcnt\(0\)|lgkmcnt\(0\))(?: (?:vmcnt\(0\)|expcnt\(0\)|lgkmcnt\(0\)))*",
@@ -598,6 +616,7 @@ class Wave:
                 if "lgkmcnt" in tail:
                     self.pending.clear()
                     self.pending_ds.clear()
+                    self.pending_lds_sources.clear()
                     self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
@@ -654,6 +673,7 @@ class Wave:
                                 raise ValueError(
                                     "Vertex load overwrites an outstanding result"
                                 )
+                            self.check_vector_write(*key)
                             self.v[lane][reg] = (
                                 f"asfloat(vertexData.Load({address + 4 * j}))"
                             )
@@ -669,6 +689,7 @@ class Wave:
                         addr = self.lane_value(match[2], lane)
                         if self.vector_pending(lane, match[1]):
                             raise ValueError("Vector load overwrites pending result")
+                        self.check_vector_write(lane, match[1])
                         if addr % 4 or not 0 <= addr // 4 < len(self.geometry):
                             raise ValueError("Geometry address out of range")
                         self.v[lane][int(match[1][1:])] = self.geometry[addr // 4]
@@ -731,30 +752,26 @@ def check_interval(waves):
 
 
 def run_group(waves, decoded, expressions):
-    """Run the waves of one group in lockstep between barriers.
-
-    Each wave runs to its next barrier before any wave goes on. Stores become
-    visible to every wave only when all of them have reached the barrier.
-    """
+    """Publish completed LDS stores when all remaining waves reach the same barrier."""
     lds = {}
     for wave in waves:
         wave.lds = lds
     running = [wave.steps(decoded, expressions) for wave in waves]
-    while True:
-        reached = 0
+    while running:
+        waiting = []
+        barriers = set()
         for steps in running:
             try:
-                next(steps)
-                reached += 1
+                barriers.add(next(steps))
+                waiting.append(steps)
             except StopIteration:
                 pass
-        if not reached:
-            check_interval(waves)
-            return
-        if reached != len(waves):
-            raise ValueError("Waves of one group reach different numbers of barriers")
+        if len(barriers) > 1:
+            raise ValueError("Inconsistent mesh synchronization: live waves reach different barrier instructions")
         published = check_interval(waves)
-        lds.update(published)
+        if waiting:
+            lds.update(published)
+        running = waiting
 
 
 def float4(values):
@@ -809,11 +826,7 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     waves = [Wave(i, geometry, vertex_header) for i in range(2)]
     expressions = {}
     run_group(waves, decoded, expressions)
-    if (
-        not live_barriers_agree(*waves)
-        or len(waves[0].counts) != 1
-        or waves[1].counts
-    ):
+    if len(waves[0].counts) != 1 or waves[1].counts:
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = waves[0].counts[0]
     pos = waves[0].positions | waves[1].positions

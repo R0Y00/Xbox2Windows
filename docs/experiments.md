@@ -3624,6 +3624,26 @@ not waited on before the barrier, a read before its wait, a load of the wave's o
 store before a barrier, conflicting stores, dynamic or unaligned addresses, an
 address outside the 64 KiB group allocation, and unsupported compares.
 
+For gfx1013, dependency wait `s_waitcnt_depctr 0xffe3` completes the modeled
+LDS source-register dependency. Store and load completion still require
+`s_waitcnt lgkmcnt(0)`. All live waves must reach the same barrier instruction
+before a completed store becomes visible. A wave that ends before the next
+barrier retires from the rendezvous. See sections 4.3, 4.4 and 12.5 of the
+[RDNA 2 ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf).
+
+The CPU control overwrites a store's source after the dependency wait and
+verifies the other wave reads the original word after the common barrier.
+Missing or incorrect waits and different barrier instructions refuse. The draw
+control overwrites a source VGPR before the store-completion wait and compares
+1,024 pixels. This control passed on Windows 11 build 26200.9974 with WARP
+10.0.26100.9818 and an RTX 4060 Laptop GPU on driver 32.0.16.1656, with the
+debug layer enabled and no warnings or errors on either adapter.
+
+The fixed slot 57 reader uses the same evaluator as a diagnostic for an LDS
+program. It assumes a bounded two-wave profile and synthetic input words
+because the request has no verified entry bindings. The diagnostic may find a
+blocking instruction and keeps the request unforwarded.
+
 ```text
 python3 -B tests/mesh_scc_any_lane_check.py
 python3 -B tests/mesh_scc_any_lane_check.py binary llvm-mc llvm-objcopy libLLVM-15.so.1

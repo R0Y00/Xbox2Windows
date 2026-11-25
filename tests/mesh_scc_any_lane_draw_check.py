@@ -56,6 +56,18 @@ def check(dxc, runner, backend, target):
         if result.returncode:
             sys.stderr.write(result.stderr)
             return result.returncode
+    # Both waves write their flag to LDS. Retire the VGPR source dependency,
+    # overwrite that VGPR, then complete the stores before the group barrier.
+    # T=100 requires the second wave's original nonzero flag.
+    store = next(pc for pc, text in decode(CODE) if text.startswith("ds_write_b32"))
+    after_store = store + 8
+    with_depctr = CODE[:after_store] + struct.pack("<2I", 0xBFA3FFE3, 0x7E180280) + CODE[after_store:]
+    print("group any-lane branch with VM_VSRC wait and source overwrite", flush=True)
+    result = draw(runner, backend, shader("depctr", with_depctr, 100), pixel, inputs, 100)
+    sys.stdout.write(result.stdout)
+    if result.returncode:
+        sys.stderr.write(result.stderr)
+        return result.returncode
     for name, code in mutants().items():
         print(f"mutant: {name}", flush=True)
         result = draw(runner, backend, shader("mutant", code, MUTANT_THRESHOLD), pixel, inputs, MUTANT_THRESHOLD)

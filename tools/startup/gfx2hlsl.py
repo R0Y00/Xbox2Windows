@@ -3890,7 +3890,8 @@ def inspect_mesh57_request(out_dir, key):
     if mesh57_key(ms, ps, root) != key:
         raise Unsupported('slot 57 mesh request key mismatch')
     parse_root(root)
-    mesh = decode(strip_header(ms))
+    code = strip_header(ms)
+    mesh = decode(code)
     exports = [assembly.split()[1] for _, _, op, assembly in mesh if op == 'exp']
     if not mesh or mesh[-1][2] != 's_endpgm' or not any(
         op == 's_sendmsg' and assembly == 's_sendmsg 0x9' for _, _, op, assembly in mesh
@@ -3900,9 +3901,28 @@ def inspect_mesh57_request(out_dir, key):
         pixel = decode(strip_header(ps))
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps':
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
-    for offset, _, op, _ in mesh:
-        if op.startswith('ds_'):
-            raise Unsupported('slot 57 mesh workgroup memory: %s at +0x%x' % (op, offset))
+    if any(op.startswith('ds_') for _, _, op, _ in mesh):
+        from mesh_entry_aot import Wave, run_group
+        decoded = []
+        for offset, _, op, assembly in mesh:
+            if op == 's_branch' or op.startswith('s_cbranch_'):
+                displacement, = struct.unpack_from('<h', code, offset)
+                if assembly != f'{op} label_0x{offset + 4 + displacement * 4:x}':
+                    raise Unsupported('slot 57 mesh branch target disagrees with its encoding')
+                assembly = f'{op} {displacement}'
+            elif assembly == 's_barrier 0x0':
+                assembly = 's_barrier'
+            elif assembly == 's_sendmsg 0x9':
+                assembly = 's_sendmsg sendmsg(MSG_GS_ALLOC_REQ)'
+            elif assembly.startswith('exp target_20 '):
+                assembly = 'exp prim ' + assembly.removeprefix('exp target_20 ')
+            decoded.append((offset, assembly))
+        try:
+            # Raw slot 57 requests lack the real entry bindings. The fixed two-wave
+            # diagnostic profile identifies a blocker but cannot authorize code emission.
+            run_group([Wave(0, [0] * 32), Wave(1, [0] * 32)], decoded, {})
+        except (ValueError, KeyError) as reason:
+            raise Unsupported(f'slot 57 mesh workgroup probe: {reason}') from None
     raise Unsupported('slot 57 mesh code emission is unavailable')
 
 

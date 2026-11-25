@@ -54,6 +54,17 @@ CODE = bytes.fromhex(
     """
 )
 NOP = 0xBF800000
+DEPCTR_CODE = bytes.fromhex(
+    """
+    8104febe 03ff0a87 0000000f 080085bf
+    8002007e a502027e 080034d8 00010000
+    e3ffa3bf b302027e 7fc08cbf 010082bf
+    000080bf 00008abf 060084bf 8002007e
+    0800d8d8 00000002 e3ffa3bf 7fc08cbf
+    0205167e 000081bf
+    """
+)
+DEPCTR_SOURCE = HERE / "mesh_depctr_lds.s"
 
 
 def decode(code):
@@ -190,20 +201,35 @@ def check_pending_lds_destination():
             raise AssertionError(line)
 
 
+def check_dependency_wait():
+    # The first wave overwrites its former DS source after VM_VSRC reaches
+    # zero. The second wave must see the original value after the true wait
+    # and common barrier, then must wait again before consuming its read.
+    first, second = run(DEPCTR_CODE, 0)
+    assert first.v[0][1] == 51 and second.s[11] == first.lds[8] == 37
+    assert first.barriers == second.barriers == [52]
+    refuses(patched(DEPCTR_CODE, "s_waitcnt_depctr", [NOP]), "LDS source overwritten")
+    refuses(patched(DEPCTR_CODE, "s_waitcnt_depctr", [0xBFA3FFE7]), "dependency-counter wait")
+    refuses(patched(DEPCTR_CODE, "s_waitcnt lgkmcnt(0)", [NOP]), "not waited before the barrier")
+    refuses(patched_nth(DEPCTR_CODE, "s_waitcnt lgkmcnt(0)", 1, [NOP]), "before wait")
+    refuses(patched(DEPCTR_CODE, "s_nop", [0xBF8A0000]), "different barrier instructions")
+
+
 def reassemble(assembler, objcopy, library):
     with tempfile.TemporaryDirectory() as directory:
         obj, raw = (Path(directory) / name for name in ("fixture.o", "fixture.bin"))
-        subprocess.run(
-            [assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-mattr=" + WAVE64,
-             "-filetype=obj", SOURCE, "-o", obj],
-            check=True,
-        )
-        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
-        code = raw.read_bytes()
-    assert code == CODE, "Embedded bytes differ from the assembled mesh"
-    native = disassemble(code, library, offsets=True, features=WAVE64.encode("ascii"))
-    for llvm_instruction, python_instruction in zip(native, decode(code), strict=True):
-        assert llvm_instruction == python_instruction, (llvm_instruction, python_instruction)
+        for source, expected in ((SOURCE, CODE), (DEPCTR_SOURCE, DEPCTR_CODE)):
+            subprocess.run(
+                [assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-mattr=" + WAVE64,
+                 "-filetype=obj", source, "-o", obj],
+                check=True,
+            )
+            subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+            code = raw.read_bytes()
+            assert code == expected, f"Embedded bytes differ from {source.name}"
+            native = disassemble(code, library, offsets=True, features=WAVE64.encode("ascii"))
+            for llvm_instruction, python_instruction in zip(native, decode(code), strict=True):
+                assert llvm_instruction == python_instruction, (llvm_instruction, python_instruction)
 
 
 if __name__ == "__main__":
@@ -216,4 +242,5 @@ if __name__ == "__main__":
     check_mutants_change_the_result(CODE)
     check_interval_hazards()
     check_pending_lds_destination()
+    check_dependency_wait()
     print("Group-wide any-lane branch matched the CPU model; mutants and refusals held")
