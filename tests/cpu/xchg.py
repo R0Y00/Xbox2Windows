@@ -1,4 +1,8 @@
-"""Compare native and translated XCHG, and check that the memory form stays atomic under contention."""
+"""Compare native and translated XCHG, and check that the memory form stays atomic under contention.
+
+CTest runs the parts as separate cases (check-native, check-lifted, check-controls, in parallel) and keeps
+check-rejections on the aggregate. The `check` mode still runs every part serially for a direct run; the
+parts above are not the only coverage of that mode, they are the same checks split up."""
 from collections import Counter
 import ctypes
 import os

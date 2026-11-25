@@ -4,7 +4,10 @@ ADDPD, SUBPD, MULPD, DIVPD, MINPD, MAXPD and SQRTPD (xmm and aligned m128 source
 through the translator in the default control word and under all sixteen combinations of MXCSR rounding
 mode, DAZ and FTZ, each against the exact reference in sse_fp_pd_ref.py. CMPPD (predicates 0..7, xmm and
 aligned m128 sources) gets the same treatment against the predicate rules of that reference. The packed
-single checks in sse_fp_check.py provide the buffer, driver and encoding helpers."""
+single checks in sse_fp_check.py provide the buffer, driver and encoding helpers.
+
+CTest runs the parts (differential, modes, cmp_differential, cmp_modes, rejections) as separate cases in
+parallel. Passing no part name after the four paths still runs all of them serially, for a direct run."""
 
 from pathlib import Path
 import random

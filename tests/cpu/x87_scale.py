@@ -5,6 +5,8 @@ Usage:
     python tests/cpu/x87_scale.py emit <dll> <cpp> [control]   translate (and optionally mutate) the fixture
     python tests/cpu/x87_scale.py check <harness> <native> <lifted> [controls...]
 
+CTest runs the check-* parts as separate cases in parallel; `check` runs every part serially for a direct run.
+
 The exports, harness and guards follow tests/cpu/x87_add.py, and the other steps use the format of
 tests/cpu/x87_moves.py. emit checks that every decoded x87 instruction is the form its sequence names.
 The model scales with Fraction arithmetic and is independent of tools/x87_soft.h.

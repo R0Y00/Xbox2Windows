@@ -5,6 +5,8 @@ Usage:
     python tests/cpu/x87_fprem.py emit <dll> <cpp> [control]   translate (and optionally mutate) the fixture
     python tests/cpu/x87_fprem.py check <harness> <native> <lifted> [controls...]
 
+CTest runs the check-* parts as separate cases in parallel; `check` runs every part serially for a direct run.
+
 Each export loads ST(1) from offset 16 and ST(0) from offset 0 of its input block, takes the partial
 remainder, and stores the result, the divisor and records of the status word in its output block. The
 translation is lower(..., x87=Checked(REJECT)) inside a checked entry, uint32_t name(word input,
