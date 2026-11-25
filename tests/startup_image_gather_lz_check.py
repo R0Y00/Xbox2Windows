@@ -79,9 +79,13 @@ def controls(llvm_mc):
     # v[254:257] and v[255:258], which would otherwise write past v255.
     refused(shader(dst=0xfe), 'four destination registers')
     refused(shader(dst=0xff), 'four destination registers')
+    # The explicit-LOD and fixed-mip comparison gathers are lowered by their own tests; the implicit,
+    # biased and offset gathers stay refused here.
     refused(shader(opcode=0x40), 'image_gather4')
-    refused(shader(opcode=0x44), 'image_gather4_l')
-    refused(shader(opcode=0x4f), 'image_gather4_c_lz')
+    refused(shader(opcode=0x45), 'image_gather4_b')
+    refused(shader(opcode=0x54), 'image_gather4_l_o')
+    refused(shader(opcode=0x48), 'image_gather4_c')
+    refused(shader(opcode=0x5f), 'image_gather4_c_lz_o')
     bad_wrap = PREFIX.replace(bytes.fromhex('920398be'), bytes.fromhex('930398be'))
     bad_min_lod = PREFIX.replace(bytes.fromhex('800399be'), bytes.fromhex('810399be'))
     missing_sampler = PREFIX.replace(bytes.fromhex('80039bbe'), b'')

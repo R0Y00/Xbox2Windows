@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 
@@ -609,32 +610,47 @@ def lower(assembly):
     return merge_pointer_types(output)
 
 
-def main():
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    if left.exists() and right.exists():
+        return left.samefile(right)
+    return False
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--assembler", default="spirv-as")
     parser.add_argument("--validator", default="spirv-val")
-    args = parser.parse_args()
-    if args.output.resolve() == args.source.resolve():
-        parser.error("use separate input assembly and output binary paths")
-    original = args.source.read_text(encoding="utf-8")
-    with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
-        path = Path(directory)
-        binary = path / "module.spv"
+    args = parser.parse_args(argv)
+    try:
+        if _same_path(args.output, args.source):
+            raise ValueError("use separate input assembly and output binary paths")
+        if args.output.is_dir():
+            raise ValueError(f"output path must not be a directory: {args.output}")
+        original = args.source.read_text(encoding="utf-8")
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
+            path = Path(directory)
+            binary = path / "module.spv"
 
-        def validate(source):
-            subprocess.run([args.assembler, "--target-env", "vulkan1.2", source, "-o", binary], check=True)
-            subprocess.run([args.validator, "--target-env", "vulkan1.2", binary], check=True)
+            def validate(source):
+                subprocess.run([args.assembler, "--target-env", "vulkan1.2", source, "-o", binary], check=True)
+                subprocess.run([args.validator, "--target-env", "vulkan1.2", binary], check=True)
 
-        snapshot = path / "original.spvasm"
-        snapshot.write_text(original, encoding="utf-8")
-        validate(snapshot)
-        adapted = path / "logical.spvasm"
-        adapted.write_text(lower(original), encoding="utf-8")
-        validate(adapted)
-        binary.replace(args.output)
+            snapshot = path / "original.spvasm"
+            snapshot.write_text(original, encoding="utf-8")
+            validate(snapshot)
+            adapted = path / "logical.spvasm"
+            adapted.write_text(lower(original), encoding="utf-8")
+            validate(adapted)
+            binary.replace(args.output)
+    except (OSError, UnicodeDecodeError, ValueError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"error: {error}\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
