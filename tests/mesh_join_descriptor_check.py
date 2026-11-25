@@ -70,6 +70,20 @@ def checks():
     expect = "(asuint(pointData[0].x) == 0u) ? pointData[0].y : matrixData[0].y"
     assert expect in source, source
     assert "(asuint(pointData[0].x) == 0u) ? pointData[0].y : 0.0f" in build(NULL_ARM)
+    # LLVM 15 prints a branch to itself (SIMM16 = -1) as 65535.
+    split = PER_MATERIAL.copy()
+    split[split.index("s_cbranch_scc0 3")] = "s_cbranch_scc0 65535"
+    refused(split, "Expected a forward mesh branch")
+
+    arm = PER_MATERIAL.copy()
+    latch = arm.index("s_branch 2")
+    arm[latch] = "s_branch 65535"
+    # Give the *unsigned* destination an instruction. Otherwise a missing
+    # destination and a backward jump both produce the expected refusal.
+    unsigned_target = latch + 1 + 65535
+    arm.extend(["s_nop 0"] * (unsigned_target - len(arm)))
+    arm.append("s_endpgm")
+    refused(arm, "Expected a forward mesh branch")
     # Negative controls: precisely what the join does not cover.
     refused(program(table(POINT), table("0x20")), "Unsupported descriptor in a join")
     refused(
