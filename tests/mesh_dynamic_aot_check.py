@@ -182,6 +182,17 @@ def check():
     check_exec_restore(decoded)
 
     hlsl = lower(decoded, 2, MESH_LIMITS)
+    writes = [
+        (0, "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0x1234"),
+        (8, "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0"),
+    ]
+    assert lower(writes + [(pc + 16, line) for pc, line in decoded], 2, MESH_LIMITS) == hlsl
+    dead_arm = [(0, "s_branch 2"), (4, "scratch_load_dword v4, v1, off")]
+    # Without the writes the skipped scratch load is never checked; with them it refuses the program.
+    assert lower(dead_arm + [(pc + 12, line) for pc, line in decoded], 2, MESH_LIMITS) == hlsl
+    dead_scratch = writes + [(pc + 16, line) for pc, line in dead_arm]
+    expect_refusal(dead_scratch + [(pc + 28, line) for pc, line in decoded], 2,
+                   "may be observed by scratch_load_dword")
     assert hlsl.count("SetMeshOutputCounts(") == 1
     assert "ByteAddressBuffer geometryData : register(t0);" in hlsl
     assert "geometryData.Load(0)" in hlsl and "geometryData.Load(4)" in hlsl

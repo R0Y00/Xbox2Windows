@@ -4,7 +4,8 @@ usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--st
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
-Stops at the first second-chance exception, at a breakpoint inside the main image, or at the timeout.
+Stops at a second-chance exception, an uncontinued main-image breakpoint, or the timeout.
+A timeout of zero disables the timer. An assertion continuation limit of -1 removes that limit.
 A file named `stop` created in <logdir> during the run ends it as the timeout does (checked twice a
 second; a stop file left from an earlier run is removed at start).
 """
@@ -119,10 +120,13 @@ def main():
     def print(*args, **kwargs):
         summary.append(" ".join(str(a) for a in args))
         builtins.print(*args, **kwargs)
-    timeout = float(opts.get("--timeout", 15))
+    timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
     memory = int(float(opts.get("--memory-gib", 16)) * 2**30)
     stop_first = opts.get("--stop-first-chance") == "1"
-    skip_asserts = int(opts.get("--continue-asserts", "0"))  # main-image int3s to log and continue past
+    skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
+    if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
+        print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
+        return 2
     asserts_seen = {}
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
@@ -615,7 +619,7 @@ def main():
 
     stop_requested = False
     stop_next = 0.0
-    while time.time() - start < timeout:
+    while not timeout or time.time() - start < timeout:
         if time.time() >= stop_next:
             stop_next = time.time() + 0.5
             if os.path.exists(stop_file):
@@ -752,7 +756,8 @@ def main():
                     log(f"X2W_LOG_AT ignored {rva:#x}: cannot arm a main-image instruction breakpoint")
                     del log_at[rva]
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and sum(asserts_seen.values()) < skip_asserts and (ex_addr - main_base) not in stop_at):
+                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
+                  and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
                 status = DBG_CONTINUE  # rip is already past the int3
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and

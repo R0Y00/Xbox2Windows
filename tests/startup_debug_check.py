@@ -49,16 +49,25 @@ def run(probe, work, name, variables, options=("--continue-asserts", "10")):
     return result.stdout + result.stderr, logdir
 
 
-def run_with_stop(probe, work, name, after):
-    """run() without X2W_ variables, creating <logdir>/stop `after` seconds into the run."""
+def run_with_stop(probe, work, name):
+    """Create <logdir>/stop once the launcher records the running probe."""
     logdir = work / name
     env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_") and k.upper() != "_NO_DEBUG_HEAP"}
-    command = [sys.executable, "-B", str(DEBUG), str(probe), str(work), str(logdir), "--timeout", "30", "--console", "0",
+    command = [sys.executable, "-B", str(DEBUG), str(probe), str(work), str(logdir), "--timeout", "0", "--console", "0",
                "--continue-asserts", "10"]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-    time.sleep(after)
-    (logdir / "stop").write_text("", encoding="utf-8")
-    out, _ = process.communicate(timeout=120)
+    try:
+        deadline = time.monotonic() + 10
+        while f"process {probe.name} at " not in text(logdir / "events.txt"):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("stop-file probe did not start")
+            time.sleep(0.025)
+        (logdir / "stop").write_text("", encoding="utf-8")
+        out, _ = process.communicate(timeout=120)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
     return out, logdir
 
 
@@ -145,6 +154,13 @@ def main(probe, calls_dll):
         assert "process exited with 0x00000000" in out, out
         assert "debug-probe heap flags 0x70\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
 
+        out, _ = run(probe, work, "unlimited", {}, options=("--timeout", "0", "--continue-asserts", "-1"))
+        assert "process exited with 0x00000000" in out and "timeout after" not in out, out
+        out, _ = run(probe, work, "assert-cap", {}, options=("--timeout", "0", "--continue-asserts", "1"))
+        assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out, out
+        out, _ = run(probe, work, "finite", {}, options=("--timeout", "1", "--continue-asserts", "-1"))
+        assert "timeout after" in out and "process exited with" not in out, out
+
         # X2W_STOP_AT on the second site: the first is still stepped over, the run stops at the second.
         out, logdir = run(probe, work, "stop", {"X2W_STOP_AT": f"{sites[1]:x}"})
         assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out and "first chance" in out, out
@@ -166,10 +182,10 @@ def main(probe, calls_dll):
         assert "rip=" in text(logdir / "threads_1.txt"), text(logdir / "threads_1.txt")
         assert not (work / "baseline" / "threads_1.txt").exists()
 
-        # <logdir>/stop created 1.5 s in ends the run as a timeout does, with thread stacks, while the probe
+        # <logdir>/stop ends the run with thread stacks even when the timer is disabled, while the probe
         # (which waits 3 s) is still alive. Control: a stop file left in the directory before the run is removed at
         # start, so that run exits normally.
-        out, logdir = run_with_stop(probe, work, "stop-file", 1.5)
+        out, logdir = run_with_stop(probe, work, "stop-file")
         assert "stopped by request after" in out and "process exited" not in out, out
         assert "stop file found" in text(logdir / "events.txt"), text(logdir / "events.txt")
         assert "rip=" in text(logdir / "threads.txt"), text(logdir / "threads.txt")
