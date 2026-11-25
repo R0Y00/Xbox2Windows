@@ -75,6 +75,41 @@ s_endpgm
 PS_WORDS = bytes.fromhex(
     '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04'
     '070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf')
+# Variants of PS_SOURCE for the barycentric, omitted-result and upper-half refusals. The words are llvm-mc output
+# (src2 of p1ll cleared as for PS_WORDS), verified by `binary`; the sources are in PS_VARIANT_SOURCES.
+V_BODY = PS_SOURCE.split('\n', 1)[1]
+V_FIRST = 'v_interp_p1ll_f16 v4, v0, attr0.x\nv_interp_p2_f16 v4, v1, attr0.x, v4\n'
+V_TAIL = 'exp mrt0 v4, v4, v4, v4 done vm\ns_endpgm\n'
+PS_VARIANT_SOURCES = {
+    'I clobbered': 's_mov_b32 m0, s2\nv_mov_b32 v0, 1.0\n' + V_BODY,
+    'J clobbered': 's_mov_b32 m0, s2\nv_mov_b32 v1, 1.0\n' + V_BODY,
+    'I and J swapped': ('s_mov_b32 m0, s2\n' + V_BODY).replace('v0,', 'vI,').replace('v1,', 'v0,').replace('vI,', 'v1,'),
+    'p1ll result read between the pair':
+        's_mov_b32 m0, s2\nv_interp_p1ll_f16 v4, v0, attr0.x\nv_mov_b32 v8, v4\n'
+        'v_interp_p2_f16 v4, v1, attr0.x, v4\n' + V_BODY.split('\n', 2)[2],
+    'p1ll result read after p2 wrote elsewhere':
+        's_mov_b32 m0, s2\nv_interp_p1ll_f16 v4, v0, attr0.x\nv_interp_p2_f16 v8, v1, attr0.x, v4\n'
+        'v_cvt_f32_f16 v8, v8\nv_mov_b32 v9, v4\nexp mrt0 v8, v9, v9, v9 done vm\ns_endpgm\n',
+    'upper half read by a shift': 's_mov_b32 m0, s2\n' + V_FIRST + 'v_lshrrev_b32 v8, 16, v4\n'
+        'v_cvt_f32_f16 v4, v4\nexp mrt0 v4, v8, v8, v8 done vm\ns_endpgm\n',
+    'upper half exported': 's_mov_b32 m0, s2\n' + V_FIRST + V_TAIL,
+    'branch into p2': 's_mov_b32 m0, s2\ns_cbranch_vccz L0\nv_interp_p1ll_f16 v4, v0, attr0.x\nL0:\n'
+        'v_interp_p2_f16 v4, v1, attr0.x, v4\nv_cvt_f32_f16 v4, v4\n' + V_TAIL,
+    'unrelated read of v2': 's_mov_b32 m0, s2\nv_mov_b32 v8, v2\n' + V_BODY,
+    'unrelated write of v9': 's_mov_b32 m0, s2\nv_mov_b32 v9, 1.0\n' + V_BODY,
+}
+PS_VARIANTS = {name: bytes.fromhex(h) for name, h in (
+    ('I clobbered', '0203fcbef202007e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('J clobbered', '0203fcbef202027e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('I and J swapped', '0203fcbe040042d70002020004005ad700001204050042d70003020005005ad700011604060042d74002020006005ad740001a04070042d74003020007005ad740011e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('p1ll result read between the pair', '0203fcbe040042d7000002000403107e04005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('p1ll result read after p2 wrote elsewhere', '0203fcbe040042d70000020008005ad7000212040817107e0403127e0f1800f808090909000081bf'),
+    ('upper half read by a shift', '0203fcbe040042d70000020004005ad7000212049008102c0417087e0f1800f804080808000081bf'),
+    ('upper half exported', '0203fcbe040042d70000020004005ad7000212040f1800f804040404000081bf'),
+    ('branch into p2', '0203fcbe020086bf040042d70000020004005ad7000212040417087e0f1800f804040404000081bf'),
+    ('unrelated read of v2', '0203fcbe0203107e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('unrelated write of v9', '0203fcbef202127e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+)}
 P1LL_SRC2_MASK = 0x07fc0000  # w1 bits 26:18, the unused third source
 
 # The reference, from the ISA layout: two binary16 values per dword of the compr export.
@@ -105,15 +140,17 @@ def f16_to_f32_bits(h):
     return f32_bits(struct.unpack('<e', struct.pack('<H', h))[0])
 
 
-def evaluate(vs, ps):
+def evaluate(vs, ps, channels=None):
     """Evaluate the translated text: the vertex compr export, then the pixel conversions. Only the statements
-    the fixture produces are understood; anything else fails the check."""
-    regs = {'v6': EXPORT[0], 'v7': EXPORT[1]}
-    m = re.search(r'o\.param0 = float4\(([^;]*)\);\n', vs)
-    channels = []
-    for expr in re.findall(r'f16tof32\((v\d+)( >> 16)?\)', m.group(1)):
-        channels.append(f16_to_f32_bits((regs[expr[0]] >> (16 if expr[1] else 0)) & 0xffff))
-    assert len(channels) == 4, m.group(0)
+    the fixture produces are understood; anything else fails the check. `channels` replaces the vertex export with
+    four interpolated f32 words (what the rasterizer hands the pixel stage)."""
+    if channels is None:
+        regs = {'v6': EXPORT[0], 'v7': EXPORT[1]}
+        m = re.search(r'o\.param0 = float4\(([^;]*)\);\n', vs)
+        channels = []
+        for expr in re.findall(r'f16tof32\((v\d+)( >> 16)?\)', m.group(1)):
+            channels.append(f16_to_f32_bits((regs[expr[0]] >> (16 if expr[1] else 0)) & 0xffff))
+        assert len(channels) == 4, m.group(0)
     state = {}
     for line in ps.splitlines():
         stmt = re.fullmatch(r'    (v\d+) = \((v\d+) & 0xffff0000u\) \| f32tof16\(i\.param0\.([xyzw])\);', line)
@@ -129,8 +166,8 @@ def evaluate(vs, ps):
     return tuple(state['v%d' % n] for n in (4, 5, 6, 7))
 
 
-def translate(ps_words=PS_WORDS, vs_words=VS_WORDS):
-    return G.Pipeline(vs_words, ps_words, root_blob())
+def translate(ps_words=PS_WORDS, vs_words=VS_WORDS, **kwargs):
+    return G.Pipeline(vs_words, ps_words, root_blob(), **kwargs)
 
 
 def patch(words, index, w0=0, w1=0):
@@ -222,10 +259,78 @@ def controls():
     # p1ll result overwritten before p2 reads it
     # (an overwrite between the pair: v_mov_b32 v4, v0 = 7e080300 inserted after the p1ll)
     clobbered = PS_WORDS[:12] + bytes.fromhex('0003087e') + PS_WORDS[12:]
-    refused('p1ll result overwritten', clobbered, 'is not the v_interp_p1ll_f16 result')
+    refused('p1ll result overwritten', clobbered, 'before the matching v_interp_p2_f16')
     # The attribute is a plain float export, not a compr pair.
     refused('attribute not exported with compr', PS_WORDS, 'compr', vs_words=F32_VS_WORDS)
+    barycentric_controls(expected)
     print('controls ok')
+
+
+def f32(x):
+    return struct.unpack('<f', struct.pack('<f', x))[0]
+
+
+def barycentric_controls(expected):
+    # 1. The operand must be the entry PERSP_CENTER pair, still holding the entry values.
+    refused('I clobbered before use', PS_VARIANTS['I clobbered'], 'writes v0')
+    refused('J clobbered before use', PS_VARIANTS['J clobbered'], 'writes v1')
+    refused('I and J swapped', PS_VARIANTS['I and J swapped'], 'barycentric operand v1')
+    # One operand on another register: p1ll reads v2 as I, p2 reads v0 as J (the VGPR is src1, w1 bits 17:9).
+    for label, index, field in (('p1ll reads v2', 0, 2), ('p2 reads v0', 1, 0)):
+        words = bytearray(PS_WORDS)
+        off = 4 + 8 * index
+        w1 = struct.unpack_from('<I', words, off + 4)[0]
+        w1 = (w1 & ~(0x1ff << 9)) | ((256 + field) << 9)
+        struct.pack_into('<I', words, off + 4, w1)
+        refused(label, bytes(words), 'barycentric operand')
+    # Entry layout: the pair follows the PERSP_SAMPLE pair when that one is enabled, and PERSP_CENTER must be enabled.
+    translate(ps_hw_inputs=(2, 2))
+    print('accepted: PERSP_CENTER alone (v0, v1)')
+    try:
+        translate(ps_hw_inputs=(3, 3))
+    except G.Unsupported as error:
+        assert 'barycentric operand v0' in str(error), str(error)
+        print('refused: PERSP_CENTER at v2, v3 (%s)' % error)
+    else:
+        raise AssertionError('v0, v1 accepted although they hold PERSP_SAMPLE')
+    try:
+        translate(ps_hw_inputs=(1, 1))
+    except G.Unsupported as error:
+        assert 'PERSP_CENTER' in str(error), str(error)
+        print('refused: PERSP_CENTER not enabled (%s)' % error)
+    else:
+        raise AssertionError('accepted without PERSP_CENTER')
+    # Positive control, varying triangle: the three vertices carry different binary16 pairs and the pixel reads an
+    # interior point. ISA arithmetic: p1ll gives P0 + I * (P1 - P0) in f32, p2 adds J * (P2 - P0) and rounds to
+    # binary16. The lowering's input is the rasterizer's value of the same interpolation.
+    triangle = ((1.5, -2.0, 0.5, 3.0), (2.5, 1.0, -1.5, 0.25), (-0.5, 4.0, 2.0, -3.0))
+    for i, j in ((0.25, 0.5), (0.5, 0.25), (0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.125, 0.375)):
+        isa = []
+        for c in range(4):
+            p0, p1, p2 = (v[c] for v in triangle)
+            partial = f32(p0 + i * (p1 - p0))
+            isa.append(f16_to_f32_bits(f16_bits(f32(partial + j * (p2 - p0)))))
+        interpolated = [f32_bits(f32(p0 + i * (p1 - p0) + j * (p2 - p0)))
+                        for p0, p1, p2 in zip(*triangle)]
+        pipe = translate()
+        got = evaluate(pipe.hlsl_vs(), pipe.hlsl_ps(), interpolated)
+        assert got == tuple(isa), ((i, j), [hex(w) for w in got], [hex(w) for w in isa])
+    assert tuple(isa) != expected
+    print('varying triangle: translated words equal the ISA arithmetic at 6 interior and corner points')
+    # Registers other than the pair may be read or written freely.
+    for label in ('unrelated read of v2', 'unrelated write of v9'):
+        pipe = translate(PS_VARIANTS[label])
+        assert evaluate(pipe.hlsl_vs(), pipe.hlsl_ps()) == expected, label
+        print('accepted: %s' % label)
+
+    # 2. The omitted p1ll result and the upper half of the p2 result.
+    refused('p1ll result read between the pair', PS_VARIANTS['p1ll result read between the pair'],
+            'reads it before the matching v_interp_p2_f16')
+    refused('p1ll result read after p2 wrote elsewhere', PS_VARIANTS['p1ll result read after p2 wrote elsewhere'],
+            'after a v_interp_p2_f16 that wrote another register')
+    refused('upper half read by a shift', PS_VARIANTS['upper half read by a shift'], 'upper 16 bits')
+    refused('upper half exported', PS_VARIANTS['upper half exported'], 'upper 16 bits')
+    refused('branch into p2 without the matching p1ll', PS_VARIANTS['branch into p2'], 'a branch between')
 
 
 def normalise(words):
@@ -245,6 +350,12 @@ def check_binary(llvm_mc):
         built = normalise(assemble(llvm_mc, source))
         if built != words:
             raise AssertionError('%s fixture: assembled %s, recorded %s' % (name, built.hex(), words.hex()))
+    for name, source in PS_VARIANT_SOURCES.items():
+        built = normalise(assemble(llvm_mc, source))
+        # a forward branch is an unresolved fixup in llvm-mc's listing (placeholder 0x0a): the offset is 2 dwords
+        built = built.replace(bytes.fromhex('0a0a86bf'), bytes.fromhex('020086bf'))
+        if built != PS_VARIANTS[name]:
+            raise AssertionError('%s variant: assembled %s, recorded %s' % (name, built.hex(), PS_VARIANTS[name].hex()))
     print('fixture words match llvm-mc')
 
 
