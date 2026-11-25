@@ -78,10 +78,25 @@ def main():
         rig.compile("void main(){}")
         if rig.calls() != 4:
             fail("changed compiler reused a stale entry")
+        library = Path(rig.compiler).with_name("dxcompiler.dll")
+        library.write_bytes(b"v1")
+        rig.compile("void main(){}")
+        before = rig.calls()
+        rig.compile("void main(){}")
+        if rig.calls() != before:
+            fail("unchanged compiler library missed the cache")
+        os.utime(library, ns=(1, 1))
+        rig.compile("void main(){}")
+        if rig.calls() != before + 1:
+            fail("changed compiler library reused a stale entry")
+        library.write_bytes(b"version two")
+        rig.compile("void main(){}")
+        if rig.calls() != before + 2:
+            fail("resized compiler library reused a stale entry")
 
         bad1, none1 = rig.compile("BROKEN")
         bad2, none2 = rig.compile("BROKEN")
-        if rig.calls() != 5 or bad1.returncode != 3 or bad2.returncode != 3:
+        if rig.calls() != before + 3 or bad1.returncode != 3 or bad2.returncode != 3:
             fail("failing compile not replayed with the same return code")
         if bad1.stderr != bad2.stderr or "in.hlsl" not in bad2.stderr:
             fail("failing compile stderr differs on replay")

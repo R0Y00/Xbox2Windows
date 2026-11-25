@@ -106,6 +106,22 @@ def _resolve(compiler):
     return os.path.abspath(found) if found else None
 
 
+COMPILER_LIBRARIES = ("dxcompiler.dll", "dxil.dll", "libdxcompiler.so", "libdxil.so")
+
+
+def _libraries(resolved):
+    """Name, size and mtime of the DXC libraries next to the compiler (missing ones are skipped)."""
+    folder = os.path.dirname(resolved)
+    found = []
+    for name in COMPILER_LIBRARIES:
+        try:
+            info = os.stat(os.path.join(folder, name))
+        except OSError:
+            continue
+        found.append([name, info.st_size, info.st_mtime_ns])
+    return found
+
+
 def run_dxc(compiler, args, **options):
     """Mirror subprocess.run([compiler, *args]) with an optional on-disk cache."""
     command = [compiler, *args]
@@ -134,7 +150,7 @@ def run_dxc(compiler, args, **options):
         return subprocess.run(command, **_passthrough(options, check))
     digest = hashlib.sha256()
     digest.update(json.dumps([KEY_VERSION, resolved, info.st_size, info.st_mtime_ns,
-                              key_args]).encode())
+                              _libraries(resolved), key_args]).encode())
     digest.update(b"\0")
     digest.update(source_bytes)
     entry = os.path.join(cache_dir, digest.hexdigest() + ".json")
