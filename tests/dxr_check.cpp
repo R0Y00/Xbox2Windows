@@ -495,6 +495,8 @@ bool check_dxr_address_ranges(ID3D12Device* device) {
 std::vector<UINT32> dxr_fixture::trace_placed_triangle(ID3D12Device* device, const ResolvedBatch* resolved,
                                                        PlacedBuildScene* placement, BuildCounts* counts) {
     using namespace dxr_fixture;
+    const std::vector<Vertex> vertices{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1}, {0,0,0,.01f,0,0,1,4,2}};
     return trace_scene(device, vertices, {instance(7,1)}, rays, Backend::pipeline,
                        nullptr, nullptr, nullptr, placement, resolved, counts);
 }
