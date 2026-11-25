@@ -13311,6 +13311,30 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+### Startup compute masked bit count
+
+For groups of at most 32 threads, the startup translator lowers gfx1013
+`v_mbcnt_lo_u32_b32` and `v_mbcnt_hi_u32_b32` with an inline or known SGPR mask.
+The low instruction counts mask bits below the current lane and adds the base
+modulo 2³². The high instruction returns the base because all group lanes are in
+the low half of either guest wave size. The HLSL computes the lane from the local
+thread coordinates and group dimensions. EXEC controls which destinations are
+written. The base can be a VGPR or a known scalar word. Larger groups require
+evidence of the guest wave size. [AMD RDNA 2 ISA, V_MBCNT_LO/HI_U32_B32](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
+Fixture D dispatches two 4×2×4 groups. It counts sparse SGPR mask `0x85241249`
+with base 7 and counts an all-ones mask with only lanes 16–31 active. A variant
+starts at `UINT_MAX` to exercise wraparound. Each dispatch checks all 320 output
+words, including the 64 untouched words. Six controls pin the first incorrect
+word when the shader ignores the mask, counts the whole mask, uses only the X
+coordinate, drops the base, adds low-half bits to the high count, or writes to
+inactive lanes.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(mbcnt_)?(warp|hardware))$' -V
+```
+
 ## Startup translator: refusal census
 
 The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).

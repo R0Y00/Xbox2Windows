@@ -17,7 +17,9 @@ reads the read buffer at that index and stores to its own destination:
 - case B enables X and Z only (Y omitted, so Z is s8), v0-v1, group size 5x2x1 and 4x1x3 groups, and stores two
   words at an immediate offset of 8 bytes;
 - case C enables Y only (s7), v0 only, group size 8x1x1 and 1x5x1 groups, stores four words with every lane, then
-  three words at offset 16 under an exec mask set from a compare (lanes with tid.x < 6), and restores exec.
+  three words at offset 16 under an exec mask set from a compare (lanes with tid.x < 6), and restores exec;
+- case D counts sparse mask bits below each lane with v_mbcnt_lo/hi, then obtains the full-mask count in lanes
+  16-31 under partial EXEC. Two 4x2x4 groups write separate records to the raw buffer.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -130,11 +132,45 @@ WORDS_C = bytes.fromhex(
     '9c060816' '0303127e' '0a0069d5030b0000' '0414144a' '703f8cbf' '0815163a' '001078e004080480' '7e0395be'
     '8600887d' '6a03febe' '10107ce004080480' '1503febe' '000081bf')
 
+SOURCE_D = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx4 s[16:19], s[10:11], 0
+s_mov_b32 s20, 0x85241249
+v_mad_u32_u24 v3, v2, 2, v1
+v_mad_u32_u24 v3, v3, 4, v0
+v_lshlrev_b32 v4, 5, s7
+v_add_nc_u32 v4, v4, v3
+v_lshlrev_b32 v4, 4, v4
+v_mov_b32 v6, 7
+v_mbcnt_lo_u32_b32 v8, s20, v6
+v_mbcnt_hi_u32_b32 v9, s20, v8
+v_mov_b32 v10, -1
+s_mov_b32 s21, exec_lo
+v_cmp_lt_u32 vcc_lo, 15, v3
+s_mov_b32 exec_lo, vcc_lo
+v_mbcnt_lo_u32_b32 v10, -1, 0
+s_mov_b32 exec_lo, s21
+v_mbcnt_hi_u32_b32 v11, -1, v3
+s_waitcnt lgkmcnt(0)
+buffer_store_dwordx4 v[8:11], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_D = bytes.fromhex(
+    '06038abe80038bbe050408f4000000faff0394be49122485030043d502050504030043d50309010404001ad5850e0000'
+    '0407084a8408083487020c7e080065d7140c0200090066d714100200c102147e7e0395be8f06827d6a03febe'
+    '0a0065d7c10001001503febe0b0066d7c10602007fc08cbf001078e004080480000081bf')
+# A known SGPR base of UINT_MAX wraps to zero when the first mask bit is counted.
+SOURCE_D_WRAP = SOURCE_D.replace('v_mov_b32 v6, 7', 's_mov_b32 s22, -1').replace('v8, s20, v6', 'v8, s20, s22')
+WORDS_D_WRAP = WORDS_D.replace(bytes.fromhex('87020c7e080065d7140c0200'), bytes.fromhex('c10396be080065d7142c0000'))
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | TGID_Z | tidig(2), (5, 2, 1), (4, 1, 3)),
     'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
+    'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
+    'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -186,6 +222,14 @@ def input_word(i):
 def expected(name):
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    if name in ('D', 'D-wrap'):
+        for group in range(groups[0]):
+            count = 7 if name == 'D' else MASK
+            for lane in range(32):
+                i = 4 * (32 * group + lane)
+                out[i:i + 4] = [count, count, lane if lane >= 16 else MASK, lane]
+                count = (count + ((0x85241249 >> lane) & 1)) & MASK
+        return out
     for gz in range(groups[2]):
         for gy in range(groups[1]):
             for gx in range(groups[0]):
@@ -228,7 +272,37 @@ def patch(words, old, new):
     return words.replace(old, new)
 
 
+MBCNT_REFUSALS = (
+    ('v_mbcnt_lo_u32_b32 v8, v0, 0', '080065d700010100', 'known mask'),
+    ('v_mbcnt_hi_u32_b32 v8, v0, 0', '080066d700010100', 'known mask'),
+    ('v_mbcnt_lo_u32_b32 v8, s4, 0', '080065d704000100', 'known mask'),
+    ('v_mbcnt_lo_u32_b32 v8, exec_lo, 0', '080065d77e000100', 'known mask'),
+    ('v_mbcnt_hi_u32_b32 v8, vcc_lo, 0', '080066d76a000100', 'known mask'),
+    ('v_mbcnt_lo_u32_b32 v8, -1, exec_lo', '080065d7c1fc0000', 'VGPR or known base'),
+    ('v_mbcnt_lo_u32_b32 v8, -1, s4', '080065d7c1080000', 'VGPR or known base'),
+)
+
+
+def check_mbcnt():
+    for _, words, reason in MBCNT_REFUSALS:
+        refused(reason, lambda: translate('D', code=bytes.fromhex(words + '000081bf')))
+    for op in ('lo', 'hi'):
+        # Keep the two refusals independent: a program starting with _lo would hide
+        # an incorrectly accepted _hi when testing a group whose wave size is unknown.
+        word = '0a0065d7c1000100' if op == 'lo' else '0b0066d7c1060200'
+        single = bytes.fromhex(word + '000081bf')
+        refused('at most 32 threads', lambda: translate('D', code=single, group=(3, 11, 1)))
+        stage = translate('D', code=single, group=(3, 5, 2)).cs
+        emit = getattr(stage, f'op_v_mbcnt_{op}_u32_b32')
+        refused('three unmodified operands', lambda: emit(['v0', '-1', '0'], ['clamp']))
+        refused('destination', lambda: emit(['v[0:1]', '-1', '0'], []))
+        stage.kind = 'ps'
+        refused(f'v_mbcnt_{op}_u32_b32', lambda: emit(['v0', '-1', '0'], []))
+    assert 'uav 0 table 1 0' in translate('D').manifest()
+
+
 def check_controls():
+    check_mbcnt()
     a = translate('A')
     # The compute stage keeps its buffer stores in self.uavs as descriptor key -> u index, while the pixel stage's
     # image stores (#2155) are listed by stored_images() through the shared common() and manifest(). A compute
@@ -329,7 +403,7 @@ def check_controls():
     refused('compute d16 image load requires validated SRV formats',
             lambda: pipeline.cs.image(['v12', 'v[0:1]', 's[24:31]'],
                                       ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))
-    print('compute entry, numthreads, manifest, offen store forms and the store, descriptor, execz and sample '
+    print('compute entry, numthreads, masked bit counts, manifest, offen store forms and the store, descriptor, execz and sample '
           'refusals pass')
 
 
@@ -345,15 +419,36 @@ def check_binary(llvm_mc):
     for line, words in SPLICE.items():
         built = assemble(llvm_mc, line + '\n').hex()
         assert built == words, '%s: assembled %s, recorded %s' % (line, built, words)
+    for line, words, _ in MBCNT_REFUSALS:
+        assert assemble(llvm_mc, line + '\n').hex() == words, line
     print('fixture words match llvm-mc')
 
 
 # control -> (case, text the translation must contain once, replacement)
+MBCNT_LANE = '(tid.x + 4u * (tid.y + 2u * tid.z))'
+MBCNT_COUNT = f'countbits(0x85241249u & ((1u << {MBCNT_LANE}) - 1u))'
 CONTROLS = {
     'swapped-axes': ('A', '    s7 = gid.x;\n    s8 = gid.y;\n', '    s7 = gid.y;\n    s8 = gid.x;\n'),
     'dropped-store': ('A', '    u0.Store(a, v5);\n', ''),
     'b-offset': ('B', '    a = (v4 + 8) & 0xfffffffcu;\n', '    a = (v4 + 0) & 0xfffffffcu;\n'),
     'c-unpredicated': ('C', 'if (exec & 1) u0.Store3(', 'u0.Store3('),
+    'd-mask': ('D', MBCNT_COUNT, MBCNT_LANE),
+    'd-whole-mask': ('D', MBCNT_COUNT, 'countbits(0x85241249u)'),
+    'd-x-only': ('D', MBCNT_COUNT, MBCNT_COUNT.replace(MBCNT_LANE, 'tid.x')),
+    'd-base': ('D', MBCNT_COUNT + ' + v6', MBCNT_COUNT),
+    'd-hi': ('D', 'v9 = v8;', f'v9 = v8 + {MBCNT_COUNT};'),
+    'd-exec': ('D', 'if (exec & 1) v10 =', 'v10 ='),
+}
+
+# Independent first bad word for each D mutation, including lane zero and the
+# first lane on the next Y row. The two groups must repeat the same lane values.
+MBCNT_MISMATCH = {
+    'd-mask': 'word=8 expected=00000008 actual=00000009',
+    'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
+    'd-x-only': 'word=16 expected=00000009 actual=00000007',
+    'd-base': 'word=0 expected=00000007 actual=00000000',
+    'd-hi': 'word=5 expected=00000008 actual=00000009',
+    'd-exec': 'word=2 expected=ffffffff actual=00000000',
 }
 
 
@@ -382,15 +477,23 @@ def check_dispatch(dxc, runner, adapter, control=None):
     out = HERE.parent / 'out'
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
-        for name in ((CONTROLS[control][0],) if control else CASES):
-            run = run_case(name, dxc, runner, adapter, Path(tmp), control)
+        if control == 'mbcnt':
+            runs = [('D', mutation) for mutation in MBCNT_MISMATCH]
+        elif control:
+            runs = [(CONTROLS[control][0], control)]
+        else:
+            runs = [(name, None) for name in CASES]
+        for name, mutation in runs:
+            run = run_case(name, dxc, runner, adapter, Path(tmp), mutation)
             print(run.stdout, end='')
             if run.returncode == 77:
                 return 77
-            if control:
-                if run.returncode != 1 or 'expected=' not in run.stderr:
-                    raise AssertionError('control %s: not rejected (exit %d) %s' % (control, run.returncode, run.stderr))
-                print('control %s: rejected at %s' % (control, run.stderr.strip().splitlines()[0]))
+            if mutation:
+                first = run.stderr.strip().splitlines()[:1]
+                if (run.returncode != 1 or 'expected=' not in run.stderr or
+                        mutation in MBCNT_MISMATCH and first != [MBCNT_MISMATCH[mutation]]):
+                    raise AssertionError('control %s: unexpected result (exit %d) %s' % (mutation, run.returncode, run.stderr))
+                print('control %s: rejected at %s' % (mutation, first[0]))
             elif run.returncode or run.stderr:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:

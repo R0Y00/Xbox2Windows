@@ -2687,6 +2687,36 @@ class Stage:
         self.set_v(dst[1], '((%s & ~(0xffu << %s)) | ((uint(clamp(F(%s), 0.0, 255.0)) & 0xffu) << %s))'
                    % (rest, shift, value, shift))
 
+    def op_v_mbcnt_lo_u32_b32(self, ops, mods, high=False):
+        name = 'v_mbcnt_%s_u32_b32' % ('hi' if high else 'lo')
+        if self.kind != 'cs':
+            raise Unsupported(name)
+        if mods or len(ops) != 3:
+            raise Unsupported('%s requires three unmodified operands' % name)
+        x, y, z = self.pipe.group
+        if x * y * z > 32:
+            raise Unsupported('%s requires at most 32 threads per group' % name)
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        mask = self.const_u32(ops[1])
+        if mask is None:
+            raise Unsupported('%s requires a known mask' % name)
+        base = reg_range(ops[2])
+        base_is_vgpr = base and base[0] == 'v' and base[1] == base[2] and base[2] <= 255
+        if not base_is_vgpr and self.const_u32(ops[2]) is None:
+            raise Unsupported('%s requires a VGPR or known base' % name)
+        result = self.u(ops[2])
+        # RDNA 2 V_MBCNT counts mask bits strictly below the lane. All threads of
+        # this group fit in the low half of either guest wave size, including lane 31.
+        if not high:
+            lane = '(tid.x + %du * (tid.y + %du * tid.z))' % (x, y)
+            result = '(countbits(0x%08xu & ((1u << %s) - 1u)) + %s)' % (mask, lane, result)
+        self.set_v(dst[1], result)
+
+    def op_v_mbcnt_hi_u32_b32(self, ops, mods):
+        self.op_v_mbcnt_lo_u32_b32(ops, mods, high=True)
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
