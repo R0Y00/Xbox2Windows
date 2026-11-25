@@ -1,11 +1,12 @@
-// Experimental (docs/startup-runtime.md): which PE imports the gaming-runtime proxy rewrites.
+// Experimental (docs/startup-runtime.md): which PE imports the gaming-runtime proxy considers.
 //
 // The GameInput-hosted proxy used to patch only the main EXE's GetProcAddress IAT. A title that
 // resolves QueryApiImpl through another module's GetProcAddress (or that imports QueryApiImpl from
-// xgameruntime.dll by name, including delay-load) never hits that hook, so FakeUser / X2W_TRACE_API
-// see no providers. This header lists the import shapes that must be rewritten; the stand-in applies
-// them to every loaded module. Pure walk helpers — no Windows calls — so a source-built control can
-// check them.
+// xgameruntime.dll by name) never hits that hook, so FakeUser / X2W_TRACE_API see no providers.
+// This header lists the import shapes to notice — regular and delay-import tables. The stand-in
+// rewrites only regular IAT slots: a delay IAT holds a delay-load thunk until first use, so treating
+// it as GetProcAddress or QueryApiImpl is wrong. Ordinal imports are ignored. Pure walk helpers —
+// no Windows calls — so a source-built control can check them.
 #pragma once
 
 #include <cstddef>
@@ -18,9 +19,10 @@ enum class Kind : unsigned char { get_proc_address = 1, query_api_impl = 2 };
 
 struct Hit {
     Kind kind;
-    std::uint32_t first_thunk_rva;  // RVA of the IMAGE_THUNK_DATA64 slot to rewrite
+    std::uint32_t first_thunk_rva;  // RVA of the IMAGE_THUNK_DATA64 / delay-IAT slot
     const char* dll_name;           // pointed into the image
     const char* import_name;
+    bool delay_import;              // true = delay-load table (do not treat *slot as the real export)
 };
 
 inline bool dll_is_xgameruntime(const char* name) noexcept
@@ -46,7 +48,7 @@ inline bool import_is_query_api_impl(const char* name) noexcept
     return name && std::strcmp(name, "QueryApiImpl") == 0;
 }
 
-// Decide whether one named import of `dll_name` should be rewritten. Ordinal imports are ignored.
+// Decide whether one named import of `dll_name` should be noticed. Ordinal imports are ignored.
 inline bool classify(const char* dll_name, const char* import_name, Kind* kind) noexcept
 {
     if (!import_name || !kind) return false;
@@ -112,7 +114,7 @@ inline bool c_string_in_image(const unsigned char* base, std::size_t image_size,
 
 template <class Fn>
 int visit_named_thunks(const unsigned char* base, std::size_t image_size, const char* dll, std::uint32_t name_table_rva,
-                       std::uint32_t iat_rva, Fn on_hit)
+                       std::uint32_t iat_rva, bool delay_import, Fn on_hit)
 {
     int hits = 0;
     for (std::uint32_t ti = 0;; ++ti) {
@@ -122,14 +124,14 @@ int visit_named_thunks(const unsigned char* base, std::size_t image_size, const 
         if (!readable_range(base, image_size, ft_rva, sizeof(Thunk64))) break;
         const auto oft = *reinterpret_cast<const Thunk64*>(base + oft_rva);
         if (oft.value == 0) break;
-        if (oft.value & 0x8000000000000000ull) continue;  // ordinal
+        if (oft.value & 0x8000000000000000ull) continue;  // ordinal: low bits are not a name RVA
         const auto hint_rva = static_cast<std::uint32_t>(oft.value & 0xffffffffu);
         if (!readable_range(base, image_size, hint_rva, 3)) continue;
         if (!c_string_in_image(base, image_size, hint_rva + 2)) continue;
         const char* import_name = reinterpret_cast<const char*>(base + hint_rva + 2);
         Kind kind{};
         if (!classify(dll, import_name, &kind)) continue;
-        Hit hit{kind, ft_rva, dll, import_name};
+        Hit hit{kind, ft_rva, dll, import_name, delay_import};
         on_hit(hit);
         ++hits;
     }
@@ -164,11 +166,11 @@ int visit_imports(const unsigned char* base, std::size_t image_size, Fn on_hit)
             if (!imp->name || !imp->original_first_thunk || !imp->first_thunk) continue;
             if (!c_string_in_image(base, image_size, imp->name)) continue;
             const char* dll = reinterpret_cast<const char*>(base + imp->name);
-            hits += visit_named_thunks(base, image_size, dll, imp->original_first_thunk, imp->first_thunk, on_hit);
+            hits += visit_named_thunks(base, image_size, dll, imp->original_first_thunk, imp->first_thunk, false, on_hit);
         }
     }
 
-    // DataDirectory[13] = delay imports.
+    // DataDirectory[13] = delay imports (reported with delay_import=true; callers must not rewrite the slot as a real export).
     const auto& delay_dir = dirs[13];
     if (delay_dir.virtual_address && delay_dir.size) {
         for (std::uint32_t at = delay_dir.virtual_address;; at += sizeof(DelayDesc)) {
@@ -178,7 +180,7 @@ int visit_imports(const unsigned char* base, std::size_t image_size, Fn on_hit)
             if (!delay->dll_name || !delay->original_first_thunk || !delay->first_thunk) continue;
             if (!c_string_in_image(base, image_size, delay->dll_name)) continue;
             const char* dll = reinterpret_cast<const char*>(base + delay->dll_name);
-            hits += visit_named_thunks(base, image_size, dll, delay->original_first_thunk, delay->first_thunk, on_hit);
+            hits += visit_named_thunks(base, image_size, dll, delay->original_first_thunk, delay->first_thunk, true, on_hit);
         }
     }
     return hits;

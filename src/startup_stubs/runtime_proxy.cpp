@@ -2,11 +2,14 @@
 //
 // The title's static runtime library loads the system xgameruntime.dll and asks it for API objects
 // with QueryApiImpl(provider GUID, interface GUID, &object). With X2W_RUNTIME_PROXY=1 this file (built
-// into the GameInput stand-in, which the title imports) patches GetProcAddress imports — and any
-// direct xgameruntime.dll!QueryApiImpl import — in every loaded module (not only the main EXE), so
-// the lookup of "QueryApiImpl" returns a wrapper. Modules that load later are patched through
-// LdrRegisterDllNotification. The wrapper hands out proxy objects whose methods log their first
-// calls ("x2w-runtime") and forward to the real object.
+// into the GameInput stand-in, which the title imports) rewrites GetProcAddress and a direct
+// xgameruntime.dll!QueryApiImpl import in every loaded module's regular IAT (not only the main EXE),
+// so the lookup of "QueryApiImpl" returns a wrapper. Modules that load later are patched through
+// LdrRegisterDllNotification. Delay-import IAT slots are not rewritten: they hold a delay-load thunk
+// until first use (rewriting them loses the hook or would record the thunk as real_query). A delay
+// QueryApiImpl only seeds real_query via GetProcAddress(GetModuleHandle("xgameruntime.dll"), …).
+// Delay-imported GetProcAddress is not hooked. The wrapper hands out proxy objects whose methods log
+// their first calls ("x2w-runtime") and forward to the real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
 // and, while the proxy is on, XStoreCreateContext for that user (see area_call).
@@ -19,6 +22,7 @@
 #include "startup_stubs/storage_root_utf8.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,7 +56,17 @@ SRWLOCK proxy_lock = SRWLOCK_INIT;
 void* slot_table[max_slots];
 
 using QueryApi = HRESULT(__stdcall*)(const GUID*, const GUID*, void**);
-QueryApi real_query;
+// Written from the GPA hook, the IAT patch thread, and LdrDllNotification; first non-null wins.
+std::atomic<QueryApi> real_query{nullptr};
+
+void remember_real_query(QueryApi query) noexcept
+{
+    if (!query) return;
+    QueryApi expected = nullptr;
+    real_query.compare_exchange_strong(expected, query, std::memory_order_acq_rel);
+}
+
+QueryApi load_real_query() noexcept { return real_query.load(std::memory_order_acquire); }
 
 // ---- local user (X2W_FAKE_USER=1) ----------------------------------------------------------
 // The user API object is the provider whose GUID starts 01acd177 (seen: called at start-up and when
@@ -298,7 +312,9 @@ void fill_slots(std::index_sequence<I...>)
 
 HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
 {
-    const HRESULT hr = real_query(provider, iid, out);
+    const QueryApi query = load_real_query();
+    if (!query) return E_FAIL;
+    const HRESULT hr = query(provider, iid, out);
     const bool output_writable = FAILED(hr) && fake_user() && x2w_local::writable(out, sizeof(*out));
     const bool pair_readable = output_writable && x2w_local::readable(provider, sizeof(*provider)) &&
                                x2w_local::readable(iid, sizeof(*iid));
@@ -394,7 +410,7 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
         static LONG logged;
         if (x2w_local::first_calls(logged, 40)) x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name, static_cast<void*>(real));
         if (std::strcmp(name, "QueryApiImpl") == 0) {
-            real_query = reinterpret_cast<QueryApi>(real);
+            remember_real_query(reinterpret_cast<QueryApi>(real));
             return reinterpret_cast<FARPROC>(&proxy_query);
         }
         if (runtime_local() && fake_user()) {
@@ -411,7 +427,17 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
 
 HMODULE proxy_module;  // this DLL; its own GetProcAddress IAT must stay real or the hook recurses
 
-// Rewrite one module's GetProcAddress IAT slots and any xgameruntime.dll!QueryApiImpl import.
+// Resolve QueryApiImpl from a loaded xgameruntime.dll without reading a delay-IAT thunk.
+void remember_real_query_from_export() noexcept
+{
+    const HMODULE runtime = GetModuleHandleW(L"xgameruntime.dll");
+    if (!runtime) return;
+    // This stand-in's own GetProcAddress IAT is left unpatched, so this is the real export lookup.
+    remember_real_query(reinterpret_cast<QueryApi>(GetProcAddress(runtime, "QueryApiImpl")));
+}
+
+// Rewrite one module's regular GetProcAddress / xgameruntime.dll!QueryApiImpl IAT slots.
+// Delay-import hits are not rewritten (slot is a delay thunk until first use).
 int patch_module(HMODULE module)
 {
     if (!module) return 0;
@@ -426,6 +452,12 @@ int patch_module(HMODULE module)
     x2w_runtime_patch::visit_imports(base, image_size, [&](const x2w_runtime_patch::Hit& hit) {
         // Never rewrite this DLL's GetProcAddress: hooked_get_proc_address calls it for the real lookup.
         if (self && hit.kind == x2w_runtime_patch::Kind::get_proc_address) return;
+        if (hit.delay_import) {
+            // Delay IAT holds a thunk, not the export. Do not rewrite; delay GetProcAddress is unhooked.
+            // A delay QueryApiImpl can still seed real_query once the DLL is loaded.
+            if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) remember_real_query_from_export();
+            return;
+        }
         auto* slot = reinterpret_cast<ULONGLONG*>(base + hit.first_thunk_rva);
         DWORD old = 0;
         if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return;
@@ -435,9 +467,9 @@ int patch_module(HMODULE module)
                 ++patched;
             }
         } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {
-            // Direct import of QueryApiImpl: remember the real export once, then point at the proxy.
+            // Regular import: slot holds the real export after the loader bound it.
             if (*slot && *slot != reinterpret_cast<ULONGLONG>(&proxy_query)) {
-                if (!real_query) real_query = reinterpret_cast<QueryApi>(*slot);
+                remember_real_query(reinterpret_cast<QueryApi>(*slot));
                 *slot = reinterpret_cast<ULONGLONG>(&proxy_query);
                 ++patched;
             }
@@ -487,12 +519,27 @@ void CALLBACK dll_loaded(ULONG reason, const void* data, void*)
 
 void patch_all_loaded_modules()
 {
-    HMODULE modules[512];
+    std::vector<HMODULE> modules(512);
     DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed) || !needed) return;
+    if (!EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed) || !needed)
+        return;
+    if (needed > modules.size() * sizeof(HMODULE)) {
+        x2w_local::logf("x2w-runtime proxy: EnumProcessModules truncated (%u bytes needed, grew from %zu)",
+                        static_cast<unsigned>(needed), modules.size() * sizeof(HMODULE));
+        modules.resize(needed / sizeof(HMODULE) + 8);
+        needed = 0;
+        if (!EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed) ||
+            !needed)
+            return;
+        if (needed > modules.size() * sizeof(HMODULE)) {
+            x2w_local::logf("x2w-runtime proxy: EnumProcessModules still truncated (%u bytes needed for %zu slots); patching first %zu",
+                            static_cast<unsigned>(needed), modules.size(), modules.size());
+            needed = static_cast<DWORD>(modules.size() * sizeof(HMODULE));
+        }
+    }
     const unsigned count = needed / sizeof(HMODULE);
     int modules_patched = 0, slots = 0;
-    for (unsigned i = 0; i < count && i < 512; ++i) {
+    for (unsigned i = 0; i < count; ++i) {
         const int n = patch_module(modules[i]);
         if (n > 0) {
             ++modules_patched;
@@ -504,6 +551,8 @@ void patch_all_loaded_modules()
 
 // Patch the main module immediately (safe under the loader lock), then every already-loaded module
 // and every later load — so a helper DLL that calls GetProcAddress(QueryApiImpl) is covered.
+// Modules already loaded are enumerated on a worker thread after attach returns; a GetProcAddress
+// between attach and that pass can still miss the hook until the next load notification.
 void patch_imports()
 {
     const int main_slots = patch_module(GetModuleHandleW(nullptr));
@@ -710,9 +759,10 @@ constexpr char submit_identity[] = "local XGameSaveSubmitUpdate";
 HRESULT WINAPI submit_provider(unsigned, const void*) { return S_OK; }
 u64 async_submit(int slot, u64 update, u64 block)
 {
-    if (!block || !real_query) return e_fail;
+    const QueryApi ask = load_real_query();
+    if (!block || !ask) return e_fail;
     void* service = nullptr;
-    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    const auto query = ask(&submit_async_family, &submit_async_family, &service);
     if (FAILED(query)) return static_cast<unsigned>(query);
     if (!service) return e_fail;
     auto** methods = *static_cast<void***>(service);
@@ -740,9 +790,10 @@ u64 async_submit(int slot, u64 update, u64 block)
 constexpr char user_add_identity[] = "local XUserAddAsync";
 u64 local_user_add(u64 block)
 {
-    if (!block || !real_query) return e_fail;
+    const QueryApi ask = load_real_query();
+    if (!block || !ask) return e_fail;
     void* service = nullptr;
-    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    const auto query = ask(&submit_async_family, &submit_async_family, &service);
     if (FAILED(query) || !service) {
         x2w_local::logf("x2w-runtime local: XUserAddAsync, async service unavailable 0x%08lx", static_cast<unsigned long>(query));
         return FAILED(query) ? static_cast<unsigned>(query) : e_fail;
@@ -868,9 +919,10 @@ u64 snapshot_read(ReadAsync& state, u64 container, u64 names_pointer, std::uint3
 }
 u64 async_read(int slot, u64 container, u64 names, u64 count_or_size, u64 block_or_buffer, u64 count_pointer)
 {
-    if (!real_query) return e_fail;
+    const QueryApi ask = load_real_query();
+    if (!ask) return e_fail;
     void* service = nullptr;
-    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    const auto query = ask(&submit_async_family, &submit_async_family, &service);
     if (FAILED(query)) return static_cast<unsigned>(query);
     if (!service) return e_fail;
     auto** methods = *static_cast<void***>(service);

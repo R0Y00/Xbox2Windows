@@ -1,9 +1,10 @@
-// Source-built control for runtime_gpa_patch.h: which PE imports the gaming-runtime proxy rewrites.
+// Source-built control for runtime_gpa_patch.h: which PE imports the gaming-runtime proxy notices.
 //
-// The stand-in must catch GetProcAddress in any module (including delay-load) and a direct
-// xgameruntime.dll!QueryApiImpl import. A synthetic PE32+ image with those imports is walked; the
-// mutated control classifies by import name alone (accepting QueryApiImpl from other.dll) and must
-// fail. No Windows loader and no game files.
+// The stand-in must catch GetProcAddress and a direct xgameruntime.dll!QueryApiImpl on the regular
+// import table, report delay-import hits with delay_import set (without treating the delay IAT as a
+// real export), and ignore ordinal thunks. A synthetic PE32+ image is walked; the mutated control
+// classifies by import name alone (accepting QueryApiImpl from other.dll) and must fail. No Windows
+// loader and no game files.
 #include "startup_stubs/runtime_gpa_patch.h"
 
 #include <cstdint>
@@ -53,7 +54,9 @@ std::vector<unsigned char> build_image()
 
     const char* names[] = {"GetProcAddress", "QueryApiImpl", "SomethingElse"};
     std::uint32_t hint_rva = 0x2C0;
+    std::uint32_t gpa_hint = 0;
     for (int i = 0; i < 3; ++i) {
+        if (i == 0) gpa_hint = hint_rva;
         reinterpret_cast<Thunk64*>(image.data() + 0x240)[i].value = hint_rva;
         reinterpret_cast<Thunk64*>(image.data() + 0x270)[i].value = 0x1000u + static_cast<unsigned>(i);
         image[hint_rva] = image[hint_rva + 1] = 0;
@@ -61,8 +64,12 @@ std::vector<unsigned char> build_image()
         hint_rva += 2 + static_cast<std::uint32_t>(std::strlen(names[i]) + 1);
         hint_rva = (hint_rva + 1) & ~1u;
     }
-    reinterpret_cast<Thunk64*>(image.data() + 0x240)[3].value = 0;
-    reinterpret_cast<Thunk64*>(image.data() + 0x270)[3].value = 0;
+    // Ordinal import whose low bits alias the GetProcAddress hint RVA. Without the ordinal skip the
+    // walk would treat those bits as a name RVA and report a third GetProcAddress hit.
+    reinterpret_cast<Thunk64*>(image.data() + 0x240)[3].value = 0x8000000000000000ull | gpa_hint;
+    reinterpret_cast<Thunk64*>(image.data() + 0x270)[3].value = 0xDEAD;
+    reinterpret_cast<Thunk64*>(image.data() + 0x240)[4].value = 0;
+    reinterpret_cast<Thunk64*>(image.data() + 0x270)[4].value = 0;
 
     // other.dll!QueryApiImpl must not classify (negative shape in the same image).
     imp[1].original_first_thunk = 0x340;
@@ -76,7 +83,7 @@ std::vector<unsigned char> build_image()
     reinterpret_cast<Thunk64*>(image.data() + 0x340)[1].value = 0;
     reinterpret_cast<Thunk64*>(image.data() + 0x350)[1].value = 0;
 
-    // Delay-load kernel32!GetProcAddress — same rewrite rule as a normal import.
+    // Delay-load kernel32!GetProcAddress — reported with delay_import; not a regular IAT rewrite target.
     auto* delay = reinterpret_cast<DelayDesc*>(image.data() + 0x400);
     delay->dll_name = 0x480;
     delay->original_first_thunk = 0x4A0;
@@ -118,16 +125,20 @@ int main(int argc, char** argv)
     check("unrelated refused", !patch::classify("xgameruntime.dll", "SomethingElse", &kind));
 
     auto image = build_image();
-    int gpa = 0, query = 0;
+    int gpa = 0, query = 0, delay_hits = 0, regular_hits = 0;
     std::vector<std::uint32_t> rvas;
     const int hits = patch::visit_imports(image.data(), image.size(), [&](const patch::Hit& hit) {
         rvas.push_back(hit.first_thunk_rva);
+        if (hit.delay_import) ++delay_hits;
+        else ++regular_hits;
         if (hit.kind == patch::Kind::get_proc_address) ++gpa;
         else if (hit.kind == patch::Kind::query_api_impl) ++query;
     });
     check("visit finds GetProcAddress (import + delay)", gpa == 2);
     check("visit finds one xgameruntime QueryApiImpl", query == 1);
     check("visit hit count", hits == 3);
+    check("ordinal import skipped", gpa == 2 && hits == 3);
+    check("delay vs regular hits", delay_hits == 1 && regular_hits == 2);
     check("first thunk RVAs", rvas.size() == 3 && rvas[0] == 0x270 && rvas[1] == 0x278 && rvas[2] == 0x4B0);
 
     if (failures) {
