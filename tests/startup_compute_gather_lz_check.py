@@ -68,7 +68,35 @@ def controls(llvm_mc):
     # Point the raw output and the texture input at the same table slot.
     aliased = PREFIX.replace(bytes.fromhex('050708f4200000fa'), bytes.fromhex('050708f4000000fa'))
     refused('used for a load and a store', lambda: pipeline(shader(2, aliased)))
+    check_image_provenance(llvm_mc)
     print('Four compute gather channels, manifest bindings and refusal controls passed')
+
+
+def check_image_provenance(llvm_mc):
+    def encoded(source, hex_words):
+        words = bytes.fromhex(hex_words)
+        if llvm_mc:
+            assert assemble(llvm_mc, source + '\n') == words, source
+        return words
+
+    # The gather still reads the intact s[16:23]. An update through a second load
+    # of the same table slot marks the low or high four-word key in pipe.modified.
+    duplicate = encoded('s_load_dwordx8 s[40:47], s[10:11], 0', '050a0cf4000000fa')
+    assert 'srv 0 tex2d table 1 0' in pipeline(shader(2, PREFIX + duplicate)).manifest()
+    for reg, words in ((41, '29ff298800000400'), (46, '2eff2e8800000400')):
+        change = encoded(f's_or_b32 s{reg}, s{reg}, 0x40000', words)
+        refused('modified image descriptor', lambda: pipeline(shader(2, PREFIX + duplicate + change)))
+
+    # Fetch the output first since the wide loads can overwrite the table pointer.
+    # With s[12:27] the gather starts at loaded word 4 and straddles two descriptors.
+    # With s[8:23] it starts at word 8, the complete second descriptor (byte offset 32).
+    original = bytes.fromhex('05040cf4000000fa050708f4200000fa')
+    output = encoded('s_load_dwordx4 s[28:31], s[10:11], 64', '050708f4400000fa')
+    middle = encoded('s_load_dwordx16 s[12:27], s[10:11], 0', '050310f4000000fa')
+    aligned = encoded('s_load_dwordx16 s[8:23], s[10:11], 0', '050210f4000000fa')
+    refused('fixed table image descriptor', lambda: pipeline(shader(2, PREFIX.replace(original, output + middle))))
+    manifest = pipeline(shader(2, PREFIX.replace(original, output + aligned))).manifest().splitlines()
+    assert 'srv 0 tex2d table 1 32' in manifest and 'uav 0 table 1 64' in manifest, manifest
 
 
 def reference(level, channel):
