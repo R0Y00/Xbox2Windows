@@ -7993,6 +7993,15 @@ one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
 as lane masks are refused because their per-lane projections lose the other
 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' -V`.
 
+**Scalar bit set and clear.** Startup translation lowers `s_bitset0_b32` and
+`s_bitset1_b32` in place: bit `S0[4:0]` of the destination is cleared or set,
+and SCC is unchanged (same form as `pixel_aot` / #1579; Refs #2023 Item J).
+Lane masks and descriptor-bearing SGPRs are refused. A known constant
+destination with a known bit index folds. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitset$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_bitset_check.py`). The fixture is
+CPU-only; Windows WARP/hardware draws are left for an independent retest.
+
 **Scalar immediate comparisons.** The startup translator sign-extends the
 16-bit field of `s_movk_i32` and `s_cmpk_*_i32`, and zero-extends the field
 of `s_cmpk_*_u32`. The source-built check covers all six relations against

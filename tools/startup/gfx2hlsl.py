@@ -3826,6 +3826,58 @@ class Stage:
         value = sopk_imm(ops[1], True)
         self.scalar_cmov([ops[0], '0x%x' % value], mods, False, 's_cmovk_i32')
 
+    def op_s_bitset0_b32(self, ops, mods):
+        return self.scalar_bitset(ops, mods, clear=True)
+
+    def op_s_bitset1_b32(self, ops, mods):
+        return self.scalar_bitset(ops, mods, clear=False)
+
+    def scalar_bitset(self, ops, mods, clear):
+        """s_bitset0/1_b32: clear or set bit S0[4:0] of D in place; SCC unchanged.
+
+        RDNA 2 ISA SOP1 0x1b / 0x1d (and the pixel_aot / #1579 lowering): D.u &= ~(1u << (S0.u & 31))
+        or D.u |= (1u << (S0.u & 31)). The destination is also a source (READ_MODIFY_WRITE). Only a
+        plain user SGPR destination is accepted; lane masks and descriptor-bearing SGPRs stay refused
+        so a partial word cannot be treated as a full 32-bit scalar.
+        """
+        name = 's_bitset%d_b32' % (0 if clear else 1)
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2 unmodified' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        d = dst[1]
+        if self.is_lane_mask(ops[0]) or d in self.masks:
+            raise Unsupported('%s on a lane mask' % name)
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        bit_sym = None
+        if imm:
+            index_imm = int(ops[1], 0) & 31
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+                raise Unsupported('%s on a lane mask' % name)
+            bit_sym = self.sym.get(src[1])
+            if bit_sym and bit_sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('%s on %s data' % (name, bit_sym[0]))
+            index_imm = bit_sym[1] & 31 if bit_sym and bit_sym[0] == 'const' else None
+        sym = self.sym.get(d)
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('%s on %s data' % (name, sym[0]))
+        prev = self.S(d)
+        bit = self.u(ops[1])
+        mask = '(1u << (%s & 31))' % bit
+        result = '(%s & ~%s)' % (prev, mask) if clear else '(%s | %s)' % (prev, mask)
+        if sym and sym[0] == 'const' and index_imm is not None:
+            value = ((sym[1] & ~(1 << index_imm)) if clear else (sym[1] | (1 << index_imm))) & 0xffffffff
+            self.set_s(d, '0x%08xu' % value, ('const', value))
+        else:
+            self.set_s(d, result)
+        self.masks.discard(d)
+        return None
+
     def scalar_cmov(self, ops, mods, pair, name=None):
         """D = SCC ? S0 : D on plain SGPR destinations; SCC is unchanged."""
         name = name or 's_cmov_b%d' % (64 if pair else 32)
