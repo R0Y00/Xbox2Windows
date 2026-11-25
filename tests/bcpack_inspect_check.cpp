@@ -160,6 +160,14 @@ void test_bc1()
     check(x2w_bcpack::inspect_bcpack(bc1.data(), bc1.size(), 1, x2w_bcpack::inspect_max_output + 8).cls ==
               C::bad_arguments,
           "destination over the inspection limit");
+    // A tiny source declaring a 256 MiB BC7 output is refused before the ~1 GiB lane-symbol allocation.
+    const Bytes bc7_tiny = from_hex(bc7_one_hex);
+    for (const std::size_t declared : { std::size_t{256} << 20, x2w_bcpack::inspect_max_output + 16 }) {
+        const InspectResult over = x2w_bcpack::inspect_bcpack(bc7_tiny.data(), bc7_tiny.size(), 7, declared);
+        check(over.cls == C::bad_arguments && over.bytes_read == 0 && over.target_symbols_per_lane == 0,
+              "bc7 declared " + std::to_string(declared) + " bytes refused before scratch");
+    }
+    check(x2w_bcpack::inspect_max_output == (std::size_t{16} << 20), "inspection cap is the 16 MiB chunk window");
 }
 
 void test_bc7()

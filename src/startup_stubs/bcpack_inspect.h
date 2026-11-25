@@ -40,8 +40,10 @@ struct InspectResult {
     uint32_t target_symbols_per_lane = 0;  // what the destination size asked for
 };
 
-// Largest destination inspected; the decoded-chunk cap in the chunk-window experiment is 16 MiB.
-inline constexpr size_t inspect_max_output = size_t{256} << 20;
+// Largest destination inspected: the 16 MiB decoded-chunk cap of the chunk-window experiment. Lane symbols cost
+// (output / block_bytes) * symbols_per_block * lanes * 2 bytes, at most 4x the output for BC7 (64 MiB at the
+// cap). A declared size above the cap returns bad_arguments before anything is allocated.
+inline constexpr size_t inspect_max_output = size_t{16} << 20;
 
 struct InspectLayout {
     unsigned format;
