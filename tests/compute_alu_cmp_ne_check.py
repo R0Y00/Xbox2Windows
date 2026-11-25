@@ -26,7 +26,8 @@ def controls():
     for compare, diagnostic in (
         ("v_cmp_ne_i32_e32 vcc_lo, v0, s3", "Unsupported compute instruction"),
         ("v_cmp_ne_i32_e32 vcc_hi, s3, v0", "Unsupported compute instruction"),
-        ("v_cmp_ne_i32_e64 s20, s3, v0", "Unsupported compute instruction"),
+        # v_cmp_ne_i32_e64 s20, ... sets s20 to a per-lane cond without writing vcc_lo, so s_and_saveexec_b32 refuses it.
+        ("v_cmp_ne_i32_e64 s20, s3, v0", "Unverified or repeated lane guard"),
         ("v_cmp_ne_i32_e64 vcc_lo, -v0, s3", "Unsupported compute instruction"),
         ("v_cmpx_ne_i32_e32 vcc_lo, s3, v0", "Unsupported compute instruction"),
         ("v_cmp_ne_i32_e32 vcc_lo, s20, v0", "Unverified lane guard compare"),

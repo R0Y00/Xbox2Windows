@@ -720,6 +720,16 @@ HRESULT __stdcall input_previous_reading(Object*, Reading* reference, std::uint3
     *out = make_reading(entry, kind, device);
     return S_OK;
 }
+
+// Microsoft's v0 GetTemporalReading was never implemented and was removed in v1.
+HRESULT __stdcall input_temporal_reading(Object*, u64 timestamp, Object* device, Reading** out)
+{
+    static LONG calls;
+    note("GameInput::GetTemporalReading", calls, timestamp, reinterpret_cast<u64>(device));
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
+    *out = nullptr;
+    return E_NOTIMPL;
+}
 using DeviceCallback = void(__stdcall*)(u64 token, void* context, Object* device, u64 timestamp, std::uint32_t current, std::uint32_t previous);
 HRESULT __stdcall input_register_device_callback(Object*, Object* device, std::uint32_t kind, std::uint32_t status_filter, std::uint32_t enumeration,
                                                  void* context, DeviceCallback callback, u64* token)
@@ -817,6 +827,7 @@ void build()
     input_table.slots[4] = reinterpret_cast<void*>(&input_current_reading);
     input_table.slots[5] = reinterpret_cast<void*>(&input_next_reading);
     input_table.slots[6] = reinterpret_cast<void*>(&input_previous_reading);
+    input_table.slots[7] = reinterpret_cast<void*>(&input_temporal_reading);
     input_table.slots[8] = reinterpret_cast<void*>(&input_register_callback);          // RegisterReadingCallback
     input_table.slots[9] = reinterpret_cast<void*>(&input_register_device_callback);
     input_table.slots[10] = reinterpret_cast<void*>(&input_register_short_callback);   // RegisterGuideButtonCallback
