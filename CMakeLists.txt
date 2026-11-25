@@ -630,6 +630,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_present_producer_${backend} COMMAND "${INTAKE_PYTHON}" -B
                  "${CMAKE_SOURCE_DIR}/tests/startup_present_producer_check.py" "${backend}" "$<TARGET_FILE:startup_present_producer>")
         set_tests_properties(startup_present_producer_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+        add_test(NAME startup_list_uav_barriers_${backend} COMMAND "${INTAKE_PYTHON}" -B
+                 "${CMAKE_SOURCE_DIR}/tests/startup_present_producer_check.py" "${backend}" "$<TARGET_FILE:startup_present_producer>" barriers)
+        set_tests_properties(startup_list_uav_barriers_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     endforeach()
 endif()
 add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)

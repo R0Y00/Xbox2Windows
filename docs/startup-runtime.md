@@ -31,10 +31,25 @@ records. The control expects the first blend patch to win and must fail.
 
 Command-list slot 24 (`OMSetStencilRef`, the desktop slot) passes its reference to the desktop list, as slots 21 to 23 do for viewports, scissors and the blend factor, so a translated draw whose pipeline enables the stencil test compares against it. A closed list ignores the call. The slot number is the desktop one and has not been seen in a title log; `startup_stream_depth_{warp,hardware}` checks the references 0x5A, 0x5B, 0 and 0xFF against a stencil cleared to the matching value.
 
+## Command-list UAV barriers
+
+Render-mode slot 26 forwards unflagged UAV barriers on an open direct or compute list. A null
+resource orders UAV accesses across resources. A named resource must be a wrapper around a local
+desktop resource with UAV access. Transition and aliasing records are skipped because desktop
+resource states and heap aliases are managed by the shim. The slot returns zero console actions.
+The console slot and record layout are also documented by the
+[ztrx command-list implementation](https://github.com/Zettrox/ztrx/blob/90b529f878a470fec9bf07b7be316bc769a12232/crates/victory-gpu/src/list.rs).
+
+Build `startup_present_producer` and run
+`ctest --preset release --no-tests=error -R '^startup_list_uav_barriers_(warp|hardware)$' -V`.
+The source-built caller submits both supported forms and checks the forwarding log, with refusal
+controls for other barrier types, flagged barriers, invalid resources and arrays, and closed lists.
+
 ## Occlusion queries
 
 Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
-shows only that four console methods sit in 26 to 31 (32 is `SetDescriptorHeaps`, desktop 28 plus four) and that
+places `ResourceBarrier` at 26 and four additional console methods in the 26 to 31 range
+(32 is `SetDescriptorHeaps`, desktop 28 plus four). It also shows that
 the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
 implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
 `ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a

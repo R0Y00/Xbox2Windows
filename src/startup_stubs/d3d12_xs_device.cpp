@@ -2385,6 +2385,40 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
 }
 // List slot 33 (desktop 29 + 4), SetComputeRootSignature.
+// Slot 26: the console's UAV records have the desktop layout, with wrapped resource pointers.
+// Desktop transitions are owned by the shim, so the other barrier types are left unhandled.
+UINT __stdcall list_resource_barriers(Wrapper* self, UINT count, const D3D12_RESOURCE_BARRIER* barriers)
+{
+    static_assert(sizeof(D3D12_RESOURCE_BARRIER) == 32);
+    UINT forwarded = 0;
+    auto* list = recording(self);
+    const auto type = list ? list->GetType() : D3D12_COMMAND_LIST_TYPE_COPY;
+    if ((type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE) &&
+        count && barriers && x2w_local::readable(barriers, std::size_t{count} * sizeof(*barriers))) {
+        for (UINT i = 0; i < count; ++i) {
+            D3D12_RESOURCE_BARRIER barrier;
+            std::memcpy(&barrier, barriers + i, sizeof(barrier));
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_UAV || barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE)
+                continue;
+            if (barrier.UAV.pResource) {
+                Wrapper* resource = as_wrapper(barrier.UAV.pResource);
+                if (!resource || resource->own().kind != resource_kind || !resource->own().real) continue;
+                auto* real = static_cast<ID3D12Resource*>(resource->own().real);
+                if (!(real->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) continue;
+                Microsoft::WRL::ComPtr<ID3D12Device> owner;
+                if (FAILED(real->GetDevice(IID_PPV_ARGS(&owner))) || owner.Get() != device_of(self->own().list_device)) continue;
+                barrier.UAV.pResource = real;
+            }
+            list->ResourceBarrier(1, &barrier);
+            ++forwarded;
+        }
+    }
+    static LONG reports;
+    if (count && first_calls(reports, 8))
+        log("x2w-d3d12 CommandList::slot26(ResourceBarrier): forwarded=%u refused=%u", forwarded, count - forwarded);
+    return 0; // no console barrier actions to perform on the caller's side
+}
+
 void __stdcall list_compute_root(Wrapper* self, void* root)
 {
     auto* list = recording(self);
@@ -4798,6 +4832,7 @@ void build_tables()
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
         list_typed[24] = reinterpret_cast<ListTyped>(&list_stencil_ref);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
+        list_typed[x2w_list_slots::resource_barrier_slot] = reinterpret_cast<ListTyped>(&list_resource_barriers);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
