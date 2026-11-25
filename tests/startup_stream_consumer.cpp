@@ -248,8 +248,11 @@ int main(int argc, char** argv)
         bc7 = {argv[6], static_cast<UINT>(std::strtoul(argv[7], nullptr, 10)),
                static_cast<UINT>(std::strtoul(argv[8], nullptr, 10)),
                std::strcmp(argv[9], "tiled") == 0};
-        if ((bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
+        bc7.small4k = std::strcmp(argv[9], "small4k") == 0;
+        if (bc7.small4k ? bc7.width != 32 || bc7.height != 32
+                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
         if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
+        else if (bc7.small4k) {}
         else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
     ComPtr<IDXGIAdapter> adapter;
@@ -293,8 +296,8 @@ int main(int argc, char** argv)
     } else if (argc == 7 || argc == 8) {
         // A render-target format for the translated MRT export, and an optional root constant.
         format = static_cast<DXGI_FORMAT>(std::strtoul(argv[6], nullptr, 10));
-        if (format != DXGI_FORMAT_R32_UINT && format != DXGI_FORMAT_R32_SINT &&
-            format != DXGI_FORMAT_R32G32B32A32_FLOAT) return 2;
+        StreamMrtFormat mrt{};
+        if (!stream_mrt_format(format, mrt)) return 2;
         if (argc == 8) export_word = static_cast<UINT>(std::strtoul(argv[7], nullptr, 0));
     }
     wchar_t manifest[MAX_PATH];
