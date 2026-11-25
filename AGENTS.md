@@ -216,6 +216,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_stream_interface_check.py
 ./out/pe-env/bin/python -B tests/compute_alu_cmp_ne_check.py
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
+./out/pe-env/bin/python -B tests/compute_buffer_atomics_check.py
 ./out/pe-env/bin/python -B tests/compute_alu_bcnt64_check.py
 ./out/pe-env/bin/python -B tests/compute_load_format_check.py
 ./out/pe-env/bin/python -B tests/compute_heap_view_check.py

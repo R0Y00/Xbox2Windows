@@ -215,18 +215,23 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                 z, color[0], color[1], color[2], color[3]);
 }
 
-// Draws an 8x2 R32G32B32A32_UINT target against an 8x2 2D source texture with no static samplers:
+// Draws an 8x2 R32G32B32A32_UINT target against a two-mip (8x2 mip 0, 4x1 mip 1) 2D or two-slice 2D-array
+// source texture with no static samplers:
 //   depth16 == true:  DXGI_FORMAT_R16_UNORM (16-bit depth SRV format) covering zero, binary16 subnormals,
-//                     exact fractions and values where IEEE round-to-nearest-even differs from RTZ;
+//                     exact fractions, double-rounding discriminators (0xffaf, 0xffef) and RNE-vs-RTZ codes;
 //   depth16 == false: DXGI_FORMAT_R32G32B32A32_FLOAT covering four distinct channels per texel, halfway ties
 //                     to even, 1-ULP midpoint neighbours, subnormals, signed zero, overflow and quiet NaNs.
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t words[64])
+                                  bool depth16, std::uint32_t words[64], bool array)
 {
-    constexpr UINT width = 8, height = 2;
+    constexpr UINT width = 8, height = 2, d16_mips = 2;
     static constexpr std::uint16_t kDepthTexels[width * height] = {
         0x0000, 0x0001, 0x0003, 0x1234, 0x2aad, 0x4008, 0x5555, 0x8000,
         0x8010, 0xa018, 0xc018, 0xe00c, 0xffaf, 0xffef, 0xfffe, 0xffff,
+    };
+    static constexpr std::uint16_t kDepthMip1[2][width / 2] = {
+        {0xffaf, 0xffef, 0x0003, 0x8010},
+        {0xffef, 0xffaf, 0x5555, 0xa018},
     };
     static constexpr std::uint32_t kFloatTexels[width * height][4] = {
         {0x3f801000u, 0x3f803000u, 0x3f801001u, 0x3f7fffffu},
@@ -245,6 +250,12 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
         {0xb4000000u, 0xb4800000u, 0xb5000000u, 0xb5800000u},
         {0x3fc00000u, 0xc0000000u, 0x40200000u, 0xc0400000u},
         {0x477fe000u, 0xc77fe000u, 0x38800000u, 0xb8800000u},
+    };
+    static constexpr std::uint32_t kFloatMip1[width / 2][4] = {
+        {0x3f803000u, 0x387fe000u, 0xbf803000u, 0x477fefffu},
+        {0x33800000u, 0x33000001u, 0x80000000u, 0x7fc00001u},
+        {0x44006000u, 0xc4006000u, 0x39003000u, 0xb9003000u},
+        {0x477ff000u, 0xc77ff000u, 0x3e200000u, 0xbe200000u},
     };
 
     const auto vs = read_blob(vertex_path);
@@ -271,29 +282,46 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     ComPtr<ID3D12PipelineState> pipeline;
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image_load d16 PSO");
 
+    const UINT slices = array ? 2u : 1u;
+    const UINT subresources = slices * d16_mips;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = width;
     td.Height = height;
-    td.DepthOrArraySize = 1;
-    td.MipLevels = 1;
+    td.DepthOrArraySize = static_cast<UINT16>(slices);
+    td.MipLevels = d16_mips;
     td.Format = depth16 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprints[4]{};
     UINT64 upload_size = 0;
-    device->GetCopyableFootprints(&td, 0, 1, 0, &src_footprint, nullptr, nullptr, &upload_size);
+    device->GetCopyableFootprints(&td, 0, subresources, 0, src_footprints, nullptr, nullptr, &upload_size);
     const auto upload = make_buffer(device, upload_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
     check(upload->Map(0, &none, &mapped), "Map image_load d16 texels");
-    auto* const dst_bytes = static_cast<std::uint8_t*>(mapped) + src_footprint.Offset;
-    const UINT row_bytes = depth16 ? width * sizeof(std::uint16_t) : width * 4 * sizeof(std::uint32_t);
-    for (UINT y = 0; y < height; ++y) {
-        const void* row_src = depth16 ? static_cast<const void*>(&kDepthTexels[y * width])
-                                      : static_cast<const void*>(&kFloatTexels[y * width][0]);
-        std::memcpy(dst_bytes + y * src_footprint.Footprint.RowPitch, row_src, row_bytes);
+    const UINT texel_bytes = depth16 ? sizeof(std::uint16_t) : 4 * sizeof(std::uint32_t);
+    for (UINT s = 0; s < slices; ++s) {
+        for (UINT m = 0; m < d16_mips; ++m) {
+            const UINT sub = m + s * d16_mips;
+            const UINT mw = width >> m, mh = height >> m;
+            auto* const sub_bytes = static_cast<std::uint8_t*>(mapped) + src_footprints[sub].Offset;
+            for (UINT y = 0; y < mh; ++y) {
+                for (UINT x = 0; x < mw; ++x) {
+                    auto* const cell = sub_bytes + y * src_footprints[sub].Footprint.RowPitch + x * texel_bytes;
+                    if (m == 0) {
+                        const UINT idx = s == 0 ? (y * width + x) : (width * height - 1u - (y * width + x));
+                        if (depth16) std::memcpy(cell, &kDepthTexels[idx], texel_bytes);
+                        else std::memcpy(cell, &kFloatTexels[idx][0], texel_bytes);
+                    } else {
+                        const UINT idx = s == 0 ? x : ((width / 2 - 1u) - x);
+                        if (depth16) std::memcpy(cell, &kDepthMip1[s][x], texel_bytes);
+                        else std::memcpy(cell, &kFloatMip1[idx][0], texel_bytes);
+                    }
+                }
+            }
+        }
     }
     upload->Unmap(0, nullptr);
 
@@ -323,11 +351,13 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    to.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    from.PlacedFootprint = src_footprint;
-    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    for (UINT sub = 0; sub < subresources; ++sub) {
+        D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        to.SubresourceIndex = sub;
+        D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        from.PlacedFootprint = src_footprints[sub];
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->SetGraphicsRootSignature(root.Get());
     ID3D12DescriptorHeap* heaps[]{views.Get()};
