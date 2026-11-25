@@ -43,6 +43,8 @@ WQM = struct.pack('<I', 0xbefe0a7e)  # s_wqm_b64 exec, exec
 WQM_TEXT = 's_wqm_b64 exec, exec\n'
 PACKED = (0x8000, 0x8000)  # SPI_PS_INPUT_ENA/ADDR: the packed screen position only, in v0
 V_OR = 0x1c
+V_MIN_U32 = 0x13
+NAMES = ('or', 'mov', 'min')
 SWAPS = {(1, 0, 3, 2): ('X', 1, 0), (2, 3, 0, 1): ('Y', 0, 1), (3, 2, 1, 0): ('Diagonal', 1, 1)}
 failures = []
 
@@ -88,7 +90,9 @@ FLAG_TEXT = 'v_mov_b32_e32 v9, 2.0\n'
 
 def fixture(name, wqm=True):
     """-> (assembly text, machine words). 'or': VOP2 DPP v_or_b32 with the flag in v9 as the own-lane source.
-    'mov': VOP1 DPP v_mov_b32 into v5..v7, then a plain OR with v9. v4 is always the own-lane position | flag."""
+    'mov': VOP1 DPP v_mov_b32 into v5..v7, then a plain OR with v9. v4 is always the own-lane position | flag.
+    'min': VOP2 DPP v_min_u32 (#2023 item H) of the exchanged position and the own position into v1..v3, then a
+    plain OR with v9. Positions order by y first, so the minimum is the neighbour or the lane itself by pixel."""
     text, words = (WQM_TEXT, WQM) if wqm else ('', b'')
     text, words = text + FLAG_TEXT, words + vop1_mov_flag(9)
     perms = list(SWAPS)
@@ -96,9 +100,16 @@ def fixture(name, wqm=True):
         if name == 'or':
             text += dpp_text('v_or_b32_dpp', 'v%d, v0, v9' % (1 + i), perm) + '\n'
             words += vop2_dpp(V_OR, 1 + i, 0, 9, perm)
+        elif name == 'min':
+            text += dpp_text('v_min_u32_dpp', 'v%d, v0, v0' % (1 + i), perm) + '\n'
+            words += vop2_dpp(V_MIN_U32, 1 + i, 0, 0, perm)
         else:
             text += dpp_text('v_mov_b32_dpp', 'v%d, v0' % (5 + i), perm) + '\n'
             words += vop1_dpp(1, 5 + i, 0, perm)
+    if name == 'min':
+        for i in range(3):
+            text += 'v_or_b32_e32 v%d, v%d, v9\n' % (1 + i, 1 + i)
+            words += vop2_plain(V_OR, 1 + i, 1 + i, 9)
     if name == 'mov':
         for i in range(3):
             text += 'v_or_b32_e32 v%d, v%d, v9\n' % (1 + i, 5 + i)
@@ -108,19 +119,21 @@ def fixture(name, wqm=True):
     return text + EXPORT_TEXT, words + EXPORT
 
 
-def pixel_words(x, y):
-    """The four exported words of pixel (x, y): the position of its neighbour in the quad for each swap, then its own."""
+def pixel_words(x, y, name='or'):
+    """The four exported words of pixel (x, y): the position of its neighbour in the quad for each swap, then its own.
+    For 'min' each word is the unsigned minimum of the neighbour position and the own position."""
     out = []
     for _, dx, dy in SWAPS.values():
-        out.append(((x ^ dx) | (y ^ dy) << 16) | FLAG)
+        word = (x ^ dx) | (y ^ dy) << 16
+        out.append((min(word, x | y << 16) if name == 'min' else word) | FLAG)
     return out + [(x | y << 16) | FLAG]
 
 
-def image(skip=None):
+def image(skip=None, name='or'):
     words = []
     for y in range(HEIGHT):
         for x in range(WIDTH):
-            row = pixel_words(x, y)
+            row = pixel_words(x, y, name)
             if skip is not None:
                 row[skip] = (x | y << 16) | FLAG  # the exchange missing: each lane keeps its own source
             words += row
@@ -161,7 +174,7 @@ def controls():
           {p: v for p, v in G.QUAD_SWAPS.items()} == {p: 'QuadReadAcross' + n for p, (n, _, _) in SWAPS.items()})
 
     # 2. The fixture words decode to the assembly text they were built from (the decoder is the reference for the bits).
-    for name in ('or', 'mov'):
+    for name in NAMES:
         text, words = fixture(name)
         decoded = G.decode(words)
         got = [asm for _, _, _, asm in decoded]
@@ -171,7 +184,7 @@ def controls():
               [normal(a) for a in got] == [normal(w) for w in want], '%s\n%s' % (got, want))
 
     # 3. Translation: each fixture lowers to the three intrinsics and asks for shader model 6.0.
-    for name in ('or', 'mov'):
+    for name in NAMES:
         pipe = pipeline(fixture(name)[1])
         ps = pipe.hlsl_ps()
         check('%s fixture: three distinct quad intrinsics and the stage needs SM 6.0' % name,
@@ -210,7 +223,7 @@ def controls():
         check('refused: a shader with branches', True)
 
     # 4b. Whole-quad EXEC comes only from s_wqm of exec into itself, seen on the real translation path.
-    for name in ('or', 'mov'):
+    for name in NAMES:
         try:
             pipeline(fixture(name, wqm=False)[1]).hlsl_ps()
             check('%s fixture without s_wqm exec is refused' % name, False)
@@ -224,6 +237,16 @@ def controls():
         check('refused: whole-quad proof dropped by a restored exec copy', False)
     except G.Unsupported as reason:
         check('refused: whole-quad proof dropped by a restored exec copy (%s)' % reason, 'whole-quad' in str(reason))
+
+    # 4c. The min fixture keeps src1 in its own lane and its reference is neither the plain exchange nor a maximum.
+    line = pipeline(fixture('min')[1]).hlsl_ps()
+    check('v_min_u32_dpp lowers to min(exchanged src0, own src1)',
+          all(re.search(r'min\(QuadReadAcross%s\(v0\), v0\)' % n, line) for n in ('X', 'Y', 'Diagonal')))
+    check('the min reference differs from the plain exchange at some pixels in every swap',
+          all(any(pixel_words(x, y, 'min')[i] != pixel_words(x, y)[i] for x in range(WIDTH) for y in range(HEIGHT))
+              for i in range(3)))
+    check('the min reference keeps the own position where it is the smaller one',
+          pixel_words(0, 2, 'min')[2] == (0 | 2 << 16 | FLAG) and pixel_words(0, 3, 'min')[2] == (1 | 2 << 16 | FLAG))
 
     # 5. A float VOP2 keeps its second source in its own lane.
     stage = Probe()
@@ -254,7 +277,7 @@ def controls():
 
 
 def check_binary(llvm_mc):
-    for name in ('or', 'mov'):
+    for name in NAMES:
         text, words = fixture(name)
         check('llvm-mc assembles the %s fixture to the same words' % name, assemble(llvm_mc, text) == words)
 
@@ -286,8 +309,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'vs', 'vs_6_0', directory)
-        good = words_file(directory, 'good', image())
-        for name in ('or', 'mov'):
+        for name in NAMES:
+            good = words_file(directory, 'good_' + name, image(name=name))
             text = pipeline(fixture(name)[1]).hlsl_ps()
             ps = compile_hlsl(dxc, 'dxc', text, 'ps_' + name, 'ps_6_0', directory)
             run = draw(renderer, adapter, vs, ps, good)
@@ -301,6 +324,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 'Diagonal reads the X neighbour': mutate(text, r'QuadReadAcrossDiagonal\(', 'QuadReadAcrossX('),
                 'no exchange (each lane keeps its own value)': re.sub(r'QuadReadAcross\w+\((v\d+)\)', r'\1', text),
             }
+            if name == 'min':
+                wrong['unsigned maximum instead of minimum'] = mutate(text, r'\bmin\(', 'max(')
             for label, source in wrong.items():
                 bad = compile_hlsl(dxc, 'dxc', source, 'bad_%s_%d' % (name, abs(hash(label))), 'ps_6_0', directory)
                 run = draw(renderer, adapter, vs, bad, good)
@@ -308,7 +333,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                       run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
             # The unmutated lowering also differs from an image in which one exchange is missing.
             for index in range(3):
-                partial = words_file(directory, 'partial%d' % index, image(skip=index))
+                partial = words_file(directory, 'partial%d' % index, image(skip=index, name=name))
                 run = draw(renderer, adapter, vs, ps, partial)
                 check('%s %s: reference with swap %d dropped is rejected' % (adapter, name, index),
                       run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
