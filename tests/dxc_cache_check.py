@@ -69,6 +69,12 @@ def main():
         if first.stdout.replace("in.hlsl", "") != second.stdout.replace("in.hlsl", "") or "compiled" not in second.stdout:
             fail("stdout not replayed")
 
+        # A hit must not create a directory where the real compiler would refuse the output.
+        missing_output = rig.root / "missing" / "output.cso"
+        rejected, obj = rig.compile("void main(){}", out=missing_output)
+        if rejected.returncode == 0 or obj is not None or missing_output.parent.exists():
+            fail("cache hit bypassed a missing output directory")
+
         rig.compile("void main(){ int x; }")
         if rig.calls() != 2:
             fail("changed source reused a stale entry")

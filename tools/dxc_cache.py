@@ -44,6 +44,8 @@ def _plan(compiler, args):
             path = args[index + 1]
             if path.endswith(("/", "\\")) or os.path.isdir(path) or path in outputs.values() or path == source:
                 return None
+            if not os.path.isdir(os.path.dirname(os.path.abspath(path))):
+                return None
             outputs[arg] = path
             key_args.append(arg)
             key_args.append("<out:%s>" % arg)
@@ -81,8 +83,6 @@ def _store(path, payload):
 
 
 def _write_file(path, data):
-    _store_dir = os.path.dirname(os.path.abspath(path))
-    os.makedirs(_store_dir, exist_ok=True)
     with open(path, "wb") as out:
         out.write(data)
 
