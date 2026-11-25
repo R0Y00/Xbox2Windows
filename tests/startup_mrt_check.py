@@ -93,7 +93,8 @@ def check(work, consumer, backend, kind, dxc, fxc):
     for fmt, expected_type, channels in INTEGER_FORMATS:
         key, cleared = request(fmt, (fmt, 28))
         variants[fmt] = key
-        assert cleared.hex() == '00' * 4 * channels + '0000ffff', cleared.hex()
+        # The harness clears every target to (0, 0, 1, 1); integer channels hold those values as words.
+        assert cleared == struct.pack(f'<{channels}I', *(0, 0, 1, 1)[:channels]) + bytes.fromhex('0000ffff'), cleared.hex()
         outputs = compile_pair(key)
         if outputs.get('0') == 'sint':
             outputs['0'] = 'int'
