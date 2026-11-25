@@ -2,10 +2,14 @@
 // permissive startup paths. Lines go to stderr and are appended to %X2W_TRAP_LOG% when set.
 #pragma once
 
+#include "startup_stubs/log_cap.h"
 #include "startup_stubs/trap.h"
 
 #include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 namespace x2w_local {
 
@@ -33,35 +37,103 @@ inline void logf(const char* format, ...) noexcept
     line[n++] = '\n';
     const DWORD error = GetLastError();
     x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n));
-    x2w_trap::append_log(line, static_cast<DWORD>(n), false);
+    x2w_trap::append_trap_log(line, static_cast<DWORD>(n));  // one open handle per module (trap.h)
     SetLastError(error);
 }
 
-// True for the first `limit` calls on `counter`. The counter stops at the limit instead of counting
-// every call: a gate on a hot path would otherwise pass 2^31 calls, turn negative and pass again.
-inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
-{
-    LONG seen = counter;
-    while (seen < limit) {
-        const LONG previous = InterlockedCompareExchange(&counter, seen + 1, seen);
-        if (previous == seen) return true;
-        seen = previous;
-    }
-    return false;
-}
+// first_calls (a saturating log cap) is in startup_stubs/log_cap.h.
 
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
 // VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a
 // millisecond (it walks the region to size it). A bad pointer costs a first-chance exception, so
 // callers on hot paths should pass values that normally are pointers. A guard page that the probe
 // trips is re-armed.
+struct ProbeCache {
+    struct Range { std::uintptr_t start, end; ULONGLONG until; };
+    static constexpr unsigned size = 64;
+    SRWLOCK lock = SRWLOCK_INIT;
+    Range ranges[size] = {};
+    unsigned next = 0;
+    volatile LONG64 hits = 0, faults = 0, cached = 0, queries = 0, query_ticks = 0;
+    volatile LONG generation = 0;   // invalidate_probe_cache: entries of an older generation are ignored
+    LONG range_generation[size] = {};
+};
+inline ProbeCache& probe_cache() noexcept
+{
+    static ProbeCache cache;
+    return cache;
+}
+inline bool probe_cache_on() noexcept
+{
+    static const bool on = env_on("X2W_PROBE_CACHE");
+    return on;
+}
+inline ULONGLONG probe_cache_ms() noexcept
+{
+    static const ULONGLONG ms = [] {
+        const DWORD saved = GetLastError();
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_PROBE_CACHE_MS", value, sizeof(value));
+        SetLastError(saved);
+        const unsigned long parsed = n && n < sizeof(value) ? std::strtoul(value, nullptr, 10) : 100;
+        return static_cast<ULONGLONG>(parsed);
+    }();
+    return ms;
+}
+inline void invalidate_probe_cache() noexcept { InterlockedIncrement(&probe_cache().generation); }
+// The end of the part of [start, end) before the first cached unreadable range; start itself when start is in one.
+inline std::uintptr_t probe_cache_clamp(std::uintptr_t start, std::uintptr_t end) noexcept
+{
+    ProbeCache& c = probe_cache();
+    const ULONGLONG now = GetTickCount64();
+    const LONG generation = c.generation;
+    AcquireSRWLockShared(&c.lock);
+    for (unsigned i = 0; i < ProbeCache::size; ++i) {
+        const ProbeCache::Range& r = c.ranges[i];
+        if (r.end <= r.start || now >= r.until || c.range_generation[i] != generation || r.end <= start || r.start >= end) continue;
+        end = r.start <= start ? start : r.start;
+        if (end == start) break;
+    }
+    ReleaseSRWLockShared(&c.lock);
+    return end;
+}
+inline void probe_cache_fault(std::uintptr_t at) noexcept
+{
+    ProbeCache& c = probe_cache();
+    InterlockedIncrement64(&c.faults);
+    MEMORY_BASIC_INFORMATION info{};
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    const SIZE_T got = VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info));
+    QueryPerformanceCounter(&t1);
+    InterlockedIncrement64(&c.queries);
+    InterlockedAdd64(&c.query_ticks, t1.QuadPart - t0.QuadPart);
+    if (got != sizeof(info) || !info.RegionSize) return;
+    const DWORD protect = info.Protect & 0xFF;
+    const bool unreadable = info.State != MEM_COMMIT || protect == PAGE_NOACCESS || protect == 0;
+    if (!unreadable || (info.Protect & PAGE_GUARD)) return;
+    const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+    AcquireSRWLockExclusive(&c.lock);
+    const unsigned slot = c.next++ % ProbeCache::size;
+    c.ranges[slot] = {begin, begin + info.RegionSize, GetTickCount64() + probe_cache_ms()};
+    c.range_generation[slot] = c.generation;
+    ReleaseSRWLockExclusive(&c.lock);
+    InterlockedIncrement64(&c.cached);
+}
 inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexcept
 {
     if (start < 0x10000 || start > 0x00007FFFFFFEFFFFull || bytes == 0) return 0;
     std::size_t done = 0;
     DWORD code = 0;
     std::uintptr_t at = start;
-    const std::uintptr_t end = start + bytes;
+    std::uintptr_t end = start + bytes;
+    const bool cache = probe_cache_on();
+    if (cache) {
+        const std::uintptr_t clamped = probe_cache_clamp(start, end);
+        if (clamped != end) InterlockedIncrement64(&probe_cache().hits);
+        end = clamped;
+        if (end == start) return 0;
+    }
     __try {
         volatile unsigned char sink = 0;
         while (at < end) {
@@ -77,6 +149,8 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
             DWORD old = 0;
             if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) && info.State == MEM_COMMIT)
                 VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
+        } else if (cache) {
+            probe_cache_fault(at);
         }
     }
     return done;

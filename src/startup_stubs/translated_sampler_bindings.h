@@ -19,6 +19,47 @@ constexpr UINT translated_sampler_space = 1;
 constexpr UINT translated_sampler_fallback = translated_sampler_count - 1;
 constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
+inline bool sampler_lod_fields_on()
+{
+    static const bool on = [] {
+        char value[4]{};
+        const DWORD saved = GetLastError();
+        const bool v = GetEnvironmentVariableA("X2W_SAMPLER_LOD", value, sizeof(value)) && value[0] == '1';
+        SetLastError(saved);
+        return v;
+    }();
+    return on;
+}
+
+struct SamplerLodFields {
+    float bias, min_lod, max_lod;
+    D3D12_STATIC_BORDER_COLOR border;
+    bool border_register;  // BORDER_COLOR_TYPE 3 (a border colour table entry): not translated, transparent black
+};
+
+// Field positions of SQ_IMG_SAMP_WORD1..3 (Mesa src/amd/registers/gfx10-rsrc.json, as cited in tools/pixel_aot.py):
+// word 1 bits 11:0 MIN_LOD and 23:12 MAX_LOD, unsigned 4.8 fixed point; word 2 bits 13:0 LOD_BIAS, signed 5.8
+// (bits 19:14 LOD_BIAS_SEC, the secondary bias, are not carried); word 3 bits 31:30 BORDER_COLOR_TYPE
+// (0 transparent black, 1 opaque black, 2 opaque white, 3 register), numbered as D3D12_STATIC_BORDER_COLOR 0..2.
+// MAX_LOD 0xfff (15.996) stays unlimited. D3D12 limits the bias to [-16, 15.99].
+inline SamplerLodFields sampler_lod_fields(const SamplerWords& words)
+{
+    SamplerLodFields f{};
+    int bias = static_cast<int>(words[2] & 0x3fff);
+    if (bias & 0x2000) bias -= 0x4000;
+    f.bias = static_cast<float>(bias) / 256.0f;
+    if (f.bias < D3D12_MIP_LOD_BIAS_MIN) f.bias = D3D12_MIP_LOD_BIAS_MIN;
+    if (f.bias > D3D12_MIP_LOD_BIAS_MAX) f.bias = D3D12_MIP_LOD_BIAS_MAX;
+    f.min_lod = static_cast<float>(words[1] & 0xfff) / 256.0f;
+    const UINT max_raw = (words[1] >> 12) & 0xfff;
+    f.max_lod = max_raw == 0xfff ? D3D12_FLOAT32_MAX : static_cast<float>(max_raw) / 256.0f;
+    if (f.max_lod < f.min_lod) f.max_lod = f.min_lod;
+    const UINT type = words[3] >> 30;
+    f.border_register = type == 3;
+    f.border = type == 3 ? D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK : static_cast<D3D12_STATIC_BORDER_COLOR>(type);
+    return f;
+}
+
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
 // lod_limits (manifest line smpl, image_sample_b and a constant sampler of image_sample, _l, _lz): the descriptor's LOD clamp is carried over. MIN_LOD (word 1 bits
@@ -27,7 +68,7 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 // divided by 256. dynamic_sampler() sets it for every heap entry. Without it MinLOD stays 0 and MaxLOD unbounded, as
 // for the other sample forms.
 inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
-                                                bool lod_limits = false)
+                                                bool lod_limits = false, bool lod_fields = sampler_lod_fields_on())
 {
     static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -54,6 +95,13 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
                   : border_type == 1u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
                                       : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
+    if (lod_fields) {
+        const auto f = sampler_lod_fields(words);
+        s.MipLODBias = f.bias;
+        s.MinLOD = f.min_lod;
+        s.MaxLOD = f.max_lod;
+        s.BorderColor = f.border;
+    }
     if (lod_limits) {
         s.MinLOD = static_cast<float>(words[1] & 0xfffu) / 256.0f;
         s.MaxLOD = static_cast<float>((words[1] >> 12) & 0xfffu) / 256.0f;
@@ -106,7 +154,7 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
     std::vector<D3D12_STATIC_SAMPLER_DESC> statics;
     for (UINT i = 0; i < samplers.statics.size(); ++i)
         statics.push_back(decode_sampler(samplers.statics[i], i, i < samplers.comparison.size() && samplers.comparison[i],
-                                         i < samplers.lod_limits.size() && samplers.lod_limits[i]));
+                                         i < samplers.lod_limits.size() && samplers.lod_limits[i], sampler_lod_fields_on()));
     return statics;
 }
 
@@ -187,21 +235,24 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
     return snapshot;
 }
 
-inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
+inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words, bool lod_fields = sampler_lod_fields_on())
 {
-    // A heap entry is the title's own descriptor, so its MIN_LOD, MAX_LOD (#2221) and fixed border color apply.
-    const auto s = decode_sampler(words, 0, false, true);
-    const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
-    const float alpha = (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
-                         s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK) ? 1.0f : 0.0f;
-    return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
-            {rgb, rgb, rgb, alpha}, s.MinLOD, s.MaxLOD};
+    const auto s = decode_sampler(words, 0, false, true, lod_fields);
+    D3D12_SAMPLER_DESC d{s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
+                         {}, s.MinLOD, s.MaxLOD};
+    if (lod_fields) {
+        const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
+        const float alpha = s.BorderColor == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK ? 0.0f : 1.0f;
+        d.BorderColor[0] = d.BorderColor[1] = d.BorderColor[2] = rgb;
+        d.BorderColor[3] = alpha;
+    }
+    return d;
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
 {
     // Not a title descriptor: its zero word 1 is not a LOD clamp, so the full mip range stays available.
-    auto s = dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    auto s = dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0}, false);
     s.MaxLOD = D3D12_FLOAT32_MAX;
     return s;
 }

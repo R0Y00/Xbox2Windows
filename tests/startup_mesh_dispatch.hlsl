@@ -1,0 +1,117 @@
+// Shaders for tests/startup_mesh_dispatch.cpp (a hand-written stand-in for a translated mesh pipeline).
+//
+// MeshMain / PixelMain use the translated draw root signature the stand-in builds from the manifest
+// (x2w_startup::create_translated_root): b0 = the entry values (udsrc 0 rect, udsrc 1 rootconst), t0 = srv 0.
+// One triangle per group: group g reads vertices 3g..3g+2 (float2 each) from t0. Colour from entry value 1
+// (0x00BBGGRR); alpha 1 when the rect entry value is 0 (a mesh call must bind 0 there), else 0.5.
+ByteAddressBuffer positions : register(t0);
+cbuffer Entry : register(b0) { uint rect; uint colour; };
+
+struct Vertex {
+    float4 param0 : PARAM0;
+    float4 pos : SV_Position;
+};
+
+[numthreads(3, 1, 1)]
+[outputtopology("triangle")]
+void MeshMain(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID, out vertices Vertex verts[3], out indices uint3 tris[1])
+{
+    SetMeshOutputCounts(3, 1);
+    const float2 p = asfloat(positions.Load2((group.x * 3 + thread) * 8));
+    // Colour bit 24 (the stateclip modes): z 1.5 = beyond the far plane (z / w > 1), drawn only with depth clip off.
+    verts[thread].pos = float4(p, (colour >> 24) & 1 ? 1.5 : 0.25, 1.0);
+    verts[thread].param0 = float4((colour & 255) / 255.0, ((colour >> 8) & 255) / 255.0, ((colour >> 16) & 255) / 255.0,
+                                  rect == 0 ? 1.0 : 0.5);
+    if (thread == 0) tris[0] = uint3(0, 1, 2);
+}
+
+cbuffer HeapEntry : register(b0) { uint heap_rect; uint heap_colour; uint heap_slot; };
+ByteAddressBuffer heapmem : register(t0, space1);
+ByteAddressBuffer vdesc : register(t2, space1);
+ByteAddressBuffer heapbuf[] : register(t0, space6);
+
+[numthreads(3, 1, 1)]
+[outputtopology("triangle")]
+void MeshHeap(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID, out vertices Vertex verts[3], out indices uint3 tris[1])
+{
+    const uint h = heap_slot * 32;
+    const uint id = heapmem.Load(h) == 0x56573258u ? heapmem.Load(h + 4) : 0xffffffffu;
+    const uint word3 = id < 90000u ? vdesc.Load(id * 32 + 12) : 0u;
+    const uint format = (word3 >> 12) & 127u;
+    const bool known = format == 29u || format == 64u;
+    SetMeshOutputCounts(known ? 3 : 0, known ? 1 : 0);
+    if (!known) return;
+    const uint e = group.x * 3 + thread;
+    const uint k = 8u + 8u * id + 4u;
+    float2 p;
+    if (format == 29u) {
+        const uint v = heapbuf[NonUniformResourceIndex(k)].Load(e * 4);
+        p = f16tof32(uint2(v & 0xffffu, v >> 16));
+    } else {
+        p = asfloat(heapbuf[NonUniformResourceIndex(k)].Load2(e * 8));
+    }
+    verts[thread].pos = float4(p, 0.25, 1.0);
+    verts[thread].param0 = float4((heap_colour & 255) / 255.0, format / 255.0, ((heap_colour >> 16) & 255) / 255.0, heap_rect == 0 ? 1.0 : 0.5);
+    if (thread == 0) tris[0] = uint3(0, 1, 2);
+}
+
+// MeshDescword (modes descword / descwordoff; manifest `udsrc 2 descword 1 8`, mesh2hlsl X2W_MESH_FEATURES=descword): a
+// word of a TABLE descriptor read as a number, as a translated mesh stage reads a V# NUM_RECORDS. Entry value 2 is
+// dword 2 (byte 8) of the descriptor in table parameter 1 entry 0: the test's hardware buffer descriptor, NUM_RECORDS
+// = 48 (0x30). Green = that word's low byte; the triangle is drawn only when the word is 48 (a group reads its
+// vertices only within NUM_RECORDS bytes, as the console's bounds check would).
+cbuffer DescEntry : register(b0) { uint desc_rect; uint desc_colour; uint desc_word2; };
+
+[numthreads(3, 1, 1)]
+[outputtopology("triangle")]
+void MeshDescword(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID, out vertices Vertex verts[3], out indices uint3 tris[1])
+{
+    const uint e = group.x * 3 + thread;
+    const bool inside = desc_word2 == 48u && (group.x * 3 + 3) * 8 <= desc_word2;
+    SetMeshOutputCounts(inside ? 3 : 0, inside ? 1 : 0);
+    if (!inside) return;
+    const float2 p = asfloat(positions.Load2(e * 8));
+    verts[thread].pos = float4(p, 0.25, 1.0);
+    verts[thread].param0 = float4((desc_colour & 255) / 255.0, (desc_word2 & 255) / 255.0, ((desc_colour >> 16) & 255) / 255.0,
+                                  desc_rect == 0 ? 1.0 : 0.5);
+    if (thread == 0) tris[0] = uint3(0, 1, 2);
+}
+
+Texture2D smp_tex : register(t1);
+SamplerState qh[2048] : register(s0, space1);
+float4 PixelSampler(Vertex input) : SV_Target0
+{
+    return smp_tex.SampleLevel(qh[65u], float2(0.375, 0.5), 0);
+}
+
+float4 PixelMain(Vertex input) : SV_Target0
+{
+    return input.param0;
+}
+
+// PixelUint (mode rtvvariant): the RTV variant of PixelMain for an R32_UINT target, as a translator would emit it for
+// `rtv1 <key> 42`: the colour bytes of param0 packed into one uint (0x00BBGGRR when alpha is 1).
+uint4 PixelUint(Vertex input) : SV_Target0
+{
+    const uint4 c = uint4(round(saturate(input.param0) * 255.0));
+    return uint4(c.x | (c.y << 8) | (c.z << 16) | ((c.w == 255u ? 0u : c.w) << 24), 0, 0, 0);
+}
+
+// PixelStore (modes uavtex / uavtexnoflag): an image_store as the translator lowers it (`uav 0 tex2d table 1 <off>`):
+// the colour stored to texel (x, y) of the texture UAV u0 and also returned to the target.
+RWTexture2D<float4> store0 : register(u0);
+float4 PixelStore(Vertex input) : SV_Target0
+{
+    store0[uint2(input.pos.xy)] = input.param0;
+    return input.param0;
+}
+
+// Writer (a console compute pipeline, container path): root [0] UAV u0, [1] four constants b1.
+// Stores the DispatchMesh record values.xyz at byte offset values.w of u0.
+RWByteAddressBuffer target : register(u0);
+cbuffer Values : register(b1) { uint4 values; };
+[numthreads(1, 1, 1)]
+void Writer()
+{
+    target.Store3(values.w, values.xyz);
+}

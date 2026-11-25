@@ -176,6 +176,19 @@ PlacementIndex& placement_group(u64 width)
     return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
 }
 
+x2w_startup::BufferAddressIndex<const Wrapper*>& buffer_address_index()
+{
+    static x2w_startup::BufferAddressIndex<const Wrapper*> index;
+    return index;
+}
+void index_buffer_record(const Wrapper* w, const ResourceInfo& info)  // note_lock exclusive held
+{
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    if (info.placement == Placement::none && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && base)
+        buffer_address_index().insert(w, base, info.console.Width);
+    else
+        buffer_address_index().erase(w);
+}
 // Resources by the title memory they start at (note_lock held), for the memory SRV lookups. An entry stays
 // as long as the resource's record in resource_infos does (never pruned); every lookup applies its own
 // live-reference filter, so a released resource is skipped there and found again if it is referenced again.
@@ -211,6 +224,7 @@ void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
     // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
     x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
         resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);
+    index_buffer_record(w, resource_infos().at(w));
 }
 void retire_placement(Wrapper* w)
 {
@@ -227,6 +241,7 @@ void retire_placement(Wrapper* w)
             }
         }
         found->second.placement = Placement::none;
+        index_buffer_record(w, found->second);
     }
     ReleaseSRWLockExclusive(&note_lock);
 }
@@ -282,6 +297,7 @@ void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT incre
 void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_t desc_bytes, u64 dest_title, u64 dest_desktop,
                bool materialized = true)
 {
+    if (const Wrapper* r = as_wrapper(reinterpret_cast<const void*>(resource)); r && r->own().refs <= 0) x2w_memcut::note_after_release(false);
     ViewRecord record{};
     record.slot = static_cast<std::uint32_t>(slot);
     record.resource = resource;

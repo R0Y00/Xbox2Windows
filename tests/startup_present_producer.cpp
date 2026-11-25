@@ -26,6 +26,13 @@ bool ok(Word result) { return SUCCEEDED(static_cast<HRESULT>(result)); }
 
 int main(int argc, char** argv)
 {
+    const bool title_mode = argc >= 2 && std::strcmp(argv[1], "title-window") == 0;
+    HWND title = nullptr;
+    if (title_mode) {
+        title = CreateWindowExW(WS_EX_NOACTIVATE, L"STATIC", L"Fixture title", WS_POPUP | WS_VISIBLE,
+                                -31000, -31000, 120, 80, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!title) return 16;
+    }
     const bool reverse = argc >= 2 && std::strcmp(argv[1], "reverse") == 0;
     const bool use_magenta = argc >= 2 && std::strcmp(argv[1], "auto-magenta") == 0;
     const bool automatic = use_magenta || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
@@ -147,6 +154,21 @@ int main(int argc, char** argv)
             call(queue, 10, 1, arg(lists));
             if (!finish() || !present() || !present()) return 11;
         }
+    }
+    if (title_mode) {
+        if (!SetWindowPos(title, nullptr, 0, 0, 160, 90, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER) || !present()) return 17;
+        unsigned output_windows = 0;
+        EnumWindows([](HWND window, LPARAM count) -> BOOL {
+            wchar_t name[64]{};
+            DWORD pid = 0;
+            GetWindowThreadProcessId(window, &pid);
+            if (pid == GetCurrentProcessId() && GetClassNameW(window, name, 64) && !lstrcmpW(name, L"X2WOutputWindow"))
+                ++*reinterpret_cast<unsigned*>(count);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&output_windows));
+        wchar_t text[64]{};
+        if (output_windows || !IsWindowVisible(title) || !GetWindowTextW(title, text, 64) || lstrcmpW(text, L"Fixture title")) return 18;
+        DestroyWindow(title);
     }
     if (FAILED(desktop->GetDeviceRemovedReason())) return 12;
     ComPtr<ID3D12InfoQueue> messages;

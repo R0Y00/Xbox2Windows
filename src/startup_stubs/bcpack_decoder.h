@@ -19,6 +19,8 @@
 
 namespace x2w_bcpack {
 
+// (The BC3/BC4/BC5 rank tables and dictionaries come from bcpack_tables.h, which includes bcpack_tables_bcn.inl.)
+
 inline void model_forward(uint8_t eab, uint8_t q, uint16_t sym, uint32_t& f, uint32_t& cf) {
     uint32_t s = sym;
     unsigned long seg = 0;
@@ -1160,6 +1162,7 @@ inline bool decode_bc1_blocks(const std::vector<uint16_t>& symbols, size_t targe
     }
     return true;
 }
+
 
 inline constexpr uint8_t ALPHA_CODE[8] = { 0, 2, 3, 4, 5, 6, 7, 1 };
 inline constexpr uint8_t COLOUR_CODE[4] = { 0, 2, 3, 1 };

@@ -56,6 +56,7 @@ if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
 if ($TraceApi) { $env:X2W_TRACE_API = "1" }
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" }
 if ($Render) {
+    if (-not (Test-Path Env:X2W_PRESENT_IN_TITLE_WINDOW)) { $env:X2W_PRESENT_IN_TITLE_WINDOW = "1" }
     New-Item -ItemType Directory -Force $ShaderCache | Out-Null
     $env:X2W_D3D12_RENDER = "1"; $env:X2W_DRAW_NULL_IDENTITY = "1"
     $env:X2W_SHADER_CACHE = (Resolve-Path $ShaderCache).Path

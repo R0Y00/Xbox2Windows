@@ -39,6 +39,8 @@ int draw_root_cbv(void* list)
     } else if (!std::strcmp(mode, "wrong_type")) {
         invoke(list, 42, 0, address);
         invoke(list, 42, 0, address);
+    } else if (!std::strcmp(mode, "root_srv")) {
+        invoke(list, 44, 0, address);
     } else if (std::strcmp(mode, "unbound")) {
         return 2;
     }

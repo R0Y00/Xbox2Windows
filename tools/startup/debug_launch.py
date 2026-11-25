@@ -181,6 +181,9 @@ def main():
     k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess))
     k32.DebugSetProcessKillOnExit(True)
     k32.ResumeThread(wt.HANDLE(pi.hThread))
+    if env.get("X2W_PRESENT_IN_TITLE_WINDOW") == "1":
+        import window_status
+        window_status.start(pi.dwProcessId, trap_log)
     if opts.get("--console", "1") == "1":
         # Live debug console in its own window: follows this run's logs (live_view.py).
         import subprocess

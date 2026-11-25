@@ -47,27 +47,22 @@ long release_handle(const char* name, unsigned index, u64 rcx, u64 rdx, u64 r8, 
 }
 }  // namespace
 
+// XDspActivate(connection, parameters, &state, &handle): the caller keeps both outputs next to each
+// other in its effect object and later reads the state block (+0x4 compared with its own counter,
+// +0xc tested for zero). Each activation gets its own zeroed 256-byte state block and a handle.
 extern "C" __declspec(noinline) long XDspActivate(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
     static LONG calls;
-    accept("XDspActivate", 0, rcx, rdx, r8, r9, _ReturnAddress(), calls);
-    // XDspActivate(client, params, XDspStatus** status, XDspStreamHandle* stream). No XDSP device exists
-    // under this stand-in, so the call fails the way the documented code says instead of returning success
-    // with both outputs untouched: validate them, clear them, then report the failure.
-    auto** status_out = reinterpret_cast<void**>(static_cast<std::uintptr_t>(r8));
-    auto** stream_out = reinterpret_cast<void**>(static_cast<std::uintptr_t>(r9));
-    if (!status_out || !x2w_local::writable(status_out, sizeof(void*)) ||
-        !stream_out || !x2w_local::writable(stream_out, sizeof(void*))) {
-        x2w_local::logf("x2w-audio XDspActivate status_out=%p stream_out=%p -> E_POINTER",
-                        static_cast<void*>(status_out), static_cast<void*>(stream_out));
-        return hr_pointer;
+    const long result = accept("XDspActivate", 0, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    static unsigned char* blocks = static_cast<unsigned char*>(VirtualAlloc(nullptr, 1u << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    static LONG used;
+    const LONG index = InterlockedIncrement(&used) - 1;
+    if (blocks && index < 4096) {
+        void* state = blocks + static_cast<std::size_t>(index) * 256;
+        if (r8 && x2w_local::writable(reinterpret_cast<void*>(r8), sizeof(void*))) *reinterpret_cast<void**>(r8) = state;
+        if (r9 && x2w_local::writable(reinterpret_cast<void*>(r9), sizeof(u64))) *reinterpret_cast<u64*>(r9) = 0x58325344ull << 32 | (index + 1);
     }
-    *status_out = nullptr;
-    *stream_out = nullptr;
-    x2w_local::logf("x2w-audio XDspActivate status_out=%p stream_out=%p -> 0x8AC810A2 "
-                    "(XDSP_E_NO_DEVICE_RESOURCES)",
-                    static_cast<void*>(status_out), static_cast<void*>(stream_out));
-    return hr_no_device_resources;
+    return result;
 }
 
 extern "C" __declspec(noinline) long XDspConnectWithMaximumStreamLimit(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 flag, void** handle)

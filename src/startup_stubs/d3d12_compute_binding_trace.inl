@@ -74,7 +74,7 @@ void trace_compute_dispatch(Wrapper* list, const Pass& pass, UINT x, UINT y, UIN
         bindings += item;
     }
     x2w_local::logf("x2w-compute-bindings key=%016llx Dispatch=%ux%ux%u root=%s desktop-root=%u desktop-pso=%u params=%zu%s",
-        pipeline.compute_trace_key, x, y, z, root_match, pass.compute_root != nullptr, pass.compute_pipeline,
+        pipeline.compute_trace_key, x, y, z, root_match, pass.compute_root_desktop != nullptr, pass.compute_pipeline,
         params ? params->size() : 0, bindings.c_str());
 }
 

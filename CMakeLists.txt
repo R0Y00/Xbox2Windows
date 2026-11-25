@@ -167,7 +167,8 @@ set_tests_properties(era_physical_owns_last_page_control PROPERTIES PASS_REGULAR
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp src/xmem_census.cpp
+    src/xmem_gpu_pool.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -381,7 +382,7 @@ target_compile_options(x2w_build_rev PRIVATE /Zl)
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
 add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp
-    src/d3d12_xs_iids.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_device.cpp)
+    src/d3d12_xs_iids.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_traps.cpp src/startup_stubs/d3d12_xs_device.cpp)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
@@ -545,7 +546,7 @@ endif()
 # The DirectStorage heartbeat reports this process's peak commit (#1199).
 target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
-target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_build_rev)
+target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 dcomp d3dcompiler dxgi x2w_build_rev)
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -639,6 +640,10 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(startup_view_heap_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
+# BCPack BC6H rebuild and its dictionary fallback on synthetic lane symbols (bcpack_bc6h.h).
+add_executable(bcpack_bc6h_test tests/bcpack_bc6h_test.cpp)
+target_compile_features(bcpack_bc6h_test PRIVATE cxx_std_17)
+add_test(NAME bcpack_bc6h COMMAND bcpack_bc6h_test)
 add_executable(startup_gameinput_keys tests/startup_gameinput_keys.cpp)
 target_compile_features(startup_gameinput_keys PRIVATE cxx_std_17)
 add_test(NAME startup_gameinput_keys COMMAND startup_gameinput_keys "$<TARGET_FILE:startup_stub_gameinput>")
@@ -679,7 +684,10 @@ set_tests_properties(startup_present_signature_unheld_source_control_warp PROPER
 if(EXISTS "${INTAKE_PYTHON}")
     add_executable(startup_present_producer tests/startup_present_producer.cpp)
     target_compile_features(startup_present_producer PRIVATE cxx_std_17)
-    target_link_libraries(startup_present_producer PRIVATE d3d12_xs_shim d3d12 dxgi)
+    target_link_libraries(startup_present_producer PRIVATE d3d12_xs_shim d3d12 dxgi user32)
+    add_test(NAME startup_present_original_window_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_present_producer_check.py" warp "$<TARGET_FILE:startup_present_producer>" title-window)
+    set_tests_properties(startup_present_original_window_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_present_producer_${backend} COMMAND "${INTAKE_PYTHON}" -B
                  "${CMAKE_SOURCE_DIR}/tests/startup_present_producer_check.py" "${backend}" "$<TARGET_FILE:startup_present_producer>")
@@ -693,6 +701,20 @@ add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)
 target_compile_features(startup_placement_alloc PRIVATE cxx_std_17)
 target_include_directories(startup_placement_alloc PRIVATE src)
 add_test(NAME startup_placement_alloc COMMAND startup_placement_alloc)
+# Log caps that never wrap (src/startup_stubs/log_cap.h); the old wrapping pattern is the negative control.
+add_executable(startup_log_cap_check tests/startup_log_cap_check.cpp)
+target_compile_features(startup_log_cap_check PRIVATE cxx_std_17)
+target_include_directories(startup_log_cap_check PRIVATE src)
+add_test(NAME startup_log_cap COMMAND startup_log_cap_check)
+add_test(NAME startup_log_cap_wrap_control COMMAND startup_log_cap_check --mutate wrap)
+set_tests_properties(startup_log_cap_wrap_control PROPERTIES WILL_FAIL TRUE)
+# Status wait diagnostics of the DirectStorage stand-in (src/startup_stubs/dstorage_status_stats.h).
+add_executable(startup_dstorage_status_stats_check tests/startup_dstorage_status_stats_check.cpp)
+target_compile_features(startup_dstorage_status_stats_check PRIVATE cxx_std_17)
+target_include_directories(startup_dstorage_status_stats_check PRIVATE src)
+add_test(NAME startup_dstorage_status_stats COMMAND startup_dstorage_status_stats_check)
+add_test(NAME startup_dstorage_status_stats_stale_control COMMAND startup_dstorage_status_stats_check --mutate no-stale)
+set_tests_properties(startup_dstorage_status_stats_stale_control PROPERTIES WILL_FAIL TRUE)
 # The same registration under the lock held exclusively, and max_width kept at the widest record
 # (src/startup_stubs/placement_publish.h). The mutated run is the negative control.
 add_executable(startup_placement_publish_check tests/startup_placement_publish_check.cpp)
@@ -1201,7 +1223,8 @@ add_test(NAME startup_typed_buffer_view COMMAND startup_typed_buffer_view)
 add_library(startup_stream_setup_obj OBJECT tests/startup_stream_setup.cpp)
 target_compile_features(startup_stream_setup_obj PRIVATE cxx_std_17)
 add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp $<TARGET_OBJECTS:startup_stream_setup_obj> tests/startup_stream_draw.cpp
-    tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp)
+    tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp
+    tests/startup_draw_uav.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
 target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
@@ -1221,6 +1244,10 @@ add_executable(startup_draw_depth_target tests/startup_draw_depth_target.cpp $<T
 target_compile_features(startup_draw_depth_target PRIVATE cxx_std_17)
 target_link_libraries(startup_draw_depth_target PRIVATE d3d12_xs_shim d3d12 dxgi)
 
+# Decoded depth / cull / write-mask state of slot 57 pipelines on translated draws (X2W_DRAW_STATE_*).
+add_executable(startup_draw_state tests/startup_draw_state.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_draw_state PRIVATE cxx_std_17)
+target_link_libraries(startup_draw_state PRIVATE d3d12_xs_shim d3d12 dxgi)
 add_executable(startup_stream_rasterizer tests/startup_stream_rasterizer.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_rasterizer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_rasterizer PRIVATE d3d12_xs_shim d3d12 dxgi)
@@ -1244,9 +1271,9 @@ add_dependencies(startup_queue_page_batch xmem_shim)
 add_test(NAME startup_queue_page_batch_warp COMMAND startup_queue_page_batch "$<TARGET_FILE:xmem_shim>")
 add_test(NAME startup_queue_page_batch_runs_warp COMMAND startup_queue_page_batch "$<TARGET_FILE:xmem_shim>" runs)
 set_tests_properties(startup_queue_page_batch_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90
-    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
+    ENVIRONMENT "X2W_UPSTREAM_QUEUE_PAGE_BATCH=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
 set_tests_properties(startup_queue_page_batch_runs_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90 SKIP_RETURN_CODE 77
-    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=1")
+    ENVIRONMENT "X2W_UPSTREAM_QUEUE_PAGE_BATCH=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=1")
 
 # Closed lists stay submittable, also after their allocator's Reset (#1352).
 add_executable(startup_list_resubmit tests/startup_list_resubmit.cpp)
@@ -1269,6 +1296,14 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
 
+add_executable(startup_rtv_bind_local tests/startup_rtv_bind_local.cpp)
+target_compile_features(startup_rtv_bind_local PRIVATE cxx_std_17)
+target_link_libraries(startup_rtv_bind_local PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_rtv_bind_local_${backend} COMMAND startup_rtv_bind_local ${backend})
+    set_tests_properties(startup_rtv_bind_local_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
 add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
 target_compile_features(startup_upload_arena PRIVATE cxx_std_17)
 target_include_directories(startup_upload_arena PRIVATE src)
@@ -1387,6 +1422,13 @@ endforeach()
 
 # X2W_D3D12_RELEASE_RETIRED_VIEWS=1 frees a released class texture that only tracked slot-18 descriptor slots keep alive by
 # replacing those slots with null descriptors. `keep` is the negative control (views switch off, or retire switch off).
+add_test(NAME startup_cold_texture_priority_off_warp COMMAND startup_resource_retire_title warp cold-off)
+set_tests_properties(startup_cold_texture_priority_off_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_COLD_TEXTURE_PRIORITY=0;X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+add_test(NAME startup_cold_texture_priority_warp COMMAND startup_resource_retire_title warp cold)
+set_tests_properties(startup_cold_texture_priority_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_COLD_TEXTURE_PRIORITY=1;X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+
 add_executable(startup_resource_retire_views tests/startup_resource_retire_views.cpp)
 target_include_directories(startup_resource_retire_views PRIVATE src)
 target_compile_features(startup_resource_retire_views PRIVATE cxx_std_17)
@@ -1419,7 +1461,8 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_dispatch_${backend} COMMAND startup_indirect_dispatch ${backend})
     add_test(NAME startup_indirect_root_constants_${backend} COMMAND startup_indirect_dispatch ${backend} constants)
     add_test(NAME startup_indirect_count_${backend} COMMAND startup_indirect_dispatch ${backend} count)
-    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} startup_indirect_count_${backend} PROPERTIES TIMEOUT 30)
+    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} startup_indirect_count_${backend} PROPERTIES TIMEOUT 30
+        ENVIRONMENT "X2W_UPSTREAM_EXECUTE_INDIRECT=1;X2W_UPSTREAM_COMPUTE_ROOT=1")
 endforeach()
 set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware startup_indirect_count_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -1532,6 +1575,23 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_rtv_bind_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
+set(x2w_upstream_list_paths "X2W_UPSTREAM_EXECUTE_INDIRECT=set:1;X2W_UPSTREAM_COMPUTE_ROOT=set:1;X2W_LIST_UPLOAD_PAGES=set:1;X2W_UPSTREAM_MESH86_CACHE=set:1")
+foreach(backend IN ITEMS warp hardware)
+    set(x2w_upstream_list_tests startup_slot148_acceptance_${backend} startup_slot148_acceptance_nodebug_${backend}
+        startup_resource_budget_${backend}_debug0 startup_resource_budget_${backend}_debug0_inline_control
+        startup_resource_budget_${backend}_debug1 startup_resource_budget_${backend}_debug1_inline_control
+        startup_indirect_mesh_request_${backend} startup_rtv_bind_${backend}
+        startup_slot148_acceptance_serialized_${backend} startup_slot148_acceptance_serialized_nodebug_${backend})
+    foreach(mode IN ITEMS draw_indexed draw translated_draw copy_provenance copy_provenance_off translated_indexed
+                          translated_indexed_upload translated_indexed_rect mesh mesh_console mesh_amplified
+                          mesh_xmem_arguments mesh_xmem_arguments_skip_wait rectlist translated_refusal_census
+                          other_refusal_census translated_indexed_alias translated_indexed_alias_off)
+        list(APPEND x2w_upstream_list_tests startup_indirect_${mode}_${backend})
+    endforeach()
+    set_tests_properties(${x2w_upstream_list_tests} PROPERTIES ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
+endforeach()
+set_tests_properties(startup_indirect_counts_control_warp startup_indirect_translated_refusal_census_control_warp
+    startup_indirect_other_refusal_census_control_warp PROPERTIES ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
 
 # CopyResource, ResolveSubresource and CopyBufferRegion on a recording list (slots 17, 19 and 15).
 add_executable(startup_list_copy tests/startup_list_copy.cpp)
@@ -1609,6 +1669,7 @@ add_test(NAME startup_slice_footprints COMMAND startup_slice_footprints_check)
 add_test(NAME startup_slice_footprints_padded_control COMMAND startup_slice_footprints_check --mutate padded-last-row)
 set_tests_properties(startup_slice_footprints_padded_control PROPERTIES WILL_FAIL TRUE)
 
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 foreach(stage mesh vertex pixel)
     if(stage STREQUAL mesh)
@@ -1636,24 +1697,28 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
         "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" warp
         "$<TARGET_FILE:xmem_shim>" dual-trace-disabled)
-    set_tests_properties(startup_indirect_mesh_lease_warp_dual-trace-disabled PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_indirect_mesh_lease_warp_dual-trace-disabled PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_indirect_mesh_lease_${backend}_dual-trace COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
             "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend}
             "$<TARGET_FILE:xmem_shim>" dual-trace)
-        set_tests_properties(startup_indirect_mesh_lease_${backend}_dual-trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_indirect_mesh_lease_${backend}_dual-trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
         add_test(NAME startup_indirect_mesh_cache_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
             "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend})
-        set_tests_properties(startup_indirect_mesh_cache_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_indirect_mesh_cache_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
         foreach(mode IN ITEMS ordered_control skip-wait dual dual-skip-srv dual-skip-argument dual-init-only loose-root)
             set(test_name startup_indirect_mesh_lease_${backend}_${mode})
             add_test(NAME ${test_name} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
                 "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend}
                 "$<TARGET_FILE:xmem_shim>" ${mode})
-            set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+            set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+                ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
         endforeach()
     endforeach()
 endif()
@@ -1679,6 +1744,166 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_MESH86_FIXTURE_XMEM=$<TARGET_FILE:xmem_shim>")
 endforeach()
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
+
+set(startup_indirect_headers)
+foreach(entry IN ITEMS Writer Counter)
+    string(TOLOWER "${entry}" entry_lower)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_indirect_${entry_lower}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry} -Vn startup_indirect_${entry_lower} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_dispatch.hlsl"
+        DEPENDS tests/startup_indirect_dispatch.hlsl VERBATIM)
+    list(APPEND startup_indirect_headers "${header}")
+endforeach()
+add_executable(startup_indirect_dispatch_local tests/startup_indirect_dispatch_local.cpp ${startup_indirect_headers})
+target_include_directories(startup_indirect_dispatch_local PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_indirect_dispatch_local PRIVATE cxx_std_17)
+target_link_libraries(startup_indirect_dispatch_local PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS gpu no-writer zero off huge huge-product wrap wrap-legacy wrap-cap)
+        add_test(NAME startup_indirect_dispatch_${mode}_${backend} COMMAND startup_indirect_dispatch_local ${backend} ${mode})
+        set(indirect_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(mode STREQUAL "off")
+            set(indirect_env "${indirect_env};X2W_INDIRECT_OFF=1")
+        endif()
+        set_tests_properties(startup_indirect_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${indirect_env}")
+    endforeach()
+    # gpu mode with the read-back copies recorded (X2W_INDIRECT_READBACK) under the debug layer.
+    add_test(NAME startup_indirect_dispatch_gpu-readback_${backend} COMMAND startup_indirect_dispatch_local ${backend} gpu)
+    set_tests_properties(startup_indirect_dispatch_gpu-readback_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_INDIRECT_READBACK=8")
+    foreach(mode IN ITEMS rectrace rectrace-off)
+        add_test(NAME startup_indirect_dispatch_${mode}_${backend} COMMAND startup_indirect_dispatch_local ${backend} ${mode})
+        set(rectrace_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_D3D12_TRACE_ALL=1")
+        if(mode STREQUAL "rectrace")
+            set(rectrace_env "${rectrace_env};X2W_MESH_RECORD_TRACE=1")
+        endif()
+        set_tests_properties(startup_indirect_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${rectrace_env}")
+    endforeach()
+endforeach()
+
+set(startup_mesh_headers)
+foreach(entry IN ITEMS "MeshMain;ms_6_5;ms" "MeshHeap;ms_6_5;heap_ms" "MeshDescword;ms_6_5;descword_ms" "PixelMain;ps_6_5;ps" "PixelSampler;ps_6_5;smp_ps" "PixelUint;ps_6_5;uint_ps" "PixelStore;ps_6_5;store_ps" "Writer;cs_6_0;writer")
+    list(GET entry 0 entry_name)
+    list(GET entry 1 entry_profile)
+    list(GET entry 2 entry_short)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_mesh_${entry_short}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${entry_profile} -E ${entry_name} -Vn startup_mesh_${entry_short} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh_dispatch.hlsl"
+        DEPENDS tests/startup_mesh_dispatch.hlsl VERBATIM)
+    list(APPEND startup_mesh_headers "${header}")
+endforeach()
+add_executable(startup_mesh_dispatch tests/startup_mesh_dispatch.cpp ${startup_mesh_headers})
+target_include_directories(startup_mesh_dispatch PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_mesh_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_mesh_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS gpu derived zero huge off missing depth words16 words32 wordsraw fmaprecise fmabad notargets rtvuint smpheap smpheapswap
+            statez statezge statezoff statecull stateculloff statedepth statecullflip statecullnone statezrepeat statezuncleared statezlateclear async asyncone rtvvariant uavtex uavtexnoflag rtvnops wordsoob stateclip stateclipon stateclipkeep
+            descword descwordoff)
+        add_test(NAME startup_mesh_dispatch_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set(mesh_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(NOT mode STREQUAL "off")
+            set(mesh_env "${mesh_env};X2W_MESH=1")
+        endif()
+        set_tests_properties(startup_mesh_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${mesh_env}")
+    endforeach()
+    foreach(mode IN ITEMS statez notargets zero statecull stateculloff rectrace rectraceapart)
+        add_test(NAME startup_mesh_dispatch_trace_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_trace_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_D3D12_TRACE_ALL=1;X2W_D3D12_TRACE_TARGETS=1")
+    endforeach()
+    foreach(mode IN ITEMS statez zero)
+        add_test(NAME startup_mesh_dispatch_dump_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_dump_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_TEST_MESH_DUMP=1")
+    endforeach()
+    foreach(mode IN ITEMS gpu zero)
+        add_test(NAME startup_mesh_dispatch_framestats_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_framestats_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_MESH_STATS_FRAMES=1")
+        add_test(NAME startup_mesh_dispatch_framestatsmulti_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_framestatsmulti_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_MESH_STATS_FRAMES=2;X2W_TEST_FS_MULTI=1")
+    endforeach()
+endforeach()
+
+add_executable(startup_placed_fast tests/startup_placed_fast.cpp)
+target_compile_features(startup_placed_fast PRIVATE cxx_std_17)
+target_link_libraries(startup_placed_fast PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS fast walk)
+        add_test(NAME startup_placed_fast_${mode}_${backend} COMMAND startup_placed_fast ${backend} ${mode})
+        set(placed_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+        if(mode STREQUAL "fast")
+            set(placed_env "${placed_env};X2W_PLACED_FAST=1")
+        endif()
+        set_tests_properties(startup_placed_fast_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "${placed_env}")
+    endforeach()
+endforeach()
+
+add_executable(startup_probe_cache tests/startup_probe_cache.cpp)
+target_include_directories(startup_probe_cache PRIVATE src)
+target_compile_features(startup_probe_cache PRIVATE cxx_std_17)
+add_test(NAME startup_probe_cache_cache COMMAND startup_probe_cache cache)
+set_tests_properties(startup_probe_cache_cache PROPERTIES TIMEOUT 60 ENVIRONMENT "X2W_PROBE_CACHE=1;X2W_PROBE_CACHE_MS=100")
+add_test(NAME startup_probe_cache_nocache COMMAND startup_probe_cache nocache)
+set_tests_properties(startup_probe_cache_nocache PROPERTIES TIMEOUT 60)
+
+add_executable(startup_draw_lock_times tests/startup_draw_lock_times.cpp)
+target_compile_features(startup_draw_lock_times PRIVATE cxx_std_17)
+add_dependencies(startup_draw_lock_times d3d12_xs_shim)
+foreach(mode IN ITEMS on off)
+    add_test(NAME startup_draw_lock_times_${mode} COMMAND startup_draw_lock_times ${mode})
+    set(lock_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+    if(mode STREQUAL "on")
+        set(lock_env "${lock_env};X2W_DRAW_LOCK_TIMES=1")
+    endif()
+    set_tests_properties(startup_draw_lock_times_${mode} PROPERTIES TIMEOUT 60 ENVIRONMENT "${lock_env}")
+endforeach()
+
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CountMain -Vn startup_cx_async_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
+    DEPENDS tests/startup_cx_async.hlsl VERBATIM)
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E HeapMain -Vn startup_cx_heap_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
+    DEPENDS tests/startup_cx_async.hlsl VERBATIM)
+add_executable(startup_cx_async tests/startup_cx_async.cpp "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h")
+target_include_directories(startup_cx_async PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_cx_async PRIVATE cxx_std_17)
+target_link_libraries(startup_cx_async PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS async sync known seen heap)
+        add_test(NAME startup_cx_async_${mode}_${backend} COMMAND startup_cx_async ${backend} ${mode})
+        set(cx_async_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(mode STREQUAL "async")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1")
+        elseif(mode STREQUAL "known" OR mode STREQUAL "seen")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1;X2W_CX_PREWARM_ALL=1")
+        endif()
+        set_tests_properties(startup_cx_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${cx_async_env}")
+    endforeach()
+endforeach()
+
+add_executable(tile_mapping_shared_heap_check tests/tile_mapping_shared_heap_check.cpp)
+target_compile_features(tile_mapping_shared_heap_check PRIVATE cxx_std_17)
+target_link_libraries(tile_mapping_shared_heap_check PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS plain shared)
+        add_test(NAME tile_mapping_${mode}_heap_${backend} COMMAND tile_mapping_shared_heap_check ${backend} ${mode})
+        add_test(NAME tile_mapping_${mode}_heap_nodebug_${backend} COMMAND tile_mapping_shared_heap_check ${backend} ${mode} nodebug)
+        set_tests_properties(tile_mapping_${mode}_heap_${backend} tile_mapping_${mode}_heap_nodebug_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
     tests/descriptor_heap_paging.cpp)
@@ -1732,7 +1957,7 @@ if(NOT OFFSCREEN_AGILITY_620_DIR)
 else()
     target_sources(offscreen_check PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
 endif()
-target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32 x2w_build_rev)
+target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32 dcomp x2w_build_rev)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 if(OFFSCREEN_AGILITY_620_DIR)
     if(EXISTS "${OFFSCREEN_AGILITY_620_DIR}/sdk.nupkg")
@@ -1926,6 +2151,14 @@ add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison
 target_include_directories(startup_sampler_comparison_check PRIVATE src)
 target_compile_features(startup_sampler_comparison_check PRIVATE cxx_std_17)
 add_test(NAME startup_sampler_comparison COMMAND startup_sampler_comparison_check)
+add_executable(startup_gfx10_view_words_check tests/startup_gfx10_view_words_check.cpp)
+target_include_directories(startup_gfx10_view_words_check PRIVATE src)
+target_compile_features(startup_gfx10_view_words_check PRIVATE cxx_std_17)
+add_test(NAME startup_gfx10_view_words COMMAND startup_gfx10_view_words_check)
+foreach(mutation IN ITEMS legacy width order uint)
+    add_test(NAME startup_gfx10_view_words_${mutation}_control COMMAND startup_gfx10_view_words_check --mutate ${mutation})
+    set_tests_properties(startup_gfx10_view_words_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Diagnostic line for a refused device slot 70 call (src/startup_stubs/memory_srv_report.h).
 add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_check.cpp)
 target_include_directories(startup_memory_srv_report_check PRIVATE src)
@@ -2111,6 +2344,13 @@ target_compile_features(startup_depth_state_check PRIVATE cxx_std_17)
 add_test(NAME startup_depth_state COMMAND startup_depth_state_check)
 add_test(NAME startup_depth_state_switch_control COMMAND startup_depth_state_check --mutate switch)
 set_tests_properties(startup_depth_state_switch_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_pipeline_state_local_check tests/startup_pipeline_state_local_check.cpp)
+target_include_directories(startup_pipeline_state_local_check PRIVATE src)
+target_compile_features(startup_pipeline_state_local_check PRIVATE cxx_std_17)
+add_test(NAME startup_pipeline_state_local COMMAND startup_pipeline_state_local_check)
+add_test(NAME startup_pipeline_state_local_winding_control COMMAND startup_pipeline_state_local_check --mutate winding)
+add_test(NAME startup_pipeline_state_local_mesh_shift_control COMMAND startup_pipeline_state_local_check --mutate mesh-shift)
+set_tests_properties(startup_pipeline_state_local_winding_control startup_pipeline_state_local_mesh_shift_control PROPERTIES WILL_FAIL TRUE)
 # Root table handles resolved against a logical view heap, and the records a translated draw reads
 # from the window (src/startup_stubs/logical_view_table.h).
 add_executable(startup_logical_view_table_check tests/startup_logical_view_table_check.cpp)
@@ -2707,6 +2947,26 @@ if(XBOX2WINDOWS_ADDRLIB_DIR)
 else()
     message(STATUS "xg_swizzle_select: addrlib not configured, the test will skip (77)")
 endif()
+add_executable(gfx10_layout_check tests/gfx10_layout_check.cpp)
+target_compile_features(gfx10_layout_check PRIVATE cxx_std_17)
+target_include_directories(gfx10_layout_check PRIVATE src)
+if(XBOX2WINDOWS_ADDRLIB_DIR)
+    target_link_libraries(gfx10_layout_check PRIVATE xbw_addrlib)
+    target_compile_definitions(gfx10_layout_check PRIVATE XBOX2WINDOWS_HAVE_ADDRLIB)
+endif()
+set(_gfx10_golden "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfx10_layout_golden.txt")
+add_test(NAME gfx10_layout_golden COMMAND gfx10_layout_check "${_gfx10_golden}")
+add_test(NAME gfx10_layout_floor_control COMMAND gfx10_layout_check "${_gfx10_golden}" --mutate floor)
+add_test(NAME gfx10_layout_tail_control COMMAND gfx10_layout_check "${_gfx10_golden}" --mutate tail)
+set_tests_properties(gfx10_layout_floor_control gfx10_layout_tail_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME gfx10_layout_addrlib COMMAND gfx10_layout_check --addrlib)
+set_tests_properties(gfx10_layout_addrlib PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+add_executable(buffer_address_index_check tests/buffer_address_index_check.cpp)
+target_compile_features(buffer_address_index_check PRIVATE cxx_std_17)
+target_include_directories(buffer_address_index_check PRIVATE src)
+add_test(NAME buffer_address_index COMMAND buffer_address_index_check)
+add_test(NAME buffer_address_index_control COMMAND buffer_address_index_check --mutate)
+set_tests_properties(buffer_address_index_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 # 4 KiB allocation answers for small 2D textures (src/startup_stubs/small_texture_4k.h): literal sizes and
@@ -2915,6 +3175,11 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_sampler_x_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "startup_sampler_x swapped=0")
+    add_test(NAME startup_sampler_lod_words_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x-words)
+    add_test(NAME startup_sampler_lod_words_dropped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x-words-dropped)
+    set_tests_properties(startup_sampler_lod_words_${adapter} startup_sampler_lod_words_dropped_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_sampler_lod_words_dropped_${adapter} PROPERTIES WILL_FAIL TRUE)
     # The dropped control resets the decoded LOD limits and must read the wrong mip for both entries.
     add_test(NAME startup_sampler_lod_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod)
     add_test(NAME startup_sampler_lod_dropped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod-dropped)
@@ -3076,6 +3341,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_buffer_atomics_check.py")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
+    # Pixel-stage lowerings of mesh pairs (gfx2hlsl): translation checks with negative controls.
+    foreach(check IN ITEMS scalar_pack_hh quad_dpp spi_input mesh_spi_input image_sample_b image_sample_d interp_f16 round_mode front_face quad_divergent scalar_const_fold sample_c_preclamp sample_c_border vopc_dpp image_get_lod)
+        add_test(NAME startup_${check} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_${check}_check.py")
+        set_tests_properties(startup_${check} PROPERTIES TIMEOUT 120)
+    endforeach()
     add_test(NAME startup_image_gather_c_lz COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_gather_c_lz_check.py")
     # image_sample_b (#1996): translation controls, then a desktop draw whose mip level the bias selects.
@@ -3500,6 +3771,21 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_flat_param_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # binary16 interpolation (v_interp_p2_f16) on the same one-pixel renderer
+        add_test(NAME startup_interp_f16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_interp_f16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_interp_f16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # s_round_mode 0xc: binary16 results rounded toward zero, on the same renderer
+        add_test(NAME startup_round_mode_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_round_mode_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_round_mode_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # FRONT_FACE as SV_IsFrontFace (+1.0 / -1.0), on the same renderer
+        add_test(NAME startup_front_face_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_front_face_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_front_face_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME raster_winding_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/raster_winding_reference.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3840,7 +4126,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_compute_binding_trace_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_binding_trace_check.py"
         "$<TARGET_FILE:startup_compute_binding_trace>")
-    set_tests_properties(startup_compute_binding_trace_warp PROPERTIES TIMEOUT 30)
+    set_tests_properties(startup_compute_binding_trace_warp PROPERTIES TIMEOUT 30
+        ENVIRONMENT "X2W_UPSTREAM_COMPUTE_ROOT=1;X2W_LIST_UPLOAD_PAGES=1")
     add_test(NAME startup_compute_request_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>")
     add_test(NAME startup_compute_request_disabled_control COMMAND "${INTAKE_PYTHON}" -B
@@ -3872,6 +4159,18 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_stream_draw_${backend} PROPERTIES TIMEOUT 90)
+        foreach(mode IN ITEMS async sync)
+            add_test(NAME startup_draw_async_${mode}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_async_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${mode}")
+            set_tests_properties(startup_draw_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endforeach()
+        foreach(mode IN ITEMS split copy below locked)
+            add_test(NAME startup_draw_lock_split_${mode}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_lock_split_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${mode}")
+            set_tests_properties(startup_draw_lock_split_${mode}_${backend} PROPERTIES TIMEOUT 150 SKIP_RETURN_CODE 77)
+        endforeach()
         add_test(NAME startup_stream_viewport_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_viewport_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -3879,7 +4178,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_stream_fetch_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_fetch_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
-        set_tests_properties(startup_stream_fetch_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_stream_fetch_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_STREAM_LAYOUT=1")
         add_test(NAME startup_stream_interface_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_interface_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -3887,7 +4187,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_stream_depth_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_depth_check.py"
             "$<TARGET_FILE:startup_stream_depth>" "${backend}")
-        set_tests_properties(startup_stream_depth_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_stream_depth_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_STENCIL_REF=1")
+        add_test(NAME startup_draw_state_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_state_check.py"
+            "$<TARGET_FILE:startup_draw_state>" "${backend}")
+        set_tests_properties(startup_draw_state_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_stream_rasterizer_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
             "$<TARGET_FILE:startup_stream_rasterizer>" "${backend}")
@@ -3941,6 +4246,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_requests_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_indirect_requests_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            add_test(NAME startup_draw_srv_limit_warp COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_srv_limit_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${STARTUP_FXC}")
+            set_tests_properties(startup_draw_srv_limit_warp PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_formatted_view_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_formatted_view_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${STARTUP_FXC}")
@@ -3961,14 +4272,27 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_cbv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
         set_tests_properties(startup_root_cbv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_root_srv_lazy_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_srv_lazy_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" ${backend})
+        set_tests_properties(startup_root_srv_lazy_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_root_heap_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_heap_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
-        set_tests_properties(startup_root_heap_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_root_heap_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_DEFER_HEAP_ROOTS=1")
         add_test(NAME startup_address_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_memory_srv_announced_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_announced_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_memory_srv_announced_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_memory_srv_detile_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_detile_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "$<TARGET_FILE:gfx10_layout_check>")
+        set_tests_properties(startup_memory_srv_detile_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         if(backend STREQUAL "warp")
             # Negative control for X2W_RESOURCE_INDEX_CHECK: mode 2 skips the index inserts, so the check must
             # report the first live resource it does not find (the run passes only on that report).
@@ -3994,7 +4318,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_address_single_element_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_single_element_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
-        set_tests_properties(startup_address_single_element_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_address_single_element_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1")
         add_test(NAME startup_address_buffer_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -4015,6 +4340,18 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
         set_tests_properties(startup_frame_copy_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_draw_uav_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_uav_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_draw_uav_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_heap_texture_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_heap_texture_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "$<TARGET_FILE:gfx10_layout_check>")
+        set_tests_properties(startup_heap_texture_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_buffer_heap_index_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_buffer_heap_index_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_buffer_heap_index_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -4026,7 +4363,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_address_console_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
-        set_tests_properties(startup_address_console_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_address_console_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1")
         # Uploads of by-address textures recorded while the queue waits on a fence keep their bytes until the
         # queue has run them. The ring control fills them from the shared upload ring and must lose the first.
         foreach(gate IN ITEMS gate gate-ring)
@@ -4034,7 +4372,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             add_test(NAME startup_address_console_${gate_name}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
                 "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${gate}")
-            set_tests_properties(startup_address_console_${gate_name}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+            set_tests_properties(startup_address_console_${gate_name}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
+                ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1")
+            if(gate STREQUAL "gate-ring")
+                set_tests_properties(startup_address_console_${gate_name}_${backend} PROPERTIES ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1;X2W_UPLOAD_RING=legacy")
+            endif()
         endforeach()
         add_test(NAME startup_xg_bc_chain_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_chain_check.py"
