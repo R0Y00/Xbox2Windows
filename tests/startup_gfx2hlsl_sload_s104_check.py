@@ -1,16 +1,25 @@
 """Check s_load into s[104:107] in tools/startup/gfx2hlsl.py (#1723).
 
-usage: startup_gfx2hlsl_sload_s104_check.py
+usage: startup_gfx2hlsl_sload_s104_check.py                              pure Python controls
+       startup_gfx2hlsl_sload_s104_check.py draw <dxc> <offscreen_check> <warp|hardware> [fxc]
+                                                                      draw the translated pair, compare with a CPU reference
 
 s106 and s107 are vcc. A descriptor load (a table pointer plus an immediate offset) emits no code and only
 records which table bytes the destination registers name, so it may end in s[104:107]. A load that must
 write the registers (a root constant buffer) or that starts above s105 is still refused.
 """
 import os
+import struct
 import sys
+import tempfile
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'startup'))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
+sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
+from startup_flat_param_check import compile_hlsl, draw  # noqa: E402
+from startup_gfx2hlsl_bit_alu_check import POST_WORDS, PRE_WORDS, vs_words, words_text  # noqa: E402
 
 
 class Pipe:
@@ -44,6 +53,45 @@ def translate(*instructions):
 
 TABLE = {4: ('ptr', ('table', 0))}
 ROOT = {4: ('ptr', ('root', 1))}
+
+
+# One descriptor table at s[8:9] (an SRV/UAV range of two entries, as the buffer store check declares it).
+_RTS0 = b''.join((struct.pack('<6I', 2, 1, 24, 0, 0, 0), struct.pack('<3I', 0, 0, 36),
+                  struct.pack('<2I', 1, 44), struct.pack('<6I', 0, 2, 0, 0, 0, 0)))
+_PART = b'RTS0' + struct.pack('<I', len(_RTS0)) + _RTS0
+TABLE_ROOT = b'DXBC' + bytes(16) + struct.pack('<4I', 1, 36 + len(_PART), 1, 36) + _PART
+
+# Pixel body, words from llvm-mc gfx1013 with the first instruction's SDST patched from s[100:103] to s[104:107]
+# (the assembler does not name s106/s107, the machine code does):
+#   s_load_dwordx4 s[104:107], s[8:9], 0x20
+#   lane 0..3:  v_cmp_eq_u32 vcc_lo, v<lane>, v<4+lane>;  v_cndmask_b32 v<12+lane>, v<8+lane>, v<lane>, vcc_lo
+# The descriptor load overwrites the vcc word; the compare redefines it before the mask is read.
+BODY_WORDS = bytes.fromhex('041a08f4200000fa0009847d08011802010b847d09031a02020d847d0a051c02030f847d0b071e02')
+DRAW = [(5, 5, 7), (1, 2, 9), (0xffffffff, 0xffffffff, 3), (0x80000000, 0x7fffffff, 0x1234)]
+DRAW_B = [(9, 9, 0), (4, 4, 4), (0, 1, 2), (0xdeadbeef, 0xdeadbeef, 1)]
+
+
+def reference(sets):
+    return [a if a == b else c for a, b, c in sets]
+
+
+def check_draw(dxc, renderer, adapter, fxc=None):
+    main()
+    ps = PRE_WORDS + BODY_WORDS + POST_WORDS
+    compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        for kind, compiler, vs_profile, ps_profile in compilers:
+            for number, sets in enumerate((DRAW, DRAW_B)):
+                # Triples are (a, b, c): the load is a no-op, so the pixel is a == b ? a : c on each lane.
+                pipe = G.Pipeline(vs_words(sets), ps, TABLE_ROOT)
+                vs = compile_hlsl(compiler, kind, pipe.hlsl_vs(), 'vs%d_%s' % (number, kind), vs_profile, directory)
+                px = compile_hlsl(compiler, kind, pipe.hlsl_ps(), 'ps%d_%s' % (number, kind), ps_profile, directory)
+                expected = words_text(reference(sets))
+                run = draw(renderer, adapter, vs, px, expected)
+                if run.returncode:
+                    raise AssertionError('%s %s\n%s\n%s' % (kind, expected, run.stdout, run.stderr))
+                print('%s s104 draw %d: %s' % (kind, number, expected), flush=True)
 
 
 def main():
@@ -105,4 +153,10 @@ def main():
     print('ok')
 
 
-main()
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        main()
+    elif sys.argv[1] == 'draw':
+        check_draw(*sys.argv[2:])
+    else:
+        raise SystemExit(__doc__)
