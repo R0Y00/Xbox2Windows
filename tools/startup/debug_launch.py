@@ -4,7 +4,10 @@ usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--st
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
-Stops at the first second-chance exception, at a breakpoint inside the main image, or at the timeout.
+Stops at a second-chance exception, an uncontinued main-image breakpoint, or the timeout.
+A timeout of zero disables the timer. An assertion continuation limit of -1 removes that limit.
+A file named `stop` created in <logdir> during the run ends it as the timeout does (checked twice a
+second; a stop file left from an earlier run is removed at start).
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -117,11 +120,19 @@ def main():
     def print(*args, **kwargs):
         summary.append(" ".join(str(a) for a in args))
         builtins.print(*args, **kwargs)
-    timeout = float(opts.get("--timeout", 15))
+    timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
     memory = int(float(opts.get("--memory-gib", 16)) * 2**30)
     stop_first = opts.get("--stop-first-chance") == "1"
-    skip_asserts = int(opts.get("--continue-asserts", "0"))  # main-image int3s to log and continue past
+    skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
+    if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
+        print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
+        return 2
     asserts_seen = {}
+    # X2W_NOP_SOFT_ASSERTS=1: after the first hit of a main-image int3 that is continued, replace the
+    # trap byte with NOP. DBG_CONTINUE already bypasses the title's handler, so the visible behavior is
+    # unchanged, but a long mapping that traps once per chunk then runs at native speed.
+    nop_soft_asserts = os.environ.get("X2W_NOP_SOFT_ASSERTS") == "1"
+    nop_sites = {}
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
     host_cpu_sites = {}
@@ -131,7 +142,8 @@ def main():
     stub_area = [0, 0]  # next free address and end of the block the stubs go to
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
-    for stale in (trap_log, os.path.join(logdir, "finished.txt")):  # a reused run directory starts clean
+    stop_file = os.path.join(logdir, "stop")  # created from outside: end the run as at the timeout
+    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file):  # a reused run directory starts clean
         if os.path.exists(stale):
             os.remove(stale)
     if os.path.exists(trap_log):
@@ -610,7 +622,15 @@ def main():
                 watch_values[rva] = blob
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
-    while time.time() - start < timeout:
+    stop_requested = False
+    stop_next = 0.0
+    while not timeout or time.time() - start < timeout:
+        if time.time() >= stop_next:
+            stop_next = time.time() + 0.5
+            if os.path.exists(stop_file):
+                stop_requested = True
+                log(f"{time.time() - start:7.3f} stop file found: ending the run")
+                break
         if dump_at and time.time() - start >= dump_at[0]:
             dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
         if watches and time.time() >= watch_next:
@@ -741,8 +761,11 @@ def main():
                     log(f"X2W_LOG_AT ignored {rva:#x}: cannot arm a main-image instruction breakpoint")
                     del log_at[rva]
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and sum(asserts_seen.values()) < skip_asserts and (ex_addr - main_base) not in stop_at):
+                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
+                  and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
+                if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
+                    nop_sites[ex_addr] = 1
                 status = DBG_CONTINUE  # rip is already past the int3
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
                                                   main_base <= ex_addr < main_base + 0x10000000):
@@ -835,7 +858,8 @@ def main():
     elif exit_code is not None:
         print(f"process exited with {exit_code:#010x} after {elapsed:.2f} s")
     else:
-        print(f"timeout after {elapsed:.2f} s")
+        print(f"stopped by request after {elapsed:.2f} s (stop file)" if stop_requested
+              else f"timeout after {elapsed:.2f} s")
         dumped = dump_threads(os.path.join(logdir, "threads.txt"))
         for item in filter(None, os.environ.get("X2W_DUMP", "").split(",")):
             rva, _, size = item.partition(":")
@@ -853,6 +877,8 @@ def main():
         print("  host-cpu sites rewritten: " + ", ".join(f"{name} x{n}" for name, n in sorted(host_cpu_sites.items())))
     if host_cpu_resumed:
         print(f"  host-cpu threads resumed at a site another thread had rewritten: {len(host_cpu_resumed)}")
+    if nop_sites:
+        print("  soft asserts NOP'd: " + ", ".join(where(addr) for addr in nop_sites))
     bink_report()
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
