@@ -8934,6 +8934,14 @@ The test checks all 16,384 words in each read. The deliberately early read diffe
 
 Run `ctest --preset dev --no-tests=error -R '^vm_copy_queue_' -V`.
 
+### Queue page batches on XMem sections
+
+Command queue slot 31 resolves 64 KiB pool pages against the views XMem currently owns. A batch can map consecutive pages, repeat one pool page, unmap a range or preserve its mapping. The destination is a Windows virtual address. A GPU consumer can import a supported section-backed linear buffer and hold its lease until its submission fence completes. Resources with separate desktop backing still need their own data upload or readback.
+
+`startup_queue_page_batch_warp` calls slot 31 on the permissive shim's COPY queue. It compares four 32-page regions in a 64 MiB pool across 51 paired submissions. It reports median and p95 CPU time separately for an identical batch and one that changes all 128 pages. An identical batch must complete with zero mapped or unmapped views. With `X2W_XMEM_SHARED_VIEWS=1`, `startup_queue_page_batch_runs_warp` also checks that the four physically consecutive runs take four successful view mappings. These measurements cover the host mapping path.
+
+The `xmem_page_batch_inflight_{warp,hardware}` fixture holds a submitted GPU read behind an unsignaled fence, remaps the same virtual address, then releases the fence. The held read must see the old pattern. A second read binds the new section, writes a different pattern through its CPU pool after recording, and checks every byte across a 64 KiB boundary. Run `ctest --preset release --no-tests=error -R '^xmem_page_batch_inflight_' -V`.
+
 `vm_page_provenance_warp` and `vm_page_provenance_hardware` test the source side independently. Two pagefile sections hold distinct data and are mapped into adjacent CPU addresses in reverse creation order. D3D12 reopens those same sections as heaps. The test copies a 4 KiB span centered on the page boundary into a GPU buffer using the logical page order, then compares its readback with the two expected token patterns. It writes new data through the CPU aliases and reads the GPU buffer again before uploading, which must still return the old data. A second upload must produce all the updated words. The tests skip (77) if the requested adapter or section-backed D3D12 buffers are unavailable. [Opening a D3D12 heap from a file mapping](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromfilemapping)
 
 Run `ctest --preset dev --no-tests=error -R '^vm_page_provenance_' -V`.
@@ -8956,7 +8964,7 @@ Title memory follows XMem (`src/xmem_mapped_pages.cpp`). The section pool is one
 
 | Path | Backing |
 |---|---|
-| `share` | The pool is opened once as a heap: `OpenExistingHeapFromFileMapping` for the section, or `OpenExistingHeapFromAddress` on the allocation base for the private range, after `D3D12_FEATURE_EXISTING_HEAPS`. A cross-adapter buffer is placed at the slot offset. Nothing is copied. |
+| `share` | The pool is opened once as a heap: `OpenExistingHeapFromAddress` on a whole-pool view of the section, or on the allocation base for the private range (`OpenExistingHeapFromFileMapping` leaks Windows commit, #2234), after `D3D12_FEATURE_EXISTING_HEAPS`. A cross-adapter buffer is placed at the slot offset. Nothing is copied. |
 | `copy` | A default buffer fed from a two-slot upload ring. The ring wraps like `reserve_upload_ring`, but refuses a slot whose fence has not completed (`DXGI_ERROR_WAS_STILL_DRAWING`). Title memory is copied into the ring at one named copy point: `bind` (as `upload_from_title`), `record` (as `frame_copy`) or `submit`, just before `ExecuteCommandLists`. The ring slot is copied into the buffer at the start of the submission. When a use declares GPU writes, the buffer is copied to readback at the end, and completion of that fence copies readback to title memory. |
 | `fallback` | Sharing is forced to fail: the section through a `FILE_MAP_READ` handle, or an interior address of the private range. The fixture records the HRESULT. The path falls back to `copy` only when the copy can keep the guarantees. A GPU-written use with no completion point is refused with the sharing HRESULT. |
 | `slot133` | A model of slot 133's fallback. A non-`MEM_PRIVATE` address is refused before D3D12 with `E_INVALIDARG`, and a committed default buffer stands in with `S_OK` and no copy. A private range is aliased through its allocation base. |
@@ -9913,7 +9921,7 @@ ctest --preset dev --no-tests=error -R '^xmem_startup_below_40' -V
 
 Experimental, for [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199). Physical pages are 64 KiB slots of `SEC_RESERVE` slabs (see [Startup memory accounting](startup-runtime.md#startup-memory-accounting)). By default a fresh slot is committed when its page is first mapped. A startup run maps far more pages than it touches before the main load, and slab commit is charged to the system commit limit, not to the process. On a 16 GB host this pushes the system to its commit limit during the load.
 
-`X2W_XMEM_LAZY_COMMIT=1` leaves a fresh slot uncommitted when its page is mapped. The first CPU access faults, and a vectored exception handler installed when `xmem.dll` loads commits that slot and resumes the thread. A thread that loses the race to commit the same slot finds it committed and retries once. If the handler cannot be installed, the switch acts as off: pages are committed when they are mapped and no import is wrapped. GPU-view addresses resolve to the CPU-view slot (the same section). Reused slots and `x2w_xmem_write_physical` still commit before use, as before.
+`X2W_XMEM_LAZY_COMMIT=1` leaves a fresh slot uncommitted when its page is mapped. The first CPU access faults, and a vectored exception handler installed when `xmem.dll` loads commits that slot and resumes the thread. A thread that loses the race to commit the same slot finds it committed and retries once. If the handler cannot be installed, the switch acts as off: pages are committed when they are mapped and no import is wrapped. GPU-view addresses resolve to their currently mapped section slot. An implicit mirror follows the CPU view until an explicit page batch selects its own backing. Reused slots and `x2w_xmem_write_physical` still commit before use, as before.
 
 Some writers cannot fault a slot in, so they commit the range first through the experimental export `x2w_xmem_commit_range(address, bytes)`:
 
