@@ -575,6 +575,12 @@ class Wave:
         raise ValueError("No program exit")
 
 
+def live_barriers_agree(first, second):
+    # Wave.run only returns at S_ENDPGM. RDNA 2 ISA section 4.3 drops a retired
+    # wave from later barriers. While both waves are live their PCs must match.
+    return all(a == b for a, b in zip(first.barriers, second.barriers))
+
+
 def float4(values):
     components = ", ".join(v if isinstance(v, str) else f"asfloat(0x{v:08x}u)" for v in values)
     return f"float4({components})"
@@ -629,7 +635,7 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     for wave in waves:
         wave.run(decoded, expressions)
     if (
-        waves[0].barriers != waves[1].barriers
+        not live_barriers_agree(*waves)
         or len(waves[0].counts) != 1
         or waves[1].counts
     ):

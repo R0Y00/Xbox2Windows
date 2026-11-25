@@ -5,10 +5,11 @@ import struct
 import sys
 from unittest.mock import patch
 
-from mesh_dynamic_geometry_check import CASES, CODE, MESH_LIMITS, decode, words
+from mesh_dynamic_geometry_check import CASES, CODE, MESH_LIMITS, RETIRED_PREFIX, SECOND, Wave, decode, words
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from mesh_dynamic_aot import enumerate_variants, lower
+from mesh_entry_aot import lower as lower_static
 
 
 def select(variants, geometry):
@@ -27,7 +28,39 @@ def expect_refusal(decoded, geometry_word_count, text, limits=MESH_LIMITS):
         raise AssertionError(f"Expected refusal: {text}")
 
 
+def check_retired_wave():
+    body = decode(CODE)
+    decoded = decode(RETIRED_PREFIX + CODE)
+    geometry = [0x1003, SECOND]
+    body_barrier, = [pc + len(RETIRED_PREFIX) for pc, op in body if op == "s_barrier"]
+    # Source schedule: both arrive at 0; wave 1 branches to S_ENDPGM at 28; wave 0
+    # alone arrives at 20 and the body barrier, then exports the triangle.
+    def arrivals(program):
+        waves = [Wave(i, geometry) for i in range(2)]
+        for wave in waves:
+            wave.run(program, {})
+        return [wave.barriers for wave in waves]
+
+    assert arrivals(decoded) == [[0, 20, body_barrier], [0]]
+    assert lower_static(decoded, geometry, MESH_LIMITS) == lower_static(body, geometry, MESH_LIMITS)
+    assert lower(decoded, 2, MESH_LIMITS) == lower(body, 2, MESH_LIMITS)
+
+    # Replace wave 1's branch to the exit with a barrier. Both traces now have the same
+    # length, but the second rendezvous has two live waves at different PCs.
+    assert dict(decoded)[28].startswith("s_branch ")
+    divergent = [(pc, "s_barrier" if pc == 28 else op) for pc, op in decoded]
+    assert arrivals(divergent) == [[0, 20, body_barrier], [0, 28, body_barrier]]
+    for lowering, binding in ((lower_static, geometry), (lower, 2)):
+        try:
+            lowering(divergent, binding, MESH_LIMITS)
+        except ValueError as error:
+            assert "Inconsistent mesh synchronization" in str(error), error
+        else:
+            raise AssertionError("Live waves at different barrier PCs were accepted")
+
+
 def check():
+    check_retired_wave()
     decoded = decode(CODE)
     variants = enumerate_variants(decoded, 2, MESH_LIMITS)
     for name, packed_counts, second_index, vertex_count, triangles in CASES:

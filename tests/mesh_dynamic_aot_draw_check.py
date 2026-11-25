@@ -6,8 +6,9 @@ import subprocess
 import sys
 import tempfile
 
-from mesh_dynamic_geometry_check import CASES, CODE, MESH_LIMITS, decode
+from mesh_dynamic_geometry_check import CASES, CODE, MESH_LIMITS, RETIRED_PREFIX, SECOND, decode
 from mesh_dynamic_aot import lower
+from mesh_entry_aot import lower as lower_static
 
 
 SIDE = 32
@@ -43,6 +44,13 @@ def check(dxc, runner, backend, target):
     alternate_code = CODE.replace(old_key, struct.pack("<I", 0x300401))
     alternate = compile_shader(dxc, target, "changed", lower(decode(alternate_code), 2, MESH_LIMITS), "ms_6_5")
     cases = [(mesh, *case) for case in CASES]
+    retired_program = decode(RETIRED_PREFIX + CODE)
+    retired = compile_shader(dxc, target, "retired", lower(retired_program, 2, MESH_LIMITS), "ms_6_5")
+    # One triangle and two triangles take distinct runtime geometry paths after the early exit.
+    cases.extend((retired, "retired wave: " + name, *values) for name, *values in CASES[:2])
+    static = compile_shader(dxc, target, "retired-static",
+                            lower_static(retired_program, [0x2004, SECOND], MESH_LIMITS), "ms_6_5")
+    cases.append((static, "retired wave: specialized quad", *CASES[1][1:]))
     cases.extend([
         (alternate, "changed source rejects old input", 0x2004, 0x300402, 0, ()),
         (alternate, "changed source accepts new input", 0x2004, 0x300401, 4, ((0, 1, 2), (1, 1, 3))),
@@ -54,6 +62,13 @@ def check(dxc, runner, backend, target):
         result = subprocess.run([runner, backend, "--mesh-indexed", shader, pixel, inputs])
         if result.returncode:
             return result.returncode
+    wrong_case = target / "quad-with-triangle-reference.bin"
+    wrong_case.write_bytes(fixture(0x2004, SECOND, ((0, 1, 2),)))
+    wrong = subprocess.run([runner, backend, "--mesh-indexed", retired, pixel, wrong_case], capture_output=True, text=True)
+    if (wrong.returncode != 1 or "Draw reference mismatch" not in wrong.stderr
+            or "pixels=1024 mismatches=528" not in wrong.stdout.splitlines()):
+        raise AssertionError(wrong.stdout + wrong.stderr)
+    print("Retired-wave quad rejected the triangle reference at 528 pixels")
     return 0
 
 

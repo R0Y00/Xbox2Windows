@@ -11,7 +11,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
-from mesh_entry_aot import U32, Wave, decode_mesh, float4
+from mesh_entry_aot import U32, Wave, decode_mesh, float4, live_barriers_agree
 
 
 MAX_VARIANTS = 32
@@ -117,7 +117,7 @@ def run_variant(decoded, geometry, limits, conditions):
     first, second = RuntimeWave(0, geometry), RuntimeWave(1, geometry)
     for wave in (first, second):
         wave.run(decoded, expressions)
-    if first.barriers != second.barriers or len(first.counts) != 1 or second.counts:
+    if not live_barriers_agree(first, second) or len(first.counts) != 1 or second.counts:
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = first.counts[0]
     pos = first.positions | second.positions

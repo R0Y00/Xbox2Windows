@@ -15,6 +15,7 @@ from pixel_aot import disassemble
 
 SOURCE = Path(__file__).with_name("mesh_dynamic_geometry.s")
 WAVE64 = "+wavefrontsize64,-wavefrontsize32"
+RETIRED_PREFIX = bytes.fromhex("00008abf 03ff8893 18000400 088006bf 020084bf 00008abf 010082bf 4c0082bf")
 MESH_LIMITS = (4, 2)
 SECOND = 0x300402  # (2, 1, 3)
 DUPLICATE = 0x402  # (2, 1, 0)
@@ -94,17 +95,22 @@ def decode(code):
     return instructions
 
 
-def reassemble(assembler, objcopy, library):
+def reassemble(assembler, objcopy, library, *, retired=False):
     with tempfile.TemporaryDirectory() as directory:
+        source = SOURCE
+        if retired:
+            source = Path(directory) / "retired.s"
+            prefix = SOURCE.with_name("mesh_retired_wave_prefix.s").read_text(encoding="ascii")
+            source.write_text(prefix + "\n" + SOURCE.read_text(encoding="ascii"), encoding="ascii")
         obj, raw = (Path(directory) / name for name in ("fixture.o", "fixture.bin"))
         subprocess.run(
             [assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-mattr=" + WAVE64,
-             "-filetype=obj", SOURCE, "-o", obj],
+             "-filetype=obj", source, "-o", obj],
             check=True,
         )
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
         code = raw.read_bytes()
-    assert code == CODE, "Embedded bytes differ from the assembled mesh"
+    assert code == (RETIRED_PREFIX + CODE if retired else CODE), "Embedded bytes differ from the assembled mesh"
     native = disassemble(code, library, offsets=True, features=WAVE64.encode("ascii"))
     for llvm_instruction, python_instruction in zip(native, decode(code), strict=True):
         assert llvm_instruction == python_instruction, (llvm_instruction, python_instruction)
@@ -139,6 +145,7 @@ def check_cases(decoded):
 if __name__ == "__main__":
     if len(sys.argv) == 5 and sys.argv[1] == "binary":
         reassemble(*sys.argv[2:])
+        reassemble(*sys.argv[2:], retired=True)
     elif len(sys.argv) != 1:
         raise SystemExit("Usage: mesh_dynamic_geometry_check.py [binary llvm-mc llvm-objcopy libLLVM]")
     check_cases(decode(CODE))
