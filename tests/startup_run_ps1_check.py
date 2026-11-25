@@ -56,6 +56,16 @@ STOP = "taskkill.exe /T /F /PID $translator.Id"
 CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
+# Without -FakeUser, user APIs hit the host runtime; run.ps1 must warn (docs/startup-runtime.md).
+FAKE_USER_WARN = re.compile(
+    r"if\s*\(\s*-not\s+\$FakeUser\s*\)\s*\{\s*"
+    r'Write-Warning\s+"Without -FakeUser, user API calls go to the host gaming runtime',
+    re.I | re.S,
+)
+FAKE_USER_WARN_LINE = (
+    'Write-Warning "Without -FakeUser, user API calls go to the host gaming runtime '
+    '(docs/startup-runtime.md)."'
+)
 
 
 def decode(raw):
@@ -175,6 +185,8 @@ def text_problems(script):
         found.append(f"the script does not end with 'exit ${capture.group(1)}'")
     if HEAD not in after[1:-1]:
         found.append("the log head is not printed between the capture and the exit")
+    if not FAKE_USER_WARN.search(code):
+        found.append("missing Write-Warning when -FakeUser is not passed")
     return found
 
 
@@ -188,10 +200,12 @@ def mutants_of(script):
             early += [other for other in lines if is_exit(other)]
         if not is_exit(line):
             early.append(line)
+    no_fake_warn = [line for line in lines if FAKE_USER_WARN_LINE not in line]
     mutants = {
         "no capture and no exit": [line for line in lines if not is_exit(line) and not is_capture(line)],
         "fixed exit 2": ["exit 2" if is_exit(line) else line for line in lines],
         "exit before the log head": early,
+        "no FakeUser warning": no_fake_warn,
     }
     return {name: None if mutant == lines else "\n".join(mutant) + "\n" for name, mutant in mutants.items()}
 
@@ -223,7 +237,11 @@ def main():
             if bad:
                 continue
             mutants = mutants_of(script)
-            if shells:  # only an executed run can see the translator outlive the script
+            if shells:
+                # The FakeUser warning is asserted by text_problems below; an executed
+                # run still succeeds without it, so it is not a shell mutant.
+                mutants.pop("no FakeUser warning", None)
+                # only an executed run can see the translator outlive the script
                 stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
                 mutants["translator left running"] = None if stopless == script else stopless
                 parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
@@ -231,6 +249,14 @@ def main():
             for label, mutant in mutants.items():
                 if mutant is None or not check(mutant, True):
                     failures.append(f"{name}: mutant '{label}' was not detected")
+        if shells:
+            # Windows hosts that execute the script still need the FakeUser text gate.
+            text_bad = text_problems(script)
+            failures += [f"text: {item}" for item in text_bad]
+            if not text_bad:
+                no_warn = mutants_of(script).get("no FakeUser warning")
+                if no_warn is None or not text_problems(no_warn):
+                    failures.append("text: mutant 'no FakeUser warning' was not detected")
     for item in failures:
         print("FAIL", item)
     print(f"startup run.ps1 exit code: {len(failures)} failed ({mode})")

@@ -475,7 +475,13 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
-socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
+socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). Offline mode
+applies to the title's process only. Runtime calls can still be serviced by Gaming Services
+components outside that process, which can use a signed-in Xbox, Store or Gaming Services account.
+Prefer a Windows user or machine with none of those accounts signed in, or the isolated VM in
+[Iterating on start-up runs](#iterating-on-start-up-runs). The live log window already notes that it
+does not establish that all network activity is blocked; see
+[Startup memory accounting](#startup-memory-accounting).
 
 The file hooks that offline mode needs are always armed. The gaming-runtime call hooks
 (`QueryApiImpl`, `InitializeApiImpl*`, `XErrorReport`) and the movie-player call hooks (open,
