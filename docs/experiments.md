@@ -13560,7 +13560,13 @@ register or aligned immediate, and aligned 12-bit `offset` rounded down by
 `glc` writes the pre-atomic word back to `vdata[0]` (preserving `vdata[1]` on
 `cmpswap`, which reverses the ISA `(replacement, compare)` register pair to HLSL's
 `(compare, replacement)` order). `buffer_atomic_sub` emits `InterlockedAdd(a, (0u - val))`,
-and `smin`/`smax` use signed `asint` overloads. `idxen`, missing `offen`, `slc`/`dlc`,
+and `smin`/`smax` use signed `asint` overloads.
+Returning `buffer_atomic_add` also accepts `off` with a scalar byte offset
+register. The fixture increments separate counters at scalar offsets 0 and 32
+with immediate offsets 0 and 4, and records the returned old values.
+Each readback compares all 320 words, including the untouched guards.
+Dropping either offset, the old-value return, or the observer store changes
+the expected output. `idxen`, other scalar-only forms, `slc`/`dlc`,
 unaligned immediate offsets, modified or aliased descriptors, non-compute stages,
 and `inc`/`dec`/float/64-bit forms stay refused.
 
