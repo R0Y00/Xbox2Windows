@@ -8232,20 +8232,26 @@ counts. It requires a direct list and a desktop mesh and pixel pipeline using
 an empty root signature, one matching single-sample color target, a viewport,
 and a scissor. Producers that bypass wrapper state tracking return the argument
 buffer to `COMMON` before slot 61. The mesh path uses the record's group counts
-without binding an input assembler topology or an index buffer. Amplification
-and console shader pipelines are tracked in
+without binding an input assembler topology or an index buffer. Slot 86 accepts
+desktop DXIL mesh programs under desktop tag 25 or console tag 24. Tag 24 with
+desktop amplification DXIL stays an amplification subobject and requires a
+desktop mesh stage. Any other payload under the shared tag is refused. Translation
+of console shader programs and support for other console mesh paths are tracked in
 [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 
 The fixture writes its group counts at byte offset four on the GPU and checks
 all eight pixels and the surrounding argument words. One group paints the
 left half. Two groups paint both halves. An omitted writer, a short argument
-range, and a missing viewport each leave the target clear. Adapters without
-mesh shader support report a capability skip.
+range, and a missing viewport each leave the target clear. The console tag
+fixture repeats the readback with a mesh program under tag 24 and checks that
+a pixel program under the same tag leaves the target clear. The amplified
+fixture passes a group index through an amplification payload and checks the
+same pixels. Adapters without mesh shader support report a capability skip.
 
 ```powershell
 cmake --build --preset release --target startup_indirect_draw_indexed
-ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(warp|hardware)$' -V
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_' -V
 ```
 
 On Windows build 26100, WARP 10.0.26100.33648 with the debug layer enabled
@@ -8253,6 +8259,13 @@ passed all four indirect fixtures. The baseline rejected the mesh shader stream
 and left the first mesh case clear. Physical adapter coverage is pending.
 [Candidate run](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45487176129)
 [Negative control](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45486140968)
+
+The slot 86 tag checks passed on Windows 11 build 26200.9974 with WARP
+10.0.26100.9818 and GeForce RTX 4060 Laptop GPU driver 32.0.16.1656, both
+with the debug layer enabled. Each mesh tag and the amplification payload
+produced 4/8 and 8/8 colored pixels for one and two groups. Pixel DXIL under
+tag 24 left 0/8 colored pixels on both adapters. The previous shim rejected
+the new console-tag fixture on WARP and left 0/8 colored pixels.
 
 #### D3D12.X graphics command list (XCL-12)
 
