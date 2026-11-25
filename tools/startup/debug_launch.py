@@ -41,6 +41,14 @@ def read_qword(read, address):
     return int.from_bytes(data, "little") if len(data) == 8 else None
 
 
+def read_stack(read, rsp, words):
+    """Return `words` qwords read from `rsp`, zero-padded. The full read fails when it crosses past
+    the stack's last committed page; then read only to the end of RSP's page, which is committed."""
+    size = 8 * words
+    data = read(rsp, size) or read(rsp, min(size, 0x1000 - (rsp & 0xfff))) or b""
+    return data.ljust(size, b"\0")
+
+
 def final_path(handle):
     buf = ctypes.create_unicode_buffer(1024)
     n = k32.GetFinalPathNameByHandleW(wt.HANDLE(handle), buf, 1024, 0)
@@ -65,6 +73,8 @@ def main():
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
     host_cpu_sites = {}
+    host_cpu_rewritten = set()  # sites replaced in place; a thread may still fault on one (see the handler)
+    host_cpu_resumed = set()  # (site, thread) pairs continued once for that reason
     flushopt_missing = [False]  # set when a CLFLUSHOPT faults: CLWB then becomes a NOP instead
     stub_area = [0, 0]  # next free address and end of the block the stubs go to
     os.makedirs(logdir, exist_ok=True)
@@ -378,7 +388,7 @@ def main():
                     requested = "unreadable" if base is None else hex(base)
                     stack_args = struct.unpack("<2Q", (read(rsp + 0x28, 16) or b"").ljust(16, b"\0"))
                     kind, protect = (regs["R9"], stack_args[0]) if extended else stack_args
-                    words = struct.unpack_from("<200Q", (read(rsp, 8 * 200) or b"").ljust(8 * 200, b"\0"))
+                    words = struct.unpack_from("<200Q", read_stack(read, rsp, 200))
                     chain = [where(w) for w in words if any(b <= w < b + 0x10000000 for b in modules)]
                     chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                     file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={requested} size={size:#x} "
@@ -602,8 +612,16 @@ def main():
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
                     and main_base <= ex_addr < main_base + 0x10000000):
                 name = rewrite_for_host(ex_addr)
-                if not name and sha_for_host(tid, ex_addr):
+                if name:
+                    host_cpu_rewritten.add(ex_addr)
+                elif sha_for_host(tid, ex_addr):
                     name = "sha (per hit)"
+                elif ex_addr in host_cpu_rewritten and (ex_addr, tid) not in host_cpu_resumed:
+                    # Another thread ran the old instruction before the rewrite and its fault arrived after:
+                    # continued, it runs the replacement. Once per thread, so a fault that stays is reported.
+                    host_cpu_resumed.add((ex_addr, tid))
+                    k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
+                    continue
                 if name:
                     host_cpu_sites[name] = host_cpu_sites.get(name, 0) + 1
                     if sum(host_cpu_sites.values()) <= 40:
@@ -733,6 +751,8 @@ def main():
             print("  asserts continued: " + ", ".join(f"{where(a)} x{n}" for a, n in asserts_seen.items()))
     if host_cpu_sites:
         print("  host-cpu sites rewritten: " + ", ".join(f"{name} x{n}" for name, n in sorted(host_cpu_sites.items())))
+    if host_cpu_resumed:
+        print(f"  host-cpu threads resumed at a site another thread had rewritten: {len(host_cpu_resumed)}")
     bink_report()
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
