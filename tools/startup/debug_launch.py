@@ -557,12 +557,16 @@ def main():
             retired.add(addr)
             set_ctx(thread)
             return True
+        # Suspend every peer first; only then open the byte. If a peer cannot be suspended the byte stays
+        # patched and the thread re-executes the breakpoint, so no call runs through the restored byte.
+        if gate.begin(tid, addr) is None:
+            set_ctx(thread)
+            return True
         # Step over the original instruction, then re-arm.
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
         write(addr, breakpoints[addr])
-        gate.begin(tid, addr)
         return True
 
     def dump_threads(path):

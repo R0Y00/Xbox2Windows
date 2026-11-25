@@ -81,6 +81,20 @@ class StepGateTest(unittest.TestCase):
         self.end(2)
         self.assertEqual({t: c for t, c in self.machine.suspended.items() if c}, {})
 
+    def test_failed_suspension_leaves_the_gate_closed_and_rolls_back(self):
+        machine = Machine({1, 2, 3, 4})
+        refuse = {4}  # peer 4 cannot be suspended
+        gate = StepGate(lambda tid: tid not in refuse and machine.suspend(tid), machine.resume, lambda: machine.live)
+        self.assertIsNone(gate.begin(1, 0x1000))
+        self.assertEqual(gate.stepping, {})  # not stepping: the caller keeps the byte patched
+        self.assertEqual(gate.dropped, 0)
+        self.assertEqual({t: c for t, c in machine.suspended.items() if c}, {})  # 2 and 3 were released
+        refuse.clear()  # the retried hit succeeds
+        self.assertFalse(gate.begin(1, 0x1000))
+        self.assertEqual({t: c for t, c in machine.suspended.items() if c}, {2: 1, 3: 1, 4: 1})
+        self.assertEqual(gate.finish(1), 0x1000)
+        self.assertEqual({t: c for t, c in machine.suspended.items() if c}, {})
+
     def test_last_stepper_exit_releases_held_threads(self):
         self.hit(1)
         self.machine.live.discard(1)

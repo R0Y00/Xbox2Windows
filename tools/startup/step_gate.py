@@ -17,16 +17,29 @@ class StepGate:
         self.dropped = 0  # steps begun while another thread was already stepping the same address
 
     def begin(self, tid, addr):
-        """A thread hit the hook at addr and is about to step. Returns True when addr was already open."""
+        """A thread hit the hook at addr and is about to step.
+
+        All-or-nothing: every live peer is suspended before the caller opens the byte. Returns whether addr was
+        already open (bool), or None when a peer could not be suspended; the peers taken so far are released,
+        the thread is not marked as stepping and the caller must leave the byte patched and retry the hit.
+        """
         overlap = addr in self.stepping.values()
-        if overlap:
-            self.dropped += 1
         for _ in range(self._held.pop(tid, 0)):  # a gate-held thread that hit the hook must run to step
             self._resume(tid)
-        self.stepping[tid] = addr
+        taken = []
         for other in sorted(self._live()):
-            if other not in self.stepping and self._suspend(other):
-                self._held[other] = self._held.get(other, 0) + 1
+            if other == tid or other in self.stepping:
+                continue
+            if not self._suspend(other):
+                for done in taken:
+                    self._resume(done)
+                return None
+            taken.append(other)
+        for other in taken:
+            self._held[other] = self._held.get(other, 0) + 1
+        self.stepping[tid] = addr
+        if overlap:
+            self.dropped += 1
         return overlap
 
     def finish(self, tid):
