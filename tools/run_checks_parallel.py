@@ -5,7 +5,8 @@ Usage:
 
 Each script runs as `python -B <script>` from the current directory. Output is printed one
 script at a time, in the order given, so a failure log stays readable. The exit status is 1
-when any script exits non-zero.
+when any script exits non-zero. Scripts that exit 77 (skip) are listed under `SKIPPED:`,
+apart from the `FAILED:` line; a skip still makes the exit status 1.
 
 `run_checks(checks, jobs=None)` runs the same runner directly over check pairs. Each pair is
 `(command, extra_env)`: `command` is the argument list placed after `python -B` and
@@ -18,6 +19,8 @@ import os
 import subprocess
 import sys
 import time
+
+SKIP_EXIT_CODE = 77
 
 
 def run_one(check):
@@ -33,6 +36,7 @@ def run_one(check):
 def run_checks(checks, jobs=None):
     checks = list(checks)
     failed = []
+    skipped = []
     max_workers = max(1, os.cpu_count() or 2) if jobs is None else max(1, jobs)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         for script, code, output, secs in pool.map(run_one, checks):
@@ -41,10 +45,15 @@ def run_checks(checks, jobs=None):
             if output and not output.endswith("\n"):
                 print()
             print("::endgroup::", flush=True)
-            if code != 0:
+            if code == SKIP_EXIT_CODE:
+                skipped.append(script)
+            elif code != 0:
                 failed.append(script)
     if failed:
         print("FAILED: " + " ".join(failed))
+    if skipped:
+        print("SKIPPED: " + " ".join(skipped))
+    if failed or skipped:
         return 1
     print(f"all {len(checks)} checks passed")
     return 0

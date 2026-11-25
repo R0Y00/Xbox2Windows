@@ -88,6 +88,7 @@ jobs:
               (["tests/startup_image_sample_lod_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_compute_image_store_d16_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_c_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
@@ -179,6 +180,7 @@ jobs:
             tests/mesh_dynamic_aot_check.py \
             tests/mesh_lane_spill_check.py \
             tests/mesh_join_descriptor_check.py \
+            tests/mesh_loop_census_check.py \
             tests/pso_readiness_check.py \
             tests/xmem_attribute_scan_check.py \
             tests/xgameruntime_table_check.py \
@@ -194,6 +196,7 @@ jobs:
             tests/startup_image_sample_lod_check.py \
             tests/startup_image_gather_lz_check.py \
             tests/startup_compute_gather_lz_check.py \
+            tests/startup_compute_image_store_d16_check.py \
             tests/startup_image_gather_c_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
@@ -223,6 +226,7 @@ jobs:
             tests/startup_gfx2hlsl_calculated_target_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
+            tests/startup_run_sh_check.py \
             tests/startup_flat_param_check.py \
             tests/startup_build_rev_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \

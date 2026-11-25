@@ -3821,6 +3821,43 @@ mutants must draw something else. The `binary` mode reassembles the source with
 LLVM 15 and is not part of ctest. The draw tests and the `binary` check were
 not run on Linux. They need Windows verification.
 
+### Loop census of mesh-stage programs
+
+`tools/mesh_loop_census.py` reads a directory of DXBC containers, keeps the
+mesh-stage programs that `tools/mesh_entry_aot.py` decodes, and prints aggregate
+tables only: no file name, digest, offset or instruction of an input. It lowers
+nothing.
+
+Every backward branch is counted as an observed back-edge, with the body taken
+from the branch target to the branch. Per back-edge it reports a group barrier
+in the body, LDS access in the body, an EXEC write in the body (an upper bound
+on a loop-carried EXEC: a save/restore pair counts too), a latch that tests
+EXEC, a scalar read before the body writes it, and the trip count as a pattern
+(a constant start, step and bound with no second exit), not as a proof. A loop
+the pattern does not match is reported as `other`, with nothing claimed.
+
+It then runs both bounded lowerers once per program and places the first
+refusal: at a latch, in a loop body, before the first loop or after one. The
+run is repeated with the two flat-scratch setup writes replaced by `s_nop`,
+because the lowerers refuse `s_setreg_imm32_b32` and that refusal otherwise
+hides what follows. LLVM 15 prints a negative branch offset unsigned
+(`s_branch 65535`); the census reads it signed.
+The SCC-writer filter excludes scalar instructions by mnemonic prefix, so a later
+`s_mul_*` or `s_cselect_*` variant that writes SCC would be skipped.
+
+```sh
+python3 -B tools/mesh_loop_census.py <directory> --llvm libLLVM-15.so.1
+python3 -B tools/mesh_loop_census.py <directory> --llvm-mc llvm-mc-15
+python3 -B tests/mesh_loop_census_check.py
+python3 -B tests/mesh_loop_census_check.py binary llvm-mc-15 llvm-objcopy-15
+```
+
+`tests/mesh_loop_census_check.py` holds 14 hand-written programs assembled
+with LLVM 15: 13 with a loop, one per shape, and a loop-free control. A
+barrier placed before the header instead of in the body is a second control.
+14 mutants each move one loop across one category boundary. The fixtures carry
+a loop and nothing else; they are not complete mesh programs.
+
 ## Amplification and mesh pipeline forms
 
 `tests/mesh_amplified_check.py` builds an amplification shader (`as_6_5`) and a
@@ -8964,6 +9001,134 @@ The fixture maps two pages from the shim's `SEC_RESERVE` pool and copies a 4 KiB
 
 Run `cmake --build --preset release --target xmem_section_lease_check` and `ctest --preset release --no-tests=error -R '^xmem_section_lease_' -V`. The tests report a capability skip (77) when the D3D12 device lacks existing heap support.
 
+#### GPU queue handoff to an XMem-backed root SRV (#1914)
+
+The same fixture has mesh and vertex modes that read one DWORD through a root
+SRV at byte offset `0xf800` in the first leased page. A COPY queue writes a new
+DWORD to the desktop buffer placed over the XMem pages. A DIRECT queue waits
+on the writer's fence, binds a graphics root SRV and draws to a 4×2 UINT target.
+The fixture records the lease ID, section page offset and byte offset at the
+write and at the bind. For the missing-wait control, the writer stays behind a
+gate until the reader finishes, so the read of the old DWORD is deterministic.
+Binding the second page while retaining the wait returns its independent
+sentinel. Both queues complete before the buffer, heap view and lease are released.
+
+Release on base `76aeef7f` plus the fixture, Windows 10 build 19045.6456 with
+the D3D12 debug layer enabled: WARP 10.0.19041.5794 and GeForce GTX 1080 Ti
+32.0.15.8278 each returned eight pixels of `0x9abcdef0` with the wait,
+`0x12345678` without it, and `0x1372ba5d` from the other page. The vertex
+mode reported zero debug warnings or errors on each adapter. The two mesh
+runs reported capability skip (77), because neither selected device supported
+mesh shaders.
+
+```powershell
+cmake --build --preset release --target xmem_section_lease_check
+ctest --preset release --no-tests=error -j1 -R '^xmem_section_lease_' -V
+```
+
+This measures a source-built D3D12 queue handoff. The same-recording copy proof from
+[#2240](https://github.com/R0Y00/Xbox2Windows/pull/2240) identifies contents
+in a desktop copy. The lease handoff needs its own proof of page identity and
+writer ordering across queues.
+
+**Branch goal and PR acceptance.** `codex/mesh-root-srv-lease` targets one
+GPU-written XMem range consumed by a root SRV in the cached slot 86 mesh path.
+The proposed PR, `gpu: bind one leased XMem range for cached mesh draws`, uses
+the lease from [#2280](https://github.com/R0Y00/Xbox2Windows/pull/2280) and
+covers one SRV with a proven byte extent through the startup command-list and
+queue wrappers. Track it under [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914#issuecomment-7159228037)
+and [#870](https://github.com/R0Y00/Xbox2Windows/issues/870).
+
+- Verify the full read extent, physical page identity and byte offset at writer
+  publication and root bind. Refuse a page mismatch, an out-of-range read or
+  a missing writer record with a specific diagnostic.
+- Before submitting a consumer on a different queue, enqueue a GPU wait on
+  the last writer's fence. The startup fixture must read the fresh DWORD. A
+  control that omits the wait must expose the old DWORD, and a different-page
+  control must be refused by the runtime.
+- Retain the lease and desktop backing until the last consumer fence completes.
+  Hold a consumer behind a gate and verify that its physical slots cannot be
+  reused until the submission finishes.
+- Run the end-to-end mesh case on at least one mesh-capable adapter. Record the
+  commit, test command, adapter, driver, Windows build and debug-layer status.
+
+Two pieces of the runtime contract now have source-built checks. The lease
+matcher compares the live CPU and GPU mappings against the original pinned
+slab slots and byte extent under the XMem lock. The check accepts the full
+span and a second-page subrange. It rejects a different page, a different
+offset, bytes outside the original span and a replacement mapping at the
+same virtual address. A pinned desktop view remains valid after the old
+guest mapping stops matching.
+
+Slot 44 supplies an address alone. The cache publisher's `--prove-root-srv`
+option derives a four-byte extent from DXC's dump of the compiled shader.
+It emits a version 2 marker tied to the published bytecode only for one
+raw DWORD load at offset zero from `t0 space0`, with a resource-free pixel
+stage. The check compiles and rejects shifted, dynamic, wider and wrong-space
+loads and a pixel-stage buffer read. Run it with
+`ctest --preset release --no-tests=error -R '^startup_mesh86_srv_proof$' -V`.
+
+On the Release worktree at `76aeef7f` plus these changes, the combined lease,
+SRV proof, export and mapped-page selection passed eight tests. The two mesh
+cases returned 77 on the adapters listed above. `dumpbin /exports` showed
+lease and release at ordinals 19 and 20, and match at 21.
+
+**Wrapped startup path.** With `X2W_MESH86_XMEM_SRV=1`, one eligible slot 15
+copy from an upload buffer writes a DWORD to a mirrored slot 133 buffer. The
+normal desktop copy and the write into the leased view use the same GPU source.
+The copied placement must be live and unique, and the word must be aligned for
+a raw root SRV. Slot 86 accepts the version 2 marker for one `t0 space0` root
+SRV, with matching stage hashes. Slot 61 binds the lease after checking the
+placement, page identity and byte extent. An overlapping copy without a lease
+update invalidates the writer publication when its recording is submitted.
+
+Slot 10 publishes the writer after enqueuing its completion signal. A consumer
+on a different queue waits on that fence, or on a later access already ordered
+after it. The wrapper checks the live mapping again at submission. Each flight
+holds the buffer, heap view and lease through its own completion fence. A closed
+recording also holds its reference until Reset or Release, so it can be submitted
+again. If a completion signal fails after submission, the runtime retains the
+in-flight backing and refuses further handoffs for it.
+
+Build and run the wrapped fixtures with a mesh-capable adapter. For app-local
+software coverage, use Microsoft.Direct3D.WARP 1.0.22 and
+Microsoft.Direct3D.D3D12 1.620.2. Put their x64 files in local directories
+under `out/`. Keep the Agility NuGet archive as `sdk.nupkg` alongside its
+x64 DLLs so the build can use the matching headers. Set `$warp` and `$agility`
+to those directories and `$python` to the test Python interpreter.
+
+```powershell
+cmake --preset release -B out/build/mesh-agility "-DOFFSCREEN_WARP_DIR=$warp" "-DOFFSCREEN_AGILITY_620_DIR=$agility" "-DINTAKE_PYTHON=$python"
+cmake --build out/build/mesh-agility --target startup_indirect_draw_indexed startup_list_copy_check --parallel 3
+ctest --test-dir out/build/mesh-agility --no-tests=error -j1 -R '^(startup_indirect_mesh_lease_|startup_indirect_mesh_cache_warp$|startup_mesh_xmem_writer_(warp|hardware)$|startup_mesh86_srv_proof$|startup_list_copy_validation)' --output-on-failure
+```
+
+The wrapped test uses an actual slot 15 writer on a COPY queue and a cached
+slot 86 mesh shader dispatched through slot 61 on a DIRECT queue. Wrong page,
+same-page wrong offset, absent writer and a corrupted cache marker each leave
+the eight target pixels at the clear color. Ordered readback expects eight red
+pixels. The omitted-wait control keeps the writer behind a gate until the read
+finishes and expects eight green pixels. The lifetime case removes both guest
+mappings and releases the resource and recordings while the consumer is gated.
+An allocation after that release takes a different slot. The consumer still
+reads red, and the original slot becomes reusable after its completion fence.
+
+Release on base `5c7b538b` plus this branch, Windows 10 build 19045.6456,
+MSVC 19.31.31105 and DXC 1.8.2502.11: the app-local selection passed ten
+tests with two capability skips. Microsoft Basic Render Driver 1.0.22.0
+with D3D12Core 1.620.2 ran the ordered and missing-wait mesh cases with the
+debug layer enabled and reported zero warnings or errors. GeForce GTX 1080 Ti
+32.0.15.8278 passed the wrapped writer check with the debug layer enabled
+and skipped both mesh cases. The earlier in-box Release run on base `76aeef7f`
+passed twenty tests with two capability skips. It also checks the original
+XMem lease, mapped pages, exported names, copy validation and WARP list
+resubmission.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed startup_list_copy_check startup_list_copy startup_list_resubmit xmem_section_lease_check xmem_shim_check xmem_shim_test_controls --parallel 3
+ctest --preset release --no-tests=error -j1 -R '^(xmem_section_lease_|xmem_shim_(exports|mapped_pages|page_runs)$|startup_(mesh_xmem_writer|mesh86_srv_proof|list_copy|list_resubmit.*_warp$))' --output-on-failure
+```
+
 #### Xbox frame events and token wait semantics (#874)
 
 The source-built frame events fixture (`tests/cpu/frame_events_caller.asm`, `tests/cpu/frame_events_provider.cpp`, `tests/cpu/frame_events_check.py`, CTest `cpu_native_frame_events`) models the scheduling and wait semantics of the Xbox frame-pacing extensions in `d3d12_xs.dll`:
@@ -12108,8 +12273,8 @@ than the reported size and
 handle. `XPackageGetMountPathSize` and `XPackageGetMountPath` report that path,
 and `XPackageCloseMountHandle` invalidates the handle; later path queries return
 `E_HANDLE`. The mapping is shim-only and does not read or verify a real package
-manifest. `XPackageMountWithUiAsync` remains an explicit stub because its
-completion contract is not modeled.
+manifest. `XPackageMountWithUiAsync` and `XPackageMountWithUiResult` are
+implemented on the manual task queue, described below.
 
 The same fixture adds the synchronous XSystem and XGame identity subset.
 `XSystemGetConsoleId` reports the fixed 38-character console ID
@@ -12138,16 +12303,17 @@ device type.
 checks repeated path and space values, writes and removes a PLS marker, verifies
 the package mount directory, checks the unmounted `E_HANDLE` status, and asserts
 that no implemented call logged `E_NOTIMPL`. Its negative control is
-`XPackageMountWithUiAsync`, which must log `E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
-checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls the
-`XPackageMountWithUiAsync` stub as a negative control. `xgameruntime_identity`
+`XPackageMountWithUiAsync` with a null block, which must log `E_INVALIDARG`.
+`xgameruntime_contracts` exercises the XUser/XGameSave subset and
+checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls
+`XPackageMountWithUiAsync` with null arguments as a negative control (`E_INVALIDARG`). `xgameruntime_identity`
 calls `XSystemGetConsoleId`, `XSystemGetDeviceType`, and `XGameGetXboxTitleId`,
 repeats each call for stability, checks the short-buffer and null-pointer errors,
 and asserts that `XUserAddAsync(None)` (the unsupported picker option) still logs `E_NOTIMPL`. The DLL remains under
 `out/build/dev/fixture-shims/` and is loaded by explicit path. The exact CTest
 names are `xgameruntime_thunks`, `xgameruntime_contracts`,
 `xgameruntime_pls_xpackage`, `xgameruntime_identity`,
-`xgameruntime_gamesave_async`, and `xgameruntime_user_async`.
+`xgameruntime_gamesave_async`, `xgameruntime_user_async`, and `xgameruntime_package_async`.
 
 `XGameSaveInitializeProviderAsync` and `XGameSaveInitializeProviderResult` are
 implemented on top of the synchronous provider path. Argument errors (null
@@ -12170,7 +12336,7 @@ queue open for the caller to close after delivery.
 completion, expiration or successful queue closure. The work port has no work
 items in this profile. The
 shim keeps its state in a side table keyed by the block address and reads only
-the leading queue, context and callback fields. `XPackageMountWithUiAsync` remains an `E_NOTIMPL` stub.
+the leading queue, context and callback fields. No explicit stub export remains in the table.
 `XUserAddAsync` and `XUserAddResult` (part of #870, #1334; on #2170 and #2179)
 use the same manual-queue contract for the one synthetic user. Only
 `AddDefaultUserSilently` or `AddDefaultUserAllowingUI` alone are accepted. Any
@@ -12181,6 +12347,24 @@ returns `E_PENDING` until then without consuming anything, then `S_OK` with one
 handle for `XUserCloseHandle`, once. An untracked block, a second claim or a
 game-save block gets `E_INVALIDARG`. A start that finds no free user handle
 fails with `E_OUTOFMEMORY` and frees its block.
+`XPackageMountWithUiAsync` and `XPackageMountWithUiResult` (part of #870) use the
+same manual-queue contract. The package identifier is validated like
+`XPackageMount` (`E_INVALIDARG`, nothing consumed); a null queue or a queue the
+shim did not make is refused with `E_NOTIMPL`; no UI is ever shown. The mount is
+made before the call returns and the callback fires once on `XTaskQueueDispatch`.
+`XPackageMountWithUiResult` returns `E_PENDING` until then without consuming
+anything, then `S_OK` with one mount handle for `XPackageCloseMountHandle`, once.
+An untracked block, a second claim or a block of another operation gets
+`E_INVALIDARG`; a start with no free mount fails with `E_OUTOFMEMORY` and frees
+its block. `XAsyncGetResultSize` reports one mount handle.
+`xgameruntime_package_async` covers the lifecycle, the in-callback claim, the
+refusals (negative control), the wrong-kind and close guards and mount-table
+exhaustion:
+
+```sh
+ctest --preset dev --no-tests=error -R '^xgameruntime_package_async$' -V
+```
+
 `XAsyncGetStatus` and `XAsyncGetResultSize` answer for tracked blocks only.
 Operation completion and callback dispatch stay separate: once the provider work
 has finished, both queries report the stored status (and a result size of one
@@ -12199,8 +12383,20 @@ user-table exhaustion, and that `XAsyncGetStatus` and `XAsyncGetResultSize` repo
 in-callback claim, the error paths, reuse, provider exhaustion, early result
 retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
+`XGameSaveEnumerateBlobInfo` and `XGameSaveEnumerateBlobInfoByName` walk the
+committed blobs of an open container in slot order and call the public
+`bool(const XGameSaveBlobInfo*, void*)` callback for each; returning `false`
+stops the walk with `S_OK`. The by-name form matches a case-sensitive prefix
+(an empty prefix matches every blob). The names and sizes are copied under the
+shared lock and the callback runs after it is released, so a callback may call
+back into the shim. A null container, prefix or callback returns `E_INVALIDARG`;
+a closed handle returns `E_HANDLE`; a handle whose provider closed returns
+`E_HANDLE` or `E_GS_HANDLE_EXPIRED`. Container enumeration and asynchronous
+reads are not implemented. `xgameruntime_gamesave_enumerate` covers these
+cases, including sibling-container isolation.
+
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check xgameruntime_user_async_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_gamesave_enumerate_check xgameruntime_async_status_check xgameruntime_user_async_check xgameruntime_package_async_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
@@ -13201,6 +13397,30 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_gather_lz(_warp|_hardware)?$' -V
 ```
 
+### Startup compute D16 image store
+
+The startup compute translator accepts a 2D `image_store d16` with all four
+DMASK bits set, full-width X/Y and eight intact image descriptor words from a
+fixed table offset. The R/G half-floats occupy the low/high halves of the first
+data VGPR. B/A occupy the second. The translator widens the four halves for a
+typed UAV store under the lane's EXEC bit. The version 2 compute manifest
+records `uav N tex2d float table P O channels 4`. Raw buffer and texture UAVs
+share a register index space. The consumer must validate the bound view against
+its dimension and float type. [AMD RDNA 2 ISA, §§8.2.1 and 8.2.5](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+
+The standalone dispatch uses the source and CPU reference from the
+[gfx1013 D16 store fixture](#gfx1013-2d-d16-float-image-stores). Two groups
+write 16 texels to mip zero of an RGBA16_FLOAT UAV. Each run compares all 1,344
+half-words across three mips, including signed zeros, subnormals and untouched
+texels. A second program masks out the second row. Omitting the store, swapping
+R/G, swapping the packed registers and dropping the EXEC guard produce 64, 32,
+64 and 32 differences respectively. Slot-67 runtime binding is tracked in #2274.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
+```
+
 ## Startup translator: fixed-mip 2D comparison gathers
 
 The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D
@@ -13387,6 +13607,10 @@ the scalar offset and the immediate, through a descriptor at a fixed root-table 
 - a descriptor word that was moved, overwritten or modified;
 - a descriptor that is also loaded.
 
+A scalar ALU operation on symbolic descriptor data can also change SCC. The translator refuses an SCC read
+if a path from that operation reaches the read before an emitted SCC write. A fresh comparison on every path
+allows the read, including at a branch target. The compute controls exercise conditional moves, selects and branches.
+
 As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
 handling of out-of-range stores, are assumptions, not measurements.
 The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
@@ -13415,6 +13639,30 @@ On Windows 11 (26300), all 320 words matched in every case on WARP (10.0.26100.1
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
+```
+
+### Startup compute masked bit count
+
+For groups of at most 32 threads, the startup translator lowers gfx1013
+`v_mbcnt_lo_u32_b32` and `v_mbcnt_hi_u32_b32` with an inline or known SGPR mask.
+The low instruction counts mask bits below the current lane and adds the base
+modulo 2³². The high instruction returns the base because all group lanes are in
+the low half of either guest wave size. The HLSL computes the lane from the local
+thread coordinates and group dimensions. EXEC controls which destinations are
+written. The base can be a VGPR or a known scalar word. Larger groups require
+evidence of the guest wave size. [AMD RDNA 2 ISA, V_MBCNT_LO/HI_U32_B32](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
+Fixture D dispatches two 4×2×4 groups. It counts sparse SGPR mask `0x85241249`
+with base 7 and counts an all-ones mask with only lanes 16–31 active. A variant
+starts at `UINT_MAX` to exercise wraparound. Each dispatch checks all 320 output
+words, including the 64 untouched words. Six controls pin the first incorrect
+word when the shader ignores the mask, counts the whole mask, uses only the X
+coordinate, drops the base, adds low-half bits to the high count, or writes to
+inactive lanes.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(mbcnt_)?(warp|hardware))$' -V
 ```
 
 ## Startup translator: refusal census

@@ -3,6 +3,7 @@
 // D3D12_DEPTH_STENCIL_DESC, the refusals, and a synthetic slot 57 state block.
 //
 // --mutate offset: expects the words one word later in the block (the check must then fail).
+// --mutate mesh-shift: puts a mesh block's words at the vertex offsets (the check must then fail).
 #include "startup_stubs/pipeline_state_decode.h"
 
 #include <cstdio>
@@ -12,7 +13,7 @@
 namespace {
 using namespace x2w_pipeline_state;
 int failures, cases;
-bool mutate_offset;
+bool mutate_offset, mutate_shift;
 
 void check(bool ok, const char* name)
 {
@@ -130,22 +131,65 @@ void block_cases()
     check(!read_depth_stencil_words(nullptr, 0x184, none) && !read_depth_stencil_words(std::vector<unsigned char>(4).data(), 4, none),
           "no block refused");
 }
+
+// The two layouts: +0x004 = 4 (vertex) reads the words at their offsets, +0x004 = 6 (mesh) 0x54 bytes later.
+// Each block also holds a different, decodable depth state at the other layout's offsets, so reading the
+// wrong offsets gives the wrong state instead of zeros.
+void layout_cases()
+{
+    const std::uint32_t mesh_dc = depth_control(true, true, true, false, 6, true, 7, 7), mesh_sc = stencil_control(0, 3, 0, 0, 3, 0);
+    const std::uint32_t mesh_rm = refmask(0x21, 0xf0, 0x0f, 1);
+    const std::uint32_t vert_dc = depth_control(false, true, false, false, 1, false, 7, 7);
+    for (std::uint32_t layout : {4u, 6u, 5u}) {
+        std::vector<unsigned char> a(0x1d8, 0x5a);
+        auto put = [&](std::size_t off, std::uint32_t v) { std::memcpy(a.data() + off, &v, 4); };
+        put(a_layout, layout);
+        const bool mesh = layout == a_layout_mesh;
+        // The mesh state at the shifted offsets (or, mutated, at the vertex offsets), the vertex state at the others.
+        const std::size_t ms = mutate_shift ? 0 : a_mesh_shift, vs = mutate_shift ? a_mesh_shift : 0;
+        put(a_depth + ms, mesh_dc);
+        put(a_stencil + ms, mesh_sc);
+        put(a_refmask + ms, mesh_rm);
+        put(a_refmask_bf + ms, mesh_rm);
+        put(a_depth + vs, vert_dc);
+        put(a_stencil + vs, 0);
+        put(a_refmask + vs, 0);
+        put(a_refmask_bf + vs, 0);
+        DepthStencilWords w;
+        const bool ok = read_depth_stencil_words(a.data(), a.size(), w);
+        const auto d = decode_depth_stencil(w.depth, w.stencil, w.refmask, w.refmask_bf);
+        if (mesh)
+            check(ok && w.mesh_layout && w.depth == mesh_dc && d.ok && d.desc.StencilEnable && d.stencil_ref == 0x21 &&
+                      d.desc.StencilReadMask == 0xf0 && d.desc.DepthFunc == D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+                  "mesh layout words");
+        else
+            check(ok && !w.mesh_layout && w.depth == vert_dc && d.ok && !d.desc.StencilEnable && d.desc.DepthFunc == D3D12_COMPARISON_FUNC_LESS,
+                  layout == 4 ? "vertex layout words" : "other layout values read at the vertex offsets");
+    }
+    // A mesh block long enough for the vertex offsets but not the shifted ones is refused.
+    std::vector<unsigned char> a(a_refmask_bf + 4 + 0x20, 0);
+    std::memcpy(a.data() + a_layout, &a_layout_mesh, 4);
+    DepthStencilWords w;
+    check(!read_depth_stencil_words(a.data(), a.size(), w), "short mesh block refused");
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
     if (argc > 2 && std::strcmp(argv[1], "--mutate") == 0) {
         mutate_offset = std::strcmp(argv[2], "offset") == 0;
-        if (!mutate_offset) {
+        mutate_shift = std::strcmp(argv[2], "mesh-shift") == 0;
+        if (!mutate_offset && !mutate_shift) {
             std::printf("unknown mutation\n");
             return 2;
         }
     } else if (argc > 1) {
-        std::printf("usage: startup_pipeline_state_check [--mutate offset]\n");
+        std::printf("usage: startup_pipeline_state_check [--mutate offset|mesh-shift]\n");
         return 2;
     }
     depth_stencil_cases();
     block_cases();
+    layout_cases();
     std::printf("%d of %d checks failed\n", failures, cases);
     return failures ? 1 : 0;
 }
