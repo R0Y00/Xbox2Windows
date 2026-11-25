@@ -781,6 +781,20 @@ OperationResult run_check_pixel_gather(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// A comparison gather needs a view format that advertises SHADER_GATHER_COMPARISON. R32_FLOAT does
+// on both WARP and hardware; R32G32B32A32_FLOAT does not, so the ordinary gather case cannot be reused.
+OperationResult run_check_pixel_compare_gather(const OperationContext& ctx)
+{
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{
+        DXGI_FORMAT_R32_FLOAT, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON))
+        return {OutcomeKind::skip, "R32_FLOAT comparison gather support unavailable"};
+    check_pixel_compare_gather(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                               ctx.argc == 7 ? ctx.argv[6] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel_case(const OperationContext& ctx)
 {
     check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4], D3D12_COLOR_WRITE_ENABLE_ALL,
@@ -1302,6 +1316,20 @@ OperationResult run_startup_image_load_d16(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits>: the translated pixel stage stores to
+// u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and every other texel -1.0.
+OperationResult run_startup_image_store(const OperationContext& ctx)
+{
+    unsigned x = 0, y = 0;
+    std::uint32_t expected[4]{};
+    if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
+    if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+        return {OutcomeKind::fail, "image store readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_startup_packed_position(const OperationContext& ctx)
 {
     constexpr UINT width = 13, height = 7;
@@ -1514,6 +1542,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
@@ -1555,6 +1584,7 @@ const OperationSpec kOperations[] = {
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
     {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
+    {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},

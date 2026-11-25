@@ -2181,6 +2181,54 @@ class Stage:
     def op_image_load_mip(self, ops, mods):
         self.image(ops, mods, 'load_mip')
 
+    def op_image_store(self, ops, mods):
+        """image_store in a pixel stage: a typed store of four channels to one texel of a 2D image.
+
+        MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
+        source, VADDR the integer texel address (x, y for dim 2D) and SRSRC the image descriptor; the
+        channels selected by DMASK are written in order from consecutive VDATA registers. HLSL's typed UAV
+        store writes every channel of the view, so only DMASK 0xf is exact here; a partial mask would need a
+        read-modify-write and is refused. The data is stored as float4, so the bound view must be of a
+        float or normalized format (the runtime side is not part of this lowering). The store runs under the
+        lane's exec bit, like the other per-lane writes, and D3D drops UAV writes from helper lanes as the
+        hardware drops them for lanes outside exec.
+        """
+        name = 'image_store'
+        if self.kind != 'ps':
+            raise Unsupported('%s outside a pixel stage' % name)
+        if len(ops) != 3:
+            raise Unsupported('%s with %d operands' % (name, len(ops)))
+        for m in mods:
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        dims = [m[4:] for m in mods if m.startswith('dim:')]
+        masks = [m[6:] for m in mods if m.startswith('dmask:')]
+        if len(dims) != 1 or len(masks) != 1:
+            raise Unsupported('%s without exactly one dim and dmask' % name)
+        if dims[0] != 'SQ_RSRC_IMG_2D':
+            raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
+        try:
+            mask = int(masks[0], 0)
+        except ValueError:
+            raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
+        if mask != 0xf:
+            raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
+        data = reg_range(ops[0])
+        if not data or data[0] != 'v' or data[2] - data[1] != 3:
+            raise Unsupported('%s data %s: four VGPRs expected' % (name, ops[0]))
+        coords = ops[1]
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
+        if len(cs) != 2:
+            raise Unsupported('%s with %d address registers: x and y expected' % (name, len(cs)))
+        image = self.pipe.uav(self.descriptor(ops[2]), 'tex2d')
+        value = 'asfloat(uint4(%s))' % ', '.join(self.u('v%d' % n) for n in range(data[1], data[1] + 4))
+        body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
     def op_image_gather4_lz(self, ops, mods):
         name = 'image_gather4_lz'
         if self.kind != 'ps' or len(ops) != 4:
@@ -2213,6 +2261,53 @@ class Stage:
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
         self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channels[masks[0]], smp, u, v))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
+    def op_image_gather4_c_lz(self, ops, mods):
+        """image_gather4_c_lz: four red-channel depth comparisons at view mip zero.
+
+        The address dwords are the reference, then u and v, as on the hardware gather. The comparison
+        function and the depth compare live in the constant sampler, so the guest words are bound as a
+        SamplerComparisonState and the sample profile is the one pixel_aot.check_gather_sampler already
+        checks for comparison gathers. Only red is in contract: gather4_c compares the resource's red
+        component and D3D's gather4_c takes a single-component view.
+        """
+        name = 'image_gather4_c_lz'
+        if self.kind != 'ps' or len(ops) != 4:
+            raise Unsupported('%s requires a pixel stage and four operands' % name)
+        for modifier in mods:
+            if not (modifier.startswith(('dim:', 'dmask:')) or modifier in ('dlc', 'glc', 'slc')):
+                raise Unsupported('%s modifier %s' % (name, modifier))
+        if [m for m in mods if m.startswith('dim:')] != ['dim:SQ_RSRC_IMG_2D']:
+            raise Unsupported('%s requires a 2D texture' % name)
+        masks = [m for m in mods if m.startswith('dmask:')]
+        if masks != ['dmask:0x1']:
+            raise Unsupported('%s requires red dmask 0x1' % name)
+        dst, addr, image, sampler = (reg_range(ops[i]) for i in (0, 1, 2, 3))
+        if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
+            raise Unsupported('%s requires four destination registers' % name)
+        if not addr or addr[0] != 'v' or addr[2] - addr[1] != 2 or addr[2] > 255:
+            raise Unsupported('%s requires three contiguous address registers' % name)
+        if not image or image[0] != 's' or image[2] - image[1] != 7 or image[2] > 105:
+            raise Unsupported('%s requires eight image descriptor registers' % name)
+        if not sampler or sampler[0] != 's' or sampler[2] - sampler[1] != 3 or sampler[2] > 105:
+            raise Unsupported('%s requires four sampler descriptor registers' % name)
+        words = self.const_words(ops[3])
+        if words is None:
+            raise Unsupported('%s requires a constant sampler' % name)
+        from pixel_aot import check_gather_sampler
+        try:
+            # Both the guest _lz and D3D gather compare at mip zero of the bound view.
+            check_gather_sampler(words, 1, comparison=True)
+        except ValueError as error:
+            raise Unsupported('%s sampler: %s' % (name, error)) from error
+        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        smp = self.pipe.sampler(tuple(words), comparison=True)
+        reference, u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
+        # The gather is read before any destination register is written, so an alias between the address
+        # and destination ranges keeps the original operands.
+        self.emit('t = %s.GatherCmp(%s, float2(%s, %s), %s);' % (tex, smp, u, v, reference))
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
@@ -3200,6 +3295,7 @@ VERIFIED_SINT_RTVS = frozenset((4, 18, 43))
 class Pipeline:
     uses_pack16_rne = False
     srv_formats = ()
+    uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
                  refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), pk_u8_s0_contract=False):
@@ -3282,10 +3378,25 @@ class Pipeline:
         return self.uds.index(source)
 
     def resource(self, key, kind):
+        if key in self.stored_images():
+            raise Unsupported('resource %s is both read and stored to' % (key,))
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
         if r['kind'] != kind:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
         return 'r%d' % r['index']
+
+    def stored_images(self):
+        return self.uavs or {}
+
+    def uav(self, key, kind):
+        if key in self.resources:
+            raise Unsupported('resource %s is both read and stored to' % (key,))
+        if self.uavs is None:
+            self.uavs = {}
+        r = self.uavs.setdefault(key, dict(index=len(self.uavs), kind=kind))
+        if r['kind'] != kind:
+            raise Unsupported('stored image %s used as %s and %s' % (key, r['kind'], kind))
+        return 'w%d' % r['index']
 
     def sampler(self, key, comparison=False, lod_limits=False):
         if not isinstance(key[0], int):
@@ -3350,6 +3461,8 @@ class Pipeline:
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+        for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
+            out.append('%s w%d : register(u%d);' % ({'tex2d': 'RWTexture2D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:
@@ -3469,7 +3582,8 @@ class Pipeline:
         return '\n'.join(out) + '\n'
 
     def manifest(self):
-        lines = ['x2w-manifest 1', 'ud %d' % len(self.uds)]
+        # A manifest that names a writable view is version 2, so a runtime that reads only version 1 lines can tell.
+        lines = ['x2w-manifest %d' % (2 if self.stored_images() else 1), 'ud %d' % len(self.uds)]
         for i, source in enumerate(self.uds):
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
@@ -3481,6 +3595,11 @@ class Pipeline:
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
             if r.get('d16_exact'):
                 lines.append('d16srv %d exact' % r['index'])
+        for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
+            source, off = key
+            if source[0] != 'table':
+                raise Unsupported('stored image through %s' % (source,))
+            lines.append('uav %d %s table %d %d' % (r['index'], r['kind'], source[1] if len(source) > 1 else 0, off or 0))
         for key, i in self.samplers.items():
             prefixed = key[0] in ('cmp', 'lod')
             lines.append('%s %d %s' % ({'cmp': 'smpc', 'lod': 'smpl'}.get(key[0], 'smp'), i,
@@ -3526,6 +3645,11 @@ class ComputePipeline(Pipeline):
         if key in self.resources:
             raise Unsupported('descriptor %s used for a load and a store' % (key,))
         return 'u%d' % self.uavs.setdefault(key, len(self.uavs))
+
+    def stored_images(self):
+        # self.uavs here maps buffer descriptors to u indices (declared and listed by common() and manifest()
+        # below); the pixel-stage image stores that Pipeline.stored_images lists do not occur in a compute program.
+        return {}
 
     def common(self):
         out = [line for line in super().common() if self.uds or not line.startswith('cbuffer entry')]

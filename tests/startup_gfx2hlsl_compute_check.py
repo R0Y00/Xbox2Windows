@@ -230,7 +230,14 @@ def patch(words, old, new):
 
 def check_controls():
     a = translate('A')
+    # The compute stage keeps its buffer stores in self.uavs as descriptor key -> u index, while the pixel stage's
+    # image stores (#2155) are listed by stored_images() through the shared common() and manifest(). A compute
+    # program must list no image stores: no RWTexture2D declaration and no `uav <i> tex2d` line.
+    assert a.uavs and a.stored_images() == {}, (a.uavs, a.stored_images())
     hlsl, manifest = a.hlsl_cs(), a.manifest()
+    assert not any(line.startswith('RWTexture2D') for line in hlsl.splitlines()), hlsl
+    assert manifest.splitlines()[:2] == ['x2w-manifest 2', 'stage cs'], manifest
+    assert [line for line in manifest.splitlines() if line.startswith('uav ')] == ['uav 0 table 1 16'], manifest
     for line in ('[numthreads(2, 3, 4)]', 'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {',
                  '    s7 = gid.x;', '    s8 = gid.y;', '    s9 = gid.z;', '    v0 = tid.x;', '    v1 = tid.y;',
                  '    v2 = tid.z;', 'ByteAddressBuffer r0 : register(t0);', 'RWByteAddressBuffer u0 : register(u0);',

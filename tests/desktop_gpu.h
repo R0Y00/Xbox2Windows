@@ -26,6 +26,8 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                             bool one_dimensional = false, bool two_dimensional = false);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                   bool depth16, std::uint32_t words[64]);
+int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
+                              const std::uint32_t expected[4]);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
@@ -87,6 +89,8 @@ void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, unsigned ex
 void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance);
 void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);
 void check_pixel_gather(ID3D12Device* device, const char* shader, const char* reference);
+void check_pixel_compare_gather(ID3D12Device* device, const char* shader, const char* reference,
+                                const char* sampler_line, const char* vsPath = nullptr);
 bool check_mesh_shadow_draw(ID3D12Device*, const char* mesh, const char* receiver, const char* caster,
                             const char* fixture, bool stale);
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* input,

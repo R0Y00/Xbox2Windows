@@ -87,6 +87,7 @@ jobs:
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_b_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_image_gather_c_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_load_mip_check.py", "--llvm-mc", "llvm-mc-15"], {}),
@@ -214,6 +215,7 @@ jobs:
             tests/startup_image_sample_l_check.py \
             tests/startup_image_sample_b_check.py \
             tests/startup_image_gather_lz_check.py \
+            tests/startup_image_gather_c_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
             tests/startup_image_load_mip_check.py \
