@@ -562,6 +562,16 @@ def check_lds():
         ('0000dcd806000006', 'distinct offsets'),
     ):
         refused(reason, lambda: translate('G', code=patch(WORDS_G, pair, other)))
+    # The binary decoder only emits unsigned 8-bit offsets and consecutive pairs. Exercise
+    # the proof's operand checks directly for inputs the instruction cannot encode.
+    decoded = list(G.decode(WORDS_G))
+    index, = (i for i, ins in enumerate(decoded) if ins[2] == 'ds_read2_b32')
+    prefix, assembly = decoded[index][:3], decoded[index][3]
+    for old, new, reason in (('offset0:5', 'offset0:256', 'ordinary dword offsets'),
+                             ('v[6:7]', 'v[6:8]', 'VGPR pair')):
+        assert old in assembly
+        decoded[index] = (*prefix, assembly.replace(old, new))
+        refused(reason, lambda: G.check_lds_exchange(decoded, (64, 1, 1), 128))
     # Offset fields omitted by the disassembler default independently to zero. With the fill at zero,
     # both zero and +31 dwords are valid from any masked base in this fixture.
     for name, expected_offsets in (('G-offset0-only', (124, 0)), ('G-offset1-only', (0, 124))):
