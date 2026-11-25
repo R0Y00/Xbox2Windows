@@ -8956,7 +8956,7 @@ Title memory follows XMem (`src/xmem_mapped_pages.cpp`). The section pool is one
 
 | Path | Backing |
 |---|---|
-| `share` | The pool is opened once as a heap: `OpenExistingHeapFromAddress` on a whole-pool view of the section, or on the allocation base for the private range (`OpenExistingHeapFromFileMapping` leaks Windows commit, #2234), after `D3D12_FEATURE_EXISTING_HEAPS`. A cross-adapter buffer is placed at the slot offset. Nothing is copied. |
+| `share` | The pool is opened once as a heap: `OpenExistingHeapFromFileMapping` for the section, or `OpenExistingHeapFromAddress` on the allocation base for the private range, after `D3D12_FEATURE_EXISTING_HEAPS`. A cross-adapter buffer is placed at the slot offset. Nothing is copied. |
 | `copy` | A default buffer fed from a two-slot upload ring. The ring wraps like `reserve_upload_ring`, but refuses a slot whose fence has not completed (`DXGI_ERROR_WAS_STILL_DRAWING`). Title memory is copied into the ring at one named copy point: `bind` (as `upload_from_title`), `record` (as `frame_copy`) or `submit`, just before `ExecuteCommandLists`. The ring slot is copied into the buffer at the start of the submission. When a use declares GPU writes, the buffer is copied to readback at the end, and completion of that fence copies readback to title memory. |
 | `fallback` | Sharing is forced to fail: the section through a `FILE_MAP_READ` handle, or an interior address of the private range. The fixture records the HRESULT. The path falls back to `copy` only when the copy can keep the guarantees. A GPU-written use with no completion point is refused with the sharing HRESULT. |
 | `slot133` | A model of slot 133's fallback. A non-`MEM_PRIVATE` address is refused before D3D12 with `E_INVALIDARG`, and a committed default buffer stands in with `S_OK` and no copy. A private range is aliased through its allocation base. |
@@ -14224,19 +14224,3 @@ ctest --preset dev --no-tests=error -R '^(cpu_aot_switch_sal|cpu_aot_switch_shif
 The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequences (because ML64 assembles the `sal` mnemonic as `/4` `SHL`) across 24 translated functions covering all 12 `SAL` `Code` encodings (`SAL_RM{8,16,32,64}_{1,CL,IMM8}`), register and memory destinations, count-`1` all-16 `SETcc` checks, count->1 10-condition `SETcc` checks, `Jcc`, `CMOVcc`, narrow returns, and nonvolatile/stack-frame operands, plus 11 negative exports. [The differential check](../tests/cpu/switch_sal_check.py) verifies 28,024 `dev` and 28,024 `/O2` comparisons against native execution and the Python reference, four `/O2` mutated-C++ controls (`shift_dir`, `cf_mask`, `of_mask`, `cl_mask`), 11 MASM, 4 unit, and 7 PE-patched rejection controls, and records decoded mnemonics via `iced_x86.Mnemonic` to `FORM_COVERAGE_RECORD`.
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
-
-## Non-constant scalar symbols at branch targets in the startup translator
-
-Follow-up to #2279, which drops scalar constants at a join that another path writes, over the textual range between
-a branch and its target. Two cases remained wrong in the emitted HLSL:
-- A symbol that is not a constant (a descriptor word, a pointer, a 64-bit pair, an unplaced compute user SGPR) was
-  kept across the join, so a descriptor reloaded on one path was bound for both, and a word overwritten on one path
-  was read as a register nothing assigned.
-- A path that leaves a loop's textual range and comes back changes a constant the textual range does not cover.
-
-The joined registers are now worked out over the basic blocks and their dominators (a proven `s_setpc_b64` is an
-edge, and ends its block). A joined register keeps its symbol when every path into the target brings an equal symbol
-that names one value (a pointer only if no add touched it), is read at run time when it holds a constant, and refuses a
-read before its next write when a path brings a symbol with no run-time value or no definition at all. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
-`join_symbols_folded_*` tests run the old OUTSIDE statement and must give 3, not 11. Controls are pure Python plus
-a pixel dispatch on WARP and hardware; `binary` reassembles the fixture words with LLVM 15.

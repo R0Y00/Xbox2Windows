@@ -5,8 +5,8 @@
 #include <wrl/client.h>
 
 #include "desktop_gpu.h"
-#include "xmem_section_lease.h"
 #include "startup_stubs/rect_indirect_args.h"
+#include "xmem_section_lease.h"
 #include "startup_indirect_mesh_mesh.h"
 #include "startup_indirect_mesh_amplify.h"
 #include "startup_indirect_mesh_amplified_mesh.h"
@@ -280,7 +280,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
                                     bool needs_start, bool table_buffer = false, bool indexed = false, bool rect = false)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
-    constexpr char revision[] = "x2w-startup-shader-11";
+    constexpr char revision[] = "x2w-startup-shader-10";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
     static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000204};
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
@@ -446,20 +446,6 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
-struct MeshLeaseDraw {
-    UINT64 address;
-    IUnknown* queue;
-    UINT expected;
-    bool drop_recording = false;
-    std::function<void(ID3D12Fence*)> queued;
-};
-
-void submit_wrapped(IUnknown* queue, IUnknown* list)
-{
-    using Execute = void (WINAPI*)(IUnknown*, UINT, IUnknown* const*);
-    slot<Execute>(queue, 10)(queue, list ? 1u : 0u, list ? &list : nullptr);
-}
-
 // Two runs on two threads share one guest device, whose recording state is not meant to be driven from two threads
 // at once. The gate serializes everything except the GPU phase and releases both submits together, so the two
 // queues run their conversions at the same time.
@@ -487,6 +473,20 @@ struct Gate {
         changed.notify_all();
     }
 };
+
+struct MeshLeaseDraw {
+    UINT64 address;
+    IUnknown* queue;
+    UINT expected;
+    bool drop_recording = false;
+    std::function<void(ID3D12Fence*)> queued;
+};
+
+void submit_wrapped(IUnknown* queue, IUnknown* list)
+{
+    using Execute = void (WINAPI*)(IUnknown*, UINT, IUnknown* const*);
+    slot<Execute>(queue, 10)(queue, list ? 1u : 0u, list ? &list : nullptr);
+}
 
 enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered,
                      alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
@@ -978,6 +978,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         }
     }
     check(closed, "close guest command list");
+    if (gate) {
+        recording.unlock();
+        gate->meet();
+    }
     if (leased) {
         const auto queue = native_object<ID3D12CommandQueue>(device, guest, leased->queue);
         ComPtr<ID3D12Fence> completion;
@@ -989,13 +993,9 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         check(completion->SetEventOnCompletion(1, nullptr), "wait for mesh consumer");
         check(device->GetDeviceRemovedReason(), "leased mesh GPU completion");
     } else {
-        if (gate) {
-            recording.unlock();
-            gate->meet();
-        }
         submit(device, list);
-        if (gate) recording.lock();
     }
+    if (gate) recording.lock();
 
     if (restore_compute) {
         const D3D12_RANGE read{0, 4}, none{0, 0};
@@ -1721,7 +1721,8 @@ int main(int argc, char** argv) try
             try {
                 for (int round = 0; round < 24 && concurrent_ok; ++round)
                     if (!run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
-                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr, false, false, 0, false, false, &gate)) concurrent_ok = false;
+                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr,
+                             false, false, 0, false, false, nullptr, &gate)) concurrent_ok = false;
             } catch (...) {
                 concurrent_ok = false;
             }
