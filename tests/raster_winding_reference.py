@@ -59,6 +59,10 @@ def verify(dxc, renderer, adapter, directory):
         if show_adapter:
             print("\n".join(line for line in report.splitlines()
                             if line.startswith(("backend=", "adapter=", "driver=", "debug_errors="))))
+            # Some hosted adapters enumerate as hardware but identify themselves as the Basic Render Driver.
+            if adapter == "hardware" and " vendor=1414 device=008c" in report:
+                print("skip: the hardware selection returned the Microsoft Basic Render Driver")
+                raise SystemExit(77)
 
     for state, pair in EXPECTED.items():
         draw(state, pair, 0, show_adapter=(state == ("none", "cw")))
