@@ -50,13 +50,20 @@ def check_retired_wave():
     assert dict(decoded)[28].startswith("s_branch ")
     divergent = [(pc, "s_barrier" if pc == 28 else op) for pc, op in decoded]
     assert arrivals(divergent) == [[0, 20, body_barrier], [0, 28, body_barrier]]
-    for lowering, binding in ((lower_static, geometry), (lower, 2)):
-        try:
-            lowering(divergent, binding, MESH_LIMITS)
-        except ValueError as error:
-            assert "Inconsistent mesh synchronization" in str(error), error
-        else:
-            raise AssertionError("Live waves at different barrier PCs were accepted")
+    # Wave 1 can also retire at the allocation skip, after the conflicting
+    # rendezvous. The shorter trace must still agree on the common phases.
+    exit_pc = decoded[-1][0]
+    short = [(pc, f"s_cbranch_execz {(exit_pc - pc - 4) // 4}" if op.startswith("s_cbranch_execz ") else op)
+             for pc, op in divergent]
+    assert arrivals(short) == [[0, 20, body_barrier], [0, 28]]
+    for program in (divergent, short):
+        for lowering, binding in ((lower_static, geometry), (lower, 2)):
+            try:
+                lowering(program, binding, MESH_LIMITS)
+            except ValueError as error:
+                assert "Inconsistent mesh synchronization" in str(error), error
+            else:
+                raise AssertionError("Live waves at different barrier PCs were accepted")
 
 
 def insert_scalar(decoded, after_pc, lines, skip_pc=None):
