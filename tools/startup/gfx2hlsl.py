@@ -1729,8 +1729,12 @@ class Stage:
                 raise Unsupported('%s with an empty dmask' % op_name)
             if len(cs) != (4 if three else 3):
                 raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
-            # image_sample_b carries the bias where image_sample_l carries the level: the last address register.
-            lod, cs = cs[-1], cs[:-1]
+            # The address order is [bias], coordinates, [lod]: image_sample_b leads with the bias (before the
+            # coordinates), while image_sample_l ends with the level.
+            if how == 'b':
+                lod, cs = cs[0], cs[1:]
+            else:
+                lod, cs = cs[-1], cs[:-1]
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):

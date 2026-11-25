@@ -1,8 +1,8 @@
 """Biased image_sample_b in tools/startup/gfx2hlsl.py (pure Python, no arguments).
 
-image_sample_b addresses the coordinates and then the bias, exactly where image_sample_l puts its level. The bias
+image_sample_b addresses the bias and then the coordinates (image_sample_l puts its level after them). The bias
 is added to the implicit level, so the lowering must be Texture.SampleBias(sampler, uv, bias) with the bias read from
-the LAST address register. Sampling at level zero or at the bias as a level would be a different picture, and
+the FIRST address register. Sampling at level zero or at the bias as a level would be a different picture, and
 forms the lowering does not model are refused by name.
 
 The fixtures reuse the recorded image_sample_l stages of startup_image_sample_l_check.py and change only the MIMG
@@ -57,14 +57,14 @@ def bias_register(ps, width):
 def main():
     assert PLAIN_INSTRUCTION in L_WORDS['plain']
     plain = stage('plain')
-    assert bias_register(plain, 2) == ('v0', 'v1', None, 'v2'), plain
+    assert bias_register(plain, 2) == ('v1', 'v2', None, 'v0'), plain
     assert 'SampleLevel' not in plain  # not the explicit-level or level-zero lowering
-    assert bias_register(stage('nsa'), 2) == ('v0', 'v1', None, 'v3')  # the bias is the last register
-    assert bias_register(stage('three'), 3) == ('v0', 'v1', 'v2', 'v3')
+    assert bias_register(stage('nsa'), 2) == ('v1', 'v3', None, 'v0')  # the bias is the first register
+    assert bias_register(stage('three'), 3) == ('v1', 'v2', 'v3', 'v0')
     array = stage('array')
-    assert bias_register(array, 3) == ('v0', 'v1', 'v2', 'v3') and 'Texture2DArray' in array
+    assert bias_register(array, 3) == ('v1', 'v2', 'v3', 'v0') and 'Texture2DArray' in array
     assert stage('glc') == plain and stage('dlc') == plain and stage('slc') == plain
-    assert bias_register(stage('dmask3'), 2) == ('v0', 'v1', None, 'v2')
+    assert bias_register(stage('dmask3'), 2) == ('v1', 'v2', None, 'v0')
     assert plain != G.Pipeline(VS_WORDS, L_WORDS['plain'], root_blob(flags=0)).hlsl_ps()
 
     refused('unorm', 'image_sample_b modifier unorm')
