@@ -94,7 +94,6 @@ def controls():
     cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('unorm', patched(1, 0x10)),
-             ('dmask 0x7', patched(1, 0, 0x07)), ('dmask 0x1', patched(1, 0, 0x01)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
              ('SQ_RSRC_IMG_2D_ARRAY', bytes.fromhex('280f20f000040400')),
              ('SQ_RSRC_IMG_1D', bytes.fromhex('000f20f000040400')))
@@ -103,6 +102,30 @@ def controls():
         message = refused(with_store(store), 'image_store')
         print('refused %-20s %s' % (name + ':', message))
         assert decoded.startswith('image_store'), decoded
+    # A partial channel mask, encoded: the decoder sizes VDATA from the mask (v[4:6], v4), so each must be
+    # refused for the mask itself, which the translator checks before the data registers.
+    for mask, data in ((0x7, 'v[4:6]'), (0x1, 'v4')):
+        store = patched(1, 0, mask)
+        decoded = D.decode_instruction(store, 0)[2]
+        assert decoded.startswith('image_store %s, ' % data) and 'dmask:%#x' % mask in decoded, decoded
+        message = refused(with_store(store), 'dmask %#x' % mask, 'writes all four channels')
+        print('refused %-20s %s' % ('dmask %#x:' % mask, message))
+    # The same partial mask with four data registers, through the handler: only the mask guard can refuse it.
+    try:
+        pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0x7', 'dim:SQ_RSRC_IMG_2D'])
+    except G.Unsupported as error:
+        assert 'dmask 0x7' in str(error) and 'writes all four channels' in str(error), error
+    else:
+        raise AssertionError('a partial dmask with four data registers was accepted')
+    print('refused dmask 0x7 with four data registers (v[4:7])')
+    # Four data registers are required for the full mask: three are refused for the data, not the mask.
+    try:
+        pipe.ps.op_image_store(['v[4:6]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D'])
+    except G.Unsupported as error:
+        assert 'four VGPRs expected' in str(error), error
+    else:
+        raise AssertionError('dmask 0xf with three data registers was accepted')
+    print('refused dmask 0xf with three data registers (v[4:6])')
     refused(with_store(bytes.fromhex('080f24f000040400')), 'image_store_mip')
     print('refused image_store_mip (not lowered)')
     try:
