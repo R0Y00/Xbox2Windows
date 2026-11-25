@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
+#include "xmem_page_batch.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/overlay_window.h"
@@ -58,6 +59,7 @@
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
+#include "xmem_section_lease.h"
 #include <d3d12sdklayers.h>
 #include <d3d12shader.h>
 #include <d3dcompiler.h>
@@ -125,6 +127,7 @@ struct IndirectGraphicsPipeline {
     DXGI_FORMAT cached_depth{};
     bool cached_depth_writes{};
     const std::vector<RootParameter>* guest_root_params{};
+    UINT cached_srv_root = UINT_MAX;
 };
 
 struct alignas(16) WrapperOwn {
@@ -863,13 +866,20 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
 ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
 // The wrappers and their desktop objects stay alive for the process (experiment scope).
 void retire_placement(Wrapper* w);
+void drop_mesh_lease_owner(Wrapper* w);
+void discard_mesh_lease_recording(ID3D12CommandList* list);
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
     if (!refs) {
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
-        if (self->own().kind == resource_kind && self->own().title_memory) retire_placement(self);
+        if (self->own().kind == resource_kind && self->own().title_memory) {
+            drop_mesh_lease_owner(self);
+            retire_placement(self);
+        }
+        if (self->own().kind == list_kind && self->own().real)
+            discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
     }
     return static_cast<ULONG>(refs);
 }
@@ -1494,6 +1504,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(previous);
         discard_address_uploads(previous);
+        discard_mesh_lease_recording(previous);
         if (draw_dump_frame()) draw_dumps().discard(previous);
         discard_red_producer(previous);
     }
@@ -1530,6 +1541,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(list);
         discard_address_uploads(list);
+        discard_mesh_lease_recording(list);
         if (draw_dump_frame()) draw_dumps().discard(list);
         discard_red_producer(list);
         static LONG failures;
@@ -2274,6 +2286,7 @@ D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
 }
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 
+#include "startup_stubs/mesh_xmem_handoff.inl"
 #include "startup_stubs/red_producer_diagnostic.inl"
 
 void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().discard(list); }
@@ -2553,6 +2566,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             if (!pass.root || pass.root != pso.guest_root_params || pass.root_heap_flags)
                 return refuse("cached mesh requires a recorded root without heap indexing", indirect_graphics_pipeline);
             for (std::size_t i = 0; i < pass.root->size(); ++i) {
+                if (i == pso.cached_srv_root) continue;
                 const auto mask = (1u << (*pass.root)[i].constants_count) - 1;
                 if ((pass.constant_words_bound[i] & mask) != mask)
                     return refuse("cached mesh root constants are incomplete", indirect_graphics_pipeline);
@@ -2651,9 +2665,17 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
-        if (pass.indirect_graphics.cached_mesh)
-            for (UINT i = 0; i < pass.root->size(); ++i)
+        if (pass.indirect_graphics.cached_mesh) {
+            const UINT srv = pass.indirect_graphics.cached_srv_root;
+            if (srv != UINT_MAX) {
+                if (const char* failure = bind_mesh_xmem_srv(self, srv, pass.root_address[srv]))
+                    return refuse(failure, indirect_graphics_pipeline);
+            }
+            for (UINT i = 0; i < pass.root->size(); ++i) {
+                if (i == srv) continue;
                 list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants[i], 0);
+            }
+        }
     }
     ID3D12Resource* counts = nullptr;
     if (count_buffer) {
@@ -2961,6 +2983,8 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     if (!list || !pass.root || pass.root_heap_flags || parameter >= pass.root->size() || parameter >= 32 ||
         (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
         return;
+    if (pass.indirect_graphics.cached_mesh && pass.indirect_graphics.cached_srv_root == parameter)
+        return; // The slot 61 draw binds the validated lease rather than an upload snapshot.
     if (const auto gpu = list_upload_gpu(self, address, 1)) {
         if (gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return;
         list->SetGraphicsRootShaderResourceView(parameter, gpu);
@@ -3164,22 +3188,41 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 submitted.push_back(w);
             }
         }
-        if (!ready.empty()) {
-            auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
-            const UINT ready_count = static_cast<UINT>(ready.size());
-            red_producers().execute(queue, ready, [&] {
+        auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
+        const auto submit = [&](const auto& native_lists, const auto& wrappers) {
+            const UINT ready_count = static_cast<UINT>(native_lists.size());
+            red_producers().execute(queue, native_lists, [&] {
                 if (draw_dump_frame()) {
-                    const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
+                    const HRESULT hr = draw_dumps().execute(queue, ready_count, native_lists.data());
                     if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
                 } else {
-                    queue->ExecuteCommandLists(ready_count, ready.data());
+                    queue->ExecuteCommandLists(ready_count, native_lists.data());
                 }
             });
-            retire_address_uploads(queue, ready);
-            retire_draw_sampler_heaps(queue, ready);
-            note_submits(queue, submitted);
-            for (Wrapper* w : submitted) commit_list_gpu_writes(w);
+            retire_address_uploads(queue, native_lists);
+            retire_draw_sampler_heaps(queue, native_lists);
+            note_submits(queue, wrappers);
+            for (Wrapper* w : wrappers) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
+        };
+        bool split = false;
+        if (mesh_xmem_handoff()) {
+            const std::lock_guard lock(mesh_xmem_mutex);
+            reap_mesh_xmem_flights();
+            split = std::any_of(ready.begin(), ready.end(), mesh_xmem_needs_submission);
+        }
+        if (split) {
+            // Submit each recording in guest order so a writer's publication
+            // belongs to its own completion point, even within a guest batch.
+            std::vector<ID3D12CommandList*> native_list(1);
+            std::vector<Wrapper*> wrapper(1);
+            for (std::size_t i = 0; i < ready.size(); ++i) {
+                native_list[0] = ready[i];
+                wrapper[0] = submitted[i];
+                execute_mesh_xmem_recording(queue, ready[i], [&] { submit(native_list, wrapper); });
+            }
+        } else if (!ready.empty()) {
+            submit(ready, submitted);
         }
         ReleaseSRWLockExclusive(&allocator_lock);
         ReleaseSRWLockExclusive(&draw_lock);
@@ -3224,6 +3267,26 @@ HRESULT __stdcall queue_timestamp_frequency(Wrapper* self, UINT64* frequency)
     if (first_calls(calls, 2))
         log("x2w-d3d12 CommandQueue::slot18(GetTimestampFrequency) -> 0x%08lx %llu", static_cast<unsigned long>(hr),
             frequency ? *frequency : 0ull);
+    return hr;
+}
+
+// The page grants, section offsets and destination views are owned by XMem.
+// Hold the installed provider for this batch; a queue can predate xmem.dll.
+HRESULT WINAPI queue_page_mappings(Wrapper*, UINT count, const X2WPageBatch* batches,
+                                   UINT64 pool, UINT pool_pages, UINT flags)
+{
+    HMODULE xmem = nullptr;
+    if (!GetModuleHandleExW(0, L"xmem.dll", &xmem)) return HRESULT_FROM_WIN32(GetLastError());
+    const auto map = reinterpret_cast<decltype(&X2WMapPageBatch)>(GetProcAddress(xmem, "X2WMapPageBatch"));
+    const HRESULT hr = map ? map(count, batches, pool, pool_pages, flags, nullptr)
+                           : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    FreeLibrary(xmem);
+    if (FAILED(hr)) {
+        static LONG failures;
+        if (first_calls(failures, 2))
+            log("x2w-d3d12 CommandQueue::slot31 count=%u poolPages=%u flags=0x%x -> 0x%08lx",
+                count, pool_pages, flags, static_cast<unsigned long>(hr));
+    }
     return hr;
 }
 
@@ -4487,6 +4550,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         // Render mode: the presented surface goes to the title's window through a swap chain.
         if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
             shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        InterlockedExchange(&last_frame_shown, shown_in_window ? 1 : 0);
         if (render_mode()) present_signature(self, surface, frame);
     }
     const ULONGLONG now = GetTickCount64();
@@ -4756,6 +4820,7 @@ void build_tables()
     fill_queue_dynamic(tables[queue_kind], std::make_index_sequence<64>{});
     tables[queue_kind][17] = reinterpret_cast<void*>(&queue_wait);
     tables[queue_kind][18] = reinterpret_cast<void*>(&queue_timestamp_frequency);
+    tables[queue_kind][31] = reinterpret_cast<void*>(&queue_page_mappings);
     tables[queue_kind][32] = reinterpret_cast<void*>(&queue_present);
 
     // Fence: GetCompletedValue, SetEventOnCompletion, Signal, GetCreationFlags.

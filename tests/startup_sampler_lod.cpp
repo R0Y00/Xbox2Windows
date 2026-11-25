@@ -1,6 +1,7 @@
 // Sampler word 1 LOD limits through the startup stand-in's production decoder (#2221).
 //
-// Two sampler heap entries differ only in word 1: entry 0 has MIN_LOD 2 and entry 1 has MAX_LOD 1. They
+// Two sampler heap entries differ only in word 1: entry 0 has MIN_LOD 2 (MAX_LOD 4095/256) and entry 1 has
+// MAX_LOD 1 (MIN_LOD 0). Both keep MinLOD <= MaxLOD, as D3D12_SAMPLER_DESC requires, and the test checks it. They
 // are snapshotted from title memory and decoded with dynamic_sampler() into the stand-in's sampler table
 // (create_sampler_snapshot_heap), behind the stand-in's translated root signature. A source-built pixel
 // shader reads an 8x8 R32_FLOAT texture whose four mips each hold one value, with SampleLevel at an
@@ -109,6 +110,7 @@ int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp)
     NullSamplerCounts counts;
     check(create_sampler_snapshot_heap(device, snapshot, [&](const SamplerWords& words, D3D12_SAMPLER_DESC& out) {
         out = dynamic_sampler(words);
+        if (out.MinLOD > out.MaxLOD) throw std::runtime_error("Fixture sampler has MinLOD above MaxLOD");
         std::printf("heap entry words %08x %08x: MinLOD=%g MaxLOD=%g", words[0], words[1], out.MinLOD, out.MaxLOD);
         if (drop_clamp) {
             out.MinLOD = 0.0f;

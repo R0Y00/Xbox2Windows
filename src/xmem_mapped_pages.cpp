@@ -5,6 +5,7 @@
 #include "era_physical.h"
 #include "xmem_slab_slots.h"
 #include "xmem_section_lease.h"
+#include "xmem_page_batch.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,8 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <set>
+#include <utility>
 
 namespace {
 struct Backing {
@@ -30,6 +33,11 @@ struct Backing {
 
 using Slot = std::pair<std::size_t, ULONG64>;
 struct SlotPin { unsigned references{}; bool retired{}; };
+struct SectionLease {
+    SIZE_T first_byte;
+    SIZE_T length;
+    std::vector<Slot> slots;
+};
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
 // views so its bytes survive unmapping. Its backing is released before reuse.
@@ -45,6 +53,7 @@ struct PhysicalMemory {
     SIZE_T last_cpu_bytes = 0;
     ULONG_PTR mirror_cpu = 0, mirror_gpu = 0;
     SIZE_T mirror_bytes = 0;
+    std::set<ULONG_PTR> explicit_mirror_pages;
     std::map<ULONG_PTR, SIZE_T> runs;  // OS views: base -> bytes
     // The slabs and their 64 KiB slots; released slots are reused lowest first, so that pages reused together
     // are adjacent slots again.
@@ -52,7 +61,7 @@ struct PhysicalMemory {
     // A grant may be freed after unmapping while a submitted GPU operation
     // still uses the section. Keep those slots out of the reusable pool.
     std::map<Slot, SlotPin> pins;
-    std::map<ULONG64, std::vector<Slot>> leases;
+    std::map<ULONG64, SectionLease> leases;
     ULONG64 next_lease = 1;
 
     ~PhysicalMemory()
@@ -66,6 +75,27 @@ struct PhysicalMemory {
 
 PhysicalMemory memory;
 constexpr SIZE_T page_bytes = era_physical::page_bytes;
+
+// Caller holds memory.mutex. A lease may only refer to committed pages whose
+// CPU and GPU views still name the same grant.
+bool mirrored_range(ULONG_PTR address, SIZE_T length)
+{
+    if (!length || !memory.mirror_gpu || address < memory.mirror_gpu || address > UINT64_MAX - length)
+        return false;
+    const auto offset = address - memory.mirror_gpu;
+    return offset < memory.mirror_bytes && length <= memory.mirror_bytes - offset;
+}
+
+const Backing* mirrored_backing(ULONG_PTR page)
+{
+    const auto mirror = memory.views.find(page);
+    const auto cpu = memory.views.find(memory.mirror_cpu + (page - memory.mirror_gpu));
+    if (mirror == memory.views.end() || (!memory.explicit_mirror_pages.count(page) &&
+        (cpu == memory.views.end() || cpu->second != mirror->second)))
+        return nullptr;
+    const auto backing = memory.backings.find(mirror->second);
+    return backing != memory.backings.end() && backing->second.committed ? &backing->second : nullptr;
+}
 
 // Caller holds memory.mutex.
 void unpin_slot(const Slot& slot)
@@ -194,8 +224,6 @@ bool commit_backing(Backing& backing)
 // The backing behind a mapped address (CPU view, or its GPU-view mirror), under memory.mutex.
 Backing* backing_at(ULONG_PTR address)
 {
-    if (memory.mirror_bytes && address - memory.mirror_gpu < memory.mirror_bytes)
-        address = address - memory.mirror_gpu + memory.mirror_cpu;  // the GPU view shows the same section
     const auto view = memory.views.find(address & ~(ULONG_PTR{page_bytes} - 1));
     if (view == memory.views.end()) return nullptr;
     const auto backing = memory.backings.find(view->second);
@@ -369,7 +397,8 @@ bool unmap_view(ULONG_PTR address)
                            MEM_PRESERVE_PLACEHOLDER) != FALSE;
 }
 
-void coalesce_unused(const std::map<ULONG_PTR, ULONG_PTR>& batch)
+template <class Pages>
+void coalesce_unused(const Pages& batch)
 {
     auto previous = memory.reservations.end();
     for (const auto& entry : batch) {
@@ -395,8 +424,9 @@ RemapWindow remap_window;
 
 void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
 {
+    std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges(broken.begin(), broken.end());
     AcquireSRWLockExclusive(&remap_window.lock);
-    remap_window.ranges.assign(broken.begin(), broken.end());
+    remap_window.ranges.swap(ranges);
     ++remap_window.generation;
     ReleaseSRWLockExclusive(&remap_window.lock);
 }
@@ -406,6 +436,8 @@ void end_break()
     ++remap_window.generation;
     ReleaseSRWLockExclusive(&remap_window.lock);
 }
+
+struct EndBreak { ~EndBreak() { end_break(); } };
 
 // Retries an access violation only when all of this holds: the address is inside a run that the
 // break in progress, or the last finished one, took apart; after that break has finished (the
@@ -631,15 +663,12 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
 template <typename AddressAt>
-BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
-               MapFailure* failure = nullptr) noexcept
+BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
+                      bool share_views, MapFailure* failure = nullptr) noexcept
 {
     if (!count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
     try {
-        const bool share_views = fault_retry.ready();
-        const MappingThread marker;
-        const std::lock_guard guard(memory.mutex);
         std::map<ULONG_PTR, ULONG_PTR> batch;
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto address = address_at(i);
@@ -708,9 +737,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
             }
             TestFault test;
             begin_break(broken);
-            struct EndBreak {
-                ~EndBreak() { end_break(); }
-            } const end;
+            const EndBreak end;
             DWORD error = ERROR_SUCCESS;
             std::vector<std::pair<ULONG_PTR, SIZE_T>> unmapped;
             for (const auto& [base, size] : broken) {
@@ -748,6 +775,16 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
         return physical_result(era_physical::Status::exhausted);
     }
     return physical_result(era_physical::Status::ok);
+}
+
+template <typename AddressAt>
+BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
+               MapFailure* failure = nullptr) noexcept
+{
+    const bool share_views = fault_retry.ready();
+    const MappingThread marker;
+    const std::lock_guard guard(memory.mutex);
+    return map_pages_locked(count, tokens, address_at, share_views, failure);
 }
 }
 
@@ -866,36 +903,36 @@ void log_failed_ranges(const char* what, const char* operation, const std::vecto
 
 // Applies (address, page) pairs; page 0 unmaps. An address that already shows the requested page is
 // left alone; one that shows another page is unmapped first.
-BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages, const char* what)
+BOOL local_apply_locked(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages,
+                        const char* what, bool share_views)
 {
     std::map<ULONG_PTR, ULONG_PTR> want;
     for (ULONG_PTR i = 0; i < count; ++i) want[addresses[i]] = pages[i];
     std::vector<ULONG_PTR> unmap, map_at, map_page;
-    {
-        const std::lock_guard guard(memory.mutex);
-        for (const auto& [address, page] : want) {
-            const auto live = memory.views.find(address);
-            if (!page) {
-                if (live != memory.views.end()) unmap.push_back(address);
-                continue;
-            }
-            if (live != memory.views.end()) {
-                if (live->second == page) continue;
-                unmap.push_back(address);
-            }
-            map_at.push_back(address);
-            map_page.push_back(page);
+    for (const auto& [address, page] : want) {
+        const auto live = memory.views.find(address);
+        if (!page) {
+            if (live != memory.views.end()) unmap.push_back(address);
+            continue;
         }
+        if (live != memory.views.end()) {
+            if (live->second == page) continue;
+            unmap.push_back(address);
+        }
+        map_at.push_back(address);
+        map_page.push_back(page);
     }
     BOOL ok = TRUE;
     DWORD error = 0;
     MapFailure failure;
-    if (!unmap.empty() && !map_pages(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; }, &failure)) {
+    if (!unmap.empty() && !map_pages_locked(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; },
+                                            share_views, &failure)) {
         ok = FALSE;
         error = GetLastError();
     }
     if (ok && !map_at.empty() &&
-        !map_pages(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; }, &failure)) {
+        !map_pages_locked(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; },
+                          share_views, &failure)) {
         ok = FALSE;
         error = GetLastError();
     }
@@ -915,22 +952,31 @@ BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* p
 }
 
 // Applies the same (address, page) pairs again at the GPU view for those addresses in the CPU view.
-void local_mirror(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages)
+void local_mirror_locked(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages,
+                         bool share_views)
 {
-    ULONG_PTR cpu, gpu;
-    SIZE_T bytes;
-    {
-        const std::lock_guard guard(memory.mutex);
-        cpu = memory.mirror_cpu, gpu = memory.mirror_gpu, bytes = memory.mirror_bytes;
-    }
+    const auto cpu = memory.mirror_cpu, gpu = memory.mirror_gpu;
+    const auto bytes = memory.mirror_bytes;
     if (!cpu) return;
     std::vector<ULONG_PTR> at, page;
     for (ULONG_PTR i = 0; i < count; ++i)
         if (addresses[i] >= cpu && addresses[i] - cpu < bytes) {
-            at.push_back(addresses[i] - cpu + gpu);
+            const auto address = addresses[i] - cpu + gpu;
+            if (memory.explicit_mirror_pages.count(address)) continue;
+            at.push_back(address);
             page.push_back(pages[i]);
         }
-    if (!at.empty()) local_apply(at.size(), at.data(), page.data(), "GPU view mirror");
+    if (!at.empty()) local_apply_locked(at.size(), at.data(), page.data(), "GPU view mirror", share_views);
+}
+
+BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages, const char* what)
+{
+    const bool share_views = fault_retry.ready();
+    const MappingThread marker;
+    const std::lock_guard guard(memory.mutex);
+    if (!local_apply_locked(count, addresses, pages, what, share_views)) return FALSE;
+    local_mirror_locked(count, addresses, pages, share_views);
+    return TRUE;
 }
 
 bool to_pages(ULONG_PTR count, const ULONG_PTR* tokens, std::vector<ULONG_PTR>& pages)
@@ -1011,6 +1057,310 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
 }
 }  // namespace
 
+namespace {
+struct AliasRange {
+    ULONG_PTR address;
+    X2WPageRange source;
+};
+
+// Keep the guarded reads outside the transaction and out of C++ functions that need unwinding.
+template <typename T>
+bool read_alias_record(const T* array, UINT index, T& record)
+{
+    __try {
+        record = array[index];
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+struct AliasEdit {
+    ULONG_PTR old;
+    ULONG_PTR desired;
+    ULONG_PTR actual;
+};
+
+using AliasPlan = std::map<ULONG_PTR, AliasEdit>;
+using ViewRuns = std::map<ULONG_PTR, SIZE_T>;
+
+bool alias_placeholders(ULONG_PTR address, SIZE_T bytes)
+{
+    // The region query exposes the placeholder reservation flag in Flags even though the
+    // SDK does not name that bit. VirtualQuery alone cannot distinguish a reserved private
+    // allocation from a placeholder. PRESERVE_PLACEHOLDER can silently release that allocation.
+    constexpr ULONG placeholder_reservation = 0x100;
+    const auto end = address + bytes;
+    while (address < end) {
+        WIN32_MEMORY_REGION_INFORMATION info{};
+        if (!QueryVirtualMemoryInformation(GetCurrentProcess(), reinterpret_cast<void*>(address),
+                                           MemoryRegionInfo, &info, sizeof(info), nullptr) ||
+            !(info.Flags & placeholder_reservation))
+            return false;
+        const auto base = reinterpret_cast<ULONG_PTR>(info.AllocationBase);
+        if (address - base >= info.RegionSize) return false;
+        address += info.RegionSize - (address - base);
+    }
+    return true;
+}
+
+// Both maps have the same node type. The node for each possible run base was reserved before
+// unmapping anything, so recording a successful OS call cannot fail for lack of C++ heap memory.
+bool install_alias_view(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
+                        ViewRuns& nodes, X2WPageBatchStats& stats)
+{
+    auto* target = reinterpret_cast<void*>(address);
+    auto map = [&] {
+        return MapViewOfFile3(backing.section, GetCurrentProcess(), target, backing.offset, bytes,
+                              MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
+    };
+    if (!map()) {
+        const DWORD original_error = GetLastError();
+        const auto reservation = owned_reservation(address);
+        if (reservation == memory.reservations.end() ||
+            bytes > reservation->second - (address - reservation->first) || !alias_placeholders(address, bytes)) {
+            SetLastError(original_error);
+            return false;
+        }
+        // A subrange of one placeholder must be split. Several exact placeholders left by old
+        // views may be coalesced instead. Both operations stay within the recorded reservation.
+        if (!VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+            (bytes == page_bytes || !VirtualFree(target, bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))) {
+            SetLastError(original_error);
+            return false;
+        }
+        if (!map()) return false;
+    }
+    auto node = nodes.extract(address);
+    node.mapped() = bytes;
+    memory.runs.insert(std::move(node));
+    ++stats.mapCalls;
+    return true;
+}
+
+DWORD install_alias_plan(AliasPlan& plan, ViewRuns& nodes, bool share_views, bool restoring,
+                         std::vector<ULONG_PTR>& made, X2WPageBatchStats& stats)
+{
+    DWORD error = ERROR_SUCCESS;
+    auto token = [&](const AliasEdit& edit) { return restoring ? edit.old : edit.desired; };
+    auto it = plan.begin();
+    while (it != plan.end()) {
+        if (it->second.actual || !token(it->second)) {
+            ++it;
+            continue;
+        }
+        const auto address = it->first;
+        const auto& head = memory.backings.at(token(it->second));
+        auto end = std::next(it);
+        SIZE_T bytes = page_bytes;
+        for (; share_views && end != plan.end(); ++end, bytes += page_bytes) {
+            if (end->first != address + bytes || end->second.actual || !token(end->second)) break;
+            const auto& next = memory.backings.at(token(end->second));
+            if (next.section != head.section || next.offset != head.offset + bytes) break;
+        }
+        if (install_alias_view(address, head, bytes, nodes, stats)) {
+            made.push_back(address);
+            for (auto page = it; page != end; ++page)
+                page->second.actual = token(page->second);
+        } else if (bytes == page_bytes) {
+            error = GetLastError();
+            if (!restoring) break;
+        } else {
+            // A grouped view may cross placeholder boundaries. Retry each page once.
+            for (auto page = it; page != end; ++page) {
+                if (install_alias_view(page->first, memory.backings.at(token(page->second)),
+                                       page_bytes, nodes, stats)) {
+                    made.push_back(page->first);
+                    page->second.actual = token(page->second);
+                } else {
+                    error = GetLastError();
+                    if (!restoring) return error;
+                }
+            }
+        }
+        it = end;
+    }
+    return error;
+}
+
+HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& stats)
+{
+    ViewRuns broken;
+    for (const auto& [address, edit] : plan) {
+        if (!edit.old) continue;
+        const auto run = memory.runs.upper_bound(address);
+        if (run == memory.runs.begin() || address - std::prev(run)->first >= std::prev(run)->second)
+            return E_UNEXPECTED;
+        broken.insert(*std::prev(run));
+    }
+    for (const auto& [base, size] : broken) {
+        // Surviving neighbours of a shared view are part of the transaction as well.
+        for (auto view = memory.views.lower_bound(base);
+             view != memory.views.end() && view->first - base < size; ++view) {
+            const auto page = view->second;
+            plan.try_emplace(view->first, AliasEdit{page, page, page});
+        }
+    }
+
+    ViewRuns run_nodes;
+    std::map<ULONG_PTR, ULONG_PTR> view_nodes;
+    std::vector<ULONG_PTR> made;
+    made.reserve(plan.size());
+    for (const auto& [address, edit] : plan) {
+        run_nodes.emplace(address, page_bytes);
+        view_nodes.emplace(address, 0);
+    }
+    auto clear_run = [&](ULONG_PTR address, SIZE_T size) {
+        ++stats.unmapCalls;
+        for (auto it = plan.lower_bound(address); it != plan.end() && it->first - address < size; ++it)
+            it->second.actual = 0;
+    };
+
+    begin_break(broken);
+    const EndBreak end;
+    DWORD error = ERROR_SUCCESS;
+    for (const auto& [base, size] : broken) {
+        if (!unmap_view(base)) {
+            error = GetLastError();
+            break;
+        }
+        memory.runs.erase(base);
+        clear_run(base, size);
+    }
+    if (!error)
+        error = install_alias_plan(plan, run_nodes, share_views, false, made, stats);
+    bool restore_failed = false;
+    if (error) {
+        for (const auto address : made) {
+            if (!unmap_view(address)) {
+                restore_failed = true;
+                continue;
+            }
+            auto run = memory.runs.extract(address);
+            clear_run(address, run.mapped());
+            run_nodes.insert(std::move(run));
+        }
+        made.clear();
+        if (install_alias_plan(plan, run_nodes, share_views, true, made, stats))
+            restore_failed = true;
+    }
+    // Publish the OS state, including any views left over if Windows refused rollback.
+    for (const auto& [address, edit] : plan) {
+        if (edit.old == edit.actual) continue;
+        forget_page(address);
+        if (edit.actual) {
+            ++memory.backings.at(edit.actual).views;
+            auto node = view_nodes.extract(address);
+            node.mapped() = edit.actual;
+            memory.views.insert(std::move(node));
+        }
+    }
+    if (restore_failed) {
+        x2w_local::logf("x2w-xmem page batch rollback incomplete (original error %lu)", error);
+        return E_UNEXPECTED;
+    }
+    if (!error) coalesce_unused(plan);
+    return error ? HRESULT_FROM_WIN32(error) : S_OK;
+}
+}  // namespace
+
+extern "C" HRESULT WINAPI X2WMapPageBatch(UINT count, const X2WPageBatch* batches, UINT64 pool,
+                                           UINT poolPages, UINT flags, X2WPageBatchStats* stats)
+{
+    // Buffers are valid for this call. The descriptor arrays may be supplied by the caller's
+    // address space, so take a bounded snapshot before taking the memory lock.
+    if (stats) *stats = {};
+    constexpr UINT limit = static_cast<UINT>(era_physical::capacity_pages);
+    if (flags || count > limit || (count && !batches) ||
+        (poolPages && !pool) || pool % page_bytes || pool > UINT64_MAX - UINT64{poolPages} * page_bytes)
+        return E_INVALIDARG;
+    if (!count) return S_OK;
+    try {
+        std::vector<AliasRange> ranges;
+        UINT total = 0;
+        bool ordered_disjoint = true;
+        UINT64 previous_end = 0;
+        for (UINT i = 0; i < count; ++i) {
+            X2WPageBatch batch{};
+            if (!read_alias_record(batches, i, batch)) return E_POINTER;
+            if (!batch.destination || batch.destination % page_bytes || !batch.ranges ||
+                !batch.count || batch.count > limit - total)
+                return E_INVALIDARG;
+            auto address = batch.destination;
+            for (UINT j = 0; j < batch.count; ++j) {
+                X2WPageRange range{};
+                if (!read_alias_record(batch.ranges, j, range)) return E_POINTER;
+                const auto bytes = UINT64{range.count} * page_bytes;
+                if (!range.count || range.count > limit - total || address > UINT64_MAX - bytes ||
+                    range.kind > 3 || (range.kind <= 1 && range.start >= poolPages) ||
+                    (range.kind == 0 && range.count > poolPages - range.start))
+                    return E_INVALIDARG;
+                ordered_disjoint &= address >= previous_end;
+                ranges.push_back({address, range});
+                total += range.count;
+                address += bytes;
+                previous_end = address;
+            }
+        }
+
+        const bool share_views = fault_retry.ready();
+        const MappingThread marker;
+        const std::lock_guard guard(memory.mutex);
+        constexpr ULONG_PTR keep = UINT64_MAX;
+        AliasPlan plan;
+        std::set<ULONG_PTR> explicit_pages;
+        X2WPageBatchStats result{};
+        const auto add_edit = [&](ULONG_PTR address, ULONG_PTR desired) {
+            if (desired == keep) {
+                ++result.pagesSkipped;
+                return;
+            }
+            const auto live = memory.views.find(address);
+            const auto old = live != memory.views.end() ? live->second : 0;
+            if (memory.mirror_bytes && address - memory.mirror_gpu < memory.mirror_bytes &&
+                !memory.explicit_mirror_pages.count(address))
+                explicit_pages.insert(address);
+            if (old == desired) {
+                ++result.pagesSkipped;
+            } else {
+                plan.emplace(address, AliasEdit{old, desired, old});
+                ++result.pagesChanged;
+            }
+        };
+        std::map<ULONG_PTR, ULONG_PTR> requested;
+        for (const auto& [base, range] : ranges) {
+            for (UINT i = 0; i < range.count; ++i) {
+                const auto address = base + SIZE_T{i} * page_bytes;
+                if (owned_reservation(address) == memory.reservations.end()) return E_INVALIDARG;
+                ULONG_PTR desired = range.kind == 3 ? keep : 0;
+                if (range.kind <= 1) {
+                    const auto source = pool + SIZE_T{range.start + (range.kind == 0 ? i : 0)} * page_bytes;
+                    const auto view = memory.views.find(source);
+                    if (view == memory.views.end()) return E_INVALIDARG;
+                    desired = view->second;
+                }
+                // Ordered, disjoint ranges need no per-page nodes for already satisfied edits.
+                if (ordered_disjoint)
+                    add_edit(address, desired);
+                else if (desired == keep)
+                    requested.try_emplace(address, keep);
+                else
+                    requested.insert_or_assign(address, desired);
+            }
+        }
+        for (const auto& [address, desired] : requested) add_edit(address, desired);
+        const HRESULT hr = plan.empty() ? S_OK : remap_alias_pages(plan, share_views, result);
+        if (SUCCEEDED(hr)) {
+            memory.explicit_mirror_pages.merge(explicit_pages);
+            if (stats) *stats = result;
+        }
+        return hr;
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    }
+}
+
 // The view is a dense range of committed slots in one section. A caller can
 // map it as a separate view at section_offset and open that address as a heap.
 extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, SIZE_T length,
@@ -1020,11 +1370,9 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
     *out = {};
     if (version != x2w_xmem_section_lease_version) return FALSE;
     constexpr SIZE_T max_pages = 64;
-    if (!length || length > max_pages * page_bytes || address > UINT64_MAX - length) return FALSE;
+    if (length > max_pages * page_bytes) return FALSE;
     const std::lock_guard guard(memory.mutex);
-    if (!memory.mirror_gpu || address < memory.mirror_gpu || !memory.next_lease) return FALSE;
-    const auto offset = address - memory.mirror_gpu;
-    if (offset >= memory.mirror_bytes || length > memory.mirror_bytes - offset) return FALSE;
+    if (!memory.next_lease || !mirrored_range(address, length)) return FALSE;
     const auto first = address & ~(page_bytes - 1);
     const auto first_byte = address - first;
     const auto count = (first_byte + length + page_bytes - 1) / page_bytes;
@@ -1036,19 +1384,14 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
         selected.reserve(count);
         for (SIZE_T i = 0; i < count; ++i) {
             const auto page = first + i * page_bytes;
-            const auto mirror = memory.views.find(page);
-            const auto cpu = memory.views.find(memory.mirror_cpu + (page - memory.mirror_gpu));
-            if (mirror == memory.views.end() || cpu == memory.views.end() || cpu->second != mirror->second)
-                return FALSE;
-            const auto backing = memory.backings.find(mirror->second);
-            if (backing == memory.backings.end() || !backing->second.committed) return FALSE;
-            const auto& slot = backing->second;
+            const auto* slot = mirrored_backing(page);
+            if (!slot) return FALSE;
             if (selected.empty())
-                section = slot.section;
-            else if (slot.section != section || slot.slab != selected.front().first ||
-                     slot.offset != selected.front().second + i * page_bytes)
+                section = slot->section;
+            else if (slot->section != section || slot->slab != selected.front().first ||
+                     slot->offset != selected.front().second + i * page_bytes)
                 return FALSE;
-            selected.emplace_back(slot.slab, slot.offset);
+            selected.emplace_back(slot->slab, slot->offset);
         }
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE,
                              DUPLICATE_SAME_ACCESS))
@@ -1058,7 +1401,7 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
             ++pinned;
         }
         const auto lease = memory.next_lease;
-        memory.leases.emplace(lease, selected);
+        memory.leases.emplace(lease, SectionLease{first_byte, length, selected});
         ++memory.next_lease;
         *out = {duplicate, lease, selected.front().second, count * page_bytes, first_byte};
         return TRUE;
@@ -1069,13 +1412,34 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
     }
 }
 
+extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_T byte_offset,
+                                              ULONG_PTR address, SIZE_T length)
+{
+    if (version != x2w_xmem_section_lease_version || byte_offset % page_bytes != address % page_bytes)
+        return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    const auto found = memory.leases.find(lease);
+    if (found == memory.leases.end() || !mirrored_range(address, length)) return FALSE;
+    const auto& pin = found->second;
+    if (byte_offset < pin.first_byte || byte_offset - pin.first_byte >= pin.length ||
+        length > pin.length - (byte_offset - pin.first_byte)) return FALSE;
+    const SIZE_T first_slot = byte_offset / page_bytes;
+    const SIZE_T last_slot = (byte_offset + length - 1) / page_bytes;
+    const auto first_page = address & ~(page_bytes - 1);
+    for (SIZE_T slot = first_slot; slot <= last_slot; ++slot) {
+        const auto* backing = mirrored_backing(first_page + (slot - first_slot) * page_bytes);
+        if (!backing || pin.slots[slot] != Slot{backing->slab, backing->offset}) return FALSE;
+    }
+    return TRUE;
+}
+
 extern "C" BOOL WINAPI x2w_xmem_release_section(UINT version, ULONG64 lease)
 {
     if (version != x2w_xmem_section_lease_version) return FALSE;
     const std::lock_guard guard(memory.mutex);
     const auto found = memory.leases.find(lease);
     if (found == memory.leases.end()) return FALSE;
-    for (const auto& slot : found->second) unpin_slot(slot);
+    for (const auto& slot : found->second.slots) unpin_slot(slot);
     memory.leases.erase(found);
     return TRUE;
 }
@@ -1299,7 +1663,6 @@ extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const 
         }
         if (!count) return base;
         if (!local_apply(count, addresses.data(), pages.data(), "XMemMapPhysicalPages")) return nullptr;
-        local_mirror(count, addresses.data(), pages.data());
         return base;
     }
     return map_pages(count, tokens, [=](ULONG_PTR i) { return address + i * page_bytes; }) ? base : nullptr;
@@ -1314,7 +1677,6 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
         if (!to_pages(count, tokens, pages)) return physical_result(era_physical::Status::invalid);
         if (!local_apply(count, reinterpret_cast<const ULONG_PTR*>(addresses), pages.data(), "XMemMapPhysicalPagesScatter"))
             return FALSE;
-        local_mirror(count, reinterpret_cast<const ULONG_PTR*>(addresses), pages.data());
         return TRUE;
     }
     return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); });
@@ -1473,6 +1835,7 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
             memory.mirror_cpu = memory.last_cpu_base;
             memory.mirror_gpu = base;
             memory.mirror_bytes = bytes;
+            memory.explicit_mirror_pages.clear();
             x2w_local::logf("x2w-xmem GPU view %p (+0x%llx) mirrors CPU view %p, 0x%llx bytes", reservation,
                             static_cast<unsigned long long>(base - memory.last_cpu_base), reinterpret_cast<void*>(memory.last_cpu_base),
                             static_cast<unsigned long long>(bytes));

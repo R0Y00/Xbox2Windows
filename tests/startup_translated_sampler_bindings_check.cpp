@@ -207,10 +207,13 @@ int main(int argc, char** argv)
     decoded("ignored bits", {word0(2, 1, 3, 0) | 0xfffff000u, ~0u, 1u << 22 | 3u << 24 | 0xf0000000u | 0xfffffu, ~0u},
             clamp, mirror, mirror_once, min_linear, 1, 7, 15.99609375f, 15.99609375f);
     // Word 1: MIN_LOD bits 11:0 and MAX_LOD bits 23:12, unsigned 4.8 fixed point. Each field is read on its
-    // own: a whole level, a fraction, the smallest step, the largest value, and MIN_LOD above MAX_LOD.
+    // own: a whole level, a fraction, the smallest step and the largest value.
     decoded("min lod 2", {0, 0x200u | 0xfffu << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 2.0f, 15.99609375f);
     decoded("max lod 1", {0, 0x100u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.0f, 1.0f);
-    decoded("lod fractions", {0, 0x1c0u | 0x140u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.75f, 1.25f);
+    decoded("lod fractions", {0, 0x140u | 0x1c0u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.25f, 1.75f);
+    // MIN_LOD above MAX_LOD is passed through unchanged: D3D12 documents MaxLOD >= MinLOD, and no source here
+    // says what the console sampler does with that pair, so the decoder does not pick one. Device-free only.
+    decoded("min lod above max lod", {0, 0x1c0u | 0x140u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 1.75f, 1.25f);
     decoded("lod smallest steps", {0, 0x001u | 0x001u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0, 0.00390625f,
             0.00390625f);
     decoded("lod with perf bits", {0, 0xff000000u | 0x080u | 0x300u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0,
