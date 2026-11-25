@@ -41,6 +41,14 @@ def read_qword(read, address):
     return int.from_bytes(data, "little") if len(data) == 8 else None
 
 
+def read_stack(read, rsp, words):
+    """Return `words` qwords read from `rsp`, zero-padded. The full read fails when it crosses past
+    the stack's last committed page; then read only to the end of RSP's page, which is committed."""
+    size = 8 * words
+    data = read(rsp, size) or read(rsp, min(size, 0x1000 - (rsp & 0xfff))) or b""
+    return data.ljust(size, b"\0")
+
+
 def final_path(handle):
     buf = ctypes.create_unicode_buffer(1024)
     n = k32.GetFinalPathNameByHandleW(wt.HANDLE(handle), buf, 1024, 0)
@@ -380,7 +388,7 @@ def main():
                     requested = "unreadable" if base is None else hex(base)
                     stack_args = struct.unpack("<2Q", (read(rsp + 0x28, 16) or b"").ljust(16, b"\0"))
                     kind, protect = (regs["R9"], stack_args[0]) if extended else stack_args
-                    words = struct.unpack_from("<200Q", (read(rsp, 8 * 200) or b"").ljust(8 * 200, b"\0"))
+                    words = struct.unpack_from("<200Q", read_stack(read, rsp, 200))
                     chain = [where(w) for w in words if any(b <= w < b + 0x10000000 for b in modules)]
                     chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                     file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={requested} size={size:#x} "

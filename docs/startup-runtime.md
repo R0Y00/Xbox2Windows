@@ -579,6 +579,94 @@ print the same results and write the same failures as one, an unexpected transla
 `startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
 with a child process.
 
+### Compute pipeline requests
+
+Device slot 67 creates a pipeline from a console compute program. The stand-in reads 12 64-bit words of the
+description:
+
+| Words | Content |
+|---|---|
+| 0 | root signature |
+| 1-2, 3-4 | two state blocks and their sizes (a size of 0 means the block is absent) |
+| 5-6 | program code and its size |
+| 7-8 | a second blob and its size |
+| 9, 10 | pointers whose targets are not decoded |
+| 11 | a value |
+
+It interprets none of these parts and still creates a placeholder. With `X2W_D3D12_RENDER=1` and
+`X2W_SHADER_CACHE` set, it writes a request to the cache directory the graphics requests use:
+
+| File | Content |
+|---|---|
+| `req_<key>.desc` | the 12 words with the pointer words 0, 1, 3, 5, 7, 9 and 10 always set to zero, so no process address reaches a file or the key |
+| `req_<key>.sa`, `req_<key>.sb` | state blocks A and B (at most 4 KiB each; empty when the size is 0) |
+| `req_<key>.data` | the words 7-8 blob (at most 1 MiB; required) |
+| `req_<key>.root` | the serialized root signature |
+| `req_<key>.c67` | the program code (at most 1 MiB); written last, as the ready marker |
+
+The `.c67` extension keeps these requests apart from draft #1954, which uses `req_<key>.cs` for desktop DXIL
+containers created at device slot 62.
+
+**Reading the parts.** Each part is checked and then copied once, with a fault-safe copy, before anything is
+hashed, scanned or written, so a later write by the title cannot leave a file that does not match its key.
+If any declared part cannot be taken, no file is written and the creation counts as failed. The logged reason
+names the part and the cause:
+- a code or data size of 0 (a program without the words 7-8 blob is refused);
+- a size over its limit;
+- a part that is not readable to its declared end;
+- a description that is not readable;
+- a root signature without a recorded blob.
+
+A cache directory that is set but does not exist makes every creation fail. Publishing is off only when
+render mode is off or `X2W_SHADER_CACHE` is unset; such creations are counted nowhere.
+
+**Key.** The key hashes the revision string followed by `cs`, then each part preceded by its length as a
+little-endian u64. The order is: code, words 7-8 blob, root, `.desc`, `.sa`, `.sb` (`compute_key` in
+`gfx2hlsl.py`), so moving bytes from one part to the next changes the key. A compute key and a graphics key
+can still coincide only through a 64-bit hash collision, or through a graphics program crafted to start with
+the compute framing.
+
+What words 9 and 10 point to is not part of the request, so two descriptions that differ only there share a
+key. If those targets are decoded and added later, every key changes and each request is published once more.
+
+**Pointers inside blobs.** An aligned qword in `.data`, `.sa` or `.sb` that names committed memory of the
+process (one `VirtualQuery` per candidate, so no fault is taken) would make its key run-dependent. These
+qwords are counted and published, not refused, because hash-like values can name memory by chance. The code
+is not scanned.
+
+**Dedupe.** Each key is written once per cache and never rewritten. Parts left by an interrupted write, which
+has no `.c67` yet, are kept, and the next creation completes the request. A key already seen in the process
+costs no file access, and the writes take their own lock, not the draw lock.
+
+**Log and totals.** Each creation logs `x2w-draw compute request <key> published`, `already present` or
+`not written`, with the reason when refused, up to 12 lines per run. The render totals line ends with
+`compute requests published <n> (already present <n>, failed <n>, pointer-like blob qwords <n>)`.
+
+**Offline.** `gfx2hlsl.py --pending` and `--watch` take `.c67` as a ready marker. With no compute stage yet,
+they record `compute stage not supported` in `<key>.fail`. The request stays in the cache, and a later
+`--pending` retries it. `--refusals` reports compute requests in a separate section, so its graphics counts
+do not change, and `triage_run.py` puts their `.fail` reasons in a `compute:` class.
+
+**Local observation** (a local build of this change ported to an older base; one title, local files only, not
+in the repository):
+- One run published 2,689 requests with 0 failed. It wrote 2,689 files of each of the six kinds, 120.3 MB in
+  all (98.8 MB of it `.c67`), and counted 729 pointer-like blob qwords.
+- A second run with the same cache published 0 (2,689 already present, 0 failed), wrote no files and changed
+  no modification time.
+- An earlier build with the same layout found that in every request the code length equals word 6 and the
+  blob length equals word 8, and that state block A is 28 bytes and state block B 20 bytes.
+- In the first 40 descriptions, words 9 and 10 point at a readable block of at least 4 KiB.
+
+**Checks.** Run `ctest --preset dev --no-tests=error -R "^startup_compute_request_(warp|disabled_control)$" -V`
+after building `startup_stream_consumer`. On WARP:
+- The same synthetic description is created twice in each of two processes, with words 9 and 10 pointing
+  into the consumer and a 20-byte state block B, and the files are written once.
+- Each refusal writes no file. These include reads next to a `PAGE_NOACCESS` page and sizes 1 byte over each
+  limit, while code, data and both state blocks at exactly their limits are published.
+- A valid, refused, valid sequence publishes the two valid keys.
+- A request whose first four parts already exist is completed without rewriting them.
+- The control runs without render mode and must print `FAIL: no compute request`.
+
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
 did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
@@ -872,7 +960,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |

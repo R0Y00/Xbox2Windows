@@ -1063,9 +1063,10 @@ target_link_libraries(startup_indirect_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_dispatch_${backend} COMMAND startup_indirect_dispatch ${backend})
     add_test(NAME startup_indirect_root_constants_${backend} COMMAND startup_indirect_dispatch ${backend} constants)
-    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_indirect_count_${backend} COMMAND startup_indirect_dispatch ${backend} count)
+    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} startup_indirect_count_${backend} PROPERTIES TIMEOUT 30)
 endforeach()
-set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware startup_indirect_count_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
 # Occlusion queries recorded through command-list slots 28 to 30 reach the readback buffer (#870).
 add_executable(startup_list_queries tests/startup_list_queries.cpp tests/desktop_gpu.cpp)
@@ -1568,6 +1569,13 @@ target_compile_features(startup_export_write_mask_check PRIVATE cxx_std_17)
 add_test(NAME startup_export_write_mask COMMAND startup_export_write_mask_check)
 add_test(NAME startup_export_write_mask_shared_blend_control COMMAND startup_export_write_mask_check --mutate shared-blend)
 set_tests_properties(startup_export_write_mask_shared_blend_control PROPERTIES WILL_FAIL TRUE)
+# Bound SRV format classification and 'd16srv' manifest parsing for D16 image_load (#2023).
+add_executable(startup_d16_image_format_check tests/startup_d16_image_format_check.cpp)
+target_include_directories(startup_d16_image_format_check PRIVATE src)
+target_compile_features(startup_d16_image_format_check PRIVATE cxx_std_17)
+add_test(NAME startup_d16_image_format COMMAND startup_d16_image_format_check)
+add_test(NAME startup_d16_image_format_accept_uint_control COMMAND startup_d16_image_format_check --mutate accept-uint)
+set_tests_properties(startup_d16_image_format_accept_uint_control PROPERTIES WILL_FAIL TRUE)
 # Composite provenance (#1628): one VS and two pixel shaders from one HLSL file.
 set(startup_composite_provenance_headers "")
 foreach(stage IN ITEMS "vs_6_0;vs_main;vs" "ps_6_0;ps_fill;fill" "ps_6_0;ps_composite;composite")
@@ -2593,6 +2601,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_sample_a16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl level-zero D16 image_load narrowing and pairwise packing (#2023).
+    add_test(NAME startup_image_load_d16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_load_d16_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_image_load_d16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_load_d16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_image_load_d16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl flat parameters keep the exported words (#1259): translation controls, then a desktop
     # draw of the translated pair with FXC 5_1 (the --pending path) and DXC 6_0.
     add_test(NAME startup_flat_param_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -2731,6 +2748,13 @@ if(EXISTS "${INTAKE_PYTHON}")
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
+    # Device slot 67 compute pipelines publish req_<key>.{desc,sa,sb,data,root,c67}; the control (render mode off) must fail.
+    add_test(NAME startup_compute_request_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>")
+    add_test(NAME startup_compute_request_disabled_control COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>" disabled)
+    set_tests_properties(startup_compute_request_warp startup_compute_request_disabled_control PROPERTIES TIMEOUT 60)
+    set_tests_properties(startup_compute_request_disabled_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: no compute request")
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
@@ -2823,6 +2847,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_buffer_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_d16_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_d16_srv_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_d16_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_frame_copy_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
@@ -2865,6 +2893,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: read-only census of every refusal site (--refusals).
     add_test(NAME startup_gfx2hlsl_refusals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_refusals_check.py")
+    # Device slot 67 compute requests offline: key vector, --pending and --refusals (pure Python).
+    add_test(NAME startup_compute_request_offline COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_offline_check.py")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
