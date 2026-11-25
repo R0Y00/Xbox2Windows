@@ -105,6 +105,8 @@ The full Linux CI list is in the `Run Python checks` step of the `python-linux`
 job in the [CI workflow](.github/workflows/windows.yml). To run it locally,
 copy the step's `tools/run_checks_parallel.py` command with all its arguments
 and replace the leading `python` with `./out/pe-env/bin/python`.
+See the [Linux quick start](docs/non-windows-hosts.md#quick-start-on-linux)
+for how skips affect the runner's exit status.
 
 ```bash
 python3 -m venv out/pe-env
