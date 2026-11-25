@@ -8,8 +8,13 @@
 // - VirtualFree: this program releases a lazy startup block through its own VirtualFree import, reserves the
 //   same addresses again, and touches them. The touch must fault: a block still on the lazy list would be
 //   committed by the fault handler as if it were the old block.
+// - A refused release: MEM_RELEASE with a nonzero size fails, so the block stays reserved and must stay lazy. A
+//   write to an untouched page after it must still be committed by the fault handler; then the block is released.
 //
-// Usage: xmem_lazy_imports_check <path to xmem.dll>
+// With `handler-failure` (the test-controls build, X2W_XMEM_TEST_LAZY_HANDLER_FAILURE=1): the fault handler is
+// refused, so the switches must act as off. A mapped page and a startup block are committed up front.
+//
+// Usage: xmem_lazy_imports_check <path to xmem.dll> [handler-failure]
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -46,6 +51,17 @@ bool read_faults(volatile const unsigned char* address)
     }
 }
 
+// True when writing the byte faults; kept free of C++ objects for __try.
+bool write_faults(volatile unsigned char* address)
+{
+    __try {
+        *address = 0x5a;
+        return false;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return true;
+    }
+}
+
 DWORD state(const void* address)
 {
     MEMORY_BASIC_INFORMATION info{};
@@ -55,13 +71,15 @@ DWORD state(const void* address)
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
-        std::printf("usage: xmem_lazy_imports_check <xmem.dll>\n");
+    const bool handler_failure = argc > 2 && std::strcmp(argv[2], "handler-failure") == 0;
+    if (argc < 2 || (argc > 2 && !handler_failure)) {
+        std::printf("usage: xmem_lazy_imports_check <xmem.dll> [handler-failure]\n");
         return 2;
     }
     // xmem.dll reads the switches and wraps this program's imports when it loads.
     SetEnvironmentVariableA("X2W_XMEM_LAZY_COMMIT", "1");
     SetEnvironmentVariableA("X2W_XMEM_LAZY_STARTUP", "1");
+    if (handler_failure) SetEnvironmentVariableA("X2W_XMEM_TEST_LAZY_HANDLER_FAILURE", "1");
     const HMODULE xmem = LoadLibraryA(argv[1]);
     if (!xmem) {
         std::printf("check_failed: load (error %lu)\n", GetLastError());
@@ -74,6 +92,32 @@ int main(int argc, char** argv)
     if (!virtual_alloc || !allocate || !map || !release) {
         std::printf("check_failed: exports\n");
         return 1;
+    }
+
+    if (handler_failure) {
+        // No fault handler: nothing may be left for a first touch to commit.
+        void* const reservation = virtual_alloc(nullptr, SIZE_T{16} << 30, 0x20402000, 0x21, PAGE_READWRITE);
+        SIZE_T count = pages, tokens[pages] = {};
+        const bool mapped = reservation && allocate(0x20400000, &count, tokens) && count == pages &&
+                            map(reservation, pages, tokens) == reservation;
+        check(mapped, "map");
+        if (mapped) {
+            auto* const target = static_cast<unsigned char*>(reservation) + page;
+            check(state(target) == MEM_COMMIT, "page_committed_without_handler");
+            check(!write_faults(target), "page_writable_without_handler");
+            map(reservation, pages, nullptr);
+            release(pages, tokens);
+        }
+        if (reservation) VirtualFree(reservation, 0, MEM_RELEASE);
+        void* const block = virtual_alloc(nullptr, block_bytes, 0x20403000, 0x181, PAGE_READWRITE);
+        auto* const inside = static_cast<unsigned char*>(block) + page;
+        check(block && state(inside) == MEM_COMMIT, "block_committed_without_handler");
+        if (block) {
+            check(!write_faults(inside), "block_writable_without_handler");
+            VirtualFree(block, 0, MEM_RELEASE);
+        }
+        std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
+        return failures ? 1 : 0;
     }
 
     // ReadFile into an untouched mapped page, through this program's import.
@@ -121,6 +165,20 @@ int main(int argc, char** argv)
             check(state(again) == MEM_RESERVE, "released_block_still_reserved");
             VirtualFree(again, 0, MEM_RELEASE);
         }
+    }
+
+    // A refused release leaves the block reserved and lazy: a later first touch is still committed.
+    void* const kept = virtual_alloc(nullptr, block_bytes, 0x20403000, 0x181, PAGE_READWRITE);
+    check(kept && state(kept) == MEM_RESERVE, "kept_block_left_lazy");
+    if (kept) {
+        SetLastError(ERROR_SUCCESS);
+        const BOOL refused = VirtualFree(kept, block_bytes, MEM_RELEASE);  // MEM_RELEASE needs size 0
+        check(!refused && GetLastError() == ERROR_INVALID_PARAMETER, "release_with_size_refused");
+        auto* const untouched = static_cast<unsigned char*>(kept) + 2 * page;
+        check(state(untouched) == MEM_RESERVE, "refused_release_kept_reservation");
+        check(!write_faults(untouched), "refused_release_block_still_lazy");
+        check(state(untouched) == MEM_COMMIT && *untouched == 0x5a, "refused_release_write_committed");
+        check(VirtualFree(kept, 0, MEM_RELEASE) != FALSE, "release_after_refusal");
     }
     std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
     return failures ? 1 : 0;

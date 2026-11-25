@@ -104,10 +104,19 @@ bool commit_slot(HANDLE slab, ULONG64 offset, bool zero)
 // CPU access faults and lazy_commit_fault commits that slot. Writers that do not fault -- kernel-mode I/O into
 // mapped pages, GPU placement, stand-in writes behind a commit-state check -- call x2w_xmem_commit_range first.
 // Reused slots and x2w_xmem_write_physical still commit before use.
-bool lazy_commit()
+bool lazy_commit_requested()
 {
     static const bool on = x2w_local::env_on("X2W_XMEM_LAZY_COMMIT");
     return on;
+}
+
+// Set when xmem.dll loads, once the fault handler is installed. Without the handler a lazy page could never be
+// committed, so the switch then acts as off: pages and blocks are committed up front.
+bool lazy_handler_installed = false;
+
+bool lazy_commit()
+{
+    return lazy_handler_installed && lazy_commit_requested();
 }
 
 // Experimental (X2W_XMEM_LAZY_STARTUP=1 with X2W_XMEM_LAZY_COMMIT=1, #1199): the large startup blocks
@@ -116,8 +125,8 @@ bool lazy_commit()
 // for writers that cannot fault, and x2w_xmem_commit_block commits a whole block before the GPU uses it.
 bool lazy_startup()
 {
-    static const bool on = lazy_commit() && x2w_local::env_on("X2W_XMEM_LAZY_STARTUP");
-    return on;
+    static const bool on = x2w_local::env_on("X2W_XMEM_LAZY_STARTUP");
+    return on && lazy_commit();
 }
 
 constexpr SIZE_T lazy_chunk = SIZE_T{256} << 10;
@@ -131,17 +140,17 @@ struct LazyBlocks {
 LazyBlocks lazy_blocks;
 volatile LONG lazy_block_releases = 0;  // lazy blocks the title has released (keys the fault handler's retry)
 
-// The lazy block holding address, as base and size; false when there is none.
+// The lazy block holding address, as base and size; false when there is none. The caller holds lazy_blocks.lock
+// until it has committed what it found, so that a release (virtual_free_lazy) cannot run in between and leave it
+// committing addresses that no longer belong to the block.
 bool lazy_block_at(ULONG_PTR address, ULONG_PTR& base, SIZE_T& bytes)
 {
-    AcquireSRWLockShared(&lazy_blocks.lock);
     auto it = lazy_blocks.blocks.upper_bound(address);
     const bool inside = it != lazy_blocks.blocks.begin() && (--it, address - it->first < it->second);
     if (inside) {
         base = it->first;
         bytes = it->second;
     }
-    ReleaseSRWLockShared(&lazy_blocks.lock);
     return inside;
 }
 
@@ -184,11 +193,12 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
         ULONG_PTR base = 0;
         SIZE_T bytes = 0;
         MEMORY_BASIC_INFORMATION info{};
-        if (lazy_block_at(address, base, bytes) && VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) &&
-            info.State == MEM_RESERVE) {
-            if (!commit_block_chunks(base, bytes, address, address + 1)) return EXCEPTION_CONTINUE_SEARCH;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
+        AcquireSRWLockShared(&lazy_blocks.lock);
+        const bool lazy = lazy_block_at(address, base, bytes) &&
+                          VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) && info.State == MEM_RESERVE;
+        const bool committed = lazy && commit_block_chunks(base, bytes, address, address + 1);
+        ReleaseSRWLockShared(&lazy_blocks.lock);
+        if (lazy) return committed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
         // Another thread committed this chunk (or the whole block, which then leaves the list) between the fault
         // and the query: committed read-write memory cannot fault, so retry once. The retry is keyed on the chunk
         // and on the release count, so a fault that stays is passed on, while a new block later placed at the same
@@ -1017,8 +1027,14 @@ extern "C" BOOL WINAPI x2w_xmem_commit_range(const void* address, SIZE_T bytes)
     if (lazy_startup()) {
         ULONG_PTR base = 0;
         SIZE_T block_bytes = 0;
-        for (; from < end && lazy_block_at(from, base, block_bytes); from = base + block_bytes)
-            if (!commit_block_chunks(base, block_bytes, from, end)) return FALSE;
+        bool committed = true;
+        AcquireSRWLockShared(&lazy_blocks.lock);
+        for (; from < end && lazy_block_at(from, base, block_bytes); from = base + block_bytes) {
+            committed = commit_block_chunks(base, block_bytes, from, end);
+            if (!committed) break;
+        }
+        ReleaseSRWLockShared(&lazy_blocks.lock);  // keeps the commit's error
+        if (!committed) return FALSE;
         if (from >= end) return TRUE;  // the range lies in lazy startup blocks
     }
     const std::lock_guard guard(memory.mutex);
@@ -1036,14 +1052,15 @@ extern "C" BOOL WINAPI x2w_xmem_commit_range(const void* address, SIZE_T bytes)
 // switch or when the address is in no lazy block; FALSE with the system error when the commit fails.
 extern "C" BOOL WINAPI x2w_xmem_commit_block(const void* address)
 {
+    if (!lazy_startup()) return TRUE;
     ULONG_PTR base = 0;
     SIZE_T bytes = 0;
-    if (!lazy_startup() || !lazy_block_at(reinterpret_cast<ULONG_PTR>(address), base, bytes)) return TRUE;
-    if (!VirtualAlloc(reinterpret_cast<void*>(base), bytes, MEM_COMMIT, PAGE_READWRITE)) return FALSE;
     AcquireSRWLockExclusive(&lazy_blocks.lock);
-    lazy_blocks.blocks.erase(base);
-    ReleaseSRWLockExclusive(&lazy_blocks.lock);
-    return TRUE;
+    const bool lazy = lazy_block_at(reinterpret_cast<ULONG_PTR>(address), base, bytes);
+    const bool committed = !lazy || VirtualAlloc(reinterpret_cast<void*>(base), bytes, MEM_COMMIT, PAGE_READWRITE);
+    if (lazy && committed) lazy_blocks.blocks.erase(base);
+    ReleaseSRWLockExclusive(&lazy_blocks.lock);  // keeps the commit's error
+    return committed;
 }
 
 namespace {
@@ -1060,21 +1077,23 @@ BOOL WINAPI read_file_committed(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD
 }
 
 // The title releases its startup blocks through its VirtualFree import: with X2W_XMEM_LAZY_STARTUP a released
-// block leaves the lazy list first, so a later allocation at the same addresses is never committed as part of it.
+// block leaves the lazy list, so a later allocation at the same addresses is never committed as part of it. The
+// release runs under the list lock, so no commit of the block is in flight, and the block leaves the list only if
+// the release succeeded: a refused release (a nonzero size, for instance) leaves it reserved and still lazy.
 using VirtualFreeFn = BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD);
 VirtualFreeFn real_virtual_free;
 
 BOOL WINAPI virtual_free_lazy(LPVOID address, SIZE_T bytes, DWORD type)
 {
-    if (type & MEM_RELEASE) {
-        AcquireSRWLockExclusive(&lazy_blocks.lock);
-        const bool listed = lazy_blocks.blocks.erase(reinterpret_cast<ULONG_PTR>(address)) != 0;
-        ReleaseSRWLockExclusive(&lazy_blocks.lock);
-        // Counted before the block is released: a thread that faults in between sees the new count while the old
-        // block is still reserved, which costs it at most one extra retry.
-        if (listed) InterlockedIncrement(&lazy_block_releases);
-    }
-    return real_virtual_free(address, bytes, type);
+    if (!(type & MEM_RELEASE)) return real_virtual_free(address, bytes, type);
+    AcquireSRWLockExclusive(&lazy_blocks.lock);
+    const BOOL released = real_virtual_free(address, bytes, type);
+    const DWORD error = GetLastError();
+    if (released && lazy_blocks.blocks.erase(reinterpret_cast<ULONG_PTR>(address)))
+        InterlockedIncrement(&lazy_block_releases);
+    ReleaseSRWLockExclusive(&lazy_blocks.lock);
+    SetLastError(error);
+    return released;
 }
 
 // Points the main module's imports of name at replacement; returns how many import slots were changed.
@@ -1102,24 +1121,37 @@ int patch_main_import(const char* name, const void* replacement) noexcept
     return patched;
 }
 
+// Test build only (tests/xmem_lazy_imports_check.cpp): X2W_XMEM_TEST_LAZY_HANDLER_FAILURE=1 refuses the handler.
+bool add_lazy_handler()
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    if (x2w_local::env_on("X2W_XMEM_TEST_LAZY_HANDLER_FAILURE")) return false;
+#endif
+    return AddVectoredExceptionHandler(1, lazy_commit_fault) != nullptr;
+}
+
 // With the switch, install the fault handler and the ReadFile wrapper when xmem.dll loads, before the title runs.
-// The module is pinned: the handler must outlive any unload.
+// The module is pinned: the handler must outlive any unload. If the handler cannot be installed, lazy commit stays
+// off and nothing is wrapped.
 const bool lazy_commit_installed = [] {
-    if (!lazy_commit()) return false;
+    if (!lazy_commit_requested()) return false;
     HMODULE self = nullptr;
-    const bool handler = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                                            reinterpret_cast<LPCWSTR>(&lazy_commit_fault), &self) &&
-                         AddVectoredExceptionHandler(1, lazy_commit_fault);
+    lazy_handler_installed = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                                 reinterpret_cast<LPCWSTR>(&lazy_commit_fault), &self) &&
+                             add_lazy_handler();
+    if (!lazy_handler_installed) {
+        x2w_local::logf("x2w-xmem lazy commit (X2W_XMEM_LAZY_COMMIT): fault handler failed, pages committed when mapped");
+        return false;
+    }
     real_read_file = reinterpret_cast<ReadFileFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReadFile"));
     const int reads = real_read_file ? patch_main_import("ReadFile", reinterpret_cast<const void*>(&read_file_committed)) : 0;
-    x2w_local::logf("x2w-xmem lazy commit (X2W_XMEM_LAZY_COMMIT): fault handler %s, %d ReadFile import(s) wrapped",
-                    handler ? "on" : "failed", reads);
+    x2w_local::logf("x2w-xmem lazy commit (X2W_XMEM_LAZY_COMMIT): fault handler on, %d ReadFile import(s) wrapped", reads);
     if (lazy_startup()) {
         real_virtual_free = reinterpret_cast<VirtualFreeFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualFree"));
         const int frees = real_virtual_free ? patch_main_import("VirtualFree", reinterpret_cast<const void*>(&virtual_free_lazy)) : 0;
         x2w_local::logf("x2w-xmem lazy startup blocks (X2W_XMEM_LAZY_STARTUP): %d VirtualFree import(s) wrapped", frees);
     }
-    return handler;
+    return true;
 }();
 }  // namespace
 

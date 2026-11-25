@@ -279,9 +279,13 @@ endforeach()
 # main module, which the Python checks cannot reach.
 add_executable(xmem_lazy_imports_check tests/xmem_lazy_imports_check.cpp)
 target_compile_features(xmem_lazy_imports_check PRIVATE cxx_std_17)
-add_dependencies(xmem_lazy_imports_check xmem_shim)
+add_dependencies(xmem_lazy_imports_check xmem_shim xmem_shim_test_controls)
 add_test(NAME xmem_lazy_imports COMMAND xmem_lazy_imports_check "$<TARGET_FILE:xmem_shim>")
 set_tests_properties(xmem_lazy_imports PROPERTIES TIMEOUT 60)
+# A refused fault handler (test-controls build) leaves the switches off: pages and blocks are committed up front.
+add_test(NAME xmem_lazy_handler_failure COMMAND xmem_lazy_imports_check
+    "$<TARGET_FILE:xmem_shim_test_controls>" handler-failure)
+set_tests_properties(xmem_lazy_handler_failure PROPERTIES TIMEOUT 60)
 add_executable(xmem_startup_below_40_check tests/xmem_startup_below_40_check.cpp)
 target_link_libraries(xmem_startup_below_40_check PRIVATE OneCore)
 target_compile_features(xmem_startup_below_40_check PRIVATE cxx_std_17)
