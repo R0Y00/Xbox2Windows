@@ -267,6 +267,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup tooling lint (#1149): every Python file under tools/startup must parse. The check compiles each
     # source without running it and self-tests that a broken snippet is rejected, so a passing run means the
     # files were actually looked at. It needs no GPU and no game files.
+    add_test(NAME startup_shader_cache_key COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_shader_cache_key_check.py")
+    set_tests_properties(startup_shader_cache_key PROPERTIES TIMEOUT 30)
     add_test(NAME startup_tools_lint COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_tools_lint_check.py" "${CMAKE_SOURCE_DIR}/tools/startup")
     set_tests_properties(startup_tools_lint PROPERTIES TIMEOUT 60)

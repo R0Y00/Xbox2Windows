@@ -15661,3 +15661,29 @@ ctest --preset dev --no-tests=error -R '^(pixel_aot_sdwa_int_extra_warp|pixel_ao
 ```
 
 Linux controls, `form_coverage_check.check_sdwa_int_extra_forms`, and Python reference/mutation checks ran locally; LLVM 15 `pixel_aot_binary` round-trips and Windows WARP/hardware D3D12 draws run in CI.
+
+## Startup shader request identity
+
+`startup_shader_cache_key` uses the explicit `X2W_FXC=''` manifest-only mode: no GPU
+or shader compiler is required, and it does not claim compiled bytecode. Real hashing,
+raw classification, container extraction and HLSL generation remain active. A wrapping
+translation spy requires every identity failure to occur before translation. All rejected
+fresh requests must publish only the exact `.fail` diagnostic, not a shader or manifest.
+
+The source-built raw VS/PS pair, reversed raw storage, full containers and a minimal
+RTS0 root cover accepted identities; wrong keys and independent VS/PS/root/input layout mutations
+cover rejection. Valid and invalid RTV requests preserve existing behavior and diagnostic.
+A literal known-answer vector independently executed with the runtime C++ `fnv_bytes`
+and revision/order (including optional `.ia`) (`src/startup_stubs/d3d12_draw.inl`) prevents a shared Python-key error
+from silently agreeing in both producer and validator.
+
+```powershell
+python -B tests/startup_shader_cache_key_check.py
+ctest --preset dev --no-tests=error -j 1 -R '^startup_shader_cache_key$' -V
+```
+
+Publication through `translate_request` validates base request identity as well as RTV source identity. The refusal-only diagnostic mode is unchanged.
+Before this guard, a base request could publish a manifest under a key that did not hash
+its inputs. This is malformed-request integrity hardening, not a demonstrated normal-game
+misrender, cryptographic authenticity, cleanup of already-published artifacts or driver
+PSO-cache change. Canonical output bytes remain unchanged.

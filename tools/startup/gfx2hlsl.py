@@ -7238,7 +7238,7 @@ def classify(blob):
     return classify_decoded(decode(strip_header(blob)))
 
 
-def load_request(out_dir, key, refusals=None, pair_info=None):
+def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_key=False):
     """Read a base request or an RTV variant and classify the source stages."""
     decoded = {}
 
@@ -7269,8 +7269,8 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
         pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
     # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
     layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
-    if request and pipeline_key(a, b, root, layout) != base:
-        raise Unsupported('RTV variant source key mismatch')
+    if (request or validate_base_key) and pipeline_key(a, b, root, layout) != base:
+        raise Unsupported('RTV variant source key mismatch' if request else 'shader request source key mismatch')
     fetch = attr_map = None
     if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
         # Slot 86 records complete containers in canonical (VS, PS) order.
@@ -7371,7 +7371,7 @@ def translate_request(out_dir, key):
             open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
             return 'unsupported: %s' % reason
     try:
-        kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key)
+        kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
