@@ -16314,6 +16314,13 @@ The log line `x2w-render compute dispatches: translated <n>, refused <n>, no tra
 
 Measured on three fixture programs. The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
 
+The `startup_compute_live_retry_warp` and `startup_compute_live_retry_hardware` tests keep the device and
+slot 67 pipeline alive across two fenced Dispatch calls. The first observes the missing translation and
+preserves all 320 output words. The test runs `gfx2hlsl.py --pending` while the process waits, then checks
+the second output against the source program once the one-second manifest poll interval has elapsed.
+A second run keeps the manifest absent and checks both refusals and both untouched outputs.
+Run the two backends with `ctest --preset release --no-tests=error -j 1 -R '^startup_compute_live_retry_(warp|hardware)$' -V`.
+
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
