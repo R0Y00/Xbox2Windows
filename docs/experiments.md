@@ -8372,6 +8372,29 @@ of console shader programs and support for other console mesh paths are tracked 
 [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 
+Slot 86 publishes complete Xbox mesh containers under a separate cache key. The
+key frames the original MS, the optional PS, the creation root signature and the
+pipeline-state stream with its pointers cleared. The shim writes `.m86` last,
+after `.ps86`, `.root` and `.stream86`. An empty `.ps86` records a stream
+without a pixel shader. Use the cache tool with a desktop pair independently
+validated for that exact source and root. The ready marker records both output
+shader hashes so an incomplete or mixed update cannot reach PSO creation.
+
+```powershell
+python -B tools/startup/mesh86_cache.py <cache> <key> --mesh <desktop-ms.cso> --pixel <desktop-ps.cso>
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_cache_' -V
+```
+
+The executable subset uses the original root and PSO state. It accepts root
+constants captured on the list, single-sample color attachments in exact format
+order and a matching depth view when the stream declares one. A mesh stream
+without a pixel stage requires zero color attachments, a writable matching
+depth view and a physical adapter. The depth-only fixture removed the device
+on WARP when dispatched, so the shim refuses it there. Untracked descriptor
+tables, heap indexing, root descriptors,
+stencil state and depth bounds are refused. A shader accepted individually can still
+fail PSO creation or lack a consumable root binding.
+
 The fixture writes its group counts at byte offset four on the GPU and checks
 all eight pixels and the surrounding argument words. One group paints the
 left half. Two groups paint both halves. An omitted writer, a short argument
