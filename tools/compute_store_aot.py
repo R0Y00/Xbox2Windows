@@ -198,13 +198,14 @@ SCC_PRESERVING = ("s_cselect_b32", "s_mov_b32", "s_movk_i32", "s_load", "s_buffe
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
-# Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a 2D,
-# linear (non-swizzled) image of the listed format. The translator checks where the eight words were
+# Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a
+# linear (non-swizzled) image of the declared type and format. The translator checks where the eight words were
 # loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
 # 16-byte descriptor slots are bound to t0 for reads or u0 for writes.
 # Value: (HLSL texel type, channel count).
 IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4)}
 RGBA32_FLOAT = "R32G32B32A32_FLOAT"
+IMAGE_UAV_TYPES = {"2d": "RWTexture2D", "2d-array": "RWTexture2DArray", "3d": "RWTexture3D"}
 RGBA16_FLOAT = "R16G16B16A16_FLOAT"
 # image_gather4_l on the gfx1013 RGBA32 FLOAT SRV, with the sampler profile of pixel_aot.check_gather_sampler
 # (normalized coordinates, clamp to the last texel, point mip, no LOD bias). RDNA 2 MIMG gathers return one DMASK
@@ -769,6 +770,7 @@ def heap_store_view_hlsl(table_offset, view_count, output_bytes, *, components=4
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
+          image_uav_dimension="2d",
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, image_float_domain=None, buffer_float_domain=None, cpu="gfx1013", lds_bytes=0,
@@ -807,6 +809,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
+    image_uav_dimension declares the view for a store. Array and volume
+    stores require three address VGPRs and are available for gfx1013 RGBA32 FLOAT.
     R32_UINT selects the 4-sample Texture2DMS profile for an SRV or the
     non-returning 2D integer atomic profile for a UAV. R32_SINT is UAV-only
     and selects signed min/max. R32_FLOAT declares a native atomic image carried as raw words
@@ -848,6 +852,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     float_image = rgba32_float_image or rgba16_float_image
     if image_format == RGBA16_FLOAT and not rgba16_float_image:
         raise ValueError("RGBA16 FLOAT requires a gfx1013 D16 image store UAV")
+    if image_uav_dimension not in IMAGE_UAV_TYPES:
+        raise ValueError("Unknown image UAV dimension")
+    if image_uav_dimension != "2d" and not (image_output and rgba32_float_image):
+        raise ValueError("Array and 3D image UAVs require a gfx1013 RGBA32 FLOAT store binding")
     # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only (add, umax, cmpswap; see lower()).
     gfx1013_image_atomic = cpu == "gfx1013" and image_atomic_type is not None and image_format == "R32_UINT"
     if image_output:
@@ -2561,14 +2569,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
-                               r"dim:SQ_RSRC_IMG_2D(?: unorm)?(?P<a16> a16)?(?P<d16> d16)?", line):
+                               r"dim:SQ_RSRC_IMG_(?P<dimension>2D_ARRAY|2D|3D)(?: unorm)?(?P<a16> a16)?(?P<d16> d16)?", line):
             # A16 packs x/y into one dword and takes the mip from the low half of the next dword.
             mip, a16 = bool(m["mip"]), bool(m["a16"])
             d16 = bool(m["d16"])
             write = m["kind"] == "store"
             resinfo = m["kind"] == "get_resinfo"
+            dimension = m["dimension"].lower().replace("_", "-")
+            layered = dimension != "2d"
+            if m["d16"] and layered:
+                # D16 stores are 2D only; refuse array and volume forms as an unmatched instruction.
+                raise ValueError(f"Unsupported compute instruction: {line}")
+            if write and dimension != image_uav_dimension:
+                raise ValueError(f"Unsupported compute instruction: image_store dimension {dimension} "
+                                 f"does not match the {image_uav_dimension} UAV view")
+            if layered and (not write or not rgba32_float_image or a16 or mip or m["packed"]):
+                raise ValueError(f"Unsupported compute instruction: {line}")
             vaddr = [int(n) for n in re.findall(r"\d+", m["addr"])]
-            address_words = 1 if resinfo else (1 if a16 else 2) + int(mip)
+            address_words = 1 if resinfo else (1 if a16 else 2) + int(mip) + int(layered)
             base, high = int(m["base"]), int(m["high"])
             dmask = int(m["mask"], 16)
             # DMASK selects components in XYZW order and packs them into consecutive VGPRs.
@@ -2604,7 +2622,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             elif cpu == "gfx1013" and (not rgba32_float_image or a16 or m["packed"]
                                      or (m["kind"], mip) not in (("store", False), ("load", True))):
                 raise ValueError(f"Unsupported image {m['kind']} target: "
-                                 "gfx1013 requires full-width 2D RGBA32 FLOAT image_store or image_load_mip")
+                                 "gfx1013 requires full-width RGBA32 FLOAT image_store or 2D image_load_mip")
             if rgba32_float_image and write and dmask != 0xf:
                 raise ValueError("gfx1013 RGBA32 FLOAT image_store requires full DMASK 0xf")
             separate_srv = not write and not uav_load and image_srv_descriptor is not None
@@ -2639,7 +2657,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 else:
                     x, y = map(hlsl_word, coordinates[:2])
             if write:
-                # A D3D12 Texture2D UAV names one mip. Verify native and desktop mip selection agree.
+                # A D3D12 image UAV names one mip. Verify native and desktop mip selection agree.
                 level = coordinates[-1] if mip else 0
                 if not isinstance(level, int) or (level & 0xffff if a16 else level) != image_uav_mip:
                     raise ValueError("Image store mip does not match the UAV view")
@@ -2667,7 +2685,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     selected = dict(zip(channels, words))
                     texel = ", ".join(selected.get(channel, "0u") for channel in "xyzw")
                     value = f"uint4({texel})"
-                stores.append(f"    outputData[uint2({x}, {y})] = {value};")
+                address = (f"uint3({x}, {y}, {hlsl_word(coordinates[2])})" if layered
+                           else f"uint2({x}, {y})")
+                stores.append(f"    outputData[{address}] = {value};")
                 continue
             if resinfo:
                 name = f"image_resinfo_{image_step_count}"
@@ -3014,7 +3034,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         cbuffer += CVT_U32_F32_HELPER
     cbuffer += "".join(text for name, text in DOT_U_HELPERS.items() if f"{name}(" in body)
     uav_texel_type = image_atomic_type or ("float4" if float_image else "uint4")
-    uav = f"RWTexture2D<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
+    uav = f"{IMAGE_UAV_TYPES[image_uav_dimension]}<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
     # The helper reads outputData, so it follows the UAV declaration.
     descriptor_hlsl = descriptor_store_hlsl() if "store_descriptor_format(" in body else ""
     if "load_descriptor_format(" in body or "load_heap_view_format(" in body:
@@ -3079,6 +3099,8 @@ def main():
                         help="Table byte offset of the 8-dword image descriptor bound to t0 or u0")
     parser.add_argument("--image-uav-mip", type=int,
                         help="Bind the image to u0 at this mip instead of binding a raw output descriptor")
+    parser.add_argument("--image-uav-dimension", choices=IMAGE_UAV_TYPES, default="2d",
+                        help="Declare the u0 view dimension for an image store")
     parser.add_argument("--image-srv-descriptor", type=lambda n: int(n, 0),
                         help="Separate image descriptor at t0 when u0 is a gfx1013 RGBA32 FLOAT image")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | IMAGE_ATOMIC_TYPES.keys()
@@ -3114,6 +3136,7 @@ def main():
                    output_format=args.output_format,
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
                    buffer_float_domain=args.buffer_float_domain,
+                   image_uav_dimension=args.image_uav_dimension,
                    image_uav_mip=args.image_uav_mip, image_float_domain=args.image_float_domain,
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,

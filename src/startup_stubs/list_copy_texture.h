@@ -61,7 +61,7 @@ enum class Verdict {
     bad_offset,         // a footprint offset that is not a multiple of 512
     footprint_overflow, // the footprint reaches past the end of its buffer
     sample_mismatch,    // the two sides differ in sample count
-    bad_alignment,      // a block-compressed copy that does not start on a block
+    bad_alignment,      // a block-compressed copy that does not start on a block, or a box that does not end on one
     bad_subresource,    // an index outside the resource's mips * array slices * planes
     format_mismatch,    // the two sides name different formats
     partial_multisample, // a multisampled copy that is not the whole subresource at the origin
@@ -154,6 +154,10 @@ inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uin
     if (use.left >= use.right || use.top >= use.bottom || use.front >= use.back) return Verdict::bad_box;
     if (use.right > src_w || use.bottom > src_h || use.back > src.depth) return Verdict::source_overflow;
     if (x % tex.block_w || use.left % tex.block_w || y % tex.block_h || use.top % tex.block_h) return Verdict::bad_alignment;
+    // The box must also end on a block, even where it ends at the edge of a smaller mip: a {0,0,2,2} box on a 2x2 or
+    // a {0,0,6,6} box on a 6x6 block-compressed mip makes the desktop list's Close fail with E_INVALIDARG, so every
+    // command recorded in it is lost (measured without the debug layer on WARP and on an RX 6600).
+    if (use.right % tex.block_w || use.bottom % tex.block_h) return Verdict::bad_alignment;
     const std::uint32_t w = use.right - use.left, h = use.bottom - use.top, d = use.back - use.front;
     // D3D12 requires a null source box even if an explicit box would cover the whole subresource.
     const bool depth_stencil = src.depth_stencil || dst.depth_stencil;

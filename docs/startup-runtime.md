@@ -204,10 +204,13 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
-constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+The shader cache revision is `x2w-startup-shader-16`. Earlier translations lower `v_fract_f32`
+through a bare `frac` instead of the clamped `fract32` helper. The matching compute
+(`x2w-startup-shader-16cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
+because those stages use the shared lowering.
 Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
 rounding mode.
+Revisions before 14 evaluate constant `s_brev_b32` at run time instead of folding it into a known word.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
@@ -1938,7 +1941,7 @@ These are measured on one executable; treat them as hypotheses for others.
   lane's exec bit, and the manifest becomes version 2 with a
   `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
   channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
-  `lwe`, `r128`, `unorm`, `image_store_mip`, a store outside a pixel stage, and a program that loads
+  `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads
   and stores the same image are refused by name. The runtime does not bind UAVs on the translated
   graphics path yet: it logs and does not use a translation whose manifest has a `uav` line. A
   hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
@@ -2911,9 +2914,17 @@ descriptions with:
 
 - `D3D12_SRV_DIMENSION_BUFFER` (raw `R32_TYPELESS`, structured `Format == UNKNOWN` with a stride that is a multiple of 4 up to
   2048, or typed buffers). It resolves an existing live placed (slot 133) or committed (slot 127)
-  buffer covering `[address, address + (FirstElement + NumElements) * element_bytes)`, checks
-  alignment and bounds, adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards
-  to `CreateShaderResourceView` (slot 18).
+  buffer covering `[address, address + (FirstElement + NumElements) * element_bytes)`. When no live
+  buffer exists at the address, `unplaced_memory_buffer` backs the unplaced range: it calculates a
+  64 KiB page-aligned extent via `unplaced_buffer_extent`, verifies committed pages through
+  `measure_placed_buffer`, and avoids placed alias conflicts (`placed_buffer_range`). It reuses
+  cached unplaced buffers per device matching the base allocation when `unplaced_buffer_covers` is true,
+  re-checking committed status to handle title memory deallocation/reallocation. On adapters supporting
+  `D3D12_FEATURE_EXISTING_HEAPS` for `MEM_PRIVATE` memory, it opens the existing heap and creates a
+  zero-copy placed resource alias; otherwise (or on WARP), it falls back to a committed upload buffer and
+  synchronizes memory from the host. When the device wrapper is released (`refs == 0`),
+  `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
+  adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
 
 Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
 `src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's
@@ -2939,9 +2950,10 @@ Checks:
 `startup_memory_srv_buffer` is device-free and owns every rejection (bounds, alignment, format,
 stride). It changes each buffer description and view field alone, checks the element bytes of every
 typed format, views that end exactly at the end of the buffer, raw alignment of the adjusted first
-element, and widths, addresses and first elements above 4 GiB. Its `_control` runs (`height`,
-`exact-fit`, `first-32`) expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises
-only the resolve path with valid addresses on a device, so it does not cover the rejections.
+element, widths, addresses and first elements above 4 GiB, page extent calculation, and cache range
+coverage. Its `_control` runs (`height`, `exact-fit`, `first-32`, `unplaced-extent`, `unplaced-covers`)
+expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises placed and unplaced buffer
+views with valid addresses on a device (WARP and hardware), and verifies the refusal lines.
 
 `startup_memory_srv_volume` is device-free and validates volume (Texture3D) memory SRVs in
 device slot 70 (`supports_volume_memory_srv`, `address_view_fits`, `volume_texture_bytes`).
@@ -2973,6 +2985,8 @@ check only:
   the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
   block alignment, every multiply and add in the footprint arithmetic checked for wrapping. Block-compressed
   bounds are whole 4x4 blocks, as in D3D12: a 2x2 or 1x1 mip takes the 4x4 footprint GetCopyableFootprints gives it.
+  An explicit box must also end on a block (`{0,0,2,2}` on a 2x2 mip is `bad_alignment`): forwarded, it makes the
+  desktop list's Close fail with E_INVALIDARG.
 - Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
   `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
   (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).
@@ -2990,6 +3004,7 @@ check only:
 Wrapped-list readback (`tests/startup_list_copy_texture_warp.cpp`): two images round-trip through array
 slices 1 and 2 of a 2-mip, 3-slice texture (upload buffer, texture, readback buffer, byte-for-byte), and a
 list with an out-of-range subresource, an index of `0xffffffff` and a footprint format mismatch is refused
-before any desktop copy, leaving a sentinel-filled readback buffer unchanged. Reproduce the portable check
-with its negative controls and the WARP and hardware runs with
+before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On a BC1 2x2 mip, the same
+list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
+all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
