@@ -180,6 +180,20 @@ s = run(TABLE, IN_PLACE)
 check('the same in-place advance without branches still folds to +0x50',
       not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0x50, 0), str(s if isinstance(s, str) else s.sym))
 
+# The pair is complete only after its s_addc_u32: an in-place pair folds, and a high word that was only
+# copied (never advanced) must not stand in for it.
+s = run(ROOT, [('s_add_u32', 's8, s8, 0x20'), ('s_addc_u32', 's9, s9, 0'),
+               ('s_load_dwordx4', 's[4:7], s[8:9], 0x10')])
+check('complete in-place pair folds to +0x30',
+      not isinstance(s, str) and any('Load(%d)' % 0x30 in line for line in s.lines), str(s if isinstance(s, str) else s.lines))
+
+s = run(ROOT, [ADVANCE[0], ('s_mov_b32', 's21, s9')] + LOAD)
+check('out-of-place low add with a copied, unadvanced high word is refused', isinstance(s, str), str(s))
+
+s = run(ROOT, [ADVANCE[0], ADVANCE[1]] + LOAD)
+check('complete out-of-place pair leaves the original high source untouched',
+      not isinstance(s, str) and s.sym.get(9) == ('ptrhi', ('root', 1)), str(s if isinstance(s, str) else s.sym))
+
 if failures:
     print('FAILED: %s' % ', '.join(failures))
     sys.exit(1)

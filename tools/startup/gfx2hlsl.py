@@ -2412,8 +2412,9 @@ class Stage:
                 # instruction starts so that the high-word add is accepted right behind it and nowhere else.
                 size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
                 self.ptr_low_add = (d, self.pc + size, syms[0][1])
-                # The high word is stale until the matching s_addc_u32 completes the pair.
-                self.sym[d + 1] = ('ptrhi', syms[0][1], 'pending')
+                # The pair stays open until the matching s_addc_u32 completes it. The high register is left as it
+                # is (in place it is still the original high source); a load through an open pair is refused.
+                self.__dict__.setdefault('ptr_open_pairs', set()).add(d)
             return True
         low = self.sym.get(d - 1)
         mark = getattr(self, 'ptr_low_add', None)
@@ -2424,6 +2425,7 @@ class Stage:
                 or self.sym.get(hi[1]) != ('ptrhi', mark[2])):
             return False
         self.sym[d] = ('ptrhi', mark[2])
+        getattr(self, 'ptr_open_pairs', set()).discard(d - 1)
         return True
 
     # scalar ALU with descriptor-word bookkeeping
@@ -2826,7 +2828,7 @@ class Stage:
         if (base_off or len(p) > 2) and p[1][0] in PTR64_SOURCES:
             # An advanced 64-bit pointer needs its high word completed by the matching s_addc_u32;
             # a table pointer is 32 bits wide and has no high word.
-            if self.sym.get(base[1] + 1) != ('ptrhi', p[1]):
+            if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[1] + 1) != ('ptrhi', p[1]):
                 raise Unsupported('s_load through s%d: its high word is not the matching advanced pair' % base[1])
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
         token = smem_offset(ops[2])
