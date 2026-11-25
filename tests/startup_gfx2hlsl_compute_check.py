@@ -962,6 +962,12 @@ def check_controls():
         assert '& 1) ? ' in text and ('vcc = (exec) & 1;' in text or 's20 = ' in text), text
     # s_and with exec reads the lane bit only (the result is a lane mask): accepted
     phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_b32 s20, vcc_lo, exec_lo'] + cnd_vcc))
+    # so does s_and_saveexec with the mask as its source (exec &= the lane bit); with the mask as its destination
+    # the saved exec overwrites it, a whole-mask value, and the later lane select is refused
+    SPLICE.update({'s_and_saveexec_b32 s22, vcc_lo': '6a3c96be', 's_and_saveexec_b32 vcc_lo, vcc_lo': '6a3ceabe'})
+    phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_saveexec_b32 s22, vcc_lo'] + cnd_vcc))
+    refused('definition of vcc, live where the block joins', lambda: phi_text(phi(
+        ['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_saveexec_b32 vcc_lo, vcc_lo'] + cnd_vcc)))
     # Negative controls: each condition removed keeps the refusal of the live definition.
     live = lambda name: 'definition of %s, live where the block joins' % name
     wr, rd = ['s_mov_b32 vcc_lo, exec_lo'], cnd_vcc
