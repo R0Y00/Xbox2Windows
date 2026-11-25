@@ -3800,8 +3800,12 @@ HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT6
     const auto out = translate(dest, sizes.ResultDataMaxSizeInBytes, as_state);
     if (out.cause != Cause::ok) return refuse(out.cause, "dest", dest);
     // An update is sized by its own scratch requirement, a full build by the build one.
-    const auto temp = translate(scratch, update ? sizes.UpdateScratchDataSizeInBytes : sizes.ScratchDataSizeInBytes,
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // A device may report no update scratch at all (WARP does). Then a null scratch is fine, and a scratch the title
+    // still passes must be a placed buffer, checked over at least one byte.
+    const UINT64 scratch_bytes = update ? sizes.UpdateScratchDataSizeInBytes : sizes.ScratchDataSizeInBytes;
+    const bool no_scratch = update && !scratch_bytes && !scratch;
+    const auto temp = no_scratch ? Translated{Cause::ok, 0}
+                                 : translate(scratch, (std::max<UINT64>)(scratch_bytes, 1), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (temp.cause != Cause::ok) return refuse(temp.cause, "scratch", scratch);
     Translated from{Cause::ok, 0};
     if (update) {

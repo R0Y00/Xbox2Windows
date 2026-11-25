@@ -148,6 +148,20 @@ public:
         if (!in_place.DestAccelerationStructureData || in_place.SourceAccelerationStructureData != in_place.DestAccelerationStructureData)
             throw std::runtime_error("An in-place update must translate source and destination to the same address");
 
+        // A device that reports no update scratch (WARP): a placed scratch and a null scratch both resolve, and a
+        // scratch outside every placed buffer is still refused.
+        auto none = sizes;
+        none.UpdateScratchDataSizeInBytes = 0;
+        for (const UINT64 given : {scratch, UINT64{0}}) {
+            auto build = request(tlas, true);
+            check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, given, none, build), "Resolve update without scratch");
+            if (!build.DestAccelerationStructureData || bool(build.ScratchAccelerationStructureData) != bool(given))
+                throw std::runtime_error("A zero-size update scratch was not published as given");
+        }
+        auto stray = request(tlas, true);
+        if (x2w_startup::resolve_placed_build(guest_.Get(), tlas, unmapped, none, stray) != E_INVALIDARG)
+            throw std::runtime_error("A stray scratch was accepted for a zero-size update scratch");
+
         // Out of place: another placed acceleration structure, its interior offset kept.
         const auto other = place(7, dest_offset + top_size.ResultDataMaxSizeInBytes,
             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) + dest_offset;
@@ -168,9 +182,6 @@ public:
         const auto& placed = titles_.at(which);
         build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
         build.SourceAccelerationStructureData = placed.dest;
-        std::printf("placed update %u: dest=%llx scratch=%llx result=%llu build_scratch=%llu update_scratch=%llu\n", which,
-            placed.dest, placed.scratch, placed.sizes.ResultDataMaxSizeInBytes, placed.sizes.ScratchDataSizeInBytes,
-            placed.sizes.UpdateScratchDataSizeInBytes);
         check(x2w_startup::resolve_placed_build(guest_.Get(), placed.dest, placed.scratch, placed.sizes, build),
             "Resolve placed in-place update");
     }
