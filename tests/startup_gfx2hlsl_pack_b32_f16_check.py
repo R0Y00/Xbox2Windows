@@ -8,6 +8,7 @@ bit 15) and then neg (flip bit 15). An SGPR source is accepted.
 Controls (refused): a destination op_sel bit, clamp, an inline float constant and an inline integer source.
 Negative controls: an expression with the halves swapped, or with neg applied before abs, is caught by the
 reference; without op_v_pack_b32_f16 the instruction is refused, as on main.
+The draw mode checks raw integer readback under DXC and FXC and rejects a lowering that omits negation.
 """
 import re
 import struct
@@ -111,5 +112,30 @@ def main():
           'handler' % cases)
 
 
+def draw_cases(dxc, renderer, adapter, fxc=None):
+    from startup_gfx2hlsl_lane_alu import check_draw
+
+    op = 'v_pack_b32_f16'
+    # The selected halves cover zeros, subnormals, infinities and NaN payloads as integer bits.
+    values = [
+        (0x0000bc00, 0xa5a58000, 0), (0x80017e00, 0xf0f00001, 0),
+        (0xfc008001, 0xabcd7d55, 0), (0x7d337c00, 0xdcba7c00, 0),
+    ]
+    body = b''.join(struct.pack('<2I', *vop3(12 + lane, 256 + lane, 260 + lane, 1, 1, 1))
+                    for lane in range(4))
+    family = {
+        'ops': {op: (2, lambda a, b: ref(a, b, 1, 1, 1), False)},
+        'draw': {op: values},
+        'body': {op: body},
+        'mutations': {op: (r' \^ 0x8000u', '', lambda a, b: ref(a, b, 1, 1, 0))},
+        'accepted': [],
+        'refused': [],
+    }
+    check_draw(family, dxc, renderer, adapter, fxc)
+
+
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == 'draw':
+        draw_cases(*sys.argv[2:])
+    else:
+        main()
