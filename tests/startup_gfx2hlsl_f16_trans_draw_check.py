@@ -43,9 +43,10 @@ def ref_fract(x):
     return min(x - math.floor(x), FRACT_MAX)
 
 
-# mnemonic -> reference on the float value, in float64
+# mnemonic -> reference on the float value, in float64; a rounding that reaches zero keeps the sign of the input
 REF = {
-    'v_ceil_f16': math.ceil, 'v_floor_f16': math.floor, 'v_trunc_f16': math.trunc, 'v_rndne_f16': round,
+    'v_ceil_f16': lambda x: math.copysign(math.ceil(x), x), 'v_floor_f16': math.floor,
+    'v_trunc_f16': lambda x: math.copysign(math.trunc(x), x), 'v_rndne_f16': lambda x: math.copysign(round(x), x),
     'v_fract_f16': ref_fract, 'v_rcp_f16': lambda x: 1.0 / x, 'v_rsq_f16': lambda x: 1.0 / math.sqrt(x),
     'v_sqrt_f16': math.sqrt, 'v_sin_f16': lambda x: math.sin(TAU * x), 'v_cos_f16': lambda x: math.cos(TAU * x),
     'v_exp_f16': lambda x: 2.0 ** x, 'v_log_f16': math.log2,
