@@ -2946,7 +2946,7 @@ class Pipeline:
                ' return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }',
                'uint3 mad64u(uint a, uint b, uint clo, uint chi) {'
                ' uint ph = mulhi32(a, b), pl = a * b, lo = pl + clo, c0 = lo < pl ? 1u : 0u, hs = ph + chi, hi = hs + c0;'
-               ' return uint3(lo, hi, (ph > ~chi || hi < c0) ? 1u : 0u); }',
+               ' return uint3(lo, hi, (ph > ~chi ? 1u : 0u) | (hi < c0 ? 1u : 0u)); }',
                'uint3 mad64i(uint a, uint b, uint clo, uint chi) {'
                ' uint ph = mulhi32(a, b) - (asint(a) < 0 ? b : 0u) - (asint(b) < 0 ? a : 0u), pl = a * b, lo = pl + clo;'
                ' return uint3(lo, ph + chi + (lo < pl ? 1u : 0u), 0u); }',
