@@ -486,6 +486,7 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         return slots;
     }();
     const bool bc7_4k = use_bc7_4k_s_layout(desc);
+    // The 4 KiB profile requires UNKNOWN layout and one mip. BC64 requires layout 0x109 and six or nine mips.
     const auto* slots = bc64::supports(desc) ? bc_table.data() : table.data();
     if (bc7_4k) slots = bc7_4k_table.data();
     auto* computer = new Computer{slots, desc, 1, bc7_4k};
