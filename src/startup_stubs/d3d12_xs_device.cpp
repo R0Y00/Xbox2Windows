@@ -68,6 +68,7 @@
 #include <new>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -124,6 +125,9 @@ struct alignas(16) WrapperOwn {
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     bool compute_pipeline;   // PipelineState: a desktop compute pipeline
+    u64 compute_trace_key;   // Opt-in trace: selected slot 62 container hash
+    const void* compute_trace_root;
+    LONG compute_trace_dispatches;
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
@@ -503,6 +507,8 @@ extern LONG capture_active;
 // noop_slot, which times, captures and traces it, then hands over to the entry here if there is one.
 using ListTyped = u64(__stdcall*)(u64, u64, u64, u64, u64, u64, u64, u64);
 ListTyped list_typed[slot_count];
+bool compute_binding_trace_enabled();
+void trace_compute_binding(Wrapper*, int slot, u64 first, u64 second, u64 third, u64 fourth);
 namespace capture { void list_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, const u64* stack, u64 ret); }
 const char* arg_kind(u64 value)
 {
@@ -538,6 +544,9 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
         log("x2w-frame tid=%lu list=%llx slot%d(0x%llx%s%s, 0x%llx%s%s, 0x%llx%s%s | 0x%llx, 0x%llx, 0x%llx, 0x%llx) ret=+0x%llx",
             GetCurrentThreadId(), rcx, N, rdx, *arg_kind(rdx) ? ":" : "", arg_kind(rdx), r8, *arg_kind(r8) ? ":" : "",
             arg_kind(r8), r9, *arg_kind(r9) ? ":" : "", arg_kind(r9), s0, s1, s2, s3, ret);
+    }
+    if constexpr (K == list_kind && (N == 14 || N == 35 || N == 37 || N == 39 || N == 41 || N == 43 || N == 45)) {
+        if (compute_binding_trace_enabled()) trace_compute_binding(reinterpret_cast<Wrapper*>(rcx), N, rdx, r8, r9, s0);
     }
     if (K == list_kind && list_typed[N]) return list_typed[N](rcx, rdx, r8, r9, s0, s1, s2, s3);
     // Register arguments only: stale caller stack words often still point at an IID. The probe
@@ -1630,6 +1639,7 @@ std::size_t readable_window(u64 address, std::size_t wanted);
 struct RootParameter {
     D3D12_ROOT_PARAMETER_TYPE type;
     UINT shader_register, space;
+    UINT constants_count{};
 };
 SRWLOCK root_lock = SRWLOCK_INIT;
 std::unordered_map<const Wrapper*, std::vector<RootParameter>>& root_infos()
@@ -1693,6 +1703,10 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
                     parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) {
                     info.shader_register = parameter.Descriptor.ShaderRegister;
                     info.space = parameter.Descriptor.RegisterSpace;
+                } else if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                    info.shader_register = parameter.Constants.ShaderRegister;
+                    info.space = parameter.Constants.RegisterSpace;
+                    info.constants_count = parameter.Constants.Num32BitValues;
                 }
                 parameters.push_back(info);
             }
@@ -1949,12 +1963,24 @@ std::size_t readable_window(u64 address, std::size_t wanted)
     return x2w_local::probe_readable(static_cast<std::uintptr_t>(address), wanted);
 }
 
+// The opt-in slot 62 trace records setter arguments without forwarding the calls.
+struct ComputeBindingTrace {
+    struct Parameter {
+        UINT setter{};           // The most recent non-constant setter for this parameter.
+        u64 argument{};          // Address or handle. It is classified at dispatch, never printed.
+        u64 constants{};         // Dwords covered by constant setters, within the first 64.
+    };
+    const Wrapper* root{};
+    std::array<Parameter, 16> parameters{};
+};
+
 // Per-list state while recording.
 struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
     ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
     const std::vector<RootParameter>* compute_params = nullptr;
+    std::unique_ptr<ComputeBindingTrace> compute_trace;
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -2088,6 +2114,10 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     pass.compute_params = real ? root_info(w) : nullptr;
+    if (compute_binding_trace_enabled() && (!pass.compute_trace || pass.compute_trace->root != w)) {
+        pass.compute_trace = std::make_unique<ComputeBindingTrace>();
+        pass.compute_trace->root = w;
+    }
     if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
 }
 
@@ -2719,6 +2749,7 @@ std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_draw.inl"
+#include "startup_stubs/d3d12_compute_binding_trace.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
@@ -3578,7 +3609,9 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
             static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text, bytes);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
-    note_pipeline(static_cast<Wrapper*>(*out), 62, nullptr, desc, sizeof(*desc));
+    auto* pipeline = static_cast<Wrapper*>(*out);
+    note_pipeline(pipeline, 62, nullptr, desc, sizeof(*desc));
+    note_compute_binding_pipeline(pipeline, *desc);
     return S_OK;
 }
 

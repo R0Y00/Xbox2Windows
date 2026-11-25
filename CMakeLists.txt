@@ -1105,6 +1105,10 @@ foreach(backend IN ITEMS warp hardware)
 endforeach()
 
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
+add_executable(startup_compute_binding_trace tests/startup_compute_binding_trace.cpp)
+target_compile_features(startup_compute_binding_trace PRIVATE cxx_std_20)
+target_link_libraries(startup_compute_binding_trace PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+
 add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
 target_link_libraries(startup_indirect_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
@@ -2919,6 +2923,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
     # Device slot 67 compute pipelines publish req_<key>.{desc,sa,sb,data,root,c67}; the control (render mode off) must fail.
+    add_test(NAME startup_compute_binding_trace_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_binding_trace_check.py"
+        "$<TARGET_FILE:startup_compute_binding_trace>")
+    set_tests_properties(startup_compute_binding_trace_warp PROPERTIES TIMEOUT 30)
     add_test(NAME startup_compute_request_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>")
     add_test(NAME startup_compute_request_disabled_control COMMAND "${INTAKE_PYTHON}" -B
