@@ -2604,8 +2604,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             } else {
                 queue->ExecuteCommandLists(ready_count, ready.data());
             }
-            retire_draw_sampler_heaps(queue, ready);
             retire_address_uploads(queue, ready);
+            retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
             InterlockedIncrement(&render_executes);
         }

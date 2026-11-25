@@ -218,7 +218,8 @@ def gate_colour(payload):
 def check_gate(directory, consumer, backend, ring):
     """Uploads recorded while the queue cannot run must still hold their bytes when it does.
 
-    The fixture makes the queue wait on a fence it controls, then records and submits eighteen lists. Each
+    The normal fixture records and discards a draw using payload 0 before the first submit retries that
+    payload. The fixture makes the queue wait on a fence it controls, then records and submits eighteen lists. Each
     republishes one 2048x2048 RGBA8 texture (64 KiB standard layout, 16 MiB) from the same address with a new
     payload and draws it: payload 0 over the left half of the target, the others over the right half. The list
     object and its allocator are reset between submits. Nothing may complete while the fence is unsignalled.
@@ -233,9 +234,8 @@ def check_gate(directory, consumer, backend, ring):
             "float4 main(float4 p : SV_Position) : SV_Target {\n"
             "  return t.Load(int3(uint(p.x) % 2048, uint(p.y) % 2048, 0));\n}\n")
     trap_log = directory / "trap.log"
-    modes = {"X2W_TEST_CONSOLE_GATE": "1", "X2W_TRAP_LOG": str(trap_log)}
-    if ring:
-        modes["X2W_TEST_ADDRESS_UPLOAD_RING"] = "1"
+    modes = {"X2W_TEST_CONSOLE_GATE": "1", "X2W_TRAP_LOG": str(trap_log),
+             "X2W_TEST_ADDRESS_UPLOAD_RING": "1" if ring else ""}
     actual = draw_texture(directory, consumer, backend, hlsl, modes)
     if actual is None:
         return 77
