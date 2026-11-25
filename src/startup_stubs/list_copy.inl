@@ -83,12 +83,18 @@ bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // A target or UAV holds what the GPU wrote; its title memory is never uploaded.
         if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return true;
-        const auto written = texture_uploads().find(source.resource);
         if (list_wrote(self, source.resource)) return true;
-        if (written != texture_uploads().end() && written->second.gpu_written) return true;
-        if (!upload_texture(self, source.wrapper, source.resource)) return false;
-        const auto found = texture_uploads().find(source.resource);
-        return found != texture_uploads().end() && found->second.staged;
+        AcquireSRWLockExclusive(&draw_lock);
+        const auto written = texture_uploads().find(source.resource);
+        bool ok = false;
+        if (written != texture_uploads().end() && written->second.gpu_written) {
+            ok = true;
+        } else if (upload_texture(self, source.wrapper, source.resource)) {
+            const auto found = texture_uploads().find(source.resource);
+            ok = found != texture_uploads().end() && found->second.staged;
+        }
+        ReleaseSRWLockExclusive(&draw_lock);
+        return ok;
     }
     const auto* info = resource_info(source.wrapper);
     return info && info->placement == Placement::aliased_buffer;
@@ -207,7 +213,9 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
             (from_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
             SUCCEEDED(from.resource->GetHeapProperties(&source_properties, nullptr)) &&
             source_properties.Type == D3D12_HEAP_TYPE_DEFAULT;
-        note_mesh_xmem_write(self, to.wrapper, destination_offset, bytes,
+        const char* source_kind = upload ? "upload" : mesh_record ? "default-uav" :
+            (from_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? "uav-capable-buffer" : "buffer";
+        note_mesh_xmem_write(self, to.wrapper, destination_offset, bytes, 15, source_kind,
                              srv_word || mesh_record ? from.resource : nullptr, source_offset);
     }
     if (indirect_copy_ranges()) {
@@ -237,7 +245,7 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
     retire_hold(self, to.wrapper);
     retire_hold(self, from.wrapper);
     if (to_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        note_mesh_xmem_write(self, to.wrapper, 0, to_desc.Width);
+        note_mesh_xmem_write(self, to.wrapper, 0, to_desc.Width, 17, "buffer");
         note_copy_gpu_range(self, to.resource, 0, to_desc.Width, false);
     } else mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
