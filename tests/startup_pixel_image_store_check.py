@@ -126,6 +126,14 @@ def controls():
     else:
         raise AssertionError('dmask 0xf with three data registers was accepted')
     print('refused dmask 0xf with three data registers (v[4:6])')
+    # Mask text that is not an integer is a named refusal, not a ValueError.
+    try:
+        pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xz', 'dim:SQ_RSRC_IMG_2D'])
+    except G.Unsupported as error:
+        assert str(error) == 'image_store with dmask 0xz: not an integer', error
+    else:
+        raise AssertionError('a malformed dmask was accepted')
+    print('refused dmask 0xz (not an integer)')
     refused(with_store(bytes.fromhex('080f24f000040400')), 'image_store_mip')
     print('refused image_store_mip (not lowered)')
     try:

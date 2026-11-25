@@ -1488,7 +1488,11 @@ class Stage:
             raise Unsupported('%s without exactly one dim and dmask' % name)
         if dims[0] != 'SQ_RSRC_IMG_2D':
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
-        if int(masks[0], 0) != 0xf:
+        try:
+            mask = int(masks[0], 0)
+        except ValueError:
+            raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
+        if mask != 0xf:
             raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
         data = reg_range(ops[0])
         if not data or data[0] != 'v' or data[2] - data[1] != 3:
