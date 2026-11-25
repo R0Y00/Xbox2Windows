@@ -3048,8 +3048,7 @@ class Stage:
         body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
-    def op_image_gather4_lz(self, ops, mods):
-        name = 'image_gather4_lz'
+    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
         for modifier in mods:
@@ -3057,30 +3056,49 @@ class Stage:
                 raise Unsupported('%s modifier %s' % (name, modifier))
         if [m for m in mods if m.startswith('dim:')] != ['dim:SQ_RSRC_IMG_2D']:
             raise Unsupported('%s requires a 2D texture' % name)
-        channels = {'dmask:0x1': 'Red', 'dmask:0x2': 'Green', 'dmask:0x4': 'Blue', 'dmask:0x8': 'Alpha'}
+        channels = {'dmask:0x1': ('Red', 0), 'dmask:0x2': ('Green', 1), 'dmask:0x4': ('Blue', 2), 'dmask:0x8': ('Alpha', 3)}
         masks = [m for m in mods if m.startswith('dmask:')]
         if len(masks) != 1 or masks[0] not in channels:
             raise Unsupported('%s requires a one-hot dmask' % name)
         dst, addr, sampler = (reg_range(ops[i]) for i in (0, 1, 3))
         if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
             raise Unsupported('%s requires four destination registers' % name)
-        if not addr or addr[0] != 'v' or addr[2] - addr[1] != 1 or addr[2] > 255:
-            raise Unsupported('%s requires two contiguous address registers' % name)
+        if not addr or addr[0] != 'v' or addr[2] - addr[1] + 1 != addr_count or addr[2] > 255:
+            raise Unsupported('%s requires %s' % (name, addr_label))
         words = self.const_words(ops[3]) if sampler and sampler[0] == 's' and sampler[2] - sampler[1] == 3 else None
         if words is None:
             raise Unsupported('%s requires a constant sampler' % name)
         from pixel_aot import check_gather_sampler
+        profiled = gather_2d_profile_words(words)
+        if not mip_preclamp and (words[2] & (1 << 28)):
+            profiled = (profiled[0], profiled[1], profiled[2] | (1 << 28), profiled[3])
         try:
-            # Both the guest _lz and D3D Gather select mip zero of the bound view.
-            # Validate the sampler for that level even when the view has more mips.
-            check_gather_sampler(gather_2d_profile_words(words), 1, comparison=False)
+            # _lz reads mip zero of the bound view; _l checks all other sampler fields against
+            # the 2D gather profile and enforces words[1] MAX_LOD plus view mip bounds in HLSL.
+            check_gather_sampler(profiled, 1, comparison=False)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
         key = self.fixed_table_image(ops[2], name) if self.kind == 'cs' else self.descriptor(ops[2])
         tex = self.pipe.resource(key, 'tex2d')
+        return dst, addr, words, channels[masks[0]], tex
+
+    def op_image_gather4_lz(self, ops, mods):
+        dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
+            'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True)
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
-        self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channels[masks[0]], smp, u, v))
+        self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channel_name, smp, u, v))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
+    def op_image_gather4_l(self, ops, mods):
+        """image_gather4_l on a 2D texture with explicit LOD and a validated constant sampler."""
+        dst, addr, words, (_, channel_index), tex = self.gather_2d_setup(
+            'image_gather4_l', ops, mods, 3, 'three contiguous address registers', mip_preclamp=False)
+        self.pipe.uses_gather_2d_lod = True
+        max_lod = ((words[1] >> 12) & 0xfff) / 256.0
+        u, v, lod = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
+        self.emit('t = gather_2d_lod(%s, float2(%s, %s), %s, %d, %sf);' % (tex, u, v, lod, channel_index, repr(max_lod)))
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
@@ -4153,6 +4171,7 @@ VERIFIED_SINT_RTVS = frozenset((4, 18, 43))
 
 class Pipeline:
     uses_pack16_rne = False
+    uses_gather_2d_lod = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
@@ -4183,6 +4202,7 @@ class Pipeline:
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.uses_pack16_rne = False
+        self.uses_gather_2d_lod = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -4362,6 +4382,30 @@ class Pipeline:
                 '    return unorm16 != 0u ? pack16_unorm16(value) : pack16_rne(value);',
                 '}',
             ))
+        if self.uses_gather_2d_lod:
+            out.extend((
+                'float4 gather_2d_lod(Texture2D<float4> tex, float2 uv, float lod, uint component, float max_lod) {',
+                '    float4 result = float4(0.0f, 0.0f, 0.0f, 0.0f);',
+                '    if ((asuint(uv.x) & 0x7f800000u) != 0x7f800000u &&',
+                '        (asuint(uv.y) & 0x7f800000u) != 0x7f800000u &&',
+                '        (asuint(lod) & 0x7f800000u) != 0x7f800000u) {',
+                '        uint width, height, levels;',
+                '        tex.GetDimensions(0u, width, height, levels);',
+                '        if (levels != 0u) {',
+                '            uint mip = min(uint(floor(clamp(lod, 0.0f, max_lod) + 0.5f)), levels - 1u);',
+                '            tex.GetDimensions(mip, width, height, levels);',
+                '            int2 edge = int2(width, height) - 1;',
+                '            precise float2 scaled = uv * float2(width, height) - 0.5f;',
+                '            int2 origin = int2(floor(clamp(scaled, float2(-1.0f, -1.0f), float2(width, height))));',
+                '            result = float4(tex.Load(int3(clamp(origin + int2(0, 1), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin + int2(1, 1), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin + int2(1, 0), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin,              int2(0, 0), edge), int(mip)))[component]);',
+                '        }',
+                '    }',
+                '    return result;',
+                '}',
+            ))
         return out
 
     def interface(self, for_pixel):
@@ -4492,6 +4536,7 @@ class ComputePipeline(Pipeline):
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
+        self.uses_gather_2d_lod = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: anything but a stride clear
         self.lod_unvalidated = set()

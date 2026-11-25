@@ -13433,6 +13433,35 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
 ```
 
+### Explicit-LOD 2D gather
+
+The startup pixel and compute translators lower gfx1013 `image_gather4_l` on a
+2D texture with three contiguous address registers (`u`, `v`, explicit `lod`),
+one-hot component `dmask`, and a constant sampler matching the 2D gather profile
+(`CLAMP_LAST_TEXEL` in X/Y, `CLAMP_Z` ignored, bilinear or point XY, point mip
+filtering, zero `MIN_LOD`, zero bias, and zero `MIP_POINT_PRECLAMP`). Compute
+stages enforce the same fixed-table eight-word unmodified image descriptor check
+as `image_gather4_lz`.
+
+Because Direct3D 12 SM 5.1/6.0 `Gather` always reads view mip zero, the lowering
+emits `gather_2d_lod(...)`, which checks finite `uv` and `lod` bitwise, queries
+visible view dimensions via `GetDimensions`, clamps `lod` to `[0, MAX_LOD]` and
+rounds to `[0, levels - 1]`, and loads the four `(0,1), (1,1), (1,0), (0,0)`
+bilinear taps clamped to the selected mip bounds. Non-finite inputs evaluate to
+zeros without aborting other instructions or lanes.
+
+Source-built `gfx1013` compute and pixel fixtures check all four channels,
+overlapping destination/address registers, descriptor provenance and table
+alignment, refusal controls, DXC `cs_6_0` compute readbacks across explicit,
+fractional, negative, sampler-clamped, view-relative (`MostDetailedMip = 1`),
+and per-lane dynamic LODs, DXC `ps_6_0` / FXC `ps_5_1` pixel draws, and
+predicted failure counts under negative mutations.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_hardware)?$' -V
+```
+
 ## Startup translator: fixed-mip 2D comparison gathers
 
 The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D
