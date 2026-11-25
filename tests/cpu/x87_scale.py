@@ -337,7 +337,9 @@ def check_rejections():
 
 
 if __name__ == "__main__":
-    mode, first, second, *rest = sys.argv[1:]
+    mode, *args = sys.argv[1:]  # check-rejections takes no paths
+    first, second = (args + [None, None])[:2]
+    rest = args[2:]
     if mode == "asm":
         write_asm(first, second)
     elif mode == "emit":
