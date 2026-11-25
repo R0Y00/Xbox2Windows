@@ -96,7 +96,8 @@ def main():
     try:
         translate('s_cbranch_scc0 label_000C', load, 's_nop 0', fetch, 's_endpgm')
     except G.Unsupported as error:
-        assert 'without a matching load on every path' in str(error), error
+        assert ('without a matching load on every path' in str(error)
+                or 'joined at a branch target' in str(error)), error
     else:
         raise AssertionError('branch skipped the only descriptor load')
     s = run(TABLE, 's_load_dwordx4', 's[100:103], s[4:5], 0x20')

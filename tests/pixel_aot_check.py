@@ -345,6 +345,15 @@ def expect_unbound_operand(function, program, bank, register, index, offset, ins
         raise AssertionError(f"An unbound {register} was accepted")
 
 
+# draw-core-vulkan sets this to the extra DXC arguments that make compile_shader emit SPIR-V for Vulkan 1.2
+# instead of DXIL. The bindings follow tests/vk_pixel_draw.c: b0 to b2 at 0 to 2, t0 and t1 at 16 and 17, s0 at 32.
+# It stays None for every other mode, and compile_shader then builds exactly the DXIL command it always built.
+SPIRV_ARGS = None
+SPIRV_TARGET_ARGS = ["-spirv", "-fspv-target-env=vulkan1.2", "-fvk-use-dx-layout",
+                     "-fvk-b-shift", "0", "0", "-fvk-t-shift", "16", "0",
+                     "-fvk-s-shift", "32", "0", "-fvk-u-shift", "48", "0"]
+
+
 def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MODE, ieee=True):
     """Run DXC on one translated shader under an explicit binary32 denormal mode."""
     # DXC accepts -denorm only at shader model 6.2 and above; ps_6_2 is the minimum target.
@@ -352,8 +361,12 @@ def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MO
                "-T", "ps_6_2", "-E", "main", "-Fo", shader]
     if listing is not None:
         command += ["-Fc", listing]
+    if SPIRV_ARGS is not None:
+        command += SPIRV_ARGS
     command.append(source)
     subprocess.run(command, check=True)
+    if SPIRV_ARGS is not None:
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", shader], check=True)
 
 
 def flush_ftz(value):
@@ -23742,6 +23755,48 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     return check_blend_and_scalar_draws(directory, compiler, renderer, backend)
 
 
+def check_render_vulkan(directory, compiler, device, *options):
+    """draw-core on a Vulkan device: SPIR-V from the same DXC options, drawn through tests/vk_offscreen.py.
+
+    The renderer is the Python interpreter and the backend is the adapter, so check_render and its negative
+    controls run unchanged. A device without shaderDenormPreserveFloat32 is a capability skip (77), because
+    every program here is compiled with -denorm preserve; --allow-denorm-mismatch draws anyway for a diagnostic run.
+    """
+    global SPIRV_ARGS
+    if set(options) - {"--allow-denorm-mismatch"}:
+        raise SystemExit("usage: pixel_aot_check.py draw-core-vulkan <dxc> <device> [--allow-denorm-mismatch]")
+    tests = Path(__file__).resolve().parent
+    out = tests.parent / "out"
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="vk-core-", dir=out) as work_name:
+        work = Path(work_name)
+        host = work / "vk_pixel_draw"
+        subprocess.run(["cc", "-std=c11", "-O1", "-o", host, tests / "vk_pixel_draw.c", "-lvulkan"], check=True)
+        vertex = work / "pixel_aot_vs.spv"
+        subprocess.run([compiler, *SPIRV_TARGET_ARGS, "-fvk-invert-y", "-T", "vs_6_2", "-E", "main",
+                        "-Fo", vertex, tests / "pixel_aot_vs.hlsl"], check=True)
+        caps = subprocess.run([host, "--caps", device], capture_output=True, text=True)
+        if caps.returncode:
+            sys.stderr.write(caps.stderr)
+            return caps.returncode
+        print(caps.stdout.strip())
+        environment = {"X2W_VK_HOST": str(host), "X2W_VK_VS": str(vertex), "X2W_VK_DEVICE": device,
+                       "X2W_VK_WORK": str(work),
+                       "X2W_VK_ALLOW_NO_DENORM": "1" if "--allow-denorm-mismatch" in options else "0"}
+        SPIRV_ARGS = SPIRV_TARGET_ARGS
+        try:
+            with patch.dict(os.environ, environment):
+                try:
+                    return check_render(directory, compiler, sys.executable, str(tests / "vk_offscreen.py"),
+                                        core_only=True)
+                except subprocess.CalledProcessError as error:
+                    if error.returncode == 77 and str(error.cmd[0]) == sys.executable:
+                        return 77
+                    raise
+        finally:
+            SPIRV_ARGS = None
+
+
 def check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend):
     source = directory / "sopk_cmpk_cmovk.hlsl"
     shader = directory / "sopk_cmpk_cmovk.cso"
@@ -25445,6 +25500,8 @@ def main():
                 return check_bit_draws(directory, *args)
             elif mode in ("draw", "draw-core"):
                 return check_render(directory, *args, core_only=mode == "draw-core")
+            elif mode == "draw-core-vulkan":
+                return check_render_vulkan(directory, *args)
             elif mode == "three-way":
                 return check_three_way_draw(directory, *args)
             elif mode == "buffer-color":

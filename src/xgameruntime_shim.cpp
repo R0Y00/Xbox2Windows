@@ -29,6 +29,7 @@
 //   XPackageGetMountPath                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagegetmountpath?view=gdk-2604
 //   XPackageCloseMountHandle            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackageclosemounthandle?view=gdk-2510
 //   XPackageMountWithUiAsync            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagemountwithuiasync?view=gdk-2610
+//   XPackageMountWithUiResult           https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagemountwithuiresult?view=gdk-2610
 //   XSystemGetConsoleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/functions/xsystemgetconsoleid?view=gdk-2604
 //   XSystemGetDeviceType                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/functions/xsystemgetdevicetype?view=gdk-2604
 //   XSystemDeviceType                   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/enums/xsystemdevicetype?view=gdk-2604
@@ -46,9 +47,14 @@
 // operation completes before the call returns, the callback fires once on
 // XTaskQueueDispatch, XUserAddResult returns E_PENDING until then and then
 // hands over one new user handle exactly once.
-// Async gap: XPackageMountWithUiAsync remains a stub.
+// XPackageMountWithUiAsync / XPackageMountWithUiResult use the same contract: the
+// package identifier is validated like XPackageMount (E_INVALIDARG, nothing
+// consumed), no UI is ever shown, the mount completes before the call returns,
+// XPackageMountWithUiResult returns E_PENDING until the callback was dispatched
+// and then hands over one mount handle exactly once (the caller closes it with
+// XPackageCloseMountHandle).
 // XAsyncGetStatus and XAsyncGetResultSize answer only for blocks the shim tracks
-// (XGameSaveInitializeProviderAsync and XUserAddAsync blocks). XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
+// (XGameSaveInitializeProviderAsync, XUserAddAsync and XPackageMountWithUiAsync blocks). XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
 // XTaskQueueDispatch (completion port) and XTaskQueueCloseHandle model one
 // shim-owned manual queue. XGameSaveInitializeProviderAsync is implemented for
 // one queue configuration: a live manual queue from XTaskQueueCreate, where it
@@ -166,6 +172,9 @@ struct XGameSaveBlob {
     std::uint8_t* data;
 };
 
+// Public XGameSave.h callback: return false to stop the enumeration.
+using XGameSaveBlobInfoCallback = bool CALLBACK(const XGameSaveBlobInfo*, void*);
+
 // Shim-only observability interface. It is not a GDK API.
 struct XGameRuntimeShimLogEntry {
     std::uint32_t sequence;
@@ -200,6 +209,8 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XGameSaveSubmitBlobWrite, XGameSave, HRESULT, (XGameSaveUpdateHandle updateContext, const char* blobName, const std::uint8_t* data, std::size_t byteCount), implemented_hr, (updateContext, blobName, data, byteCount), game_save_submit_blob_write) \
     X(XGameSaveSubmitUpdate, XGameSave, HRESULT, (XGameSaveUpdateHandle updateContext), implemented_hr, (updateContext), game_save_submit_update) \
     X(XGameSaveReadBlobData, XGameSave, HRESULT, (XGameSaveContainerHandle container, const char** blobNames, std::uint32_t* countOfBlobs, std::size_t blobsSize, XGameSaveBlob* blobData), implemented_hr, (container, blobNames, countOfBlobs, blobsSize, blobData), game_save_read_blob_data) \
+    X(XGameSaveEnumerateBlobInfo, XGameSave, HRESULT, (XGameSaveContainerHandle container, void* context, XGameSaveBlobInfoCallback* callback), implemented_hr, (container, context, callback), game_save_enumerate_blob_info) \
+    X(XGameSaveEnumerateBlobInfoByName, XGameSave, HRESULT, (XGameSaveContainerHandle container, const char* blobNamePrefix, void* context, XGameSaveBlobInfoCallback* callback), implemented_hr, (container, blobNamePrefix, context, callback), game_save_enumerate_blob_info_by_name) \
     X(XGameSaveCloseProvider, XGameSave, void, (XGameSaveProviderHandle provider), implemented_void, (provider), game_save_close_provider) \
     X(XGameSaveCloseContainer, XGameSave, void, (XGameSaveContainerHandle context), implemented_void, (context), game_save_close_container) \
     X(XGameSaveCloseUpdate, XGameSave, void, (XGameSaveUpdateHandle context), implemented_void, (context), game_save_close_update) \
@@ -210,7 +221,8 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XPackageGetMountPathSize, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t* pathSize), implemented_hr, (mountHandle, pathSize), xpackage_get_mount_path_size) \
     X(XPackageGetMountPath, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t pathSize, char* path), implemented_hr, (mountHandle, pathSize, path), xpackage_get_mount_path) \
     X(XPackageCloseMountHandle, XPackage, void, (XPackageMountHandle mountHandle), implemented_void, (mountHandle), xpackage_close_mount_handle) \
-    X(XPackageMountWithUiAsync, XPackage, HRESULT, (const char*, XAsyncBlock*), stub, (), stub) \
+    X(XPackageMountWithUiAsync, XPackage, HRESULT, (const char* packageIdentifier, XAsyncBlock* asyncBlock), implemented_hr, (packageIdentifier, asyncBlock), xpackage_mount_with_ui_async) \
+    X(XPackageMountWithUiResult, XPackage, HRESULT, (XAsyncBlock* asyncBlock, XPackageMountHandle* mountHandle), implemented_hr, (asyncBlock, mountHandle), xpackage_mount_with_ui_result) \
     X(XSystemGetConsoleId, XSystem, HRESULT, (std::size_t consoleIdSize, char* consoleId, std::size_t* consoleIdUsed), implemented_hr, (consoleIdSize, consoleId, consoleIdUsed), xsystem_get_console_id) \
     X(XSystemGetDeviceType, XSystem, XSystemDeviceType, (), implemented_value, (), xsystem_get_device_type) \
     X(XGameGetXboxTitleId, XGame, HRESULT, (std::uint32_t* titleId), implemented_hr, (titleId), xgame_get_xbox_title_id) \
@@ -356,7 +368,7 @@ static_assert(has_implemented(thunks, "XPersistentLocalStorage"));
 static_assert(has_implemented(thunks, "XPackage"));
 static_assert(has_implemented(thunks, "XSystem"));
 static_assert(has_implemented(thunks, "XGame"));
-static_assert(has_stub(thunks, "XPackageMountWithUiAsync"));
+static_assert(!has_stub(thunks, "XPackageMountWithUiAsync"));
 
 struct XUserHandleStorage {
     std::uint64_t id = 0;
@@ -410,7 +422,7 @@ struct XPackageMountStorage {
 
 // One in-flight or completed-but-unclaimed XGameSaveInitializeProviderAsync.
 // The slot lives from the call until XGameSaveInitializeProviderResult.
-enum class AsyncKind : std::uint8_t { provider, user_add };
+enum class AsyncKind : std::uint8_t { provider, user_add, package_mount };
 
 struct ProviderAsyncSlot {
     bool live = false;
@@ -424,6 +436,7 @@ struct ProviderAsyncSlot {
     HRESULT status = S_OK;
     XGameSaveProviderHandle provider = nullptr;
     XUserHandle user = nullptr;
+    XPackageMountHandle package = nullptr;
 };
 
 struct RuntimeState {
@@ -1024,7 +1037,8 @@ HRESULT async_get_result_size(XAsyncBlock* async_block, std::size_t* buffer_size
         // The result is one provider or user handle; nothing is consumed here.
         if (SUCCEEDED(status)) {
             *buffer_size = slot->kind == AsyncKind::user_add ? sizeof(XUserHandle)
-                                                             : sizeof(XGameSaveProviderHandle);
+                         : slot->kind == AsyncKind::package_mount ? sizeof(XPackageMountHandle)
+                                                                  : sizeof(XGameSaveProviderHandle);
         }
     }
     ReleaseSRWLockExclusive(&runtime_state.lock);
@@ -1079,6 +1093,55 @@ HRESULT user_add_result(XAsyncBlock* async_block, XUserHandle* new_user) noexcep
     }
     const HRESULT status = slot->status;
     *new_user = slot->user;
+    *slot = ProviderAsyncSlot{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return status;
+}
+
+// The identifier is checked before the block or capacity is touched, so a bad
+// identifier consumes nothing. The mount is made now and stays owned by the
+// slot until XPackageMountWithUiResult hands it over; a failed mount releases
+// the slot again.
+HRESULT xpackage_mount_with_ui_async(const char* package_identifier, XAsyncBlock* async_block) noexcept
+{
+    if (!valid_package_identifier(package_identifier)) return E_INVALIDARG;
+    ProviderAsyncSlot* reserved = nullptr;
+    const HRESULT reserve = reserve_async(async_block, AsyncKind::package_mount, &reserved);
+    if (FAILED(reserve)) return reserve;
+
+    XPackageMountHandle mount = nullptr;
+    const HRESULT status = xpackage_mount(package_identifier, &mount);
+    if (FAILED(status)) {
+        release_async(reserved);
+        return status;
+    }
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    reserved->package = mount;
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    complete_async(reserved, async_block);
+    return S_OK;
+}
+
+// E_PENDING until the callback has been dispatched, then S_OK with one mount
+// handle. The slot is consumed, so a second call, an untracked block or a block
+// of another operation kind gets E_INVALIDARG and no handle.
+HRESULT xpackage_mount_with_ui_result(XAsyncBlock* async_block, XPackageMountHandle* mount_handle) noexcept
+{
+    if (!mount_handle) return E_POINTER;
+    *mount_handle = nullptr;
+    if (!async_block) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    ProviderAsyncSlot* slot = find_provider_async(async_block);
+    if (!slot || slot->kind != AsyncKind::package_mount) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_INVALIDARG;
+    }
+    if (!slot->completed || slot->callback_pending) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_PENDING;
+    }
+    const HRESULT status = slot->status;
+    *mount_handle = slot->package;
     *slot = ProviderAsyncSlot{};
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return status;
@@ -1375,6 +1438,62 @@ HRESULT game_save_read_blob_data(XGameSaveContainerHandle container, const char*
     *count_of_blobs = requested;
     ReleaseSRWLockShared(&runtime_state.lock);
     return S_OK;
+}
+
+// Blob enumeration copies the matching names and sizes under the shared lock,
+// releases it, and only then calls the title. The callback may therefore call
+// back into this shim (including closing the container) without deadlocking,
+// and sees the name pointer valid for the duration of that one call.
+// A null prefix is an argument error; an empty prefix matches every blob.
+HRESULT enumerate_blobs(XGameSaveContainerHandle container, const char* prefix, void* context,
+                        XGameSaveBlobInfoCallback* callback) noexcept
+{
+    if (!container || !prefix || !callback) return E_INVALIDARG;
+    struct Entry {
+        char name[blob_name_capacity];
+        std::uint32_t size;
+    };
+    std::array<Entry, blob_capacity> entries{};
+    std::size_t count = 0;
+    const std::size_t prefix_length = std::strlen(prefix);
+    AcquireSRWLockShared(&runtime_state.lock);
+    const auto found_container = find_live(runtime_state.containers, container);
+    if (!found_container) {
+        ReleaseSRWLockShared(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    const auto provider = find_live(runtime_state.providers, found_container->provider);
+    const auto store = find_store_by_id(found_container->store_id);
+    if (!provider || provider->scope != found_container->provider_scope || !store ||
+        store->provider_scope != found_container->provider_scope) {
+        ReleaseSRWLockShared(&runtime_state.lock);
+        return e_gs_handle_expired;
+    }
+    for (const auto& blob : store->blobs) {
+        if (!blob.live || std::strncmp(blob.name, prefix, prefix_length) != 0) continue;
+        std::memcpy(entries[count].name, blob.name, sizeof(blob.name));
+        entries[count].size = blob.size;
+        ++count;
+    }
+    ReleaseSRWLockShared(&runtime_state.lock);
+    for (std::size_t i = 0; i < count; ++i) {
+        const XGameSaveBlobInfo info{entries[i].name, entries[i].size};
+        if (!callback(&info, context)) break;
+    }
+    return S_OK;
+}
+
+HRESULT game_save_enumerate_blob_info(XGameSaveContainerHandle container, void* context,
+                                      XGameSaveBlobInfoCallback* callback) noexcept
+{
+    return enumerate_blobs(container, "", context, callback);
+}
+
+HRESULT game_save_enumerate_blob_info_by_name(XGameSaveContainerHandle container,
+                                              const char* blob_name_prefix, void* context,
+                                              XGameSaveBlobInfoCallback* callback) noexcept
+{
+    return enumerate_blobs(container, blob_name_prefix, context, callback);
 }
 
 HRESULT game_save_close_provider(XGameSaveProviderHandle provider) noexcept
