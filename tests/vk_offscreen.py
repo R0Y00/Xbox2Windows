@@ -374,16 +374,20 @@ def self_test():
         width = height = 64
         exact = readback_of(plain)
         compare(plain, as_bytes(exact), width, height)
-        drift = list(exact)
-        drift[(5 * width + 9) * 4 + 2] += 1  # x=9 y=5, one ulp in channel 2
-        drift[(20 * width + 1) * 4] += 1  # a later pixel must not be reported
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            must_raise(PixelMismatch, "differs from CPU reference", compare, plain, as_bytes(drift), width, height)
-        report = stderr.getvalue().splitlines()
-        assert report[0] == "pixel_mismatch x=9 y=5", report[0]
-        assert report[3].startswith("channel=2 expected=0.75 actual=0.75 ") and report[3].endswith(
-            f"expected_bits={bits(0.75):08x} actual_bits={bits(0.75) + 1:08x}"), report[3]
+        for channel in range(4):
+            drift = list(exact)
+            drift[(5 * width + 9) * 4 + channel] += 1  # x=9 y=5, one ulp in this channel only
+            drift[(20 * width + 1) * 4] += 1  # a later pixel must not be reported
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                must_raise(PixelMismatch, "differs from CPU reference", compare, plain, as_bytes(drift), width, height)
+            report = stderr.getvalue().splitlines()
+            assert report[0] == "pixel_mismatch x=9 y=5", report[0]
+            for c in range(4):
+                line = report[1 + c]
+                word = (bits(0.25), bits(0.5), bits(0.75), bits(1.0))[c]
+                assert line.startswith(f"channel={c} expected="), line
+                assert line.endswith(f"expected_bits={word:08x} actual_bits={word + (c == channel):08x}"), line
         masks.expected = [(nan,) * 4] * 64
         with contextlib.redirect_stdout(io.StringIO()) as shown:
             compare(masks, as_bytes([0x7FC12345] * (width * height * 4)), width, height)
@@ -398,11 +402,20 @@ def self_test():
         good, wrong = os.path.join(work, "good.bin"), os.path.join(work, "wrong.bin")
         open(good, "wb").write(as_bytes(exact))
         open(wrong, "wb").write(as_bytes(drift))
-        host = os.path.join(work, "fake_host")
-        with open(host, "w") as file:
-            file.write(f"#!{sys.executable}\nimport shutil, sys, os\n"
+        script = os.path.join(work, "fake_host.py")
+        with open(script, "w") as file:
+            file.write("import shutil, sys, os\n"
                        "if os.environ.get('FAKE_EXIT'): sys.exit(int(os.environ['FAKE_EXIT']))\n"
                        "shutil.copy(os.environ['FAKE_READBACK'], sys.argv[5])\n")
+        # The adapter takes one host path, so a launcher runs the script through sys.executable (no shebang needed).
+        if os.name == "nt":
+            host = os.path.join(work, "fake_host.cmd")
+            launcher = f'@"{sys.executable}" "{script}" %*\r\n'
+        else:
+            host = os.path.join(work, "fake_host")
+            launcher = f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n'
+        with open(host, "w", newline="") as file:
+            file.write(launcher)
         os.chmod(host, os.stat(host).st_mode | stat.S_IXUSR)
         cases = [case("b0.case"), os.path.join(work, "missing.case"), case("b2.case")]
 
