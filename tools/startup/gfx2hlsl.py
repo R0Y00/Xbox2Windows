@@ -1335,7 +1335,7 @@ MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
-def mesh_skeleton(ins, vcc_branches):
+def mesh_skeleton(ins, vcc_branches, wave_limits):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -1409,8 +1409,15 @@ def mesh_skeleton(ins, vcc_branches):
 
     targets = set(edges.values())
     no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+    first_post_count_branch = next((i for i in edges if i >= b_end), None)
+    shift_branch = None
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
+            # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
+            if (source == first_post_count_branch and source >= b_end + 2 and target == source + 2
+                    and ins[source + 1][2] == 's_lshl_b32' and ins[target][3] == 's_mov_b64 exec, -1'):
+                shift_branch = source
+                continue
             # The model skips per lane, while the guest skips per wave. The difference is invisible when
             # lanes with clear EXEC can only bypass predicated writes before the paths meet. A skipped
             # s_branch may land at the execz target or past it over instructions without effect (the
@@ -1500,6 +1507,13 @@ def mesh_skeleton(ins, vcc_branches):
         if index in edges:
             if scc_stale and reads_scc(name, asm):
                 raise Unsupported('slot 57 mesh: an unmodelled SCC is read by a branch')
+            if index == shift_branch:
+                # Under full EXEC the preceding thread < limit comparison selects a contiguous prefix.
+                # A guest wave64 has any active lane exactly when its first thread is below the limit.
+                cmp = re.fullmatch(r'v_cmp_gt_u32_e32 vcc_lo, (0x[0-9a-f]+|[0-9]+), v(\d+)', ins[index - 2][3])
+                if mask != index - 1 or not cmp or int(cmp[2]) != thread:
+                    raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
+                wave_limits[off] = int(cmp[1], 0)
             if name in MESH_VCC_BRANCHES:
                 if mask is not None or not vcc_compares:
                     raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
@@ -1646,7 +1660,8 @@ class Stage:
             self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
         if kind == 'ms':
             self.mesh_vcc_branches = {}
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches)
+            self.mesh_wave_limits = {}
+            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits)
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -2310,6 +2325,7 @@ class Stage:
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
+        wave_limits = getattr(self, 'mesh_wave_limits', {})
         vcc_compares = set().union(*vcc_branches.values())
         try:
             self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
@@ -2523,7 +2539,7 @@ class Stage:
                         uniform_vcc_compares.add(off)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
-                        cond_uniform = cond in ('scc0', 'scc1') and self.scc_uniform
+                        cond_uniform = (cond in ('scc0', 'scc1') and self.scc_uniform) or off in wave_limits
                         if off in vcc_branches:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
@@ -2537,6 +2553,8 @@ class Stage:
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
                     term = self.one(name, asm)
+                    if off in wave_limits:
+                        term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
                 except Unsupported as reason:
                     if refusals is None:
                         if not hasattr(reason, 'instruction'):

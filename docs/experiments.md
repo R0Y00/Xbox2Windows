@@ -9501,6 +9501,17 @@ VGPR source, a different VCC write, or a narrowed EXEC at the branch
 invalidates the proof. The CPU-reference draws cover both outcomes for each
 branch polarity and a VCC-zero branch after a join.
 
+The `startup_mesh57_skeleton_wave_shift_{warp,hardware}` tests cover a single
+`s_lshl_b32` behind a forward EXEC-zero branch after the count exchange. From
+full EXEC a compare selects the threads with index below an unsigned constant.
+Each guest wave of 64 threads takes the shift if its first thread is below that
+limit. At the join the program restores full EXEC and uses the scalar as
+vertex red. The draw checks a vertex in the upper half of a partially active
+wave and vertices in a second, empty wave that retain the previous value.
+It also compiles a per-lane branch and checks its different image. The proof
+requires a straight path from the count exchange and an immediate EXEC
+restore. Scalar memory operations in the skipped region remain unsupported.
+
 The `startup_mesh57_formatted_load_{warp,hardware}` tests use one
 `buffer_load_format_x` to set vertex red. The fixture supplies descriptor word 3
 in the constant slot published as `descword3` for SRV 0. It draws the same mesh
