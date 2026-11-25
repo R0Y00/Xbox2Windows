@@ -158,6 +158,12 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
     root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"
     startup.mkdir(parents=True)
+    watch_spawn = startup / "watch-spawn.flag"
+    if not translate and "--translate" in switches:
+        # The fast debugger can exit before a spawned watcher reaches Python.
+        # Record the launch in the parent shell of this test copy.
+        script = replace(script, "    watcher=$!\n",
+                         '    watcher=$!\n    : > "$here/watch-spawn.flag"\n')
     (startup / "run.sh").write_text(script, encoding="utf-8")
     (startup / "debug_launch.py").write_text(
         STUB.format(code=code, alive=ALIVE, prefixes=ENV_PREFIXES), encoding="utf-8")
@@ -304,9 +310,9 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
             # The stub debugger does not wait for a watcher here. A started watcher needs a
             # Python start-up to write watch.json, which can take over a second on a loaded runner.
             deadline = time.time() + 5
-            while not watch.is_file() and time.time() < deadline:
+            while not (watch_spawn.is_file() or watch.is_file()) and time.time() < deadline:
                 time.sleep(0.05)
-        if watch.is_file():
+        if watch_spawn.is_file() or watch.is_file():
             found.append(f"{label}: the translator started without --render --translate")
     return found
 

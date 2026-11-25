@@ -9118,6 +9118,10 @@ stage. The check compiles and rejects shifted, dynamic, wider and wrong-space
 loads and a pixel-stage buffer read. Run it with
 `ctest --preset release --no-tests=error -R '^startup_mesh86_srv_proof$' -V`.
 
+Run `python -B tests/startup_mesh86_srv_proof_check.py` to check the load count
+without DXC. The synthetic DXIL dump passes with one DWORD load and is
+rejected when a second identical load uses the same SRV handle.
+
 On the Release worktree at `76aeef7f` plus these changes, the combined lease,
 SRV proof, export and mapped-page selection passed eight tests. The two mesh
 cases returned 77 on the adapters listed above. `dumpbin /exports` showed
@@ -13442,6 +13446,35 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
 ```
 
+### Explicit-LOD 2D gather
+
+The startup pixel and compute translators lower gfx1013 `image_gather4_l` on a
+2D texture with three contiguous address registers (`u`, `v`, explicit `lod`),
+one-hot component `dmask`, and a constant sampler matching the 2D gather profile
+(`CLAMP_LAST_TEXEL` in X/Y, `CLAMP_Z` ignored, bilinear or point XY, point mip
+filtering, zero `MIN_LOD`, zero bias, and zero `MIP_POINT_PRECLAMP`). Compute
+stages enforce the same fixed-table eight-word unmodified image descriptor check
+as `image_gather4_lz`.
+
+Because Direct3D 12 SM 5.1/6.0 `Gather` always reads view mip zero, the lowering
+emits `gather_2d_lod(...)`, which checks finite `uv` and `lod` bitwise, queries
+visible view dimensions via `GetDimensions`, clamps `lod` to `[0, MAX_LOD]` and
+rounds to `[0, levels - 1]`, and loads the four `(0,1), (1,1), (1,0), (0,0)`
+bilinear taps clamped to the selected mip bounds. Non-finite inputs evaluate to
+zeros without aborting other instructions or lanes.
+
+Source-built `gfx1013` compute and pixel fixtures check all four channels,
+overlapping destination/address registers, descriptor provenance and table
+alignment, refusal controls, DXC `cs_6_0` compute readbacks across explicit,
+fractional, negative, sampler-clamped, view-relative (`MostDetailedMip = 1`),
+and per-lane dynamic LODs, DXC `ps_6_0` / FXC `ps_5_1` pixel draws, and
+predicted failure counts under negative mutations.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_hardware)?$' -V
+```
+
 ## Startup translator: fixed-mip 2D comparison gathers
 
 The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D
@@ -13634,6 +13667,15 @@ allows the read, including at a branch target. The compute controls exercise con
 
 As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
 handling of out-of-range stores, are assumptions, not measurements.
+
+One descriptor modification is accepted for a raw buffer store: clearing the stride field of dword 1. That is
+`s_and_b32` of dword 1 with `0xc000ffff`, which keeps the base address bits 15:0 and bits 31:30. The result is
+the raw descriptor such a store already assumes. Any other mask, any other dword, a repeated modification, and
+the same clear on an image store stay refused. Loads through the descriptor still treat it as modified.
+
+Case I is case A with the clear before its store. The runner binds a root UAV and reads no descriptor, so the
+GPU run checks the translation, not the stride; the negative controls are the pure-Python refusals.
+
 The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
 
 `startup_gfx2hlsl_compute_check.py` translates three source-built programs:
@@ -13684,6 +13726,32 @@ inactive lanes.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(mbcnt_)?(warp|hardware))$' -V
+```
+
+### Startup compute LDS dword exchange
+
+Case F uses two groups of 64 threads. Each thread stores its group number
+times 256 plus its local X ID into LDS at byte `16 + 4 * X`. After
+`s_waitcnt lgkmcnt(0)` and `s_barrier`, it reads the word from lane
+`X xor 32` and the word from lane 37. Each read completes before its value
+is consumed. The expected UAV contains 256 result words and 64 sentinels.
+On WARP, RTX 4060 and Intel UHD 770, all 320 matched. Reading the same lane
+or broadcasting lane 36 instead changed exactly 128 words per adapter.
+
+The startup translator accepts one straight-line, full-EXEC fill in a 1D
+group, one group barrier, and reads from that initialized span. The fill
+address is the entry X ID shifted left by two. Read addresses come from an
+immediately preceding literal move or AND with an aligned literal mask.
+The bounds check includes the instruction's byte offset. The LDS allocation
+comes from bits 23:15 of `COMPUTE_PGM_RSRC2`, in units of 128 dwords, up to
+the 32 KiB groupshared limit. The barrier becomes an unconditional
+`GroupMemoryBarrierWithGroupSync()`.
+[LLVM AMDGPU compute register fields](https://releases.llvm.org/15.0.0/docs/AMDGPUUsage.html)
+and [HLSL group barrier](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/groupmemorybarrierwithgroupsync).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(f-peer_|f-broadcast_)?(warp|hardware))$' -V
+python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
 ## Startup translator: refusal census
