@@ -2085,9 +2085,12 @@ class Pipeline:
                '}',
                # Match pixel_aot: x - floor(x) capped at 0x3f7fffff, so a tiny negative input cannot round up to
                # 1.0. The cap is a comparison, not min: min returns its other operand for a NaN.
+               # The comparison is on the bits because FXC folds `frac(value) >= 1.0f` to false and emits a bare
+               # frc for it, which loses the cap on an adapter whose frac returns 1.0. frac can only reach the cap
+               # by rounding to exactly +1.0, so the equality covers the same case, and a NaN misses it and passes.
                'float fract32(float value) {',
                '    float f = frac(value);',
-               '    return f >= 1.0f ? asfloat(0x3f7fffffu) : f;',
+               '    return asuint(f) == 0x3f800000u ? asfloat(0x3f7fffffu) : f;',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
@@ -2221,7 +2224,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-7'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-8'))))
     return fnv(layout, key) if layout else key
 
 
