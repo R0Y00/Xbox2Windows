@@ -103,6 +103,8 @@ F16_C = [pair(0.5, 1.0), pair(2.0, -2.0), pair(1.0, 0.25), pair(-1.0, 4.0)]
 INT_A = [0x00010001, 0x7fff8000, 0x8000ffff, 0x12345678]
 INT_B = [0x00020003, 0x00018000, 0x7fff0001, 0xfffe0002]
 INT_C = [0, MASK, 0x80000000, 0x00ff00ff]
+# a * b + c = 3075.0000..1 lands near a binary16 midpoint: one rounding gives 0x6a01, binary32 first gives 0x6a02.
+F16_MID_A, F16_MID_B, F16_MID_C = [0x6a006a00] * 4, [0x3c013c01] * 4, [0x84008400] * 4
 BYTES_A = [0x01020304, 0xffffffff, 0x80ff017f, 0]
 BYTES_B = [0x04030201, 0xffffffff, 0x02020202, 0xffffffff]
 BYTES_C = [0, 5, MASK, 0x12345678]
@@ -112,6 +114,7 @@ CASES = {
     'pk_add_f16': ('v_pk_add_f16', {}, 2, (F16_A, F16_B), f16_lanes(lambda a, b: a + b)),
     'pk_mul_f16': ('v_pk_mul_f16', {}, 2, (F16_A, F16_B), f16_lanes(lambda a, b: a * b)),
     'pk_fma_f16': ('v_pk_fma_f16', {}, 3, (F16_A, F16_B, F16_C), f16_lanes(lambda a, b, c: a * b + c)),
+    'pk_fma_f16_midpoint': ('v_pk_fma_f16', {}, 3, (F16_MID_A, F16_MID_B, F16_MID_C), lambda a, b, c: 0x6a016a01),
     'pk_min_f16': ('v_pk_min_f16', {}, 2, (F16_A, F16_B), f16_lanes(min)),
     'pk_max_f16': ('v_pk_max_f16', {}, 2, (F16_A, F16_B), f16_lanes(max)),
     'pk_mul_f16_op_sel': ('v_pk_mul_f16', {'op_sel': (1, 0, 0), 'op_sel_hi': (0, 1, 1)}, 2, (F16_A, F16_B),

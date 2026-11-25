@@ -311,6 +311,93 @@ def stream_interface(vs_container, ps_container):
 
 
 # Binary32 words for inline source encodings 240 through 248, in encoding order.
+# Single-rounding binary16 fma (v_pk_fma_f16): integer arithmetic only, same routine as pixel_aot.fma16_rne.
+FMA16_RNE_HLSL = (
+    '// Exact fused binary16 multiply-accumulate (a * b + c), rounding once to binary16 RNE.',
+    '// Operates on finite binary16 encodings in bits [15:0] using 32-bit integer arithmetic only,',
+    '// avoiding intermediate binary32 rounding and remaining independent of binary32 FTZ modes.',
+    'uint fma16_rne(uint a_bits, uint b_bits, uint c_bits) {',
+    '    uint a = a_bits & 0xffffu;',
+    '    uint b = b_bits & 0xffffu;',
+    '    uint c = c_bits & 0xffffu;',
+    '    uint sa = (a >> 15u) & 1u;',
+    '    uint ea_f = (a >> 10u) & 31u;',
+    '    uint ma = (a & 0x3ffu) | (ea_f != 0u ? 0x400u : 0u);',
+    '    int ea = ea_f != 0u ? (int)ea_f - 25 : -24;',
+    '    uint sb = (b >> 15u) & 1u;',
+    '    uint eb_f = (b >> 10u) & 31u;',
+    '    uint mb = (b & 0x3ffu) | (eb_f != 0u ? 0x400u : 0u);',
+    '    int eb = eb_f != 0u ? (int)eb_f - 25 : -24;',
+    '    uint sc = (c >> 15u) & 1u;',
+    '    uint ec_f = (c >> 10u) & 31u;',
+    '    uint mc = (c & 0x3ffu) | (ec_f != 0u ? 0x400u : 0u);',
+    '    int ec = ec_f != 0u ? (int)ec_f - 25 : -24;',
+    '    uint sp = sa ^ sb;',
+    '    uint mp = ma * mb;',
+    '    int ep = ea + eb;',
+    '    if (mp == 0u && mc == 0u) return (sp != 0u && sc != 0u) ? 0x8000u : 0u;',
+    '    if (mp == 0u) return c;',
+    '    uint norm;',
+    '    int res_exp;',
+    '    uint res_sign;',
+    '    if (mc == 0u) {',
+    '        uint top = firstbithigh(mp);',
+    '        norm = mp << (31u - top);',
+    '        res_exp = ep + (int)top;',
+    '        res_sign = sp;',
+    '    } else {',
+    '        uint bp = firstbithigh(mp);',
+    '        uint px = mp << (30u - bp);',
+    '        int ex = ep + (int)bp;',
+    '        uint bc = firstbithigh(mc);',
+    '        uint cx = mc << (30u - bc);',
+    '        int ey = ec + (int)bc;',
+    '        uint big_m, small_m, big_s, small_s;',
+    '        int big_e, small_e;',
+    '        if (ex > ey || (ex == ey && px >= cx)) {',
+    '            big_m = px; big_e = ex; big_s = sp;',
+    '            small_m = cx; small_e = ey; small_s = sc;',
+    '        } else {',
+    '            big_m = cx; big_e = ey; big_s = sc;',
+    '            small_m = px; small_e = ex; small_s = sp;',
+    '        }',
+    '        if (big_e == small_e && big_m == small_m && big_s != small_s) return 0u;',
+    '        uint diff_e = (uint)(big_e - small_e);',
+    '        uint y_main = 0u;',
+    '        uint y_sticky = 1u;',
+    '        if (diff_e < 30u) {',
+    '            y_main = (small_m >> diff_e) & 0xfffffffeu;',
+    '            y_sticky = (small_m & ((1u << (diff_e + 1u)) - 1u)) != 0u ? 1u : 0u;',
+    '        }',
+    '        res_sign = big_s;',
+    '        uint mag = big_s == small_s ? (big_m + y_main + y_sticky) : (big_m - y_main - y_sticky);',
+    '        uint top = firstbithigh(mag);',
+    '        norm = mag << (31u - top);',
+    '        res_exp = big_e + (int)top - 30;',
+    '    }',
+    '    if (res_exp >= -14) {',
+    '        uint sig = norm >> 21u;',
+    '        uint rem = norm & 0x001fffffu;',
+    '        if (rem > 0x00100000u || (rem == 0x00100000u && (sig & 1u) != 0u)) sig += 1u;',
+    '        if (sig == 0x800u) {',
+    '            sig = 0x400u;',
+    '            res_exp += 1;',
+    '        }',
+    '        if (res_exp > 15) return (res_sign << 15u) | 0x7c00u;',
+    '        return (res_sign << 15u) | ((uint)(res_exp + 15) << 10u) | (sig & 0x3ffu);',
+    '    }',
+    '    if (res_exp == -25) return (res_sign << 15u) | (norm > 0x80000000u ? 1u : 0u);',
+    '    if (res_exp < -25) return res_sign << 15u;',
+    '    uint shift = (uint)(7 - res_exp);',
+    '    uint sig = norm >> shift;',
+    '    uint half_bit = 1u << (shift - 1u);',
+    '    uint mask = (1u << shift) - 1u;',
+    '    uint rem = norm & mask;',
+    '    if (rem > half_bit || (rem == half_bit && (sig & 1u) != 0u)) sig += 1u;',
+    '    return (res_sign << 15u) | sig;',
+    '}',
+)
+
 CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
                             0x40000000, 0xc0000000, 0x40800000, 0xc0800000,
                             0x3e22f983)  # 1/(2*pi)
@@ -2767,7 +2854,17 @@ class Stage:
         self.pk_float(ops, mods, lambda a, b: 'min(%s, %s)' % (a, b))
 
     def op_v_pk_fma_f16(self, ops, mods):
-        self.pk_float(ops, mods, lambda a, b, c: '%s * %s + %s' % (a, b, c))
+        # Fused: the product is not rounded before the add, so binary32 arithmetic would round twice.
+        low, high, clamp, _ = self.pk_lanes(ops, mods, 3, float_lanes=False, clamp_ok=True)
+        fields, _ = self.pk_modifiers(mods, 3, True, True)
+        results = []
+        for lane, neg in ((low, fields['neg_lo']), (high, fields['neg_hi'])):
+            args = ['(%s ^ 0x8000u)' % h if n else h for h, n in zip(lane, neg)]
+            expr = 'fma16_rne(%s, %s, %s)' % tuple(args)
+            if clamp:
+                expr = 'f32tof16(saturate(f16tof32(%s)))' % expr
+            results.append(expr)
+        self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % tuple(results))
 
     def op_v_pk_add_i16(self, ops, mods):
         self.pk_int(ops, mods, lambda a, b: '%s + %s' % (a, b), True)
@@ -3453,6 +3550,7 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
+               *FMA16_RNE_HLSL,
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]

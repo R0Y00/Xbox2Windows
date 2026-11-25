@@ -110,7 +110,8 @@ _, hlsl = translate(encode('v_pk_max_f16', 0, (V1, V2), clamp=1))
 check('pk_max_f16 clamp', hlsl.count('saturate(max(') == 2, hlsl)
 
 _, hlsl = translate(encode('v_pk_fma_f16', 0, (V1, V2, V3)))
-check('pk_fma_f16 three sources', '* f16tof32((v2 & 0xffffu)) + f16tof32((v3 & 0xffffu))' in hlsl, hlsl)
+check('pk_fma_f16 single rounding', 'fma16_rne((v1 & 0xffffu), (v2 & 0xffffu), (v3 & 0xffffu))' in hlsl
+      and 'fma16_rne((v1 >> 16), (v2 >> 16), (v3 >> 16))' in hlsl, hlsl)
 _, hlsl = translate(encode('v_pk_min_f16', 0, (V1, V2)))
 check('pk_min_f16', hlsl.count('min(') == 2, hlsl)
 
