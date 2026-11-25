@@ -1929,6 +1929,9 @@ class Stage:
                  'SQ_RSRC_IMG_CUBE': 'tex2da'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
+        if dim == 'SQ_RSRC_IMG_CUBE' and how in ('load', 'load_mip'):
+            # Only the sample path converts the cube s/t/face address; a load has no such address form.
+            raise Unsupported('image dimension %s for image_%s' % (dim, how))
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
