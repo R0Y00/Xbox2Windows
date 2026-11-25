@@ -1874,9 +1874,11 @@ These are measured on one executable; treat them as hypotheses for others.
   The control expects all three axes to use the U field and must fail.
   Table entries take their LOD range from word 1, as `smpl` static samplers do: `MIN_LOD` (bits 11:0) and
   `MAX_LOD` (bits 23:12), unsigned 4.8 fixed point. An entry with word 1 = 0 samples mip 0 only; the border
-  fallback is not a title descriptor and keeps the full mip range. `startup_sampler_lod_{warp,hardware}`
-  decode two table entries that differ only in word 1 (`MIN_LOD` 2, `MAX_LOD` 1) and read a four-mip
-  texture with one value per mip at explicit LODs; a
+  fallback is not a title descriptor and keeps the full mip range. A `MIN_LOD` above `MAX_LOD` is passed
+  through unchanged; D3D12 documents `MaxLOD >= MinLOD`, and the console behaviour for that case is not
+  established here. `startup_sampler_lod_{warp,hardware}` decode two table entries that differ only in
+  word 1, both with `MinLOD <= MaxLOD`: entry 0 is `MIN_LOD` 2 with `MAX_LOD` 4095/256, entry 1 is
+  `MIN_LOD` 0 with `MAX_LOD` 1. They read a four-mip texture with one value per mip at explicit LODs, and a
   static `smpc` sampler must keep `LESS`. The `_dropped_` control resets the decoded range and must read
   mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
