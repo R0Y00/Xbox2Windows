@@ -13972,8 +13972,10 @@ def check_dead_integer_temporaries():
     for chain, stem in ((scalar, "salu"), (vector, "alu")):
         for instruction in chain:
             assert exists(source, declaration(live, instruction, stem)), instruction
-    assert f"salu{live.index(scalar[-1])} != 0u" in source
-    assert f"asuint(alu{live.index(vector[-1])})" in source
+    scalar_producer, scalar_consumer = (declaration(live, instruction, "salu") for instruction in scalar)
+    vector_producer, vector_consumer = (declaration(live, instruction, "alu") for instruction in vector)
+    assert source.index(scalar_producer) < source.index(scalar_consumer) < source.index(f"salu{live.index(scalar[-1])} != 0u")
+    assert source.index(vector_producer) < source.index(vector_consumer) < source.index(f"asuint(alu{live.index(vector[-1])})")
     assert f"alu{live.index(MASKED_OR_RESTORE)}_v13" in source
 
     # A load with unused data still roots its integer address and remains emitted.
