@@ -16,6 +16,10 @@ import compute_store_aot as aot
 import shader_profile_audit
 from pixel_aot import _read_named_container, disassemble
 from resource_inventory import parts
+import dxc_cache
+
+# Route DXC compiles through the opt-in X2W_DXC_CACHE cache; other subprocess calls are untouched.
+subprocess = dxc_cache.with_dxc_cache(subprocess)
 
 SENTINEL = 0xc5c5c5c5
 INDEXED = [
