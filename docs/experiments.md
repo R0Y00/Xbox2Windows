@@ -3250,6 +3250,25 @@ reference fails the trace check while every pixel still matches.
 ctest --preset dev --no-tests=error -R "^mesh_descriptor_swap_" -V
 ```
 
+A uniform branch on a constant-buffer word can pick the descriptor table that
+a later `s_buffer_load` reads (a per-material view, or a null descriptor in one
+arm). `tools/mesh_entry_aot.py` runs both arms of the if/else, which may hold
+only scalar ALU and loads and must leave EXEC, VCC and M0 unchanged, and merges
+each scalar register as a select on the predicate. After the join only
+`s_buffer_load_*` may read the selected descriptor, from the two constant
+tables or a zero (null) descriptor, which reads as 0.0. It refuses nested
+joins, geometry tables or vector/export/barrier instructions in an arm, a
+register defined in one arm only, and scalar ALU on the joined registers.
+`tests/mesh_join_descriptor_check.py` checks the lowering and these refusals
+in pure Python and, with `<dxc> <renderer> <adapter>`, draws both arms and the
+null arm on D3D12 against the mesh export trace and a pixel reference.
+The Linux run covers only the Python part; the D3D12 draw runs on Windows.
+
+```sh
+python3 -B tests/mesh_join_descriptor_check.py
+ctest --preset dev --no-tests=error -R "^mesh_join_descriptor_" -V
+```
+
 A local 1,028-byte entry (197 instructions) read three distinct vertex
 positions and produced visible geometry with controlled indices, transforms and
 vertex data. The two sets of positions cover 1,024 and 276 of the 1,024 pixel
