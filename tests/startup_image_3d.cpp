@@ -216,7 +216,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     constexpr UINT width = 8, height = 2;
     static constexpr std::uint16_t kDepthTexels[width * height] = {
         0x0000, 0x0001, 0x0003, 0x1234, 0x2aad, 0x4008, 0x5555, 0x8000,
-        0x8010, 0x8020, 0xa018, 0xc018, 0xe00c, 0xffd0, 0xfffe, 0xffff,
+        0x8010, 0xa018, 0xc018, 0xe00c, 0xffaf, 0xffef, 0xfffe, 0xffff,
     };
     static constexpr std::uint32_t kFloatTexels[width * height][4] = {
         {0x3f801000u, 0x3f803000u, 0x3f801001u, 0x3f7fffffu},
@@ -224,7 +224,7 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
         {0x33000001u, 0xb5c00000u, 0x80000000u, 0x00000000u},
         {0xbf803000u, 0xbf801000u, 0x477fefffu, 0x477ff000u},
         {0xc77ff000u, 0x7f800000u, 0xff800000u, 0x7fc00001u},
-        {0xffc00123u, 0x35555555u, 0xbeaaaaabu, 0x40490fdbu},
+        {0x40490fdbu, 0x35555555u, 0xbeaaaaabu, 0xffc00123u},
         {0x3c000000u, 0xbc800000u, 0x3d000000u, 0xbd800000u},
         {0x42000000u, 0xc2200000u, 0x42400000u, 0xc2600000u},
         {0x3e200000u, 0x3ea00000u, 0x3ef00000u, 0x3f100000u},
@@ -239,8 +239,11 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
 
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
+    constexpr UINT d16_entry_constants = 5;  // ud0..ud3 from FULLSCREEN_VS plus ud4 ('d16unorm16 0')
     const x2w_startup::TranslatedSamplers no_samplers{};
-    const auto root = create_root(device, no_samplers);
+    ComPtr<ID3D12RootSignature> root;
+    check(x2w_startup::create_translated_root(device, d16_entry_constants, 1, no_samplers, &root),
+          "Create translated image_load d16 root signature");
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
@@ -319,8 +322,8 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     list->SetGraphicsRootSignature(root.Get());
     ID3D12DescriptorHeap* heaps[]{views.Get()};
     list->SetDescriptorHeaps(1, heaps);
-    const std::uint32_t constants[entry_constants] = {0, 0, 0, 0};
-    list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
+    const std::uint32_t constants[d16_entry_constants] = {0, 0, 0, 0, depth16 ? 1u : 0u};
+    list->SetGraphicsRoot32BitConstants(0, d16_entry_constants, constants, 0);
     list->SetGraphicsRootDescriptorTable(1, views->GetGPUDescriptorHandleForHeapStart());
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};

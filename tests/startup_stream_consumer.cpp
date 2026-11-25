@@ -105,7 +105,8 @@ int main(int argc, char** argv)
     void* device = nullptr;
     void* pso = nullptr;
     const bool hardware = draw && std::strcmp(argv[4], "hardware") == 0;
-    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, bc7.blocks != nullptr,
+    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0;
+    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, textured,
                                                 adapter, device, pso)) return rc;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
     if (argc == 4) return 0;

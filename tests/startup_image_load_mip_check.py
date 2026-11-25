@@ -69,8 +69,14 @@ def check_plain_load_layouts(llvm_mc):
     invalid_nsa = '0a0f00f00004044001000000'
 
     d16_ps = shader(bytes.fromhex('080f00f000040480')).hlsl_ps()
-    assert 'v4 = pack16_rne(t.x) | (pack16_rne(t.y) << 16);' in d16_ps, d16_ps
-    assert 'v5 = pack16_rne(t.z) | (pack16_rne(t.w) << 16);' in d16_ps, d16_ps
+    assert 'v4 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in d16_ps, d16_ps
+    assert 'v5 = pack16_d16(t.z, ud4) | (pack16_d16(t.w, ud4) << 16);' in d16_ps, d16_ps
+    try:
+        shader(bytes.fromhex('080f04f000040480'))
+    except G.Unsupported as error:
+        assert 'image_load_mip' in str(error) and 'd16' in str(error), error
+    else:
+        raise AssertionError('d16 image_load_mip accepted')
 
     for flag, encoded in (('tfe', '080f01f000040400'),
                           ('r128', '088f00f000040400'), ('lwe', '080f02f000040400'),

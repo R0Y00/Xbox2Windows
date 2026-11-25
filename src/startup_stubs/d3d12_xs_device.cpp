@@ -21,6 +21,7 @@
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/depth_state_apply.h"
+#include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
