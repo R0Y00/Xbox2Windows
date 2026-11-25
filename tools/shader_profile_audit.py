@@ -2,13 +2,16 @@
 
 import argparse
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import hashlib
 import itertools
 import json
 import mmap
+import os
 from pathlib import Path
 import struct
+import tempfile
+import zlib
 
 import compute_store_aot
 import depth_mask_aot
@@ -213,25 +216,40 @@ def cb_diagnostic(program, llvm):
     return group, read, method, stop, probe
 
 
-def scan(archive, llvm, source_dir=None, *, cb_reads=False):
-    if isinstance(archive, (str, Path)):
-        path = Path(archive)
-        if not path.is_file():
-            raise ValueError(f"Missing archive file: {path}")
-        with path.open("rb") as f:
-            if f.seek(0, 2):
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                    return scan(data, llvm, source_dir, cb_reads=cb_reads)
-            return scan(b"", llvm, source_dir, cb_reads=cb_reads)
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _write_text_atomic(destination: Path, content: str, *, encoding: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=destination.parent) as staging_dir:
+        staged = Path(staging_dir) / destination.name
+        staged.write_text(content, encoding=encoding)
+        os.replace(staged, destination)
+
+
+def _validate_source_dir(source_dir: Path, archive_path: Path | None = None) -> None:
+    if archive_path is not None and _same_path(source_dir, archive_path):
+        raise ValueError(f"Source directory collides with archive: {source_dir}")
+    if source_dir.exists() and not source_dir.is_dir():
+        raise ValueError(f"Source directory is not a directory: {source_dir}")
+
+
+def _scan_bytes(archive, llvm, source_dir=None, *, cb_reads=False, archive_path: Path | None = None):
     if not isinstance(archive, (bytes, bytearray, memoryview, mmap.mmap)):
         raise ValueError("Archive payload must be bytes-like or a path")
     source_dir = Path(source_dir) if source_dir is not None else None
+    if source_dir is not None:
+        _validate_source_dir(source_dir, archive_path)
     cache = {}
     records, accepted = Counter(), Counter()
     profiles, first_stops = defaultdict(Counter), defaultdict(Counter)
     cb_cache = {}
     groups, modes, consumers, after_binding = Counter(), Counter(), Counter(), Counter()
     probe_source = None
+    pending_writes: dict[Path, tuple[str, str]] = {}
 
     def observe(stage, blob, sections):
         nonlocal probe_source
@@ -241,9 +259,7 @@ def scan(archive, llvm, source_dir=None, *, cb_reads=False):
 
         def emit(profile, source):
             if source_dir is not None:
-                directory = source_dir / profile
-                directory.mkdir(exist_ok=True, parents=True)
-                (directory / (digest.hex() + ".hlsl")).write_text(source, encoding="utf-8")
+                pending_writes[source_dir / profile / f"{digest.hex()}.hlsl"] = (source, "utf-8")
 
         if digest not in cache:
             try:
@@ -276,24 +292,52 @@ def scan(archive, llvm, source_dir=None, *, cb_reads=False):
                                   s9_zero_reads=consumers.most_common(),
                                   s9_zero_full_shader_stops=after_binding.most_common())
         if probe_source is not None and source_dir is not None:
-            source_dir.mkdir(parents=True, exist_ok=True)
-            (source_dir / "s9-slot0-read-probe.hlsl").write_text(probe_source, encoding="ascii")
+            pending_writes[source_dir / "s9-slot0-read-probe.hlsl"] = (probe_source, "ascii")
+    for destination, _ in pending_writes.items():
+        if archive_path is not None and _same_path(destination, archive_path):
+            raise ValueError(f"Output file collides with archive: {destination}")
+        if destination.exists() and destination.is_dir():
+            raise ValueError(f"Output path is a directory: {destination}")
+    for destination, (content, encoding) in pending_writes.items():
+        _write_text_atomic(destination, content, encoding=encoding)
     return result
 
 
-def main():
+def scan(archive, llvm, source_dir=None, *, cb_reads=False):
+    if isinstance(archive, (str, Path)):
+        path = Path(archive)
+        if path.is_dir():
+            raise ValueError(f"Archive path is a directory: {path}")
+        if not path.is_file():
+            raise ValueError(f"Missing archive file: {path}")
+        if source_dir is not None:
+            _validate_source_dir(Path(source_dir), path)
+        with path.open("rb") as f:
+            if f.seek(0, 2):
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    return _scan_bytes(data, llvm, source_dir, cb_reads=cb_reads, archive_path=path)
+            return _scan_bytes(b"", llvm, source_dir, cb_reads=cb_reads, archive_path=path)
+    return _scan_bytes(archive, llvm, source_dir, cb_reads=cb_reads)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--llvm", required=True, help="Path or loader name for the LLVM 15 library")
     parser.add_argument("--source-dir", type=Path, help="Optional local directory for accepted HLSL by profile and container hash")
     parser.add_argument("--cb-reads", action="store_true", help="Trace first-profile unresolved constant buffer reads")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if args.archive.is_dir():
+            raise ValueError(f"Archive path is a directory: {args.archive}")
+        if args.source_dir is not None:
+            _validate_source_dir(args.source_dir, args.archive)
         result = scan(args.archive, args.llvm, args.source_dir, cb_reads=args.cb_reads)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, struct.error, zlib.error) as error:
         parser.exit(1, f"Shader profile audit: {error}\n")
     print(json.dumps(result, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

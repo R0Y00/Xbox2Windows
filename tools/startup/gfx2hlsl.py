@@ -666,7 +666,9 @@ def names_one_value(sym):
     if sym is None:
         return False
     if sym[0] == 'desc':
-        return len(sym) == 4  # ('desc', source, load offset, dword); the 'modified' mark drops the written value
+        # ('desc', source, load offset, dword) and, in a compute stage, the offset of the s_load that read it: the
+        # source does not record an addend on the pointer, so only the same load proves the same words.
+        return len(sym) == 4 or (len(sym) == 5 and isinstance(sym[4], int))
     # An add on a pointer keeps its symbol and marks it 'added' (the offset is not in the tuple), so only an
     # untouched pointer, exactly (kind, source), names one value.
     return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
@@ -693,6 +695,44 @@ def desc_key(sym):
     """Resource key of the descriptor a ('desc', source, load offset, dword) word belongs to: the key descriptor()
     gives its first word, so a write into a later descriptor of a wide load marks that descriptor."""
     return sym[1], None if sym[2] is None else sym[2] + 4 * (sym[3] & ~3)
+
+
+def desc_word(sym, dword):
+    return sym[:3] + (dword,) + sym[4:]
+
+
+def raw_descriptor_alu(base, syms, constants):
+    """Recognize only the word expressions needed for a structured-to-raw buffer store."""
+    # gfx10 V# layout in docs/pixel_mubuf_contract.md: stride is DW1[29:16],
+    # NUM_RECORDS is DW2 and OOB_SELECT is DW3[29:28].
+    # The extracted stride may be clamped to at least 1 (s_max_u32 with 1), so that a descriptor that is
+    # already raw (stride 0) keeps NUM_RECORDS bytes.
+    if base == 's_max_u32':
+        for i, word in enumerate(syms):
+            if word and word[:2] == ('descnum', 'stride') and constants[1 - i] == 1:
+                return ('descnum', 'stride_min1', word[2])
+        return None
+    for i, word in enumerate(syms):
+        if not word or word[0] != 'desc' or len(word) < 4:
+            continue
+        other = 1 - i
+        field = word[3] % 4
+        loaded = 5 if len(word) > 4 and isinstance(word[4], int) else 4  # with the compute load tag
+        plain = len(word) == loaded  # a loaded word of one s_load
+        if plain and field == 1:
+            if base == 's_and_b32' and constants[other] == 0xc000ffff:
+                return word + ('stride0',)
+            if base == 's_bfe_u32' and i == 0 and constants[1] == 0xe0010:
+                return ('descnum', 'stride', word)
+        if plain and field == 2 and base == 's_mul_i32':
+            if syms[other] in (('descnum', kind, desc_word(word, word[3] - 1)) for kind in ('stride', 'stride_min1')):
+                return word + ('byte_count',)
+        if field == 3:
+            if plain and base == 's_and_b32' and constants[other] == 0xcfffffff:
+                return word + ('oob0',)
+            if (plain or word[loaded:] == ('oob0',)) and base == 's_or_b32' and constants[other] == 0x30000000:
+                return word[:loaded] + ('oob3',)
+    return None
 
 
 def smem_offset(tok):
@@ -1216,11 +1256,11 @@ def mesh_skeleton(ins):
     Accepted shape, in program order (anything else is refused with its own message):
     - Exchange: exec = 1 (lane 0 of each wave), the mask saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
       entry v5 >> 7 at byte 8, waits and passes a barrier; every other wave passes a barrier and reads byte 8 to v5.
-    - Straight-line code up to the next barrier. Its only read of v5 may be one v_readfirstlane_b32 under exec = -1.
+    - Code up to the next barrier. Its only read of v5 may be one v_readfirstlane_b32 under exec = -1.
     - Counts: one barrier; the wave whose index (s_bfe_u32 of s3, 4 bits at 24) is zero stores SGPR P at byte 0 and
       SGPR V at byte 4 under the saved lane-0 mask, waits, passes a barrier and sends one allocation request with
       m0 = P << 12 | V; every other wave passes a barrier and reads both words back into the same P and V.
-    - Straight-line code to s_endpgm. Exports only here: pos0 and param under exec = -1 narrowed by one
+    - Code to s_endpgm. Exports only here: pos0 and param under exec = -1 narrowed by one
       v_cmpx_gt_i32 V, thread; the primitive export likewise with P. thread is the v_mbcnt pair over wave << 6.
     Each path therefore passes three barriers, each store has one writer (one lane of one wave), and a wait and a
     barrier separate it from every read. The lowering keeps one writer and one barrier: thread 0 stores, all read.
@@ -1230,7 +1270,8 @@ def mesh_skeleton(ins):
     op_x2w_mesh_* handlers), SCC and m0 after the counts. Of s3 only the wave index is modelled.
     """
     env = {}
-    start = 1 if ins and ins[0][2] == 's_inst_prefetch' else 0
+    first = 1 if ins and ins[0][2] == 's_inst_prefetch' else 0
+    start = next((i for i in range(first, len(ins)) if ins[i][3] == 's_mov_b64 exec, 1'), first)
     a_end = mesh_run(ins, start, 'group-index exchange', MESH_EXCHANGE, env)
     count_at = next((i for i in range(a_end, len(ins)) if ins[i][2] == 's_barrier'), len(ins))
     b_end = mesh_run(ins, count_at, 'count exchange', MESH_COUNTS, env)
@@ -1245,30 +1286,106 @@ def mesh_skeleton(ins):
     lands('b_join', b_end, 'count exchange')
     lands('b_rskip', count_at + 27, 'count exchange')
     lane = set(range(*(lambda r: (r[1], r[2] + 1))(reg_range(env['lane']))))
+    a_bits = int(env['a_bits'][1:])
     sreg = {key: int(env[key][1:]) for key in ('wave', 'prims', 'verts', 'b_tmp')}
     vreg = {key: int(env[key][1:]) for key in ('a_zero', 'a_zero2', 'b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
     if (len({vreg['b_p'], vreg['b_zero'], vreg['b_v']}) != 3 or len({vreg['b_r0'], vreg['b_r1']}) != 2
             or vreg['b_r0'] == vreg['b_zero2'] or 5 in (vreg['a_zero'], vreg['a_zero2'])
             or len({sreg['prims'], sreg['verts'], sreg['b_tmp']}) != 3 or {sreg['prims'], sreg['verts']} & lane
-            or sreg['wave'] in lane | {3, sreg['prims'], sreg['verts']} or int(env['a_bits'][1:]) in lane):
+            or sreg['wave'] in lane | {3, sreg['prims'], sreg['verts']} or a_bits in lane | {3} or 3 in lane):
         raise Unsupported('slot 57 mesh count exchange: registers of the accepted shape overlap')
     if not ins or ins[-1][2] != 's_endpgm':
         raise Unsupported('slot 57 mesh program does not end with s_endpgm')
 
-    out = list(ins[:start])
+    offsets = {item[0]: i for i, item in enumerate(ins)}
+    edges = {}
+    for lo, hi in ((0, start), (a_end, count_at), (b_end, len(ins))):
+        for i in range(lo, hi):
+            off, _, name, asm = ins[i]
+            if name.startswith(('s_setpc', 's_call', 's_swappc')):
+                raise Unsupported('slot 57 mesh: indirect control flow (%s) is not covered' % name)
+            if name == 's_endpgm' and i != len(ins) - 1:
+                raise Unsupported('slot 57 mesh: an early s_endpgm is not covered')
+            if not name.startswith(('s_cbranch', 's_branch')):
+                continue
+            target = int(parse(asm)[1][0].split('_')[1], 16)
+            dest = offsets.get(target)
+            if dest is None:
+                raise Unsupported('slot 57 mesh: a branch target is not an instruction boundary')
+            # The first instruction of an exchange is also the preceding region's join.
+            # Branches must reconverge before that instruction.
+            if not lo <= dest < hi:
+                raise Unsupported('slot 57 mesh: a branch enters or crosses a group-memory exchange')
+            if target <= off:
+                raise Unsupported('slot 57 mesh: a loop outside the group-memory exchanges is not covered')
+            if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz'):
+                raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
+            edges[i] = dest
+
+    targets = set(edges.values())
+    no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+    for source, target in edges.items():
+        if ins[source][2] == 's_cbranch_execz':
+            # The model skips per lane, while the guest skips per wave. The difference is invisible when
+            # lanes with clear EXEC can only bypass predicated writes before the paths meet. A skipped
+            # s_branch may land at the execz target or past it over instructions without effect (the
+            # `s_branch .else` over `.empty: s_nop` of an if/else), so both paths meet with the same state.
+            for i in range(source + 1, target):
+                _, _, name, asm = ins[i]
+                if not (no_effect(i) or name == 'exp'
+                        or (name == 's_branch' and edges[i] >= target
+                            and all(no_effect(k) for k in range(target, edges[i])))
+                        or (name.startswith(('v_', 'buffer_load')) and not name.startswith(EXECZ_REFUSED)
+                            and not scalar_effects(name, asm)[2])):
+                    raise Unsupported('slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes')
+        elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
+            raise Unsupported('slot 57 mesh: a branch bypasses an export')
+
+    saved_masks = set().union(*(scalar_registers(parse(asm)[1][0]) for _, _, name, asm in ins
+                              if name == 's_and_saveexec_b64'))
+    out = list(ins[:first])
     span = lambda first, last: (ins[first][0], ins[last][0] + ins[last][1] - ins[first][0])
-    out.append(span(start, start + 1) + ('x2w_mesh_lane0', 'x2w_mesh_lane0 ' + env['lane']))
-    out.append(ins[start + 2])
-    out.append(span(start + 3, a_end - 1) + ('s_nop', 's_nop 0'))
     # State of the walk over the code outside the two exchanges.
     stale = set(range(256))   # VGPRs the model does not hold for every lane; no entry VGPR is modelled
     pending = set()           # of those, the ones written only for the lanes of a narrowed exec
-    mask = 'lane0'         # 'lane0', None (all lanes), 'verts' or 'prims' (all lanes narrowed by one compare)
+    mask = None           # None (all lanes), an output count, or another narrowed mask
     wave_known = False     # sreg['wave'] holds s_bfe_u32(s3, 4 bits at 24)
     thread = base = None   # VGPR of the thread index, SGPR holding wave << 6
+    thread_high = None    # second instruction of a proven adjacent v_mbcnt pair
     scc_stale = False
     exports = []
-    for index in list(range(a_end, count_at)) + [None] + list(range(b_end, len(ins) - 1)):
+    incoming = {}
+    falls = True
+    for index in (list(range(first, start)) + [start] + list(range(a_end, count_at)) + [None]
+                  + list(range(b_end, len(ins)))):
+        if index in targets:
+            paths = incoming[index]
+            if falls:
+                paths.append((stale, pending, mask, wave_known, thread, base, scc_stale))
+            stale = set().union(*(p[0] for p in paths))
+            pending = set().union(*(p[1] for p in paths))
+            mask = paths[0][2]
+            if any(p[2] != mask for p in paths):
+                stale |= pending
+                pending.clear()
+                mask = 'unknown'
+            wave_known = all(p[3] for p in paths)
+            thread, base = (paths[0][k] if all(p[k] == paths[0][k] for p in paths) else None for k in (4, 5))
+            scc_stale = any(p[6] for p in paths)
+            falls = True
+        if not falls:
+            raise Unsupported('slot 57 mesh: unreachable code after a branch is not covered')
+        if index == start:
+            out.append(span(start, start + 1) + ('x2w_mesh_lane0', 'x2w_mesh_lane0 ' + env['lane']))
+            out.append(ins[start + 2])
+            out.append(span(start + 3, a_end - 1) + ('s_nop', 's_nop 0'))
+            stale |= pending | {5, vreg['a_zero'], vreg['a_zero2']}
+            pending.clear()
+            mask, thread = 'lane0', None
+            wave_known = wave_known and sreg['wave'] != a_bits
+            if base == a_bits or base in lane:
+                base = None
+            continue
         if index is None:
             if not wave_known:
                 raise Unsupported('slot 57 mesh count exchange: the compared register is not the wave index')
@@ -1278,20 +1395,34 @@ def mesh_skeleton(ins):
             stale |= pending | {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
             pending.clear()
             mask, scc_stale = None, True
+            wave_known = wave_known and sreg['wave'] != sreg['b_tmp']
+            if base in {sreg['prims'], sreg['verts'], sreg['b_tmp']}:
+                base = None
             continue
         off, size, name, asm = ins[index]
         after = index >= b_end
         _, ops, _ = parse(asm)
         base_name = re.sub(r'_e(32|64)$', '', name)
-        if name.startswith(('s_cbranch', 's_branch', 's_setpc', 's_call', 's_swappc')):
-            raise Unsupported('slot 57 mesh: a branch outside the group-memory exchanges is not covered')
+        complement = (name == 's_andn2_b64' and type(mask) is int and len(ops) == 3
+                      and ops == ['exec', parse(ins[mask][3])[1][0], 'exec'])
+        if name != 's_and_saveexec_b64' and not complement and scalar_registers(asm) & saved_masks:
+            raise Unsupported('slot 57 mesh: an unproven use of a saved EXEC mask is not covered')
+        if index in edges:
+            if scc_stale and reads_scc(name, asm):
+                raise Unsupported('slot 57 mesh: an unmodelled SCC is read by a branch')
+            incoming.setdefault(edges[index], []).append(
+                (stale.copy(), pending.copy(), mask, wave_known, thread, base, scc_stale))
+            out.append(ins[index])
+            falls = name != 's_branch'
+            continue
         if name.startswith('ds_') or name in ('s_barrier', 's_sendmsg', 's_sendmsghalt'):
             raise Unsupported('slot 57 mesh: %s outside the group-memory exchanges' % name)
         if name.startswith(('v_readlane', 'v_writelane')):
             raise Unsupported('slot 57 mesh: lane spills are not covered')
         keep = ins[index]
         if base_name == 'v_readfirstlane_b32':
-            if after or asm != 'v_readfirstlane_b32 %s, v5' % ops[0] or mask is not None or 5 not in stale:
+            if (not a_end <= index < count_at or asm != 'v_readfirstlane_b32 %s, v5' % ops[0]
+                    or mask is not None or 5 not in stale):
                 raise Unsupported('slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered')
             keep = (off, size, 'x2w_mesh_group', 'x2w_mesh_group ' + ops[0])
             ops = ops[:1]
@@ -1317,11 +1448,21 @@ def mesh_skeleton(ins):
             raise Unsupported('slot 57 mesh: SCC of the count exchange is read')
         if name.startswith(('s_cmp', 's_bitcmp')):
             scc_stale = False
-        # EXEC and VCC as wave-wide masks are outside the per-thread model here: only the two forms below touch EXEC.
+        # Saveexec uses a fresh VCC from an adjacent compare. Only the matching complement can read the
+        # saved mask. Hardware SCC (whether any bit is set) is not represented by a per-lane boolean.
         if asm == 's_mov_b64 exec, -1':
             mask = None
             stale |= pending
             pending.clear()
+        elif (name == 's_and_saveexec_b64' and mask is None and index > 0 and index not in targets
+              and re.fullmatch(r's_and_saveexec_b64 s\[\d+:\d+\], vcc', asm)
+              and ins[index - 1][2].startswith('v_cmp_')
+              and parse(ins[index - 1][3])[1][:1] in (['vcc'], ['vcc_lo'])):
+            mask, scc_stale = index, True
+        elif complement:
+            stale |= pending
+            pending.clear()
+            mask, scc_stale = ('else', mask), True
         elif base_name.startswith('v_cmpx'):
             count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
             if (base_name != 'v_cmpx_gt_i32' or not after or mask is not None or count is None
@@ -1329,7 +1470,7 @@ def mesh_skeleton(ins):
                 raise Unsupported('slot 57 mesh: an EXEC compare other than output count > thread index under '
                                   'exec = -1 is not covered')
             mask = count
-        elif writes_exec(name, ops) or re.search(r'\bexec(_lo|_hi)?\b', asm) or (
+        elif writes_exec(name, ops) or re.search(r'\b(?:exec(?:_lo|_hi)?|src_execz|src_vccz)\b', asm) or (
                 name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm)):
             raise Unsupported('slot 57 mesh: %s on a wave mask is not covered' % base_name)
         # The thread index: v_mbcnt_lo(-1, wave << 6) then v_mbcnt_hi(-1, that) under exec = -1.
@@ -1345,9 +1486,11 @@ def mesh_skeleton(ins):
         dest = reg_range(ops[0]) if ops and not base_name.startswith(('v_cmp', 'exp', 'buffer_store')) else None
         writes_v = set(range(dest[1], dest[2] + 1)) if dest and dest[0] == 'v' else set()
         if base_name == 'v_mbcnt_lo_u32_b32' and base is not None and ops[1:] == ['-1', 's%d' % base] and mask is None \
+                and index + 1 not in targets \
                 and index + 1 < len(ins) and ins[index + 1][3] == 'v_mbcnt_hi_u32_b32 %s, -1, %s' % (ops[0], ops[0]):
             thread = dest[1]
-        elif thread in writes_v and not (base_name == 'v_mbcnt_hi_u32_b32' and ins[index - 1][2].startswith('v_mbcnt_lo')):
+            thread_high = index + 1
+        elif thread in writes_v and index != thread_high:
             raise Unsupported('slot 57 mesh: the thread index register is rewritten')
         if keep[2] != 'x2w_mesh_group' and reads_v & stale:
             raise Unsupported('slot 57 mesh: v%d is read where it is not defined for every lane (an entry value, or '
@@ -1369,7 +1512,6 @@ def mesh_skeleton(ins):
         out.append(keep)
     if exports.count('pos0') != 1 or exports.count('target_20') != 1:
         raise Unsupported('slot 57 mesh: one pos0 and one primitive export are required')
-    out.append(ins[-1])
     return out
 
 
@@ -2086,6 +2228,14 @@ class Stage:
         names = {off: name for off, _n, name, _asm in self.ins}
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
+        self.mesh_allocation_block = None
+        splits = set(targets)
+        if getattr(self, 'kind', None) == 'ms' and targets:
+            at = next(i for i, item in enumerate(self.ins) if item[2] == 'x2w_mesh_counts')
+            self.mesh_allocation_block = self.ins[at][0]
+            # The exchange and its EXEC restore always run. Keep the group barrier and allocation outside
+            # the pc dispatch even when the preceding region took different paths.
+            splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
         joined, forward_splits, div_targets = self.joined_registers(with_cfg=True)
@@ -2159,7 +2309,7 @@ class Stage:
             raised_unsupported = None
 
             for instruction_index, (off, n, name, asm) in enumerate(self.ins):
-                if off in targets and off != start:
+                if off in splits and off != start:
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, None))
                     self.lines, start = [], off
@@ -2594,6 +2744,8 @@ class Stage:
             self.emit('GroupMemoryBarrierWithGroupSync();')
             return None
         if base.startswith('s_cbranch_'):
+            if getattr(self, 'kind', None) == 'ms' and base in ('s_cbranch_scc0', 's_cbranch_scc1') and not self.scc_uniform:
+                raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
             return ('branch', cond, int(ops[0].split('_')[1], 16))
@@ -2981,6 +3133,8 @@ class Stage:
                 raise Unsupported('mask from descriptor data')
             d = reg_range(dname)[1]
             own = self.sym.get(d)
+            raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
+                   if getattr(self, 'kind', None) == 'cs' and len(syms) == 2 else None)
             if base in ('s_mov_b32', 's_mov_b64'):
                 self.sym[d] = syms[0]
                 if pair:
@@ -2996,17 +3150,16 @@ class Stage:
                             self.sym[d + 1] = hi
                         elif self.tracks_uniformity():
                             self.varying_s.add(d + 1)
+            elif raw is not None:
+                self.sym[d] = raw
+                if raw[0] == 'desc':
+                    self.pipe.modified.add(desc_key(raw))
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add(desc_key(own))
-                    # The word keeps its descriptor identity for loads; the store check (store_descriptor) sees the
-                    # mark. In a compute stage, clearing the stride field of dword 1 (bits 29:16, keeping the base
-                    # address bits 15:0 and bits 31:30) is marked on its own: a raw byte-address store accepts it.
-                    stride0 = (getattr(self, 'kind', None) == 'cs' and base == 's_and_b32' and len(own) == 4
-                               and own[3] % 4 == 1 and sorted(srcs) == sorted([dname, '0xc000ffff']))
-                    self.sym[d] = own[:4] + ('stride0' if stride0 else 'modified',)
-                    if not stride0:
-                        getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
+                    # Keep the resource identity for loads; stores refuse the unproved value.
+                    self.sym[d] = own[:4] + ('modified',)
+                    getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
                 else:
                     self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
             else:
@@ -3358,8 +3511,20 @@ class Stage:
                 for i in range(count):
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
                 return
+            # The pointer symbol does not record an addend or a rewritten high word, so two loads through such a
+            # pointer may read different words under the same (source, offset). In a compute stage those loads
+            # are told apart by the offset of the s_load; loads through the untouched pair keep one identity.
+            # A 32-bit table pointer carries a high word the program sets to a constant: loads through the same
+            # untouched low word and the same constant read the same words (tag -1 - constant).
+            hi = self.sym.get(base[1] + 1)
+            if getattr(self, 'kind', None) != 'cs' or (p == ('ptr', p[1]) and hi == ('ptrhi', p[1])):
+                load = ()
+            elif p == ('ptr', p[1]) and hi and hi[0] == 'const' and len(hi) == 2:
+                load = (-1 - hi[1],)
+            else:
+                load = (self.pc,)
             for i in range(count):
-                self.sym[dst[1] + i] = ('desc', p[1], off, i)
+                self.sym[dst[1] + i] = ('desc', p[1], off, i) + load
             return
         if p[1] == ('smpheap',):
             if self.pipe.sampler_heap and count == 4:
@@ -3674,25 +3839,28 @@ class Stage:
         self.emit('a = (%s%d) & 0xfffffffcu;' % (soffset, offset) if soffset else 'a = %d;' % offset)
         self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
 
-    def store_descriptor(self, tok, words, what, stride0_ok=False):
-        """Resource key of a store's descriptor operand: all its words must still be the loaded words of one
-        descriptor at a fixed table offset. A moved, overwritten or modified word (stride, num_records, format)
-        would change what the store does. With stride0_ok (a raw byte-address store), dword 1 may carry a cleared
-        stride field: that is the raw descriptor such a store already assumes."""
+    def store_descriptor(self, tok, words, what, stride0_ok=False, raw_conversion_ok=False):
+        """Resource key for a single loaded descriptor or a proven raw transformation of it."""
         rsrc = reg_range(tok)
         first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == words - 1 else None
         if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
             raise Unsupported('%s through %s holding %s' % (what, tok, first))
         key = desc_key(first)
-        def word_ok(k):
-            sym, want = self.sym.get(rsrc[1] + k), first[:3] + (first[3] + k,)
-            return sym == want or (stride0_ok and k == 1 and sym == want + ('stride0',))
-        if (not all(word_ok(k) for k in range(words)) or key in getattr(self.pipe, 'other_modified', ())
+        loaded = tuple(desc_word(first, first[3] + k) for k in range(words))
+        actual = tuple(self.sym.get(rsrc[1] + k) for k in range(words))
+        valid = names_one_value(first) and actual == loaded
+        if names_one_value(first) and stride0_ok and words == 4:
+            cleared = loaded[1] + ('stride0',)
+            valid = valid or actual == (loaded[0], cleared, *loaded[2:])
+            if not valid and raw_conversion_ok:
+                valid = actual == (loaded[0], cleared, loaded[2] + ('byte_count',), loaded[3] + ('oob3',))
+        if (not valid or key in getattr(self.pipe, 'other_modified', ())
                 or (key in self.pipe.modified and not stride0_ok)):
             raise Unsupported('%s through a modified descriptor' % what)
         return key
 
-    def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False):
+    def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False,
+                            raw_conversion_ok=False):
         """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
@@ -3713,7 +3881,7 @@ class Stage:
             vaddr = reg_range(ops[1])
             if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
                 raise Unsupported('%s vaddr %s for offen' % (kind_label, ops[1]))
-        key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True)
+        key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             if not offen:
@@ -3738,7 +3906,7 @@ class Stage:
             return self.op_buffer_store_vs(ops, mods, count)
         if self.kind != 'cs':
             raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
-        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count)
+        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True)
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
         # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
@@ -4056,8 +4224,9 @@ class Stage:
         # FORMAT and DST_SEL are read from the table word, so word 3 must still be the loaded one.
         r = reg_range(ops[2])
         first = self.sym.get(r[1]) if r else None
-        if not r or r[0] != 's' or r[2] - r[1] != 3 or not first or first[0] != 'desc' or any(
-                self.sym.get(r[1] + i) != ('desc', first[1], first[2], first[3] + i) for i in range(4)):
+        if (not r or r[0] != 's' or r[2] - r[1] != 3 or not first or first[0] != 'desc'
+                or not names_one_value(first) or any(
+                    self.sym.get(r[1] + i) != desc_word(first, first[3] + i) for i in range(4))):
             raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
         if first[1][0] != 'table':
             raise Unsupported('formatted buffer load requires a hardware table descriptor')
@@ -4429,7 +4598,7 @@ class Stage:
         if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 8:
             raise Unsupported('%s requires a fixed table image descriptor' % name)
         for i in range(8):
-            word = first[:3] + (first[3] + i,)
+            word = desc_word(first, first[3] + i)
             # A write through a second load of this descriptor can leave these SGPR symbols intact.
             if self.sym.get(image[1] + i) != word or desc_key(word) in self.pipe.modified:
                 raise Unsupported('%s through a modified image descriptor' % name)
@@ -5660,7 +5829,10 @@ class Stage:
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
         for i, (off, lines, term) in enumerate(self.blocks):
-            out.append('    %sif (pc == %d) {' % ('else ' if loops and i else '', i))
+            if off == getattr(self, 'mesh_allocation_block', None):
+                out.append('    {')
+            else:
+                out.append('    %sif (pc == %d) {' % ('else ' if loops and i else '', i))
             out += ['        ' + line for line in lines]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
             if not term:
@@ -5762,7 +5934,7 @@ VEC_F = {
     'v_madmk_f32': (3, 'mad32({0}, {1}, {2}, false)'), 'v_madak_f32': (3, 'mad32({0}, {1}, {2}, false)'),
     'v_rcp_f32': (1, '1.0 / {0}'), 'v_rcp_iflag_f32': (1, '1.0 / {0}'), 'v_rsq_f32': (1, 'rsqrt({0})'), 'v_sqrt_f32': (1, 'sqrt({0})'),
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
-    'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
+    'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'fract32({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
     'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
@@ -6117,6 +6289,15 @@ class Pipeline:
                '    precise float sum = product + ftz32(c);',
                '    return ftz32(sum);',
                '}',
+               # Match pixel_aot: x - floor(x) capped at 0x3f7fffff, so a tiny negative input cannot round up to
+               # 1.0. The cap is a comparison, not min: min returns its other operand for a NaN.
+               # The comparison is on the bits because FXC folds `frac(value) >= 1.0f` to false and emits a bare
+               # frc for it, which loses the cap on an adapter whose frac returns 1.0. frac can only reach the cap
+               # by rounding to exactly +1.0, so the equality covers the same case, and a NaN misses it and passes.
+               'float fract32(float value) {',
+               '    float f = frac(value);',
+               '    return asuint(f) == 0x3f800000u ? asfloat(0x3f7fffffu) : f;',
+               '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
                # High half of an unsigned 32x32 product, by halfword products so it fits 32-bit HLSL.
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
@@ -6377,7 +6558,7 @@ class ComputePipeline(Pipeline):
         self.uses_gather_2d_lod = False
         self.uses_sad = set()
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
-        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: anything but a stride clear
+        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
@@ -6443,8 +6624,6 @@ class MeshPipeline(Pipeline):
 
     def hlsl_ms(self):
         s = self.vs
-        if len(s.blocks) != 1:
-            raise Unsupported('slot 57 mesh: a branch outside the group-memory exchanges is not covered')
         lines = [re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
                         re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
                                lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
@@ -6470,7 +6649,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-15'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-16'))))
     return fnv(layout, key) if layout else key
 
 
@@ -6479,7 +6658,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-15cs')
+    key = fnv(b'x2w-startup-shader-16cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
@@ -6803,7 +6982,7 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
 
 
 def mesh57_key(ms, ps, root):
-    value = fnv(b'x2w-startup-mesh-57-1')
+    value = fnv(b'x2w-startup-mesh-57-2')
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value

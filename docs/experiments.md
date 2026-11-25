@@ -4428,6 +4428,37 @@ python3 -B tests/compute_mimg_image_uav_load_check.py
 python3 -B tests/compute_mimg_image_uav_load_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
 ```
 
+### gfx1013 2D array and 3D float image stores
+
+For full-mask `R32G32B32A32_FLOAT` stores at mip zero, declare
+`--image-uav-dimension 2d-array` or `3d`. The dimension must match the native
+`image_store` form. The translator binds `RWTexture2DArray<float4>` or
+`RWTexture3D<float4>` at `u0` and indexes it with three consecutive
+full-width address VGPRs in X, Y and slice or depth order. Bind the matching
+UAV view and supply a unique destination texel for each invocation. The
+opt-in covers stores with DMASK `0xf` and no explicit mip operand.
+
+Each source-built case writes 64 texels across two slices or depth planes at
+mip zero, with distinct data derived from X, Y and the third coordinate.
+The comparator checks every word of every slice and mip. The array check
+covers 5,376 words across four layers at each mip. The volume check covers
+4,672 words across mips with depths 4, 2 and 1. The swapped-coordinate control
+exchanges Y with the last coordinate while keeping the values the same.
+The translation controls refuse an incorrect view dimension, a sparse mask and an array or
+volume view on gfx1030. A 2D `image_load_mip` from the separate SRV followed by a 2D array
+store translates to the two views. The translator does not clamp the slice or depth
+coordinate. A D3D12 UAV store outside the view is dropped, and the console's behaviour for
+an out-of-range layer has not been measured.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_store_layers_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_mimg_float_store_layers_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
 ### gfx1013 2D D16 float image stores
 
 Declare `--image-format R16G16B16A16_FLOAT` and `--image-uav-mip 0`
@@ -7555,6 +7586,24 @@ hashes and per-case outcomes. The union of the two new coverage records matched
 the original 710 forms. This establishes equivalent selected work on WARP, not
 physical-adapter timeout headroom.
 
+If `pixel_aot_hardware` approaches its 60 s timeout on Windows, you can prime
+the Python bytecode cache once before measuring. CTest starts the fixture with
+`-B`, so Python can read cached modules but does not write them during the test.
+From the repository root, use the same interpreter configured as `INTAKE_PYTHON`
+(the default path is shown here) and run CTest in the same PowerShell session.
+
+```powershell
+$env:PYTHONPYCACHEPREFIX = Join-Path $PWD 'out/pycache'
+& .\out\pe-env\Scripts\python.exe -c "import sys; sys.path.insert(0, 'tests'); import pixel_aot_check"
+ctest --preset dev --no-tests=error -R '^pixel_aot_hardware$' -V
+```
+
+On Windows 11 build 26100.9711 at `82bb67ef`, six of eight runs on an Intel UHD
+770 and RTX 4060 reached the timeout before priming. The import took 5.75 s
+once. With the cache, three runs per adapter took 25.68–27.77 s and produced
+the same 1,010-line form record as the two earlier completed runs.
+[Commands, drivers and individual times in #448](https://github.com/R0Y00/Xbox2Windows/issues/448#issuecomment-7174505456).
+
 The first raw buffer_load_dword path remains a proposal while
 [issue #319](https://github.com/R0Y00/Xbox2Windows/issues/319) is open. The
 [binding contract](pixel_mubuf_contract.md) records the separate DW0/DW1
@@ -9297,8 +9346,8 @@ and compiles them as `ms_6_5` and `ps_6_0` (without a pixel program, to
 `.ms57.hlsl` alone; see below). In that shape lane 0 of wave 0
 stores the primitive and vertex counts, every wave passes a barrier, wave 0
 sends one allocation request and the other wave reads the counts back; the
-code around it is straight-line and exports vertex and primitive `thread`
-under `count > thread`. `mesh_skeleton` in `tools/startup/gfx2hlsl.py` states
+code around it exports vertex and primitive `thread` under
+`count > thread`. `mesh_skeleton` in `tools/startup/gfx2hlsl.py` states
 the shape and refuses every other program with the first difference. The
 lowering clamps both counts to the 128 threads of a group and each index to
 the last vertex. It reads 9-bit indices, ignores the edge flags, and gives a
@@ -9328,6 +9377,16 @@ The pending scan checks the DXContainer header and file length for every
 required slot 57 bytecode artifact. A `ps none` result needs the mesh artifact
 only. A missing or truncated required artifact leaves the request pending
 even if its manifest exists. In manifest-only mode the manifest completes it.
+
+The code outside the exchanges accepts forward `s_branch` and wave-uniform
+SCC branches. A forward `s_cbranch_execz` can skip guarded lane writes, including
+the masked arm of an if/else formed with `s_and_saveexec_b64` and a proven
+complement. The proof checks register definitions and output masks at joins.
+Loops, indirect jumps and calls, branches entering or crossing either exchange,
+and unproven wave masks remain unsupported. Use
+`python -B tests/startup_mesh57_skeleton_check.py` for translations and refusals.
+Append `draw <dxc> <offscreen_check> <warp|hardware>` for CPU-reference readback
+of the SCC paths and lane-masked if/else.
 
 Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
 slot 57 creation. The descriptor must name a registered root, have an empty
@@ -14466,13 +14525,19 @@ allows the read, including at a branch target. The compute controls exercise con
 As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
 handling of out-of-range stores, are assumptions, not measurements.
 
-One descriptor modification is accepted for a raw buffer store: clearing the stride field of dword 1. That is
+The stride-only exception for raw buffer stores clears the stride field of dword 1. That is
 `s_and_b32` of dword 1 with `0xc000ffff`, which keeps the base address bits 15:0 and bits 31:30. The result is
-the raw descriptor such a store already assumes. Any other mask, any other dword, a repeated modification, and
-the same clear on an image store stay refused. Loads through the descriptor still treat it as modified.
+the raw descriptor such a store already assumes. Repeated clears and the same clear on an image store stay
+refused. Loads through the descriptor still treat it as modified.
 
 Case I is case A with the clear before its store. The runner binds a root UAV and reads no descriptor, so the
 GPU run checks the translation, not the stride; the negative controls are the pure-Python refusals.
+
+Compute buffer stores also accept a structured-to-raw conversion from one descriptor load. The shader
+clears the stride in DW1[29:16], multiplies the original DW2 record count by the stride extracted from DW1
+(optionally clamped to at least 1 with `s_max_u32`), and sets DW3[29:28] (OOB_SELECT) to 3. Every other bit must match the load. Case I-raw uses the same
+byte-address store and read-back as case I. As with the stride-only case, matching out-of-range behavior
+requires the runtime to bind a UAV view sized to the resulting byte count.
 
 The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
 
@@ -15200,6 +15265,28 @@ On an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`) and on in-bo
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^startup_range_provenance' -V
+
+## Startup v_fract_f32 upper bound
+
+`v_fract_f32` in `tools/startup/gfx2hlsl.py` now lowers through a `fract32` helper in the common preamble
+instead of a bare D3D `frac`. The helper is `frac(value)` capped at `0x3f7fffff` by a comparison,
+`f >= 1.0f ? asfloat(0x3f7fffffu) : f`, which is the form and the rule `tools/pixel_aot.py` has always used:
+for an input such as -2^-30 (`0xb0800000`) the unclamped `x - floor(x)` rounds up to 1.0 in binary32, while the
+instruction returns at most `0x3f7fffff`. The cap is not written with `min`, because D3D `min` returns its other
+operand for a NaN and a NaN input has to stay a NaN. Two NVIDIA reports fail `startup_gfx2hlsl_float_round_hardware`
+on that very input with `expected=...3f7fffff... actual=...3f800000...`: an RTX 3070 Ti on driver 32.0.16.2101 and
+a Quadro M1000M (Maxwell) on driver 32.0.15.7371, both in #1741, while the same draw passes on WARP, on Intel HD
+Graphics 530 and on the RDNA 4 card used here. That agreement is the reason the D3D `frac` was the deviating side,
+not the fixture. No NVIDIA adapter is available on this machine, so the Maxwell and Turing results are **not**
+reproduced here: what the change is verified against is the emitted text, the pixel_aot rule it now matches, and
+the adapters that already returned `0x3f7fffff`. `tests/startup_gfx2hlsl_fract_check.py` asserts that the statement
+of the `_e32` and `_e64` forms is `U(fract32(...))`, that no bare `frac(` reaches it, that the preamble clamps at
+`0x3f7fffff` with the comparison form, and that the table entry is used by `v_fract_f32` alone. Two controls
+rewrite the lowering to the uncapped `frac` and to a `min`-form cap and require the checks to reject both. Only
+`v_fract_f32` changes in this patch.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_fract$' -V
 ```
 
 ## Vulkan subnormal preservation in a pixel shader
