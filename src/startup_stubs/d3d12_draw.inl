@@ -1325,6 +1325,7 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
     ID3D12Resource* readback = nullptr;
     if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                               IID_PPV_ARGS(&readback)))) return;
+    x2w_budget::committed(device_of(the_device), readback, D3D12_HEAP_TYPE_READBACK);
     DrawDump dump{};
     dump.buffer.Attach(readback);
     dump.footprint = footprint;

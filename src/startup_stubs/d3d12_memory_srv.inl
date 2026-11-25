@@ -354,6 +354,7 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
             if (first_calls(failures, 8)) log("x2w-d3d12 failed to materialize tiled memory SRV: 0x%08lx", hr);
             return nullptr;
         }
+        x2w_budget::committed(device_of(sampled.device), sampled.desktop.Get(), D3D12_HEAP_TYPE_DEFAULT);
         x2w_startup::mark_packed_stand_in(sampled.desktop.Get(), desktop_format(sampled.desc.Format));
     }
     return sampled.desktop.Get();

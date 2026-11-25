@@ -1065,6 +1065,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
+| `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1099,6 +1100,38 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
+
+## D3D12 resource budget
+
+Set `X2W_D3D12_BUDGET=1` before startup to add one `x2w-budget` line to each
+D3D12 present heartbeat. `local` and `nonlocal` show DXGI current usage and
+budget in bytes for node 0 of the adapter matching the desktop device LUID.
+An unavailable segment reads `n/a`.
+
+Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
+The categories are desktop placed resources, committed textures, committed
+buffers, upload buffers, readback buffers, and explicit heaps. Resource sizes
+come from the desktop allocation info for the created description. A slot 133
+texture or buffer with committed backing counts in its committed category.
+Each opened or created heap uses its desktop heap size once, even when several
+placements share it. Placed resource sizes describe the objects occupying
+heaps, so adding both columns would count the backing twice.
+
+Final guest release moves a wrapped allocation to the retained column when
+the shim still owns the desktop reference. An explicit heap stays live while
+its wrapper or a live placement uses it. A cached opened heap moves to
+retained when its last placement retires. Internal resources such as the draw
+upload ring, slot 148 pages, tiled SRV materializations, and readback buffers
+stay live until their desktop references are released. The diagnostic leaves
+those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
+also include allocations outside these categories, such as swap chain and
+descriptor heap backing.
+
+The source-built fixture reads the process-wide counters through
+`x2w_d3d12_budget_snapshot` and checks allocation sizes, final guest release,
+and slot 148 page retirement after queue completion. See
+[D3D12 budget accounting](experiments.md#d3d12-budget-accounting) for the test
+command.
 
 ## Input script
 

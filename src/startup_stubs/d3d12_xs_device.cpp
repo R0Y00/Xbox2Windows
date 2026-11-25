@@ -30,6 +30,7 @@
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/list_upload_pages.h"
+#include "startup_stubs/resource_budget.h"
 #include <optional>
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
@@ -117,6 +118,8 @@ struct alignas(16) WrapperOwn {
     IUnknown* real;
     LONG refs;
     Kind kind;
+    x2w_budget::Ticket* budget;
+    x2w_budget::Ticket* backing_budget;
     void* title_memory;       // Resource: the title-side memory (placement address or hook allocation), or null
     std::uint64_t title_cpu;  // DescriptorHeap: title-owned descriptor memory, or 0
     // Fence: the completed value the title polls through the address from slot 12 (monitorx/mwaitx).
@@ -760,6 +763,31 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
         if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
             x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        if constexpr (K == device_kind && (N == 27 || N == 28 || N == 29)) {
+            if (x2w_budget::enabled()) {
+                using Microsoft::WRL::ComPtr;
+                auto* device = static_cast<ID3D12Device*>(self->own().real);
+                if constexpr (N == 28) {
+                    ComPtr<ID3D12Heap> heap;
+                    if (SUCCEEDED(child->own().real->QueryInterface(IID_PPV_ARGS(&heap))))
+                        child->own().budget = x2w_budget::backing_heap(heap.Get());
+                } else {
+                    ComPtr<ID3D12Resource> resource;
+                    if (SUCCEEDED(child->own().real->QueryInterface(IID_PPV_ARGS(&resource)))) {
+                        if constexpr (N == 27) {
+                            const auto* props = reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a);
+                            child->own().budget = x2w_budget::committed(device, resource.Get(), props->Type);
+                        } else {
+                            child->own().budget = x2w_budget::resource(device, resource.Get(), x2w_budget::placed);
+                            if (auto* heap = as_wrapper(reinterpret_cast<const void*>(a))) {
+                                child->own().backing_budget = heap->own().budget;
+                                if (child->own().backing_budget) child->own().backing_budget->begin_use();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (K == device_kind && kind == list_kind) {
             child->own().list_device = self;
             if (N == 12) child->own().list_node_mask = static_cast<UINT>(a);
@@ -824,7 +852,11 @@ void retire_placement(Wrapper* w);
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
-    if (!refs && self->own().kind == resource_kind && self->own().title_memory) retire_placement(self);
+    if (!refs) {
+        if (self->own().budget) self->own().budget->end_use();
+        if (self->own().backing_budget) self->own().backing_budget->end_use();
+        if (self->own().kind == resource_kind && self->own().title_memory) retire_placement(self);
+    }
     return static_cast<ULONG>(refs);
 }
 
@@ -1568,6 +1600,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
         buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                              IID_PPV_ARGS(&readback));
+        if (SUCCEEDED(hr)) x2w_budget::committed(device, readback, D3D12_HEAP_TYPE_READBACK);
         readback_bytes = SUCCEEDED(hr) ? total : 0;
     }
     if (SUCCEEDED(hr)) hr = allocator->Reset();
@@ -2013,10 +2046,16 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset)
             buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             ID3D12Resource* created = nullptr;
             void* base = nullptr;
-            if (SUCCEEDED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&created))) && SUCCEEDED(created->Map(0, nullptr, &base))) {
-                mapped = static_cast<unsigned char*>(base);
-                ring = created;
+            auto* device = device_of(the_device);
+            if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&created)))) {
+                auto* budget = x2w_budget::committed(device, created, D3D12_HEAP_TYPE_UPLOAD);
+                if (SUCCEEDED(created->Map(0, nullptr, &base))) {
+                    mapped = static_cast<unsigned char*>(base);
+                    ring = created;
+                } else if (budget) {
+                    budget->end_use(); // The failed Map leaves the existing desktop reference held.
+                }
             }
         }
         ReleaseSRWLockExclusive(&lock);
@@ -3482,7 +3521,11 @@ HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* 
 // cross-adapter buffer is placed at the address's offset. Its desktop GPU address differs from the
 // title address; nothing translates title GPU addresses yet. Textures trap.
 std::mutex placed_mutex;
-std::vector<std::pair<void*, ID3D12Heap*>> existing_heaps;
+struct ExistingHeap {
+    ID3D12Heap* real;
+    x2w_budget::Ticket* budget;
+};
+std::vector<std::pair<void*, ExistingHeap>> existing_heaps;
 volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_queries;  // five-second totals
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
@@ -3526,6 +3569,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         if (FAILED(texture_hr)) return texture_hr;
         x2w_startup::mark_packed_stand_in(created, desktop_format(desc->Format));
         Wrapper* w = wrap(created, resource_kind);
+        w->own().budget = x2w_budget::committed(device_of(self), created, props.Type);
         w->own().title_memory = address;
         note_resource(w, desc, 0);
         *out = w;
@@ -3554,6 +3598,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         return E_INVALIDARG;
     const UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
     ID3D12Heap* heap = nullptr;
+    x2w_budget::Ticket* backing_budget = nullptr;
     HRESULT hr = S_OK;
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
     // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
@@ -3562,8 +3607,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
-        for (auto& [known, h] : existing_heaps)
-            if (known == base) heap = h;
+        for (const auto& [known, h] : existing_heaps) {
+            if (known == base) {
+                heap = h.real;
+                backing_budget = h.budget;
+            }
+        }
         if (!heap) {
             ID3D12Device3* device3 = nullptr;
             hr = device_of(self)->QueryInterface(IID_PPV_ARGS(&device3));
@@ -3571,7 +3620,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                 hr = device3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&heap));
                 device3->Release();
             }
-            if (SUCCEEDED(hr)) existing_heaps.emplace_back(base, heap);
+            if (SUCCEEDED(hr)) {
+                backing_budget = x2w_budget::backing_heap(heap, 0);
+                existing_heaps.emplace_back(base, ExistingHeap{heap, backing_budget});
+            }
         }
     }
     D3D12_RESOURCE_DESC copy = *desc;
@@ -3610,6 +3662,13 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         resource->Release();
         _aligned_free(&w->own());
         return hr;
+    }
+    if (aliased) {
+        w->own().budget = x2w_budget::resource(device_of(self), resource, x2w_budget::placed);
+        w->own().backing_budget = backing_budget;
+        if (backing_budget) backing_budget->begin_use();
+    } else {
+        w->own().budget = x2w_budget::committed(device_of(self), resource, D3D12_HEAP_TYPE_DEFAULT);
     }
     *out = w;
     return S_OK;
@@ -3913,6 +3972,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     if (FAILED(hr)) return hr;
     x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
     Wrapper* w = wrap(resource, resource_kind);
+    w->own().budget = x2w_budget::committed(device_of(self), resource, props->Type);
     w->own().title_memory = title_memory;
     note_resource(w, desc, info.SizeInBytes != ~0ull ? info.SizeInBytes : 0);
     *out = w;
@@ -4070,6 +4130,44 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
                                 : "x2w-present picture signature: setup failed, no samples");
 }
 
+void report_budget(ID3D12CommandQueue* queue)
+{
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D12Device> device;
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter3> adapter;
+    if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        const LUID luid = device->GetAdapterLuid();
+        if (FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
+            ComPtr<IDXGIAdapter1> warp;
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) && SUCCEEDED(warp->GetDesc1(&desc)) &&
+                desc.AdapterLuid.LowPart == luid.LowPart && desc.AdapterLuid.HighPart == luid.HighPart)
+                warp.As(&adapter);
+        }
+    }
+    char local[48] = "n/a", nonlocal[48] = "n/a";
+    const auto sample = [&](DXGI_MEMORY_SEGMENT_GROUP segment, char (&text)[48]) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+        if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, segment, &info)))
+            std::snprintf(text, sizeof(text), "%llu/%llu", info.CurrentUsage, info.Budget);
+    };
+    sample(DXGI_MEMORY_SEGMENT_GROUP_LOCAL, local);
+    sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
+    const auto counts = x2w_budget::snapshot();
+    char text[640]{};
+    std::size_t used = 0;
+    for (int i = 0; i < x2w_budget::category_count; ++i) {
+        const auto& active = counts.live[i];
+        const auto& held = counts.retained[i];
+        const int n = std::snprintf(text + used, sizeof(text) - used, " %s=%llu/%llu+%llu/%llu", x2w_budget::names[i],
+                                    active.bytes, active.objects, held.bytes, held.objects);
+        if (n < 0 || static_cast<std::size_t>(n) >= sizeof(text) - used) break;
+        used += n;
+    }
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu", local, nonlocal, text, counts.unmeasured);
+}
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -4220,6 +4318,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
+        if (x2w_budget::enabled()) report_budget(static_cast<ID3D12CommandQueue*>(self->own().real));
     }
     return S_OK;
 }
@@ -4426,6 +4525,13 @@ HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT6
     build.DestAccelerationStructureData = out;
     build.ScratchAccelerationStructureData = temp;
     return S_OK;
+}
+
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_budget_snapshot(x2w_budget::Snapshot* out, SIZE_T bytes)
+{
+    if (!out || bytes != sizeof(*out) || !x2w_budget::enabled()) return FALSE;
+    *out = x2w_budget::snapshot();
+    return TRUE;
 }
 
 // Called by the XG stand-in after it filled texture memory at a title address.
