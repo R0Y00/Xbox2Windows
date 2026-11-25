@@ -8804,6 +8804,14 @@ The negative controls each remove one guarantee and must fail every case that it
 
 Run `cmake --build --preset dev --target unified_buffer_paths_check` and `ctest --preset dev --no-tests=error -R '^unified_buffer_paths_' -V`. Set `XBOX2WINDOWS_ADAPTER` to select a hardware adapter and `X2W_TEST_DEBUG_LAYER=1` to enable the debug layer. The hardware case skips (77) without an `ID3D12Device3` adapter or without sharing support. The controls run on WARP as `WILL_FAIL` tests and skip if a targeted case could not run. Unsynchronized concurrent CPU and GPU writes are outside the contract and not exercised. Textures, render targets and acceleration structures are outside this slice.
 
+#### A lease for committed XMem section pages (#1914)
+
+The in-process lease API requires version 1 and the exact output structure size. It clears a correctly sized output before checking the request. It checks the mirrored and CPU mappings under the XMem lock, accepts only committed pages backed by consecutive slots of one section, and duplicates the section handle within the caller's process. The caller maps the selected span with `MapViewOfFile` and opens that view with `OpenExistingHeapFromAddress`. The returned byte offset identifies the requested start inside the placed buffer. The lease holds the slots until the caller releases it after its last GPU fence. Freeing the original title grant is allowed after unmapping. Its slots stay out of the reuse pool until the lease retires.
+
+The fixture maps two pages from the shim's `SEC_RESERVE` pool and copies a 4 KiB span across their boundary. A GPU write appears in both title views. A second copy sees the original pages' late CPU updates after the title frees and remaps the same virtual addresses. Readback compares all 4,096 bytes and checks the replacement pages retain their own data. A later allocation gets the retired slot and sees zeroes. The checks also refuse holes, reversed section order, a CPU address passed to the mirrored address API, an invalid output size and a repeated release.
+
+Run `cmake --build --preset release --target xmem_section_lease_check` and `ctest --preset release --no-tests=error -R '^xmem_section_lease_' -V`. The tests report a capability skip (77) when the D3D12 device lacks existing heap support.
+
 #### Xbox frame events and token wait semantics (#874)
 
 The source-built frame events fixture (`tests/cpu/frame_events_caller.asm`, `tests/cpu/frame_events_provider.cpp`, `tests/cpu/frame_events_check.py`, CTest `cpu_native_frame_events`) models the scheduling and wait semantics of the Xbox frame-pacing extensions in `d3d12_xs.dll`:
