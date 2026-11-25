@@ -62,28 +62,6 @@ bool read_bytes(const char* path, std::vector<char>& out)
     return !out.empty();
 }
 
-int pick_adapter(bool hardware, ComPtr<IDXGIAdapter>& adapter)
-{
-    ComPtr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
-    if (!hardware) return SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))) ? 0 : 4;
-    ComPtr<IDXGIFactory6> factory6;
-    if (FAILED(factory.As(&factory6))) return 77;
-    for (UINT n = 0;; ++n) {
-        ComPtr<IDXGIAdapter1> candidate;
-        const HRESULT hr = factory6->EnumAdapterByGpuPreference(n, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
-        if (hr == DXGI_ERROR_NOT_FOUND) return 77;
-        if (FAILED(hr)) return 4;
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(candidate->GetDesc1(&desc))) return 4;
-        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-            SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
-            adapter = candidate;
-            return 0;
-        }
-    }
-}
-
 D3D12_RASTERIZER_DESC raster_desc(D3D12_CULL_MODE cull, BOOL depth_clip)
 {
     D3D12_RASTERIZER_DESC desc{};
@@ -145,13 +123,13 @@ int execute_guest_list(void* queue, void* list, void* fence, UINT64 fence_value)
 
 int main(int argc, char** argv)
 {
-    if (argc != 5 && argc != 13) return 2;
+    if (argc != 5 && argc != 13 && argc != 17) return 2;
     std::vector<char> vs, ps;
     if (!read_bytes(argv[1], vs) || !read_bytes(argv[2], ps)) return 3;
     const bool hardware = std::strcmp(argv[4], "hardware") == 0;
 
     ComPtr<IDXGIAdapter> adapter;
-    if (const int rc = pick_adapter(hardware, adapter)) return rc;
+    if (const int rc = pick_stream_adapter(hardware, adapter)) return rc;
     {
         DXGI_ADAPTER_DESC desc{};
         LARGE_INTEGER driver{};
@@ -248,5 +226,18 @@ int main(int argc, char** argv)
     if (const int rc = run_case(6, argv[10], pso_bias)) return rc;
     if (const int rc = run_case(7, argv[11], mixed_10_27)) return rc;
     if (const int rc = run_case(8, argv[12], mixed_27_10)) return rc;
+    if (argc == 17) {
+        int output = 13;
+        for (int kind : {1, 2}) {
+            for (auto cull : {D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT}) {
+                auto raster = raster_desc(cull, TRUE);
+                raster.FrontCounterClockwise = TRUE;
+                void* pso = create_stream_pso(guest, root, vs, ps, kind, raster, 0);
+                if (!pso) return 9;
+                if (const int rc = run_case(output - 4, argv[output], pso)) return rc;
+                ++output;
+            }
+        }
+    }
     return 0;
 }
