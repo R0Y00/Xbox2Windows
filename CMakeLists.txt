@@ -3081,6 +3081,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: the SMEM offset 'off' is the literal 0; m0 and other operands keep their handling (#1674).
     add_test(NAME startup_gfx2hlsl_smem_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_smem_offset_check.py")
+    # Startup shader translator: s_load descriptor into s[104:107] (vcc is s106/s107) (#1723).
+    add_test(NAME startup_gfx2hlsl_sload_s104 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sload_s104_check.py")
     # Startup shader translator: uniform sources of v_readfirstlane_b32 in straight-line code and entry blocks (#1723).
     add_test(NAME startup_gfx2hlsl_readfirstlane_uniform COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_uniform_check.py")
