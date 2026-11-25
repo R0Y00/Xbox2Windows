@@ -956,10 +956,8 @@ class Stage:
     def note_v_write(self, *regs):
         """Count writes per VGPR: the NGG pass-through checks use it to prove a register is unchanged."""
         counts = self.__dict__.setdefault('v_writes', {})
-        lanes = self.__dict__.setdefault('lane_v', {0})
         for n in regs:
             counts[n] = counts.get(n, 0) + 1
-            lanes.discard(n)
 
     def v_version(self, n):
         return self.__dict__.get('v_writes', {}).get(n, 0)
@@ -2739,10 +2737,9 @@ class Stage:
     # ---- NGG vertex pass-through ---------------------------------------------------------------
     # A pass-through NGG vertex shader asks for its allocation (s_sendmsg GS_ALLOC_REQ), parks per-lane values in LDS,
     # synchronises (s_barrier), reads them back and exports the position, the parameters and the primitive word. D3D
-    # assembles the primitives itself, so the allocation request and the barrier have no effect here, and an LDS slot
-    # that the same lane writes and reads back is the register it was written from. Anything else stays refused: a
-    # slot read before it is written, a slot that another write or a register change made stale, an address not proven
-    # different for every lane (v0 at entry, or a plain copy of it; lanes could share one slot) and any other LDS form.
+    # assembles the primitives itself, so the allocation request and the barrier have no effect here. The LDS round
+    # trip stays refused: forwarding it as a register copy needs a proven cross-lane byte-range layout (lane addresses
+    # at least 4 bytes apart, every write offset disjoint across all active lanes), which the entry v0 does not give.
     GS_ALLOC_REQ = 9
 
     def ngg_stage(self, what):
@@ -2763,38 +2760,17 @@ class Stage:
         self.ngg_stage('s_barrier')
         return None
 
-    def lds_slot(self, ops, mods, count):
-        if mods == []:
-            mods = ['offset:0']   # the decoder omits a zero immediate offset
-        if len(ops) != count or len(mods) != 1 or not re.fullmatch(r'offset:\d+', mods[0]):
-            raise Unsupported('LDS access %s needs one VGPR address and an offset' % ' '.join(ops + mods))
-        regs = [reg_range(o) for o in ops]
-        if any(not r or r[0] != 'v' or r[1] != r[2] for r in regs):
-            raise Unsupported('LDS access %s needs single VGPR operands' % ' '.join(ops + mods))
-        return [r[1] for r in regs], int(mods[0][7:])
+    LDS_REFUSAL = ('%s: an LDS slot is private to a lane only if the lane addresses are proven at least 4 bytes apart '
+                   'and every write offset is proven disjoint across all active lanes; the entry v0 is a packed word '
+                   'with no such layout, so the round trip is not forwarded as a register copy')
 
     def op_ds_write_b32(self, ops, mods):
         self.ngg_stage('ds_write_b32')
-        (addr, data), offset = self.lds_slot(ops, mods, 2)
-        if addr not in self.__dict__.setdefault('lane_v', {0}):
-            raise Unsupported('ds_write_b32 address v%d is not proven different for every lane' % addr)
-        slots = self.__dict__.setdefault('lds', {})
-        # Another address register may hold the same word, and a 4-byte write overlaps a neighbour closer than 4.
-        for key in [k for k in slots if k[0] != addr or abs(k[1] - offset) < 4]:
-            del slots[key]
-        slots[(addr, offset)] = (self.v_version(addr), data, self.v_version(data))
-        self.used_v.update((addr, data))
-        return None
+        raise Unsupported(self.LDS_REFUSAL % ('ds_write_b32 ' + ' '.join(ops + mods)))
 
     def op_ds_read_b32(self, ops, mods):
         self.ngg_stage('ds_read_b32')
-        (dst, addr), offset = self.lds_slot(ops, mods, 2)
-        slot = self.__dict__.get('lds', {}).get((addr, offset))
-        if slot is None or slot[0] != self.v_version(addr) or slot[2] != self.v_version(slot[1]):
-            raise Unsupported('ds_read_b32 v%d reads an LDS slot this lane did not write unchanged' % dst)
-        self.used_v.add(addr)
-        self.set_v(dst, 'v%d' % slot[1])
-        return None
+        raise Unsupported(self.LDS_REFUSAL % ('ds_read_b32 ' + ' '.join(ops + mods)))
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])

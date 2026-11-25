@@ -1,9 +1,10 @@
 """Check the NGG vertex pass-through lowering in tools/startup/gfx2hlsl.py without shader machine code.
 
 A pass-through NGG vertex shader asks for its allocation, parks per-lane values in LDS, waits at a barrier, reads
-them back and exports position, parameters and the primitive word. The lowering drops the LDS round trip (the read
-returns the register that was written), keeps the position and parameter exports, and accepts the primitive export
-only when it hands on the entry VGPR0 word unchanged. Everything else stays refused.
+them back and exports position, parameters and the primitive word. The lowering drops the allocation request and the
+barrier, keeps the position and parameter exports, and accepts the primitive export only when it hands on the entry
+VGPR0 word unchanged. The LDS round trip stays refused: no cross-lane byte-range layout is proven. Everything else
+stays refused.
 """
 import os
 import sys
@@ -53,20 +54,21 @@ def run(*instructions, kind='vs', branch=False):
     return [line for _, lines, _ in s.blocks for line in lines]
 
 
-ROUND_TRIP = ('v_mov_b32_e32 v1, v0', 'ds_write_b32 v1, v2 offset:16', BARRIER, 'ds_read_b32 v3, v1 offset:16')
+got = run(ALLOC, BARRIER, POS, PRIM)
+check('allocation request and barrier are dropped', got == ['o.pos = float4(F(v4), F(v5), F(v6), F(v7));'], repr(got))
 
-got = run(ALLOC, *ROUND_TRIP, PRIM)
-check('round trip becomes a register copy', got == ['v1 = v0;', 'v3 = v2;'], repr(got))
-
-got = run(ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', BARRIER, 'ds_read_b32 v3, v1 offset:16', POS, PRIM)
-check('position export survives the pass-through', got[-1] == 'o.pos = float4(F(v4), F(v5), F(v6), F(v7));', repr(got))
-
-got = run(ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v1, v8 offset:20', BARRIER,
-          'ds_read_b32 v3, v1 offset:20', 'ds_read_b32 v9, v1 offset:16', PRIM)
-check('slots are kept apart by offset', got == ['v1 = v0;', 'v3 = v8;', 'v9 = v2;'], repr(got))
-
+# LDS round trips are refused: nothing proves the lane addresses are 4 bytes apart. With a stride of 4, lane A's
+# v0+20 and lane B's v0+16 name the same DWORD, so a read can return another lane's payload, not the register copy.
+ALIAS = (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v1, v8 offset:20', BARRIER,
+         'ds_read_b32 v3, v1 offset:20', 'ds_read_b32 v9, v1 offset:16', PRIM)
+got = run(*ALIAS)
+check('refused: two aligned offsets that alias across lanes (distinct payloads v2, v8)',
+      isinstance(got, str) and 'private to a lane' in got, repr(got))
+got = run(ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', BARRIER, 'ds_read_b32 v3, v1 offset:16', PRIM)
+check('refused: disjoint single-offset round trip is still unproven',
+      isinstance(got, str) and 'private to a lane' in got, repr(got))
 got = run(ALLOC, 'ds_write_b32 v0, v2', BARRIER, 'ds_read_b32 v3, v0', PRIM)
-check('omitted DS offset means zero', got == ['v3 = v2;'], repr(got))
+check('refused: omitted DS offset', isinstance(got, str) and 'private to a lane' in got, repr(got))
 
 # Controls that must stay refused.
 REFUSED = [
@@ -78,26 +80,8 @@ REFUSED = [
     ('compressed primitive export', (ALLOC, 'exp target_20 v0, off, off, off compr done'),
      'non-identity primitive export'),
     ('primitive export after a branch', (PRIM,), 'non-identity primitive export', True),
-    ('slot read without a write', (ALLOC, LANE, 'ds_read_b32 v3, v1 offset:16'), 'did not write'),
-    ('other offset read', (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'ds_read_b32 v3, v1 offset:20'),
-     'did not write'),
-    ('address masked to one word for all lanes',
-     (ALLOC, 'v_and_b32_e32 v1, 0, v0', 'ds_write_b32 v1, v0 offset:16', 'ds_read_b32 v3, v1 offset:16'),
-     'not proven different'),
-    ('address never derived from the lane word', (ALLOC, 'ds_write_b32 v7, v2 offset:16'), 'not proven different'),
-    ('aliasing write through a copied address',
-     (ALLOC, LANE, 'v_mov_b32_e32 v4, v1', 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v4, v8 offset:16',
-      'ds_read_b32 v3, v1 offset:16'), 'did not write'),
-    ('overlapping write at a nearby offset',
-     (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v1, v8 offset:18', 'ds_read_b32 v3, v1 offset:16'),
-     'did not write'),
-    ('address changed after the write',
-     (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'v_add_nc_u32_e32 v1, 1, v1', 'ds_read_b32 v3, v1 offset:16'),
-     'did not write'),
-    ('data changed after the write',
-     (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'v_mov_b32_e32 v2, 0', 'ds_read_b32 v3, v1 offset:16'),
-     'did not write'),
     ('unknown message', ('s_sendmsg 0x2',), 's_sendmsg'),
+    ('LDS read without a write', (ALLOC, LANE, 'ds_read_b32 v3, v1 offset:16'), 'private to a lane'),
     ('LDS write in a pixel shader', ('ds_write_b32 v1, v2 offset:16',), 'straight-line vertex shader', False, 'ps'),
     ('LDS after a branch', ('ds_write_b32 v1, v2 offset:16',), 'straight-line vertex shader', True),
 ]
