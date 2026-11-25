@@ -3173,6 +3173,26 @@ def inline_calls(instructions):
                   *((call_offset + 4 + offset - target, text) for offset, text in instructions[start:end]),
                   *((offset + size, text) for offset, text in instructions[c + 1:start])])
 
+INTEGER_TEMPORARY = re.compile(r"\b(?:salu|alu)[0-9]+\b")
+
+
+def discard_dead_integer_temporaries(lines, candidates):
+    """Remove only emitter-marked, single-assignment locals after validation."""
+    live = set()
+    retained = []
+    first = next(iter(candidates))  # Emit sites mark candidates in line order.
+    # Locals are declared before their uses. Scan backwards from the roots
+    # (all unmarked lines), so skipped declarations do not root their inputs.
+    for index in range(len(lines) - 1, first - 1, -1):
+        name = candidates.get(index)
+        if name is not None and name not in live:
+            continue
+        line = lines[index]
+        retained.append(line)
+        live.update(INTEGER_TEMPORARY.findall(line))
+    retained.reverse()
+    return lines[:first] + retained
+
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
@@ -3248,6 +3268,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
     lines = [PREAMBLE] if sampler is None else [SAMPLED_RESOURCES, PREAMBLE]
+    dead_integer_candidates = {}
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
@@ -4322,6 +4343,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif op == "flbit_i32":
                 helpers.add("dpp_ffbh_i32")
             values = [scalar_u32(t, scalar, pending) for t in tokens]
+            if mask == "entry" and op in ("xor_b32", "lshl_b32"):
+                dead_integer_candidates[len(lines)] = f"salu{i}"
             lines.append(f"    uint salu{i} = {template.format(*values)};")
             if carry:
                 scc = f"({carry.format(*values, r=f'salu{i}')})"
@@ -5213,6 +5236,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             helpers.update(INTEGER_HELPERS.get(op, ()))
             helpers.update(SAD_HELPERS.get(op, ()))
             vector[dst] = f"alu{i}"
+            if op == "xor_b32":
+                dead_integer_candidates[len(lines)] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             enc, dst, value, classes = m.groups()
@@ -5252,6 +5277,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
             expression = {"add": f"{a} + {b}", "sub": f"{a} - {b}", "subrev": f"{b} - {a}"}[op]
             vector[dst] = f"alu{i}"
+            if line.startswith("v_add_nc_u32"):
+                dead_integer_candidates[len(lines)] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_(add|sub|subrev)_co_u32 (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+)"):
             # 32-bit add or subtract that also writes the unsigned carry or borrow of each lane to a lane
@@ -6844,6 +6871,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Expected one gather for the declared view")
     if not ended or sampled_textures != set(bindings.values()):
         raise ValueError("Unexpected sample count or missing color export")
+    if dead_integer_candidates:
+        lines = discard_dead_integer_temporaries(lines, dead_integer_candidates)
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
         if "div_fmas32" in helpers:

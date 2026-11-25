@@ -13936,6 +13936,67 @@ def check_nc_integer_lowering():
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
+def check_dead_integer_temporaries():
+    def declaration(program, instruction, name):
+        return f"{name}{program.index(instruction)} ="
+
+    def exists(source, name):
+        return any(name in line for line in source.splitlines())
+
+    scalar = ("s_xor_b32 s50, s44, s45", "s_lshl_b32 s50, s50, 3")
+    vector = ("v_xor_b32_e32 v18, s46, v12", "v_add_nc_u32_e32 v18, 1, v18")
+
+    dead = uncompressed_export([*scalar, *vector])
+    source = translate_int(dead)
+    for chain, stem in ((scalar, "salu"), (vector, "alu")):
+        for instruction in chain:
+            assert not exists(source, declaration(dead, instruction, stem)), instruction
+    assert "return uint4(asuint(sample" in source
+    assert source.count(".Sample(") == 1
+    assert "params[" in source
+
+    # The scalar chain reaches the export only via SCC written by the shift.
+    # The vector chain feeds both a predicate and the outer value of a masked join.
+    live = uncompressed_export([
+        *scalar,
+        "s_cselect_b32 s51, 1, 0",
+        "v_mov_b32_e32 v14, s51",
+        *vector,
+        "v_cmp_lt_u32_e64 vcc_lo, v18, s47",
+        "v_mov_b32_e32 v13, v18",
+        "s_and_saveexec_b64 s[60:61], vcc",
+        "v_mov_b32_e32 v13, s45",
+        MASKED_OR_RESTORE,
+    ])
+    source = translate_int(live)
+    for chain, stem in ((scalar, "salu"), (vector, "alu")):
+        for instruction in chain:
+            assert exists(source, declaration(live, instruction, stem)), instruction
+    assert f"salu{live.index(scalar[-1])} != 0u" in source
+    assert f"asuint(alu{live.index(vector[-1])})" in source
+    assert f"alu{live.index(MASKED_OR_RESTORE)}_v13" in source
+
+    # A load with unused data still roots its integer address and remains emitted.
+    address = "v_add_nc_u32_e32 v20, 1, v12"
+    title = uncompressed_export([
+        address,
+        "v_mov_b32_e32 v21, s45",
+        "flat_load_dword v22, v[20:21]",
+        "s_waitcnt vmcnt(0) lgkmcnt(0)",
+    ])
+    source = translate_title(title)
+    assert exists(source, declaration(title, address, "alu"))
+    assert "title_load_dword(uint2(" in source
+
+    # Even a dead result still has to pass operand and wait validation.
+    unsupported_modifier = "v_add_nc_u32_e64 v18, v12, v13 clamp"
+    expect_value_error(translate_int, uncompressed_export([unsupported_modifier]), "Unsupported instruction")
+    must_reject(translate_int, uncompressed_export(["v_add_nc_u32_e32 v18, 1, v200"]))
+    early = uncompressed_export([])
+    early.insert(early.index("s_waitcnt vmcnt(0)"), vector[0])
+    must_reject(translate_int, early)
+
+
 def check_masked_mov_close_controls():
     """Issue #1315: an s_and_saveexec_b64 region may close with the s_mov_b64 copy of its exact saved pair."""
     # EXEC inside the region is a subset of the saved entry mask, so both closes restore the same mask and lower
@@ -18758,6 +18819,7 @@ _CONTROL_SUBCHECKS = (
     "check_scalar_pair_reads",
     "check_readfirstlane_controls",
     "check_flat_scratch_controls",
+    "check_dead_integer_temporaries",
     "check_nc_integer_lowering",
     "check_e64_integer_lowering",
     "check_carry_out_lowering",

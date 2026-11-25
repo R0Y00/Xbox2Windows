@@ -6497,6 +6497,20 @@ record counts have not been remeasured after this change.
 
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
 
+## Unused integer results in emitted pixel HLSL
+
+After validating a shader, the pixel translator omits unused temporary
+declarations created by `s_xor_b32`, `s_lshl_b32`, `v_xor_b32` and
+`v_add_nc_u32`. A use in a predicate, address or exported value keeps
+its dependencies. The controls in `tests/pixel_aot_check.py` exercise
+these uses and the instruction refusal paths.
+
+Reproduction:
+
+```powershell
+python -B tests/pixel_aot_check.py
+```
+
 ## Vector bit operations in pixel shaders
 
 `pixel_aot.py` adds vector bitfield extraction (`v_bfe_u32`, `v_bfe_i32`),
