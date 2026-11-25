@@ -219,7 +219,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
     if (rejection == Rejection::partial_record) offset = argument_bytes - sizeof(D3D12_DISPATCH_ARGUMENTS);
     if (counted)
         slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, max_commands, argument, offset,
-                                            rejection == Rejection::no_count_buffer ? nullptr : argument, count_offset);
+                                            rejection == Rejection::no_count_buffer ? nullptr : argument,
+                                            rejection == Rejection::no_count_buffer ? 0 : count_offset);
     else
         slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, 1, argument, offset, nullptr, 0);
     transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
