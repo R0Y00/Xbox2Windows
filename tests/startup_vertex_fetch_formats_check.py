@@ -336,10 +336,53 @@ def controls():
     source = pipeline_mubuf(0).hlsl_vs()
     for label, old, new in DESC_MUTATIONS:
         assert old in source, label
+    runtime_gate_controls()
     # Each reference is built from the format table: no case may be degenerate (an all-zero or all-sentinel set).
     for label, name, word3, words in mubuf_cases():
         assert words != [SENTINEL] * 320 and (any(words[:64]) or 'zeros' in label), label
     assert mubuf_expected('BUF_FMT_32_32_32_32_FLOAT', 3, (5, 4, 1)) != mubuf_expected('BUF_FMT_32_32_32_32_FLOAT', 3)
+
+
+RUNTIME = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12_draw.inl'
+
+
+def runtime_gate(source):
+    """The draw refuses (returns false) before any list command unless every descword3 binding is usable.
+
+    Returns the FORMAT numbers the runtime accepts and the gate text, or raises AssertionError.
+    """
+    known = re.search(r'known\[\] = \{([0-9, ]+)\}', source)
+    gate = re.search(r'if \(ud\.kind != Translation::desc_word3\) continue;(.*?)return false;', source, re.S)
+    assert known and gate, 'descriptor word 3 gate missing'
+    assert source.index(gate.group(0)) < source.index('list->SetPipelineState(pipeline)'), 'gate must precede list commands'
+    for condition in ('desc_hardware[ud.a]', 'desc_backed[ud.a]', 'supported_descriptor_format('):
+        assert condition in gate.group(1), condition
+    return {int(n) for n in known.group(1).split(',')}, gate.group(0)
+
+
+def runtime_gate_controls():
+    """Unresolved metadata, an unsupported FORMAT and missing backing are each refused; a real zero payload is not a refusal."""
+    source = RUNTIME.read_text()
+    accepted, gate = runtime_gate(source)
+    assert accepted == set(gfx2hlsl.DESC_FORMAT_CODES.values()), 'runtime FORMAT list differs from the translation switch'
+    assert 2 not in accepted and 0 not in accepted  # the unsupported FORMAT 2 and the invalid FORMAT 0 are refused
+    # word 3 and the hardware flag are only set together, in the hardware descriptor branch
+    assert source.count('desc_hardware[i] = true;') == 1 and source.count('desc_word3[i] = words[3];') == 1
+    # each of the three conditions is necessary: dropping any one must be noticed
+    for dropped in ('desc_hardware[ud.a]', 'desc_backed[ud.a]', 'supported_descriptor_format('):
+        try:
+            runtime_gate(source.replace(gate, gate.replace(dropped, 'true')))
+        except AssertionError:
+            continue
+        raise AssertionError('gate without %s must fail the control' % dropped)
+    # a gate placed after the first list command is refused too
+    late = source.replace(gate, '').replace('list->SetPipelineState(pipeline);', 'list->SetPipelineState(pipeline);\n' + gate, 1)
+    try:
+        runtime_gate(late)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('a gate after list commands must fail the control')
 
 
 def run(directory, compiler, consumer, adapter, name, source, words, translated=None, word3=None):

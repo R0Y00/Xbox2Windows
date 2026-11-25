@@ -1154,6 +1154,14 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
     return true;
 }
 
+// The buffer-descriptor FORMAT numbers the translated formatted loads decode (DESC_FORMAT_CODES in tools/startup/gfx2hlsl.py).
+static bool supported_descriptor_format(std::uint32_t format)
+{
+    static const std::uint32_t known[] = {1, 5, 14, 22, 23, 24, 29, 56, 64, 71, 74, 77};
+    for (const std::uint32_t code : known) if (code == format) return true;
+    return false;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     auto* list = recording(self);
@@ -1180,7 +1188,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
     std::uint32_t strides[32] = {};
-    std::uint32_t desc_word3[32] = {};  // word 3 (FORMAT and DST_SEL) of a hardware buffer descriptor; 0 for any other binding
+    std::uint32_t desc_word3[32] = {};  // word 3 (FORMAT and DST_SEL) of a hardware buffer descriptor
+    bool desc_hardware[32] = {};        // the binding is a hardware descriptor read from the table (word 3 is real, even when 0)
+    bool desc_backed[32] = {};          // ... and its buffer range was bound
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
     // -vertex_first and each stream's view starts at vertex_first.
@@ -1339,6 +1349,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             address = words[0] | (static_cast<u64>(words[1] & 0xffff) << 32);
             strides[i] = (words[1] >> 16) & 0x3fff;
             desc_word3[i] = words[3];
+            desc_hardware[i] = true;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         if (bytes > (16u << 20)) bytes = 16u << 20;
@@ -1368,11 +1379,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             buffer_view(dest, target ? upload_ring : nullptr, offset, padded);
             count_buffer(target != nullptr);
+            desc_backed[i] = target != nullptr;
             continue;
         }
         if (placed.alias && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && bytes) {
             require_state(self, placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
+            desc_backed[i] = true;
             continue;
         }
         bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
@@ -1389,6 +1402,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         buffer_view(dest, have ? upload_ring : nullptr, offset, bytes);
         count_buffer(have);
+        desc_backed[i] = have;
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
             if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
@@ -1399,6 +1413,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     static LONG checks;
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
+    // A formatted buffer load reads FORMAT and DST_SEL from word 3, so every binding that supplies it must be a
+    // hardware descriptor with a supported FORMAT and a bound buffer. Anything else is refused before the list
+    // is touched: a word 3 of 0 from a missing binding must not look like a real descriptor.
+    for (const Translation::Ud& ud : tr->uds) {
+        if (ud.kind != Translation::desc_word3) continue;
+        const bool valid = ud.a >= 0 && ud.a < 32 && desc_hardware[ud.a] && desc_backed[ud.a] &&
+                           supported_descriptor_format((desc_word3[ud.a] >> 12) & 127u);
+        if (valid) continue;
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-draw   %016llx refused: buffer descriptor %d has no usable word 3 (hardware %d, bound %d, FORMAT %u)", tr->key, ud.a,
+                ud.a >= 0 && ud.a < 32 && desc_hardware[ud.a], ud.a >= 0 && ud.a < 32 && desc_backed[ud.a],
+                ud.a >= 0 && ud.a < 32 ? (desc_word3[ud.a] >> 12) & 127u : 0u);
+        ReleaseSRWLockExclusive(&draw_lock);
+        return false;
+    }
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];

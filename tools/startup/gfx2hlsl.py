@@ -1698,8 +1698,9 @@ class Stage:
 
         The runtime passes that word as an entry constant. Each supported format becomes one case of a switch
         on the FORMAT field that decodes the four components as the tbuffer path does; DST_SEL then picks, for
-        each destination register, a component or the constant 0 or 1. A format outside the table decodes as
-        zeros (assumption: the invalid format 0 loads zero) and a descriptor the draw cannot read passes word 3 as 0.
+        each destination register, a component or the constant 0 or 1. The draw refuses before submission when
+        word 3 is not a hardware descriptor with a FORMAT from the table and a bound buffer, so the default arm
+        is not reached at run time and a word 3 of 0 never stands in for missing metadata.
         """
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
