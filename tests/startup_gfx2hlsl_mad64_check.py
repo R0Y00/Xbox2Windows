@@ -9,7 +9,7 @@ also writes the carry-out of the 64-bit add to a lane mask; the signed form is a
                                        compile the translated pixel shaders (FXC ps_5_1 when given, DXC ps_6_0),
                                        draw one pixel per input and compare mrt0 with the 64-bit reference
 
-Draw pixel: v0 = S0, v1 = S1, v[2:3] = the 64-bit S2. The unsigned shader exports (lo, hi, carry, 0), the signed
+Draw pixel: v0 = S0, v1 = S1, v[2:3] = the 64-bit S2. The unsigned shader exports (lo, hi, 1.0f when carry else 0, 0), the signed
 shader exports (lo, hi, 0, 0). A mutation that drops the low-word carry into the high word must read the exact
 mutated words, so the draw cannot pass by accident.
 
@@ -35,11 +35,11 @@ ADDENDS = (0, 1, M64, 1 << 63, 0x00000001ffffffff, 0xfedcba9876543210, 0x7ffffff
 
 BODY_SOURCE = {
     False: ('v_mad_u64_u32 v[12:13], vcc_lo, v0, v1, v[2:3]\n'
-            'v_cndmask_b32_e64 v14, 0, 1, vcc_lo\nv_mov_b32 v15, 0\n'),
+            'v_cndmask_b32_e64 v14, 0, 1.0, vcc_lo\nv_mov_b32 v15, 0\n'),
     True: 'v_mad_i64_i32 v[12:13], null, v0, v1, v[2:3]\nv_mov_b32 v14, 0\nv_mov_b32 v15, 0\n',
 }
 BODY_WORDS = {
-    False: bytes.fromhex('0c6a76d500030a040e0001d58002a90180021e7e'),
+    False: bytes.fromhex('0c6a76d500030a040e0001d580e4a90180021e7e'),
     True: bytes.fromhex('0c7d77d500030a0480021c7e80021e7e'),
 }
 # (S0, S1, S2): carry out of the low word, carry out of the 64-bit add, negative factors, the largest products.
@@ -190,7 +190,7 @@ def pixel_text(signed, mutate=False):
 
 def expected_words(signed, a, b, c):
     result, carry = reference(signed, a, b, c)
-    return [result & MASK, result >> 32, 0 if signed else carry, 0]
+    return [result & MASK, result >> 32, 0 if signed else (0x3f800000 if carry else 0), 0]
 
 
 def mutated_words(signed, a, b, c):
@@ -199,7 +199,7 @@ def mutated_words(signed, a, b, c):
     low = (product & MASK) + (c & MASK)
     hi = ((product >> 32) + (c >> 32)) & MASK
     total = product + c
-    return [low & MASK, hi, 0 if signed else int(total > M64), 0]
+    return [low & MASK, hi, 0 if signed else (0x3f800000 if total > M64 else 0), 0]
 
 
 def check_binary(llvm_mc):
