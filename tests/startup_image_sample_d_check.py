@@ -78,8 +78,27 @@ def check_address_count():
             raise AssertionError('image_sample_d accepted %d address registers' % count)
 
 
+def check_lod_cap():
+    """A guest sampler capped to MAX_LOD 0 keeps its cap: the static sampler carries it, so SampleGrad cannot reach mip 2.
+
+    The cap fixture is the 2D program with `s_mov_b32 s26, 0` (80039abe) widened to the literal 0x04000000, mip filter
+    point (word 2 bits 27:26 = 1), words (0, 0, 0x04000000, 0). A mip filter of 0 keeps the ordinary sampler."""
+    words = WORDS['d2']
+    assert words.count(bytes.fromhex('80039abe')) == 1
+    capped = words.replace(bytes.fromhex('80039abe'), bytes.fromhex('ff039abe') + (0x04000000).to_bytes(4, 'little'))
+    pipe = G.Pipeline(VS_WORDS, capped, root_blob(flags=0))
+    assert 'SampleGrad(' in pipe.hlsl_ps()
+    lines = pipe.manifest().splitlines()
+    assert 'smpl 0 0x0 0x0 0x4000000 0x0' in lines and 'smp ' not in pipe.manifest(), pipe.manifest()
+    plain = G.Pipeline(VS_WORDS, words, root_blob(flags=0))
+    plain.hlsl_ps()
+    assert 'smp 0 0x0 0x0 0x0 0x0' in plain.manifest().splitlines() and 'smpl' not in plain.manifest(), plain.manifest()
+    print('a capped constant sampler is carried to the static sampler; mip filter 0 keeps the ordinary one')
+
+
 def controls():
     check_address_count()
+    check_lod_cap()
     assert grad_call('d2') == [['v4', 'v5'], ['v0', 'v1'], ['v2', 'v3']], grad_call('d2')
     assert grad_call('d2nsa') == [['v1', 'v0'], ['v0', 'v1'], ['v2', 'v3']], grad_call('d2nsa')
     assert grad_call('d3') == [['v6', 'v7', 'v8'], ['v0', 'v1', 'v2'], ['v3', 'v4', 'v5']], grad_call('d3')

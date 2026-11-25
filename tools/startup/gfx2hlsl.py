@@ -2351,12 +2351,12 @@ class Stage:
                 # from the heap or from a register is refused: its limits and bias cannot be shown to be irrelevant.
                 words = self.sample_b_sampler(heap, words)
                 smp = self.pipe.sampler(tuple(words), lod_limits=True)
-            elif how in ('sample', 'l', 'lz') and (heap or (words and self.default_sampler_words(words))):
+            elif how in ('sample', 'l', 'lz', 'd') and (heap or (words and self.default_sampler_words(words))):
                 # A heap sampler, or the fixed default that stands in for one, keeps its unbounded static LOD range: the
                 # descriptor is read at run time, so its MIN_LOD, MAX_LOD and bias are not validated here (#2221).
                 self.pipe.lod_unvalidated.add(name)
                 smp = heap or self.pipe.sampler(tuple(words))
-            elif how in ('sample', 'l', 'lz') and words:
+            elif how in ('sample', 'l', 'lz', 'd') and words:
                 # A constant descriptor carries its LOD limits like image_sample_b, under the same bias and range
                 # validation. A mip filter of 0 (base level only) keeps the ordinary sampler, as before: refusing it
                 # would drop every pipeline with an all-zero inline sampler, and only the bias form needs it refused.
