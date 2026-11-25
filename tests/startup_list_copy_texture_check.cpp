@@ -57,6 +57,19 @@ int main(int argc, char** argv)
     // Block-compressed: 4x4 blocks of 8 bytes; a 6-texel start is not on a block.
     expect(check(texture(64, 64, 4), 6, 0, 0, texture(64, 64, 4), nullptr), Verdict::bad_alignment, "block alignment");
     expect(check(footprint(64, 64, 0, 256, 8, 256 * 16, 4), 0, 0, 0, texture(64, 64, 4), nullptr), Verdict::ok, "bc footprint");
+    // A 2x2 or 1x1 BC mip spans one 4x4 block: GetCopyableFootprints gives it a 4x4 footprint (one 8-byte row
+    // on a 256-byte pitch) and D3D12 accepts the whole-footprint upload (WARP with the debug layer: no message).
+    expect(check(texture(2, 2, 4), 0, 0, 0, footprint(4, 4, 512, 256, 8, 1032, 4), nullptr), Verdict::ok, "bc 2x2 mip upload");
+    expect(check(texture(1, 1, 4), 0, 0, 0, footprint(4, 4, 1024, 256, 8, 1032, 4), nullptr), Verdict::ok, "bc 1x1 mip upload");
+    expect(check(texture(6, 6, 4), 0, 0, 0, footprint(8, 8, 0, 256, 8, 272, 4), nullptr), Verdict::ok, "bc 6x6 mip upload");
+    expect(check(texture(2, 2, 4), 0, 0, 0, footprint(4, 4, 512, 256, 8, 1032, 4), &(const Box&)Box{0, 0, 0, 4, 4, 1}),
+           Verdict::ok, "bc 2x2 mip, 4x4 box");
+    expect(check(footprint(4, 4, 0, 256, 8, 8, 4), 0, 0, 0, texture(1, 1, 4), nullptr), Verdict::ok, "bc 1x1 mip readback");
+    // The rounded extent is still one block: a second block, or an 8x8 footprint, leaves the 1x1 mip (the debug
+    // layer reports both as a destination region past the subresource).
+    expect(check(texture(2, 2, 4), 4, 0, 0, footprint(4, 4, 512, 256, 8, 1032, 4), nullptr), Verdict::dest_overflow, "bc 2x2 mip, second block");
+    expect(check(texture(1, 1, 4), 0, 0, 0, footprint(8, 8, 0, 256, 8, 272, 4), nullptr), Verdict::dest_overflow, "bc 1x1 mip, 8x8 footprint");
+    expect(check(texture(2, 2, 4), 0, 0, 0, texture(4, 4, 4), &(const Box&)Box{0, 0, 0, 8, 4, 1}), Verdict::source_overflow, "bc 4x4 source, 8-wide box");
 
     // The destination origin counts: a 1x1 RGBA8 copy at Y=63 of a 64x64, 256-pitch footprint ends at byte 16132.
     expect(check(footprint(64, 64, 0, 256, 4, 256), 0, 63, 0, texture(1, 1), nullptr), Verdict::footprint_overflow, "dest origin counts");

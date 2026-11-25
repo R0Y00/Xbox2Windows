@@ -22,7 +22,6 @@ from mesh_two_exits_check import mesh_container
 
 LIMITS = (4, 2)
 BACK_EDGE = "Expected a forward mesh branch"
-SETREG = "Unsupported scalar instruction s_setreg_imm32_b32"
 # Shape columns: barrier in body, LDS access in body, body writes EXEC, latch tests EXEC, loop-carried scalar, trip.
 COUNTED = (False, False, False, False, True, "constant pattern")
 SCALAR_OTHER = (False, False, False, False, True, "other")
@@ -168,12 +167,12 @@ def check_lowerers():
         for tier in census.TIERS:
             assert refusal(counters, lowerer, tier) == (
                 {("at a latch", "with loops"): 1}, {(BACK_EDGE, "with loops"): 1}), (lowerer, tier)
-        # The scratch setup stops the program before its loop; with the two writes skipped the latch is reached.
+        # The lowerers accept the whole-register scratch-base setup, so the program reaches its latch as it
+        # does with the two writes skipped.
         counters = census.census([(program("flat-scratch setup"), LIMITS)])
-        assert refusal(counters, lowerer, as_decoded) == (
-            {("before the first loop", "with loops"): 1}, {(SETREG, "with loops"): 1}), lowerer
-        assert refusal(counters, lowerer, skipped) == (
-            {("at a latch", "with loops"): 1}, {(BACK_EDGE, "with loops"): 1}), lowerer
+        for tier in (as_decoded, skipped):
+            assert refusal(counters, lowerer, tier) == (
+                {("at a latch", "with loops"): 1}, {(BACK_EDGE, "with loops"): 1}), (lowerer, tier)
         # An unsupported latch is counted by name at its own instruction.
         latch = [(pc, text.replace("s_cbranch_scc1", "s_cbranch_execnz")) for pc, text in program("counted")]
         counters = census.census([(latch, LIMITS)])

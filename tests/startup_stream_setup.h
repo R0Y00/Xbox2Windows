@@ -6,6 +6,7 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 
+int pick_stream_adapter(bool hardware, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter);
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
                             void*& device, void*& pso);
@@ -45,6 +46,18 @@ struct StreamMrtFormat {
 inline bool stream_mrt_format(DXGI_FORMAT format, StreamMrtFormat& out)
 {
     switch (format) {
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT:
+        out = {true, true, 1, DXGI_FORMAT_R8_TYPELESS}; return true;
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT:
+        out = {true, true, 2, DXGI_FORMAT_R8G8_TYPELESS}; return true;
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT:
+        out = {true, true, 2, DXGI_FORMAT_R16_TYPELESS}; return true;
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT:
+        out = {true, true, 4, DXGI_FORMAT_R16G16_TYPELESS}; return true;
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+        out = {true, true, 8, DXGI_FORMAT_R16G16B16A16_TYPELESS}; return true;
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+        out = {true, true, 4, DXGI_FORMAT_R10G10B10A2_TYPELESS}; return true;
     case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT:
         out = {true, true, 4, DXGI_FORMAT_R8G8B8A8_TYPELESS}; return true;
     case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: out = {true, true, 4, DXGI_FORMAT_R32_TYPELESS}; return true;
