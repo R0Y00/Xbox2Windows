@@ -2273,6 +2273,18 @@ class Stage:
                 if self.kind != 'ps' or not self.exec_known or len(self.blocks) > 0:
                     raise Unsupported('image_sample_b needs implicit derivatives: pixel stage, entry mask, no branches')
                 bias, cs = cs[0], cs[1:]
+        if how == 'get_lod':
+            # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
+            # (Mesa nir_texop_lod, which ACO emits as image_get_lod; GLSL textureQueryLod x/y). Only the 2D form with
+            # two address registers and dmask 0x1-0x3 is lowered; the cache-policy bits are the only other modifiers.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_get_lod modifier %s' % m)
+            if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
+                raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
+            # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
+            if not self.exec_known or len(self.blocks) > 0:
+                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage, entry mask, no branches')
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):
@@ -2330,6 +2342,12 @@ class Stage:
                 # from the heap or from a register is refused: its limits and bias cannot be shown to be irrelevant.
                 words = self.sample_b_sampler(heap, words)
                 smp = self.pipe.sampler(tuple(words), lod_limits=True)
+            elif how == 'get_lod':
+                # The clamped result depends on the sampler's MIN_LOD, MAX_LOD and bias, so the sampler must be a
+                # constant descriptor under the same validation as image_sample_b, with its limits carried.
+                if heap or not words or self.default_sampler_words(words):
+                    raise Unsupported('image_get_lod with a sampler that is not constant (LOD limits and bias unknown)')
+                smp = self.pipe.sampler(tuple(self.lod_sampler_words('image_get_lod', words)), lod_limits=True)
             elif how in ('sample', 'l', 'lz') and (heap or (words and self.default_sampler_words(words))):
                 # A heap sampler, or the fixed default that stands in for one, keeps its unbounded static LOD range: the
                 # descriptor is read at run time, so its MIN_LOD, MAX_LOD and bias are not validated here (#2221).
@@ -2362,6 +2380,11 @@ class Stage:
                 # computed"). The sampler's LOD limits are carried by the smpl line; its LOD bias is refused in
                 # sample_b_sampler.
                 call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
+            elif how == 'get_lod':
+                # HLSL CalculateLevelOfDetail (clamped) and CalculateLevelOfDetailUnclamped (SM 4.1+). Which clamps
+                # each side applies besides the sampler's (the view's mip range) is assumed to agree.
+                call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
+                    tex, smp, uv, tex, smp, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
@@ -2501,6 +2524,9 @@ class Stage:
 
     def op_image_sample_b(self, ops, mods):
         self.image(ops, mods, 'b')
+
+    def op_image_get_lod(self, ops, mods):
+        self.image(ops, mods, 'get_lod')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
