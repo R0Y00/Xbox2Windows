@@ -1,0 +1,22 @@
+EXPORTS
+    op_f2xm1_m80
+    op_f2xm1_m64
+    op_f2xm1_m32
+    op_f2xm1_fst_m64
+    op_f2xm1_fst_m32
+    op_f2xm1_sw
+    op_fyl2x_m80
+    op_fyl2x_m64
+    op_fyl2x_m32
+    op_fyl2x_sw
+    op_fyl2x_pop_depth
+    op_fyl2x_depth8
+    op_fyl2xp1_m80
+    op_fyl2xp1_m64
+    op_fyl2xp1_m32
+    op_fyl2xp1_sw
+    op_fyl2xp1_pop_depth
+    op_exp_log_roundtrip
+    op_fcw_roundtrip
+    op_fninit_cw_sw
+    op_fninit_sw

@@ -139,6 +139,16 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_wqm_(?:b64|b32)\s+(?:exec|exec_lo),\s+(?:exec|exec_lo)",
     r"s_and_b64\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+(?:s\[\d+:\d+\]|s\d+)",
     r"s_and_b32\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+s\d+",
+    # The structured masked region pixel_aot lowers: the s_and_saveexec opener, the s_or close, the s_andn2 else
+    # transition and the empty-mask skip, in the wave64 spellings and the wave32 ones on exec_lo (the MOV close is the
+    # s_mov line above). Whether a line sits in a well-formed region is decided by the translator, not here.
+    r"s_and_saveexec_b64\s+s\[\d+:\d+\],\s+(?:vcc|s\[\d+:\d+\])",
+    r"s_and_saveexec_b32\s+s\d+,\s+(?:vcc_lo|s\d+)",
+    r"s_or_b64\s+exec,\s+exec,\s+s\[\d+:\d+\]",
+    r"s_or_b32\s+exec_lo,\s+exec_lo,\s+s\d+",
+    r"s_andn2_b64\s+exec,\s+s\[\d+:\d+\],\s+exec",
+    r"s_andn2_b32\s+exec_lo,\s+s\d+,\s+exec_lo",
+    r"s_cbranch_execz\s+-?(?:0x[0-9a-f]+|0|[1-9]\d*)",
     rf"s_(?:cmov|not|brev)_b64\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE}",
     rf"s_(?:lshl_b64|lshr_b64|ashr_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_bfm_b64\s+s\[\d+:\d+\],\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
@@ -652,6 +662,13 @@ def is_instruction_supported(instruction_line: str) -> bool:
     if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
         counters = [token.partition("(")[0] for token in wait[1].split()]
         return len(counters) == len(set(counters))
+    if re.match(r"s_and_saveexec_b(?:32|64)\s|s_(?:or|andn2)_b(?:32|64)\s+exec", clean):
+        # Masked-region exec forms: an aligned SGPR pair or an SGPR up to s105, as pixel_aot's sgpr_pair/sgpr_name.
+        return (all(_sgpr_pair_ok(pair) for pair in re.finditer(r"s\[(\d+):(\d+)\]", clean))
+                and all(int(n) <= 105 for n in re.findall(r"(?<![\w\[:])s(\d+)(?!\d)", clean)))
+    if execz := re.fullmatch(r"s_cbranch_execz\s+(-?(?:0x[0-9a-f]+|0|[1-9]\d*))", clean):
+        # The 16-bit signed displacement pixel_aot accepts.
+        return -0x8000 <= int(execz[1], 0) <= 0x7fff
     return True
 
 

@@ -124,13 +124,13 @@ def controls():
         (lane_mask, (("0x600d, s8", "0x600d, s4"),), {}),
         (lane_mask, (("s_bitreplicate_b64_b32 s[8:9], 0x3f3f3f3f", "s_mov_b32 s8, 0x3f3f3f3f\ns_add_u32 s8, s8, s14"),
                      ("s_mov_b32 s14, 0xbeef", ""), ("s_mov_b32 s1, 0", "s_mov_b32 s1, 0\ns_mov_b32 s14, 0xbeef")), {}),
-        # Mask uses the profile does not lower: a wave64 pair, vcc_lo or exec_lo as the mask, the e32 form, an exec
-        # write from the mask, and a saveexec from it instead of a compare.
+        # Mask uses the profile does not lower: a wave64 pair, exec_lo as the mask, an exec write from the mask,
+        # and a saveexec from it instead of a compare; vcc_lo without a prior v_cmp_* cond is an unverified lane mask.
         (unsupported + "v_cndmask_b32_e64 v1, v0, 0x600d, s[8:9]", (("0x600d, s8", "0x600d, s[8:9]"),), {}),
-        (unsupported + "v_cndmask_b32_e64 v1, v0, 0x600d, vcc_lo", (("0x600d, s8", "0x600d, vcc_lo"),), {}),
+        (lane_mask, (("0x600d, s8", "0x600d, vcc_lo"),), {}),
         (unsupported + "v_cndmask_b32_e64 v1, v0, 0x600d, exec_lo", (("0x600d, s8", "0x600d, exec_lo"),), {}),
-        (unsupported + "v_cndmask_b32_e32", (("v_cndmask_b32_e64 v2, s14, v0, s10",
-                                              "v_cndmask_b32_e32 v2, s14, v0, vcc_lo"),), {}),
+        (lane_mask, (("v_cndmask_b32_e64 v2, s14, v0, s10",
+                      "v_cndmask_b32_e32 v2, s14, v0, vcc_lo"),), {}),
         (unsupported + "s_mov_b32 exec_lo, s8", (("s_mov_b32 s14, 0xbeef", "s_mov_b32 s14, 0xbeef\n"
                                                                             "s_mov_b32 exec_lo, s8"),), {}),
         (unsupported + "s_and_saveexec_b32 s20, s8", (("s_mov_b32 s14, 0xbeef", "s_mov_b32 s14, 0xbeef\n"
@@ -142,7 +142,7 @@ def controls():
         # Select sources that are not known words, and a destination past v255.
         ("Unverified ALU operand", (("v2, s14, v0, s10", "v2, s20, v0, s10"),), {}),
         ("Unverified ALU operand", (("v2, s14, v0, s10", "v2, s14, v7, s10"),), {}),
-        ("Unverified ALU operand", (("v1, v0, 0x600d, s8", "v256, v0, 0x600d, s8"),), {}),
+        ("Invalid vector destination", (("v1, v0, 0x600d, s8", "v256, v0, 0x600d, s8"),), {}),
         # A select result is data only: not a store address.
         ("Unsupported store address", (("v[1:4], v0, s[4:7]", "v[1:4], v1, s[4:7]"),), {}),
         # Groups whose lanes depend on the unknown wave size, or on more than local X.

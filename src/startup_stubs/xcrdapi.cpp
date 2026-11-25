@@ -8,6 +8,7 @@
 #define X2W_TRAP_MODULE "XCRDAPI.dll"
 #define X2W_TRAP_MODULE_ID 4
 #include "startup_stubs/trap.h"
+#include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
@@ -159,6 +160,7 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     if (bytes == 0) return true;
     std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
     const std::uintptr_t end = cursor + bytes;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION info{};
@@ -576,6 +578,7 @@ void log_bcpack_summary()
 
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
+    X2W_ZONE("DirectStorage request");
     if (!request) return;
     const u64 options = *reinterpret_cast<const u64*>(request);
     auto* const destination = *reinterpret_cast<unsigned char* const*>(request + 0x08);
