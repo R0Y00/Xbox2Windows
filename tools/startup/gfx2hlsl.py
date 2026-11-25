@@ -6193,6 +6193,19 @@ def has_bytecode(path):
         return False
 
 
+def has_complete_mesh57_bytecode(path):
+    """Check the DXContainer header and length without reading the shader body."""
+    try:
+        with open(path, 'rb') as shader:
+            header = shader.read(32)
+            if len(header) != 32 or header[:4] != b'DXBC':
+                return False
+            size, parts = struct.unpack_from('<II', header, 24)
+            return size == os.fstat(shader.fileno()).st_size and 0 < parts <= (size - 32) // 4
+    except OSError:
+        return False
+
+
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
                  ps_attr_map=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
@@ -6385,10 +6398,10 @@ def translate_mesh57(out_dir, key):
                 bytecode = os.path.join(staging, stage + '.cso')
                 r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
                                    capture_output=True, text=True)
-                if r.returncode or not has_bytecode(bytecode):
+                if r.returncode or not has_complete_mesh57_bytecode(bytecode):
                     # DXC names the source path; keep only the diagnostic after it.
                     lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
-                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'no bytecode produced')[:500]))
+                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
             for stage, _, _ in sources:
                 os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
     temporary = '%s.ms57.txt.%d.tmp' % (name, os.getpid())
@@ -6739,8 +6752,10 @@ def pending_keys(out_dir, skip_failed):
         result = os.path.join(out_dir, '%016x' % key)
         mesh = m.group(2) == 'm57'
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
+        ready_bytecode = has_complete_mesh57_bytecode if mesh else has_bytecode
+        manifest = result + ('.ms57.txt' if mesh else '.txt')
         # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if os.path.isfile(result + ('.ms57.txt' if mesh else '.txt')) and (manifest_only or all(has_bytecode(result + s) for s in stages)):
+        if os.path.isfile(manifest) and (manifest_only or all(ready_bytecode(result + s) for s in stages)):
             continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
         # A repeated pass retries a failure only once its request is rewritten.

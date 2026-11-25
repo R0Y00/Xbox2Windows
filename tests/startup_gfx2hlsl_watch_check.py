@@ -115,6 +115,42 @@ mesh57_fixture(mesh, struct.pack('<5I', 0xf8001890, 0, *position, endpgm), 'slot
 mesh57_fixture(mesh, vertex, 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, pixel, 'slot 57 mesh request key mismatch', tamper=True)
 
+
+def mesh57_resume_controls():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        key = 0x57
+        touch(d / 'req_0000000000000057.m57')
+        stem = d / f'{key:016x}'
+        touch(stem.with_suffix('.ms57.txt'))
+        ms, ps = (stem.with_suffix(suffix) for suffix in ('.ms57.cso', '.ps57.cso'))
+        # A container envelope is sufficient for an on-disk completeness check.
+        part = struct.pack('<4sI4s', b'DXIL', 4, b'test')
+        bytecode = struct.pack('<4s16sHHIII', b'DXBC', bytes(16), 1, 0, 36 + len(part), 1, 36) + part
+        prior = os.environ.pop('X2W_FXC', None)
+        try:
+            expect('slot 57 manifest alone is pending for bytecode', scan(d, False), [key])
+            touch(ms, bytecode)
+            expect('slot 57 with only mesh bytecode is pending', scan(d, False), [key])
+            touch(ps, bytecode)
+            expect('slot 57 with both complete containers is done', scan(d, False), [])
+            for stage in (ms, ps):
+                touch(stage, bytecode[:-1])
+                expect(f'{stage.suffixes[0]} with truncated bytecode is pending', scan(d, True), [key])
+                touch(stage, b'bad!' + bytecode[4:])
+                expect(f'{stage.suffixes[0]} with a bad container header is pending', scan(d, False), [key])
+                touch(stage, bytecode)
+            os.environ['X2W_FXC'] = ''
+            ps.unlink()
+            expect('slot 57 manifest-only mode finishes without pixel bytecode', scan(d, False), [])
+        finally:
+            os.environ.pop('X2W_FXC', None)
+            if prior is not None:
+                os.environ['X2W_FXC'] = prior
+
+
+mesh57_resume_controls()
+
 # Parallel --pending must give the same results as one worker. Sixteen RTV variants each name a
 # different missing base request, so each failure names its own base and a result reported against
 # the wrong key is visible. With four workers each batch holds one request.

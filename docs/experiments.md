@@ -9104,6 +9104,11 @@ The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
 
+The pending scan checks the DXContainer header and file length for both
+slot 57 bytecode artifacts. A missing or truncated artifact leaves the
+request pending even if its manifest exists. In manifest-only mode the
+manifest still completes the request.
+
 Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
 slot 57 creation. The descriptor must name a registered root, have an empty
 VS slot and have a readable 16-byte to 64-KiB MS span. The PS span must be
