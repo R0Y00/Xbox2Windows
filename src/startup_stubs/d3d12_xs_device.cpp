@@ -2718,6 +2718,23 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     ID3D12Resource* scratch = nullptr;
     ID3D12Resource* draw_arguments = resource;
     u64 draw_offset = offset;
+    const UINT mesh_srv = mesh && pass.indirect_graphics.cached_mesh ? pass.indirect_graphics.cached_srv_root : UINT_MAX;
+    const bool leased_arguments = mesh && mesh_xmem_indirect() && info->placement == Placement::copied_buffer &&
+        (!pass.indirect_graphics.cached_mesh || mesh_srv != UINT_MAX);
+    MeshXMemRead inputs[2]{};
+    size_t input_count = 0;
+    if (mesh_srv != UINT_MAX)
+        inputs[input_count++] = {pass.root_address[mesh_srv], sizeof(UINT), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    if (leased_arguments)
+        inputs[input_count++] = {base + offset, bytes, argument_state};
+    if (input_count) {
+        if (const char* failure = record_mesh_xmem_reads(self, inputs, input_count))
+            return refuse(failure, mesh_srv != UINT_MAX ? indirect_graphics_pipeline : indirect_other);
+        if (leased_arguments) {
+            draw_arguments = inputs[input_count - 1].resource;
+            draw_offset = inputs[input_count - 1].offset;
+        }
+    }
     if (rect_list) {
         if (std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(),
                         [](u64 address) { return address != 0; }))
@@ -2740,10 +2757,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         list->SetGraphicsRootSignature(pass.graphics_root);
         if (pass.indirect_graphics.cached_mesh) {
             const UINT srv = pass.indirect_graphics.cached_srv_root;
-            if (srv != UINT_MAX) {
-                if (const char* failure = bind_mesh_xmem_srv(self, srv, pass.root_address[srv]))
-                    return refuse(failure, indirect_graphics_pipeline);
-            }
+            if (srv != UINT_MAX)
+                list->SetGraphicsRootShaderResourceView(srv, inputs[0].resource->GetGPUVirtualAddress() + inputs[0].offset);
             for (UINT i = 0; i < pass.root->size(); ++i) {
                 if (i == srv) continue;
                 list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants[i], 0);
@@ -2768,11 +2783,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
-    if (mesh && !pass.indirect_graphics.cached_mesh && mesh_xmem_indirect() &&
-        info->placement == Placement::copied_buffer) {
-        if (const char* failure = record_mesh_xmem_read(self, base + offset, bytes, argument_state, draw_arguments, draw_offset))
-            return refuse(failure);
-    } else if (!rect_list) {
+    if (!leased_arguments && !rect_list) {
         require_state(self, resource, argument_state);
     }
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
