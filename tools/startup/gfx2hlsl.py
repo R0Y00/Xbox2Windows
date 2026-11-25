@@ -2793,7 +2793,7 @@ class Stage:
             # LLVM 15 AMDGPU DPP prints them on the _dpp spelling). The permuted word is read first,
             # then neg/abs apply, so -vN negates the neighbour lane value. VGPR-only is kept: an SGPR
             # source stays refused below, as does a non-VGPR base.
-            if len(ops) != arity + 1:
+            if len(ops) != arity + 1 or not re.fullmatch(r'v\d+', ops[0]):
                 raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
             for token in ops[1:1 + arity]:
                 neg, rest = self.split_neg(token)
