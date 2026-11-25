@@ -88,5 +88,27 @@ check('control: without the guard v_med3_f32 with four sources translates',
       outcome(unguarded, 'v_med3_f32', 4) == 'ok', outcome(unguarded, 'v_med3_f32', 4))
 check('control: without the guard the VEC_F table check fails', bool(table_counts(unguarded, 'VEC_F')))
 
+# Handlers outside the tables keep their operands in method bodies, so the same rule is asserted here: the
+# destination plus exactly its sources, and a short list refused rather than indexed.
+BODY_HANDLERS = (('v_mov_b32', 1, 2), ('v_cvt_i32_f32', 1, 2), ('v_cndmask_b32', 2, 3), ('s_bfm_b32', 2, 2),
+                     ('v_cvt_pkrtz_f16_f32', 2, 3))
+for op, sources, operands in BODY_HANDLERS:
+    got = [outcome(G, op, n) for n in (sources - 1, sources)]
+    check('%s: translates with %d operands and refuses %d' % (op, operands, operands - 1),
+          got == ['refused', 'ok'], repr(got))
+
+# Negative control: with each guard disabled, the short form raises IndexError again instead of refusing.
+stripped = source
+for condition in ('if len(ops) != 2:', 'if len(ops) != 3:', 'if len(ops) not in (3, 4):'):
+    stripped = stripped.replace('        ' + condition, '        if False:')
+spec = importlib.util.spec_from_loader('gfx2hlsl_no_body_guards', loader=None)
+no_guards = importlib.util.module_from_spec(spec)
+no_guards.__dict__['__file__'] = G.__file__
+exec(compile(stripped, G.__file__, 'exec'), no_guards.__dict__)
+for op, sources, operands in BODY_HANDLERS:
+    got = outcome(no_guards, op, sources - 1)
+    check('control: without its guard %s with %d operands raises IndexError' % (op, operands - 1),
+          got == 'IndexError', got)
+
 print('operand count checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)
