@@ -443,6 +443,11 @@ UNIFORM_VALU = frozenset((
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
+# Opcodes whose first operand is a source, not a destination (interp_f16_scan must not read it as a write).
+INTERP_STORE_PREFIXES = ('buffer_store', 'tbuffer_store', 'global_store', 'flat_store', 'scratch_store', 'ds_write',
+                         'ds_store', 'image_store')
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -2084,8 +2089,7 @@ class Stage:
             if (off in targets or n.startswith('s_cbranch') or n == 's_branch') and pending:
                 raise Unsupported('a branch between v_interp_p1ll_f16 %s and its v_interp_p2_f16: p2 could be '
                                   'reached without the matching p1ll' % ', '.join('v%d' % r for r in sorted(pending)))
-            store = n == 'exp' or n.startswith(('buffer_store', 'tbuffer_store', 'global_store', 'flat_store',
-                                                'scratch_store', 'ds_write', 'ds_store', 'image_store'))
+            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
             # A malformed pair member is refused by its own handler; the scan models only the plain spelling.
             interp = (n in ('v_interp_p1ll_f16', 'v_interp_p2_f16') and len(ops) == (3 if n[10] == '1' else 4) and
                       all(re.fullmatch(r'v\d+', o) for o in ops[:2] + ops[3:]))
@@ -2129,8 +2133,7 @@ class Stage:
         # I and J: never written anywhere
         base = pair if pair is not None else (getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0) or 0)
         for off, n, ops, mods in rows:
-            store = n == 'exp' or n.startswith(('buffer_store', 'tbuffer_store', 'global_store', 'flat_store',
-                                                'scratch_store', 'ds_write', 'ds_store', 'image_store'))
+            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
             if ops and not store and regs(ops[0]) & {base, base + 1}:
                 raise Unsupported('%s writes v%d: the entry barycentric registers must still hold the entry values '
                                   'where v_interp_p1ll_f16 / v_interp_p2_f16 read them' % (n, min(

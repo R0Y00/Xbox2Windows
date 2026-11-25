@@ -187,6 +187,8 @@ def refused(label, words, needle, vs_words=VS_WORDS):
         assert needle in str(error), (label, str(error))
         print('refused: %s (%s)' % (label, error))
         return
+    except Exception as error:
+        raise AssertionError('%s crashed instead of being refused: %r' % (label, error)) from error
     raise AssertionError('%s was translated' % label)
 
 
