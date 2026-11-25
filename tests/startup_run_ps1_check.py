@@ -4,8 +4,8 @@
 On Windows the script runs under every PowerShell found (powershell is Windows
 PowerShell 5.1, pwsh is PowerShell 7) in a scratch tree whose debug_launch.py
 is a stub, so no process is ever started under a debugger. On other hosts,
-without a PowerShell, or with --text-only, only the text after the debugger
-call is checked. Mutated copies of the script must fail the same checks.
+without a PowerShell, or with --text-only, the launcher statements are checked
+as text. Mutated copies of the script must fail the same checks.
 """
 import json
 import os
@@ -261,6 +261,12 @@ def text_problems(script):
         found.append("the log head is not printed between the capture and the exit")
     if not FAKE_USER_WARN.search(code):
         found.append("missing Write-Warning when -FakeUser is not passed")
+    before = "\n".join(statements[:calls[0]])
+    if not re.search(r"^\[switch\]\s*\$TraceApi\b", before, re.I | re.M):
+        found.append("missing -TraceApi switch")
+    if not re.search(r"""^if\s*\(\s*\$TraceApi\s*\)\s*\{\s*\$env:X2W_TRACE_API\s*=\s*["']1["']\s*\}""",
+                     before, re.I | re.M):
+        found.append("missing -TraceApi environment opt-in before launch")
     if not WATCH_CLEANUP.search("\n".join(after)):
         found.append("tree cleanup lacks taskkill /T, the live-watcher guard or the local Continue scope")
     return found
