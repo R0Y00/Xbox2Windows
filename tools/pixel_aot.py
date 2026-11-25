@@ -84,6 +84,8 @@ def _check_two_exits(code, llvm, *, cpu, features, mesh=False):
     exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
     if len(exits) != 2 or exits[-1] + 4 != len(code):
         raise ValueError("Expected two decoded exits")
+    # Match the full mesh barrier and allocation instructions so extra operands
+    # or a different message cannot inherit their fall-through behavior.
     mesh_alloc = "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"
     if mesh and mesh_alloc not in instructions.values():
         raise ValueError("Unverified multi-exit program: missing mesh allocation")
