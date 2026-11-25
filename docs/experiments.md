@@ -5496,6 +5496,46 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_csub_' -V
 ```
 
+### gfx1030 fixed-address MUBUF float min/max
+
+The compute store profile lowers raw fixed-address `buffer_atomic_fmin`
+and `buffer_atomic_fmax` (RDNA 2 MUBUF opcodes 63/64) on the raw `u0`
+under an explicit caller contract: `buffer_float_domain="finite-normal"`
+(`--buffer-float-domain finite-normal`) states that every stored word and
+the operand VGPR hold finite-normal binary32, never NaN, subnormal or
+signed zero. Under that domain the sign-magnitude order matches the
+order of the sign-adjusted integer keys, so the same
+`InterlockedCompareExchange` retry loop the image float min/max path
+uses reproduces the ISA result bit-for-bit on the byte-addressed UAV:
+`outputData.InterlockedCompareExchange(offset, expected, next, observed)`.
+The operand stays 32-bit with `glc` clear, the address stays fixed, and
+the atomic remains the sole UAV operation; a missing, misspelled or
+unused domain, `_x2`, `glc`, `idxen`/`offen`, and every other reduction
+binding violation is rejected with the family's diagnostics.
+
+Four source-built gfx1030 cases cover both operations with and without
+per-lane contention: the uncontended form stores one literal
+(`0xbf800011` for fmin, `0x3f800011` for fmax, negative and positive
+values), while the contended form derives each lane's word from the
+integer reduction fixture's input pattern, which stays finite-normal
+across positive and negative magnitudes. One and two 32-lane groups
+fold over a declared initial stored word (the op-specific finite extreme
+`0x7f7fffff`/`0xff7fffff` or the sentinel) carried in a new flagged
+store-case segment, and the readback compares all 320 words
+with an independent CPU float reference. Malformed flagged case files
+(a truncated initial segment, an unknown header bit and a trailing
+partial constants payload) must fail with the parser's exact
+diagnostics. A flipped `valueKey` comparison and a removed retry
+(`while (false)`) must each fail at word 1 against the mutated
+reference. All four new binary cases and the refusal controls passed on
+macOS with LLVM 23, including assembly, disassembly and the compute-container
+CLI. The full binary suite and DXC/WARP/hardware runs were not run.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_float_' -V
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,
