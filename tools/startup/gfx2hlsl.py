@@ -2071,7 +2071,7 @@ class Stage:
             # v_cvt_pk_u8_f32 and the other conversions are lowered for round-to-nearest-even, and the hardware
             # follows MODE.round (round toward zero truncates). s_round_mode and s_setreg_b32 are refused already.
             field = re.fullmatch(r'hwreg\((HW_REG_MODE|1)(?:,\s*(\d+),\s*(\d+))?\)', ops[0].strip()) if ops else None
-            if field and int(field.group(2) or 0) < 2:
+            if field and int(field.group(2) or 0) < 2:   # shortcut: an offset >= 2 cannot reach MODE[1:0]
                 # The immediate is known: the write is harmless when it leaves MODE[1:0] at 0 (nearest even).
                 offset, width = int(field.group(2) or 0), int(field.group(3) or 32)
                 try:

@@ -208,7 +208,9 @@ FAMILY = {
                  'v_cvt_pk_u8_f32_e64 v1, v2, 3, s4', 'v_cvt_pk_u8_f32 v1, s2, v3, v4',
                  'v_cvt_pk_u8_f32 v1, 0.5, v3, v4', 'v_cvt_pk_u8_f32 v1, -1.0, v3, v4',
                  'v_cvt_pk_u8_f32 v1, 0x43800000, v3, v4', 'v_cvt_pk_u8_f32 v1, 0x7fc00000, v3, v4',
-                 'v_cvt_pk_u8_f32 v1, 0x3fc00000, v3, v4', 'v_cvt_pk_u8_f32 v1, 0x80000000, v3, v4'],
+                 'v_cvt_pk_u8_f32 v1, 0x3fc00000, v3, v4', 'v_cvt_pk_u8_f32 v1, 0x80000000, v3, v4',
+                 # the value is shifted by the offset: (2 & 3) << 1 lands on bit 2, off MODE[1:0]
+                 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 1, 2), 2', 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 1, 1), 0'],
     'refused': ['v_cvt_pk_u8_f32 v1, v2, v3', 'v_cvt_pk_u8_f32 v1, v2, v3, v4, v5',
                 'v_cvt_pk_u8_f32 v1, v2, v3, v4 clamp', 'v_cvt_pk_u8_f32 v1, v2, v3, v4 mul:2',
                 'v_cvt_pk_u8_f32 v1, -v2, v3, v4', 'v_cvt_pk_u8_f32 v1, |v2|, v3, v4',
@@ -216,6 +218,9 @@ FAMILY = {
                 # a write of the binary32 rounding mode MODE[1:0] changes the conversion
                 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 2), 3', 's_setreg_imm32_b32 hwreg(HW_REG_MODE), 3', 's_setreg_imm32_b32 hwreg(HW_REG_MODE), 0xf1',
                 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 1, 3), 3', 's_setreg_imm32_b32 hwreg(1, 0, 4), 0xf',
+                's_setreg_imm32_b32 hwreg(HW_REG_MODE, 1, 1), 1',   # offset 1 writes bit 1
+                's_setreg_imm32_b32 hwreg(HW_REG_MODE), 2',         # field omitted: the whole register, width 32
+                's_setreg_imm32_b32 0x1801, 3',                     # a raw SIMM16, not hwreg(): not decoded
                 's_round_mode 0xf', 's_setreg_b32 hwreg(HW_REG_MODE, 0, 2), s0'],
 }
 
