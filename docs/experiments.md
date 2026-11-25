@@ -8354,6 +8354,24 @@ left half. Two groups paint both halves. An omitted writer, a short argument
 range, and a missing viewport each leave the target clear. Adapters without
 mesh shader support report a capability skip.
 
+A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
+separate translation request. The descriptor must have a mesh program, an
+empty vertex slot, and a recorded root signature that matches the bound
+root. The pixel program is optional for depth-only work. The cache stores
+the root in `.root`, the pixel program (or an empty file) in `.ps57`, and
+writes the mesh program last in `.m57`. The offline reader validates the
+request key and stage exports. It reports unsupported mesh code and leaves
+the dispatch unforwarded until mesh code emission and binding are available.
+The request fixture checks paired and mesh-only requests, duplicate
+publication, a mismatched root, a populated vertex slot, and an incomplete
+pixel span.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_request_' -V
+.\out\pe-env\Scripts\python.exe -B tests/startup_gfx2hlsl_watch_check.py
+```
+
 ```powershell
 cmake --build --preset release --target startup_indirect_draw_indexed
 ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(warp|hardware)$' -V

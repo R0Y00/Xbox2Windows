@@ -108,7 +108,7 @@ bool read_text(const wchar_t* path, std::string& out)
     return true;
 }
 
-// Publish only complete inputs. The offline scanner treats .a and .rtv as ready markers.
+// Publish each input atomically. The callers write the request's ready marker last.
 bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::size_t bytes)
 {
     wchar_t path[MAX_PATH], temporary[MAX_PATH], suffix[32];
@@ -369,6 +369,57 @@ void publish_compute_request(const void* desc)
         log("x2w-draw compute request %016llx %s (code %llu bytes, data %llu bytes, state blocks %llu + %llu bytes, "
             "pointer-like blob qwords %ld)", key, present ? "already present" : written ? "published" : "not written",
             words[6], words[8], words[2], words[4], pointers);
+}
+
+// Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
+// The vertex span must be absent. A null/zero PS span is valid for depth-only work.
+void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bound_root)
+{
+    wchar_t marker[MAX_PATH];
+    if (!bound_root || !cache_path(marker, L"req_", 0, L".m57")) return;
+    const PipelineInfo* info = pipeline_info(pipeline);
+    for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth)
+        info = pipeline_info(info->base);
+    constexpr std::size_t fields = 15;  // through the MS length at +0x70
+    if (!info || info->path != 57 || info->desc.size() < fields * sizeof(u64)) return;
+    u64 words[fields];
+    std::memcpy(words, info->desc.data(), sizeof(words));
+    if (words[9] || words[10]) return;  // VS at +0x48
+    const Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
+    if (!root || root_info(root) != bound_root) return;
+    std::vector<unsigned char> root_blob;
+    {
+        AcquireSRWLockShared(&note_lock);
+        if (const auto found = root_blobs().find(root); found != root_blobs().end()) root_blob = found->second;
+        ReleaseSRWLockShared(&note_lock);
+    }
+    if (root_blob.empty()) return;
+    std::vector<unsigned char> mesh, pixel;
+    const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
+        const auto* pointer = reinterpret_cast<const void*>(words[field]);
+        const auto bytes = words[field + 1];
+        if (!bytes) return !required && !pointer;
+        if (bytes > (1u << 20) || !x2w_local::readable(pointer, bytes)) return false;
+        out.resize(static_cast<std::size_t>(bytes));
+        return copy_title_bytes(out.data(), pointer, out.size());
+    };
+    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
+    constexpr char revision[] = "x2w-startup-mesh-57-1";
+    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(revision, sizeof(revision) - 1))));
+    static SRWLOCK request_lock = SRWLOCK_INIT;
+    static std::unordered_set<u64> written;
+    x2w_startup::ExclusiveNoteLock guard(request_lock);
+    if (written.count(key)) return;
+    const unsigned char none = 0;
+    if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
+        publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
+        publish_shader_request(key, L".m57", mesh.data(), mesh.size())) {
+        written.insert(key);
+        static LONG logged;
+        if (first_calls(logged, 12))
+            log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
+                key, mesh.size(), pixel.size());
+    }
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one

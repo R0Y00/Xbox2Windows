@@ -3876,10 +3876,46 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
     return kinds, root, formats, request, fetch, decoded, attr_map
 
 
+def mesh57_key(ms, ps, root):
+    value = fnv(b'x2w-startup-mesh-57-1')
+    for part in (ms, ps, root):
+        value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
+    return value
+
+
+def inspect_mesh57_request(out_dir, key):
+    """Read a fixed-descriptor mesh request without falling back to a vertex translation."""
+    source = os.path.join(out_dir, 'req_%016x' % key)
+    ms, ps, root = (open(source + ext, 'rb').read() for ext in ('.m57', '.ps57', '.root'))
+    if mesh57_key(ms, ps, root) != key:
+        raise Unsupported('slot 57 mesh request key mismatch')
+    parse_root(root)
+    mesh = decode(strip_header(ms))
+    exports = [assembly.split()[1] for _, _, op, assembly in mesh if op == 'exp']
+    if not mesh or mesh[-1][2] != 's_endpgm' or not any(
+        op == 's_sendmsg' and assembly == 's_sendmsg 0x9' for _, _, op, assembly in mesh
+    ) or not any(target.startswith('pos') for target in exports) or 'target_20' not in exports:
+        raise Unsupported('slot 57 mesh stage has no verified allocation and primitive export')
+    if ps:
+        pixel = decode(strip_header(ps))
+        if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps':
+            raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
+    for offset, _, op, _ in mesh:
+        if op.startswith('ds_'):
+            raise Unsupported('slot 57 mesh workgroup memory: %s at +0x%x' % (op, offset))
+    raise Unsupported('slot 57 mesh code emission is unavailable')
+
+
 def translate_request(out_dir, key):
     """Translate a base shader request, an RTV variant referencing its source blobs, or a slot 67 compute request."""
     if is_compute_request(out_dir, key):
         return translate_compute(out_dir, key)
+    if os.path.isfile(os.path.join(out_dir, 'req_%016x.m57' % key)):
+        try:
+            inspect_mesh57_request(out_dir, key)
+        except (Unsupported, OSError, UnicodeError, struct.error) as reason:
+            open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
+            return 'unsupported: %s' % reason
     try:
         kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key)
     except (Unsupported, OSError, UnicodeError) as reason:
@@ -4153,7 +4189,7 @@ def translation_jobs():
 
 
 def translate_pending(out_dir, skip_failed=False, jobs=None):
-    """Translate every request that has no result yet. The runtime writes .a and .rtv last, as ready markers.
+    """Translate every request that has no result yet. The runtime writes the ready markers last.
 
     Requests are independent (each writes only its own <key>.* files), so several run in parallel
     processes; X2W_TRANSLATE_JOBS (default: the processor count, at most 61 on Windows) sets how many.
@@ -4175,14 +4211,14 @@ def pending_keys(out_dir, skip_failed):
     keys = []
     manifest_only = os.environ.get('X2W_FXC') == ''
     for name in sorted(os.listdir(out_dir)):
-        m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67)', name)
+        m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57)', name)
         if not m:
             continue
         key = int(m.group(1), 16)
         result = os.path.join(out_dir, '%016x' % key)
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.vs.cso', '.ps.cso')
         # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if os.path.isfile(result + '.txt') and (manifest_only or all(has_bytecode(result + s) for s in stages)):
+        if m.group(2) != 'm57' and os.path.isfile(result + '.txt') and (manifest_only or all(has_bytecode(result + s) for s in stages)):
             continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
         # A repeated pass retries a failure only once its request is rewritten.
