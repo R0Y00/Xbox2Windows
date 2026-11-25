@@ -13939,6 +13939,17 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+### First active lane at compute entry
+
+The startup compute translator accepts `s_ff1_i32_b32 sN, exec_lo` in the
+entry block while EXEC still has its dispatch-entry value. Lane zero is
+active even in a partial wave. Case `A-ff1` overwrites a nonzero input
+stride with that lane index in a 24-thread group and checks 320 output and
+guard words. The offline check also rejects a changed EXEC, a back edge to
+entry and a VCC source. Reproduce with
+`python -B tests/startup_gfx2hlsl_compute_check.py` and
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(warp|hardware)$'`.
+
 ### Startup compute masked bit count
 
 For groups of at most 32 threads, the startup translator lowers gfx1013

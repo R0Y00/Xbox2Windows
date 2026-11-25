@@ -412,6 +412,11 @@ STRIDE_CLEAR = 's_and_b32 s17, s17, 0xc000ffff'
 CASES['I'] = (SOURCE_A.replace('buffer_store_dword', STRIDE_CLEAR + '\nbuffer_store_dword'), splice(STRIDE_CLEAR),
               *CASES['A'][2:])
 
+# Replace the nonzero stride constant in s5 with the first active lane of a
+# fresh 24-thread group. Ignoring FF1 leaves a different word at every i > 0.
+CASES['A-ff1'] = ('s_ff1_i32_b32 s5, exec_lo\n' + SOURCE_A,
+                  bytes.fromhex('7e1385be') + WORDS_A, *CASES['A'][2:])
+
 
 def root_blob(constants=2, table_range=False):
     """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
@@ -476,9 +481,10 @@ def expected(name):
                 for tz in range(local[2]):
                     for ty in range(local[1]):
                         for tx in range(local[0]):
-                            if name == 'A':
+                            if name in ('A', 'A-ff1'):
                                 i = (gx + 3 * gy + 6 * gz) * 24 + tx + 2 * ty + 6 * tz
-                                out[i] = ((input_word(i) * 33) & MASK) ^ ((KEY + i * STRIDE) & MASK)
+                                stride = 0 if name == 'A-ff1' else STRIDE
+                                out[i] = ((input_word(i) * 33) & MASK) ^ ((KEY + i * stride) & MASK)
                             elif name == 'K':
                                 i = gx * 8 + tx
                                 if gx == 1:  # only group 1's wave enters the block
@@ -675,6 +681,16 @@ def check_lds():
 
 
 def check_controls():
+    ff1 = bytes.fromhex('7e1385be')
+    end = bytes.fromhex('000081bf')
+    # A write to EXEC can disable lane zero; a backward branch can re-enter
+    # the instruction with a different mask even at code offset zero.
+    for code in (bytes.fromhex('8003febe') + ff1 + end,
+                 ff1 + bytes.fromhex('feff82bf') + end):
+        refused('compute entry EXEC mask', lambda: translate('A', code=code))
+    refused('requires compute exec_lo', lambda: translate('A', code=bytes.fromhex('6a1385be') + end))
+    assert 's5 = 0u;' in translate('A-ff1').hlsl_cs()
+    assert expected('A-ff1') != expected('A')
     check_lds()
     check_descriptor_scc()
     check_mbcnt()
