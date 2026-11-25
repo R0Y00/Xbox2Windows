@@ -12014,6 +12014,16 @@ a LOD bias stay refused. The check translates point magnification,
 minification and both, together with `CLAMP_Z`, and its negative control
 refuses the point filter again once the profile only clears `CLAMP_Z`. One
 draw runs with point XY and `CLAMP_Z` set.
+
+`MIP_POINT_PRECLAMP` (SQ_IMG_SAMP_WORD2 bit 28) acts only on mip selection.
+The `_lz` gather reads mip zero, and Direct3D gather uses "the top level of
+any mip pyramid" (22.4.2), so this bit is not checked either. The
+level-zero comparison path already accepts it for the same reason
+(`comparison_sampler_state` in `tools/pixel_aot.py`). Bits 29 to 31 stay
+refused. The check translates the bit with and without the other
+relaxations, and its negative control keeps the bit and expects the
+refusal. One draw runs with the full combination: clamp to the last texel
+in X, Y and Z, point XY and mip filtering, and `MIP_POINT_PRECLAMP` set.
 [RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) ·
 [Direct3D gather semantics](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#Gather4)
 

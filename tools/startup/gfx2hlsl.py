@@ -82,13 +82,16 @@ def gather_2d_profile_words(words):
     point XY_MAG_FILTER or XY_MIN_FILTER (WORD2 bits 21:20 and 23:22, value 0) reads the same four texels as the
     bilinear one: gather4 "Gathers the four texels that would be used in a bi-linear filtering operation", whatever
     the sampler's filter, so a point filter is checked as bilinear. Anisotropic filters (2, 3) keep their values and
-    stay refused. The words bound as the static sampler stay the title's own.
+    stay refused. WORD2 bit 28 (MIP_POINT_PRECLAMP) acts only on mip selection, and the _lz gather reads mip zero
+    ("the top level of any mip pyramid is used", the same spec section), so it is cleared as well; the level-zero
+    comparison path (pixel_aot.comparison_sampler_state) accepts it for the same reason. Bits 29-31 stay checked.
+    The words bound as the static sampler stay the title's own.
     """
     w0, w1, w2, w3 = words
     for shift in (20, 22):
         if (w2 >> shift) & 3 == 0:
             w2 |= 1 << shift
-    return (w0 & ~(7 << 6), w1, w2, w3)
+    return (w0 & ~(7 << 6), w1, w2 & ~(1 << 28), w3)
 
 
 def strip_header(code):

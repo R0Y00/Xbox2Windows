@@ -90,6 +90,7 @@ def controls(llvm_mc):
     refused(shader(prefix=missing_sampler), 'constant sampler')
     check_clamp_z()
     check_point_xy()
+    check_mip_point_preclamp()
     print('Four fixed-mip gather channels and unsupported encodings checked')
 
 
@@ -154,6 +155,26 @@ def check_point_xy():
         G.gather_2d_profile_words = profile
 
 
+def check_mip_point_preclamp():
+    # MIP_POINT_PRECLAMP (word 2 bit 28) only acts on mip selection; the _lz gather reads mip zero.
+    # The last pair is the full sampler state the refused run pipelines bind.
+    for word0, word2 in ((0x12, 0x14500000), (0x92, 0x14000000)):
+        pipe = pipeline(shader(prefix=with_word2(word2, with_word0(word0))))
+        assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
+        assert f'smp 0 {word0:#x} 0x0 {word2:#x} 0x0\n' in pipe.manifest(), pipe.manifest()
+    # Bits 29 to 31 (ANISO_OVERRIDE, BLEND_ZERO_PRT, unnamed) stay refused.
+    for bit in (29, 30, 31):
+        refused(shader(prefix=with_word2(0x04500000 | 1 << bit)), 'requires normalized clamp')
+    # Negative control: a profile that leaves bit 28 refuses it, as before this change.
+    profile = G.gather_2d_profile_words
+    G.gather_2d_profile_words = lambda words: tuple(w | (1 << 28 if i == 2 and words[2] >> 28 & 1 else 0)
+                                                    for i, w in enumerate(profile(words)))
+    try:
+        refused(shader(prefix=with_word2(0x14000000, with_word0(0x92))), 'requires normalized clamp')
+    finally:
+        G.gather_2d_profile_words = profile
+
+
 def expected_taps(mip, component, uv):
     extent = SIDE >> mip
     x, y = (math.floor(coord * extent - 0.5) for coord in uv)
@@ -201,6 +222,8 @@ def draw(dxc, renderer, adapter):
         run(3, 1, 0, uv, shader(1, prefix=with_word0(0x92)))
         # Point XY filtering with CLAMP_Z set, the sampler state of the refused run pipelines: the same four texels.
         run(3, 1, 3, uv, shader(8, prefix=with_word2(0x04000000, with_word0(0x92))))
+        # The full sampler state of those pipelines, MIP_POINT_PRECLAMP included.
+        run(3, 1, 1, uv, shader(2, prefix=with_word2(0x14000000, with_word0(0x92))))
         run(3, 1, 2, uv, shader(4), mutant=True)
 
 
