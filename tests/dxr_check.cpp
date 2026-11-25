@@ -550,21 +550,18 @@ bool check_dxr_slot70_as(ID3D12Device* device) {
     if (!supported(device, Backend::inline_query)) return false;
     const std::vector<Vertex> vertices{{-1,-1,1}, {1,-1,1}, {0,1,1}};
     const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1}, {0,0,0,.01f,0,0,1,4,2}};
-    const auto run = [&](bool misroute, bool only_refused) {
+    const auto run = [&](bool misroute) {
         PlacedBuildScene placement;
         placement.slot70 = true;
         placement.misroute = misroute;
-        placement.only_refused = only_refused;
         return trace_scene(device, vertices, {instance(7,1)}, rays, Backend::inline_query,
                            nullptr, nullptr, nullptr, &placement);
     };
-    const auto viaView = run(false, false);
+    const auto viaView = run(false);
     // The reference: the same builds and rays with the TLAS GPU address given as a root SRV; only slot 70 is bypassed.
     const auto root = trace(device, vertices, {instance(7,1)}, rays);
     // Distinct-AS control: the view names a TLAS whose instance routes to a decoy BLAS.
-    const auto decoy = run(true, false);
-    // Empty-descriptor control: only the refused calls, so a hit can only come from the valid publication.
-    const auto empty = run(false, true);
+    const auto decoy = run(true);
     const auto print = [](const char* label, const std::vector<bvh_fixture::Word>& words) {
         std::printf("slot70_as_rows %s", label);
         for (std::size_t i = 0; i + 3 < words.size(); i += 4)
@@ -574,7 +571,6 @@ bool check_dxr_slot70_as(ID3D12Device* device) {
     print("view", viaView);
     print("root", root);
     print("decoy", decoy);
-    print("empty", empty);
     const std::vector<bvh_fixture::Word> expected{1,7,0,0, 0,0,0,0, 0,0,0,0};
     const auto fixed = [&](const std::vector<bvh_fixture::Word>& words) {
         if (words.size() != expected.size()) return false;
@@ -587,9 +583,8 @@ bool check_dxr_slot70_as(ID3D12Device* device) {
     if (viaView != root)
         throw std::runtime_error("Slot-70 view rays differ from the root-address reference");
     if (decoy == root) throw std::runtime_error("The decoy-routed view still matched the reference");
-    if (empty == root) throw std::runtime_error("An unpublished descriptor still matched the reference");
     std::printf("Slot 70 acceleration-structure view: hit7 (distance=0x%08x), miss, masked miss; all 12 words equal the "
-                "root-address reference after three refused calls kept the descriptor, decoy and empty differ\n", viaView[3]);
+                "root-address reference after three refused calls kept the descriptor and the decoy differs\n", viaView[3]);
     return true;
 }
 

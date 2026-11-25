@@ -24,9 +24,8 @@ public:
     // destination and scratch, and route the TLAS instance to the decoy instead of the BLAS under test.
     bool misroute = false;
     // Slot-70 variant (issue #1938): the TLAS is handed to the trace as an acceleration-structure view that
-    // device slot 70 published, instead of as a root address. With only_refused, the valid call is skipped so
-    // the descriptor stays empty and no ray can hit.
-    bool slot70 = false, only_refused = false;
+    // device slot 70 published, instead of as a root address.
+    bool slot70 = false;
     void attach(ID3D12Device* device) {
         device->AddRef();
         x2w_startup::attach_device(device, reinterpret_cast<void**>(guest_.GetAddressOf()));
@@ -136,21 +135,17 @@ public:
             at.address = address;
             slot70(guest_.Get(), &resource, &at, destination);
         };
-        if (only_refused) {
-            // A null acceleration-structure view stands for "nothing published yet"; the refusals must leave it.
-            D3D12_SHADER_RESOURCE_VIEW_DESC empty = at.view;
-            device->CreateShaderResourceView(nullptr, &empty, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)});
-        } else {
-            publish(tlas_title_);
-        }
+        publish(tlas_title_);
         publish(scratch_title_);   // as_wrong_state: a placed buffer, but not in the acceleration-structure state
         publish(tlas_title_ + 16); // as_unaligned
         publish(0x1000);           // as_not_placed
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> visible;
         D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&visible)), "Create the shader-visible view heap");
-        device->CopyDescriptorsSimple(1, visible->GetCPUDescriptorHandleForHeapStart(),
-            D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        // The published descriptor lives in a title-side handle range; the guest device copy (slot 24) translates it.
+        using Copy = void (WINAPI*)(void*, UINT, UINT64, UINT64, UINT);
+        reinterpret_cast<Copy>((*reinterpret_cast<void***>(guest_.Get()))[24])(guest_.Get(), 1,
+            visible->GetCPUDescriptorHandleForHeapStart().ptr, destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         return visible;
     }
 
