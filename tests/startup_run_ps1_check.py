@@ -101,7 +101,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
     `translate` exercises -Render -Translate and requires the watcher to stop with its child.
-    With `early_exit` the watcher exits before the debugger finishes.
+    With `early_exit` the watcher has no child and exits before the debugger finishes.
+    This checks the log head and debugger exit code. The live watcher case checks worker cleanup.
     """
     root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"

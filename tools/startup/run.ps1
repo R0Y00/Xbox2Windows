@@ -75,6 +75,7 @@ try {
         --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs *> "$LogDir.out"
     $debuggerExit = $LASTEXITCODE
 } finally {
+    # taskkill /T needs a live parent PID to reach the watcher's workers.
     if ($translator -and -not $translator.HasExited) {
         # Stop the workers as well. The watcher or a worker can exit during taskkill;
         # in Windows PowerShell 5.1 its redirected stderr would then abort the launcher.
