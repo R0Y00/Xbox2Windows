@@ -1552,7 +1552,7 @@ int main(int argc, char** argv) try
             try {
                 for (int round = 0; round < 24 && concurrent_ok; ++round)
                     if (!run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
-                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr, false, &gate)) concurrent_ok = false;
+                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr, false, 0, false, &gate)) concurrent_ok = false;
             } catch (...) {
                 concurrent_ok = false;
             }
