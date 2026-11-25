@@ -6,6 +6,7 @@ import sys
 from unittest.mock import patch
 
 from mesh_dynamic_geometry_check import CASES, CODE, MESH_LIMITS, RETIRED_PREFIX, SECOND, Wave, decode, words
+from mesh_dynamic_geometry_check import WIDE_COUNTS, WIDE_SECOND, surviving_wave_code
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from mesh_dynamic_aot import enumerate_variants, lower
@@ -64,6 +65,18 @@ def check_retired_wave():
                 assert "Inconsistent mesh synchronization" in str(error), error
             else:
                 raise AssertionError("Live waves at different barrier PCs were accepted")
+
+    wide = decode(surviving_wave_code())
+    for order in ((0, 1), (1, 0)):
+        waves = [Wave(i, [WIDE_COUNTS, WIDE_SECOND]) for i in range(2)]
+        for i in order:
+            waves[i].run(wide, {})
+        first, survivor = waves
+        assert first.barriers == [172] and survivor.barriers == [172, 184]
+        assert first.counts == [(68, 2)] and first.indices[1] == [2, 1, 67]
+        assert set(first.positions) == set(range(64))
+        assert set(survivor.positions) == {64, 65, 66, 67}
+        assert tuple(survivor.positions[67]) == words((1, 1, 0, 1))
 
 
 def insert_scalar(decoded, after_pc, lines, skip_pc=None):

@@ -3445,6 +3445,11 @@ branches to the exit, and wave 0 reaches two more barriers and emits geometry.
 Changing the branch to a different barrier makes the two live waves wait at
 different PCs and both lowerers refuse it. The triangle and quad draws below
 check 1,024 pixels each, including the area covered only by the second triangle.
+In the reverse order, wave 0 allocates 68 vertices and reaches the exit after
+exporting vertices 0–63. Wave 1 passes one more barrier and writes vertices
+64–67. The second triangle uses vertex 67 for its top-right corner. Giving
+it the position of vertex 2 collapses the triangle and changes 528 pixels.
+The CPU check also runs the waves in both host evaluation orders.
 
 [`tools/mesh_dynamic_aot.py`](../tools/mesh_dynamic_aot.py) emits one desktop
 mesh shader for a two-wave64 triangle entry. It splits runtime input cases
