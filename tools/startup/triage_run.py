@@ -43,6 +43,7 @@ SLOT70_REASONS = {
     "null_address",
     "unsupported_description",
     "destination_outside_view_heaps",
+    "gpu_written_resource",
     "buffer_unavailable",
     "texture_unavailable",
     # the partial-tile holds of device_memory_srv

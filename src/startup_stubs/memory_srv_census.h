@@ -29,7 +29,8 @@ namespace x2w_startup {
 // tools/startup/triage_run.py keeps the same list (SLOT70_REASONS).
 constexpr const char* memory_srv_reasons[] = {
     "null_destination", "unreadable_resource", "unreadable_view", "null_address",
-    "unsupported_description", "destination_outside_view_heaps", "buffer_unavailable", "texture_unavailable",
+    "unsupported_description", "destination_outside_view_heaps", "gpu_written_resource", "buffer_unavailable",
+    "texture_unavailable",
     // the partial-tile holds of device_memory_srv (upstream #2105)
     "partial_tile_xg_rows", "partial_tile_beyond_xg_size",
 };

@@ -20,6 +20,7 @@
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
+#include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
@@ -30,6 +31,7 @@
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/single_element_srv.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -124,6 +126,7 @@ struct alignas(16) WrapperOwn {
     UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
     UINT list_node_mask;
+    D3D12_QUERY_HEAP_DESC query_heap; // QueryHeap: the desc it was created with (device slot 39)
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
 struct Wrapper {
@@ -167,6 +170,7 @@ constexpr std::uint64_t view_heap_probe_floor = 65536;
 
 void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
+void request_translation(Wrapper* pipeline);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
@@ -1072,7 +1076,8 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // when the desktop GPU finishes, and the presented surface is read back and shown in the window.
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
-void reset_viewport_state(Wrapper* self);
+void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
+void reset_list_dynamic_state(Wrapper* self);
 void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
@@ -1350,7 +1355,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     ReleaseSRWLockExclusive(&allocator_lock);
     if (SUCCEEDED(hr)) {
-        reset_viewport_state(self);
+        reset_list_dynamic_state(self);
         discard_draw_sampler_heaps(previous);
         if (draw_dump_frame()) draw_dumps().discard(previous);
     }
@@ -1371,6 +1376,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         return S_OK;
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(state.real);
+    end_open_queries(self, list);
     release_targets(self);
     const HRESULT hr = list->Close();
     state.list_open = false;
@@ -1875,6 +1881,7 @@ struct Pass {
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
+    Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
     u64 source_view_heap = 0;
@@ -1885,6 +1892,7 @@ struct Pass {
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
@@ -1899,6 +1907,13 @@ struct Pass {
     // the title flags above so a later render target 0 of another size gets a fresh default.
     UINT64 default_viewport_w = 0, default_scissor_w = 0;
     UINT default_viewport_h = 0, default_scissor_h = 0;
+    // Queries begun on the desktop list by slot 28 and not yet ended (heap, type, index). The heap pointer is
+    // held without a reference until Close; releasing a heap mid-recording is invalid on desktop too.
+    struct OpenQuery { ID3D12QueryHeap* heap; UINT type, index; };
+    std::vector<OpenQuery> open_queries;
+    // Queries ended on this recording by slot 29: what a resolve may cover. A new BeginQuery on the index removes its
+    // entry, and Close clears the list with the rest of the Pass.
+    std::vector<OpenQuery> ended_queries;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 // Heap-indexed title root signatures not set on the desktop list, and real draws refused under one, by decision.
@@ -1943,10 +1958,11 @@ void release_targets(Wrapper* self)
     pass = Pass{};
 }
 
-// A reset list starts without a viewport or scissor, whatever the previous recording set.
-void reset_viewport_state(Wrapper* self)
+// A reset list has no viewport or scissor and uses the default stencil reference.
+void reset_list_dynamic_state(Wrapper* self)
 {
     if (!self->own().pass) return;
+    pass_of(self).stencil_reference = 0;
     pass_of(self).viewport_set = false;
     pass_of(self).scissor_set = false;
     pass_of(self).default_viewport_w = pass_of(self).default_scissor_w = 0;
@@ -1987,11 +2003,140 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
 }
 
+// Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
+// methods sit there, so they are bound only with X2W_D3D12_QUERY_SLOTS=1. The heap reaches device slot 39 with the
+// desktop desc. Only occlusion queries are
+// forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
+// heap it names is refused and logged with its values instead of reaching the desktop list.
+enum QueryMethod { begin_query, end_query, resolve_query };
+void refuse_query(QueryMethod method, const char* reason, UINT type, UINT index, UINT count)
+{
+    static const char* const names[] = {"BeginQuery", "EndQuery", "ResolveQueryData"};
+    static LONG refusals[3];  // the first 16 refusals of each method are logged
+    if (first_calls(refusals[method], 16))
+        log("x2w-render %s refused: %s (type %u, index %u, count %u)", names[method], reason, type, index, count);
+}
+// The desktop heap behind a wrapped occlusion heap that holds [index, index + count), or null with the reason.
+// Only a DIRECT recording is supported in this first slice.
+ID3D12QueryHeap* occlusion_heap(ID3D12GraphicsCommandList* list, void* heap, UINT type, UINT index, UINT count,
+                               const char** reason)
+{
+    if (!list) return *reason = "list is closed", nullptr;
+    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return *reason = "requires a direct command list", nullptr;
+    const Wrapper* w = as_wrapper(heap);
+    if (!w || w->own().kind != query_heap_kind || !w->own().real) return *reason = "not a desktop query heap", nullptr;
+    const auto& desc = w->own().query_heap;
+    if (desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION) return *reason = "only occlusion heaps are forwarded", nullptr;
+    if (type != D3D12_QUERY_TYPE_OCCLUSION && type != D3D12_QUERY_TYPE_BINARY_OCCLUSION)
+        return *reason = "query type does not fit an occlusion heap", nullptr;
+    if (index >= desc.Count || count > desc.Count - index) return *reason = "outside the heap's count", nullptr;
+    return static_cast<ID3D12QueryHeap*>(w->own().real);
+}
+// List slot 28, BeginQuery(heap, type, index).
+void __stdcall list_begin_query(Wrapper* self, void* heap, UINT type, UINT index)
+{
+    auto* list = recording(self);
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, index, 1, &reason);
+    if (!real) return refuse_query(begin_query, reason, type, index, 1);
+    Pass& pass = pass_of(self);
+    for (const auto& open : pass.open_queries)
+        if (open.heap == real && open.index == index) return refuse_query(begin_query, "query already begun", type, index, 1);
+    auto& ended = pass.ended_queries;
+    ended.erase(std::remove_if(ended.begin(), ended.end(),
+                               [&](const Pass::OpenQuery& q) { return q.heap == real && q.index == index; }),
+                ended.end());
+    pass.open_queries.push_back({real, type, index});
+    list->BeginQuery(real, static_cast<D3D12_QUERY_TYPE>(type), index);
+}
+// List slot 29, EndQuery(heap, type, index). Only a query this list began is ended.
+void __stdcall list_end_query(Wrapper* self, void* heap, UINT type, UINT index)
+{
+    auto* list = recording(self);
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, index, 1, &reason);
+    if (!real) return refuse_query(end_query, reason, type, index, 1);
+    Pass& pass = pass_of(self);
+    auto& open = pass.open_queries;
+    const auto found = std::find_if(open.begin(), open.end(),
+                                    [&](const Pass::OpenQuery& q) { return q.heap == real && q.type == type && q.index == index; });
+    if (found == open.end()) return refuse_query(end_query, "not begun on this list", type, index, 1);
+    open.erase(found);
+    pass.ended_queries.push_back({real, type, index});
+    list->EndQuery(real, static_cast<D3D12_QUERY_TYPE>(type), index);
+}
+// At Close: a query begun on the desktop list and never ended would make the desktop Close fail and drop the whole
+// list, where the console call it stands for cost nothing more than that query's result.
+void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list)
+{
+    if (!self->own().pass) return;
+    auto& open = pass_of(self).open_queries;
+    for (const auto& query : open) {
+        refuse_query(end_query, "missing at Close, ended there", query.type, query.index, 1);
+        list->EndQuery(query.heap, static_cast<D3D12_QUERY_TYPE>(query.type), query.index);
+    }
+    open.clear();
+}
+// List slot 30, ResolveQueryData(heap, type, start, count, destination, offset). The destination is a buffer on
+// a readback heap, which stays in COPY_DEST, so it is not moved through the list's COMMON state tracking.
+void __stdcall list_resolve_query(Wrapper* self, void* heap, UINT type, UINT start, UINT count, void* destination, u64 offset)
+{
+    auto* list = recording(self);
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, start, count, &reason);
+    if (!real) return refuse_query(resolve_query, reason, type, start, count);
+    // Resolving a query that was never ended, or ended with the other occlusion type, reads uninitialized data and
+    // can remove the device: every index in the range must have a matching EndQuery on this recording.
+    const auto& ended = pass_of(self).ended_queries;
+    for (UINT i = 0; i < count; ++i)
+        if (std::none_of(ended.begin(), ended.end(), [&](const Pass::OpenQuery& q) {
+                return q.heap == real && q.index == start + i && q.type == type;
+            }))
+            return refuse_query(resolve_query, "an index in the range was not ended with this type on this recording", type,
+                                start, count);
+    const Wrapper* w = as_wrapper(destination);
+    if (!w || w->own().kind != resource_kind || !w->own().real)
+        return refuse_query(resolve_query, "destination has no desktop resource", type, start, count);
+    // Map of a resource with title memory returns that memory, which a desktop resolve never reaches.
+    if (w->own().title_memory)
+        return refuse_query(resolve_query, "destination has title memory", type, start, count);
+    auto* resource = static_cast<ID3D12Resource*>(w->own().real);
+    D3D12_HEAP_PROPERTIES properties{};
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || FAILED(resource->GetHeapProperties(&properties, nullptr)) ||
+        properties.Type != D3D12_HEAP_TYPE_READBACK)
+        return refuse_query(resolve_query, "destination is not a readback buffer", type, start, count);
+    const u64 bytes = u64{count} * sizeof(UINT64);
+    if ((offset & 7) || offset > desc.Width || bytes > desc.Width - offset)
+        return refuse_query(resolve_query, "outside the destination buffer", type, start, count);
+    list->ResolveQueryData(real, static_cast<D3D12_QUERY_TYPE>(type), start, count, resource, offset);
+}
+// Device slot 39, CreateQueryHeap(desc, riid, ppv): forwarded, and the desc kept for the query slots.
+HRESULT __stdcall device_create_query_heap(Wrapper* self, const D3D12_QUERY_HEAP_DESC* desc, const GUID* iid, void** out)
+{
+    const auto hr = static_cast<HRESULT>(create_slot<device_kind, 39, 1>(self, reinterpret_cast<u64>(desc),
+                                                                         reinterpret_cast<u64>(iid), reinterpret_cast<u64>(out),
+                                                                         0, 0, 0, 0, 0));
+    if (Wrapper* w = SUCCEEDED(hr) && desc && out ? as_wrapper(*out) : nullptr; w && w->own().kind == query_heap_kind)
+        w->own().query_heap = *desc;
+    return hr;
+}
+
+// Slot-61 calls by outcome and signature kind (IndirectCommand; none counts placeholder and unknown
+// signatures), reported with the render totals. 64-bit and never reset, so they neither wrap nor stall.
+enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline, indirect_placeholder, indirect_other,
+       indirect_outcomes };
+volatile LONG64 indirect_calls[indirect_outcomes][5];
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
 {
-    const auto refuse = [](const char* reason) {
+    // Every refusal is counted under the signature's kind, including those before the signature is checked.
+    Wrapper* sig = as_wrapper(signature);
+    IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
+    const auto refuse = [&kind](const char* reason, int outcome = indirect_other) {
+        InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
         static LONG refusals;
         if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
     };
@@ -2001,9 +2146,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list");
     if (count != 1 || count_buffer || count_offset) return refuse("requires one command and no count buffer");
-    Wrapper* sig = as_wrapper(signature);
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
-        return refuse("missing or placeholder signature");
+        return refuse("missing or placeholder signature", indirect_placeholder);
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
         return refuse("requires a supported signature from this device");
@@ -2018,8 +2162,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
         if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
-            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh)
-            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root");
+            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh) {
+            // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
+            // nothing is drawn.
+            if (pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
+                pass.requested_pipeline = pass.pipeline;
+                request_translation(pass.pipeline);
+            }
+            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
+                          indirect_graphics_pipeline);
+        }
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             pass.target_formats[0] != pass.indirect_graphics.target_format ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
@@ -2030,7 +2182,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (samples.Count != 1 || samples.Quality)
             return refuse("draw requires a single-sample render target");
     } else if (!pass.compute_pipeline || !pass.compute_root) {
-        return refuse("requires a desktop compute pipeline and root");
+        return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
         return refuse("signature root constants require the bound compute root");
     }
@@ -2076,6 +2228,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     }
     require_state(self, resource, argument_state);
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
+    InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
 // draws either way. A root signature that indexes a descriptor heap directly is not set on the desktop list: the
@@ -2325,7 +2478,10 @@ void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 // List slot 24, OMSetStencilRef(reference): list state that the stencil test of the next draws compares against.
 void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 {
-    if (auto* list = recording(self)) list->OMSetStencilRef(reference);
+    if (auto* list = recording(self)) {
+        pass_of(self).stencil_reference = reference;
+        list->OMSetStencilRef(reference);
+    }
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
@@ -3642,7 +3798,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
             "textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld)", render_resets,
+            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
@@ -3650,7 +3806,24 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
-            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)]);
+            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups);
+    if (render_mode() && frame % 300 == 0) {
+        // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
+        static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
+                                               "placeholder-signature", "other"};
+        static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
+        char line[1024];  // fits every outcome with five 19-digit counts
+        int n = std::snprintf(line, sizeof(line), "x2w-render indirect:");
+        for (int o = 0; o < indirect_outcomes; ++o) {
+            n += std::snprintf(line + n, sizeof(line) - n, "%s %s:", o ? ";" : "", outcomes[o]);
+            const int start = n;
+            for (int k = 0; k < 5; ++k)
+                if (const LONG64 calls = indirect_calls[o][k])
+                    n += std::snprintf(line + n, sizeof(line) - n, " %s %lld", kinds[k], static_cast<long long>(calls));
+            if (n == start) n += std::snprintf(line + n, sizeof(line) - n, " 0");
+        }
+        log("%s", line);
+    }
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];
@@ -3773,7 +3946,7 @@ void build_tables()
     enable_create<device_kind, 36, 2>();                 // CreateFence(initial, flags, riid, ppv)
     enable_forward<device_kind, 37>();                   // GetDeviceRemovedReason
     tables[device_kind][38] = reinterpret_cast<void*>(&device_copyable_footprints);
-    enable_create<device_kind, 39, 1>();                 // CreateQueryHeap(desc, riid, ppv)
+    tables[device_kind][39] = reinterpret_cast<void*>(&device_create_query_heap);  // CreateQueryHeap(desc, riid, ppv)
     enable_forward<device_kind, 40>();                   // SetStablePowerState
     tables[device_kind][41] = reinterpret_cast<void*>(&device_create_command_signature);                 // CreateCommandSignature(desc, root, riid, ppv)
     enable_forward<device_kind, 42>();                   // GetResourceTiling
@@ -3824,6 +3997,13 @@ void build_tables()
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
+        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
+        // bindings are opt-in. Unset, the slots stay no-ops.
+        if (wchar_t on[4]{}; GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", on, 4) && on[0] == L'1') {
+            list_typed[28] = reinterpret_cast<ListTyped>(&list_begin_query);
+            list_typed[29] = reinterpret_cast<ListTyped>(&list_end_query);
+            list_typed[30] = reinterpret_cast<ListTyped>(&list_resolve_query);
+        }
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 
