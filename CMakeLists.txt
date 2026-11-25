@@ -1712,6 +1712,16 @@ foreach(mutation IN ITEMS height exact-fit first-32)
     add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
     set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Acceleration-structure memory SRV validation for device slot 70 (src/startup_stubs/memory_srv_as.h); the
+# mutated runs are negative controls.
+add_executable(startup_memory_srv_as_check tests/startup_memory_srv_as_check.cpp)
+target_include_directories(startup_memory_srv_as_check PRIVATE src)
+target_compile_features(startup_memory_srv_as_check PRIVATE cxx_std_17)
+add_test(NAME startup_memory_srv_as COMMAND startup_memory_srv_as_check)
+foreach(mutation IN ITEMS alignment state offset)
+    add_test(NAME startup_memory_srv_as_${mutation}_control COMMAND startup_memory_srv_as_check --mutate ${mutation})
+    set_tests_properties(startup_memory_srv_as_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Volume memory SRV validation for device slot 70 (src/startup_stubs/address_texture.h); the mutated
 # runs are negative controls.
 add_executable(startup_memory_srv_volume_check tests/startup_memory_srv_volume_check.cpp)
@@ -2119,6 +2129,11 @@ add_custom_command(OUTPUT "${ray_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_query -Fh "${ray_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_query.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" DEPENDS tests/ray_query.hlsl VERBATIM)
+set(ray_table_header "${CMAKE_CURRENT_BINARY_DIR}/ray_query_table.h")
+add_custom_command(OUTPUT "${ray_table_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -D AS_TABLE=1 -Vn ray_query_table -Fh "${ray_table_header}"
+            -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_query_table.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_query.hlsl"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_query_table.cso" DEPENDS tests/ray_query.hlsl VERBATIM)
 set(ray_pipeline_header "${CMAKE_CURRENT_BINARY_DIR}/ray_pipeline.h")
 add_custom_command(OUTPUT "${ray_pipeline_header}"
     COMMAND "${DXC_EXECUTABLE}" -T lib_6_3 -D DXR_PIPELINE=1 -Vn ray_pipeline -Fh "${ray_pipeline_header}"
@@ -2134,7 +2149,7 @@ add_custom_command(OUTPUT "${candidates_pipeline_header}"
     COMMAND "${DXC_EXECUTABLE}" -T lib_6_3 -D DXR_PIPELINE=1 -Vn ray_candidates_pipeline -Fh "${candidates_pipeline_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates_pipeline.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_candidates.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates_pipeline.cso" DEPENDS tests/ray_candidates.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE "${ray_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}"
+target_sources(offscreen_check PRIVATE "${ray_header}" "${ray_table_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}"
     tests/dxr_facing.cpp tests/dxr_opacity.cpp)
 foreach(layout IN ITEMS root tables)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.h")
@@ -2525,6 +2540,8 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME dxr_address_ranges_${adapter} COMMAND offscreen_check ${adapter} --dxr-address-ranges)
     add_test(NAME dxr_placed_build_${adapter} COMMAND offscreen_check ${adapter} --dxr-placed-build)
     set_tests_properties(dxr_placed_build_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    add_test(NAME dxr_slot70_as_${adapter} COMMAND offscreen_check ${adapter} --dxr-slot70-as)
+    set_tests_properties(dxr_slot70_as_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(dxr_address_ranges_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME dxr_pipeline_${adapter} COMMAND offscreen_check ${adapter} --dxr-pipeline)
     add_test(NAME dxr_update_${adapter} COMMAND offscreen_check ${adapter} --dxr-update)
@@ -2983,6 +3000,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_pk_u8_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_cvt_pk_u8_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl 16-bit integer VOPC compares (v_cmp/v_cmpx _i16/_u16, #1723): translation controls, then draws of a
+    # census-shaped v_cmpx kill and of every condition folded into mask words, with mutated lowerings.
+    add_test(NAME startup_gfx2hlsl_cmp16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cmp16_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_cmp16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cmp16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_cmp16_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_sampler_heap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
@@ -4517,6 +4544,27 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_avx_int_ymm_horizontal PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_int_ymm_horizontal.txt")
+    # cpu_avx_int_ymm_pack_checks
+    set(cpu_avx_int_ymm_pack_exports
+        "op_vpacksswb_ymm,op_vpackssdw_ymm,op_vpackusdw_ymm,"
+        "op_vpacksswb_ymm_dst_src1,op_vpackssdw_ymm_dst_src2,"
+        "op_vpackusdw_ymm_all,op_vpacksswb_ymm_dst_src2,"
+        "op_vpackusdw_ymm_then_xmm_vpacksswb,op_chain_ymm_pack")
+    string(CONCAT cpu_avx_int_ymm_pack_exports ${cpu_avx_int_ymm_pack_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_int_ymm_pack_${variant} avx_int_ymm_pack)
+        cpu_translation(cpu_avx_int_ymm_pack_${variant} cpu_avx_int_aot "${cpu_avx_int_ymm_pack_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_int_ymm_pack_altered PRIVATE ALTER_YMM)
+    add_test(NAME cpu_aot_avx_int_ymm_pack COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_ymm_pack_check.py"
+        "$<TARGET_FILE:cpu_avx_int_ymm_pack_original>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_pack_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_pack_altered>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_pack_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_int_ymm_pack PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_int_ymm_pack.txt")
     set(cpu_avx_move_exports
         "op_andpd_xmm,op_andpd_ymm,op_andps_xmm,op_andps_ymm,op_andnpd_xmm,op_andnpd_ymm,"
         "op_andnps_xmm,op_andnps_ymm,op_orpd_xmm,op_orpd_ymm,op_orps_xmm,op_orps_ymm,"
@@ -5282,6 +5330,28 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_vex_bytes PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_vex_bytes.txt")
+    # cpu_aot_vex_bytes_arith
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_vex_bytes_arith_${variant} vex_bytes_arith)
+        set(vex_bytes_arith_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_bytes_arith_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${vex_bytes_arith_lifted}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_vex_aot.py"
+                "$<TARGET_FILE:cpu_vex_bytes_arith_${variant}>" "${vex_bytes_arith_lifted}"
+                paddb_reg paddb_mem psubb_reg psubb_mem psubb_self
+                pcmpeqb_reg pcmpeqb_mem pcmpgtb_reg pcmpgtb_mem
+                bytes_arith_mem_r8_chain bytes_arith_aligned
+            DEPENDS cpu_vex_bytes_arith_${variant} tools/cpu_vex_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_library(cpu_vex_bytes_arith_${variant}_lifted SHARED "${vex_bytes_arith_lifted}")
+    endforeach()
+    target_compile_definitions(cpu_vex_bytes_arith_altered PRIVATE ALTER_BYTE_ARITH)
+    add_test(NAME cpu_aot_vex_bytes_arith COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/vex_bytes_arith_check.py"
+        "$<TARGET_FILE:cpu_vex_bytes_arith_original>" "$<TARGET_FILE:cpu_vex_bytes_arith_original_lifted>"
+        "$<TARGET_FILE:cpu_vex_bytes_arith_altered>" "$<TARGET_FILE:cpu_vex_bytes_arith_altered_lifted>")
+    set_tests_properties(cpu_aot_vex_bytes_arith PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_vex_bytes_arith.txt")
     set(cpu_seg_inspect_exports
         "lar_reg16,lar_reg32,lar_reg64,lar_mem16,lar_mem32_disp,lar_mem64_disp,"
         "lsl_reg16,lsl_reg32,lsl_reg64,lsl_mem16,lsl_mem32_disp,lsl_mem64_disp,"
@@ -5609,6 +5679,31 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_bmi2 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2.py"
         check "$<TARGET_FILE:cpu_bmi2>" "$<TARGET_FILE:cpu_bmi2_lifted>")
     set_tests_properties(cpu_aot_bmi2 PROPERTIES SKIP_RETURN_CODE 77)
+
+    # cpu_aot_bmi2_shift
+    set(cpu_bmi2_shift_exports
+        "op_rorx32,op_rorx32_imm32,op_rorx32_imm37,op_rorx64,op_rorx64_imm64,op_rorx64_imm73,"
+        "op_shlx32,op_shlx64,op_shrx32,op_shrx64,op_sarx32,op_sarx64,"
+        "op_rorx32_mem,op_rorx64_mem,op_shlx32_mem,op_shlx64_mem,"
+        "op_shrx32_mem,op_shrx64_mem,op_sarx32_mem,op_sarx64_mem,"
+        "op_mem_r8_source,op_flags_preserve32,op_flags_preserve64,"
+        "op_flags_preserve_mem,op_bmi2_discarded_read")
+    string(CONCAT cpu_bmi2_shift_exports ${cpu_bmi2_shift_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_bmi2_shift_${variant} bmi2_shift)
+        cpu_translation(cpu_bmi2_shift_${variant} cpu_bmi2_shift_aot "${cpu_bmi2_shift_exports}")
+    endforeach()
+    target_compile_definitions(cpu_bmi2_shift_altered PRIVATE ALTER_BMI2_SHIFT)
+    add_test(NAME cpu_aot_bmi2_shift COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2_shift_check.py"
+        "$<TARGET_FILE:cpu_bmi2_shift_original>"
+        "$<TARGET_FILE:cpu_bmi2_shift_original_lifted>"
+        "$<TARGET_FILE:cpu_bmi2_shift_altered>"
+        "$<TARGET_FILE:cpu_bmi2_shift_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_bmi2_shift PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_bmi2_shift.txt")
 
     cpu_asm_fixture(cpu_sse2_packed_cvt sse2_packed_cvt)
     target_sources(cpu_sse2_packed_cvt PRIVATE tests/cpu/sse2_mxcsr_test.asm)
@@ -7098,7 +7193,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_library(cpu_placed_dxr_provider SHARED tests/cpu/placed_dxr_provider.cpp tests/dxr_check.cpp
         tests/desktop_gpu.cpp src/era_title_va.cpp
-        "${ray_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}")
+        "${ray_header}" "${ray_table_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}")
     if(TARGET d3d12_xs_device_obj)
         target_sources(cpu_placed_dxr_provider PRIVATE $<TARGET_OBJECTS:d3d12_xs_device_obj>)
     else()
@@ -9094,6 +9189,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/pe_run_package_invalid_check.py")
     add_test(NAME pe_run_package_plan_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pe_run_package_plan_check.py")
+    add_test(NAME pe_intake_checks COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/intake_exe_check.py")
     add_test(NAME pe_host_commit_preflight COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/host_commit_check.py")
     add_test(NAME xgameruntime_preflight_stub_refused COMMAND "${INTAKE_PYTHON}" -B
