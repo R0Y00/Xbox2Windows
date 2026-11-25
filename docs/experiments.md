@@ -13757,6 +13757,16 @@ is consumed. The expected UAV contains 256 result words and 64 sentinels.
 On WARP, RTX 4060 and Intel UHD 770, all 320 matched. Reading the same lane
 or broadcasting lane 36 instead changed exactly 128 words per adapter.
 
+Case G checks `ds_read2_b32` against the same bounded fill. Each encoded offset
+counts dwords independently from the original byte address. The translator
+checks both addresses against the initialized span and snapshots the base before
+writing either destination VGPR. In `ds_read2_b32 v[6:7], v6 offset0:5 offset1:36`,
+the first result overwrites the address register. The data are chosen so that
+using that overwritten value for the second read still addresses initialized LDS
+and produces a predictable wrong word. A second control swaps the two offsets.
+The RDNA 2 ISA describes a single access when the offsets coincide. This slice
+requires distinct offsets. [AMD RDNA 2 ISA, §10.4, LDS Access](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
 The startup translator accepts one straight-line, full-EXEC fill in a 1D
 group, one group barrier, and reads from that initialized span. The fill
 address is the entry X ID shifted left by two. Read addresses come from an
@@ -13769,7 +13779,7 @@ the 32 KiB groupshared limit. The barrier becomes an unconditional
 and [HLSL group barrier](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/groupmemorybarrierwithgroupsync).
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(f-peer_|f-broadcast_)?(warp|hardware))$' -V
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(f-peer_|f-broadcast_|g-swapped-offsets_|g-overlap_)?(warp|hardware))$' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 

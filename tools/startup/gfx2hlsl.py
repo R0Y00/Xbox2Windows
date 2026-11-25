@@ -798,6 +798,26 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+def lds_byte_offsets(name, mods):
+    if name != 'ds_read2_b32':
+        if not mods:
+            return (0,)
+        if len(mods) == 1 and re.fullmatch(r'offset:\d+', mods[0]):
+            return (int(mods[0][7:]),)
+        raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
+    # DS_READ2 encodes each offset independently in dwords. An omitted field is zero.
+    offsets = {}
+    for mod in mods:
+        field = re.fullmatch(r'offset([01]):(\d+)', mod)
+        if not field or field[1] in offsets or int(field[2]) > 255:
+            raise Unsupported('LDS read2 needs ordinary dword offsets')
+        offsets[field[1]] = 4 * int(field[2])
+    first, second = offsets.get('0', 0), offsets.get('1', 0)
+    if first == second:
+        raise Unsupported('LDS read2 needs two distinct offsets')
+    return first, second
+
+
 def check_lds_exchange(ins, group, words):
     """Prove one race-free fill of a contiguous LDS span, one uniform barrier, then reads of initialized words."""
     if not 0 < words <= 8192 or group[1:] != (1, 1):
@@ -817,13 +837,18 @@ def check_lds_exchange(ins, group, words):
                     or mods or ops not in ([], ['0'], ['0x0'])):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
             published = True
-        elif base in ('ds_write_b32', 'ds_read_b32'):
-            if (len(ops) != 2 or not all(re.fullmatch(r'v[0-9]+', op) for op in ops)
-                    or mods and (len(mods) != 1 or not re.fullmatch(r'offset:\d+', mods[0]))):
+        elif base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32'):
+            if base == 'ds_read2_b32':
+                dest = reg_range(ops[0]) if len(ops) == 2 else None
+                if (not dest or dest[0] != 'v' or dest[2] != dest[1] + 1 or dest[2] > 255
+                        or not re.fullmatch(r'v\d+', ops[1])):
+                    raise Unsupported('LDS read2 needs a VGPR pair and a byte address VGPR')
+            elif len(ops) != 2 or not all(re.fullmatch(r'v[0-9]+', op) for op in ops):
                 raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
-            offset = int(mods[0][7:]) if mods else 0
+            offsets = lds_byte_offsets(base, mods)
             producer, args, modifiers = prev
             if base == 'ds_write_b32':
+                offset, = offsets
                 # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct dword.
                 if (first is not None or producer != 'v_lshlrev_b32' or args != [ops[0], '2', 'v0']
                         or modifiers or offset % 4 or offset + group[0] * 4 > words * 4):
@@ -839,7 +864,8 @@ def check_lds_exchange(ins, group, words):
                     low, high = 0, int(args[1], 0)
                 else:
                     raise Unsupported('LDS read needs a literal or literal-masked byte address')
-                if offset % 4 or high % 4 or low + offset < first or high + offset >= first + group[0] * 4:
+                if high % 4 or any(offset % 4 or low + offset < first or high + offset >= first + group[0] * 4
+                                   for offset in offsets):
                     raise Unsupported('LDS read outside the aligned, initialized span')
                 if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
                     raise Unsupported('LDS read needs a completed LGKM wait')
@@ -1822,7 +1848,7 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
-        if base in ('ds_write_b32', 'ds_read_b32', 's_barrier'):
+        if base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 's_barrier'):
             if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported(base)
             # The refusal census continues past failed instructions. Scan this program only once.
@@ -1840,12 +1866,17 @@ class Stage:
             else:
                 write = base == 'ds_write_b32'
                 address = self.u(ops[0 if write else 1])
-                offset = int(mods[0][7:]) if mods else 0
-                cell = 'lds[(%s + %du) >> 2]' % (address, offset)
+                offsets = lds_byte_offsets(base, mods)
                 if write:
-                    self.emit('%s = %s;' % (cell, self.u(ops[1])))
+                    self.emit('lds[(%s + %du) >> 2] = %s;' % (address, offsets[0], self.u(ops[1])))
                 else:
-                    self.set_v(reg_range(ops[0])[1], cell)
+                    if base == 'ds_read2_b32':
+                        # Either destination can overlap the incoming address VGPR.
+                        self.emit('a = %s;' % address)
+                        address = 'a'
+                    start = reg_range(ops[0])[1]
+                    for index, offset in enumerate(offsets):
+                        self.set_v(start + index, 'lds[(%s + %du) >> 2]' % (address, offset))
             return None
         if base.endswith('_dpp'):
             return self.dpp(base[:-len('_dpp')], ops, mods)
