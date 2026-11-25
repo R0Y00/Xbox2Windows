@@ -10,8 +10,10 @@ import os
 import re
 import struct
 import sys
+import sysconfig
 import tempfile
 import time
+import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
@@ -149,6 +151,21 @@ FETCH_FORMATS = {
     'BUF_FMT_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '0u', 'U(1.0)']),
     'BUF_FMT_32_FLOAT': (None, ['{0}.Load(a)', '0u', '0u', 'U(1.0)'])}
 
+
+# gfx10 buffer-descriptor FORMAT field (word 3, bits 12..18) for each FETCH_FORMATS entry: the same unified
+# numbers as the tbuffer `format:` operand (tools/disasm_rdna2.py MTBUF_FORMATS; 1 is the omitted default).
+# A MUBUF buffer_load_format_* has no format operand, so its translation switches on this field at run time.
+# A FORMAT the draw should have refused reaches the switch default: every component becomes this NaN pattern
+# (never a finite zero), so a missed validation shows in the readback instead of passing as black.
+DESC_FORMAT_UNKNOWN = 0x7fc0f0f0
+DESC_FORMAT_CODES = {
+    'BUF_FMT_8_UNORM': 1, 'BUF_FMT_8_UINT': 5, 'BUF_FMT_8_8_UNORM': 14, 'BUF_FMT_32_FLOAT': 22,
+    'BUF_FMT_16_16_UNORM': 23, 'BUF_FMT_16_16_SNORM': 24, 'BUF_FMT_16_16_UINT': 27, 'BUF_FMT_16_16_FLOAT': 29, 'BUF_FMT_8_8_8_8_UNORM': 56, 'BUF_FMT_8_8_8_8_UINT': 60,
+    'BUF_FMT_32_32_FLOAT': 64, 'BUF_FMT_16_16_16_16_FLOAT': 71, 'BUF_FMT_32_32_32_FLOAT': 74,
+    'BUF_FMT_32_32_32_32_FLOAT': 77}
+DESC_FORMAT_SHIFT, DESC_FORMAT_MASK = 12, 127
+# Integer formats read a DST_SEL constant 1 as the integer 1, every other format as 1.0.
+DESC_ONE_INTEGER = ('BUF_FMT_8_UINT', 'BUF_FMT_8_8_8_8_UINT')
 
 def starts_with_fetch_call(code):
     return len(code) >= 4 and struct.unpack_from('<I', code)[0] == FETCH_CALL
@@ -342,6 +359,13 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('image_load_mip tfe')
         if word1 & (1 << 30):
             raise Unsupported('image_load_mip a16')
+    if re.fullmatch(r'v_cmpx?_(lt|eq|le|gt|ne|ge)_[iu]16_e64', name):
+        # The decoder prints NEG on an inline integer as a sign (inline 1 with NEG reads `-1`, the same text as
+        # inline -1), and LLVM 15 rejects `-v1` and `|v1|` on these sources: refuse either bit (VOP3 w0[10:8] ABS,
+        # w1[31:29] NEG) so a printed -N is always a genuine inline integer.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & 0x700 or word1 & 0xe0000000:
+            raise Unsupported('%s with neg/abs: not a 16-bit integer source modifier' % name)
     if name == 'v_cndmask_b32_e64':
         # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -1655,6 +1679,11 @@ class Stage:
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.has_branches = bool(targets)
+            self.entry_table_pointers = {
+                reg: sym[1] for reg, sym in init_sym.items()
+                if isinstance(reg, int) and sym[0] == 'ptr' and sym[1][0] == 'table'
+            }
+            self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
             self.defined_uniform_s = set(init_entry_uniform)
@@ -1670,12 +1699,14 @@ class Stage:
             start = 0
             raised_unsupported = None
 
-            for off, n, name, asm in self.ins:
+            for instruction_index, (off, n, name, asm) in enumerate(self.ins):
                 if off in targets and off != start:
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, None))
                     self.lines, start = [], off
+                    self.descriptor_block_first = instruction_index
                 self.pc = off
+                self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
                 # Before the first branch target or terminator every path has run exactly the instructions above, so
                 # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
@@ -1765,6 +1796,8 @@ class Stage:
                     term = self.one(name, asm)
                 except Unsupported as reason:
                     if refusals is None:
+                        if not hasattr(reason, 'instruction'):
+                            reason.instruction = name  # for fail_reason(); the message itself is unchanged
                         raised_unsupported = reason
                         break
                     refusals.append((str(reason), self.kind))
@@ -1780,6 +1813,7 @@ class Stage:
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, term))
                     self.lines, start = [], off + n
+                    self.descriptor_block_first = instruction_index + 1
 
             new_bad = self.bad_sgprs - force_unproven
             new_at = {k: v - force_at.get(k, set()) for k, v in bad_at_target.items() if v - force_at.get(k, set())}
@@ -2150,10 +2184,8 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
             return self.scalar(base, ops)
-        if base in ('buffer_load_format_x', 'buffer_load_format_xy',
-                    'buffer_load_format_xyz', 'buffer_load_format_xyzw'):
-            # MUBUF formatted loads take both fields from V# word 3. The startup request carries
-            # the root signature layout, while the descriptor table is supplied at draw time.
+        if base == 'buffer_load_format_xyzw':
+            # Not translated: the four-component form has no startup request that needs it yet.
             raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
 
@@ -3049,8 +3081,8 @@ class Stage:
             raise Unsupported('%s through a modified descriptor' % what)
         return key
 
-    def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False):
-        """Validate a fixed-table raw UAV descriptor, data range, offen address, soffset, and 4-byte alignment."""
+    def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False):
+        """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
         for m in mods:
@@ -3060,17 +3092,21 @@ class Stage:
                 glc = True
             elif m != 'offen':
                 raise Unsupported('%s modifier %s' % (kind_label, m))
-        if len(ops) != 4 or 'offen' not in mods:
+        offen = 'offen' in mods
+        if len(ops) != 4 or (not offen and not (allow_scalar_address and glc and ops[1] == 'off')):
             raise Unsupported('%s without the offen address form' % kind_label)
         data = reg_range(ops[0])
         if not data or data[0] != 'v' or data[2] - data[1] != data_count - 1 or data[2] > 255:
             raise Unsupported('%s data %s' % (kind_label, ops[0]))
-        vaddr = reg_range(ops[1])
-        if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
-            raise Unsupported('%s vaddr %s for offen' % (kind_label, ops[1]))
+        if offen:
+            vaddr = reg_range(ops[1])
+            if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
+                raise Unsupported('%s vaddr %s for offen' % (kind_label, ops[1]))
         key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True)
-        terms = [self.u(ops[1])]
+        terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
+            if not offen:
+                raise Unsupported('%s off requires a scalar register soffset' % kind_label)
             offset += int(ops[3], 0)
         else:
             sreg = reg_range(ops[3])
@@ -3079,7 +3115,8 @@ class Stage:
             terms.append(self.S(sreg[1]))
         if offset % 4:
             raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
-        return data, self.pipe.uav(key), '(%s + %d) & 0xfffffffcu' % (' + '.join(terms), offset), glc
+        terms.append(str(offset))
+        return data, self.pipe.uav(key), '(%s) & 0xfffffffcu' % ' + '.join(terms), glc
 
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
@@ -3100,11 +3137,12 @@ class Stage:
         self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
 
     def buffer_atomic(self, name, ops, mods):
-        """Lower 32-bit compute MUBUF atomics in offen mode with optional glc pre-atomic return."""
+        """Lower 32-bit compute MUBUF atomics with optional glc pre-atomic return."""
         if self.kind != 'cs':
             raise Unsupported(name)
         method, signed, is_sub, data_count = MUBUF_ATOMIC_OPS[name]
-        data, uav, address, glc = self.raw_table_uav_store('buffer atomic', ops, mods, data_count, allow_glc=True)
+        data, uav, address, glc = self.raw_table_uav_store(
+            'buffer atomic', ops, mods, data_count, allow_glc=True, allow_scalar_address=name == 'buffer_atomic_add')
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         self.emit('a = %s;' % address)
         if not isinstance(getattr(self, 'used_atomic', None), set):
@@ -3174,6 +3212,128 @@ class Stage:
             self.emit('a = (vid + ud%d) * ud%d + %d;' % (base, stride, e['offset']))
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
+
+    @staticmethod
+    def descriptor_scalar_writes(name, ops):
+        regs = set()
+        for token in destinations(name, ops):
+            if token in ('vcc', 'vcc_lo', 'vcc_hi'):
+                regs.update((106, 107))
+            parsed = reg_range(token)
+            if parsed and parsed[0] == 's':
+                regs.update(range(parsed[1], parsed[2] + 1))
+        if name.startswith('v_cmp') and len(ops) == 2:
+            regs.update((106, 107))
+        return regs
+
+    def formatted_pointer_reaches(self, pointer, before):
+        """Refuse a write to the original root pointer on any predecessor path of this read."""
+        if not hasattr(self, 'descriptor_predecessors'):
+            by_offset = {off: i for i, (off, *_rest) in enumerate(self.ins)}
+            self.descriptor_predecessors = [[] for _ in self.ins]
+            self.descriptor_writes_by_instruction = []
+            for index, (_, _, name, asm) in enumerate(self.ins):
+                _, args, _ = parse(asm)
+                self.descriptor_writes_by_instruction.append(self.descriptor_scalar_writes(name, args))
+                if index + 1 < len(self.ins) and name not in ('s_branch', 's_endpgm'):
+                    self.descriptor_predecessors[index + 1].append(index)
+                if name == 's_branch' or name.startswith('s_cbranch_'):
+                    target = by_offset.get(int(args[0].split('_')[1], 16))
+                    if target is not None:
+                        self.descriptor_predecessors[target].append(index)
+        seen = set()
+        pending = list(self.descriptor_predecessors[before])
+        while pending:
+            earlier = pending.pop()
+            if earlier in seen:
+                continue
+            seen.add(earlier)
+            if pointer in self.descriptor_writes_by_instruction[earlier]:
+                return False
+            pending.extend(self.descriptor_predecessors[earlier])
+        return True
+
+    def formatted_descriptor_from_block(self, reg, first):
+        """Require one untouched local load and a table pointer that no incoming path can rewrite."""
+        start, end = self.descriptor_block_first, self.descriptor_instruction_index
+        block = self.ins[start:end]
+        words = set(range(reg[1], reg[2] + 1))
+        for index in range(len(block) - 1, -1, -1):
+            _, _, name, asm = block[index]
+            _, args, _ = parse(asm)
+            if not (self.descriptor_scalar_writes(name, args) & words):
+                continue
+            m = re.fullmatch(r's_load_dwordx(4|8|16)', name)
+            load = reg_range(args[0])
+            if not m or not load or load[1] + first[3] != reg[1] or int(m.group(1)) < first[3] + 4:
+                return False
+            base = reg_range(args[1])
+            if not base or base[0] != 's':
+                return False
+            pointer = base[1]
+            read = start + index
+            for previous in range(index - 1, -1, -1):
+                _, _, earlier, prior = block[previous]
+                _, src, _ = parse(prior)
+                if pointer not in self.descriptor_scalar_writes(earlier, src):
+                    continue
+                copied_from = reg_range(src[1]) if earlier == 's_mov_b32' and len(src) == 2 else None
+                if not copied_from or copied_from[0] != 's' or copied_from[1] != copied_from[2]:
+                    return False
+                pointer = copied_from[1]
+                read = start + previous
+                break
+            return self.entry_table_pointers.get(pointer) == first[1] and self.formatted_pointer_reaches(pointer, read)
+        return False
+
+    def mubuf_format(self, ops, mods, count):
+        """buffer_load_format_x/xy/xyz: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
+
+        The runtime passes that word as an entry constant. Each supported format becomes one case of a switch
+        on the FORMAT field that decodes the four components as the tbuffer path does; DST_SEL then picks, for
+        each destination register, a component or the constant 0 or 1. The draw validates FORMAT and descriptor
+        availability before submission, so the generated switch only sees the supported cases.
+        """
+        if self.kind not in ('vs', 'ps'):
+            raise Unsupported('formatted buffer load requires a graphics draw')
+        dst = reg_range(ops[0])
+        buf, address = self.buffer_address(ops, mods)
+        # FORMAT and DST_SEL are read from the table word, so word 3 must still be the loaded one.
+        r = reg_range(ops[2])
+        first = self.sym.get(r[1]) if r else None
+        if not r or r[2] - r[1] != 3 or not first or first[0] != 'desc' or any(
+                self.sym.get(r[1] + i) != ('desc', first[1], first[2], first[3] + i) for i in range(4)):
+            raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
+        if first[1][0] != 'table':
+            raise Unsupported('formatted buffer load requires a hardware table descriptor')
+        if self.past_entry and not self.formatted_descriptor_from_block(r, first):
+            raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
+        word3 = 'ud%d' % self.pipe.ud(('descword3', self.pipe.resources[self.descriptor(ops[2])]['index']))
+        self.emit('a = %s;' % address)
+        self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
+        self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
+        for fmt, code in sorted(DESC_FORMAT_CODES.items(), key=lambda kv: kv[1]):
+            load, comps = FETCH_FORMATS[fmt]
+            body = ['w = %s;' % load.format(buf)] if load else []
+            body += ['c%d = %s;' % (i, comps[i].format(buf)) for i in range(4)]
+            if fmt in DESC_ONE_INTEGER:
+                body.append('one = 1u;')
+            self.emit('case %du: %s break;' % (code, ' '.join(body)))
+        self.emit('default: c0 = c1 = c2 = c3 = %du; break; }' % DESC_FORMAT_UNKNOWN)
+        pick = ('((%s >> %d) & 7u)' % (word3, 3 * i) for i in range(count))
+        for i, sel in enumerate(pick):
+            self.set_v(dst[1] + i, '%s == 4u ? c0 : %s == 5u ? c1 : %s == 6u ? c2 : %s == 7u ? c3 : %s == 1u ? one : 0u'
+                       % (sel, sel, sel, sel, sel))
+        self.emit('}')
+
+    def op_buffer_load_format_x(self, ops, mods):
+        self.mubuf_format(ops, mods, 1)
+
+    def op_buffer_load_format_xy(self, ops, mods):
+        self.mubuf_format(ops, mods, 2)
+
+    def op_buffer_load_format_xyz(self, ops, mods):
+        self.mubuf_format(ops, mods, 3)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
@@ -4244,6 +4404,30 @@ class Stage:
                 reg_range(ops[0]) and reg_range(ops[0])[0] == 's'):
             raise Unsupported('%s into %s' % (base, ops[0]))
 
+    def _low16_source(self, base, tok, signed):
+        """A source of a 16-bit integer compare: bits 15:0 of the operand, sign- or zero-extended (RDNA 2 VOPC
+        S0.i16 / S0.u16). A float token is refused: on a 16-bit operand the inline constants 240-248 are binary16
+        values (LLVM 15 prints inline 1.0 there as 0x3c00), while u() would give the binary32 word."""
+        if tok in FLOATS:
+            raise Unsupported('%s source %s: inline float constants are binary16 on 16-bit operands' % (base, tok))
+        reg = reg_range(tok)
+        if reg:
+            if reg[1] != reg[2]:
+                raise Unsupported('%s source %s' % (base, tok))
+            x = self.u(tok, low16_only=True)
+            return '(asint(%s << 16u) >> 16u)' % x if signed else '(%s & 0xffffu)' % x
+        try:
+            value = int(tok, 0)
+        except ValueError:
+            # vcc, exec, m0 and modifier spellings: not a source this lowering reads.
+            raise Unsupported('%s source %s' % (base, tok))
+        # The decoder prints inline integers -16..64 in decimal and a literal in hex; LLVM 15 accepts only 16-bit
+        # literals on these operands.
+        if not -16 <= value <= 0xffff:
+            raise Unsupported('%s source %s: wider than 16 bits' % (base, tok))
+        low = value & 0xffff
+        return '%d' % (low - 0x10000 if low & 0x8000 else low) if signed else '0x%04xu' % low
+
     def compare(self, base, ops, mods=()):
         # A comparison reads its two operands directly, so a modifier that arrives here is one this
         # lowering does not model (op_sel selects a packed half, clamp/omod have no place in a compare):
@@ -4319,10 +4503,14 @@ class Stage:
                 self.masks.add(d)
             return None
 
-        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
+        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
         writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
+        # The 16-bit integer compares have the six relations only (gfx10 has no 16-bit f or t). Their SDWA forms
+        # are not lowered here (tools/pixel_aot.py has its own lowering of them).
+        if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
+            raise Unsupported(base)
         # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
         # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
         # tested on their bits. DXC marks float compares fast unless -Gis, and a driver may then fold
@@ -4352,6 +4540,8 @@ class Stage:
             x, y = self.f(a), self.f(b)
         elif typ == 'i32':
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
+        elif typ in ('i16', 'u16'):
+            x, y = (self._low16_source(base, t, typ == 'i16') for t in (a, b))
         else:
             x, y = self.u(a), self.u(b)
         def word(tok):
@@ -4735,10 +4925,10 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 D16_FLOAT_EXACT_SRV_FORMATS = frozenset((2, 6, 16, 21, 28, 41, 49, 61, 65, 87, 88))
 D16_UNORM16_SRV_FORMATS = frozenset((11, 35, 56))
 D16_EXACT_SRV_FORMATS = D16_FLOAT_EXACT_SRV_FORMATS | D16_UNORM16_SRV_FORMATS
-# The formats whose channels are all 32 bits wide: the export words are the stored words, so one integer
-# signature serves them. Narrower integer formats stay refused until a readback shows how they truncate.
-VERIFIED_UINT_RTVS = frozenset((3, 17, 42))   # R32G32B32A32, R32G32, R32
-VERIFIED_SINT_RTVS = frozenset((4, 18, 43))
+# Uncompressed exports keep their 32-bit shader values. RGBA8 integer RTVs clamp each
+# channel to the destination range in the output merger.
+VERIFIED_UINT_RTVS = frozenset((3, 17, 30, 42))
+VERIFIED_SINT_RTVS = frozenset((4, 18, 32, 43))
 
 
 class Pipeline:
@@ -5275,7 +5465,8 @@ def translate_compute(out_dir, key):
         pipe = load_compute_request(out_dir, key)
         hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
     except Unsupported as reason:
-        open(name + '.fail', 'w').write(str(reason) + '\n')
+        reason = fail_reason(reason)
+        open(name + '.fail', 'w').write(reason + '\n')
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
@@ -5377,7 +5568,8 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         if rtv_request:
             manifest += rtv_request + '\n'
     except Unsupported as reason:
-        open(name + '.fail', 'w').write(str(reason) + '\n')
+        reason = fail_reason(reason)
+        open(name + '.fail', 'w').write(reason + '\n')
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.vs.hlsl', 'w').write(vs)
@@ -5797,12 +5989,39 @@ def watch_pass(out_dir, skip_failed):
         return False
 
 
+def fail_reason(reason):
+    """The .fail text of a refusal. An operand alone ("operand '-v30'") does not say which lowering refused it, so
+    the instruction is added when the translation loop recorded it. The record is an attribute on the exception, so
+    a refusal raised outside that loop, or rebuilt as a new Unsupported on the way here, gives the message alone."""
+    text = str(reason)
+    if text.startswith('operand ') and getattr(reason, 'instruction', None):
+        text += ' in %s' % reason.instruction
+    return text
+
+
+def raise_site(error):
+    """The traceback frame that raised error, skipping standard-library frames so an error raised inside a library
+    call (json, struct helpers, ...) names the code that made the call. None without a traceback."""
+    frames = traceback.extract_tb(error.__traceback__)
+    roots = {os.path.normcase(os.path.abspath(sysconfig.get_paths()[name])) + os.sep
+             for name in ('stdlib', 'platstdlib')}
+    for frame in reversed(frames):
+        if not os.path.normcase(os.path.abspath(frame.filename)).startswith(tuple(roots)):
+            return frame
+    return frames[-1] if frames else None
+
+
 def translate_one(out_dir, key):
     """translate_request, with an unexpected translator error recorded as <key>.fail instead of raised."""
     try:
         return translate_request(out_dir, key)
     except Exception as error:  # noqa: BLE001 - one bad request must not stop a scan or the watcher
         reason = 'translator error: %s: %s' % (type(error).__name__, error)
+        # Where it was raised (function, file name, line), so the .fail points at the fault without the program
+        # that hit it. The line number moves with unrelated edits, so this text is for reading, not a stable key.
+        frame = raise_site(error)
+        if frame:
+            reason += ' (in %s, %s line %d)' % (frame.name, os.path.basename(frame.filename), frame.lineno)
         with open(os.path.join(out_dir, '%016x.fail' % key), 'w') as fail:
             fail.write(reason + '\n')
         return reason
