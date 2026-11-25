@@ -3,7 +3,7 @@
 usage: startup_vertex_fetch_formats_check.py <dxc> <offscreen_check> <adapter>
        startup_vertex_fetch_formats_check.py controls
 
-tools/startup/gfx2hlsl.py lowers tbuffer_load_format_* for eleven buffer formats from a table of HLSL
+tools/startup/gfx2hlsl.py lowers tbuffer_load_format_* for the supported buffer formats from a table of HLSL
 expressions: the load of the word or words, the field each component takes and its conversion, and the
 values of the missing components. Only BUF_FMT_8_UINT and BUF_FMT_8_UNORM were run before
 (startup_r8_uint_check.py). This drives each table entry the way that check does: a source-built vertex
@@ -55,6 +55,7 @@ FORMATS = {
     'BUF_FMT_16_16_FLOAT': (29, 10, 10, 16, 'f16', 2),
     'BUF_FMT_16_16_16_16_FLOAT': (71, 18, 10, 16, 'f16', 4),
     'BUF_FMT_8_8_8_8_UNORM': (56, 5, 3, 8, 'unorm', 4),
+    'BUF_FMT_8_8_8_8_UINT': (60, 5, 3, 8, 'uint', 4),
     'BUF_FMT_32_FLOAT': (22, 8, 4, 32, 'f32', 1),
     'BUF_FMT_32_32_FLOAT': (64, 12, 0, 32, 'f32', 2),
     'BUF_FMT_32_32_32_FLOAT': (74, 16, 4, 32, 'f32', 3),
@@ -138,6 +139,9 @@ void readback(uint id : SV_GroupIndex) {
 MUTATIONS = (
     ('BUF_FMT_8_8_8_8_UNORM', 'second byte from the third', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)'),
     ('BUF_FMT_8_8_8_8_UNORM', 'fourth byte as 255', 'U((w >> 24) / 255.0)', 'U(1.0)'),
+    ('BUF_FMT_8_8_8_8_UINT', 'normalized green byte', 'v5 = (w >> 8) & 255u;', 'v5 = U(((w >> 8) & 255u) / 255.0);'),
+    ('BUF_FMT_8_8_8_8_UINT', 'blue byte from green', 'v6 = (w >> 16) & 255u;', 'v6 = (w >> 8) & 255u;'),
+    ('BUF_FMT_8_8_8_8_UINT', 'alpha byte from blue', 'v7 = w >> 24;', 'v7 = (w >> 16) & 255u;'),
     ('BUF_FMT_8_8_UNORM', 'aligned load instead of ldu', 'ldu(r0, a)', 'r0.Load(a & ~3u)'),
     ('BUF_FMT_16_16_UNORM', 'high half over 65536', 'U((w >> 16) / 65535.0)', 'U((w >> 16) / 65536.0)'),
     ('BUF_FMT_16_16_SNORM', 'low half read unsigned', 'float(int(w << 16) >> 16)', 'float((w << 16) >> 16)'),
@@ -407,27 +411,39 @@ def runtime_gate_controls():
         raise AssertionError('gate after binding fallback or list commands must fail the control')
 
 
-def run(directory, compiler, consumer, adapter, name, source, words, translated=None, word3=None):
-    hlsl, binary, case = (directory / n for n in ('fetch.hlsl', 'fetch.cso', 'fetch.case'))
-    translated = translated or pipeline(name)
-    constants = [0] * 16
-    constants[translated.uds.index(('stride', 0))] = FORMATS[name][1]
-    if word3 is not None:
-        constants[translated.uds.index(('descword3', 0))] = word3
-    case.write_bytes(struct.pack('<337I', 1, *words, *constants))
+def compile_fetch(directory, compiler, name, source):
+    hlsl, binary = directory / 'fetch.hlsl', directory / 'fetch.cso'
     hlsl.write_text(source, encoding='ascii')
     # Compile the vertex entry as the startup tools do, then the same body in the compute wrapper.
     subprocess.run([compiler, '-T', 'vs_6_0', '-E', 'main', '-Fo', binary, hlsl], check=True)
     with hlsl.open('a', encoding='ascii') as handle:
         handle.write(wrapper(name))
     subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'readback', '-Fo', binary, hlsl], check=True)
+    return binary
+
+
+def run_reference(directory, consumer, adapter, binary, name, words, translated=None, word3=None):
+    case = directory / 'fetch.case'
+    translated = translated or pipeline(name)
+    constants = [0] * 16
+    constants[translated.uds.index(('stride', 0))] = FORMATS[name][1]
+    if word3 is not None:
+        constants[translated.uds.index(('descword3', 0))] = word3
+    case.write_bytes(struct.pack('<337I', 1, *words, *constants))
     return subprocess.run([consumer, adapter, '--compute-store-case', binary, case], capture_output=True, text=True)
+
+
+def run(directory, compiler, consumer, adapter, name, source, words, translated=None, word3=None):
+    binary = compile_fetch(directory, compiler, name, source)
+    return run_reference(directory, consumer, adapter, binary, name, words, translated, word3)
 
 
 def check(directory, compiler, consumer, adapter):
     for name in FORMATS:
         source = pipeline(name).hlsl_vs()
-        result = run(directory, compiler, consumer, adapter, name, source, expected(name))
+        binary = compile_fetch(directory, compiler, name, source)
+        correct = expected(name)
+        result = run_reference(directory, consumer, adapter, binary, name, correct)
         if result.returncode == 77:
             print(result.stdout, result.stderr)
             return 77
@@ -438,15 +454,16 @@ def check(directory, compiler, consumer, adapter):
             [line for line in result.stdout.splitlines() if 'mismatches=' in line][0]))
         for label, wrong in WRONG:
             words = expected(name, **wrong)
-            if words == expected(name):
+            if words == correct:
                 continue
-            first = next(i for i, (a, b) in enumerate(zip(words, expected(name))) if a != b)
-            bad = run(directory, compiler, consumer, adapter, name, source, words)
+            first = next(i for i, (a, b) in enumerate(zip(words, correct)) if a != b)
+            bad = run_reference(directory, consumer, adapter, binary, name, words)
             if bad.returncode != 1 or 'word=%d expected=' % first not in bad.stderr:
                 raise AssertionError('%s: reference %r escaped detection\n%s' % (name, label, bad.stderr))
     for name, label, old, new in MUTATIONS:
         source = pipeline(name).hlsl_vs()
-        bad = run(directory, compiler, consumer, adapter, name, source.replace(old, new, 1), expected(name))
+        binary = compile_fetch(directory, compiler, name, source.replace(old, new, 1))
+        bad = run_reference(directory, consumer, adapter, binary, name, expected(name))
         if bad.returncode != 1 or 'Compute readback differs' not in bad.stderr:
             raise AssertionError('%s: mutation %r escaped detection\n%s' % (name, label, bad.stderr))
         print('%s: mutation %r fails' % (name, label))

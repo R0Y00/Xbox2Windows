@@ -144,7 +144,7 @@ def controls():
         (unsupported + "s_absdiff_i32", (("s_absdiff_i32 s22, s16, s17", "s_absdiff_i32 s[22:23], s16, s17"),)),
         (unsupported + "s_absdiff_u32", (("s_absdiff_i32 s22, s16, s17", "s_absdiff_u32 s22, s16, s17"),)),
         # SCC is written but not modelled, so nothing may read it: a select and a branch on it are refused.
-        (unsupported + "s_cselect_b32", (("v_mov_b32_e32 v4, s25", "s_cselect_b32 s26, s25, 0\nv_mov_b32_e32 v4, s26"),)),
+        ("Unverified SCC for scalar select", (("v_mov_b32_e32 v4, s25", "s_cselect_b32 s26, s25, 0\nv_mov_b32_e32 v4, s26"),)),
         (unsupported + "s_cbranch_scc0", (("v_mov_b32_e32 v1, s22", "s_cbranch_scc0 .LBB0_2\nv_mov_b32_e32 v1, s22"),)),
         # A scalar result is data only: not a store address and not a lane-guard compare operand.
         ("Unsupported store address", (("v_mov_b32_e32 v1, s22", "v_mov_b32_e32 v1, s22\nv_mov_b32_e32 v5, s22"),
