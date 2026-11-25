@@ -1362,6 +1362,7 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_draw_${backend} COMMAND startup_indirect_draw_indexed ${backend} draw)
     add_test(NAME startup_indirect_translated_draw_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated)
     add_test(NAME startup_indirect_translated_refusal_census_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-refusal-census)
+    add_test(NAME startup_indirect_translated_targets_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-targets)
     add_test(NAME startup_indirect_copy_provenance_${backend} COMMAND startup_indirect_draw_indexed ${backend} copy-provenance)
     add_test(NAME startup_indirect_copy_provenance_off_${backend} COMMAND startup_indirect_draw_indexed ${backend} copy-provenance-off)
     add_test(NAME startup_indirect_translated_indexed_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-indexed)
@@ -1384,7 +1385,8 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_mesh_${backend} startup_indirect_mesh_console_${backend}
         startup_indirect_mesh_amplified_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_draw_${backend}
-        startup_indirect_translated_refusal_census_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        startup_indirect_translated_refusal_census_${backend}
+        startup_indirect_translated_targets_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_copy_provenance_${backend} startup_indirect_copy_provenance_off_${backend}
         PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_indexed_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
