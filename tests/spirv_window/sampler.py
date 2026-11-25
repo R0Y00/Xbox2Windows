@@ -300,6 +300,9 @@ if __name__ == "__main__":
                 dxil = hlsl.with_suffix(".dxil")
                 subprocess.run([sys.argv[4], "-T", "cs_6_0", "-E", "main", "-Fo", dxil, hlsl], check=True)
                 # The renamed table is read back exactly as the original is: same slots, same expected words.
-                status |= subprocess.run([sys.argv[5], sys.argv[6], "--spirv-sampler-views", dxil]).returncode
+                print(f"sampler table: {variant or 'plain'}", flush=True)
+                result = subprocess.run([sys.argv[5], sys.argv[6], "--spirv-sampler-views", dxil]).returncode
+                if result and (result != 77 or status == 0):
+                    status = result
     print("sampler views: plain and renamed tables and a level-of-detail query validated; controls passed")
     sys.exit(status)

@@ -74,6 +74,7 @@ void check_sampler_views(ID3D12Device* device, const char* path)
     UINT sampler_stride = device->GetDescriptorHandleIncrementSize(hd.Type);
 
     // Reverse each typed pair independently. The other operation must retain its results.
+    bool mismatched = false;
     for (UINT mask : {0u, 1u, 2u}) {
         auto handle = samplers->GetCPUDescriptorHandleForHeapStart();
         for (UINT i = 0; i < 4; ++i) {
@@ -125,7 +126,16 @@ void check_sampler_views(ID3D12Device* device, const char* path)
         readback->Unmap(0, &empty);
         std::printf("sampler swap %u: sample %g %g, comparison %g %g\n",
                     mask, actual[0], actual[1], actual[2], actual[3]);
-        if (std::memcmp(actual.data(), expected.data(), sizeof(actual)) != 0)
-            throw std::runtime_error("Split sampler readback mismatch");
+        for (size_t i = 0; i < expected.size(); ++i) {
+            UINT expected_word, actual_word;
+            std::memcpy(&expected_word, &expected[i], sizeof(expected_word));
+            std::memcpy(&actual_word, &actual[i], sizeof(actual_word));
+            if (actual_word != expected_word) {
+                std::printf("sampler swap %u word %zu: expected=%08x actual=%08x\n",
+                            mask, i, expected_word, actual_word);
+                mismatched = true;
+            }
+        }
     }
+    if (mismatched) throw std::runtime_error("Split sampler readback mismatch");
 }
