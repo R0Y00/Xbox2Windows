@@ -163,6 +163,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_accum_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
@@ -176,8 +177,10 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_alu_cmp_ne_check.py
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ./out/pe-env/bin/python -B tests/compute_alu_bcnt64_check.py
+./out/pe-env/bin/python -B tests/compute_load_format_check.py
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
+./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_c_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_alu_check.py

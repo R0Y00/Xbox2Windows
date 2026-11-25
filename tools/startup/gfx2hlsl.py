@@ -23,6 +23,11 @@ class Unsupported(Exception):
 
 PREFETCH = bytes.fromhex('0300a0bf')
 
+# DPP16 quad pair broadcasts (quad_perm of one lane of every horizontal or vertical pair into the other). The lanes of
+# a quad are the pixels 0 1 / 2 3, row by row; lane i reads lane quad_perm[i].
+DPP_PAIR = frozenset(((1, 1, 3, 3), (0, 0, 2, 2), (2, 3, 2, 3), (0, 1, 0, 1)))
+DPP_SCRATCH = 256
+
 # SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
 # selection is zero-extended, or sign-extended under sext(); a destination selection writes the low
 # bits of the result into that field, UNUSED_PAD zeroes the others and UNUSED_PRESERVE keeps them.
@@ -429,9 +434,13 @@ def smem_mods(mods):
 # Multiply, fused multiply-add (including the literal form), and reciprocal use only
 # local arithmetic. Move copies its input bits. None reads a lane ID or another lane.
 UNIFORM_VALU = frozenset((
-    'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_ubyte0', 'v_mul_f32',
+    'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_u32', 'v_cvt_f32_ubyte0', 'v_mul_f32',
     'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_mov_b32',
 ))
+
+
+# DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
+QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
 class Stage:
@@ -440,6 +449,7 @@ class Stage:
     # pixel: VGPR -> (attr, channel, high) of the v_interp_p1ll_f16 that wrote it. Created on first use, because
     # unit probes build a Stage without __init__.
     interp_p1 = None
+    needs_sm6 = False   # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -452,6 +462,7 @@ class Stage:
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
+        self.wqm_exec = False     # exec is proven whole-quad: an s_wqm of exec into itself ran while exec_known
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat' | 'f16'
@@ -708,6 +719,10 @@ class Stage:
                 self.blocks.append((start, self.lines, None))
                 self.lines, start = [], off
             self.pc = off
+            # Before the first branch target or terminator every path has run exactly the instructions above, so
+            # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
+            # branch-free program is past it too (dead code).
+            self.past_entry = bool(self.blocks) or 0 in targets
             try:
                 term = self.one(name, asm)
             except Unsupported as reason:
@@ -758,7 +773,7 @@ class Stage:
         dst = None
         # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
         if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
-                not getattr(self, 'has_branches', True) and getattr(self, 'exec_known', False) and
+                not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False) and
                 (not mods or (base in VEC_F or base in VEC_U_TO_F) and
                  all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
             candidate = reg_range(ops[0])
@@ -773,6 +788,52 @@ class Stage:
             self.uniform_v.add(dst)
         return term
 
+    def dpp_pair(self, base, asm, ops, mods):
+        """A DPP16 spelling whose SRC0 is a quad pair broadcast (#2125 item C).
+
+        RDNA 2 ISA section 12.19 (DPP16): lane i of a quad reads SRC0 of lane quad_perm[i] of the same quad. A pair
+        broadcast ([1,1,3,3], [0,0,2,2], [2,3,2,3], [0,1,0,1]) moves one lane of every horizontal or vertical pair
+        into the other and leaves the first lane alone. The word of each of the four lanes is read with the shader
+        model 6.0 QuadReadLaneAt (its lane argument must be a constant, so all four reads are unconditional) and this
+        lane keeps the one quad_perm names for its own position in the quad. That needs all four lanes of the quad to
+        run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and a
+        whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every
+        other control (other permutations, row_*, wave_*, a partial row or bank mask, fi, a vertex stage) is refused by
+        name, since the single lane cannot read a neighbour."""
+        perms = [m for m in mods if m.startswith('quad_perm:')]
+        rest = [m for m in mods if not m.startswith('quad_perm:')]
+        if len(perms) != 1:
+            raise Unsupported('%s_dpp with %s' % (base, ' '.join(mods)))
+        for m in rest:
+            if m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
+                raise Unsupported('%s_dpp with %s' % (base, m))
+        # With all four lanes active no source lane is disabled, so bound_ctrl has nothing to replace.
+        perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
+        if perm not in DPP_PAIR:
+            raise Unsupported('%s_dpp with %s' % (base, perms[0]))
+        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
+                not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
+            raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
+                              % (base, perms[0]))
+        if len(ops) < 2:
+            raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
+        # The permuted word goes to a scratch register (v256, beyond the 256 hardware registers), so a second source
+        # naming the same register, or a destination that is the source, still reads the right lane.
+        src = re.fullmatch(r'([-|]*)v(\d+)(\|?)', ops[1])
+        if not src:
+            raise Unsupported('%s_dpp source %s' % (base, ops[1]))
+        word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
+        self.needs_sm6 = True
+        self.used_v.add(DPP_SCRATCH)
+        self.uniform_v.discard(DPP_SCRATCH)
+        self.emit('{ uint x2w_q0 = QuadReadLaneAt(%s, 0), x2w_q1 = QuadReadLaneAt(%s, 1),'
+                  ' x2w_q2 = QuadReadLaneAt(%s, 2), x2w_q3 = QuadReadLaneAt(%s, 3);'
+                  ' uint x2w_lane = ((uint(i.pos.y) & 1u) << 1u) | (uint(i.pos.x) & 1u);'
+                  ' v%d = x2w_lane == 0u ? x2w_q%d : x2w_lane == 1u ? x2w_q%d : x2w_lane == 2u ? x2w_q%d : x2w_q%d; }'
+                  % ((word,) * 4 + (DPP_SCRATCH,) + perm))
+        ops = [ops[0], '%sv%d%s' % (src.group(1), DPP_SCRATCH, src.group(3))] + ops[2:]
+        return self.lower(base, asm, ops, [])
+
     def lower(self, base, asm, ops, mods):
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
@@ -785,6 +846,8 @@ class Stage:
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
         if base in ('s_wqm_b32', 's_wqm_b64'):
+            if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
+                self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -803,9 +866,13 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        if base.endswith('_dpp'):
+            return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
             return handler(ops, mods)
+        if base.endswith('_dpp'):
+            return self.dpp(base[:-len('_dpp')], ops, mods)
         if base.startswith('v_cmp'):
             # Before the VOP1/VOP2 SDWA route below: VOPC SDWA names also end in _sdwa.
             return self.compare(base, ops, mods)
@@ -845,6 +912,113 @@ class Stage:
             # the root signature layout, while the descriptor table is supplied at draw time.
             raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
+
+    # VOP1/VOP2 with DPP16 quad broadcast (#2125 item A): quad_perm:[k,k,k,k] makes every lane read SRC0 from
+    # lane k of its own quad (RDNA 2 ISA, "DPP": a lane reads lane (lane & ~3) | perm[lane & 3] of the row; LLVM 15
+    # AMDGPU DPP quad_perm). A pixel stage's four consecutive lanes are a 2x2 pixel quad (lane = x & 1 | (y & 1) << 1),
+    # which is what SM 6.0 QuadReadLaneAt(value, k) reads, so the stage is compiled as ps_6_0 (Stage.needs_sm6).
+    # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
+    # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
+    # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (pair
+    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, fi, and a vertex stage.
+    DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
+    DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
+
+    def dpp_broadcast(self, base, ops, mods):
+        fields, rest = {}, []
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key in ('quad_perm', 'row_mask', 'bank_mask', 'bound_ctrl') and value and key not in fields:
+                fields[key] = value
+            elif m in self.DPP_OUTPUT_MODS:
+                rest.append(m)
+            else:
+                raise Unsupported('%s_dpp with modifier %s' % (base, m))
+        lanes = re.fullmatch(r'\[([0-3]),([0-3]),([0-3]),([0-3])\]', fields.get('quad_perm', ''))
+        if not lanes or len(set(lanes.groups())) != 1:
+            raise Unsupported('%s_dpp %s: only quad_perm:[k,k,k,k] broadcasts are lowered'
+                              % (base, fields.get('quad_perm', 'without quad_perm')))
+        if fields.get('row_mask') != '0xf' or fields.get('bank_mask') != '0xf':
+            raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
+        if fields.get('bound_ctrl', '1') != '1':
+            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
+        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', [])
+                or not getattr(self, 'exec_known', False)):
+            raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        if not getattr(self, 'wqm_exec', False):
+            # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
+            # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
+            raise Unsupported('%s_dpp without s_wqm exec, exec proving whole-quad activity' % base)
+        if base != 'v_mov_b32' and base not in VEC_F and base not in VEC_U and base not in VEC_U_TO_F:
+            raise Unsupported('DPP form of %s' % base)
+        if len(ops) < 2:
+            raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
+        token = ops[1]
+        neg = token.startswith('-') and base in VEC_F
+        token = token[1:] if neg else token
+        absolute = token.startswith('|') and token.endswith('|') and base in VEC_F
+        token = token[1:-1] if absolute else token
+        source = reg_range(token)
+        if not source or source[0] != 'v' or source[1] != source[2]:
+            raise Unsupported('%s_dpp source %s is not a VGPR' % (base, ops[1]))
+        # Modifiers apply to the value the lane read, so they stay on the rewritten operand.
+        rewritten = 'v%d' % self.DPP_TEMP
+        rewritten = '|%s|' % rewritten if absolute else rewritten
+        rewritten = '-' + rewritten if neg else rewritten
+        self.needs_sm6 = True
+        self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
+        operands = [ops[0], rewritten] + ops[2:]
+        if base == 'v_mov_b32':
+            if rest or len(operands) != 2:
+                raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
+            return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
+        return self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+
+    # VOP1/VOP2 with a DPP16 quad_perm source (AMD RDNA 2 ISA, "Data-Parallel Primitives"): lane i of
+    # each aligned group of four reads src0 from lane quad_perm[i] of that group. The three exchanges
+    # map onto the SM 6.0 quad intrinsics, which read the other lane of the 2x2 pixel quad and keep
+    # helper lanes active. Only a pixel stage at entry EXEC qualifies, and only after `s_wqm exec, exec`
+    # proved whole-quad EXEC: the hardware can return 0 or the old value for a source lane whose EXEC bit
+    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Other permutations, DPP8, row shifts and partial masks stay refused.
+    def dpp(self, base, ops, mods):
+        if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
+            return self.dpp_broadcast(base, ops, mods)
+        perm = None
+        for m in mods:
+            match = re.fullmatch(r'quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\]', m)
+            if match and perm is None:
+                perm = tuple(int(x) for x in match.groups())
+            elif m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
+                raise Unsupported('%s_dpp with %s' % (base, m))
+        if perm in DPP_PAIR:
+            return self.dpp_pair(base, '%s %s' % (base, ', '.join(ops)), ops, mods)
+        intrinsic = QUAD_SWAPS.get(perm)
+        if not intrinsic:
+            raise Unsupported('%s_dpp quad_perm %s: only the swaps [1,0,3,2], [2,3,0,1] and [3,2,1,0] are lowered'
+                              % (base, perm))
+        if base == 'v_mov_b32':
+            arity, text, kind = 1, '{0}', 'u'
+        elif base in VEC_U:
+            (arity, text), kind = VEC_U[base], 'u'
+        elif base in VEC_F and base not in ('v_fmac_f32', 'v_mac_f32'):
+            (arity, text), kind = VEC_F[base], 'f'
+        else:
+            raise Unsupported('%s_dpp' % base)
+        if len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
+            raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
+        if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
+                or not getattr(self, 'exec_known', False)):
+            raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+        if not getattr(self, 'wqm_exec', False):
+            raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
+                              'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+        self.needs_sm6 = True
+        # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
+        swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
+        args = [('F(%s)' % swapped) if kind == 'f' else swapped] + \
+               [self.f(o) if kind == 'f' else self.u(o) for o in ops[2:1 + arity]]
+        expr = text.format(*args)
+        self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
@@ -914,10 +1088,14 @@ class Stage:
             srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
-        word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16')
+        # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
+        word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
         if shift_add or word_complement or word_pack:
-            # The per-lane mask cannot supply the full word needed by these operations.
-            if self.is_lane_mask(dname) or any(self.is_lane_mask(t) for t in srcs):
+            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
+            # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
+            mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
+                         else self.is_lane_mask(dname))
+            if mask_dest or any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
@@ -988,6 +1166,7 @@ class Stage:
                 copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
                     # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
+                    self.wqm_exec = False  # and the copy can be older than the WQM
                     if hasattr(self, 'uniform_v'):
                         self.uniform_v.clear()
                     return None
@@ -1074,6 +1253,56 @@ class Stage:
         self.masks.add(d)
 
     op_s_andn2_wrexec_b32 = op_s_andn2_wrexec_b64
+
+    def scalar_accumulate(self, base, ops, mods):
+        """s_addk_i32 / s_mulk_i32: D = D op signext(SIMM16), the destination is also the source.
+
+        RDNA 2 ISA 12.2 (SOPK 15, 16): addk sets SCC to the signed overflow of the sum, mulk leaves SCC
+        alone. LLVM 15 SOPInstructions.td declares Defs = [SCC] for both, so after mulk the SCC proof is
+        dropped (the emitted scc keeps its value, which is the ISA meaning).
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        if not re.fullmatch(r'0x[0-9a-f]{1,4}', ops[1]):
+            raise Unsupported('%s immediate %s' % (base, ops[1]))
+        d = dst[1]
+        # D is read before it is written: refuse a mask or descriptor source while the old state is intact.
+        if d in self.masks or self.sym.get(d, ('',))[0] == 'execcopy':
+            raise Unsupported('%s on a lane mask' % base)
+        sym = self.sym.get(d)
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('%s on %s data' % (base, sym[0]))
+        simm = int(ops[1], 16)
+        imm = (simm - 0x10000 if simm & 0x8000 else simm) & 0xffffffff
+        imm_text = '0x%08xu' % imm
+        old = self.S(d)
+        add = base == 's_addk_i32'
+        result = '%s %s %s' % (old, '+' if add else '*', imm_text)
+        if add:
+            # signed overflow: the operands share a sign that the sum does not keep
+            overflow = '((%s ^ (%s)) & ~(%s ^ %s) & 0x80000000u) != 0u' % (old, result, old, imm_text)
+            if sym and sym[0] == 'const':
+                total = (sym[1] + imm) & 0xffffffff
+                overflow = 'true' if ((sym[1] ^ total) & ~(sym[1] ^ imm) & 0x80000000) else 'false'
+            self.set_scc(overflow)
+        elif self.tracks_uniformity():
+            self.scc_uniform = False
+        if sym and sym[0] == 'const':
+            value = (sym[1] + imm if add else sym[1] * imm) & 0xffffffff
+            self.set_s(d, '0x%08xu' % value, ('const', value))
+        else:
+            self.set_s(d, result)
+        self.masks.discard(d)
+        return None
+
+    def op_s_addk_i32(self, ops, mods):
+        return self.scalar_accumulate('s_addk_i32', ops, mods)
+
+    def op_s_mulk_i32(self, ops, mods):
+        return self.scalar_accumulate('s_mulk_i32', ops, mods)
 
     def op_s_cselect_b32(self, ops, mods):
         self.scalar_select(ops, False)
@@ -1638,7 +1867,7 @@ class Stage:
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or not self.tracks_uniformity() or getattr(self, 'has_branches', True) or
+        if (mods or not self.tracks_uniformity() or getattr(self, 'past_entry', True) or
                 not getattr(self, 'exec_known', False) or not dst or dst[0] != 's' or dst[1] != dst[2] or
                 not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
@@ -2299,8 +2528,10 @@ SCA = {
     's_add_i32': ('{0} + {1}', None), 's_add_u32': ('{0} + {1}', None), 's_sub_i32': ('{0} - {1}', None), 's_sub_u32': ('{0} - {1}', None),
     's_mul_i32': ('{0} * {1}', None), 's_min_u32': ('min({0}, {1})', None), 's_max_u32': ('max({0}, {1})', None),
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
-    's_bfe_u32': ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)', '$ != 0'),
+    's_bfe_u32': ('({0} >> ({1} & 31)) & ((({1} >> 16) & 127) >= 32 ? 0xffffffffu : ((1u << (({1} >> 16) & 31)) - 1))', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
+    # s_mul_hi_u32: high 32 bits of the unsigned 64-bit product; SCC unchanged.
+    's_mul_hi_u32': ('mul_hi_u32({0}, {1})', None),
     # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
     's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
     's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
@@ -2493,6 +2724,10 @@ class Pipeline:
                '    return ftz32(sum);',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # High half of an unsigned 32x32 product, by halfword products so it fits 32-bit HLSL.
+               'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
+               ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
+               ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'
@@ -2581,6 +2816,10 @@ class Pipeline:
         out += ['    o.pos = p.pos + r.pos - q.pos;', '    return o;', '}']
         return '\n'.join(out) + '\n'
 
+    def ps_profile(self):
+        """The shader profile the pixel stage compiles with: ps_6_0 once it holds a quad read, else ps_5_1."""
+        return 'ps_6_0' if self.ps.needs_sm6 else 'ps_5_1'
+
     def hlsl_ps(self):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
@@ -2667,6 +2906,27 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
+def find_dxc():
+    """The dxc.exe for a pixel stage that needs shader model 6.0, or None. Order: X2W_DXC, the newest
+    KITS_BIN/<version>/x64, then PATH."""
+    configured = os.environ.get('X2W_DXC')
+    if configured and os.path.isfile(configured):
+        return configured
+    versions = []
+    try:
+        for entry in os.listdir(KITS_BIN):
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', entry):
+                versions.append((tuple(map(int, entry.split('.'))), entry))
+    except OSError:
+        pass
+    for _, entry in sorted(versions, reverse=True):
+        candidate = os.path.join(KITS_BIN, entry, 'x64', 'dxc.exe')
+        if os.path.isfile(candidate):
+            return candidate
+    import shutil
+    return shutil.which('dxc.exe') or shutil.which('dxc')
+
+
 def has_bytecode(path):
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
@@ -2698,14 +2958,28 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         return message
     manifest_path = name + '.txt'
     write_manifest = True
+    # A quad intrinsic exists from shader model 6.0 only, and a pipeline does not mix DXBC and DXIL stages.
+    sm6 = any(getattr(getattr(pipe, stage, None), 'needs_sm6', False) for stage in ('vs', 'ps'))
+    if fxc and sm6:
+        compiler = find_dxc()
+        if compiler is None:
+            message = 'dxc not found (X2W_DXC=%s): a DPP quad read needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            open(name + '.fail', 'w').write(message + '\n')
+            return message
+        profiles = (('vs', 'vs_6_0'), ('ps', 'ps_6_0'))
+    else:
+        compiler, profiles = fxc, (('vs', 'vs_5_1'), ('ps', 'ps_5_1'))
     if fxc:
         import subprocess
         # An existing manifest can already point at these paths. Publish only bytecode from a successful pair.
         with tempfile.TemporaryDirectory(prefix='.fxc-', dir=out_dir) as staging:
-            for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
+            for stage, profile in profiles:
                 bytecode = os.path.join(staging, stage + '.cso')
-                r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage],
-                                   capture_output=True, text=True)
+                if sm6:
+                    command = [compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.%s.hlsl' % stage]
+                else:
+                    command = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage]
+                r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
                     open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))
