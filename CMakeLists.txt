@@ -358,6 +358,14 @@ add_test(NAME xgameruntime_async_status COMMAND xgameruntime_async_status_check
     "$<TARGET_FILE_DIR:xmem_shim>")
 set_tests_properties(xgameruntime_async_status PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
 
+add_executable(xgameruntime_user_async_check tests/xgameruntime_user_async_check.cpp)
+add_dependencies(xgameruntime_user_async_check xgameruntime_shim)
+target_compile_features(xgameruntime_user_async_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_user_async COMMAND xgameruntime_user_async_check
+    "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+    "$<TARGET_FILE_DIR:xmem_shim>")
+set_tests_properties(xgameruntime_user_async PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
+
 add_executable(xgameruntime_pls_xpackage_check tests/xgameruntime_pls_xpackage_check.cpp)
 add_dependencies(xgameruntime_pls_xpackage_check xgameruntime_shim)
 target_compile_features(xgameruntime_pls_xpackage_check PRIVATE cxx_std_17)

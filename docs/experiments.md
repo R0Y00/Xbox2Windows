@@ -11142,9 +11142,8 @@ does not write into any newly created container such as `slot-b`. The contract
 test covers both controls plus independent `slot-a`/`slot-b` names on one
 provider.
 
-`XUserAddAsync` remains an explicit stub. Its completion contract needs the public
-`XAsyncBlock` and `XUserAddResult` semantics, which this repository does not model
-without GDK headers. `XGameSaveInitializeProviderAsync` is implemented; see below.
+`XUserAddAsync` was first an explicit stub; it and `XUserAddResult` are now implemented
+on the manual task queue (see below), as is `XGameSaveInitializeProviderAsync`.
 
 The same fixture adds the smallest documented synchronous persistent local
 storage and package subset. `XPersistentLocalStorageGetPathSize`,
@@ -11165,9 +11164,8 @@ than the reported size and
 handle. `XPackageGetMountPathSize` and `XPackageGetMountPath` report that path,
 and `XPackageCloseMountHandle` invalidates the handle; later path queries return
 `E_HANDLE`. The mapping is shim-only and does not read or verify a real package
-manifest. `XPackageMountWithUiAsync` remains an explicit stub, as do
-`XUserAddAsync`, because the
-`XAsyncBlock` completion contract is not modeled without GDK headers.
+manifest. `XPackageMountWithUiAsync` remains an explicit stub because its
+completion contract is not modeled.
 
 The same fixture adds the synchronous XSystem and XGame identity subset.
 `XSystemGetConsoleId` reports the fixed 38-character console ID
@@ -11195,18 +11193,17 @@ device type.
 `xgameruntime_pls_xpackage` calls every implemented PLS and XPackage function,
 checks repeated path and space values, writes and removes a PLS marker, verifies
 the package mount directory, checks the unmounted `E_HANDLE` status, and asserts
-that no implemented call logged `E_NOTIMPL`. Its negative controls are
-`XPackageMountWithUiAsync` and `XUserAddAsync`, which must both log
-`E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
+that no implemented call logged `E_NOTIMPL`. Its negative control is
+`XPackageMountWithUiAsync`, which must log `E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
 checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls the
 `XPackageMountWithUiAsync` stub as a negative control. `xgameruntime_identity`
 calls `XSystemGetConsoleId`, `XSystemGetDeviceType`, and `XGameGetXboxTitleId`,
 repeats each call for stability, checks the short-buffer and null-pointer errors,
-and asserts that `XUserAddAsync` still logs `E_NOTIMPL`. The DLL remains under
+and asserts that `XUserAddAsync(None)` (the unsupported picker option) still logs `E_NOTIMPL`. The DLL remains under
 `out/build/dev/fixture-shims/` and is loaded by explicit path. The exact CTest
 names are `xgameruntime_thunks`, `xgameruntime_contracts`,
-`xgameruntime_pls_xpackage`, `xgameruntime_identity`, and
-`xgameruntime_gamesave_async`.
+`xgameruntime_pls_xpackage`, `xgameruntime_identity`,
+`xgameruntime_gamesave_async`, and `xgameruntime_user_async`.
 
 `XGameSaveInitializeProviderAsync` and `XGameSaveInitializeProviderResult` are
 implemented on top of the synchronous provider path. Argument errors (null
@@ -11229,11 +11226,21 @@ queue open for the caller to close after delivery.
 completion, expiration or successful queue closure. The work port has no work
 items in this profile. The
 shim keeps its state in a side table keyed by the block address and reads only
-the leading queue, context and callback fields. `XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.
+the leading queue, context and callback fields. `XPackageMountWithUiAsync` remains an `E_NOTIMPL` stub.
+`XUserAddAsync` and `XUserAddResult` (part of #870, #1334; on #2170 and #2179)
+use the same manual-queue contract for the one synthetic user. Only
+`AddDefaultUserSilently` or `AddDefaultUserAllowingUI` alone are accepted. Any
+other option value (including `None` and `AllowGuests`), a null queue or a queue
+the shim did not make is refused with `E_NOTIMPL` before the block or capacity
+is touched. The callback fires once on `XTaskQueueDispatch`; `XUserAddResult`
+returns `E_PENDING` until then without consuming anything, then `S_OK` with one
+handle for `XUserCloseHandle`, once. An untracked block, a second claim or a
+game-save block gets `E_INVALIDARG`. A start that finds no free user handle
+fails with `E_OUTOFMEMORY` and frees its block.
 `XAsyncGetStatus` and `XAsyncGetResultSize` answer for tracked blocks only.
 Operation completion and callback dispatch stay separate: once the provider work
 has finished, both queries report the stored status (and a result size of one
-provider handle) even while the completion callback still waits for
+provider or user handle) even while the completion callback still waits for
 `XTaskQueueDispatch`, matching the installed runtime. A block whose work is
 still in flight reports `E_PENDING`; a waiting status sleeps until that work
 completes or the start fails (then `E_INVALIDARG`). A null, untracked or
@@ -11241,12 +11248,15 @@ already consumed block returns `E_INVALIDARG`. `xgameruntime_async_status` cover
 this against the manual queue of #2179 and the completion-port contract of #2170,
 including Begin, query status and size before the first dispatch, then dispatch
 exactly once.
+`xgameruntime_user_async` covers the user-add path, including the close guard and
+user-table exhaustion, and that `XAsyncGetStatus` and `XAsyncGetResultSize` report
+`S_OK` and one user handle size right after completion, before the callback pump.
 `xgameruntime_gamesave_async` covers the positive completion, the callback and
 in-callback claim, the error paths, reuse, provider exhaustion, early result
 retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check xgameruntime_user_async_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
