@@ -509,6 +509,90 @@ def check_uniform_valu():
     check('UNIFORM_VALU refuses v_readfirstlane_b32 when exec is unknown', ok, detail)
 
 
+def check_dpp_broadcast():
+    """The generic DPP16 `quad_perm:[k,k,k,k]` broadcast path accepts this VOP1 op, and only where it is sound.
+
+    The merge base refused every `v_cvt_off_f32_i4` form because the op was not lowered at all, so it also
+    refused the DPP form. The op is now in `VEC_U_TO_F`, and `Stage.dpp_broadcast` is op-agnostic: it proves
+    whole-quad activity, reads the named lane of the quad with `QuadReadLaneAt`, and then lowers the base
+    operation on that value (for a unary op the broadcast happens before the conversion, which is the ISA
+    order). Accepting the broadcast is therefore intended rather than incidental, and the rows below pin the
+    acceptance, the lane it reads, the shader-model bump, and the four refusals that keep the rest out.
+    """
+    def probe(**state):
+        stage = G.Stage.__new__(G.Stage)
+        stage.kind = 'ps'
+        stage.lines, stage.sym = [], {}
+        stage.used_s, stage.used_v, stage.uniform_v = set(), set(), set()
+        stage.varying_s = set()
+        stage.scc_uniform = True
+        stage.uniform_expr = {}
+        stage.past_entry = False
+        stage.has_branches = False
+        stage.exec_known = True
+        stage.masks = set()
+        stage.exports = {}
+        stage.low16_only_v = set()
+        stage.pinned_low16_v = set()
+        stage.whole_read_v = set()
+        stage.byte_float_v = set()
+        stage.bad_sgprs = set()
+        stage.defined_uniform_s = None
+        stage.since_join = None
+        stage.wqm_exec = True
+        stage.needs_sm6 = False
+        stage.pipe = type('Pipe', (), {'resources': {}, 'notes': set(), 'modified': set(),
+                                       'sampler_heap': False})()
+        for key, value in state.items():
+            setattr(stage, key, value)
+        return stage
+
+    def translate(asm, **state):
+        stage = probe(**state)
+        try:
+            stage.one(asm.split(' ', 1)[0], asm)
+        except G.Unsupported as error:
+            return None, str(error)
+        return stage, None
+
+    accepted = 'v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf'
+    stage, reason = translate(accepted)
+    check('dpp_broadcast accepts quad_perm:[2,2,2,2] for v_cvt_off_f32_i4',
+          stage is not None, str(reason))
+    check('dpp_broadcast reads lane 2 of the quad with QuadReadLaneAt',
+          stage is not None and any('QuadReadLaneAt(v1, 2u)' in line for line in stage.lines),
+          str(stage and stage.lines))
+    check('dpp_broadcast lowers the conversion on the broadcast value (nibble sign-extend x 1/16)',
+          stage is not None and any('int(v256 << 28) >> 28' in line and '0.0625' in line
+                                    for line in stage.lines),
+          str(stage and stage.lines))
+    check('dpp_broadcast requires shader model 6 for QuadReadLaneAt',
+          stage is not None and stage.needs_sm6 is True)
+    # The same broadcast at a different lane, to prove the lane is not hard-coded.
+    lane3, reason = translate('v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf')
+    check('dpp_broadcast reads the lane quad_perm names, not a fixed one',
+          lane3 is not None and any('QuadReadLaneAt(v1, 3u)' in line for line in lane3.lines),
+          str(reason) or str(lane3 and lane3.lines))
+    for label, asm, state, message in (
+        ('a non-broadcast quad_perm', 'v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf',
+         {}, ''),
+        ('a mixed quad_perm', 'v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[2,2,2,3] row_mask:0xf bank_mask:0xf',
+         {}, 'only the swaps'),
+        ('a partial row_mask', 'v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[2,2,2,2] row_mask:0x7 bank_mask:0xf',
+         {}, 'partial row_mask'),
+        ('bound_ctrl:0', 'v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf bound_ctrl:0',
+         {}, 'bound_ctrl'),
+        ('an entry mask not proven whole-quad',
+         'v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf', {'wqm_exec': False},
+         'whole-quad'),
+        ('a vertex stage', 'v_cvt_off_f32_i4_dpp v2, v1 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf',
+         {'kind': 'vs'}, 'straight-line pixel stage'),
+    ):
+        refused, detail = translate(asm, **state)
+        check('dpp_broadcast refuses %s' % label,
+              refused is None and message in (detail or ''), str(detail))
+
+
 def check_refusals_and_unlowered():
     # Refusals: abs, neg, op_sel, SDWA (all decoded from synthetic gfx1013 bytes via G.decode())
     byte_refusals = (
@@ -553,6 +637,7 @@ def controls():
     check_decode_and_lowering()
     check_low16_provenance()
     check_uniform_valu()
+    check_dpp_broadcast()
     check_refusals_and_unlowered()
     if failures:
         print('FAILED:', ', '.join(failures))
