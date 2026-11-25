@@ -163,6 +163,7 @@ def controls():
         for chunk in chunks(op):
             text = translate(op, chunk).hlsl_ps()
             check('%s: the pixel stage translates and rounds to binary16' % op, 'f32tof16' in text)
+    # Deliberate deviation from the guide formula (it gives 1.0 here); this asserts the lowering choice, not hardware.
     check('fract stops below one', expected_word('v_fract_f16', GARBAGE | bits(-0.0001)) == MARK | bits(FRACT_MAX))
 
 
