@@ -5288,6 +5288,8 @@ A load on a live view whose element does not exist **reads zero** and stays vali
 - the element would leave the `BUFFER_BYTES` of t0. The bound is derived from the buffer length and the stride (`index <= (BUFFER_BYTES - base) / stride`), so it holds for any index a dispatch can reach and the product `index * stride` cannot wrap.
 
 Refused: `d16_` forms, `offen`, gfx1030, `--source-stride` and `--source-format` with this flag.
+Raw indexed reads require a proven static source stride; a preceding
+formatted heap-view read does not supply one.
 
 What is not done here: the records live in the t0 buffer, as a side table; binding them as their own resource and reaching the desktop view through `ResourceDescriptorHeap[index]` (SM 6.6) needs a heap-indexed root signature and is still open. This is not application coverage until a real dispatch uses it.
 

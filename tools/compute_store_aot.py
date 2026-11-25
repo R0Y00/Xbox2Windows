@@ -2108,15 +2108,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                   and 2 <= tag[2] < 32):
                 # A shift below 2 gives unaligned byte offsets, which ByteAddressBuffer.Load cannot express.
                 addresses = [f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"]
-            elif (idxen and not offen and (source_stride is not None or heap_view is not None)
+            elif (idxen and not offen and isinstance(tag, tuple) and tag[0] == "thread"
+                  and heap_view is not None and descriptor_load is not None):
+                # Only the formatted heap-view helper obtains a runtime stride and bounds the read.
+                aligned = offset & ~3
+            elif (idxen and not offen and source_stride is not None
                   and isinstance(tag, tuple) and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
                 # A formatted load selects a prefix of a complete four-component texel.
                 # A descriptor-format load uses at most four bytes per channel of the opcode.
                 read_bytes = (4 * components if descriptor_load is not None
                               else source_texel_bytes if resource_channels else width * count)
-                # A heap view's stride is a run time value; the shader's range check covers it.
-                if heap_view is None and offset + read_bytes > source_stride:
+                if offset + read_bytes > source_stride:
                     raise ValueError("Read leaves its source element")
                 aligned = offset & ~3
                 addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]

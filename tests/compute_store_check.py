@@ -1072,6 +1072,33 @@ def read_controls():
             ("s_or_b32 exec_lo", "v_mov_b32_e32 v1, 5\ns_or_b32 exec_lo"),
             ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)
 
+    # A heap view provides a runtime stride only to formatted loads.
+    formatted = "buffer_load_format_x v10, v8, s[40:43], 0 idxen"
+    raw = "buffer_load_dword v10, v8, s[40:43], 0 idxen"
+    heap_lines = [
+        "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+        "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+        "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+        "s_load_dwordx4 s[40:43], s[12:13], 0x50",
+        "v_lshl_add_u32 v8, s11, 2, v0",
+        "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dwordx4 s[24:27], s[16:19], null",
+        "s_waitcnt lgkmcnt(0)",
+        formatted, "s_waitcnt vmcnt(0)",
+        "buffer_store_dword v10, v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+    heap_binding = dict(table_reg=7, descriptor_offset=0x30, constant_descriptor=0x40,
+                        source_descriptor=0x50, group_reg=11, stride=4, cpu="gfx1013",
+                        heap_view=(0, 64, 1, 128))
+    source = aot.lower(heap_lines, 4, **heap_binding)
+    assert "uint4 format_load_0 = load_heap_view_format(" in source and "Noneu" not in source
+    rejects("Unsupported read address", aot.lower,
+            variant(heap_lines, (formatted, formatted + "\ns_waitcnt vmcnt(0)\n" + raw)),
+            4, **heap_binding)
+    source = aot.lower(variant(heap_lines, (formatted, raw)), 4,
+                       **(heap_binding | dict(heap_view=None, source_stride=16)))
+    assert "inputData.Load(tid.x * 16u + 0u)" in source
+
 
 def alu_controls():
     """Read-compute-write: exact output, then one rejection per instruction or operand outside the subset."""
