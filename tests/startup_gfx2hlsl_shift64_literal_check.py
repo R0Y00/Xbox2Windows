@@ -3,12 +3,14 @@
 A literal fills the low word. The high word is zero for the unsigned shifts and copies bit 31 for the signed
 shift (the same rule the scalar 64-bit operations use). Pure Python; run with no arguments.
 """
+import struct
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
+import startup_gfx2hlsl_scalar_m0_check as M  # noqa: E402
 from startup_gfx2hlsl_bit_alu_check import Probe, check, refused  # noqa: E402
 
 # (operation, helper, literal, expected low word, expected high word)
@@ -28,7 +30,17 @@ def lowered(op, literal):
     return probe.lines
 
 
+def scalar_lowered(opcode):
+    """s_<op> s[20:21], 0xffffffff, s9 as encoded (SOP2, source 255 plus a literal dword)."""
+    stage = M.run_seq(M.encode_sop2(opcode, 20, 255, 9) + struct.pack('<I', 0xffffffff))
+    return [line for line in stage.lines if 'shr64' in line]
+
+
 def main():
+    check('s_ashr_i64 literal 0xffffffff is sign-extended',
+          scalar_lowered(0x23)[0].startswith('{ uint2 t = shr64i(4294967295u, 4294967295u, s9);'))
+    check('s_lshr_b64 literal 0xffffffff is zero-extended',
+          scalar_lowered(0x21)[0].startswith('{ uint2 t = shr64u(4294967295u, 0u, s9);'))
     for op, helper, literal, low, high in CASES:
         want = ['{ uint2 t = %s(%s, %s, v2); v0 = t.x; v1 = t.y; }' % (helper, low, high)]
         check('%s with literal %s' % (op, literal), lowered(op, literal) == want)

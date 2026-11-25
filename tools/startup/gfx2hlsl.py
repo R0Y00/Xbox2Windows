@@ -3752,7 +3752,7 @@ class Stage:
             r0 = reg_range(ops[1])
             if r0 and r0[0] != 's':
                 raise Unsupported('%s source %s' % (name, ops[1]))
-            low, high = self.i64_words(ops[1])
+            low, high = self.i64_words(ops[1], helper == 'shr64i')
             known = [self.scalar_const('s%d' % r0[1]), self.scalar_const('s%d' % r0[2])] if r0 else [
                 int(low[:-1]), int(high[:-1])]
         else:
