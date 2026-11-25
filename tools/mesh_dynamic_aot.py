@@ -11,7 +11,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
-from mesh_entry_aot import U32, Wave, decode_mesh, float4
+from mesh_entry_aot import U32, UNDEF, Wave, decode_mesh, float4
 
 
 MAX_VARIANTS = 32
@@ -56,8 +56,8 @@ class RuntimeWave(Wave):
     def lane_spill(self, op, args):
         raise ValueError(f"Unsupported runtime mesh instruction {op}")
 
-    def scalar(self, token):
-        value = super().scalar(token)
+    def scalar(self, token, allow_undef=False):
+        value = super().scalar(token, allow_undef)
         if isinstance(value, RuntimeWord):
             raise ValueError(f"Unproven runtime geometry word {value.index} in {token}")
         return value
@@ -70,7 +70,9 @@ class RuntimeWave(Wave):
 
     def scalar_op(self, op, args):
         if op == "s_cmp_eq_u32":
-            left, right = map(super().scalar, args)
+            left, right = (super(RuntimeWave, self).scalar(t, True) for t in args)
+            if left is UNDEF or right is UNDEF:
+                return super().scalar_op(op, args)
             if isinstance(right, RuntimeWord):
                 left, right = right, left
             if isinstance(left, RuntimeWord) and type(right) is int:
@@ -85,7 +87,8 @@ class RuntimeWave(Wave):
         if op not in ("v_cndmask_b32_e32", "v_cndmask_b32_e64"):
             return super().vector_op(op, args, expressions)
         dest, low, high, predicate = args
-        mask = self.scalar(predicate)
+        # No live lane reads the mask, so an undefined one is not an error.
+        mask = self.scalar(predicate) if self.exec else 0
         concrete_model = super()
         for lane in range(64):
             if not self.exec & (1 << lane):

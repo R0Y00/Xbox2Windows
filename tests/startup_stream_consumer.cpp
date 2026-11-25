@@ -248,8 +248,11 @@ int main(int argc, char** argv)
         bc7 = {argv[6], static_cast<UINT>(std::strtoul(argv[7], nullptr, 10)),
                static_cast<UINT>(std::strtoul(argv[8], nullptr, 10)),
                std::strcmp(argv[9], "tiled") == 0};
-        if ((bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
+        bc7.small4k = std::strcmp(argv[9], "small4k") == 0;
+        if (bc7.small4k ? bc7.width != 32 || bc7.height != 32
+                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
         if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
+        else if (bc7.small4k) {}
         else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
     ComPtr<IDXGIAdapter> adapter;

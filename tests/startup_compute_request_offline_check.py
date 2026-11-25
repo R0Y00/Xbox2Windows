@@ -4,7 +4,7 @@
   each part preceded by its u64 length, in the order code, data, root, desc, state A, state B) and a literal.
 - A cache directory with one synthetic request (req_<key>.{desc,sa,sb,data,root,c67}) is found by
   request_keys(compute=True) and pending_keys, but not by the graphics request_keys; gfx2hlsl.py --pending
-  records "compute stage not supported" in <key>.fail and writes no manifest; --refusals --json reports it in
+  records the compute stage's refusal of its 24-byte state block A in <key>.fail and writes no manifest; --refusals --json reports it in
   the compute section only.
 """
 import json
@@ -18,6 +18,7 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools' / 'startup'))
 import gfx2hlsl as G  # noqa: E402
 
+REASON = 'compute state block A is 24 bytes, not 28'  # the compute stage refuses the synthetic block
 CODE = struct.pack('<2I', 0x7e020280, 0xbf810000)
 DATA = struct.pack('<2Q', 0xfedcba9876543210, 0xffff00001111008c)
 ROOT = b'RTS0 synthetic root'
@@ -51,14 +52,14 @@ def main():
         assert G.pending_keys(str(cache), skip_failed=False) == [key]
         out = subprocess.run([sys.executable, '-B', G.__file__, '--pending', str(cache)], check=True,
                              capture_output=True, text=True, env=dict(os.environ, X2W_TRANSLATE_JOBS='1')).stdout
-        assert out == '%016x: unsupported: compute stage not supported\n' % key, out
-        assert (cache / ('%016x.fail' % key)).read_text() == 'compute stage not supported\n'
+        assert out == '%016x: unsupported: %s\n' % (key, REASON), out
+        assert (cache / ('%016x.fail' % key)).read_text() == REASON + '\n'
         assert not (cache / ('%016x.txt' % key)).exists()
         report = json.loads(subprocess.run([sys.executable, '-B', G.__file__, '--refusals', str(cache), '--json'],
                                            check=True, capture_output=True, text=True).stdout)
         assert report['per_request']['examined'] == 0, report['per_request']
         assert report['compute'] == dict(examined=1, no_refusal=0, reasons=[
-            dict(reason='compute stage not supported', containing=1, first=1)]), report['compute']
+            dict(reason=REASON, containing=1, first=1)]), report['compute']
     print('compute request offline: key vector, request_keys/pending_keys, --pending record and --refusals '
           'compute section pass')
 

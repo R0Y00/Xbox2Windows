@@ -4,7 +4,7 @@
   binary <llvm-mc>                     reassemble the fixture sources and compare them with the words below
   compile <dxc>                        compile the translated pair with DXC vs_6_0 / ps_6_0 (no rendering)
   draw <dxc> <offscreen_check> <warp|hardware>
-                                       draw one pixel and compare the four result words (Windows, D3D12)
+                                       draw the compr pair and the plain-export pair (both halves) and compare the four result words (Windows, D3D12)
 
 Semantics (LLVM 15 AMDGPU, VOP3Instructions.td and IntrinsicsAMDGPU.td; Mesa aco emit_interp_instr):
   v_interp_p1ll_f16 vdst, vI, attrN.c [high]   vdst(f32) = P0 + I * P10 of the binary16 half `high` of channel c
@@ -21,6 +21,14 @@ interpreter of exactly the statements the fixture produces. Negative controls: t
 refused), the high bit inverted on both instructions (the evaluated words differ from the reference), and every
 modifier or form the fixture does not cover (refused),
 including every op_sel bit (ACO's v_interp_p2_hi_f16 writes the high half of the destination).
+
+Plain export (follow-up of #2052): real programs pack the binary16 halves into a plain 32-bit export, e.g. with
+v_cvt_pkrtz_f16_f32, and read all four channels. Half h of 32-bit channel c is f16tof32(word_c >> 16 * h) (the low
+16 bits for h = 0), which is not the compr mapping (attrN.x = (param.x, param.y) of a compr export). The fixture packs
+eight binary16 values into four words (`exp param0 v6, v7, v8, v9`), two pixel stages read the low and the high halves
+of channels x..w. Controls: the compr fixture with its export flipped to plain reads other words than the compr
+reference, the high bit inverted on the plain fixture reads the other halves, an attribute exported both ways and a
+read of a channel exported as `off` are refused.
 
 The binary mode compares with llvm-mc after clearing the unused src2 field of v_interp_p1ll_f16: LLVM 15 encodes it
 as 0, newer llvm-mc encodes the inline constant 0 (128), and the words below are the LLVM 15 ones.
@@ -111,6 +119,40 @@ PS_VARIANTS = {name: bytes.fromhex(h) for name, h in (
     ('unrelated read of v2', '0203fcbe0203107e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('unrelated write of v9', '0203fcbef202127e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
 )}
+# Plain-export fixture: the vertex stage packs 8 binary16 values with v_cvt_pkrtz_f16_f32 (inputs are the f32 values
+# below) and exports the four words without compr; PLAIN_PS_LO / PLAIN_PS_HI read half 0 / half 1 of channels x..w.
+PLAIN_VALUES = ((1.5, -2.0), (0.5, 3.0), (4.0, -0.25), (8.0, 0.125))  # (low, high) half of each word
+_VS_HEAD = VS_SOURCE.split('v_mov_b32 v6')[0]
+_VS_PACK = ''.join('v_mov_b32 v%d, 0x%08x\n' % (11 + i, c) for i, c in enumerate(
+    (0x3fc00000, 0xc0000000, 0x3f000000, 0x40400000, 0x40800000, 0xbe800000, 0x41000000, 0x3e000000))) + ''.join(
+    'v_cvt_pkrtz_f16_f32 v%d, v%d, v%d\n' % (6 + i, 11 + 2 * i, 12 + 2 * i) for i in range(4))
+
+
+def plain_vs_source(exports):
+    return _VS_HEAD + _VS_PACK + 'exp pos0 v1, v2, v5, v4 done\n' + exports + 's_endpgm\n'
+
+
+def plain_ps_source(high):
+    body = ''.join('v_interp_p1ll_f16 v%d, v0, attr0.%s%s\nv_interp_p2_f16 v%d, v1, attr0.%s, v%d%s\n'
+                   % (r, c, high, r, c, r, high) for r, c in zip((4, 5, 6, 7), 'xyzw'))
+    return ('s_mov_b32 m0, s2\n' + body + ''.join('v_cvt_f32_f16 v%d, v%d\n' % (r, r) for r in (4, 5, 6, 7))
+            + 'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n')
+
+
+PLAIN_VS_SOURCES = {
+    'plain': 'exp param0 v6, v7, v8, v9\n',
+    'off': 'exp param0 v6, v7, v8, off\n',
+    'mixed': 'exp param0 v6, v6, v7, v7 compr\nexp param0 v6, v7, v8, v9\n',
+}
+PLAIN_VS = {name: bytes.fromhex(h) for name, h in (
+    ('plain', 'ff02067e00004040ff02147e000040c08100847df30602028200847df2140402f202087e80020a7eff02167e0000c03ff502187ef0021a7eff021c7e00004040f6021e7eff02207e000080beff02227e00000041ff02247e0000003e0b190c5e0d1d0e5e0f21105e1125125ecf0800f8010205040f0200f806070809000081bf'),
+    ('off', 'ff02067e00004040ff02147e000040c08100847df30602028200847df2140402f202087e80020a7eff02167e0000c03ff502187ef0021a7eff021c7e00004040f6021e7eff02207e000080beff02227e00000041ff02247e0000003e0b190c5e0d1d0e5e0f21105e1125125ecf0800f801020504070200f806070800000081bf'),
+    ('mixed', 'ff02067e00004040ff02147e000040c08100847df30602028200847df2140402f202087e80020a7eff02167e0000c03ff502187ef0021a7eff021c7e00004040f6021e7eff02207e000080beff02227e00000041ff02247e0000003e0b190c5e0d1d0e5e0f21105e1125125ecf0800f8010205040f0600f8060700000f0200f806070809000081bf'),
+)}
+PLAIN_PS = {name: bytes.fromhex(h) for name, h in (
+    ('lo', '0203fcbe040042d70000020004005ad700021204050042d74000020005005ad740021604060042d78000020006005ad780021a04070042d7c000020007005ad7c0021e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('hi', '0203fcbe040042d70001020004005ad700031204050042d74001020005005ad740031604060042d78001020006005ad780031a04070042d7c001020007005ad7c0031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+)}
 P1LL_SRC2_MASK = 0x07fc0000  # w1 bits 26:18, the unused third source
 
 # The reference, from the ISA layout: two binary16 values per dword of the compr export.
@@ -141,24 +183,41 @@ def f16_to_f32_bits(h):
     return f32_bits(struct.unpack('<e', struct.pack('<H', h))[0])
 
 
-def evaluate(vs, ps, channels=None):
+PLAIN_WORDS = tuple(f16_bits(lo) | f16_bits(hi) << 16 for lo, hi in PLAIN_VALUES)  # v6..v9 of the plain fixture
+
+
+def plain_reference(half):
+    """The four words of a plain-fixture pixel stage: half `half` of channels x..w, as f32 (from the ISA layout)."""
+    return tuple(f16_to_f32_bits(word >> (16 * half) & 0xffff) for word in PLAIN_WORDS)
+
+
+def evaluate(vs, ps, channels=None, regs=None):
     """Evaluate the translated text: the vertex compr export, then the pixel conversions. Only the statements
     the fixture produces are understood; anything else fails the check. `channels` replaces the vertex export with
     four interpolated f32 words (what the rasterizer hands the pixel stage)."""
+    regs = {'v6': EXPORT[0], 'v7': EXPORT[1]} if regs is None else regs
     if channels is None:
-        regs = {'v6': EXPORT[0], 'v7': EXPORT[1]}
         m = re.search(r'o\.param0 = float4\(([^;]*)\);\n', vs)
         channels = []
         for expr in re.findall(r'f16tof32\((v\d+)( >> 16)?\)', m.group(1)):
             channels.append(f16_to_f32_bits((regs[expr[0]] >> (16 if expr[1] else 0)) & 0xffff))
-        assert len(channels) == 4, m.group(0)
+        assert len(channels) == 4 or 'F(v' in m.group(1), m.group(0)  # a plain export has no compr channels
+    # The plain export's extra outputs: o.hparam0_lo / _hi = float4(f16tof32(vN [>> 16]) or 0.0, ...)
+    halves = {}
+    for m in re.finditer(r'o\.hparam0_(lo|hi) = float4\(([^;]*)\);\n', vs):
+        args = re.findall(r'f16tof32\((v\d+)( >> 16)?\)|(0\.0)', m.group(2))
+        assert len(args) == 4, m.group(0)
+        halves[m.group(1)] = [0 if zero else f16_to_f32_bits((regs[r] >> (16 if sh else 0)) & 0xffff)
+                              for r, sh, zero in args]
     state = {}
     for line in ps.splitlines():
-        stmt = re.fullmatch(r'    (v\d+) = \((v\d+) & 0xffff0000u\) \| f32tof16\(i\.param0\.([xyzw])\);', line)
+        stmt = re.fullmatch(r'    (v\d+) = \((v\d+) & 0xffff0000u\) \| f32tof16\(i\.(param0|hparam0_lo|hparam0_hi)\.([xyzw])\);',
+                            line)
         if stmt:
             assert stmt.group(1) == stmt.group(2), line
             # f32tof16 of the interpolated value; a constant triangle makes it the exported value
-            f32 = channels['xyzw'.index(stmt.group(3))]
+            source = channels if stmt.group(3) == 'param0' else halves[stmt.group(3)[-2:]]
+            f32 = source['xyzw'.index(stmt.group(4))]
             state[stmt.group(1)] = f16_bits(struct.unpack('<f', struct.pack('<I', f32))[0])
             continue
         stmt = re.fullmatch(r'    (v\d+) = U\(f16tof32\((v\d+)\)\);', line)
@@ -180,9 +239,9 @@ def patch(words, index, w0=0, w1=0):
     return bytes(out)
 
 
-def refused(label, words, needle, vs_words=VS_WORDS):
+def refused(label, words, needle, vs_words=VS_WORDS, **kwargs):
     try:
-        translate(words, vs_words)
+        translate(words, vs_words, **kwargs)
     except G.Unsupported as error:
         assert needle in str(error), (label, str(error))
         print('refused: %s (%s)' % (label, error))
@@ -284,10 +343,82 @@ def controls():
     # (an overwrite between the pair: v_mov_b32 v4, v0 = 7e080300 inserted after the p1ll)
     clobbered = PS_WORDS[:12] + bytes.fromhex('0003087e') + PS_WORDS[12:]
     refused('p1ll result overwritten', clobbered, 'before the matching v_interp_p2_f16')
-    # The attribute is a plain float export, not a compr pair.
-    refused('attribute not exported with compr', PS_WORDS, 'compr', vs_words=F32_VS_WORDS)
+    # A plain float export of the same attribute is lowered as a plain export since the follow-up of #2052 (it used to
+    # be refused as "not exported with compr"); plain_controls() covers it.
+    assert 'hparam0_lo' in translate(PS_WORDS, F32_VS_WORDS).hlsl_ps()
     barycentric_controls(expected)
+    plain_controls(expected)
     print('controls ok')
+
+
+def plain_pair(half=0, vs_name='plain', ps_words=None):
+    pipe = translate(PLAIN_PS['lo' if half == 0 else 'hi'] if ps_words is None else ps_words, PLAIN_VS[vs_name])
+    return pipe.hlsl_vs(), pipe.hlsl_ps()
+
+
+def plain_controls(expected):
+    """Plain 32-bit export of binary16 halves (follow-up of #2052)."""
+    lo_ref, hi_ref = plain_reference(0), plain_reference(1)
+    assert lo_ref == (0x3fc00000, 0x3f000000, 0x40800000, 0x41000000), [hex(w) for w in lo_ref]
+    assert hi_ref == (0xc0000000, 0x40400000, 0xbe800000, 0x3e000000), [hex(w) for w in hi_ref]
+    regs = {'v%d' % (6 + i): w for i, w in enumerate(PLAIN_WORDS)}
+    for half, ref in ((0, lo_ref), (1, hi_ref)):
+        vs, ps = plain_pair(half)
+        got = evaluate(vs, ps, regs=regs)
+        assert got == ref, ('plain half', half, [hex(w) for w in got], [hex(w) for w in ref])
+        assert 'hparam0_lo' in vs and 'o.fparam0' not in vs, vs
+        print('plain export half %d: %s' % (half, ','.join('%08x' % w for w in got)))
+    # Runtime interface tables can link a pixel attribute to a differently numbered vertex parameter.
+    remapped = PLAIN_PS['lo']
+    for index in range(8):
+        remapped = patch(remapped, index, w1=3)
+    pipe = translate(remapped, PLAIN_VS['plain'], ps_attr_map={3: (0, 0xf)})
+    assert evaluate(pipe.hlsl_vs(), pipe.hlsl_ps(), regs=regs) == lo_ref
+    refused('interface masks off an interpolated channel', remapped, 'undeclared component w',
+            vs_words=PLAIN_VS['plain'], ps_attr_map={3: (0, 0x7)})
+    # The compr fixture with its export flipped to plain (clear the compr bit, w0 bit 10 of the param0 export:
+    # words v6, v7, v0, v0) is the same attribute in the ISA (attrN.x = dword 0, attrN.y = dword 1), so the pixel
+    # stage reads the compr reference. Only the lowering differs: hparam0_* instead of param0.x .. w.
+    flipped_vs = bytearray(VS_WORDS)
+    flipped_vs[VS_WORDS.index(bytes.fromhex('0f0600f8')) + 1] ^= 0x04
+    pipe = translate(PS_WORDS, bytes(flipped_vs))
+    assert 'hparam0_lo' in pipe.hlsl_ps() and 'param0.' not in pipe.hlsl_ps().replace('hparam0', ''), pipe.hlsl_ps()
+    got = evaluate(pipe.hlsl_vs(), pipe.hlsl_ps(), regs={'v0': 0, 'v6': EXPORT[0], 'v7': EXPORT[1]})
+    assert got == expected, ([hex(w) for w in got], [hex(w) for w in expected])
+    print('compr fixture exported plain reads the compr reference %s' % ','.join('%08x' % w for w in got))
+    # Negative control 1: the plain fixture read through the compr mapping (attrN.x = param.x, param.y; attrN.y =
+    # param.z, param.w; channels z and w read as float channels 2c + h) gives other words: the mappings differ.
+    vs, ps = plain_pair(0)
+    compr_mapped = re.sub(r'i\.hparam0_(lo|hi)\.([xyzw])', lambda m: 'i.param0.%s' % 'xyzw'[
+        2 * 'xyzw'.index(m.group(2)) % 4 + (m.group(1) == 'hi')], ps)
+    got = evaluate(vs, compr_mapped, channels=[f16_to_f32_bits(PLAIN_WORDS[c] >> (16 * h) & 0xffff) for c, h in ((0, 0), (0, 1), (1, 0), (1, 1))],
+                   regs=regs)
+    assert got != lo_ref, 'compr mapping read the plain words'
+    print('negative control: plain fixture read with the compr mapping gives %s' % ','.join('%08x' % w for w in got))
+    # Negative control 2: the high bit inverted on the plain fixture reads the other halves.
+    inverted = PLAIN_PS['lo']
+    for index in range(8):
+        inverted = patch(inverted, index, w1=0x100)
+    got = evaluate(*plain_pair(ps_words=inverted), regs=regs)
+    assert got == hi_ref and got != lo_ref, [hex(w) for w in got]
+    print('negative control: plain high inverted reads %s' % ','.join('%08x' % w for w in got))
+    # Negative control 3: the lowering removed refuses the pair.
+    saved = {n: getattr(G.Stage, n) for n in ('op_v_interp_p1ll_f16', 'op_v_interp_p2_f16')}
+    try:
+        for n in saved:
+            delattr(G.Stage, n)
+        refused('plain lowering disabled', PLAIN_PS['lo'], 'v_interp_p1ll_f16', vs_words=PLAIN_VS['plain'])
+    finally:
+        for n, f in saved.items():
+            setattr(G.Stage, n, f)
+    # Refusals: an attribute exported both ways, and a channel exported as `off` that is read as binary16.
+    refused('exported both compr and plain', PS_WORDS, 'exported both with compr and plain',
+            vs_words=PLAIN_VS['mixed'])
+    refused('off channel read as binary16', PLAIN_PS['lo'], 'channels the vertex stage exports as off',
+            vs_words=PLAIN_VS['off'])
+    # A compr export still refuses channels z and w.
+    refused('compr attribute channel z', patch(patch(PS_WORDS, 0, w1=2 << 6), 1, w1=2 << 6), 'channel z')
+    print('plain controls ok')
 
 
 def f32(x):
@@ -378,6 +509,12 @@ def check_binary(llvm_mc):
         built = normalise(assemble(llvm_mc, source))
         if built != words:
             raise AssertionError('%s fixture: assembled %s, recorded %s' % (name, built.hex(), words.hex()))
+    for name, source in PLAIN_VS_SOURCES.items():
+        if assemble(llvm_mc, plain_vs_source(source)) != PLAIN_VS[name]:
+            raise AssertionError('plain-export %s vertex fixture differs from llvm-mc' % name)
+    for name, high in (('lo', ''), ('hi', ' high')):
+        if normalise(assemble(llvm_mc, plain_ps_source(high))) != PLAIN_PS[name]:
+            raise AssertionError('plain-export %s pixel fixture differs from llvm-mc' % name)
     for name, source in PS_VARIANT_SOURCES.items():
         built = normalise(assemble(llvm_mc, source))
         # a forward branch is an unresolved fixup in llvm-mc's listing (placeholder 0x0a): the offset is 2 dwords
@@ -398,7 +535,12 @@ def check_compile(dxc):
         directory = Path(tmp)
         compile_hlsl(dxc, 'dxc', vs, 'vs', 'vs_6_0', directory)
         compile_hlsl(dxc, 'dxc', ps, 'ps', 'ps_6_0', directory)
-    print('dxc vs_6_0 / ps_6_0: compiled')
+    for half in (0, 1):
+        vs, ps = plain_pair(half)
+        with tempfile.TemporaryDirectory() as tmp:
+            compile_hlsl(dxc, 'dxc', vs, 'vs', 'vs_6_0', Path(tmp))
+            compile_hlsl(dxc, 'dxc', ps, 'ps', 'ps_6_0', Path(tmp))
+    print('dxc vs_6_0 / ps_6_0: compiled (compr pair and the plain-export pair, both halves)')
 
 
 def check_draw(dxc, renderer, adapter):
@@ -421,6 +563,20 @@ def check_draw(dxc, renderer, adapter):
         if run.returncode == 0:
             raise AssertionError('high inverted: control read the reference words')
         print('high inverted: fails as expected', flush=True)
+        # The plain export: low and high halves of channels x..w, and the high bit inverted.
+        for half in (0, 1):
+            expected_plain = ','.join('%08x' % w for w in plain_reference(half))
+            pvs, pps = plain_pair(half)
+            vs_cso = compile_hlsl(dxc, 'dxc', pvs, 'pvs', 'vs_6_0', directory)
+            ps_cso = compile_hlsl(dxc, 'dxc', pps, 'pps', 'ps_6_0', directory)
+            run = draw(renderer, adapter, vs_cso, ps_cso, expected_plain)
+            if run.returncode:
+                raise AssertionError('plain export half %d\n%s\n%s' % (half, run.stdout, run.stderr))
+            print('plain export half %d: %s' % (half, expected_plain), flush=True)
+            wrong = compile_hlsl(dxc, 'dxc', plain_pair(1 - half)[1], 'pps_other', 'ps_6_0', directory)
+            if draw(renderer, adapter, vs_cso, wrong, expected_plain).returncode == 0:
+                raise AssertionError('plain export: the other half read the reference words')
+            print('plain export, other half: fails as expected', flush=True)
 
 
 def main():
