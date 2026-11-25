@@ -378,6 +378,10 @@ bool one_allocation_fails(Fixture& f, int fail_enqueue, int fail_submit, int& th
         f.submit(q);
         disarm();
         trace("submit_done");
+    } catch (const std::exception& e) {
+        disarm();
+        std::fprintf(stderr, "exception left Submit: %s: %s\n", typeid(e).name(), e.what());
+        return fail("an exception left Submit");
     } catch (...) {
         disarm();
         return fail("an exception left Submit");
@@ -535,6 +539,10 @@ bool ordered_failure(Fixture& f, bool status_first, int requests, int fail_enque
         f.submit(q);
         disarm();
         trace("submit_done");
+    } catch (const std::exception& e) {
+        disarm();
+        std::fprintf(stderr, "exception left Submit: %s: %s\n", typeid(e).name(), e.what());
+        return fail("an exception left Submit");
     } catch (...) {
         disarm();
         return fail("an exception left Submit");
