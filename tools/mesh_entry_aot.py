@@ -19,6 +19,7 @@ U32 = (1 << 32) - 1
 WAVE = (1 << 64) - 1
 LANE_SPILL_OPS = {"v_writelane_b32", "v_readlane_b32"}
 VGPR_OPERAND = re.compile(r"\bv(?:(\d+)\b|\[(\d+):(\d+)\])")
+LDS_BYTES = 1 << 16
 
 
 def span(token):
@@ -95,6 +96,13 @@ class Wave:
         # reload of that VGPR is refused, which can only over-refuse, never return a stale word.
         self.spill_vector_uses = {}
         self.barriers = []
+        # Group LDS: `lds` holds dwords published at an earlier barrier. A wave's own
+        # stores stay in `staged` until every wave reaches the next barrier.
+        self.lds = {}
+        self.staged = {}
+        self.reads = set()
+        self.pending_ds = set()
+        self.ds_writes_pending = False
         self.counts = []
         self.positions = {}
         self.attributes = {}
@@ -156,9 +164,13 @@ class Wave:
             for j, i in enumerate(regs):
                 self.s[i] = UNDEF if value is UNDEF else (value >> (32 * j)) & U32
 
+    def vector_pending(self, lane, reg):
+        """True while a vector load or LDS read still owes this register."""
+        return (lane, reg) in self.pending_v or (lane, reg) in self.pending_ds
+
     def lane_value(self, t, lane):
         if re.fullmatch(r"v\d+", t):
-            if (lane, t) in self.pending_v:
+            if self.vector_pending(lane, t):
                 raise ValueError("Vector load used before wait")
             return self.v[lane][int(t[1:])]
         return self.scalar(t)
@@ -227,12 +239,20 @@ class Wave:
                 return
             if not isinstance(a, int) or not isinstance(b, int):
                 raise ValueError("Dynamic scalar predicate")
-            a, b = a & U32, b & U32
-            self.scc = {
+            # 64-bit forms compare whole wave masks; 32-bit forms keep their rules.
+            width = WAVE if op.endswith("_u64") else U32
+            a, b = a & width, b & width
+            relation = {
                 "s_cmp_eq_u32": a == b,
+                "s_cmp_lg_u32": a != b,
                 "s_cmp_lt_u32": a < b,
                 "s_cmp_gt_u32": a > b,
-            }[op]
+                "s_cmp_eq_u64": a == b,
+                "s_cmp_lg_u64": a != b,
+            }
+            if op not in relation:
+                raise ValueError(f"Unsupported scalar compare {op}")
+            self.scc = relation[op]
             return
         if op == "s_and_saveexec_b64":
             a = self.scalar(src[0])
@@ -482,11 +502,62 @@ class Wave:
                 v = expressions[expr]
             else:
                 raise ValueError(f"Unsupported lane instruction {op}")
-            if (lane, d) in self.pending_v:
+            if self.vector_pending(lane, d):
                 raise ValueError("Pending vector destination")
             self.v[lane][int(d[1:])] = v & U32 if isinstance(v, int) else v
 
+    def lds_op(self, op, tail):
+        """One dword per live lane at a concrete, aligned, in-range LDS address.
+
+        A load sees only dwords published at an earlier barrier. A wave's own
+        unpublished store is refused rather than guessed at.
+        """
+        write = op == "ds_write_b32"
+        match = re.fullmatch(r"(v\d+), (v\d+)(?: offset:(\d+))?", tail)
+        if not match:
+            raise ValueError(f"Unsupported {op} operands")
+        first, second = match[1], match[2]
+        offset = int(match[3] or 0)
+        address_reg, data_reg, dest = (first, second, None) if write else (second, None, first)
+        if offset >= LDS_BYTES:
+            raise ValueError("LDS offset outside the group allocation")
+        writes = {}
+        for lane in range(64):
+            if not self.exec & (1 << lane):
+                continue
+            address = self.lane_value(address_reg, lane)
+            if type(address) is not int:
+                raise ValueError("Dynamic LDS address")
+            address += offset
+            if address % 4 or not 0 <= address < LDS_BYTES:
+                raise ValueError("LDS address outside the group allocation or unaligned")
+            if write:
+                data = self.lane_value(data_reg, lane)
+                if type(data) is not int:
+                    raise ValueError("LDS store of a non-integer value")
+                if writes.setdefault(address, data & U32) != data & U32:
+                    raise ValueError("Lanes store different values to one LDS dword")
+            else:
+                if address in self.staged:
+                    raise ValueError("LDS load of this wave's store before a barrier")
+                if address not in self.lds:
+                    raise ValueError("LDS load of a dword no wave published")
+                if self.vector_pending(lane, dest):
+                    raise ValueError("LDS load overwrites a pending result")
+                self.reads.add(address)
+                self.v[lane][int(dest[1:])] = self.lds[address]
+                self.pending_ds.add((lane, dest))
+        if write:
+            for address, data in writes.items():
+                if self.staged.setdefault(address, data) != data:
+                    raise ValueError("Conflicting LDS stores before a barrier")
+            self.ds_writes_pending = True
+
     def run(self, decoded, expressions):
+        run_group([self], decoded, expressions)
+
+    def steps(self, decoded, expressions):
+        """Execute the wave, yielding at each group barrier."""
         jumps = {offset: i for i, (offset, _) in enumerate(decoded)}
         for _, line in decoded:
             dest = line.partition(" ")[2].split(", ")[0]
@@ -514,7 +585,10 @@ class Wave:
             if op in ("s_inst_prefetch", "s_nop"):
                 continue
             if op == "s_barrier":
+                if self.ds_writes_pending:
+                    raise ValueError("LDS store not waited before the barrier")
                 self.barriers.append(offset)
+                yield
             elif op == "s_waitcnt":
                 if not re.fullmatch(
                     r"(?:vmcnt\(0\)|expcnt\(0\)|lgkmcnt\(0\))(?: (?:vmcnt\(0\)|expcnt\(0\)|lgkmcnt\(0\)))*",
@@ -523,11 +597,13 @@ class Wave:
                     raise ValueError("Unsupported wait")
                 if "lgkmcnt" in tail:
                     self.pending.clear()
+                    self.pending_ds.clear()
+                    self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
-                    op == "s_cbranch_scc0"
+                    op in ("s_cbranch_scc0", "s_cbranch_scc1")
                     and self.scc is None
                     or op == "s_cbranch_vccnz"
                     and self.vcc is None
@@ -536,6 +612,7 @@ class Wave:
                 take = {
                     "s_branch": True,
                     "s_cbranch_scc0": not self.scc,
+                    "s_cbranch_scc1": bool(self.scc),
                     "s_cbranch_execz": not self.exec,
                     "s_cbranch_vccnz": bool(self.vcc),
                 }[op]
@@ -573,7 +650,7 @@ class Wave:
                             )
                         for j, reg in enumerate(span(match[1])):
                             key = (lane, f"v{reg}")
-                            if key in self.pending_v:
+                            if self.vector_pending(*key):
                                 raise ValueError(
                                     "Vertex load overwrites an outstanding result"
                                 )
@@ -590,12 +667,14 @@ class Wave:
                 for lane in range(64):
                     if self.exec & (1 << lane):
                         addr = self.lane_value(match[2], lane)
-                        if (lane, match[1]) in self.pending_v:
+                        if self.vector_pending(lane, match[1]):
                             raise ValueError("Vector load overwrites pending result")
                         if addr % 4 or not 0 <= addr // 4 < len(self.geometry):
                             raise ValueError("Geometry address out of range")
                         self.v[lane][int(match[1][1:])] = self.geometry[addr // 4]
                         self.pending_v.add((lane, match[1]))
+            elif op in ("ds_write_b32", "ds_read_b32"):
+                self.lds_op(op, tail)
             elif op == "exp":
                 m = re.fullmatch(r"(prim|pos0|param0),? (.+?)( done)?", tail)
                 if not m:
@@ -639,6 +718,50 @@ def live_barriers_agree(first, second):
     # Wave.run only returns at S_ENDPGM. RDNA 2 ISA section 4.3 drops a retired
     # wave from later barriers. While both waves are live their PCs must match.
     return all(a == b for a, b in zip(first.barriers, second.barriers))
+
+
+def check_interval(waves):
+    """Validate one barrier interval of every wave; return the stores to publish."""
+    published = {}
+    for wave in waves:
+        for address, data in wave.staged.items():
+            if published.setdefault(address, data) != data:
+                raise ValueError("Waves store different values to one LDS dword")
+    for wave in waves:
+        others = {a for other in waves if other is not wave for a in other.staged}
+        if wave.reads & others:
+            raise ValueError("LDS dword read and stored by different waves without a barrier")
+    for wave in waves:
+        wave.staged, wave.reads = {}, set()
+    return published
+
+
+def run_group(waves, decoded, expressions):
+    """Run the waves of one group in lockstep between barriers.
+
+    Each wave runs to its next barrier before any wave goes on. Stores become
+    visible to every wave only when all of them have reached the barrier.
+    """
+    lds = {}
+    for wave in waves:
+        wave.lds = lds
+    running = [wave.steps(decoded, expressions) for wave in waves]
+    while True:
+        # A wave that ends its program drops out of later barriers (RDNA 2 ISA
+        # section 4.3); the waves still live release each other.
+        live = []
+        for steps in running:
+            try:
+                next(steps)
+                live.append(steps)
+            except StopIteration:
+                pass
+        if not live:
+            check_interval(waves)
+            return
+        running = live
+        published = check_interval(waves)
+        lds.update(published)
 
 
 def float4(values):
@@ -692,8 +815,7 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         raise ValueError("Geometry binding requires unsigned words")
     waves = [Wave(i, geometry, vertex_header) for i in range(2)]
     expressions = {}
-    for wave in waves:
-        wave.run(decoded, expressions)
+    run_group(waves, decoded, expressions)
     if (
         not live_barriers_agree(*waves)
         or len(waves[0].counts) != 1

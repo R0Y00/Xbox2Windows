@@ -386,23 +386,49 @@ void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RE
     log("%s", line);
 }
 
+// Counts a refusal (memory_srv_census) and logs its line while the first 8 refusals last, and also for
+// the first refusal of each of the first few distinct shapes (MemorySrvCensus::detail_shapes).
+void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
+                       const MemoryShaderResourceView* input, u64 destination)
+{
+    const bool within_limit = first_calls(refused, 8);
+    const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
+    if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
+}
+
+// Counts a successful write (memory_srv_writes) and logs the first write to each of the first few
+// distinct destination descriptors.
+void note_memory_srv_write(const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
+{
+    const u64 ordinal = memory_srv_writes.note(destination);
+    if (!ordinal) return;
+    char resource_text[224], view_text[256];
+    x2w_startup::report_resource(resource_text, sizeof(resource_text), resource);
+    x2w_startup::report_view(view_text, sizeof(view_text), &input->view);
+    log("x2w-d3d12 memory SRV written %llu: dest=0x%llx address=0x%llx res{%s} view{%s}", ordinal, destination, input->address,
+        resource_text, view_text);
+}
+
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
     static LONG refused;
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
-        if (first_calls(refused, 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
+        refuse_memory_srv(refused, "unsupported memory SRV arguments", reason, resource, input, destination);
         return;
     }
     // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
     if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
         if (gpu_written_overlap(input->address, x2w_startup::single_element_bytes(*resource))) {
-            if (first_calls(refused, 8))
-                log_refused_memory_srv("GPU-written resource at the supplied address", "gpu_written_resource", resource, input, destination);
-        } else if (Wrapper* texture = publish_tiled_texture(self, input->address, *resource))
+            refuse_memory_srv(refused, "GPU-written resource at the supplied address", "gpu_written_resource", resource, input,
+                              destination);
+        } else if (Wrapper* texture = publish_tiled_texture(self, input->address, *resource)) {
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
-        else if (first_calls(refused, 8))
-            log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
+            note_memory_srv_write(resource, input, destination);
+        } else {
+            refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", "texture_unavailable", resource, input,
+                              destination);
+        }
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -414,12 +440,12 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         if (!buffer || !info ||
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
-            if (first_calls(refused, 8))
-                log_refused_memory_srv("unavailable buffer at the supplied address", "buffer_unavailable",
-                                       resource, input, destination);
+            refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
+                              destination);
             return;
         }
         view_slot<18, 2>(self, reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(&adjusted), destination, 0);
+        note_memory_srv_write(resource, input, destination);
         return;
     }
     // A partial-tile view stays refused when the last XG stand-in copy to the address wrote desktop-footprint
@@ -457,10 +483,10 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (!texture) outcome = held ? held : "texture_unavailable (no resource there, or texels not readable or over 64 MiB)";
     log_address_kind(outcome, *resource, input->view, input->address);
     if (!texture) {
-        if (first_calls(refused, 8))
-            log_refused_memory_srv("unavailable texture at the supplied base and layout", held ? held : "texture_unavailable",
-                                   resource, input, destination);
+        refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", held ? held : "texture_unavailable",
+                          resource, input, destination);
         return;
     }
     view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
+    note_memory_srv_write(resource, input, destination);
 }

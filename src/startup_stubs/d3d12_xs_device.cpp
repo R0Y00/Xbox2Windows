@@ -25,6 +25,7 @@
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/indexed_indirect_guard.h"
+#include "startup_stubs/indexed_rect_geometry.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
@@ -36,6 +37,7 @@
 #include "startup_stubs/placed_build.h"
 #include "startup_stubs/placed_buffer_range.h"
 #include "startup_stubs/memory_srv_report.h"
+#include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/list_copy.h"
@@ -87,6 +89,10 @@ namespace {
 
 using u64 = std::uint64_t;
 constexpr int slot_count = 512;
+// Refused slot 70 calls and "token" texture nulls (memory_srv_census.h), printed with the five-second report.
+x2w_startup::MemorySrvCensus memory_srv_census;
+x2w_startup::TokenNullCensus token_null_census;
+x2w_startup::MemorySrvWrites memory_srv_writes;
 
 enum Kind : int {
     device_kind, queue_kind, fence_kind, allocator_kind, list_kind, descriptor_heap_kind, root_signature_kind,
@@ -2474,8 +2480,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
             return refuse("indirect graphics requires one matching target, viewport and scissor");
-        if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-            return refuse("indirect draw requires triangle-list topology");
+        if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
+            !(translated && indexed && pass.topology == 0x11))
+            return refuse("indirect draw requires triangle-list topology or a translated indexed rectangle");
         const auto samples = pass.target0->GetDesc().SampleDesc;
         if (samples.Count != 1 || samples.Quality)
             return refuse("draw requires a single-sample render target");
@@ -4325,12 +4332,32 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             }
             if (used) log("x2w-d3d12 command-list slots over 20 ms:%s", text);
         }
+        memory_srv_census.report([](const char* line) { log("%s", line); }, true);
+        token_null_census.report([](const char* line) { log("%s", line); }, true);
+        memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
         if (x2w_budget::enabled()) report_budget(static_cast<ID3D12CommandQueue*>(self->own().real));
     }
     return S_OK;
+}
+
+// Fixtures: the census lines of the five-second report, now and whether or not they changed, one per
+// line. Returns the length of the whole text and copies up to capacity - 1 bytes of it, terminated.
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, std::size_t capacity)
+{
+    std::size_t length = 0;
+    const auto emit = [&](const char* line) {
+        const std::size_t bytes = std::strlen(line);
+        for (std::size_t i = 0; i <= bytes; ++i, ++length)
+            if (out && length + 1 < capacity) out[length] = i < bytes ? line[i] : '\n';
+    };
+    memory_srv_census.report(emit, false);
+    token_null_census.report(emit, false);
+    memory_srv_writes.report(emit, false);
+    if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
+    return length;
 }
 
 template <int K, int N>
