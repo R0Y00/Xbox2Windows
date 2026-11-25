@@ -233,6 +233,7 @@ jobs:
             tests/startup_archive_requests_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_compute_request_offline_check.py \
+            tests/compute_container_index_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \

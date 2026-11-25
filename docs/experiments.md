@@ -4003,6 +4003,32 @@ python3 -B tests/startup_ngg_slice_check.py
 python3 -B tests/startup_ngg_slice_check.py binary llvm-mc-15
 ```
 
+## Local compute container index
+
+`tools/compute_container_index.py` joins the digest in a recognized slot 67
+`.data` record with the `HASH` digest of a framed compute DXIL archive record.
+The archive inventory checks compressed record framing, the container part table
+and the DXIL program header. The CLI reads local inputs and writes JSON to stdout.
+The SHA-256 of the entire decoded container identifies each candidate. Records with identical
+SHA-256 appear once with a `records` count. A request with multiple distinct
+SHA-256 values is reported as `conflict` and retains all candidates. The tool
+counts missing `HASH` parts, bad lengths and unsupported flag bits. It accepts
+flag values 0 and 1 and reports the value for each candidate. Flag 1 indicates a
+digest that includes source information. [DXC HASH definition](https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/DxilContainer/DxilContainer.h#L38-L46)
+
+```powershell
+python -B tools/compute_container_index.py "game-files/<local-shader-archive>" "out/<run>/cache" --trace "out/<run>/trace/trap.log" > out/compute-container-index.json
+python -B tests/compute_container_index_check.py
+```
+
+With `--trace`, direct and indirect dispatch rows select request keys, including
+keys missing from the cache. Their counts describe logged calls, which may have
+used a placeholder pipeline. Omit `--trace` to index all `.c67` request keys.
+The join establishes candidate metadata agreement. Native code equivalence,
+resource bindings and GPU execution require separate evidence. The synthetic
+fixture covers repeats, conflicts, absent and malformed data, invalid container
+framing and flags, a non-compute record, and trace selection.
+
 ## Compute UAV stores from a native container
 
 `tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The store profile translates one or more non-overlapping raw UAV stores of one to four known 32-bit constant words per invocation, including constants loaded via `s_mov_b32`, `s_movk_i32`, and `v_mov_b32` register copies, along with `s_clause` hints and combined `lgkmcnt(0)`/`vmcnt(0)` waits. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.
@@ -13953,6 +13979,40 @@ On Windows 11 (26300), all 320 words matched in every case on WARP (10.0.26100.1
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
+```
+
+### Startup compute formatted buffer reads
+
+The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using
+the existing FORMAT and DST_SEL decode. The instruction must use four untouched words from a
+fixed native table entry. After a branch, the descriptor must come from a local table load with
+a proven root pointer. The manifest binds `srv <slot> buf table <param> <offset>` and requests
+`udsrc <n> descword3 <slot>`. Indexed addressing also requests `udsrc <n> stride <slot>`.
+
+The dispatch caller must resolve the native descriptor to a raw SRV whose byte offset zero is
+the descriptor's base. It supplies word 3 and, when requested, the byte stride from the same
+descriptor snapshot. It must refuse missing or unresolved native descriptors, unsupported FORMAT
+codes, reserved DST_SEL values for the components read, and descriptor features that change the
+byte address, such as swizzling or adding the lane ID. The caller must establish that each
+executed access is within the native descriptor range without address wrap and that every
+desktop dword read is aligned and backed by the SRV. Packed reads can fetch an adjacent dword
+even when only one byte is used. The lowering does not model native out-of-range results.
+
+Cases `L-uint` and `L-unorm` in `startup_gfx2hlsl_compute_check.py` supply different word 3
+values to the same translated shader. They compare an unaligned UINT16 pair and an UNORM8
+field, with permuted channels and both integer and floating-point forms of the constant one.
+The WARP and hardware fixture uses a root SRV and passes the stride and word 3 directly.
+Each dispatch checks 320 output words, including untouched sentinels. Mutations that remove
+the byte offset, change a selector or replace integer one with float one must mismatch. The
+pure-Python checks cover the manifest, all four load widths, a local load after a branch and
+refusals for overwritten descriptor words or missing local provenance.
+
+On Windows build 26200.9974 with the D3D12 debug layer enabled, WARP 10.0.26100.9818 and an
+NVIDIA GeForce RTX 4060 Laptop GPU with driver 32.0.16.1656 matched all 320 words in each
+case. The three mutations mismatched 32, 8 and 16 words respectively on both adapters.
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_compute_(controls|warp|hardware)$' -V
 ```
 
 ### First active lane at compute entry
