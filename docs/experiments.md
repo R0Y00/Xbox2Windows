@@ -13462,6 +13462,27 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_hardware)?$' -V
 ```
 
+### Startup compute raw buffer atomics
+
+The startup compute translator lowers 32-bit gfx1013 raw `offen` MUBUF buffer
+atomics (`buffer_atomic_add`, `sub`, `smin`, `umin`, `smax`, `umax`, `and`,
+`or`, `xor`, `swap`, and `cmpswap`) through fixed-table unmodified `RWByteAddressBuffer`
+descriptors (`u0`). Addresses combine the `vaddr` byte offset, optional `soffset`
+register or aligned immediate, and aligned 12-bit `offset` rounded down by
+`& 0xfffffffcu`, guarded under `(exec & 1)` when `EXEC` is narrowed.
+
+`glc` writes the pre-atomic word back to `vdata[0]` (preserving `vdata[1]` on
+`cmpswap`, which reverses the ISA `(replacement, compare)` register pair to HLSL's
+`(compare, replacement)` order). `buffer_atomic_sub` emits `InterlockedAdd(a, (0u - val))`,
+and `smin`/`smax` use signed `asint` overloads. `idxen`, missing `offen`, `slc`/`dlc`,
+unaligned immediate offsets, modified or aliased descriptors, non-compute stages,
+and `inc`/`dec`/float/64-bit forms stay refused.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_buffer_atomics(_warp|_hardware)?$' -V
+```
+
 ## Startup translator: fixed-mip 2D comparison gathers
 
 The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D
