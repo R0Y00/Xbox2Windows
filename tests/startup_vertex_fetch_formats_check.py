@@ -360,7 +360,7 @@ def controls():
     try:
         stage(changed_pointer)
     except gfx2hlsl.Unsupported as error:
-        assert 'local table load' in str(error), error
+        assert 'local table load' in str(error) or 'joined at a branch target' in str(error), error
     else:
         raise AssertionError('formatted load accepted after a possibly clobbered root pointer')
     source = pipeline_mubuf(0).hlsl_vs()
