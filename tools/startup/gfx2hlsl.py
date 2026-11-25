@@ -2140,6 +2140,8 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 
 class Pipeline:
+    uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
+
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
                  refusals=None, decoded=None):
         self.root = parse_root(root_blob)
@@ -2158,7 +2160,6 @@ class Pipeline:
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.resources = {}   # key -> dict(index, kind)
-        self.uavs = {}        # key -> dict(index, kind): images a pixel stage stores to (u registers)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
         self.notes = set()    # shortcuts taken (written to the manifest as comments)
@@ -2207,14 +2208,14 @@ class Pipeline:
         return 'r%d' % r['index']
 
     def stored_images(self):
-        # Pipelines that tests assemble without __init__ have no uavs attribute: they store to no image.
-        return self.__dict__.setdefault('uavs', {})
+        return self.uavs or {}
 
     def uav(self, key, kind):
         if key in self.resources:
             raise Unsupported('resource %s is both read and stored to' % (key,))
-        uavs = self.stored_images()
-        r = uavs.setdefault(key, dict(index=len(uavs), kind=kind))
+        if self.uavs is None:
+            self.uavs = {}
+        r = self.uavs.setdefault(key, dict(index=len(self.uavs), kind=kind))
         if r['kind'] != kind:
             raise Unsupported('stored image %s used as %s and %s' % (key, r['kind'], kind))
         return 'w%d' % r['index']
