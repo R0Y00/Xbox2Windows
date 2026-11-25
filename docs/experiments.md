@@ -12007,7 +12007,9 @@ expects the refusal again, and one draw runs with `CLAMP_Z` set.
 A point XY filter (`XY_MAG_FILTER` or `XY_MIN_FILTER` 0, SQ_IMG_SAMP_WORD2)
 is checked as bilinear. The same spec section says gather4 "Gathers the
 four texels that would be used in a bi-linear filtering operation" and uses
-only the addressing modes. The renderer the draws use already binds a point
+only the addressing modes. That a point filter reads the same four texels
+is this D3D11.3 rule; it has not been measured on console hardware. The
+renderer the draws use already binds a point
 static sampler (`FILTER_MIN_MAG_MIP_POINT` in `tests/pixel_aot_vs.hlsl`)
 and reads the bilinear footprint. Anisotropic XY, a linear mip filter and
 a LOD bias stay refused. The check translates point magnification,
