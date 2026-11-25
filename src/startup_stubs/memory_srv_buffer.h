@@ -127,4 +127,30 @@ inline bool resolve_buffer_srv_desc(std::uint64_t buffer_title_base, std::uint64
     return true;
 }
 
+// Calculates 64 KiB page-aligned extent and byte span for unplaced buffer memory SRVs.
+// Returns false on zero address/bytes, arithmetic overflow, or when the span exceeds the maximum allowable limit (256 MiB).
+inline bool unplaced_buffer_extent(std::uint64_t address, std::uint64_t span_bytes,
+                                   std::uint64_t& page_start, std::uint64_t& page_span)
+{
+    constexpr std::uint64_t alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    constexpr std::uint64_t mask = alignment - 1;
+    constexpr std::uint64_t max_span = 256ull << 20;
+    if (!address || !span_bytes || span_bytes > ~std::uint64_t{0} - address) return false;
+    page_start = address & ~mask;
+    const std::uint64_t end = address + span_bytes;
+    if (end > ~std::uint64_t{0} - mask) return false;
+    const std::uint64_t page_end = (end + mask) & ~mask;
+    page_span = page_end - page_start;
+    return page_span <= max_span && page_span >= span_bytes;
+}
+
+// Checks whether an existing cached page range completely covers the requested [address, address + span_bytes).
+inline bool unplaced_buffer_covers(std::uint64_t cached_start, std::uint64_t cached_span,
+                                   std::uint64_t address, std::uint64_t span_bytes)
+{
+    if (!cached_span || !span_bytes || address < cached_start) return false;
+    const std::uint64_t offset = address - cached_start;
+    return offset <= cached_span && span_bytes <= cached_span - offset;
+}
+
 }  // namespace x2w_startup

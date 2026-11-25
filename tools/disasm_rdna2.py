@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import tempfile
 
 # Register decode helpers
 
@@ -3216,21 +3217,43 @@ def print_disassembly(shader_name: str, instructions: list[dict], show_comments:
     print()
 
 
-def main():
+def _paths_collide(path_a: Path, path_b: Path) -> bool:
+    """Return True when two paths resolve to or refer to the same file."""
+    if path_a.resolve() == path_b.resolve():
+        return True
+    try:
+        return path_a.exists() and path_b.exists() and path_a.samefile(path_b)
+    except OSError:
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("targets", nargs="*", type=Path, default=[], help="Path to shader binary .bin file(s) or folder")
     parser.add_argument("--hex", default=None, help="Direct hex string to decode (e.g. '0300a0bf8002047e')")
     parser.add_argument("--output", type=Path, default=None, help="Save disassembly listing to output file")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.output is not None:
+        try:
+            if args.output.is_dir():
+                print(f"error: {args.output}: output path is a directory", file=sys.stderr)
+                return 1
+        except OSError as exc:
+            print(f"error: {args.output}: {exc}", file=sys.stderr)
+            return 1
 
     all_listings = []
-    missing = False
+    had_error = False
 
     # Hex decode mode
-    if args.hex:
+    if args.hex is not None:
+        hex_text = "".join(args.hex.split())
+        if not hex_text:
+            parser.error("--hex: expected a non-empty hex string")
         try:
-            raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+            raw_bytes = bytes.fromhex(hex_text)
         except ValueError as exc:
             parser.error(f"--hex: {exc}")
         insns = disassemble_binary(raw_bytes, "hex_input")
@@ -3241,33 +3264,65 @@ def main():
         parser.error("Specify targets or provide hex via --hex")
 
     for target in args.targets:
-        if target.is_file():
-            data = target.read_bytes()
-            insns = disassemble_binary(data, target.name)
-            print_disassembly(target.name, insns)
-            all_listings.append((target.name, insns))
-        elif target.is_dir():
-            files = sorted(target.glob("*.bin"))
-            print(f"[*] Found {len(files)} shader binary files in {target.name}...")
-            for f in files[:20]:  # Limit preview to 20 when folder passed
-                data = f.read_bytes()
-                insns = disassemble_binary(data, f.name)
-                print_disassembly(f.name, insns)
-                all_listings.append((f.name, insns))
-        else:
-            print(f"error: {target}: not found", file=sys.stderr)
-            missing = True
+        try:
+            if target.is_file():
+                if args.output is not None and _paths_collide(args.output, target):
+                    print(f"error: --output {args.output} collides with input {target}", file=sys.stderr)
+                    return 1
+                data = target.read_bytes()
+                insns = disassemble_binary(data, target.name)
+                print_disassembly(target.name, insns)
+                all_listings.append((target.name, insns))
+            elif target.is_dir():
+                files = sorted(f for f in target.glob("*.bin") if f.is_file())
+                preview = files[:20]  # Limit preview to 20 when folder passed
+                if args.output is not None:
+                    for f in preview:
+                        if _paths_collide(args.output, f):
+                            print(f"error: --output {args.output} collides with input {f}", file=sys.stderr)
+                            return 1
+                print(f"[*] Found {len(files)} shader binary files in {target.name}...")
+                for f in preview:
+                    data = f.read_bytes()
+                    insns = disassemble_binary(data, f.name)
+                    print_disassembly(f.name, insns)
+                    all_listings.append((f.name, insns))
+            else:
+                print(f"error: {target}: not found", file=sys.stderr)
+                had_error = True
+        except OSError as exc:
+            print(f"error: {target}: {exc}", file=sys.stderr)
+            had_error = True
 
-    if args.output and all_listings:
-        with args.output.open("w", encoding="utf-8") as out_f:
-            for name, insns in all_listings:
-                out_f.write(f"; Disassembly: {name}\n")
-                for item in insns:
-                    out_f.write(f"    {item['assembly']:<40} ; +0x{item['offset']:04x} // {item['comment']}\n")
-                out_f.write("\n")
-        print(f"[+] Disassembly saved to: {args.output}")
+    if args.output is not None and all_listings and not had_error:
+        tmp_path = None
+        try:
+            output_path = args.output
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=output_path.parent,
+                prefix=f".{output_path.stem}.",
+                suffix=".tmp",
+                delete=False,
+            ) as out_f:
+                tmp_path = Path(out_f.name)
+                for name, insns in all_listings:
+                    out_f.write(f"; Disassembly: {name}\n")
+                    for item in insns:
+                        out_f.write(f"    {item['assembly']:<40} ; +0x{item['offset']:04x} // {item['comment']}\n")
+                    out_f.write("\n")
+            tmp_path.replace(output_path)
+            tmp_path = None
+            print(f"[+] Disassembly saved to: {args.output}")
+        except OSError as exc:
+            print(f"error: {args.output}: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
-    return 1 if missing else 0
+    return 1 if had_error else 0
 
 
 if __name__ == "__main__":

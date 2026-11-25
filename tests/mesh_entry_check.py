@@ -126,6 +126,42 @@ def enumerate_pcs(program):
     return [(i * 4, line) for i, line in enumerate(program)]
 
 
+def flat_scratch_checks(decoded, expected):
+    writes = [
+        (0, "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0x1234"),
+        (8, "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0"),
+    ]
+
+    def lower_prefixed(prefix, size):
+        return lower(prefix + [(pc + size, line) for pc, line in decoded], [0x1003], (3, 1))
+
+    assert lower_prefixed(writes, 16) == expected
+    # The branch skips an eight-byte scratch instruction on every wave.
+    skipped = [(0, "s_branch 2"), (4, "scratch_load_dword v4, v1, off")]
+    assert lower_prefixed(skipped, 12) == expected
+    # Each observer sits on a skipped arm, so only the whole-program check can refuse it; without the
+    # writes the same arms lower to the expected text.
+    flat = [(16, "s_branch 2"), (20, "flat_load_dword v4, v[2:3]")]
+    getreg = [(16, "s_branch 1"), (20, "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)")]
+    assert lower_prefixed([(pc - 16, line) for pc, line in flat], 12) == expected
+    assert lower_prefixed([(pc - 16, line) for pc, line in getreg], 8) == expected
+    for prefix, size, refused in (
+        (writes + [(pc + 16, line) for pc, line in skipped], 28, "may be observed by scratch_load_dword"),
+        (writes + flat, 28, "may be observed by flat_load_dword"),
+        (writes + getreg, 24, "may be observed by s_getreg_b32"),
+        ([(0, "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO, 0, 16), 0")], 8, "s_setreg_imm32_b32"),
+        ([(0, "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s3")], 4, "s_setreg_b32"),
+        ([(0, "s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0")], 8, "s_setreg_imm32_b32"),
+        ([(0, "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), s3")], 8, "s_setreg_imm32_b32"),
+    ):
+        try:
+            lower_prefixed(prefix, size)
+        except ValueError as error:
+            assert refused in str(error), error
+        else:
+            raise AssertionError(f"Accepted unsupported mesh instruction {refused}")
+
+
 def source():
     # Branches only span scalar instructions of known 4-byte length.
     decoded = enumerate_pcs(PROGRAM)
@@ -150,7 +186,9 @@ def source():
         except (KeyError, ValueError):
             continue
         raise AssertionError("Invalid mesh path accepted")
-    return lower(decoded, [0x1003], (3, 1))
+    expected = lower(decoded, [0x1003], (3, 1))
+    flat_scratch_checks(decoded, expected)
+    return expected
 
 
 ALU_PROGRAM = PROGRAM.copy()
@@ -1025,6 +1063,10 @@ if __name__ == "__main__":
             sys.exit(0)
         if sys.argv[1] == "skipped":
             skipped_cpu()
+            sys.exit(0)
+        if sys.argv[1] == "flat-scratch":
+            source()
+            print("Scratch-base writes lowered to nothing and every observer was refused")
             sys.exit(0)
         if sys.argv[1] == "draw-skipped":
             args = sys.argv[2:]
