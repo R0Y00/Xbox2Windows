@@ -5556,11 +5556,13 @@ class Stage:
             raise Unsupported(self.LDS_PROOF % (text, 'a 4-byte aligned stride and offset inside 64 KiB'))
         return stride, total
 
-    def lds_overlap(self, a, b, *, across_lanes):
-        """Whether the four-byte interval of lane i under form a meets lane j under form b (i != j, or i == j)."""
+    def lds_overlap(self, a, b):
+        """Whether the four-byte interval of lane i under form a meets lane j under form b, other than the same lane
+        rewriting its own slot (a == b, i == j). A meeting inside one lane is refused too: a later write would
+        replace the slot a read forwards."""
         for i in range(self.LANES):
             for j in range(self.LANES):
-                if (i != j) == across_lanes and abs((a[0] * i + a[1]) - (b[0] * j + b[1])) < 4:
+                if abs((a[0] * i + a[1]) - (b[0] * j + b[1])) < 4 and (i != j or a != b):
                     return True
         return False
 
@@ -5572,16 +5574,12 @@ class Stage:
         self.refuse_lane_read([data[1]])
         writes = self.__dict__.setdefault('lds_writes', [])
         for other in writes + [form]:
-            if self.lds_overlap(form, other, across_lanes=True):
+            if self.lds_overlap(form, other):
                 raise Unsupported('ds_write_b32 %s: the four-byte intervals of two lanes are not disjoint '
                                   '(stride %d offset %d against stride %d offset %d), so one lane could overwrite '
                                   'another lane\'s slot' % (' '.join(ops), form[0], form[1], other[0], other[1]))
-        slots = self.__dict__.setdefault('lds', {})
-        # The same lane's earlier slot is stale when this four-byte write reaches any of its dwords.
-        for key in [k for k in slots if k != form and self.lds_overlap(form, k, across_lanes=False)]:
-            del slots[key]
         writes.append(form)
-        slots[form] = (data[1], self.v_version(data[1]))
+        self.__dict__.setdefault('lds', {})[form] = (data[1], self.v_version(data[1]))
         self.used_v.add(data[1])
         return None
 

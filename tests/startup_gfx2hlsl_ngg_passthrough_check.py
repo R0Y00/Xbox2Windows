@@ -88,6 +88,10 @@ got = run(ALLOC, *LANE, 'v_lshlrev_b32 v10, 2, v1', 'ds_write_b32 v10, v2 offset
           'ds_read_b32 v3, v10 offset:16', POS)
 check('lowered: stride 4, single offset', got[:1] == ['v3 = v2;'], repr(got))
 
+got = run(ALLOC, *LANE, 'v_lshlrev_b32 v10, 3, v1', 'ds_write_b32 v10, v2', 'ds_write_b32 v10, v8', BARRIER,
+          'ds_read_b32 v3, v10', POS)
+check('lowered: the same lane rewrites its slot, the read returns the latest payload', got[:1] == ['v3 = v8;'], repr(got))
+
 # ---- controls that must be refused --------------------------------------------------------------------------------
 # With a stride of 4, lane A's offset 20 and lane B's offset 16 name the same DWORD (lane 0 + 20 == lane 1 + 16).
 ALIAS = (ALLOC, *LANE, 'v_lshlrev_b32 v10, 2, v1', 'ds_write_b32 v10, v2 offset:16', 'ds_write_b32 v10, v8 offset:20',
@@ -154,7 +158,7 @@ for label, instructions, reason, *extra in REFUSED:
 def mutation_control():
     """Without the disjointness check the aliasing case is accepted: the control above fails then."""
     saved = G.Stage.lds_overlap
-    G.Stage.lds_overlap = lambda self, a, b, *, across_lanes: False
+    G.Stage.lds_overlap = lambda self, a, b: False
     try:
         return run(*ALIAS)
     finally:
