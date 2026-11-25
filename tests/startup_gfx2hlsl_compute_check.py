@@ -471,6 +471,7 @@ def check_lds():
         (store, '040134d804050000', 'one bounded dword'),             # last lane exceeds the 512-byte allocation
         (store, store + store, 'one bounded dword'),                  # overlapping fill
         (wait + barrier, nop + barrier, 'completed fill'),
+        (barrier, '01008abf', 'one barrier'),                         # nonzero reserved immediate
         (barrier, nop, 'after the fill barrier'),
         (barrier, barrier + barrier, 'one barrier'),
         (peer, '0c00d8d808000006', 'initialized span'),               # read before the filled span

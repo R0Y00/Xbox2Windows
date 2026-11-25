@@ -813,7 +813,8 @@ def check_lds_exchange(ins, group, words):
                 or base == 's_endpgm' and i + 1 < len(ins)):
             raise Unsupported('LDS exchange needs straight-line code and entry EXEC')
         if base == 's_barrier':
-            if first is None or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], []) or asm != 's_barrier 0x0':
+            if (first is None or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
+                    or mods or ops not in ([], ['0'], ['0x0'])):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
             published = True
         elif base in ('ds_write_b32', 'ds_read_b32'):
@@ -847,7 +848,7 @@ def check_lds_exchange(ins, group, words):
             raise Unsupported('LDS exchange does not cover ' + asm)
         elif first is None and not base.startswith('s_'):
             # Simple VALU instructions only write their single destination. Other forms, e.g. v_swap_b32,
-            # can also change a source. An unknown write could destroy the local-ID proof.
+            # can also change a source. After the fill, each read proves its own address without the entry X ID.
             if (base not in VEC_U and base not in VEC_F and base != 'v_mov_b32'
                     or not ops or not re.fullmatch(r'v[0-9]+', ops[0]) or ops[0] == 'v0'):
                 raise Unsupported('LDS fill needs the unchanged entry local X ID')
