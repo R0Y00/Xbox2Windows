@@ -310,13 +310,19 @@ CASES['I'] = (SOURCE_A.replace('buffer_store_dword', STRIDE_CLEAR + '\nbuffer_st
               *CASES['A'][2:])
 
 
-def root_blob(constants=2):
-    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges."""
+def root_blob(constants=2, table_range=False):
+    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
+
+    table_range gives the table one SRV range (t0, one descriptor) for a blob that a device creates: the Windows 10
+    in-box D3D12 runtime (10.0.19041) corrupts its heap in CreateRootSignature for a table with no ranges. The
+    default bytes are unchanged because they are part of pinned request keys.
+    """
     params_at, constants_at = 24, 24 + 2 * 12
     table_at = constants_at + 12
-    rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8, 0)
+    ranges = struct.pack('<6I', 0, 1, 0, 0, 0, 0xffffffff) if table_range else b''  # SRV, 1, t0, space 0, append
+    rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8 + len(ranges), 0)
             + struct.pack('<3I', 1, 0, constants_at) + struct.pack('<3I', 0, 0, table_at)
-            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', 0, table_at + 8))
+            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', len(ranges) // 24, table_at + 8) + ranges)
     part = b'RTS0' + struct.pack('<I', len(rts0)) + rts0
     return b'DXBC' + bytes(16) + struct.pack('<III', 1, 32 + 4 + len(part), 1) + struct.pack('<I', 36) + part
 
