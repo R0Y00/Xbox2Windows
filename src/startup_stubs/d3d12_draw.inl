@@ -23,6 +23,7 @@ struct Translation {
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
+    std::optional<bool> independent_indirect_entry;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
     LONG logged_draws = 0, logged_bindings = 0, logged_large = 0;  // diagnostics budget per translation
@@ -31,6 +32,7 @@ struct Translation {
 // Per title pipeline: its translation and the blend state found in its state block (if any).
 struct BoundPipeline {
     Translation* translation = nullptr;
+    const std::vector<RootParameter>* guest_root = nullptr;
     bool has_blend = false;
     D3D12_BLEND_DESC blend{};
     bool has_depth_stencil = false;
@@ -562,6 +564,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
         Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
+        bound->guest_root = root ? root_info(root) : nullptr;
         std::vector<unsigned char> root_blob;
         if (root) {
             AcquireSRWLockShared(&note_lock);
@@ -1352,7 +1355,49 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
     return true;
 }
 
-bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
+// FXC keeps unused entry declarations in reflection. Check actual uses so a
+// generated shader which reads the draw's start vertex or instance is refused.
+bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation)
+{
+    x2w_startup::ComPtr<ID3D12ShaderReflection> shader;
+    if (!blob || FAILED(D3DReflect(blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(shader.GetAddressOf())))) return false;
+    D3D12_SHADER_DESC desc{};
+    if (FAILED(shader->GetDesc(&desc)) || ((desc.Version >> 4) & 0xf) != 5) return false;
+    for (UINT binding = 0; binding < desc.BoundResources; ++binding) {
+        D3D12_SHADER_INPUT_BIND_DESC input{};
+        if (FAILED(shader->GetResourceBindingDesc(binding, &input))) return false;
+        if (input.Type != D3D_SIT_CBUFFER) continue;
+        if (!input.Name || std::strcmp(input.Name, "entry") || input.Space || input.BindPoint || input.BindCount != 1) return false;
+        auto* buffer = shader->GetConstantBufferByName(input.Name);
+        D3D12_SHADER_BUFFER_DESC cb{};
+        if (!buffer || FAILED(buffer->GetDesc(&cb))) return false;
+        for (UINT i = 0; i < cb.Variables; ++i) {
+            D3D12_SHADER_VARIABLE_DESC var{};
+            if (FAILED(buffer->GetVariableByIndex(i)->GetDesc(&var))) return false;
+            if (!(var.uFlags & D3D_SVF_USED)) continue;
+            const auto word = var.StartOffset / sizeof(UINT);
+            char name[16];
+            std::snprintf(name, sizeof(name), "ud%u", static_cast<unsigned>(word));
+            if (var.StartOffset % sizeof(UINT) || var.Size != sizeof(UINT) || word >= translation.uds.size() ||
+                !var.Name || std::strcmp(var.Name, name)) return false;
+            const int kind = translation.uds[word].kind;
+            if (kind != Translation::root_constant && kind != Translation::rect && kind != Translation::d16_unorm16)
+                return false;
+        }
+    }
+    return true;
+}
+
+struct TranslatedIndirectDraw {
+    ID3D12CommandSignature* signature;
+    ID3D12Resource* argument;
+    u64 offset;
+    u64 shader_key = 0;
+    const char* refusal = "translated pipeline or target unavailable";
+};
+
+bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
+                     TranslatedIndirectDraw* indirect)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
@@ -1361,10 +1406,29 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     AcquireSRWLockExclusive(&draw_lock);
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    if (indirect && tr) indirect->shader_key = tr->key;
     std::uint32_t d16_unorm16[32] = {};
     if (!tr || tr->state != 1 || !d16_srvs_ready(*tr, pass, d16_unorm16)) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
+    }
+    if (indirect) {
+        if (!bound->guest_root || bound->guest_root != pass.root) {
+            indirect->refusal = "translated draw requires the guest pipeline's root signature";
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
+        if (!tr->independent_indirect_entry.has_value()) {
+            tr->independent_indirect_entry = indirect_shader_entry(tr->vs, *tr) && indirect_shader_entry(tr->ps, *tr) &&
+                std::all_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) {
+                    return srv.kind > 0 && srv.source == 0;
+                });
+        }
+        if (!*tr->independent_indirect_entry || tr->samplers.heap) {
+            indirect->refusal = "translated draw uses an unsupported resource or draw-dependent entry value";
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
     }
     ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
@@ -1472,6 +1536,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
                 }
             }
+            if (indirect && (!texture || record.slot != 18 || texture == pass.target0)) {
+                indirect->refusal = "translated draw requires a matching sampled texture distinct from the target";
+                ReleaseSRWLockExclusive(&draw_lock);
+                return false;
+            }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
             if (texture) require_state(self, texture, sampled_state(self, texture));
             const bool had_texture = texture != nullptr;
@@ -1492,6 +1561,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 desc.Texture2DArray = {};
                 desc.Texture2D.MipLevels = 1;
                 if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
+            }
+            if (indirect && !texture) {
+                indirect->refusal = "translated draw could not bind its sampled texture";
+                ReleaseSRWLockExclusive(&draw_lock);
+                return false;
             }
             x2w_local::BindingFacts facts;
             facts.texture = facts.from_table = true;
@@ -1641,7 +1715,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(n), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
-    if (indexed) {
+    if (indirect) {
+        require_state(self, indirect->argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list->ExecuteIndirect(indirect->signature, 1, indirect->argument, indirect->offset, nullptr, 0);
+        // The translated root invalidated the desktop arguments of the tracked guest root.
+        list->SetGraphicsRootSignature(pass.graphics_root);
+        pass.srv_bound = 0;
+        drawn = true;
+    } else if (indexed) {
         u64 offset = 0;
         const u64 address = index_address;
         const std::size_t bytes = index_total;
@@ -1657,8 +1738,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     }
     if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
-    if (drawn) draw_dump_after(self, list, tr->key, count);
+    if (drawn && !indirect) draw_dump_after(self, list, tr->key, count);
     ReleaseSRWLockExclusive(&draw_lock);
+    if (indirect) return drawn;
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {
         char indices[3 * 24 + 1] = "";
         if (indexed && pass.ib.BufferLocation) hex_text(reinterpret_cast<const void*>(pass.ib.BufferLocation + u64{start} * 2), 24, indices, sizeof(indices));
@@ -1669,6 +1751,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             pass.target_count);
     }
     return drawn;
+}
+
+bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
+{
+    return draw_translated(self, indexed, count, instances, start, base_vertex, start_instance, nullptr);
+}
+
+const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset)
+{
+    TranslatedIndirectDraw draw{signature, argument, offset};
+    if (!draw_translated(self, false, 0, 0, 0, 0, 0, &draw)) return draw.refusal;
+    InterlockedIncrement(&translated_draws);
+    static LONG reported;
+    if (first_calls(reported, 16))
+        log("x2w-render translated ExecuteIndirect Draw recorded, shader %016llx, offset 0x%llx", draw.shader_key, offset);
+    return nullptr;
 }
 
 // List slot 32, SetDescriptorHeaps. Track the title's shader-visible sampler

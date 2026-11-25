@@ -1942,21 +1942,32 @@ class Stage:
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
         if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
             raise Unsupported('unverified 1D image sample address or modifiers')
-        lod = None
-        if how == 'l':
-            # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
-            # would add dwords or modifiers this lowering does not read, so they are refused. Only the cache-policy
+        lod = bias = None
+        if how in ('l', 'b'):
+            # image_sample_l: the address dwords are the coordinates and then the explicit level. image_sample_b:
+            # the RDNA 2 ISA (section 8.2.5, "{ offset } { bias } { z-compare } { derivative } { body }") puts one
+            # float bias dword BEFORE the coordinates. Offsets, clamp and derivatives would add dwords or modifiers
+            # this lowering does not read, so they are refused. Only the cache-policy
             # bits (glc, slc, dlc), which never change the sampled value, are accepted next to dim and dmask;
             # unorm, r128, tfe, lwe, a16, d16 and reserved bits would each change the address, resource or result
             # layout and are refused by name.
+            name = 'image_sample_' + how
             for m in mods:
                 if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
-                    raise Unsupported('image_sample_l modifier %s' % m)
+                    raise Unsupported('%s modifier %s' % (name, m))
             if dmask == 0:
-                raise Unsupported('image_sample_l with an empty dmask')
+                raise Unsupported('%s with an empty dmask' % name)
             if len(cs) != (4 if three else 3):
-                raise Unsupported('image_sample_l with %d address registers' % len(cs))
-            lod, cs = cs[-1], cs[:-1]
+                raise Unsupported('%s with %d address registers' % (name, len(cs)))
+            if how == 'l':
+                lod, cs = cs[-1], cs[:-1]
+            else:
+                # The bias is added to the LOD derived from the coordinate derivatives of the pixel quad: only a
+                # pixel stage that still runs with its entry mask has them. Elsewhere the plain sample is lowered
+                # to level 0, which would drop the bias, so the bias form is refused instead.
+                if self.kind != 'ps' or not self.exec_known or len(self.blocks) > 0:
+                    raise Unsupported('image_sample_b needs implicit derivatives: pixel stage, entry mask, no branches')
+                bias, cs = cs[0], cs[1:]
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):
@@ -2007,7 +2018,14 @@ class Stage:
                     raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
-            smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
+            if how == 'b':
+                # The guest clamps the biased LOD to the sampler's MIN_LOD and MAX_LOD. Only a constant descriptor
+                # can be read here, and only its limits are carried to the static sampler (line smpl), so a sampler
+                # from the heap or from a register is refused: its limits and bias cannot be shown to be irrelevant.
+                words = self.sample_b_sampler(heap, words)
+                smp = self.pipe.sampler(tuple(words), lod_limits=True)
+            else:
+                smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             if packed_2d:
                 packed = self.u(cs[0])
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
@@ -2022,6 +2040,11 @@ class Stage:
                 raise Unsupported('image_sample with implicit LOD in a compute program')
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
+            elif how == 'b':
+                # SampleBias adds the bias to the implicit LOD, like the ISA's _B suffix ("Add this BIAS to the LOD
+                # computed"). The sampler's LOD limits are carried by the smpl line; its LOD bias is refused in
+                # sample_b_sampler.
+                call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
@@ -2123,6 +2146,34 @@ class Stage:
 
     def op_image_sample_l(self, ops, mods):
         self.image(ops, mods, 'l')
+
+    def sample_b_sampler(self, heap, words):
+        """The constant sampler words of an image_sample_b, or Unsupported when the guest sampler state is not kept.
+
+        SQ_IMG_SAMP_WORD1 bits 11:0 MIN_LOD and 23:12 MAX_LOD are u4.8 and are carried to MinLOD and MaxLOD of the
+        static sampler (translated_sampler_bindings.h, line smpl). SQ_IMG_SAMP_WORD2 bits 13:0 LOD_BIAS (s6.8) and
+        19:14 LOD_BIAS_SEC (s2.4) are not carried: the ISA scales them by T#.perf_modulation, which the D3D12 sampler
+        has no field for, so a nonzero bias is refused. Mip filter 0 disables mipmapping (ISA: "0=none (disable
+        mipmapping, use base-level)"), which a D3D12 sampler cannot express and which would make the bias count, so
+        it is refused too. Field layout: Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json, SQ_IMG_SAMP_WORD1/2."""
+        if heap:
+            raise Unsupported('image_sample_b through a sampler heap (LOD limits and bias unknown)')
+        if not words:
+            raise Unsupported('image_sample_b with a sampler that is not constant')
+        if list(words) == [0, 0, 0, 0] and 'dynamic sampler index replaced by a default sampler' in self.pipe.notes:
+            # The default-sampler shortcut for a run-time heap load leaves four zero words behind.
+            raise Unsupported('image_sample_b through a sampler heap (replaced by a default sampler)')
+        if words[2] & 0xfffff:
+            raise Unsupported('image_sample_b with a sampler LOD bias (word 2 %#x)' % words[2])
+        if (words[2] >> 26) & 3 == 0:
+            raise Unsupported('image_sample_b with mipmapping disabled (sampler mip filter 0)')
+        if words[1] & 0xfff > (words[1] >> 12) & 0xfff:
+            raise Unsupported('image_sample_b with sampler MIN_LOD %#x above MAX_LOD %#x'
+                              % (words[1] & 0xfff, (words[1] >> 12) & 0xfff))
+        return words
+
+    def op_image_sample_b(self, ops, mods):
+        self.image(ops, mods, 'b')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
@@ -3161,11 +3212,12 @@ class Pipeline:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
         return 'r%d' % r['index']
 
-    def sampler(self, key, comparison=False):
+    def sampler(self, key, comparison=False, lod_limits=False):
         if not isinstance(key[0], int):
             raise Unsupported('sampler from a descriptor')
-        # A comparison sampler is its own binding even when its words equal an ordinary sampler's.
-        key = ('cmp',) + tuple(key) if comparison else key
+        # A comparison sampler, or one that carries the descriptor's LOD limits (image_sample_b), is its own binding
+        # even when its words equal an ordinary sampler's.
+        key = ('cmp',) + tuple(key) if comparison else ('lod',) + tuple(key) if lod_limits else key
         return 'q%d' % self.samplers.setdefault(key, len(self.samplers))
 
     def common(self):
@@ -3355,8 +3407,9 @@ class Pipeline:
             if r.get('d16_exact'):
                 lines.append('d16srv %d exact' % r['index'])
         for key, i in self.samplers.items():
-            comparison = key[0] == 'cmp'
-            lines.append('%s %d %s' % ('smpc' if comparison else 'smp', i, ' '.join('0x%x' % w for w in key[comparison:])))
+            prefixed = key[0] in ('cmp', 'lod')
+            lines.append('%s %d %s' % ({'cmp': 'smpc', 'lod': 'smpl'}.get(key[0], 'smp'), i,
+                                       ' '.join('0x%x' % w for w in key[prefixed:])))
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))

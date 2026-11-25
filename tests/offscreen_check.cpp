@@ -453,7 +453,8 @@ bool validate_compute_mesh_texture_fallback_args(int argc, char** argv)
            (argc != 10 || std::string_view(argv[9]) == "--stale");
 }
 
-OperationResult run_check_pixel_batch(const OperationContext& ctx)
+template<class AfterDraw>
+OperationResult run_pixel_batch(const OperationContext& ctx, AfterDraw after_draw)
 {
     bool failed = false;
     for (int i = 4; i < ctx.argc; ++i) {
@@ -462,6 +463,7 @@ OperationResult run_check_pixel_batch(const OperationContext& ctx)
         try {
             check(ctx.device->GetDeviceRemovedReason(), "Pixel batch device");
             check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[i]);
+            after_draw(i - 4);
         } catch (const PixelMismatch& e) {
             std::fprintf(stderr, "%s\n", e.what());
             status = "mismatch";
@@ -476,6 +478,32 @@ OperationResult run_check_pixel_batch(const OperationContext& ctx)
         failed |= std::string_view(status) != "pass";
     }
     return failed ? OperationResult{OutcomeKind::fail, nullptr} : OperationResult{OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_batch(const OperationContext& ctx)
+{
+    return run_pixel_batch(ctx, [](int) {});
+}
+
+OperationResult run_pixel_batch_debug_control(const OperationContext& ctx)
+{
+    if (!ctx.messages) return {OutcomeKind::skip, "skip: pixel batch control requires the D3D12 debug layer"};
+    return run_pixel_batch(ctx, [&](int index) {
+        if (index == 1)
+            check(ctx.messages->AddApplicationMessage(D3D12_MESSAGE_SEVERITY_ERROR, "pixel batch control error"),
+                  "Add pixel batch control message");
+    });
+}
+
+OperationResult run_pixel_batch_removal_control(const OperationContext& ctx)
+{
+    ComPtr<ID3D12Device5> device;
+    const HRESULT hr = ctx.device->QueryInterface(IID_PPV_ARGS(&device));
+    if (hr == E_NOINTERFACE) return {OutcomeKind::skip, "skip: pixel batch control requires ID3D12Device5"};
+    check(hr, "Query pixel batch control device");
+    return run_pixel_batch(ctx, [&](int index) {
+        if (index == 1) device->RemoveDevice();
+    });
 }
 
 OperationResult run_compute_root(const OperationContext& ctx)
@@ -1431,6 +1459,8 @@ constexpr CapabilityGate kGateSm66MinLod{
 // remain inside the handlers and report OutcomeKind::skip.
 const OperationSpec kOperations[] = {
     {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_pixel_batch},
+    {"--pixel-batch-debug-control", 7, 7, nullptr, kNoGate, run_pixel_batch_debug_control},
+    {"--pixel-batch-removal-control", 7, 7, nullptr, kNoGate, run_pixel_batch_removal_control},
     {"--compute-root", 3, 3, nullptr, kNoGate, run_compute_root},
     {"--compute-tables", 3, 3, nullptr, kNoGate, run_compute_tables},
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},

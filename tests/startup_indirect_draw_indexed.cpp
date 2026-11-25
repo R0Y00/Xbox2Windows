@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -85,6 +86,21 @@ float4 pixel(Varying input) : SV_Target {
     discard;
     return float4(0, 0, 0, 1);
 }
+cbuffer entry : register(b0) { uint ud0; uint ud1; };
+Texture2D<float4> translated_texture : register(t0);
+
+float4 translated_vertex(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1);
+}
+
+float4 translated_vertex_with_start(uint id : SV_VertexID) : SV_Position {
+    return translated_vertex(id + ud1);
+}
+
+float4 translated_pixel() : SV_Target {
+    return translated_texture.Load(int3(0, 0, 0));
+}
+
 )";
 
 template <typename Method>
@@ -119,14 +135,60 @@ ComPtr<ID3DBlob> compile(const char* entry, const char* profile)
     return code;
 }
 
-ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_SIGNATURE_DESC& desc)
+ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_SIGNATURE_DESC& desc,
+                                       ComPtr<ID3DBlob>* serialized = nullptr)
 {
     ComPtr<ID3DBlob> code;
     check(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &code, nullptr), "serialize root");
     ComPtr<ID3D12RootSignature> root;
     check(device->CreateRootSignature(0, code->GetBufferPointer(), code->GetBufferSize(), IID_PPV_ARGS(&root)),
           "create root");
+    if (serialized) *serialized = code;
     return root;
+}
+
+ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob, bool needs_start)
+{
+    // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
+    constexpr char revision[] = "x2w-startup-shader-8";
+    static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102};
+    static std::uint32_t pixel_id = 0xe0000202;
+    auto& vertex_id = vertex_ids[needs_start];
+    std::uint64_t key = 1469598103934665603ull;
+    const auto add = [&key](const void* data, std::size_t bytes) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < bytes; ++i) key = (key ^ p[i]) * 1099511628211ull;
+    };
+    add(revision, sizeof(revision) - 1);
+    add(&vertex_id, sizeof(vertex_id));
+    add(&pixel_id, sizeof(pixel_id));
+    add(root_blob->GetBufferPointer(), root_blob->GetBufferSize());
+    char stem[32];
+    std::snprintf(stem, sizeof(stem), "%016llx", static_cast<unsigned long long>(key));
+    char directory[MAX_PATH];
+    const DWORD size = GetEnvironmentVariableA("X2W_SHADER_CACHE", directory, MAX_PATH);
+    check(size && size < MAX_PATH ? S_OK : E_FAIL, "find fixture cache");
+    const std::string prefix = std::string(directory) + "\\" + stem;
+    const auto write = [&](const char* suffix, const void* bytes, std::size_t count) {
+        std::ofstream file(prefix + suffix, std::ios::binary | std::ios::trunc);
+        file.write(static_cast<const char*>(bytes), count);
+        check(file.good() ? S_OK : E_FAIL, "write fixture cache");
+    };
+    const auto vs = compile(needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
+    const auto ps = compile("translated_pixel", "ps_5_1");
+    write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
+    write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
+    constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
+    write(".txt", manifest, sizeof(manifest) - 1);
+    const std::array<UINT64, 0x300 / sizeof(UINT64)> desc{
+        reinterpret_cast<UINT64>(root), 0, 0, 0, 0,
+        reinterpret_cast<UINT64>(&vertex_id), sizeof(vertex_id), 0, 0,
+        reinterpret_cast<UINT64>(&pixel_id), sizeof(pixel_id), 0};
+    using Create = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
+    ComPtr<IUnknown> result;
+    check(slot<Create>(guest, 57)(guest, desc.data(), __uuidof(ID3D12PipelineState),
+        reinterpret_cast<void**>(result.GetAddressOf())), "create translated guest pipeline");
+    return result;
 }
 
 ComPtr<ID3D12PipelineState> writer_pipeline(ID3D12Device* device, ID3D12RootSignature* root, const char* entry)
@@ -237,8 +299,51 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
-enum class Refusal { none, invalid_index, short_argument, missing_viewport };
+enum class Refusal { none, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex };
 enum class DrawKind { indexed, vertices, mesh };
+
+struct TranslatedDrawFixture {
+    TranslatedDrawFixture(ID3D12Device* guest, std::uint32_t colour)
+        : wrong_root(create_root(guest, {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE})),
+          backing(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+    {
+        if (!backing) throw std::bad_alloc();
+        std::memcpy(backing.get(), &colour, sizeof(colour));
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, format, {1, 0},
+                                      D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+        using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+        check(slot<Place>(guest, 133)(guest, backing.get(), &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            __uuidof(ID3D12Resource), reinterpret_cast<void**>(texture.GetAddressOf())), "place sampled texture");
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            UINT64 backing, bytes;
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+        using CreateHeap = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
+        check(slot<CreateHeap>(guest, 14)(guest, &heap_desc, __uuidof(ID3D12DescriptorHeap),
+            reinterpret_cast<void**>(heap.GetAddressOf())), "create sampled texture heap");
+        struct {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            UINT64 address = 0, tail[2]{};
+        } storage;
+        auto& srv = storage.view;
+        srv.Format = format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        using Handle = UINT64 (WINAPI*)(IUnknown*, void*);
+        const UINT64 cpu = slot<Handle>(heap.Get(), 9)(heap.Get(), nullptr);
+        gpu = slot<Handle>(heap.Get(), 10)(heap.Get(), nullptr);
+        check(cpu && gpu ? S_OK : E_FAIL, "get guest texture handles");
+        using View = void (WINAPI*)(IUnknown*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, UINT64, UINT64);
+        slot<View>(guest, 18)(guest, texture.Get(), &srv, cpu, 0);
+    }
+
+    ComPtr<ID3D12RootSignature> wrong_root;
+    std::unique_ptr<void, FreeMemory> backing;
+    ComPtr<ID3D12Resource> texture;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    UINT64 gpu = 0;
+};
 
 constexpr UINT command_stride(DrawKind kind)
 {
@@ -259,7 +364,7 @@ bool supports_mesh(ID3D12Device* device)
 
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
-         DrawKind kind, bool draw_right, Refusal refusal, const char* label)
+         DrawKind kind, bool draw_right, Refusal refusal, const char* label, const TranslatedDrawFixture* translated = nullptr)
 {
     const bool indexed = kind == DrawKind::indexed;
     const bool mesh = kind == DrawKind::mesh;
@@ -335,7 +440,14 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     slot<Clear>(wrapped, 52)(wrapped, rtv.ptr, clear, 0, nullptr);
     slot<Targets>(wrapped, 50)(wrapped, 1, &rtv, FALSE, nullptr);
     slot<Bind>(wrapped, 25)(wrapped, graphics);
-    slot<Bind>(wrapped, 34)(wrapped, graphics_root);
+    slot<Bind>(wrapped, 34)(wrapped, refusal == Refusal::wrong_root ? translated->wrong_root.Get() : graphics_root);
+    if (translated && refusal != Refusal::missing_texture) {
+        ID3D12DescriptorHeap* heaps[]{translated->heap.Get()};
+        using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+        using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
+        slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
+        slot<Table>(wrapped, 36)(wrapped, 0, translated->gpu);
+    }
     if (!mesh) slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (refusal != Refusal::missing_viewport) slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
     slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
@@ -352,6 +464,14 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     check(slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped), "close guest command list");
     submit(device, list);
 
+    if (translated) {
+        constexpr Words empty{};
+        if (std::memcmp(arguments.address, empty.data(), sizeof(empty))) {
+            std::fprintf(stderr, "%s: CPU argument backing changed\n", label);
+            return false;
+        }
+    }
+
     const D3D12_RANGE arg_range{0, sizeof(initial)};
     check(arg_readback->Map(0, &arg_range, &memory), "map argument readback");
     Words observed{};
@@ -359,7 +479,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     arg_readback->Unmap(0, &untouched);
     Words expected = initial_words;
     if (writer) {
-        expected[1] = !indexed && draw_right ? 6 : 3;
+        expected[1] = !translated && !indexed && draw_right ? 6 : 3;
         expected[2] = 1;
         if (indexed) expected[3] = draw_right ? 4 : 1;
         if (mesh) {
@@ -395,9 +515,9 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
             std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * sizeof(actual),
                         sizeof(actual));
             const bool right_half = x >= width / 2;
-            const bool covered = indexed ? right_half == draw_right : !right_half || draw_right;
+            const bool covered = translated || (indexed ? right_half == draw_right : !right_half || draw_right);
             const bool drawn = writer && refusal == Refusal::none && covered;
-            const auto wanted = drawn ? (right_half ? green : red) : black;
+            const auto wanted = drawn ? (translated ? (draw_right ? green : red) : (right_half ? green : red)) : black;
             if (actual != black) ++painted;
             if (actual == wanted) continue;
             std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
@@ -451,9 +571,10 @@ std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
+    const bool translated = argc == 3 && std::strcmp(argv[2], "translated") == 0;
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
-    if (argc == 3 && std::strcmp(argv[2], "draw") == 0) kind = DrawKind::vertices;
+    if (translated || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "mesh") == 0) kind = DrawKind::mesh;
     else if (argc != 2 && !count_control) return 2;
     const bool indexed = kind == DrawKind::indexed;
@@ -520,6 +641,42 @@ int main(int argc, char** argv) try
     const auto root_flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, root_flags};
     const auto writer = create_root(device.Get(), writer_desc);
+    if (translated) {
+        const auto cache = std::filesystem::current_path() / ("indirect-translated-" + std::to_string(GetCurrentProcessId()));
+        std::filesystem::create_directory(cache);
+        check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set fixture cache");
+        check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", "1") ? S_OK : E_FAIL, "enable fixture path");
+        const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER table{};
+        table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        table.DescriptorTable = {1, &range};
+        const D3D12_ROOT_SIGNATURE_DESC title_desc{1, &table, 0, nullptr, root_flags};
+        ComPtr<ID3DBlob> root_blob;
+        const auto title_root = create_root(guest.Get(), title_desc, &root_blob);
+        const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
+        const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
+        const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");
+        D3D12_INDIRECT_ARGUMENT_DESC argument{};
+        argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
+        ComPtr<ID3D12CommandSignature> signature;
+        check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create translated draw signature");
+        const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
+        const auto verify = [&](ID3D12PipelineState* gpu_writer, bool use_green, Refusal control, const char* label) {
+            return run(device.Get(), guest.Get(), writer.Get(), gpu_writer, title_root.Get(),
+                control == Refusal::start_vertex ? start_pso.Get() : pso.Get(), signature.Get(),
+                DrawKind::vertices, use_green, control, label, use_green ? &green_binding : &red_binding);
+        };
+        const bool ok = verify(producer.Get(), false, Refusal::none, "translated red texture") &&
+            verify(producer.Get(), true, Refusal::none, "translated green texture") &&
+            verify(nullptr, false, Refusal::none, "translated omitted GPU writer") &&
+            verify(producer.Get(), false, Refusal::wrong_root, "translated wrong guest root") &&
+            verify(producer.Get(), false, Refusal::short_argument, "translated short argument range") &&
+            verify(producer.Get(), false, Refusal::missing_texture, "translated missing texture") &&
+            verify(producer.Get(), false, Refusal::start_vertex, "translated uses start vertex");
+        if (ok) std::filesystem::remove_all(cache);
+        return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+    }
     const auto graphics = create_root(guest.Get(), graphics_desc);
     const char* left_entry = indexed ? "write_left" : "write_one_triangle";
     const char* right_entry = indexed ? "write_right" : "write_two_triangles";

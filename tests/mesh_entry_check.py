@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from mesh_entry_aot import lower
+from mesh_entry_aot import UNDEF, Wave, lower
 
 # Two explicitly modeled wave64s. Only the first three group threads export vertices.
 PROGRAM = """
@@ -805,6 +805,97 @@ def offset_draw():
     return lower(enumerate_pcs(program), words, (3, 1)), [(inputs, positions, True)]
 
 
+SKIPPED_PROGRAM = PROGRAM.copy()
+# s7 is written only inside the range that wave 1 skips (no lane has global thread 0 there), yet it is
+# read after the range. Wave 0 sees 0x1003, wave 1 never has a defined s7, and none of its lanes are live.
+SKIPPED_PROGRAM[-2:-2] = [
+    "s_add_u32 s9, s7, 0x3e7feffd",  # 0x1003 + 0x3e7feffd = 0x3e800000 = 0.25
+    "v_add_f32_e32 v3, s9, v3",
+]
+SKIPPED_DEPTH = 0.5 + 0.25
+RESTORE_EXEC = SKIPPED_PROGRAM.index("s_mov_b64 exec, s[22:23]") + 1
+
+
+def skipped_draw(program=None):
+    program = SKIPPED_PROGRAM if program is None else program
+    positions = [(x, y, SKIPPED_DEPTH, w) for x, y, _, w in TRIANGLE]
+    return lower(enumerate_pcs(program), [0x1003], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def skipped_refusals():
+    # Each control lets an undefined scalar reach something the draw can see. All must be refused.
+    after_range = SKIPPED_PROGRAM.index("s_add_u32 s9, s7, 0x3e7feffd") + 1
+    controls = {
+        "live lane reads it": (RESTORE_EXEC, ["v_add_f32_e32 v3, s9, v3"]),
+        "live lane selects with it": (SKIPPED_PROGRAM.index("v_mov_b32_e32 v9, 0xbf800000") + 1, ["v_cndmask_b32_e64 v1, v9, v8, s[8:9]"]),
+        "branch on it": (after_range, ["s_cmp_eq_u32 s9, 0", "s_cbranch_scc0 0"]),
+        "exec from it": (after_range, ["s_and_b64 exec, exec, s[8:9]"]),
+        "m0 from it": (after_range, ["s_mov_b32 m0, s9"]),
+        "never written anywhere": (after_range, ["s_add_u32 s14, s5, 1", "v_add_f32_e32 v3, s14, v3"]),
+    }
+    for name, (at, lines) in controls.items():
+        program = SKIPPED_PROGRAM.copy()
+        program[at:at] = lines
+        try:
+            lower(enumerate_pcs(program), [0x1003], (3, 1))
+        except KeyError:
+            # A register no instruction writes is an unknown operand, refused by its number.
+            if name != "never written anywhere":
+                raise
+            continue
+        except ValueError as error:
+            if "not written on this wave" not in str(error) and "Undefined" not in str(error):
+                raise AssertionError(f"{name}: refused for another reason: {error}")
+            continue
+        raise AssertionError(f"{name}: accepted")
+
+
+def skipped_unsupported_refusal():
+    # An opcode with implicit EXEC/SCC effects is refused even when an operand is undefined.
+    after_range = SKIPPED_PROGRAM.index("s_add_u32 s9, s7, 0x3e7feffd") + 1
+    program = SKIPPED_PROGRAM.copy()
+    program[after_range:after_range] = ["s_xor_saveexec_b64 s[34:35], s[8:9]"]
+    # Wave 1 reaches the instruction with an undefined operand; it must still see the unsupported opcode.
+    try:
+        Wave(1, [0x1003]).run(enumerate_pcs(program), {})
+    except ValueError as error:
+        assert "Unsupported scalar instruction s_xor_saveexec_b64" in str(error), error
+    else:
+        raise AssertionError("Unsupported scalar opcode accepted with an undefined operand")
+
+
+def skipped_cpu():
+    text = skipped_draw()[0]
+    # The first range in the program is skipped only by wave 1: the skipped write must not leak into wave 0.
+    wave = Wave(1, [0x1003])
+    wave.run(enumerate_pcs(SKIPPED_PROGRAM), {})
+    assert 7 not in wave.s and wave.s[9] is UNDEF, wave.s
+    wave = Wave(0, [0x1003])
+    wave.run(enumerate_pcs(SKIPPED_PROGRAM), {})
+    assert wave.s[7] == 0x1003 and wave.s[9] == 0x3E800000, wave.s
+    # Dropping the contribution changes the exported depth, so the reference is not satisfied by accident.
+    plain = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
+    assert plain != text
+    skipped_refusals()
+    skipped_unsupported_refusal()
+
+
+def skipped_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = skipped_draw()
+    expected = cases[0][1]
+    plain = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
+    word = struct.unpack("<I", struct.pack("<f", SKIPPED_DEPTH))[0]
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [
+        (source, [(x, y, off_by_one, w) for x, y, _, w in TRIANGLE]),
+        (plain, expected),
+    ]
+    for text, positions in wrong:
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         if sys.argv[1] == "binary":
@@ -824,6 +915,15 @@ if __name__ == "__main__":
             fract_tiny_binary(Path(directory), sys.argv[2:])
             fract_nan_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
+        if sys.argv[1] == "skipped":
+            skipped_cpu()
+            sys.exit(0)
+        if sys.argv[1] == "draw-skipped":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *skipped_draw())
+                or skipped_negative_draws(*args, Path(directory))
+            )
         if sys.argv[1] == "draw-cvt-minmax":
             args = sys.argv[2:]
             sys.exit(

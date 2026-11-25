@@ -34,10 +34,12 @@ constexpr UINT texture_atomic_mask = texture_atomic_uint_flag | texture_atomic_s
                                      texture_atomic_uint_minmax_flag | texture_atomic_exchange_flag |
                                      texture_atomic_cas_flag;
 constexpr UINT texture_rgba32_float_flag = 1u << 30;
-// Texture-store cases use scalar X group counts of 1 or 2, leaving bit 22 free.
+// Texture-store cases use only scalar X group counts of 1 or 2, leaving bits 21 and 22
+// free below the format and view selectors.
+constexpr UINT texture_uav_load_flag = 1u << 21;
 constexpr UINT texture_rgba16_float_flag = 1u << 22;
 constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask | texture_rgba32_float_flag |
-                                     texture_rgba16_float_flag;
+                                     texture_rgba16_float_flag | texture_uav_load_flag;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3;
 
@@ -472,6 +474,10 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     switch (selector) {
     case 0: break;
     case texture_rgba32_float_flag: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+    case texture_uav_load_flag:
+        format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        required |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+        break;
     case texture_rgba16_float_flag: format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
     case texture_rgba8_flag: format = DXGI_FORMAT_R8G8B8A8_UINT; break;
     case texture_atomic_uint_flag:
@@ -499,6 +505,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     default: throw std::runtime_error("Invalid compute image store format selector");
     }
     const bool float_image = selector == texture_rgba32_float_flag;
+    const bool uav_load = selector == texture_uav_load_flag;
     const bool half_image = selector == texture_rgba16_float_flag;
     const UINT words_per_texel = texture_words_per_texel(format);
     const UINT base_words = texture_width * texture_height * words_per_texel;
@@ -509,12 +516,21 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     std::vector<UINT> input_texels(float_image ? all_words : 0);
     if (float_image) source.read(reinterpret_cast<char*>(input_texels.data()), all_words * sizeof(UINT));
     if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels
-        || ((selector & texture_atomic_mask) && mip != 0))
+        || (((selector & texture_atomic_mask) || uav_load) && mip != 0))
         throw std::runtime_error("Invalid compute image store reference");
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
     check(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
           "Check texture UAV format");
+    if (uav_load) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+              "Check typed UAV loads for additional formats");
+        if (!options.TypedUAVLoadAdditionalFormats) {
+            std::puts("R32G32B32A32_FLOAT requires TypedUAVLoadAdditionalFormats");
+            return false;
+        }
+    }
     if ((support.Support2 & required) != required) {
         std::printf("format=%u required_support2=0x%x support1=0x%x support2=0x%x\n",
                     static_cast<UINT>(format), required, static_cast<UINT>(support.Support1),
