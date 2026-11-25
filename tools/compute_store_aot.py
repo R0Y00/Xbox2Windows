@@ -1330,11 +1330,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             # desktop wave width: a group of at most 32 threads is one wave of either size, a larger group needs
             # the wave32 statement. The mask must be uniform (a scalar word); exec is not read.
             half, dst = m[1], int(m[2])
-            # exec_lo as the mask (the per-lane rank among active lanes) outside a guarded region: every lane
-            # below the current one is active in a full wave, so the mask is all ones. Inside a guard exec is
-            # the lane compare and is refused.
+            # exec_lo as the mask (the per-lane rank among active lanes) while the wave is full: every lane
+            # below the current one is active, so the mask is all ones. Inside an open guard exec is the
+            # lane compare and is refused; after the restore it is full again and accepted.
             if m[3] == "exec_lo":
-                if guard is not None or guard_span is not None:
+                if guard is not None:
                     raise ValueError("Active lane mask inside guarded region")
                 mask = 0xffffffff
             else:
