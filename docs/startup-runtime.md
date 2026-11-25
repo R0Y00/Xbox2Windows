@@ -647,10 +647,10 @@ costs no file access, and the writes take their own lock, not the draw lock.
 `not written`, with the reason when refused, up to 12 lines per run. The render totals line ends with
 `compute requests published <n> (already present <n>, failed <n>, pointer-like blob qwords <n>)`.
 
-**Offline.** `gfx2hlsl.py --pending` and `--watch` take `.c67` as a ready marker. With no compute stage yet,
-they record `compute stage not supported` in `<key>.fail`. The request stays in the cache, and a later
-`--pending` retries it. `--refusals` reports compute requests in a separate section, so its graphics counts
-do not change, and `triage_run.py` puts their `.fail` reasons in a `compute:` class.
+**Offline.** `gfx2hlsl.py --pending` and `--watch` take `.c67` as a ready marker and translate the request
+(see [Compute pipeline translation](#compute-pipeline-translation)). A refused request stays in the cache, and
+a later `--pending` retries it. `--refusals` reports compute requests in a separate section, so its graphics
+counts do not change, and `triage_run.py` puts their `.fail` reasons in a `compute:` class.
 
 **Local observation** (a local build of this change ported to an older base; one title, local files only, not
 in the repository):
@@ -671,6 +671,59 @@ after building `startup_stream_consumer`. On WARP:
 - A valid, refused, valid sequence publishes the two valid keys.
 - A request whose first four parts already exist is completed without rewriting them.
 - The control runs without render mode and must print `FAIL: no compute request`.
+
+### Compute pipeline translation
+
+`gfx2hlsl.py --pending` and `--watch` translate a `.c67` request with the compute stage instead of recording
+`compute stage not supported`. The request is checked first, and it is refused into `<key>.fail` (with no
+cache path in the text) when:
+- a part is missing;
+- `.desc` is not 96 bytes;
+- a part's length disagrees with its size word in `.desc` (code word 6, data word 8, state blocks words 2 and 4);
+- the files do not hash to the key in their name;
+- the code is empty, is not whole dwords, or has no `s_endpgm`.
+
+The translation is `ComputePipeline(code, root, COMPUTE_PGM_RSRC2, group size)`. Both register values come
+from state block A, which must be 28 bytes. The stage writes `<key>.cs.hlsl`, then `<key>.cs.cso` (DXC
+`cs_6_0`), then the `stage cs` manifest `<key>.txt` last; a stage refusal goes to `<key>.fail` with the
+stage's own reason. A request is done once `<key>.txt` and `<key>.cs.cso` exist. `X2W_FXC=` (empty)
+publishes the manifest alone, as for graphics. `<key>.cs.cso` has the same form as the slot 62 results of
+#1441 in the same directory. The keys come from different hashes, so the names clash only on a 64-bit
+collision. The stand-in does not load the result yet and still creates a placeholder.
+
+The state-block reading is a **hypothesis** from a local observation of 2,689 requests (an earlier local build
+of the request change; one title, local files only):
+- dword 3 holds the thread-group size X in its low 16 bits and Y in its high 16 bits, and the low 16 bits of
+  dword 4 hold Z. All 2,689 sizes are within the `numthreads` limits, with 43 distinct sizes.
+- dword 6 has the `COMPUTE_PGM_RSRC2` layout. Bits 31:24 are zero, and the thread-ID component count never
+  exceeds what the group size needs; it covers a Y size above 1 in 2,671 of 2,689. `TG_SIZE_EN` is set in 91,
+  which the stage refuses.
+
+The stand-in does not decode these values.
+
+Census: one title, local files only.
+- Requests: 2,689, published by a local build of the request change that was ported to an older base.
+- Re-keying: the requests were re-keyed offline with this `compute_key`. The files are unchanged; only their
+  names change.
+- Result: 8 of 2,689 translate and compile, and `--pending` took 11 s. No request is refused by the request
+  checks above.
+- First refusal per request:
+  - `buffer_load_format` from the descriptor format: 1,280;
+  - scalar writes under `s_cbranch_execz`: 541;
+  - `s_load` with a register offset through the resource heap: 158;
+  - `image_store`: 110;
+  - `TG_SIZE_EN`: 91.
+
+Run `python -B tests/startup_compute_translate_check.py` (ctest `startup_compute_translate_requests`, pure
+Python) to check the refusals above and the case A manifest. `startup_compute_translate_e2e_<warp|hardware>`
+goes end to end on the GPU:
+1. the stand-in publishes case A of `startup_gfx2hlsl_compute_check.py`;
+2. `--pending` translates it and DXC compiles it;
+3. `offscreen_check` dispatches `<key>.cs.cso` and compares all 320 words.
+
+Its `wrong_group` control swaps the group size in the state block and must mismatch. This proves that the
+request, translation, bytecode and dispatch fit together. It does not prove the state-block reading, because
+the fixture builds the block at the offsets the translator reads.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
@@ -1693,6 +1746,11 @@ These are measured on one executable; treat them as hypotheses for others.
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
   gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
   (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
+- `image_sample_b` in a pixel stage lowers to `SampleBias(sampler, uv, bias)` for 2D, 2D-array and 3D textures; the bias is the
+  first address register. Offset, clamp, compare and gather forms, other stages, code after a branch, a sampler with a
+  LOD bias, mip filter 0 or MIN_LOD above MAX_LOD, and any sampler from the heap or a register are refused. The descriptor's
+  MIN_LOD and MAX_LOD reach the static sampler through an `smpl` manifest line (MinLOD, MaxLOD); other sample forms do not carry them. `ctest --preset dev --no-tests=error -R '^startup_image_sample_b'` draws bias -1, 0 and +1 on a
+  three-mip array (WARP) and requires mip 0, 1 and 2 (`docs/experiments.md`, "biased image sampling").
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
   reloads the compiled stages. A second fixture draws a clipped triangle through the translated
@@ -2042,6 +2100,81 @@ R24G8 or the added colour families.
   and descriptions outside the rule must come back unchanged. The placed texture is a committed
   desktop texture that does not alias the address, so this shows the answered size is accepted by
   the creation path, not that the console layout fits in it.
+
+## 4 KiB allocation answers for small textures
+
+A console executable asks the allocation-info entries (slots 25 and 108) with `Alignment` 0x1000 for
+a texture that is not a render or depth target and whose top level, padded to 4 KiB blocks, holds at
+most 0x80007 bits. It keeps the answer only when the returned alignment is 0x1000, and otherwise asks
+again with alignment 0. The stand-in used to drop the 4 KiB request (`sanitized()`) and forward the
+desktop answer, 64 KiB at 64 KiB alignment. The executable then recorded 16 pages for a texture the
+console sizes at one, and its streaming read for that texture ran 64 KiB through the following
+resources' compressed chunks. It ended inside one of them, which the executable's own check rejects
+before the request is submitted. The storage stand-in then refused the request as destination
+capacity exceeded.
+
+For a description in scope the stand-in now answers the console size at 4 KiB alignment
+(`src/startup_stubs/small_texture_4k.h`): the GFX10 4 KiB thin-block layout as AMD addrlib computes it.
+Each level is padded to whole blocks (128 x 64 texels at 4 bits a texel, 64 x 64 at 8, 64 x 32 at 16,
+32 x 32 at 32, 32 x 16 at 64, 16 x 16 at 128; block-compressed formats count 4 x 4 blocks) until the
+first level no wider than half a block and no taller than a block. That level and every smaller one
+share one block. (addrlib also caps a tail at 8 levels; a 4 KiB thin tail never holds more than 7.) The first eight uses are logged as
+`x2w-d3d12 allocation info: 4 KiB answer ...`. Desktop D3D12 asked with a 4 KiB alignment is not a
+substitute: on the adapter measured it answered 0x2000 for a 128 x 4 R16G16B16A16 texture, where the
+4 KiB layout takes 0x4000.
+
+Scope: a 2D texture with layout UNKNOWN, `Alignment` 0x1000, one sample, one array slice, power-of-two
+width and height up to 16384, `MipLevels` 0 (full chain) up to the full chain, no render-target or
+depth flag, a single-plane format of 4, 8, 16, 32, 64 or 128 bits a texel (`small_texture_4k_bits`;
+depth with stencil is not answered), the executable's 0x80007-bit bound, and a desktop answer that is
+not a failure. Any other description, arrays, other layouts and 1D or 3D textures included, keeps the
+desktop answer.
+
+The executable's memory for such a texture is then only the answered size. The desktop linear footprint
+(256-byte rows, 512-byte level placement) can be larger: a 32 x 32 R8G8B8A8 texture takes 0x1f80 bytes.
+So for a description that got the 4 KiB answer (`Alignment` 0x1000 and in scope) the stand-in uses one
+compact linear plan (`small_texture_4k_plan`) in every call that touches that memory:
+
+- XG slot 2 reports the answered size at 4 KiB alignment and, per level, the plan's offset, row bytes and
+  size;
+- XG slot 8 writes every row of a level there, or nothing: a row pitch shorter than a row or a level past
+  the last one fails without writing or announcing a write;
+- texture upload (`upload_texture`) reads the same rows from there.
+
+In the plan, every row has its exact byte width (a row of texels, or of 4 x 4 blocks), and the levels
+follow each other from the top level with no padding. Its size never exceeds the answer:
+`startup_small_texture_4k` checks this for every accepted shape. The texels are linear, not the console's
+4 KiB swizzle. Data the executable streams in its own 4 KiB layout is therefore read in the wrong order,
+as it already was with the desktop layout. A GFX10 4 KiB tiling plan, such as `Gfx10Texture` in #1469,
+can replace the compact plan in all three calls at once. At alignment 0 nothing changes: the desktop
+answer and the desktop footprint.
+
+Measured on one console executable under the startup debugger: 18 such reads failed during
+first-run setup in every run, each with the executable's check firing once. With this answer both
+counts were 0 to the same screen. Over the executable's archives, every resource of the family it
+places in 4 KiB blocks starts exactly the size above after the previous one.
+
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k(_whole_width_tail_control)?$' -V`
+  checks literal sizes and the refused descriptions without a device; the control expects a tail one
+  block wide and must fail.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_addrlib$' -V` compares every
+  accepted power-of-two shape and mip count, for one format of each bit depth, with addrlib's
+  `ADDR_SW_4KB_S` size (Mesa 25.1.0, `tools/fetch_addrlib.py`); it skips (77) without addrlib.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_device_' -V` goes through the
+  wrapper: slots 25 and 108 must give the 4 KiB answer, and controls the desktop answer.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_xg' -V` covers a two-mip 32 x 32
+  R8G8B8A8 texture at `Alignment` 0x1000:
+  - slot 2's size, alignment and level records;
+  - slot 8 into exactly the answered size in front of a no-access guard page, with distinct rows and a
+    different sentinel per level, checked byte for byte;
+  - refused copies that leave memory unchanged;
+  - alignment 0 unchanged: slot 2 reports 0x10000 and slot 8 writes all 32 rows.
+
+  The `_no_limit_control` run asks at an explicit 64 KiB alignment, which gets no compact plan, and must
+  fail.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_draw_' -V` writes the same
+  texture through slot 8 in front of a guard page, places it (slot 133), draws both levels through the
+  translated path on WARP and on the hardware adapter, and compares all 48 x 32 read-back pixels.
 
 ## Physical pages in shared sections
 

@@ -62,8 +62,10 @@ ACCEPTED = [
                                                           's_endpgm')),
     ('chain through a second VGPR', JOIN + (LOAD, 'v_mov_b32_e32 v6, s3', 'v_mul_f32_e64 v7, v6, 2.0', READ)),
     ('unrelated scalar write in between', JOIN + (LOAD, DEFINE, 's_mov_b32 s2, 0', READ)),
+    ('median of three after a join', JOIN + (LOAD, 'v_med3_f32 v7, s3, 0, 0.5', READ)),
 ]
-EXPECTED = {'chain through a second VGPR': 's9 = U(F((s3)) * 2.0);'}
+EXPECTED = {'chain through a second VGPR': 's9 = U(F((s3)) * 2.0);',
+            'median of three after a join': 's9 = U(med3(F(s3), F(0x00000000u), 0.5));'}
 for label, instructions in ACCEPTED:
     got = run(*instructions)
     check(f'{label} accepted', read_line(got) == EXPECTED.get(label, RECOMPUTED), repr(got))
@@ -96,6 +98,8 @@ REFUSED = [
     ('VGPR overwritten in between', JOIN + (LOAD, DEFINE, 'v_add_f32_e64 v7, v0, 1.0', READ)),
     ('chain across an EXEC write', JOIN + (LOAD, 'v_mov_b32_e32 v6, s3', 's_and_saveexec_b32 s8, s2',
                                            'v_mul_f32_e64 v7, v6, 2.0', READ)),
+    ('median of three across an EXEC write', JOIN + (LOAD, 'v_med3_f32 v7, s3, 0, 0.5', 's_and_saveexec_b32 s8, s2',
+                                                     READ)),
     ('select on an SCC from before the join', JOIN + ('s_cselect_b32 s3, 1, 0', DEFINE, READ)),
 ]
 for label, instructions in REFUSED:
