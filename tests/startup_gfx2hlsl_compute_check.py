@@ -20,6 +20,9 @@ reads the read buffer at that index and stores to its own destination:
   three words at offset 16 under an exec mask set from a compare (lanes with tid.x < 6), and restores exec;
 - case D counts sparse mask bits below each lane with v_mbcnt_lo/hi, then obtains the full-mask count in lanes
   16-31 under partial EXEC. Two 4x2x4 groups write separate records to the raw buffer.
+- case E runs five SAVEEXEC forms with overlapping and distinct source registers. Four single-thread groups
+  cover both input bits for EXEC and S0; each stores the saved EXEC, resulting SCC and new EXEC.
+- case F exchanges LDS dwords across the two halves of each 64-thread group and broadcasts lane 37.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -164,6 +167,78 @@ WORDS_D = bytes.fromhex(
 SOURCE_D_WRAP = SOURCE_D.replace('v_mov_b32 v6, 7', 's_mov_b32 s22, -1').replace('v8, s20, v6', 'v8, s20, s22')
 WORDS_D_WRAP = WORDS_D.replace(bytes.fromhex('87020c7e080065d7140c0200'), bytes.fromhex('c10396be080065d7142c0000'))
 
+def saveexec_fixture():
+    # RDNA 2 ISA, SOP1: D takes old EXEC, then EXEC takes the bitwise result and SCC reports nonzero.
+    # A single-thread group makes the lane bit the whole participating wave mask.
+    program = [
+        ('s_mov_b32 s10, s6', '06038abe'),
+        ('s_mov_b32 s11, 0', '80038bbe'),
+        ('s_load_dwordx8 s[12:19], s[10:11], 0x0', '05030cf4000000fa'),
+        ('s_waitcnt lgkmcnt(0)', '7fc08cbf'),
+        ('v_lshlrev_b32 v4, 2, s7', '04001ad5820e0000'),
+        ('s_and_b32 s22, s7, 1', '07811687'),
+        ('s_mov_b32 s23, 0', '800397be'),
+        ('s_mov_b32 s21, 0', '800395be'),
+        ('s_lshr_b32 s26, s7, 1', '07811a90'),
+    ]
+    snapshot = [
+        ('s_cselect_b32 s28, 1, 0', '81801c85'),
+        ('s_mov_b32 s29, exec_lo', '7e039dbe'),
+        ('s_mov_b32 exec_lo, 1', '8103febe'),  # every group writes its result, including EXEC == 0
+        ('v_lshlrev_b32 v5, 2, s20', '05001ad582280000'),
+        ('v_lshlrev_b32 v6, 1, s28', '06001ad581380000'),
+        ('v_or_b32 v5, v5, v6', '050d0a38'),
+        ('v_or_b32 v5, s29, v5', '1d0a0a38'),
+        ('buffer_store_dword v5, v4, s[16:19], 0 offen', '001070e004050480'),
+        ('v_add_nc_u32 v4, 16, v4', '9008084a'),
+    ]
+    for op, alias_word, distinct_word in (
+        ('s_and_saveexec_b64', '142494be', '162494be'),
+        ('s_and_saveexec_b32', '143c94be', '163c94be'),
+        ('s_or_saveexec_b64', '142594be', '162594be'),
+        ('s_or_saveexec_b32', '143d94be', '163d94be'),
+        ('s_andn2_saveexec_b64', '142794be', '162794be'),
+    ):
+        dst, src = ('s[20:21]', 's[22:23]') if op.endswith('b64') else ('s20', 's22')
+        for init, operand, word in (
+            (('s_mov_b32 s20, s22', '160394be'), dst, alias_word),
+            (('s_xor_b32 s20, s22, 1', '16811489'), src, distinct_word),
+        ):
+            program.extend((init, ('s_mov_b32 exec_lo, s26', '1a03febe'), (f'{op} {dst}, {operand}', word)))
+            program.extend(snapshot)
+    program.append(('s_endpgm', '000081bf'))
+    return '\n'.join(line for line, _ in program) + '\n', bytes.fromhex(''.join(word for _, word in program))
+
+
+SOURCE_F = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 8
+v_add_nc_u32 v5, s20, v0
+v_lshlrev_b32 v4, 2, v0
+ds_write_b32 v4, v5 offset:16
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_xor_b32 v8, 0x80, v4
+v_and_b32 v8, 0xfc, v8
+ds_read_b32 v6, v8 offset:16
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v8, 0
+ds_read_b32 v7, v8 offset:164
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s21, s7, 6
+v_add_nc_u32 v9, s21, v0
+v_lshlrev_b32 v9, 3, v9
+buffer_store_dwordx2 v[6:7], v9, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_F = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0788148f14000a4a82000834100034d804050000'
+    '7fc08cbf00008abfff08103a80000000ff101036fc0000001000d8d8080000067fc08cbf8002107e'
+    'a400d8d8080000077fc08cbf0786158f1500124a83121234001074e009060480000081bf')
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -171,6 +246,8 @@ CASES = {
     'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
+    'E': (*saveexec_fixture(), USER7 | TGID_X | tidig(1), (1, 1, 1), (4, 1, 1)),
+    'F': (SOURCE_F, WORDS_F, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -215,6 +292,11 @@ SPLICE = {
     'buffer_store_dword v5, v4, s[16:19], 0 offen': '001070e004050480',
     'buffer_store_dword v5, v4, s[16:19], 0 offen offset:6': '061070e004050480',
     'buffer_store_dword v5, v4, s[16:19], 0 offen offset:4092': 'fc1f70e004050480',
+    's_and_b32 s17, s17, 0xc000ffff': '11ff1187ffff00c0',
+    's_and_b32 s17, s17, 0xc000fff0': '11ff1187f0ff00c0',
+    's_and_b32 s18, s18, 0xc000ffff': '12ff1287ffff00c0',
+    's_and_b32 s17, 0xc000ffff, s17': 'ff111187ffff00c0',
+    's_and_b32 s21, s21, 0xc000ffff': '15ff1587ffff00c0',
 }
 
 
@@ -222,13 +304,25 @@ def splice(*lines, at=STORE_A):
     return WORDS_A[:at] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[at:]
 
 
-def root_blob(constants=2):
-    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges."""
+# Case I is case A with the store descriptor's stride field cleared before the store (expected words as case A).
+STRIDE_CLEAR = 's_and_b32 s17, s17, 0xc000ffff'
+CASES['I'] = (SOURCE_A.replace('buffer_store_dword', STRIDE_CLEAR + '\nbuffer_store_dword'), splice(STRIDE_CLEAR),
+              *CASES['A'][2:])
+
+
+def root_blob(constants=2, table_range=False):
+    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
+
+    table_range gives the table one SRV range (t0, one descriptor) for a blob that a device creates: the Windows 10
+    in-box D3D12 runtime (10.0.19041) corrupts its heap in CreateRootSignature for a table with no ranges. The
+    default bytes are unchanged because they are part of pinned request keys.
+    """
     params_at, constants_at = 24, 24 + 2 * 12
     table_at = constants_at + 12
-    rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8, 0)
+    ranges = struct.pack('<6I', 0, 1, 0, 0, 0, 0xffffffff) if table_range else b''  # SRV, 1, t0, space 0, append
+    rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8 + len(ranges), 0)
             + struct.pack('<3I', 1, 0, constants_at) + struct.pack('<3I', 0, 0, table_at)
-            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', 0, table_at + 8))
+            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', len(ranges) // 24, table_at + 8) + ranges)
     part = b'RTS0' + struct.pack('<I', len(rts0)) + rts0
     return b'DXBC' + bytes(16) + struct.pack('<III', 1, 32 + 4 + len(part), 1) + struct.pack('<I', 36) + part
 
@@ -238,8 +332,22 @@ def input_word(i):
 
 
 def expected(name):
+    if name == 'I':
+        return expected('A')
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    if name == 'F':
+        for group in range(2):
+            for lane in range(64):
+                index = (64 * group + lane) * 2
+                out[index:index + 2] = [256 * group + (lane ^ 32), 256 * group + 37]
+        return out
+    if name == 'E':
+        # Group IDs 0..3 encode (old EXEC, S0) = (0,0), (0,1), (1,0), (1,1).
+        # Store old EXEC in bit 2, SCC in bit 1 and new EXEC in bit 0. Both operand layouts agree.
+        and_bits, or_bits, andn2_bits = [0, 0, 4, 7], [0, 3, 7, 7], [0, 3, 4, 4]
+        out[:40] = and_bits * 4 + or_bits * 4 + andn2_bits * 2
+        return out
     if name in ('D', 'D-wrap'):
         for group in range(groups[0]):
             count = 7 if name == 'D' else MASK
@@ -350,7 +458,54 @@ def check_descriptor_scc():
     assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, move).hlsl_cs()
 
 
+def check_lds():
+    # Actual instruction substitutions in the LLVM-assembled exchange. Keep the prefix, except where the
+    # local-ID proof itself is under test; a different first refusal would hide the regression.
+    store = '100034d804050000'
+    peer = '1000d8d808000006'
+    broadcast = 'a400d8d808000007'
+    wait = '7fc08cbf'
+    barrier = '00008abf'
+    nop = '000080bf'
+    hlsl = translate('F').hlsl_cs()
+    sync = 'GroupMemoryBarrierWithGroupSync();'
+    assert hlsl.count(sync) == 1 and hlsl.index('] = v5;') < hlsl.index(sync) < hlsl.index('v6 = lds[')
+    for old, new, reason in (
+        ('82000834', '8002007e82000834', 'unchanged entry local X'),  # write v0 before computing the address
+        ('82000834', '00cb087e82000834', 'unchanged entry local X'),  # v_swap also writes its second operand
+        ('82000834', '82020834', 'one bounded dword'),              # use Y instead of X
+        (store, '040134d804050000', 'one bounded dword'),             # last lane exceeds the 512-byte allocation
+        (store, store + store, 'one bounded dword'),                  # overlapping fill
+        (wait + barrier, nop + barrier, 'completed fill'),
+        (barrier, '01008abf', 'one barrier'),                         # nonzero reserved immediate
+        (barrier, nop, 'after the fill barrier'),
+        (barrier, barrier + barrier, 'one barrier'),
+        (peer, '0c00d8d808000006', 'initialized span'),               # read before the filled span
+        (broadcast, '1001d8d808000007', 'initialized span'),          # first dword after the span
+        (broadcast, '1200d8d808000007', 'aligned'),
+        (broadcast, 'a400dad808000007', 'optional byte offset'),      # GDS
+        ('ff101036fc000000', 'ff101036ff000000', 'aligned'),          # mask leaves unaligned byte addresses
+        ('8002107e', '0403107e', 'literal or literal-masked'),        # unbounded VGPR address
+        (peer + wait, peer + nop, 'completed LGKM wait'),
+        (store, '8003febe' + store, 'entry EXEC'),
+        (store, '020084bf' + store, 'straight-line'),
+    ):
+        refused(reason, lambda: translate('F', code=patch(WORDS_F, old, new)))
+    base = USER7 | TGID_X
+    for units in (0, 65):
+        refused('allocation', lambda: translate('F', rsrc2=base | units << 15))
+    refused('1D group', lambda: translate('F', group=(32, 2, 1)))
+    # Slide the whole span to the end of the 512-byte allocation. Thread 63 now writes its last dword.
+    at_end = patch(WORDS_F, store, '000134d804050000')
+    at_end = patch(at_end, peer, '0001d8d808000006')
+    at_end = patch(at_end, broadcast, '9401d8d808000007')
+    assert 'lds[(v4 + 256u) >> 2] = v5;' in translate('F', code=at_end).hlsl_cs()
+    assert 'groupshared uint lds[8192];' in translate('F', rsrc2=base | 64 << 15).hlsl_cs()
+    assert 'groupshared' not in translate('A', rsrc2=CASES['A'][2] | 1 << 15).hlsl_cs()
+
+
 def check_controls():
+    check_lds()
     check_descriptor_scc()
     check_mbcnt()
     a = translate('A')
@@ -424,6 +579,24 @@ def check_controls():
     for lines in (['s_mov_b32 s18, 0'], ['s_or_b32 s17, s17, 0x40000'], ['s_and_b32 s18, s18, 0xffff'],
                   ['buffer_store_dword v5, v4, s[16:19], 0 offen', 's_mov_b32 s18, 4']):
         refused('modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
+    # Clearing the stride field of dword 1 (s_and with 0xc000ffff, either operand order) gives the raw descriptor a
+    # byte-address store assumes: accepted, and case I runs it on the GPU. Any other mask, another dword, or the same
+    # mask on an image store stays refused.
+    for line in ('s_and_b32 s17, s17, 0xc000ffff', 's_and_b32 s17, 0xc000ffff, s17'):
+        cleared = translate('A', code=splice(line)).hlsl_cs()
+        assert '    u0.Store(a, v5);' in cleared.splitlines(), cleared
+    for line in ('s_and_b32 s17, s17, 0xc000fff0', 's_and_b32 s18, s18, 0xc000ffff'):
+        refused('buffer store through a modified descriptor', lambda line=line: translate('A', code=splice(line)).hlsl_cs())
+    # The clear changes SCC (descriptor data in a scalar ALU op), so a read before a fresh compare is refused by the
+    # stale-SCC rule; with a compare in between the read is emitted. A repeated modification stays refused.
+    clear = 's_and_b32 s17, s17, 0xc000ffff'
+    for reader in ('s_cselect_b32 s20, 1, 0', 's_cbranch_scc1 1'):
+        refused('scc from descriptor data', lambda reader=reader: translate(
+            'A', code=splice(clear, reader, 'v_mov_b32 v5, s20')).hlsl_cs())
+    assert 's20 = scc ?' in translate('A', code=splice(clear, 's_cmp_lt_u32 s7, 4', 's_cselect_b32 s20, 1, 0',
+                                                       'v_mov_b32 v5, s20')).hlsl_cs()
+    for lines in ((clear, clear), (clear, 's_or_b32 s17, s17, 0x40000'), ('s_or_b32 s17, s17, 0x40000', clear)):
+        refused('buffer store through a modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
     # The modification is recorded for the descriptor the word belongs to (byte 16 of the x8 load), not for the
     # load's first descriptor: loads through the read descriptor at byte 0 are unaffected.
     refusals = []
@@ -486,6 +659,8 @@ CONTROLS = {
     'd-base': ('D', MBCNT_COUNT + ' + v6', MBCNT_COUNT),
     'd-hi': ('D', 'v9 = v8;', f'v9 = v8 + {MBCNT_COUNT};'),
     'd-exec': ('D', 'if (exec & 1) v10 =', 'v10 ='),
+    'f-peer': ('F', '0x00000080u ^ v4', 'v4'),
+    'f-broadcast': ('F', 'lds[(v8 + 164u) >> 2]', 'lds[(v8 + 160u) >> 2]'),
 }
 
 # Independent first bad word for each D mutation, including lane zero and the
@@ -536,13 +711,19 @@ def check_dispatch(dxc, runner, adapter, control=None):
             print(run.stdout, end='')
             if run.returncode == 77:
                 return 77
+            diagnostics = []
+            for line in run.stderr.splitlines():
+                if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                    print(line, file=sys.stderr)
+                else:
+                    diagnostics.append(line)
             if mutation:
-                first = run.stderr.strip().splitlines()[:1]
-                if (run.returncode != 1 or 'expected=' not in run.stderr or
+                first = diagnostics[:1]
+                if (run.returncode != 1 or not any('expected=' in line for line in diagnostics) or
                         mutation in MBCNT_MISMATCH and first != [MBCNT_MISMATCH[mutation]]):
                     raise AssertionError('control %s: unexpected result (exit %d) %s' % (mutation, run.returncode, run.stderr))
                 print('control %s: rejected at %s' % (mutation, first[0]))
-            elif run.returncode or run.stderr:
+            elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:
                 print('case %s: all %d words match' % (name, WORDS))
