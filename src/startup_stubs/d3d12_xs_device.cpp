@@ -2688,9 +2688,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     Wrapper* sig = as_wrapper(signature);
     IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
     Wrapper* refusal_pipeline = nullptr;
-    const auto refuse = [&kind, &refusal_pipeline](const char* reason, int outcome = indirect_other,
-                                                   const char* code = nullptr) {
+    u64 trace_call = 0;
+    const auto refuse = [&kind, &refusal_pipeline, &trace_call](const char* reason, int outcome = indirect_other,
+                                                               const char* code = nullptr) {
         InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
+        if (trace_call)
+            log("x2w-mesh86-trace call=%llu stage=record outcome=refused reason=%s", trace_call, reason);
         static LONG refusals;
         if (outcome == indirect_other) {
             const u64 key = known_pipeline_key(refusal_pipeline);
@@ -2704,6 +2707,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     };
     auto* list = recording(self);
     if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
+    if (kind == IndirectCommand::dispatch_mesh && mesh_xmem_trace_ordinal()) {
+        const auto& pass = pass_of(self);
+        if (pass.pipeline && pass.pipeline->own().mesh86_key) trace_call = select_mesh_xmem_trace_call();
+        if (trace_call) trace_mesh_xmem_inputs(self, pass, trace_call, argument, offset);
+    }
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list", indirect_other, indirect_other_refusal_code::invalid_list_type);
@@ -2892,7 +2900,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (leased_arguments)
         inputs[input_count++] = {base + offset, bytes, argument_state};
     if (input_count) {
-        if (const char* failure = record_mesh_xmem_reads(self, inputs, input_count))
+        if (const char* failure = record_mesh_xmem_reads(self, inputs, input_count, trace_call))
             return refuse(failure, mesh_srv != UINT_MAX ? indirect_graphics_pipeline : indirect_other,
                           indirect_other_refusal_code::mesh_xmem_read);
         if (leased_arguments) {
@@ -2957,6 +2965,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
+    if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
     if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
@@ -3464,6 +3473,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             }
         }
         auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
+        bool split = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             red_producers().execute(queue, native_lists, [&] {
@@ -3480,8 +3490,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             retire_note_submission(queue, wrappers);
             for (Wrapper* w : wrappers) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
+            return trace_mesh_xmem_submission(queue, native_lists, split);
         };
-        bool split = false;
         if (mesh_xmem_tracking()) {
             const std::lock_guard lock(mesh_xmem_mutex);
             reap_mesh_xmem_flights();
@@ -3495,7 +3505,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             for (std::size_t i = 0; i < ready.size(); ++i) {
                 native_list[0] = ready[i];
                 wrapper[0] = submitted[i];
-                execute_mesh_xmem_recording(queue, ready[i], [&] { submit(native_list, wrapper); });
+                execute_mesh_xmem_recording(queue, ready[i], [&] { return submit(native_list, wrapper); });
             }
         } else if (!ready.empty()) {
             submit(ready, submitted);

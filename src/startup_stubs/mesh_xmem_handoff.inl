@@ -18,6 +18,42 @@ bool mesh_xmem_tracking()
     return mesh_xmem_handoff() || mesh_xmem_indirect();
 }
 
+// An ordinal selects one slot 86 call per process, keeping replay logs bounded.
+UINT mesh_xmem_trace_ordinal()
+{
+    static const UINT selected = [] {
+        char value[11]{};
+        const DWORD size = GetEnvironmentVariableA("X2W_MESH86_WRITER_TRACE", value, sizeof(value));
+        if (!size || size >= sizeof(value)) return 0u;
+        u64 ordinal = 0;
+        for (DWORD i = 0; i < size; ++i) {
+            if (value[i] < '0' || value[i] > '9') return 0u;
+            ordinal = ordinal * 10 + (value[i] - '0');
+        }
+        return ordinal <= UINT_MAX ? static_cast<UINT>(ordinal) : 0u;
+    }();
+    return selected;
+}
+
+u64 select_mesh_xmem_trace_call()
+{
+    static LONG64 calls;
+    const UINT selected = mesh_xmem_trace_ordinal();
+    if (!selected) return 0;
+    const auto call = static_cast<u64>(InterlockedIncrement64(&calls));
+    return call == selected ? call : 0;
+}
+
+const char* mesh_xmem_queue_type(ID3D12CommandQueue* queue)
+{
+    switch (queue->GetDesc().Type) {
+    case D3D12_COMMAND_LIST_TYPE_DIRECT: return "direct";
+    case D3D12_COMMAND_LIST_TYPE_COMPUTE: return "compute";
+    case D3D12_COMMAND_LIST_TYPE_COPY: return "copy";
+    default: return "other";
+    }
+}
+
 struct MeshXMemLease {
     using Release = BOOL (WINAPI*)(UINT, ULONG64);
     X2WXMemSectionLease lease{};
@@ -31,6 +67,7 @@ struct MeshXMemLease {
     x2w_startup::ComPtr<ID3D12Resource> buffer;
     x2w_startup::ComPtr<ID3D12Fence> last_access;
     ID3D12CommandQueue* last_queue{};
+    u64 trace_writer{}, trace_last_access{};
     bool untracked{};
 
     ~MeshXMemLease()
@@ -50,7 +87,13 @@ struct MeshXMemLease {
 };
 
 struct MeshXMemRecording {
-    struct Write { Wrapper* owner; u64 offset, bytes; bool leased; };
+    struct Write {
+        Wrapper* owner;
+        u64 offset, bytes;
+        bool leased;
+        UINT slot;
+        const char* source;
+    };
     struct Read {
         std::shared_ptr<MeshXMemLease> lease;
         u64 address{};
@@ -58,6 +101,7 @@ struct MeshXMemRecording {
     std::vector<Write> writes;
     std::array<Read, 2> readers;
     std::array<std::shared_ptr<MeshXMemLease>, 2> writers;
+    u64 trace_call{};
 };
 struct MeshXMemFlight {
     std::shared_ptr<MeshXMemLease> lease;
@@ -76,6 +120,34 @@ std::array<MeshXMemPublication, 2> mesh_xmem_publications;
 std::unordered_map<ID3D12CommandList*, MeshXMemRecording> mesh_xmem_recordings;
 std::vector<MeshXMemFlight> mesh_xmem_flights;
 bool mesh_xmem_tracking_failed;
+
+struct MeshXMemTraceCopy {
+    MeshXMemRecording::Write write;
+    u64 submission;
+    const char* queue;
+};
+std::array<MeshXMemTraceCopy, 1024> mesh_xmem_trace_copies;
+u64 mesh_xmem_trace_copy_count, mesh_xmem_trace_submissions;
+
+// Split submissions already hold mesh_xmem_mutex. A trace never changes which
+// recordings are split or adds a completion fence to a normal copy.
+u64 trace_mesh_xmem_submission(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists, bool locked)
+{
+    if (!mesh_xmem_trace_ordinal()) return 0;
+    std::unique_lock lock(mesh_xmem_mutex, std::defer_lock);
+    if (!locked) lock.lock();
+    const u64 submission = ++mesh_xmem_trace_submissions;
+    const char* queue_type = mesh_xmem_queue_type(queue);
+    for (auto* list : lists) {
+        const auto found = mesh_xmem_recordings.find(list);
+        if (found == mesh_xmem_recordings.end()) continue;
+        for (const auto& write : found->second.writes) {
+            mesh_xmem_trace_copies[mesh_xmem_trace_copy_count++ % mesh_xmem_trace_copies.size()] =
+                {write, submission, queue_type};
+        }
+    }
+    return submission;
+}
 
 // All functions that mutate publication/flight state hold mesh_xmem_mutex.
 void reap_mesh_xmem_flights()
@@ -209,7 +281,7 @@ bool mesh_xmem_write_overlaps(const MeshXMemRecording::Write& write, const MeshX
 // Track other writes to the copied placement too. An overlapping write that
 // did not update the XMem view invalidates its publication at submission.
 void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
-                          ID3D12Resource* source = nullptr, u64 source_offset = 0)
+                          UINT slot, const char* source_kind, ID3D12Resource* source = nullptr, u64 source_offset = 0)
 {
     if (!mesh_xmem_tracking() || !owner || !owner->own().title_memory) return;
     const auto* info = resource_info(owner);
@@ -221,7 +293,7 @@ void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
     if (mesh_xmem_tracking_failed) return;
     try {
         auto& recorded = mesh_xmem_recordings[desktop_list];
-        recorded.writes.push_back({owner, offset, bytes, false});
+        recorded.writes.push_back({owner, offset, bytes, false, slot, source_kind});
         const u64 base = reinterpret_cast<u64>(owner->own().title_memory);
         const u64 alignment = bytes == sizeof(UINT) ? D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT : sizeof(UINT);
         if (!source || offset > UINT64_MAX - base || recorded.readers[mesh_xmem_srv_index].lease ||
@@ -267,8 +339,75 @@ struct MeshXMemRead {
     u64 offset{};
 };
 
+void trace_mesh_xmem_input(Wrapper* device, u64 call, size_t index, u64 address, u64 bytes, bool needs_lease,
+                           bool anchor_only = false)
+{
+    const char* input = index == mesh_xmem_srv_index ? "root-srv" : "arguments";
+    if (!address || address > UINT64_MAX - bytes) {
+        log("x2w-mesh86-trace call=%llu input=%s range=unavailable", call, input);
+        return;
+    }
+    const auto placed = placed_buffer_range(device, address, bytes);
+    const auto& lease = mesh_xmem_publications[index].ready;
+    const bool match = lease && !placed.reject && placed.owner == lease->owner &&
+        lease->device == device && lease->bytes == bytes && lease->matches(address);
+    log("x2w-mesh86-trace call=%llu input=%s range=%s bytes=%llu placement=%s lease=%s writer-submit=%llu",
+        call, input, anchor_only ? "anchor-only" : "fixed-span", bytes,
+        placed.reject ? "ambiguous" : !placed.owner ? "unresolved" : placed.alias ? "alias" : "copy",
+        !needs_lease ? "not-checked" : match ? "matched" : lease ? "mismatch" : "absent",
+        needs_lease && match ? lease->trace_writer : 0ull);
+    if (placed.reject || !placed.owner) return;
+    const u64 offset = address - reinterpret_cast<u64>(placed.owner->own().title_memory);
+    const u64 retained = (std::min)(mesh_xmem_trace_copy_count, static_cast<u64>(mesh_xmem_trace_copies.size()));
+    for (u64 i = 0; i < retained; ++i) {
+        const auto& candidate = mesh_xmem_trace_copies[(mesh_xmem_trace_copy_count - i - 1) %
+                                                      mesh_xmem_trace_copies.size()];
+        const auto& write = candidate.write;
+        if (write.owner != placed.owner || write.offset >= offset + bytes || offset >= write.offset + write.bytes)
+            continue;
+        const bool covers = write.offset <= offset && write.offset + write.bytes >= offset + bytes;
+        log("x2w-mesh86-trace call=%llu input=%s copy-slot=%u source=%s queue=%s submit=%llu range=%s",
+            call, input, write.slot, write.source, candidate.queue, candidate.submission,
+            anchor_only ? "contains-anchor" : covers ? "covers-placement" : "overlaps-placement");
+        return;
+    }
+    log("x2w-mesh86-trace call=%llu input=%s recent-copy=absent", call, input);
+}
+
+void trace_mesh_xmem_inputs(Wrapper* list, const Pass& pass, u64 call, void* argument, u64 argument_offset)
+{
+    const UINT proved_srv = pass.indirect_graphics.cached_srv_root;
+    UINT srv = proved_srv;
+    if (srv == UINT_MAX && pass.root && pass.root->size() <= std::size(pass.root_address)) {
+        for (UINT i = 0; i < pass.root->size(); ++i) {
+            if ((*pass.root)[i].type != D3D12_ROOT_PARAMETER_TYPE_SRV) continue;
+            if (srv != UINT_MAX) {
+                srv = UINT_MAX;
+                break;
+            }
+            srv = i;
+        }
+    }
+    const u64 srv_address = srv != UINT_MAX ? pass.root_address[srv] : 0;
+    const Wrapper* buffer = as_wrapper(argument);
+    const bool resource = buffer && buffer->own().kind == resource_kind;
+    const u64 base = resource ? reinterpret_cast<u64>(buffer->own().title_memory) : 0;
+    const u64 arg_address = base && argument_offset <= UINT64_MAX - base && !(argument_offset & 3)
+        ? base + argument_offset : 0;
+    const auto* info = resource ? resource_info(buffer) : nullptr;
+    const bool leased_arguments = mesh_xmem_indirect() && info && info->placement == Placement::copied_buffer &&
+        (!pass.indirect_graphics.cached_mesh || proved_srv != UINT_MAX);
+    const bool anchor_only = proved_srv == UINT_MAX;
+    auto* device = list->own().list_device;
+    const std::lock_guard lock(mesh_xmem_mutex);
+    trace_mesh_xmem_input(device, call, mesh_xmem_srv_index, srv_address, anchor_only ? 1 : sizeof(UINT),
+                          !anchor_only, anchor_only);
+    trace_mesh_xmem_input(device, call, mesh_xmem_argument_index, arg_address, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS),
+                          leased_arguments);
+}
+
 // Check all inputs to this draw before adding any recording pins or barriers.
-const char* record_mesh_xmem_reads(Wrapper* list, MeshXMemRead* reads, size_t count)
+const char* record_mesh_xmem_reads(Wrapper* list, MeshXMemRead* reads, size_t count, u64 trace_call)
 {
     if (!count) return nullptr;
     const std::lock_guard lock(mesh_xmem_mutex);
@@ -307,6 +446,7 @@ const char* record_mesh_xmem_reads(Wrapper* list, MeshXMemRead* reads, size_t co
         auto& states = pass_of(list).states;
         states.reserve(states.size() + count);
         auto& recorded = mesh_xmem_recordings[desktop_list];
+        if (trace_call) recorded.trace_call = trace_call;
         for (size_t i = 0; i < count; ++i) {
             auto& read = reads[i];
             const auto index = mesh_xmem_index(read.bytes);
@@ -364,6 +504,10 @@ void execute_mesh_xmem_recording(ID3D12CommandQueue* queue, ID3D12CommandList* l
         return;
     }
     const auto& work = record->second;
+    const auto trace_refuse = [&](const char* reason) {
+        if (work.trace_call)
+            log("x2w-mesh86-trace call=%llu stage=submit outcome=refused reason=%s", work.trace_call, reason);
+    };
     std::array<std::shared_ptr<MeshXMemLease>, 2> accesses{};
     size_t access_count = 0;
     for (size_t i = 0; i < accesses.size(); ++i) {
@@ -375,6 +519,7 @@ void execute_mesh_xmem_recording(ID3D12CommandQueue* queue, ID3D12CommandList* l
         if (mesh_xmem_tracking_failed || lease->untracked || placed.reject || placed.owner != lease->owner ||
             !lease->matches(address) || (read.lease && mesh_xmem_publications[i].ready != lease)) {
             log("x2w-render mesh XMem submit refused: writer or live page identity changed");
+            trace_refuse(i == mesh_xmem_srv_index ? "root-srv-identity-changed" : "arguments-identity-changed");
             return;
         }
         accesses[i] = lease;
@@ -389,32 +534,48 @@ void execute_mesh_xmem_recording(ID3D12CommandQueue* queue, ID3D12CommandList* l
                 return lease && device.Get() != device_of(lease->device);
             }) || FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)))) {
             log("x2w-render mesh XMem submit refused: no completion fence on this device");
+            trace_refuse("no-completion-fence");
             return;
         }
         try {
             mesh_xmem_flights.reserve(mesh_xmem_flights.size() + access_count);
         } catch (const std::bad_alloc&) {
             log("x2w-render mesh XMem submit refused: retirement allocation failed");
+            trace_refuse("retirement-allocation");
             return;
         }
         ID3D12Fence* waited = nullptr;
         for (size_t i = 0; i < accesses.size(); ++i) {
             const auto& lease = accesses[i];
-            if (!lease || !lease->last_access || lease->last_queue == queue ||
-                lease->last_access.Get() == waited || (work.readers[i].lease && mesh_xmem_skip_read_wait(i)))
-                continue;
-            if (FAILED(queue->Wait(lease->last_access.Get(), 1))) {
-                log("x2w-render mesh XMem submit refused: cross-queue wait failed");
-                return;
+            if (!lease) continue;
+            const char* order;
+            if (!lease->last_access) order = "no-fence";
+            else if (lease->last_queue == queue) order = "same-queue";
+            else if (lease->last_access.Get() == waited) order = "shared-wait";
+            else if (work.readers[i].lease && mesh_xmem_skip_read_wait(i)) order = "test-omitted";
+            else {
+                if (FAILED(queue->Wait(lease->last_access.Get(), 1))) {
+                    log("x2w-render mesh XMem submit refused: cross-queue wait failed");
+                    trace_refuse("cross-queue-wait-failed");
+                    return;
+                }
+                order = "wait";
+                waited = lease->last_access.Get();
+                static LONG reports;
+                if (first_calls(reports, 16)) log("x2w-render mesh XMem GPU wait for lease %llu", lease->lease.id);
             }
-            waited = lease->last_access.Get();
-            static LONG reports;
-            if (first_calls(reports, 16)) log("x2w-render mesh XMem GPU wait for lease %llu", lease->lease.id);
+            if (work.trace_call && work.readers[i].lease)
+                log("x2w-mesh86-trace call=%llu input=%s order=%s writer-submit=%llu fence-submit=%llu",
+                    work.trace_call, i == mesh_xmem_srv_index ? "root-srv" : "arguments", order,
+                    lease->trace_writer, lease->trace_last_access);
         }
     }
 
-    execute();
+    const u64 submission = execute();
     const bool signalled = !completion || SUCCEEDED(queue->Signal(completion.Get(), 1));
+    if (work.trace_call)
+        log("x2w-mesh86-trace call=%llu stage=submit outcome=forwarded submit=%llu queue=%s signal=%s",
+            work.trace_call, submission, mesh_xmem_queue_type(queue), signalled ? "enqueued" : "failed");
     for (size_t i = 0; i < accesses.size(); ++i) {
         const auto& lease = accesses[i];
         if (!lease) continue;
@@ -422,6 +583,7 @@ void execute_mesh_xmem_recording(ID3D12CommandQueue* queue, ID3D12CommandList* l
             mesh_xmem_flights.push_back({lease, completion});
             lease->last_access = completion;
             lease->last_queue = queue;
+            lease->trace_last_access = submission;
         } else {
             lease->untracked = true;
             mesh_xmem_publications[i].ready.reset();
@@ -443,6 +605,7 @@ void execute_mesh_xmem_recording(ID3D12CommandQueue* queue, ID3D12CommandList* l
             const auto index = mesh_xmem_index(write.bytes);
             const auto& lease = work.writers[index];
             mesh_xmem_publications[index].ready = lease;
+            lease->trace_writer = submission;
             static LONG reports;
             if (first_calls(reports, 16))
                 log("x2w-render mesh XMem writer: lease %llu section page +0x%llx byte +0x%llx, %llu bytes",

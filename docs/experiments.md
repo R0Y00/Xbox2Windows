@@ -8970,6 +8970,44 @@ Both pages are reusable afterward.
 ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_lease_(warp|hardware)_dual' -V
 ```
 
+For a matched local replay, set `X2W_MESH86_WRITER_TRACE=<n>` to select the
+one-based index of a slot 61 DispatchMesh attempt with a slot 86 cache key
+on the bound pipeline. Use `X2W_MESH86_XMEM_SRV=1` and
+`X2W_MESH_INDIRECT_XMEM=1` to exercise both handoffs. Keep the same
+initial save, cache, input script and run duration as the baseline. Record
+the late surface separately using the same capture timing.
+
+The `x2w-mesh86-trace` rows identify the selected call and check both
+inputs before wrapper validation can reject the draw. With one declared
+root SRV and no cache proof, the trace reports a one-byte binding anchor.
+A copy covering that anchor may be relevant, and the shader's consumed
+extent still needs proof. A `matched` lease covers the
+input with the writer's live physical page and byte range. Its
+`writer-submit` identifies the publication after a successful writer
+completion signal. `fence-submit` identifies the submission whose fence
+value 1 orders the consumer. It can be a later access already ordered after
+the writer. `order` records a cross-queue wait, a shared wait, same-queue
+ordering or an omitted wait in a control. A `recorded` call reaches a
+desktop command list. A `forwarded` submission reaches the desktop queue.
+
+The recent-copy rows search the last 1,024 submitted copy destinations
+recorded by the XMem lease tracker. These cover forwarded slot 15 and slot 17
+copies into eligible copied placements. A placement overlap is a candidate
+writer. The tracker can prove physical identity and fence ordering through
+a matching lease. Absence of a recent copy leaves direct UAV writes, CPU
+writes and other unobserved producer paths open. A UAV-capable copy source
+alone does not identify the dispatch that populated it.
+
+The source-built WARP check traces the attempt with an unsubmitted argument
+writer, the ordered draw, and the two remap controls. The ordered draw
+matches the root copy from COPY and the argument copy from COMPUTE to two
+DIRECT waits. The controls report the missing argument writer at recording
+and the changed root or argument page at submission.
+
+```powershell
+ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_lease_warp_dual-trace$' -V
+```
+
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
 empty vertex slot, and a recorded root signature that matches the bound
