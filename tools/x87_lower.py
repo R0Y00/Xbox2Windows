@@ -658,11 +658,15 @@ def check_flags(body, exits):
 
 def _environment(i, address, checked):
     """FNSTENV and FNSAVE right after FNINIT: control word, status word 0, tag word 0xFFFF (every register empty)
-    and the instruction and data pointers and opcode, which FNINIT clears. FNSAVE adds ST(0) to ST(7), which are
+    and the instruction and data pointers and opcode, which FNINIT clears; the reserved halfwords read 0xFFFF. FNSAVE adds ST(0) to ST(7), which are
     the slots 7 down to 0, and initializes as FNINIT does."""
     word = "0x027f" if checked is None else "x87_cw"
-    stores = [f"store<uint32_t>(a, {word});", "store<uint32_t>(a + 4, 0);", "store<uint32_t>(a + 8, 0xffff);"]
-    stores += [f"store<uint32_t>(a + {offset}, 0);" for offset in (12, 16, 20, 24)]
+    # Native FNINIT; FNSTENV/FNSAVE write 0xffff in the reserved halfwords at 2, 6, 10 and 26 (measured on two hosts).
+    stores = [f"store<uint16_t>(a, {word});", "store<uint16_t>(a + 2, 0xffff);",
+              "store<uint16_t>(a + 4, 0);", "store<uint16_t>(a + 6, 0xffff);",
+              "store<uint16_t>(a + 8, 0xffff);", "store<uint16_t>(a + 10, 0xffff);"]
+    stores += [f"store<uint32_t>(a + {offset}, 0);" for offset in (12, 16, 20)]
+    stores += ["store<uint16_t>(a + 24, 0);", "store<uint16_t>(a + 26, 0xffff);"]
     if i.mnemonic == M.FNSTENV:
         return f"{{ const word a = {address()}; {' '.join(stores)} }}  // fnstenv"
     for k in range(8):

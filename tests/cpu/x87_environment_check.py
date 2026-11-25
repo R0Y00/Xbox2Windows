@@ -71,8 +71,9 @@ def written(code, size):
 
 def environment():
     """The SDM's 28-byte environment after FNINIT: the control word, a clear status word (TOP 0), a tag word
-    that marks all eight registers empty, and zero instruction and data pointers and opcode."""
-    return struct.pack("<7I", FNINIT_CONTROL_WORD, 0, 0xFFFF, 0, 0, 0, 0)
+    that marks all eight registers empty, and zero instruction and data pointers and opcode. The reserved
+    halfwords at 2, 6, 10 and 26 read 0xFFFF as natively (Intel and a second Windows host measured)."""
+    return struct.pack("<7I", 0xFFFF0000 | FNINIT_CONTROL_WORD, 0xFFFF0000, 0xFFFFFFFF, 0, 0, 0, 0xFFFF0000)
 
 
 def registers():
