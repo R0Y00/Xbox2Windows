@@ -189,7 +189,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-9`, so translations paired by number are not reused.
+The shader cache revision is `x2w-startup-shader-10`. It also invalidates older translations that
+could read a stale SCC after an operation on a descriptor word.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
@@ -411,6 +412,28 @@ spends the line limit with eight zero-address refusals, has a 2048x2048 BC1 10-m
 draws from the untouched entry. It then publishes a supported 1-mip R8 texture and draws from it. It
 expects one counted and named BC1 shape, its line past the limit, one write line for the R8 entry, one
 token null with zero words, and the R8 texels. The control publishes the supported R8 texture in place of the BC1 one and must fail.
+
+### Per-reason refusal census per pipeline key
+
+[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) is a standalone,
+device-free header ready to be wired into runtime refusal callers (such as slot-67 compute dispatch
+and binding paths; it is not yet wired into `d3d12_xs_device.cpp` or the five-second report). It
+tracks every distinct `(key, reason)` refusal pair separately instead of overwriting earlier reasons on
+the same key with the last refusal:
+
+- Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
+  call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
+  `total` and `overflow calls` without unbounded allocation.
+- `report(emit, true)` skips emission when nothing changed since the previous periodic report and emits
+  the summary line plus only the `(key, reason)` entries whose counts grew; `report(emit, false)`
+  prints the full table without hiding the next periodic delta.
+
+Check without a device via
+`ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
+the pass run verifies interleaved reasons across two keys, detail limits, overflow accounting and delta
+reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCensus` with
+`X2W_CENSUS_KEEP_LAST` and `X2W_CENSUS_KEEP_FIRST`, print both expected reasons with counts in their
+mismatch output, and are marked `WILL_FAIL`.
 
 ## Root constant buffer views
 
@@ -1982,15 +2005,20 @@ These are measured on one executable; treat them as hypotheses for others.
 - Depth-stencil registers are decoded, and applied only with `X2W_DEPTH_STATE=1` (#1999, item A;
   see the next bullet). State block A of a
   slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
-  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
-  covered. `src/startup_stubs/pipeline_state_decode.h`
+  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally, when the word at +0x004 is 4
+  (vertex pipelines). Mesh pipelines carry 6 there and a second layout, also measured locally: every
+  field from +0x058 on is 0x54 bytes later (`DB_DEPTH_CONTROL` at +0x10C); the reader adds that
+  shift. A block with another value at +0x004 is read at the vertex offsets. The blend reader
+  (`state_block_blend.h`, +0xD0) does not take the shift yet. `src/startup_stubs/pipeline_state_decode.h`
   reads the four words and decodes them into a `D3D12_DEPTH_STENCIL_DESC` and a stencil reference
   with the field layouts of Mesa's `src/amd/registers/gfx10.json`. It refuses stencil ops D3D12
   can't express (`ONES`, `REPLACE_OP`, the logic ops, add or subtract by other than one) and colour
   writes tied to the depth result. It flags, without applying, `DEPTH_BOUNDS_ENABLE` and back-face
   masks or references that differ from the front. A device-free check decodes hand-built words for
   each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
-  Its `_offset_control` run (words one word later) is the negative control
+  Its `_offset_control` run (words one word later) is the negative control. A vertex block and a mesh
+  block each hold a different decodable state at the other layout's offsets; `_mesh_shift_control`
+  (the mesh words at the vertex offsets) is that case's negative control
   (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
 - `X2W_DEPTH_STATE=1` (off by default) takes that decoded state for translated draws of slot 57
   pipelines (`src/startup_stubs/depth_state_apply.h`, applied in `translation_for` in

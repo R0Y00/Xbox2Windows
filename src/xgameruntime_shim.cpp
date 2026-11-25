@@ -29,6 +29,7 @@
 //   XPackageGetMountPath                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagegetmountpath?view=gdk-2604
 //   XPackageCloseMountHandle            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackageclosemounthandle?view=gdk-2510
 //   XPackageMountWithUiAsync            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagemountwithuiasync?view=gdk-2610
+//   XPackageMountWithUiResult           https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagemountwithuiresult?view=gdk-2610
 //   XSystemGetConsoleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/functions/xsystemgetconsoleid?view=gdk-2604
 //   XSystemGetDeviceType                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/functions/xsystemgetdevicetype?view=gdk-2604
 //   XSystemDeviceType                   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/enums/xsystemdevicetype?view=gdk-2604
@@ -46,9 +47,14 @@
 // operation completes before the call returns, the callback fires once on
 // XTaskQueueDispatch, XUserAddResult returns E_PENDING until then and then
 // hands over one new user handle exactly once.
-// Async gap: XPackageMountWithUiAsync remains a stub.
+// XPackageMountWithUiAsync / XPackageMountWithUiResult use the same contract: the
+// package identifier is validated like XPackageMount (E_INVALIDARG, nothing
+// consumed), no UI is ever shown, the mount completes before the call returns,
+// XPackageMountWithUiResult returns E_PENDING until the callback was dispatched
+// and then hands over one mount handle exactly once (the caller closes it with
+// XPackageCloseMountHandle).
 // XAsyncGetStatus and XAsyncGetResultSize answer only for blocks the shim tracks
-// (XGameSaveInitializeProviderAsync and XUserAddAsync blocks). XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
+// (XGameSaveInitializeProviderAsync, XUserAddAsync and XPackageMountWithUiAsync blocks). XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
 // XTaskQueueDispatch (completion port) and XTaskQueueCloseHandle model one
 // shim-owned manual queue. XGameSaveInitializeProviderAsync is implemented for
 // one queue configuration: a live manual queue from XTaskQueueCreate, where it
@@ -215,7 +221,8 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XPackageGetMountPathSize, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t* pathSize), implemented_hr, (mountHandle, pathSize), xpackage_get_mount_path_size) \
     X(XPackageGetMountPath, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t pathSize, char* path), implemented_hr, (mountHandle, pathSize, path), xpackage_get_mount_path) \
     X(XPackageCloseMountHandle, XPackage, void, (XPackageMountHandle mountHandle), implemented_void, (mountHandle), xpackage_close_mount_handle) \
-    X(XPackageMountWithUiAsync, XPackage, HRESULT, (const char*, XAsyncBlock*), stub, (), stub) \
+    X(XPackageMountWithUiAsync, XPackage, HRESULT, (const char* packageIdentifier, XAsyncBlock* asyncBlock), implemented_hr, (packageIdentifier, asyncBlock), xpackage_mount_with_ui_async) \
+    X(XPackageMountWithUiResult, XPackage, HRESULT, (XAsyncBlock* asyncBlock, XPackageMountHandle* mountHandle), implemented_hr, (asyncBlock, mountHandle), xpackage_mount_with_ui_result) \
     X(XSystemGetConsoleId, XSystem, HRESULT, (std::size_t consoleIdSize, char* consoleId, std::size_t* consoleIdUsed), implemented_hr, (consoleIdSize, consoleId, consoleIdUsed), xsystem_get_console_id) \
     X(XSystemGetDeviceType, XSystem, XSystemDeviceType, (), implemented_value, (), xsystem_get_device_type) \
     X(XGameGetXboxTitleId, XGame, HRESULT, (std::uint32_t* titleId), implemented_hr, (titleId), xgame_get_xbox_title_id) \
@@ -361,7 +368,7 @@ static_assert(has_implemented(thunks, "XPersistentLocalStorage"));
 static_assert(has_implemented(thunks, "XPackage"));
 static_assert(has_implemented(thunks, "XSystem"));
 static_assert(has_implemented(thunks, "XGame"));
-static_assert(has_stub(thunks, "XPackageMountWithUiAsync"));
+static_assert(!has_stub(thunks, "XPackageMountWithUiAsync"));
 
 struct XUserHandleStorage {
     std::uint64_t id = 0;
@@ -415,7 +422,7 @@ struct XPackageMountStorage {
 
 // One in-flight or completed-but-unclaimed XGameSaveInitializeProviderAsync.
 // The slot lives from the call until XGameSaveInitializeProviderResult.
-enum class AsyncKind : std::uint8_t { provider, user_add };
+enum class AsyncKind : std::uint8_t { provider, user_add, package_mount };
 
 struct ProviderAsyncSlot {
     bool live = false;
@@ -429,6 +436,7 @@ struct ProviderAsyncSlot {
     HRESULT status = S_OK;
     XGameSaveProviderHandle provider = nullptr;
     XUserHandle user = nullptr;
+    XPackageMountHandle package = nullptr;
 };
 
 struct RuntimeState {
@@ -1029,7 +1037,8 @@ HRESULT async_get_result_size(XAsyncBlock* async_block, std::size_t* buffer_size
         // The result is one provider or user handle; nothing is consumed here.
         if (SUCCEEDED(status)) {
             *buffer_size = slot->kind == AsyncKind::user_add ? sizeof(XUserHandle)
-                                                             : sizeof(XGameSaveProviderHandle);
+                         : slot->kind == AsyncKind::package_mount ? sizeof(XPackageMountHandle)
+                                                                  : sizeof(XGameSaveProviderHandle);
         }
     }
     ReleaseSRWLockExclusive(&runtime_state.lock);
@@ -1084,6 +1093,55 @@ HRESULT user_add_result(XAsyncBlock* async_block, XUserHandle* new_user) noexcep
     }
     const HRESULT status = slot->status;
     *new_user = slot->user;
+    *slot = ProviderAsyncSlot{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return status;
+}
+
+// The identifier is checked before the block or capacity is touched, so a bad
+// identifier consumes nothing. The mount is made now and stays owned by the
+// slot until XPackageMountWithUiResult hands it over; a failed mount releases
+// the slot again.
+HRESULT xpackage_mount_with_ui_async(const char* package_identifier, XAsyncBlock* async_block) noexcept
+{
+    if (!valid_package_identifier(package_identifier)) return E_INVALIDARG;
+    ProviderAsyncSlot* reserved = nullptr;
+    const HRESULT reserve = reserve_async(async_block, AsyncKind::package_mount, &reserved);
+    if (FAILED(reserve)) return reserve;
+
+    XPackageMountHandle mount = nullptr;
+    const HRESULT status = xpackage_mount(package_identifier, &mount);
+    if (FAILED(status)) {
+        release_async(reserved);
+        return status;
+    }
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    reserved->package = mount;
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    complete_async(reserved, async_block);
+    return S_OK;
+}
+
+// E_PENDING until the callback has been dispatched, then S_OK with one mount
+// handle. The slot is consumed, so a second call, an untracked block or a block
+// of another operation kind gets E_INVALIDARG and no handle.
+HRESULT xpackage_mount_with_ui_result(XAsyncBlock* async_block, XPackageMountHandle* mount_handle) noexcept
+{
+    if (!mount_handle) return E_POINTER;
+    *mount_handle = nullptr;
+    if (!async_block) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    ProviderAsyncSlot* slot = find_provider_async(async_block);
+    if (!slot || slot->kind != AsyncKind::package_mount) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_INVALIDARG;
+    }
+    if (!slot->completed || slot->callback_pending) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_PENDING;
+    }
+    const HRESULT status = slot->status;
+    *mount_handle = slot->package;
     *slot = ProviderAsyncSlot{};
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return status;

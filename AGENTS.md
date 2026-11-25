@@ -105,6 +105,8 @@ The full Linux CI list is in the `Run Python checks` step of the `python-linux`
 job in the [CI workflow](.github/workflows/windows.yml). To run it locally,
 copy the step's `tools/run_checks_parallel.py` command with all its arguments
 and replace the leading `python` with `./out/pe-env/bin/python`.
+See the [Linux quick start](docs/non-windows-hosts.md#quick-start-on-linux)
+for how skips affect the runner's exit status.
 
 ```bash
 python3 -m venv out/pe-env
@@ -160,6 +162,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
+./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py

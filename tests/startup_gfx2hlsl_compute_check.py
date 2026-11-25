@@ -176,6 +176,24 @@ CASES = {
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
 STORE_A = WORDS_A.index(bytes.fromhex('001070e004050480'))
 SPLICE = {
+    's_cmp_lt_u32 s7, 4': '07840abf',
+    's_and_b32 s13, s13, 0xc000ffff': '0dff0d87ffff00c0',
+    's_add_u32 s13, s13, 1': '0d810d80',
+    's_mov_b32 s13, s13': '0d038dbe',
+    's_cselect_b32 s20, 1, 0': '81801485',
+    's_cselect_b64 s[20:21], 1, 0': '81809485',
+    's_cmov_b32 s20, 1': '810594be',
+    's_cmov_b64 s[20:21], s[4:5]': '040694be',
+    's_cmovk_i32 s20, 3': '030014b1',
+    's_cbranch_scc0 1': '010084bf',
+    's_cbranch_scc1 1': '010085bf',
+    's_cbranch_vccz 1': '010086bf',
+    'v_mov_b32 v3, 0': '8002067e',
+    'v_add_nc_u32 v3, 1, v3': '8106064a',
+    'v_cmp_gt_u32 vcc_lo, 2, v3': '8206887d',
+    's_cbranch_vccnz 65530': 'faff87bf',
+    's_branch 2': '020082bf',
+    's_and_b32 s22, s7, 1': '07811687',
     's_mov_b32 s18, 0': '800392be',
     's_or_b32 s17, s17, 0x40000': '11ff118800000400',
     's_and_b32 s18, s18, 0xffff': '12ff1287ffff0000',
@@ -204,13 +222,13 @@ def splice(*lines, at=STORE_A):
     return WORDS_A[:at] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[at:]
 
 
-def root_blob():
-    """RTS0: param 0 = two root constants (b0), param 1 = a descriptor table with no ranges."""
+def root_blob(constants=2):
+    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges."""
     params_at, constants_at = 24, 24 + 2 * 12
     table_at = constants_at + 12
     rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8, 0)
             + struct.pack('<3I', 1, 0, constants_at) + struct.pack('<3I', 0, 0, table_at)
-            + struct.pack('<3I', 0, 0, 2) + struct.pack('<2I', 0, table_at + 8))
+            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', 0, table_at + 8))
     part = b'RTS0' + struct.pack('<I', len(rts0)) + rts0
     return b'DXBC' + bytes(16) + struct.pack('<III', 1, 32 + 4 + len(part), 1) + struct.pack('<I', 36) + part
 
@@ -301,12 +319,42 @@ def check_mbcnt():
     assert 'uav 0 table 1 0' in translate('D').manifest()
 
 
+def check_descriptor_scc():
+    # Case A loads the input descriptor into s[12:15] and stores through s[16:19].
+    # Put the condition into the stored value, or let the branch skip the move.
+    compare = 's_cmp_lt_u32 s7, 4'
+    mask = 's_and_b32 s13, s13, 0xc000ffff'
+    select = 's_cselect_b32 s20, 1, 0'
+    move = 'v_mov_b32 v5, s20'
+
+    def pipeline(*lines):
+        return translate('A', code=splice(*lines))
+
+    def rejected(*lines):
+        refused('scc from descriptor data', lambda: pipeline(*lines))
+
+    for reader in (select, 's_cselect_b64 s[20:21], 1, 0', 's_cmov_b32 s20, 1', 's_cmov_b64 s[20:21], s[4:5]',
+                   's_cmovk_i32 s20, 3', 's_cbranch_scc0 1', 's_cbranch_scc1 1'):
+        rejected(compare, mask, reader, move)
+        assert 'uav 0 table 1 16' in pipeline(mask, compare, reader, move).manifest()
+    rejected(compare, 's_add_u32 s13, s13, 1', select, move)
+    assert 's20 = scc ?' in pipeline(compare, 's_mov_b32 s13, s13', select, move).hlsl_cs()
+    assert 's20 = scc ?' in pipeline(mask, 's_and_b32 s22, s7, 1', select, move).hlsl_cs()
+    assert 's20 = scc ?' in pipeline(mask, 's_and_saveexec_b32 s0, vcc_lo', select, move).hlsl_cs()
+
+    # A conditional edge can bypass the fresh comparison. A back edge can carry
+    # the descriptor-derived flag to a read that comes first in program order.
+    rejected(mask, 's_cbranch_vccz 1', compare, select, move)
+    rejected(compare, 'v_mov_b32 v3, 0', select, mask, 'v_add_nc_u32 v3, 1, v3',
+             'v_cmp_gt_u32 vcc_lo, 2, v3', 's_cbranch_vccnz 65530', move)
+    assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, move).hlsl_cs()
+
+
 def check_controls():
+    check_descriptor_scc()
     check_mbcnt()
     a = translate('A')
-    # The compute stage keeps its buffer stores in self.uavs as descriptor key -> u index, while the pixel stage's
-    # image stores (#2155) are listed by stored_images() through the shared common() and manifest(). A compute
-    # program must list no image stores: no RWTexture2D declaration and no `uav <i> tex2d` line.
+    # This buffer-only compute program has no typed UAV declaration or image manifest entry.
     assert a.uavs and a.stored_images() == {}, (a.uavs, a.stored_images())
     hlsl, manifest = a.hlsl_cs(), a.manifest()
     assert not any(line.startswith('RWTexture2D') for line in hlsl.splitlines()), hlsl
