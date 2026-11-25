@@ -29,6 +29,7 @@
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_distinct_rect_scratch(void*, void*);
 
 #if defined(OFFSCREEN_AGILITY_620)
 extern "C" {
@@ -467,19 +468,26 @@ struct Gate {
     std::mutex state;
     std::mutex wait_lock;
     std::condition_variable changed;
-    int arrived = 0;
+    IUnknown* first = nullptr;
     unsigned generation = 0;
     bool aborted = false;
-    void meet() {
+    bool meet(IUnknown* list) {
         std::unique_lock<std::mutex> guard(wait_lock);
-        const unsigned mine = generation;
-        if (++arrived == 2) {
-            arrived = 0;
+        if (aborted) return false;
+        if (first) {
+            if (!x2w_d3d12_distinct_rect_scratch(first, list)) {
+                std::fprintf(stderr, "rectangle scratch is missing or shared between recordings\n");
+                aborted = true;
+            }
+            first = nullptr;
             ++generation;
             changed.notify_all();
-            return;
+            return !aborted;
         }
+        first = list;
+        const unsigned mine = generation;
         changed.wait(guard, [&] { return aborted || generation != mine; });
+        return !aborted;
     }
     void abort() {
         std::lock_guard<std::mutex> guard(wait_lock);
@@ -991,7 +999,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     } else {
         if (gate) {
             recording.unlock();
-            gate->meet();
+            if (!gate->meet(wrapped)) return false;
         }
         submit(device, list);
         if (gate) recording.lock();
@@ -1713,8 +1721,8 @@ int main(int argc, char** argv) try
         !run(device.Get(), guest.Get(), writer.Get(), overflow.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
              false, Refusal::overflowing_count, "overflowing rectangle count")) return 1;
     if (kind == DrawKind::rect) {
-        // Two recordings on two queues convert different argument counts at the same time. Each must draw its own
-        // count: the conversion scratch belongs to the recording, never to the device.
+        // Check that the closed recordings own distinct scratch before releasing both submissions. Then each
+        // queue must draw its own argument count even if the GPU overlaps the two conversions.
         std::atomic<bool> concurrent_ok{true};
         Gate gate;
         const auto worker = [&](ID3D12PipelineState* producer, bool draw_right, const char* label) {
