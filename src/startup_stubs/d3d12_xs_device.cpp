@@ -119,6 +119,7 @@ struct alignas(16) WrapperOwn {
     UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
     UINT list_node_mask;
+    D3D12_QUERY_HEAP_DESC query_heap; // QueryHeap: the desc it was created with (device slot 39)
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
 struct Wrapper {
@@ -1067,6 +1068,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // when the desktop GPU finishes, and the presented surface is read back and shown in the window.
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
+void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
 void reset_viewport_state(Wrapper* self);
 void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
@@ -1366,6 +1368,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         return S_OK;
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(state.real);
+    end_open_queries(self, list);
     release_targets(self);
     const HRESULT hr = list->Close();
     state.list_open = false;
@@ -1894,6 +1897,13 @@ struct Pass {
     // the title flags above so a later render target 0 of another size gets a fresh default.
     UINT64 default_viewport_w = 0, default_scissor_w = 0;
     UINT default_viewport_h = 0, default_scissor_h = 0;
+    // Queries begun on the desktop list by slot 28 and not yet ended (heap, type, index). The heap pointer is
+    // held without a reference until Close; releasing a heap mid-recording is invalid on desktop too.
+    struct OpenQuery { ID3D12QueryHeap* heap; UINT type, index; };
+    std::vector<OpenQuery> open_queries;
+    // Queries ended on this recording by slot 29: what a resolve may cover. A new BeginQuery on the index removes its
+    // entry, and Close clears the list with the rest of the Pass.
+    std::vector<OpenQuery> ended_queries;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 // Heap-indexed title root signatures not set on the desktop list, and real draws refused under one, by decision.
@@ -1980,6 +1990,125 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
+}
+
+// Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
+// methods sit there, so they are bound only with X2W_D3D12_QUERY_SLOTS=1. The heap reaches device slot 39 with the
+// desktop desc. Only occlusion queries are
+// forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
+// heap it names is refused and logged with its values instead of reaching the desktop list.
+enum QueryMethod { begin_query, end_query, resolve_query };
+void refuse_query(QueryMethod method, const char* reason, UINT type, UINT index, UINT count)
+{
+    static const char* const names[] = {"BeginQuery", "EndQuery", "ResolveQueryData"};
+    static LONG refusals[3];  // the first 16 refusals of each method are logged
+    if (first_calls(refusals[method], 16))
+        log("x2w-render %s refused: %s (type %u, index %u, count %u)", names[method], reason, type, index, count);
+}
+// The desktop heap behind a wrapped occlusion heap that holds [index, index + count), or null with the reason.
+// Only a DIRECT recording is supported in this first slice.
+ID3D12QueryHeap* occlusion_heap(ID3D12GraphicsCommandList* list, void* heap, UINT type, UINT index, UINT count,
+                               const char** reason)
+{
+    if (!list) return *reason = "list is closed", nullptr;
+    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return *reason = "requires a direct command list", nullptr;
+    const Wrapper* w = as_wrapper(heap);
+    if (!w || w->own().kind != query_heap_kind || !w->own().real) return *reason = "not a desktop query heap", nullptr;
+    const auto& desc = w->own().query_heap;
+    if (desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION) return *reason = "only occlusion heaps are forwarded", nullptr;
+    if (type != D3D12_QUERY_TYPE_OCCLUSION && type != D3D12_QUERY_TYPE_BINARY_OCCLUSION)
+        return *reason = "query type does not fit an occlusion heap", nullptr;
+    if (index >= desc.Count || count > desc.Count - index) return *reason = "outside the heap's count", nullptr;
+    return static_cast<ID3D12QueryHeap*>(w->own().real);
+}
+// List slot 28, BeginQuery(heap, type, index).
+void __stdcall list_begin_query(Wrapper* self, void* heap, UINT type, UINT index)
+{
+    auto* list = recording(self);
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, index, 1, &reason);
+    if (!real) return refuse_query(begin_query, reason, type, index, 1);
+    Pass& pass = pass_of(self);
+    for (const auto& open : pass.open_queries)
+        if (open.heap == real && open.index == index) return refuse_query(begin_query, "query already begun", type, index, 1);
+    auto& ended = pass.ended_queries;
+    ended.erase(std::remove_if(ended.begin(), ended.end(),
+                               [&](const Pass::OpenQuery& q) { return q.heap == real && q.index == index; }),
+                ended.end());
+    pass.open_queries.push_back({real, type, index});
+    list->BeginQuery(real, static_cast<D3D12_QUERY_TYPE>(type), index);
+}
+// List slot 29, EndQuery(heap, type, index). Only a query this list began is ended.
+void __stdcall list_end_query(Wrapper* self, void* heap, UINT type, UINT index)
+{
+    auto* list = recording(self);
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, index, 1, &reason);
+    if (!real) return refuse_query(end_query, reason, type, index, 1);
+    Pass& pass = pass_of(self);
+    auto& open = pass.open_queries;
+    const auto found = std::find_if(open.begin(), open.end(),
+                                    [&](const Pass::OpenQuery& q) { return q.heap == real && q.type == type && q.index == index; });
+    if (found == open.end()) return refuse_query(end_query, "not begun on this list", type, index, 1);
+    open.erase(found);
+    pass.ended_queries.push_back({real, type, index});
+    list->EndQuery(real, static_cast<D3D12_QUERY_TYPE>(type), index);
+}
+// At Close: a query begun on the desktop list and never ended would make the desktop Close fail and drop the whole
+// list, where the console call it stands for cost nothing more than that query's result.
+void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list)
+{
+    if (!self->own().pass) return;
+    auto& open = pass_of(self).open_queries;
+    for (const auto& query : open) {
+        refuse_query(end_query, "missing at Close, ended there", query.type, query.index, 1);
+        list->EndQuery(query.heap, static_cast<D3D12_QUERY_TYPE>(query.type), query.index);
+    }
+    open.clear();
+}
+// List slot 30, ResolveQueryData(heap, type, start, count, destination, offset). The destination is a buffer on
+// a readback heap, which stays in COPY_DEST, so it is not moved through the list's COMMON state tracking.
+void __stdcall list_resolve_query(Wrapper* self, void* heap, UINT type, UINT start, UINT count, void* destination, u64 offset)
+{
+    auto* list = recording(self);
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, start, count, &reason);
+    if (!real) return refuse_query(resolve_query, reason, type, start, count);
+    // Resolving a query that was never ended, or ended with the other occlusion type, reads uninitialized data and
+    // can remove the device: every index in the range must have a matching EndQuery on this recording.
+    const auto& ended = pass_of(self).ended_queries;
+    for (UINT i = 0; i < count; ++i)
+        if (std::none_of(ended.begin(), ended.end(), [&](const Pass::OpenQuery& q) {
+                return q.heap == real && q.index == start + i && q.type == type;
+            }))
+            return refuse_query(resolve_query, "an index in the range was not ended with this type on this recording", type,
+                                start, count);
+    const Wrapper* w = as_wrapper(destination);
+    if (!w || w->own().kind != resource_kind || !w->own().real)
+        return refuse_query(resolve_query, "destination has no desktop resource", type, start, count);
+    // Map of a resource with title memory returns that memory, which a desktop resolve never reaches.
+    if (w->own().title_memory)
+        return refuse_query(resolve_query, "destination has title memory", type, start, count);
+    auto* resource = static_cast<ID3D12Resource*>(w->own().real);
+    D3D12_HEAP_PROPERTIES properties{};
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || FAILED(resource->GetHeapProperties(&properties, nullptr)) ||
+        properties.Type != D3D12_HEAP_TYPE_READBACK)
+        return refuse_query(resolve_query, "destination is not a readback buffer", type, start, count);
+    const u64 bytes = u64{count} * sizeof(UINT64);
+    if ((offset & 7) || offset > desc.Width || bytes > desc.Width - offset)
+        return refuse_query(resolve_query, "outside the destination buffer", type, start, count);
+    list->ResolveQueryData(real, static_cast<D3D12_QUERY_TYPE>(type), start, count, resource, offset);
+}
+// Device slot 39, CreateQueryHeap(desc, riid, ppv): forwarded, and the desc kept for the query slots.
+HRESULT __stdcall device_create_query_heap(Wrapper* self, const D3D12_QUERY_HEAP_DESC* desc, const GUID* iid, void** out)
+{
+    const auto hr = static_cast<HRESULT>(create_slot<device_kind, 39, 1>(self, reinterpret_cast<u64>(desc),
+                                                                         reinterpret_cast<u64>(iid), reinterpret_cast<u64>(out),
+                                                                         0, 0, 0, 0, 0));
+    if (Wrapper* w = SUCCEEDED(hr) && desc && out ? as_wrapper(*out) : nullptr; w && w->own().kind == query_heap_kind)
+        w->own().query_heap = *desc;
+    return hr;
 }
 
 // The guest method has independent resource and byte-offset arguments.
@@ -3748,7 +3877,7 @@ void build_tables()
     enable_create<device_kind, 36, 2>();                 // CreateFence(initial, flags, riid, ppv)
     enable_forward<device_kind, 37>();                   // GetDeviceRemovedReason
     tables[device_kind][38] = reinterpret_cast<void*>(&device_copyable_footprints);
-    enable_create<device_kind, 39, 1>();                 // CreateQueryHeap(desc, riid, ppv)
+    tables[device_kind][39] = reinterpret_cast<void*>(&device_create_query_heap);  // CreateQueryHeap(desc, riid, ppv)
     enable_forward<device_kind, 40>();                   // SetStablePowerState
     tables[device_kind][41] = reinterpret_cast<void*>(&device_create_command_signature);                 // CreateCommandSignature(desc, root, riid, ppv)
     enable_forward<device_kind, 42>();                   // GetResourceTiling
@@ -3799,6 +3928,13 @@ void build_tables()
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
+        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
+        // bindings are opt-in. Unset, the slots stay no-ops.
+        if (wchar_t on[4]{}; GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", on, 4) && on[0] == L'1') {
+            list_typed[28] = reinterpret_cast<ListTyped>(&list_begin_query);
+            list_typed[29] = reinterpret_cast<ListTyped>(&list_end_query);
+            list_typed[30] = reinterpret_cast<ListTyped>(&list_resolve_query);
+        }
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 

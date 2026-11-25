@@ -165,8 +165,8 @@ class Probe(G.Stage):
         self.kind = kind
         self.lines, self.sym = [], {}
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
-        self.exec_known, self.has_branches, self.blocks, self.quad_ops = exec_known, branches, [], False
-        self.quad_exec = quad_exec
+        self.exec_known, self.has_branches, self.blocks, self.needs_sm6 = exec_known, branches, [], False
+        self.wqm_exec = quad_exec
 
 
 def refused(assembly, **kwargs):
@@ -213,8 +213,8 @@ def controls():
                 'v_sub_nc_u32_dpp v1, v2, v3 quad_perm:[1,1,1,1]' + DPP]
     check('accepted forms translate', not any(refused(a) for a in accepted), str([a for a in accepted if refused(a)]))
     sane = 'v_mov_b32_dpp v1, v0 quad_perm:[1,1,1,1]' + DPP
+    check('the merged quad swap also translates', not refused('v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2]' + DPP))
     bad = {
-        'swap': 'v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2]' + DPP,
         'pair broadcast': 'v_mov_b32_dpp v1, v0 quad_perm:[1,1,3,3]' + DPP,
         'identity': 'v_mov_b32_dpp v1, v0 quad_perm:[0,1,2,3]' + DPP,
         'row_shl': 'v_mov_b32_dpp v1, v0 row_shl:1' + DPP,

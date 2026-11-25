@@ -128,6 +128,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_wakeup",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
+    # s_round_mode keeping binary32 at nearest even and writing MODE[3:2] = 0 or 3, as pixel_aot lowers it.
+    r"s_round_mode\s+0x[0c]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
     # SOPK wait forms: only null as the SGPR (reads as 0) and a count of 0..63, as in pixel_aot.
     r"s_waitcnt_(?:vmcnt|lgkmcnt|vscnt)\s+null,\s*(?:0x(?:0?[0-9a-f]|[1-3][0-9a-f])|[0-9]|[1-5][0-9]|6[0-3])",

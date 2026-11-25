@@ -54,6 +54,13 @@ ACCEPTED = [
      ['v7 = uint(int(F(s2)));']),
     ('fixed buffer word', ('v_cvt_i32_f32_e32 v7, s3',),
      ['v7 = uint(int(F(s3)));']),
+    ('unsigned to float conversion', ('v_cvt_f32_u32_e32 v7, s2',),
+     ['v7 = U(float(s2));']),
+    # The unsigned-division reciprocal estimate, the shape that reaches the read in compiled shaders.
+    ('division reciprocal chain', ('v_cvt_f32_u32_e32 v7, s2', 'v_rcp_f32_e32 v7, v7',
+                                   'v_mul_f32_e32 v7, 0x4f7ffffe, v7', 'v_cvt_u32_f32_e32 v7, v7'),
+     ['v7 = U(float(s2));', 'v7 = U(1.0 / F(v7));', 'v7 = U(F(0x4f7ffffeu) * F(v7));',
+      'v7 = uint(max(F(v7), 0.0));']),
     ('byte conversion', ('v_cvt_f32_ubyte0_e32 v7, s2',),
      ['v7 = U(float(s2 & 255));']),
     ('multiply', ('v_mul_f32_e64 v7, s2, 2.0',),
@@ -124,6 +131,18 @@ REFUSED = [
     ('interpolation p1 overwrite', (MOVE, 'v_interp_p1_f32_e32 v7, v0, attr0.x', READ)),
     ('VGPR buffer address', (MOVE, 'buffer_load_dword v7, v0, s[4:7], 0 offen', READ)),
     ('branch after read', ('v_mov_b32_e32 v7, s2', READ, 's_branch label_000C', 's_endpgm')),
+    # The unsigned-to-float conversion proves nothing from a lane-varying source, across an exec
+    # write or an overwrite, or in a program with branches (a definition in another block included).
+    ('unsigned to float conversion of an entry VGPR', ('v_cvt_f32_u32_e32 v7, v0', READ)),
+    ('unsigned to float conversion of a mask', (COMPARE, 'v_cvt_f32_u32_e32 v7, s2', READ)),
+    ('exec write inside the chain', ('v_cvt_f32_u32_e32 v7, s3', 's_and_saveexec_b32 s8, s2',
+                                     'v_rcp_f32_e32 v7, v7', READ)),
+    ('overwrite inside the chain', ('v_cvt_f32_u32_e32 v7, s3', 'v_add_f32_e64 v7, v0, 1.0',
+                                    'v_rcp_f32_e32 v7, v7', READ)),
+    ('chain in a program with branches', ('v_cvt_f32_u32_e32 v7, s3', 'v_rcp_f32_e32 v7, v7', READ,
+                                          's_cbranch_scc0 label_0010', 's_endpgm')),
+    ('definition in another block', ('v_cvt_f32_u32_e32 v7, s3', 's_cbranch_scc0 label_0008',
+                                     'v_rcp_f32_e32 v7, v7', READ, 's_endpgm')),
 ]
 # Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
 EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
