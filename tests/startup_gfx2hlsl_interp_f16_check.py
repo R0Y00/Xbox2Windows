@@ -239,9 +239,9 @@ def patch(words, index, w0=0, w1=0):
     return bytes(out)
 
 
-def refused(label, words, needle, vs_words=VS_WORDS):
+def refused(label, words, needle, vs_words=VS_WORDS, **kwargs):
     try:
-        translate(words, vs_words)
+        translate(words, vs_words, **kwargs)
     except G.Unsupported as error:
         assert needle in str(error), (label, str(error))
         print('refused: %s (%s)' % (label, error))
@@ -368,6 +368,14 @@ def plain_controls(expected):
         assert got == ref, ('plain half', half, [hex(w) for w in got], [hex(w) for w in ref])
         assert 'hparam0_lo' in vs and 'o.fparam0' not in vs, vs
         print('plain export half %d: %s' % (half, ','.join('%08x' % w for w in got)))
+    # Runtime interface tables can link a pixel attribute to a differently numbered vertex parameter.
+    remapped = PLAIN_PS['lo']
+    for index in range(8):
+        remapped = patch(remapped, index, w1=3)
+    pipe = translate(remapped, PLAIN_VS['plain'], ps_attr_map={3: (0, 0xf)})
+    assert evaluate(pipe.hlsl_vs(), pipe.hlsl_ps(), regs=regs) == lo_ref
+    refused('interface masks off an interpolated channel', remapped, 'undeclared component w',
+            vs_words=PLAIN_VS['plain'], ps_attr_map={3: (0, 0x7)})
     # The compr fixture with its export flipped to plain (clear the compr bit, w0 bit 10 of the param0 export:
     # words v6, v7, v0, v0) is the same attribute in the ISA (attrN.x = dword 0, attrN.y = dword 1), so the pixel
     # stage reads the compr reference. Only the lowering differs: hparam0_* instead of param0.x .. w.

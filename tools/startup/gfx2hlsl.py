@@ -2282,12 +2282,12 @@ class Stage:
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', ops[2])
         if not m:
             raise Unsupported('%s interpolant %s: expected attrN.x/.y/.z/.w' % (op, ops[2]))
-        chan = 'xyzw'.index(m.group(2))
-        attr, high = int(m.group(1)), int('high' in mods)
+        attr, component = self.note_attr(ops[2], 'f16')
+        chan, high = 'xyzw'.index(component), int('high' in mods)
         vs = getattr(getattr(self, 'pipe', None), 'vs', None)
         if vs is not None and attr in vs.plain_params and attr not in vs.compr_params:
             self.f16_plain.setdefault(attr, set()).add(chan)
-            return attr, 'hparam%d_%s.%s' % (attr, ('lo', 'hi')[high], m.group(2)), high
+            return attr, 'hparam%d_%s.%s' % (attr, ('lo', 'hi')[high], component), high
         if chan > 1:
             raise Unsupported('%s on channel %s: a compr export fills only the x and y channels' % (op, m.group(2)))
         return attr, 'param%d.%s' % (attr, 'xyzw'[2 * chan + high]), high
@@ -2401,7 +2401,6 @@ class Stage:
         attr, field, high = self.interp_f16('v_interp_p1ll_f16', ops, mods, 1, 3)
         self.interp_f16_pair('v_interp_p1ll_f16', ops)
         self.interp_f16_scan()
-        self.attrs.setdefault(attr, set()).add('f16')
         if self.interp_p1 is None:
             self.interp_p1 = {}
         self.interp_p1[int(ops[0][1:])] = (attr, field, high)
@@ -2415,7 +2414,6 @@ class Stage:
         self.interp_f16_scan()
         if (self.interp_p1 or {}).get(int(ops[3][1:])) != (attr, field, high):
             raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' % (ops[3], ops[2]))
-        self.attrs.setdefault(attr, set()).add('f16')
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
         self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field))
