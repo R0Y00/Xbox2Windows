@@ -495,6 +495,11 @@ def descriptor_load_hlsl():
     Every conversion is integer arithmetic, so the result does not depend on the GPU's float division. UNORM is
     x / (2^n - 1) and SNORM16 is max(x / 32767, -1), rounded to nearest even binary32 by long division. FLOAT16
     widens exactly, keeping NaN payloads. 16-bit UINT and SINT zero- and sign-extend the low halfword.
+
+    With d16 the channels pack two per result word, x in the low half. Float-type formats give binary16: the
+    FLOAT16 halves as stored, and UNORM and SNORM16 rounded to nearest even binary16 (denormals kept) by long
+    division. 16-bit UINT and SINT give the 16-bit integer, not a float. A 32-bit format has no d16 rule here and
+    is invalid.
     """
     legacy = []
     for field, code in sorted(LEGACY_DESCRIPTOR_FORMATS.items()):
@@ -519,14 +524,32 @@ def descriptor_load_hlsl():
     grouped = {}
     for code, (kind, channels) in DESCRIPTOR_STORE_FORMATS.items():
         grouped.setdefault((kind, channels), []).append(code)
+    halves = {
+        "unorm8": ("h = uint4(descriptor_ratio16(raw.x & 0xffu, 255u), descriptor_ratio16((raw.x >> 8u) & 0xffu, 255u), "
+                   "descriptor_ratio16((raw.x >> 16u) & 0xffu, 255u), descriptor_ratio16(raw.x >> 24u, 255u));"),
+        "unorm16x2": ("h.xy = uint2(descriptor_ratio16(raw.x & 0xffffu, 65535u), "
+                      "descriptor_ratio16(raw.x >> 16u, 65535u));"),
+        "unorm10": ("h = uint4(descriptor_ratio16(raw.x & 0x3ffu, 1023u), "
+                    "descriptor_ratio16((raw.x >> 10u) & 0x3ffu, 1023u), "
+                    "descriptor_ratio16((raw.x >> 20u) & 0x3ffu, 1023u), descriptor_ratio16(raw.x >> 30u, 3u));"),
+        "f16x2": "h.xy = uint2(raw.x & 0xffffu, raw.x >> 16u);",
+        "f16x4": "h = uint4(raw.x & 0xffffu, raw.x >> 16u, raw.y & 0xffffu, raw.y >> 16u);",
+        "unorm16": "h.x = descriptor_ratio16(raw.x & 0xffffu, 65535u);",
+        "snorm16": "h.x = descriptor_snorm16_half(raw.x & 0xffffu);",
+        "uint16": "h.x = raw.x & 0xffffu;",
+        "sint16": "h.x = raw.x & 0xffffu;",
+        "f16": "h.x = raw.x & 0xffffu;",
+    }
     arms = []
-    for kind in _DESCRIPTOR_KIND_ORDER:
-        for channels in range(1, 5):
-            codes = grouped.get((kind, channels))
-            if codes:
-                test = " || ".join(f"format == {code}u" for code in sorted(codes))
-                keyword = "if" if not arms else "else if"
-                arms.append(f"    {keyword} (({test}) && channels == {channels}u) {{ {bodies[kind]} valid = true; }}")
+    for d16, table in ((False, bodies), (True, halves)):
+        for kind in _DESCRIPTOR_KIND_ORDER:
+            for channels in range(1, 5):
+                codes = grouped.get((kind, channels))
+                if codes and kind in table:
+                    test = " || ".join(f"format == {code}u" for code in sorted(codes))
+                    keyword = "if" if not arms else "else if"
+                    arms.append(f"    {keyword} (d16 {'!=' if d16 else '=='} 0u && ({test}) && channels == {channels}u) "
+                                f"{{ {table[kind]} valid = true; }}")
     return (
         "uint descriptor_ratio(uint x, uint d) {\n"
         "    // binary32 bits of x / d for 0 <= x <= d < 2^16, rounded to nearest even by long division.\n"
@@ -545,6 +568,31 @@ def descriptor_load_hlsl():
         "    if ((bits & 1u) != 0u && (r != 0u || (result & 1u) != 0u)) ++result;\n"
         "    return result;\n"
         "}\n"
+        "uint descriptor_ratio16(uint x, uint d) {\n"
+        "    // binary16 bits of x / d for 0 <= x <= d < 2^16, rounded to nearest even, denormals kept.\n"
+        "    if (x == 0u) return 0u;\n"
+        "    if (x == d) return 0x3c00u;\n"
+        "    uint r = x, f = 0u;\n"
+        "    for (uint i = 0u; i < 26u; ++i) {\n"
+        "        r <<= 1u;\n"
+        "        uint bit = r >= d ? 1u : 0u;\n"
+        "        r -= bit * d;\n"
+        "        f = (f << 1u) | bit;\n"
+        "    }\n"
+        "    // x / d = f / 2^26 plus a remainder. A normal result keeps 11 bits; a denormal counts units of 2^-24.\n"
+        "    uint lead = firstbithigh(f);\n"
+        "    uint shift = lead >= 12u ? lead - 10u : 2u;\n"
+        "    uint result = lead >= 12u ? (((lead - 11u) << 10u) | ((f >> shift) & 0x3ffu)) : (f >> shift);\n"
+        "    uint roundBit = (f >> (shift - 1u)) & 1u;\n"
+        "    bool sticky = (f & ((1u << (shift - 1u)) - 1u)) != 0u || r != 0u;\n"
+        "    if (roundBit != 0u && (sticky || (result & 1u) != 0u)) ++result;\n"
+        "    return result;\n"
+        "}\n"
+        "uint descriptor_snorm16_half(uint bits16) {\n"
+        "    int value = (int)(bits16 << 16u) >> 16;\n"
+        "    if (value <= -32767) return 0xbc00u;\n"
+        "    return value < 0 ? 0x8000u | descriptor_ratio16((uint)(-value), 32767u) : descriptor_ratio16((uint)value, 32767u);\n"
+        "}\n"
         "uint descriptor_snorm16_load(uint bits16) {\n"
         "    int value = (int)(bits16 << 16u) >> 16;\n"
         "    if (value <= -32767) return 0xbf800000u;\n"
@@ -558,7 +606,7 @@ def descriptor_load_hlsl():
         "    uint top = firstbithigh(m);\n"
         "    return sign | ((top + 103u) << 23u) | ((m << (23u - top)) & 0x7fffffu);\n"
         "}\n"
-        "uint4 load_descriptor_format(uint formatWord, uint addr, uint channels, out bool valid) {\n"
+        "uint4 load_descriptor_format(uint formatWord, uint addr, uint channels, uint d16, out bool valid) {\n"
         "    valid = false;\n"
         f"    uint fixedBits = formatWord & {DESCRIPTOR_FIXED_MASK:#x}u;\n"
         f"    uint field = (formatWord >> {DESCRIPTOR_FORMAT_SHIFT}u) & {DESCRIPTOR_FORMAT_MASK:#x}u;\n"
@@ -569,8 +617,9 @@ def descriptor_load_hlsl():
         + "\n".join(legacy) + "\n"
         "    }\n"
         "    uint4 raw = inputData.Load4(addr);\n"
-        "    uint4 r = uint4(0u, 0u, 0u, 0u);\n"
+        "    uint4 r = uint4(0u, 0u, 0u, 0u), h = uint4(0u, 0u, 0u, 0u);\n"
         + "\n".join(arms) + "\n"
+        "    if (d16 != 0u) r = uint4(h.x | (h.y << 16u), h.z | (h.w << 16u), 0u, 0u);\n"
         "    return r;\n"
         "}\n"
     )
@@ -1699,11 +1748,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
         elif ((m := re.fullmatch(r"v_and_b32_e32 v(\d+), (?:0xffff|65535), v(\d+)", line))
-              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] == "source_low16"):
+              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] in ("source_low16", "alu_low16")):
             dst = int(m[1])
             if dst > 255:
                 raise ValueError("Invalid vector destination")
-            vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
+            word = f"inputData.Load({partial[1]})" if partial[0] == "source_low16" else partial[1]
+            vector[dst] = ("alu", f"({word} & 0xffffu)")
         elif m := re.fullmatch(rf"(v_(?:add|sub|subrev|mul)_f32_e32) v(\d+), {FLOAT_SOURCE}, (v\d+)", line):
             op, dst = m[1], int(m[2])
             words = [float_word(token, scalar, vector, pending) for token in m.groups()[2:]]
@@ -1812,8 +1862,6 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             descriptor_load = None
             if resource_channels and load_format_words is not None:
                 # The format is V# word 3 from a constant word, decoded in the shader (descriptor_load_hlsl).
-                if packed:
-                    raise ValueError("Descriptor-format d16 loads are not lowered")
                 if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer read target or address mode")
                 if format_load_index >= len(load_format_words):
@@ -1878,10 +1926,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 staged_steps.append((None, f"    bool format_valid_{format_load_index - 1};\n"
                                            f"    uint4 {result} = load_descriptor_format("
                                            f"{hlsl_word(('constant_word', descriptor_load))}, {addresses[0]}, "
-                                           f"{components}u, format_valid_{format_load_index - 1});"))
+                                           f"{components}u, {int(packed)}u, format_valid_{format_load_index - 1});"))
                 for reg in range(dst, dst + count):
                     vector.pop(reg, None)
-                    loading[reg] = ("alu", f"{result}.{'xyzw'[reg - dst]}")
+                    # An odd d16 count leaves the high half of the last word undefined, as for source_low16.
+                    low16 = packed and components % 2 and reg == dst + count - 1
+                    loading[reg] = ("alu_low16" if low16 else "alu", f"{result}.{'xyzw'[reg - dst]}")
                 continue
             # The address has been captured, so the index can alias a destination.
             for reg, address in enumerate(addresses, dst):

@@ -4985,7 +4985,6 @@ The gfx1013 compute store profile lowers `buffer_load_format_x`, `_xy`, `_xyz` a
 This is the format decoder of item A of #2022. The descriptor still comes from the static table offset (`--source-descriptor`, `--source-stride`). Taking the descriptor from the heap at run time is a separate slice, so this alone does not count as coverage of any application dispatch.
 
 The address is `idxen` only and 4-byte aligned, and four bytes per opcode channel must fit inside the stated stride. These stay refused with this flag:
-- the `d16_` forms;
 - `offen`;
 - gfx1030;
 - `--source-format`.
@@ -5050,6 +5049,35 @@ On the invalid runs, these mutated sources must fail:
 - the selectors ignored.
 
 Dropping only the -1 clamp is not observable: long division of 32768 by 32767 also gives 1.0. With the lowering removed, or with its channel count changed, the translation controls fail. LLVM 15 assembles the fixture, and `lower` of the disassembly and the CLI output both match `lower` of the source.
+
+#### d16 forms
+
+`buffer_load_format_d16_x`, `_xy`, `_xyz` and `_xyzw` use the same format word, validity rule and refusal, and pack two 16-bit channels per result word, x in the low half. The format's type decides the 16-bit value:
+- **FLOAT16 formats:** the stored halves, unchanged.
+- **UNORM and SNORM16:** binary16 of the value above (`x / (2^n - 1)` or `max(x / 32767, -1)`), rounded to nearest even by long division. Binary16 denormals are kept, so `1/65535` is `0x0100`.
+- **16-bit UINT and SINT:** the 16-bit integer, not a float.
+- **32-bit formats:** no d16 rule is established here, so `32_UINT` and `32_FLOAT` in one to four channels are invalid under d16 and publish nothing.
+
+Whether the RDNA format unit rounds the same way, or keeps binary16 denormals, is not verified.
+
+An odd channel count leaves the high half of the last result word undefined. That word is low-16 only: it reaches a whole-word store or an ALU operand only through `v_and_b32 0xffff`, as for the existing caller-format D16 reads.
+
+The d16 fixture makes ten loads over the same t0 words, one per format with a d16 rule, and stores them in a 64-byte u0 record. The checks:
+- **Readback:** WARP and the hardware adapter compare all 320 words for one group and for two.
+- **Invalid formats:** three runs each make one load invalid, and each must leave u0 unwritten. They use `32_32_FLOAT` under `d16_xy`, `16_16_UNORM` under `d16_x`, and `8_SNORM`.
+- **Wrong references:** on the two-group run, each of these must fail at its first differing word:
+  - truncated binary16, and flushed binary16 denormals;
+  - 16-bit UINT converted like 16-bit UNORM, and 16-bit SINT converted like 16-bit SNORM;
+  - halves packed high first;
+  - the legacy word ignored;
+  - the neighbouring thread's element.
+- **Mutated HLSL:** each of these must also fail:
+  - a binary16 ratio that never rounds up, and flushed binary16 denormals;
+  - the two integer formats converted;
+  - halves packed high first, and the SNORM16 half sign dropped;
+  - the binary32 conversion used under d16;
+  - on the invalid runs, a 32-bit format accepted under d16, and the refusal removed.
+- **Translation controls:** they reject the odd half when the mask is missing, when an ALU operation uses it, and when the destination range is too wide. With the d16 flag dropped, the low-half marking removed, or 32-bit formats given a d16 arm, they fail.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
