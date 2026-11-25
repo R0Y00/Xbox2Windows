@@ -3395,6 +3395,8 @@ ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_unary_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_skipped_scalar_" -V
+python3 -B tests/mesh_entry_check.py exec-restore
+ctest --preset dev --no-tests=error -R "^mesh_entry_exec_restore_" -V
 ```
 
 A scalar register that is written only inside a range skipped by
@@ -3409,6 +3411,24 @@ checks both waves and six refusal controls; `mesh_entry_skipped_scalar_draw_*`
 draws a program whose wave 1 skips the write and whose wave 0 adds the value
 to the depth, and compares the export trace to an off-by-one depth and to the
 program without the add.
+
+Restoring EXEC after a per-lane range (#1998 item C) is not limited to
+`s_mov_b64 exec, <pair>`. The lowerer reads and writes the two 32-bit halves
+`exec_lo` and `exec_hi` (a 64-bit write to one half is refused), and models
+`s_orn2_b64`, `s_not_b64` and the saveexec family `s_and`, `s_andn2`, `s_or`,
+`s_orn2` and `s_xor` `_saveexec_b64`, which keep the old mask in the
+destination pair. A copy may be moved between registers, and a restore may be
+joined from two arms of a wave-uniform branch (`s_cmp_eq_u32 s8, 0`). The
+`exec-restore` mode builds such a program and requires the same HLSL as the
+plain copy-and-restore program. Refused, each with a control: restoring from a
+mask saved after the flip (lane 1 lost), from a register never written, with
+one half missing, with a 64-bit write to a half, with an unmodeled saveexec
+(`s_nand_saveexec_b64`), with an unmodeled branch, and with a backward branch.
+`mesh_entry_exec_restore_draw_*` draws the same program through WARP; a depth
+one unit in the last place off must report `Mesh export trace mismatch`. The
+draw is written for Windows and has not been run on Linux. The dynamic lowerer
+shares the model; `mesh_dynamic_aot_check.py` repeats the restore forms and
+refusals there.
 
 The allocation is not limited to one triangle. `MSG_GS_ALLOC_REQ` may declare
 any vertex and primitive counts within the PSV0 output bounds, and each of the
