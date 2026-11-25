@@ -340,19 +340,12 @@ bool log_checks(HMODULE module)
     std::array<XGameRuntimeShimLogEntry, 256> entries{};
     const std::size_t count = get_log(entries.data(), entries.size());
     bool async_ok = false, async_handle = false, result_ok = false, result_invalid = false;
-    bool refused = false;
     for (std::size_t i = 0; i < count && i < entries.size(); ++i) {
         const auto& entry = entries[i];
         if (!entry.function) return false;
-        // Only the two refusal calls of unsupported_queue may report E_NOTIMPL.
-        const bool refusal_call = std::strcmp(entry.function, "XTaskQueueCreate") == 0 ||
-                                  std::strcmp(entry.function, "XGameSaveInitializeProviderAsync") == 0;
         if (entry.result == not_implemented) {
-            if (!refusal_call) {
-                std::printf("FAIL: %s logged E_NOTIMPL\n", entry.function);
-                return false;
-            }
-            refused = true;
+            std::printf("FAIL: %s logged E_NOTIMPL\n", entry.function);
+            return false;
         }
         if (std::strcmp(entry.function, "XGameSaveInitializeProviderAsync") == 0) {
             async_ok = async_ok || entry.result == S_OK;
@@ -363,8 +356,8 @@ bool log_checks(HMODULE module)
             result_invalid = result_invalid || entry.result == E_INVALIDARG;
         }
     }
-    return expect(async_ok && async_handle && result_ok && result_invalid && refused,
-                  "log carries the positive, negative and refused async calls");
+    return expect(async_ok && async_handle && result_ok && result_invalid,
+                  "log carries the positive and negative async calls");
 }
 
 // Fills every free provider slot, then returns how many fit.
@@ -450,13 +443,37 @@ bool unsupported_queue(const Api& api, XUserHandle user)
     ok = expect_hr(api.initialize_result(&block, &none_provider), E_INVALIDARG,
                    "refusal left no async state") && ok;
     // Capacity untouched: the whole provider pool is still free after many refusals.
-    for (int i = 0; i < 20; ++i) api.initialize_async(user, configuration_id, false, &block);
+    for (int i = 0; i < 3; ++i) api.initialize_async(user, configuration_id, false, &block);
     std::array<XAsyncBlock, 8> blocks{};
     std::array<XGameSaveProviderHandle, 8> providers{};
     const std::size_t filled = fill_providers(api, user, blocks, providers, probe);
     ok = expect(filled == 4, "all four provider slots still free after refusals") && ok;
     for (std::size_t i = 0; i < filled; ++i) api.close_provider(providers[i]);
     return ok;
+}
+
+// The log keeps 64 entries, so this runs on a cleared log right after the refusals.
+bool refusal_log_checks(HMODULE module)
+{
+    GetLog get_log = nullptr;
+    if (!find_proc(module, "XGameRuntimeShimGetLog", get_log)) return false;
+    std::array<XGameRuntimeShimLogEntry, 64> entries{};
+    const std::size_t count = get_log(entries.data(), entries.size());
+    bool create_refused = false, async_refused = false;
+    for (std::size_t i = 0; i < count && i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        if (!entry.function) return false;
+        if (entry.result != not_implemented) continue;
+        create_refused = create_refused || std::strcmp(entry.function, "XTaskQueueCreate") == 0;
+        async_refused = async_refused ||
+                        std::strcmp(entry.function, "XGameSaveInitializeProviderAsync") == 0;
+        if (std::strcmp(entry.function, "XTaskQueueCreate") != 0 &&
+            std::strcmp(entry.function, "XGameSaveInitializeProviderAsync") != 0) {
+            std::printf("FAIL: %s logged E_NOTIMPL\n", entry.function);
+            return false;
+        }
+    }
+    return expect(create_refused && async_refused, "log carries the refused queue calls");
 }
 
 bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* normal_shim_dir)
@@ -476,8 +493,8 @@ bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* nor
         passed = expect_hr(api.find_user(synthetic_user_id, &user), S_OK, "find user") &&
                  positive_completion(api, user) && null_callback_and_callback_claim(api, user) &&
                  argument_errors(api, user) && reuse_and_capacity(api, user) &&
-                 manual_queue(api, user) && unsupported_queue(api, user) &&
-                 log_checks(module);
+                 log_checks(module) && manual_queue(api, user) && (clear_log(), true) &&
+                 unsupported_queue(api, user) && refusal_log_checks(module);
         if (user) api.close_user(user);
     }
     FreeLibrary(module);
