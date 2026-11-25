@@ -1073,7 +1073,7 @@ class Stage:
             return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
-        if base in VEC_H:
+        if base in VEC_H1:
             return self.half_unary(base, ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
@@ -2623,7 +2623,7 @@ class Stage:
         return '(-%s)' % text if neg else text
 
     def half_unary(self, base, ops, mods):
-        """VEC_H: binary16 one-source operation, computed in binary32 and rounded into the low half."""
+        """VEC_H1: binary16 one-source operation, computed in binary32 and rounded into the low half."""
         if mods:
             raise Unsupported('%s with %s' % (base, mods))
         if len(ops) != 2:
@@ -2631,7 +2631,7 @@ class Stage:
         d = reg_range(ops[0])
         if not d or d[0] != 'v':
             raise Unsupported('%s destination %s' % (base, ops[0]))
-        self.set_v(d[1], 'f32tof16(%s)' % VEC_H[base].format(self.half_src(ops[1])))
+        self.set_v(d[1], 'f32tof16(%s)' % VEC_H1[base].format(self.half_src(ops[1])))
 
     def i64_words(self, tok):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
@@ -3063,7 +3063,7 @@ VEC_F = {
 # binary16 one-source operations (VOP1, or VOP3 without modifiers): the source is the low half of the operand,
 # the result is rounded to binary16 and written to the low half with the high half cleared, as v_cvt_f16_f32 does.
 # v_fract_f16 stops at the largest binary16 below one; v_sin/cos take revolutions, as the binary32 forms do.
-VEC_H = {
+VEC_H1 = {
     'v_ceil_f16': 'ceil({0})', 'v_floor_f16': 'floor({0})', 'v_trunc_f16': 'trunc({0})', 'v_rndne_f16': 'round({0})',
     'v_fract_f16': 'min(frac({0}), 0.99951171875)', 'v_rcp_f16': '1.0 / {0}', 'v_rsq_f16': 'rsqrt({0})',
     'v_sqrt_f16': 'sqrt({0})', 'v_sin_f16': 'sin({0} * 6.283185307)', 'v_cos_f16': 'cos({0} * 6.283185307)',
