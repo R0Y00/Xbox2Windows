@@ -164,10 +164,10 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     WindowPresenter& p = window_presenter;
     if (p.failed || !queue || !surface) return false;
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();
-    if (!x2w_startup::present_surface_supported(desc)) {
+    if (!x2w_startup::present_surface_supported(desc, x2w_startup::present_rgba16_choice())) {
         static LONG refused;
         if (first_calls(refused, 4))
-            log("x2w-present surface dim=%d samples=%u flags=0x%x format=%d not supported (present_view_format.h)",
+            log("x2w-present surface dim=%d samples=%u flags=0x%x format=%d not supported (present_view_format.h; typeless rgba16 needs X2W_PRESENT_RGBA16_VIEW=float|unorm)",
                 desc.Dimension, desc.SampleDesc.Count, desc.Flags, desc.Format);
         return false;
     }
@@ -178,7 +178,7 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
         return false;
     }
     ID3D12Device* device = device_of(the_device);
-    const DXGI_FORMAT view_format = x2w_startup::present_view_format(desc.Format);
+    const DXGI_FORMAT view_format = x2w_startup::present_view_format(desc.Format, x2w_startup::present_rgba16_choice());
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format = view_format;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;

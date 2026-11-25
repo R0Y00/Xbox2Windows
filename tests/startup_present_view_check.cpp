@@ -3,7 +3,9 @@
 // texels through the mapped view against a CPU decode of the bytes that were uploaded.
 // --mutate identity: the table with the old behaviour (the typeless format unchanged); it must fail.
 // --mutate srgb: the device run with an sRGB view of the RGBA8 texture; it must fail on a texel.
-// --mutate unorm16: the device run with a UNORM view of the RGBA16 half-float texture; it must fail on a texel.
+// --mutate unorm16: the device run with a UNORM choice for the RGBA16 half-float texture; it must fail on a texel.
+// --mutate float16: the device run with a FLOAT choice for the RGBA16 UNORM texture; it must fail on a texel.
+// --mutate nochoice: the device run with no choice for the typeless RGBA16 textures; it must be refused.
 #include "startup_stubs/present_view_format.h"
 
 #include <d3dcompiler.h>
@@ -20,15 +22,18 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 int failures, format_checks, surface_checks;
-bool identity, srgb, unorm16;
+bool identity, srgb, unorm16, float16, nochoice;
 
-DXGI_FORMAT map_format(DXGI_FORMAT format) { return identity ? format : x2w_startup::present_view_format(format); }
+DXGI_FORMAT map_format(DXGI_FORMAT format, DXGI_FORMAT choice = DXGI_FORMAT_UNKNOWN)
+{
+    return identity ? format : x2w_startup::present_view_format(format, choice);
+}
 
-void expect(const char* name, DXGI_FORMAT format, DXGI_FORMAT wanted)
+void expect(const char* name, DXGI_FORMAT format, DXGI_FORMAT wanted, DXGI_FORMAT choice = DXGI_FORMAT_UNKNOWN)
 {
     ++format_checks;
-    if (map_format(format) != wanted) {
-        std::printf("FAIL %s: format %d -> %d, expected %d\n", name, format, map_format(format), wanted);
+    if (map_format(format, choice) != wanted) {
+        std::printf("FAIL %s: format %d -> %d, expected %d\n", name, format, map_format(format, choice), wanted);
         ++failures;
     }
 }
@@ -40,7 +45,14 @@ void table()
     expect("bgra8", DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM);
     expect("bgrx8", DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM);
     expect("rgb10a2", DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM);
-    expect("rgba16 (HDR)", DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    constexpr DXGI_FORMAT f16 = DXGI_FORMAT_R16G16B16A16_FLOAT, u16 = DXGI_FORMAT_R16G16B16A16_UNORM;
+    expect("rgba16 no choice refused", DXGI_FORMAT_R16G16B16A16_TYPELESS, none);
+    expect("rgba16 float choice", DXGI_FORMAT_R16G16B16A16_TYPELESS, f16, f16);
+    expect("rgba16 unorm choice", DXGI_FORMAT_R16G16B16A16_TYPELESS, u16, u16);
+    expect("rgba16 other choice refused", DXGI_FORMAT_R16G16B16A16_TYPELESS, none, DXGI_FORMAT_R16G16B16A16_SNORM);
+    expect("rgba16 typeless choice refused", DXGI_FORMAT_R16G16B16A16_TYPELESS, none, DXGI_FORMAT_R16G16B16A16_TYPELESS);
+    expect("choice ignored for rgba8", DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, f16);
+    expect("choice ignored for rg16", DXGI_FORMAT_R16G16_TYPELESS, none, f16);
     for (DXGI_FORMAT typed : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
                               DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_SNORM,
                               DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_BC1_UNORM,
@@ -56,10 +68,10 @@ void table()
     expect("unknown refused", DXGI_FORMAT_UNKNOWN, none);
 }
 
-void expect_supported(const char* name, const D3D12_RESOURCE_DESC& desc, bool wanted)
+void expect_supported(const char* name, const D3D12_RESOURCE_DESC& desc, bool wanted, DXGI_FORMAT choice = DXGI_FORMAT_UNKNOWN)
 {
     ++surface_checks;
-    const bool got = x2w_startup::present_surface_supported(desc);
+    const bool got = x2w_startup::present_surface_supported(desc, choice);
     if (got != wanted) {
         std::printf("FAIL %s: supported=%d, expected %d (dim=%d samples=%u flags=0x%x fmt=%d)\n",
                     name, got ? 1 : 0, wanted ? 1 : 0, desc.Dimension, desc.SampleDesc.Count, desc.Flags, desc.Format);
@@ -80,12 +92,13 @@ void surface_support()
     D3D12_RESOURCE_DESC hdr = tex2d;
     hdr.Format = DXGI_FORMAT_R16G16B16A16_TYPELESS;
     hdr.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    expect_supported("2d typeless rgba16 rt", hdr, true);
+    expect_supported("2d typeless rgba16 rt, no choice", hdr, false);
+    expect_supported("2d typeless rgba16 rt, float choice", hdr, true, DXGI_FORMAT_R16G16B16A16_FLOAT);
     hdr.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
-    expect_supported("2d typeless rgba16 deny_srv", hdr, false);
+    expect_supported("2d typeless rgba16 deny_srv", hdr, false, DXGI_FORMAT_R16G16B16A16_FLOAT);
     hdr.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     hdr.SampleDesc.Count = 4;
-    expect_supported("2d typeless rgba16 msaa4", hdr, false);
+    expect_supported("2d typeless rgba16 msaa4", hdr, false, DXGI_FORMAT_R16G16B16A16_FLOAT);
     D3D12_RESOURCE_DESC two_channel16 = tex2d;
     two_channel16.Format = DXGI_FORMAT_R16G16_TYPELESS;
     expect_supported("2d typeless rg16 refused", two_channel16, false);
@@ -167,6 +180,7 @@ float half_to_float(unsigned h)
     return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f, static_cast<int>(exponent) - 15);
 }
 float decode_rgba16f(const unsigned* t, int c) { return half_to_float((t[c / 2] >> (16 * (c & 1))) & 0xffffu); }
+float decode_rgba16u(const unsigned* t, int c) { return static_cast<float>((t[c / 2] >> (16 * (c & 1))) & 0xffffu) / 65535.0f; }
 
 bool readback(ID3D12Device* device, const Case& item)
 {
@@ -201,8 +215,7 @@ bool readback(ID3D12Device* device, const Case& item)
     auto cpu = heaps->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = srgb && item.view == DXGI_FORMAT_R8G8B8A8_UNORM ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-                 : unorm16 && item.view == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_FORMAT_R16G16B16A16_UNORM
-                                                                          : item.view;
+                 : item.view;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -324,7 +337,7 @@ void verify_surface_guards(ID3D12Device* device)
     ComPtr<ID3D12DescriptorHeap> heap;
     check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "guard srv heap");
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = x2w_startup::present_view_format(actual_rt.Format);
+    srv.Format = x2w_startup::present_view_format(actual_rt.Format);  // typed: unchanged
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -362,6 +375,8 @@ int main(int argc, char** argv)
             identity = !std::strcmp(argv[i], "identity");
             srgb = !std::strcmp(argv[i], "srgb");
             unorm16 = !std::strcmp(argv[i], "unorm16");
+            float16 = !std::strcmp(argv[i], "float16");
+            nochoice = !std::strcmp(argv[i], "nochoice");
         } else {
             adapter = argv[i];
         }
@@ -379,7 +394,7 @@ int main(int argc, char** argv)
     try {
         auto device = create_device(!std::strcmp(adapter, "warp"));
         if (!device) return std::strcmp(adapter, "warp") ? 77 : 1;
-        std::vector<unsigned> rgba(16), rgb10(16), rgba16f(32);
+        std::vector<unsigned> rgba(16), rgb10(16), rgba16f(32), rgba16u(32);
         for (unsigned i = 0; i < 16; ++i) {
             // Byte 0..3 are r, g, b, a for the RGBA family; a 128 value sits in each of the first channels.
             rgba[i] = ((i * 16 + 3) | (255 - i * 16) << 8 | ((i * 37) & 255) << 16 | ((i * 53 + 7) & 255) << 24) & 0xffffffffu;
@@ -395,15 +410,29 @@ int main(int argc, char** argv)
             rgba16f[2 * i] = h(0) | h(1) << 16;
             rgba16f[2 * i + 1] = h(2) | h(3) << 16;
         }
+        // The same texture format with a second, distinct producer: UNORM texels, 16 bits a channel.
+        for (unsigned i = 0; i < 32; ++i) rgba16u[i] = (i * 2027 + 11) & 0xffffu | ((i * 4099 + 31) & 0xffffu) << 16;
+        rgba16u[0] = 0xffff0000u;  // 0 and 1.0
         const Case cases[] = {
             {"rgba8", DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, rgba, 1, decode_rgba8},
             {"bgra8", DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM, rgba, 1, decode_bgra8},
             {"rgb10a2", DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, rgb10, 1, decode_rgb10a2},
             {"rgba16f", DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT, rgba16f, 2, decode_rgba16f},
+            {"rgba16u", DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UNORM, rgba16u, 2, decode_rgba16u},
         };
         for (const Case& item : cases) {
             Case run = item;
-            run.view = map_format(item.typeless);
+            // The producer's view is the choice for typeless RGBA16; the mutations pick the wrong or no choice.
+            DXGI_FORMAT choice = item.view;
+            if (nochoice) choice = DXGI_FORMAT_UNKNOWN;
+            if (unorm16 && item.view == DXGI_FORMAT_R16G16B16A16_FLOAT) choice = DXGI_FORMAT_R16G16B16A16_UNORM;
+            if (float16 && item.view == DXGI_FORMAT_R16G16B16A16_UNORM) choice = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            run.view = map_format(item.typeless, choice);
+            if (run.view == DXGI_FORMAT_UNKNOWN) {
+                std::printf("FAIL %s: no view for typeless format %d (refused)\n", item.name, item.typeless);
+                ++failures;
+                continue;
+            }
             if (!readback(device.Get(), run)) ++failures;
         }
         verify_surface_guards(device.Get());
@@ -412,6 +441,6 @@ int main(int argc, char** argv)
         return 1;
     }
     if (failures) return 1;
-    std::printf("startup_present_view_%s: PASS (4 families read back)\n", adapter);
+    std::printf("startup_present_view_%s: PASS (5 families read back)\n", adapter);
     return 0;
 }

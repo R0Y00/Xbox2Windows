@@ -820,7 +820,8 @@ add_test(NAME startup_memory_srv_report COMMAND startup_memory_srv_report_check)
 
 # View format of the window presenter's read of typeless textures (src/startup_stubs/present_view_format.h);
 # the identity run is the old behaviour, the sRGB run is a wrong view of the RGBA8 texture and the unorm16 run is a
-# UNORM view of the RGBA16 half-float texture; all three are negative controls.
+# UNORM choice for the RGBA16 half-float texture; float16 is the FLOAT choice for the RGBA16 UNORM texture and
+# nochoice is the missing choice (refused); all five are negative controls.
 add_executable(startup_present_view_check tests/startup_present_view_check.cpp)
 target_include_directories(startup_present_view_check PRIVATE src)
 target_compile_features(startup_present_view_check PRIVATE cxx_std_17)
@@ -832,8 +833,11 @@ foreach(adapter IN ITEMS warp hardware)
 endforeach()
 add_test(NAME startup_present_view_srgb_control COMMAND startup_present_view_check warp --mutate srgb)
 add_test(NAME startup_present_view_unorm16_control COMMAND startup_present_view_check warp --mutate unorm16)
+add_test(NAME startup_present_view_float16_control COMMAND startup_present_view_check warp --mutate float16)
+add_test(NAME startup_present_view_nochoice_control COMMAND startup_present_view_check warp --mutate nochoice)
 set_tests_properties(startup_present_view_identity_control startup_present_view_srgb_control
-                     startup_present_view_unorm16_control PROPERTIES WILL_FAIL TRUE)
+                     startup_present_view_unorm16_control startup_present_view_float16_control
+                     startup_present_view_nochoice_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(startup_present_view_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Buffer memory SRV validation for device slot 70 (src/startup_stubs/memory_srv_buffer.h); the mutated
 # runs are negative controls.

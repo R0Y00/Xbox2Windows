@@ -70,18 +70,19 @@ ctest --preset dev --no-tests=error -R '^startup_mrt_' -V
 ## Typeless surfaces in the window presenter
 
 A presented texture in an 8-bit RGBA/BGRA/BGRX or 10:10:10:2 `_TYPELESS` format is sampled through its UNORM
-view, and `R16G16B16A16_TYPELESS` (the HDR scene surface) through its FLOAT view; other typeless formats are
-refused, not guessed. The half-float mapping is an assumption about the data, not something the format says:
-a 16-bit RGBA typeless texture that holds UNORM data would be read wrongly instead of being refused.
+view. `R16G16B16A16_TYPELESS` holds half-float (HDR scene) or UNORM texels and the format does not say which, so
+it is viewed only when the reading is named (a known typed producer view, or the diagnostic choice
+`X2W_PRESENT_RGBA16_VIEW=float|unorm`) and refused otherwise; other typeless formats are refused, not guessed.
 `startup_present_view_check` compares a compute readback of 16 texels per family on WARP and hardware with a CPU
 decode of the uploaded bytes. The half-float family uses sixteen values chosen to reach HDR and edge cases (1.0,
 0.5, 2.5, -0.25, 65504, the smallest normal, the smallest subnormal, +0 and -0, and others) rotated over the four
 channels; the CPU decode is written from the format's bit fields and agrees with an independent decoder on all
 63,488 finite half-float patterns. The identity mapping (the old behaviour) fails the table; an sRGB view of the
-RGBA8 texture fails on the first texel (0x03 reads 0.0009, not 0.0118); a UNORM view of the half-float texture fails
-on the first texel (0x3c00 reads 0.2344, not 1.0). On origin/main the table fails for `R16G16B16A16_TYPELESS` (it
+RGBA8 texture fails on the first texel (0x03 reads 0.0009, not 0.0118); the UNORM choice for the half-float texture fails
+on the first texel (0x3c00 reads 0.2344, not 1.0), the FLOAT choice for a second RGBA16 texture with UNORM texels fails
+on a texel, and no choice is refused (`nochoice` control). On origin/main the table fails for `R16G16B16A16_TYPELESS` (it
 maps to `UNKNOWN`) and for its surface check. Verified on Windows Server 2025 (WARP) in Debug and Release `/O2`
-(`startup_present_view`, `startup_present_view_warp`, and the three negative controls pass). Not covered: a
+(`startup_present_view`, `startup_present_view_warp`, and the five negative controls pass). Not covered: a
 presented 16-bit or 10-bit surface is shown but has no "Present mean" measure, and `startup_present_view_hardware`
 was skipped on the WARP-only runner.
 
