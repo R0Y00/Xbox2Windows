@@ -73,6 +73,7 @@ def main(xmem_path, xcrdapi_path):
     factory = pointer()
     assert get_factory(None, C.byref(factory)) == 0 and factory.value, "DStorageGetFactory failed"
     first_sample = wait_for_sample(log, lambda sample: sample[3] == "unknown")
+    assert first_sample[0] < 10, f"the interval override was ignored: first sample at {first_sample[0]} s"
     library = C.WinDLL(str(Path(xmem_path).resolve()), use_last_error=True, winmode=0x900)
     allocate = bind(library, "XMemAllocatePhysicalPages", [number, C.POINTER(number), C.POINTER(number)], C.c_int)
     release = bind(library, "XMemFreePhysicalPages", [number, C.POINTER(number)], C.c_int)

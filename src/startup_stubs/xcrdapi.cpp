@@ -18,7 +18,6 @@
 #include <psapi.h>
 
 #include <condition_variable>
-#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <memory>
