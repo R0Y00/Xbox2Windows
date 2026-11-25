@@ -1235,12 +1235,17 @@ class Stage:
 
     def half_operand(self, tok, kind):
         """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
-        if kind == 'i16':
-            return 'float(((int(%s) & 0xffff) ^ 0x8000) - 0x8000)' % self.u(tok)
-        if kind == 'u16':
-            return 'float(%s & 0xffffu)' % self.u(tok)
+        if kind in ('i16', 'u16'):
+            if tok in FLOATS:  # an inline float constant is a binary16 word at 16-bit width, not binary32
+                word = struct.unpack('<H', struct.pack('<e', FLOATS[tok]))[0]
+                src = '%du' % word
+            else:
+                src = self.u(tok)
+            if kind == 'i16':
+                return 'float(asint((%s & 0xffffu) << 16u) >> 16)' % src
+            return 'float(%s & 0xffffu)' % src
         neg = False
-        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+        if tok.startswith('-') and (not re.match(r'-[\d.]', tok) or re.match(r'-0x', tok)):
             neg, tok = True, tok[1:]
         absolute = tok.startswith('|') and tok.endswith('|')
         if absolute:
@@ -1269,7 +1274,7 @@ class Stage:
         if result == 'h':
             if 'clamp' in mods:
                 expr = 'saturate(%s)' % expr
-            expr = 'f32tof16(%s)' % expr
+            expr = 'f16rn(%s)' % expr
         self.set_v(reg_range(ops[0])[1], expr)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
@@ -3081,8 +3086,8 @@ VEC_H = {
     'v_fmac_f16': (2, 'h', '{0} * {1} + {2}', 'h'), 'v_fmamk_f16': (3, 'h', '{0} * {1} + {2}', 'h'),
     'v_fmaak_f16': (3, 'h', '{0} * {1} + {2}', 'h'),
     'v_cvt_f16_i16': (1, 'i16', '{0}', 'h'), 'v_cvt_f16_u16': (1, 'u16', '{0}', 'h'),
-    'v_cvt_i16_f16': (1, 'h', '({0} != {0}) ? 0u : (uint(int(clamp(trunc({0}), -32768.0, 32767.0))) & 0xffffu)', 'u'),
-    'v_cvt_u16_f16': (1, 'h', '({0} != {0}) ? 0u : uint(clamp(trunc({0}), 0.0, 65535.0))', 'u'),
+    'v_cvt_i16_f16': (1, 'h', 'isnan({0}) ? 0u : (uint(int(clamp(trunc({0}), -32768.0, 32767.0))) & 0xffffu)', 'u'),
+    'v_cvt_u16_f16': (1, 'h', 'isnan({0}) ? 0u : uint(clamp(trunc({0}), 0.0, 65535.0))', 'u'),
 }
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
@@ -3368,6 +3373,11 @@ class Pipeline:
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
                ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
+               # binary32 to binary16 rounded to nearest even: f32tof16 truncates, a binary16 result must round (#1723).
+               'uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
+               ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
+               ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
+               ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'

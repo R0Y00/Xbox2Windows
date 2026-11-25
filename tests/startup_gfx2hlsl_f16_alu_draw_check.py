@@ -230,6 +230,7 @@ def check_binary(llvm_mc):
 def check_draw(dxc, renderer, adapter, fxc=None):
     controls()
     compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
+    failures = []
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:
@@ -242,8 +243,13 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     expected = words_text(reference(op, x) for x in chunk)
                     run = draw(renderer, adapter, vs, ps, expected)
                     if run.returncode:
-                        raise AssertionError('%s %s inputs %s\n%s\n%s' % (kind, op, chunk, run.stdout, run.stderr))
+                        failures.append('%s %s set %d' % (kind, op, index // 4))
+                        print('%s %s set %d MISMATCH inputs %s\n%s' % (kind, op, index // 4, chunk, run.stderr.strip()),
+                              flush=True)
+                        continue
                     print('%s %s set %d: %s' % (kind, op, index // 4, expected), flush=True)
+    if failures:
+        raise AssertionError('draw mismatches: ' + ', '.join(failures))
 
 
 def main():

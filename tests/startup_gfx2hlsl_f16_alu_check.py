@@ -7,6 +7,7 @@ their sources and write the low 16 bits of the destination (RDNA 2 zeroes the up
 instruction through Stage.one() and runs the emitted statement with a small Python model of the HLSL helpers, so the
 result is compared as bits, not as text.
 """
+import math
 import os
 import re
 import struct
@@ -52,12 +53,14 @@ def run(asm, regs):
     dst, expr = re.fullmatch(r'(v\d+) = (.*);', s.lines[0]).groups()
     env = {f'v{i}': v for i, v in enumerate(regs)}
     env.update(
-        f16tof32=lambda x: h2f(x), f32tof16=lambda x: f2h(x), saturate=lambda x: min(max(x, 0.0), 1.0),
+        f16tof32=lambda x: h2f(x), f16rn=lambda x: f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00), saturate=lambda x: min(max(x, 0.0), 1.0),
         abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
-        trunc=lambda x: float(int(x)), float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
+        trunc=lambda x: float(int(x)), isnan=math.isnan,
+        asint=lambda x: x - (1 << 32) if x >> 31 else x, float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
     py = expr.replace('0u', '0').replace('&&', 'and')
     py = re.sub(r'(0x[0-9a-f]+)u', r'\1', py)
-    py = re.sub(r'^\((.*?) != (.*?)\) \? 0 : (.*)$', r'(0 if (\1) != (\2) else \3)', py)
+    py = re.sub(r'\b(\d+)u\b', r'\1', py)
+    py = re.sub(r'^isnan\((.*?)\) \? 0 : (.*)$', r'(0 if isnan(\1) else \2)', py)
     return dst, eval(py, {}, env)
 
 
@@ -75,6 +78,10 @@ CASES = [
     ('v_fmaak_f16 v3, v0, v1, 0x3c00', [THREE, TWO], f2h(7.0)),
     ('v_add_f16 v3, 1.0, v1', [0, TWO], THREE),
     ('v_mul_f16 v3, 0.15915494, v1', [0, f2h(100.0)], f2h(h2f(f2h(0.15915494)) * 100.0)),
+    ('v_mul_f16 v3, 0.15915494, v1', [0, 0x3002], 0x251b),
+    ('v_cvt_f16_i16 v3, 1.0', [], f2h(15360.0)),
+    ('v_cvt_f16_u16 v3, -1.0', [], f2h(48128.0)),
+    ('v_add_f16 v3, -0x3c01, v1', [0, 0], 0xbc01),
     ('v_add_f16 v3, -v0, v1', [ONE, THREE], TWO),
     ('v_add_f16 v3, |v0|, v1', [f2h(-1.0), TWO], THREE),
     ('v_cvt_f16_i16 v3, v0', [0xfffd | HIGH], f2h(-3.0)),
