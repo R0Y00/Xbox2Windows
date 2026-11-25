@@ -15,12 +15,17 @@ void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
 bool check_startup_sampler_x(ID3D12Device* device, bool swapped);
 int check_startup_cb_blend(ID3D12Device* device, bool swapped);
+int check_startup_export_write_mask(ID3D12Device* device, bool unmasked);
 int check_startup_composite_provenance(ID3D12Device* device);
+int check_startup_range_provenance(ID3D12Device* device);
 void check_dynamic_sampler_index(ID3D12Device* device);
 float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                  std::uint32_t byte_offset, const char* manifest, const char* binding_case);
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line, bool array = false, UINT levels = 1, bool one_dimensional = false);
+                            float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
+                            bool one_dimensional = false, bool two_dimensional = false);
+void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                  bool depth16, std::uint32_t words[64]);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
@@ -29,7 +34,8 @@ void check_spirv_window(ID3D12Device* device, const char* shader_path);
 void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors = nullptr);
-void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
+void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
+                        bool dpp_case = false);
 void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
 bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
                                      const char* vs_path, const char* ps_path);
@@ -42,7 +48,8 @@ void check_stream_root_srv(ID3D12Device* device);
 void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowCase scenario);
 void check_cpu_srv_refresh(ID3D12Device* device, bool stale);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
-enum class MeshDrawMode { color, textured, depth_pair };
+// multi_primitive: one native color draw whose export trace size comes from the fixture.
+enum class MeshDrawMode { color, textured, depth_pair, multi_primitive };
 struct MeshTextureProducers {
     const char* first;
     const char* second;
@@ -105,7 +112,7 @@ bool check_dxr_placed_build(ID3D12Device* device);
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline);
 bool check_dxr_update(ID3D12Device* device, bool usePipeline);
 bool check_dxr_facing(ID3D12Device* device, bool usePipeline);
-bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline);
+bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline, float nearT);
 
 Microsoft::WRL::ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
     D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);

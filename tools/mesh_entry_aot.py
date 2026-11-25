@@ -1,5 +1,7 @@
 """Specialize a bounded, two-wave gfx1013 mesh entry for desktop D3D12.
 
+The allocation may declare up to 128 vertices and primitives within the PSV0
+output bounds; the compute fallback keeps a single three-vertex triangle.
 Geometry words and dispatch ABI are static inputs. Position and transform buffers
 remain GPU inputs. Only forward control flow decided by static values is accepted.
 """
@@ -15,6 +17,8 @@ from resource_inventory import parts
 
 U32 = (1 << 32) - 1
 WAVE = (1 << 64) - 1
+LANE_SPILL_OPS = {"v_writelane_b32", "v_readlane_b32"}
+VGPR_OPERAND = re.compile(r"\bv(?:(\d+)\b|\[(\d+):(\d+)\])")
 
 
 def span(token):
@@ -60,6 +64,11 @@ class Wave:
         self.scc = None
         self.pending = set()
         self.pending_v = set()
+        self.spill_slots = {}
+        self.spill_vgprs = set()
+        # First ordinary use of each spill VGPR after a spill write. Never cleared, on purpose: any later
+        # reload of that VGPR is refused, which can only over-refuse, never return a stale word.
+        self.spill_vector_uses = {}
         self.barriers = []
         self.counts = []
         self.positions = {}
@@ -243,6 +252,50 @@ class Wave:
                 else bool(v & (WAVE if wide else U32))
             )
 
+    def lane_spill(self, op, args):
+        if len(args) != 3:
+            raise ValueError(f"Expected three operands for {op}")
+        dest, source, lane_token = args
+        if not re.fullmatch(r"-?(?:[0-9]+|0x[0-9a-fA-F]+)", lane_token):
+            raise ValueError(f"{op} requires a constant integer lane: {lane_token}")
+        lane = int(lane_token, 16 if "0x" in lane_token else 10)
+        if not 0 <= lane < len(self.v):
+            raise ValueError(f"{op} lane {lane} out of range for wave{len(self.v)}")
+        writing = op == "v_writelane_b32"
+        vgpr = dest if writing else source
+        if not re.fullmatch(r"v\d+", vgpr):
+            raise ValueError(f"{op} requires a single VGPR")
+        reg = int(vgpr[1:])
+        slot = (reg, lane)
+        if writing:
+            if any(int(token[1:]) == reg for _, token in self.pending_v):
+                raise ValueError(f"{op} overlaps a pending vector load into {vgpr}")
+            if source in ("exec_lo", "exec_hi"):
+                value = self.exec >> (32 if source == "exec_hi" else 0)
+            else:
+                value = self.scalar(source)
+            if not isinstance(value, (int, str)):
+                raise ValueError(f"{op} requires a scalar word: {source}")
+            value = value & U32 if isinstance(value, int) else value
+            self.spill_vgprs.add(reg)
+            self.spill_slots[slot] = value
+            # Keep the lane visible if ordinary vector use follows the final reload.
+            self.v[lane][reg] = value
+            return
+        if reg in self.spill_vector_uses:
+            offset, other_op = self.spill_vector_uses[reg]
+            raise ValueError(
+                f"Mixed lane spill use of {vgpr}: {other_op} at {offset:#x} between write and read"
+            )
+        if slot not in self.spill_slots:
+            raise ValueError(f"Read of unwritten lane spill slot {vgpr}[{lane}]")
+        if not re.fullmatch(r"s\d+", dest):
+            raise ValueError(f"{op} requires a single SGPR destination")
+        scalar_reg = int(dest[1:])
+        if scalar_reg in self.pending:
+            raise ValueError("Pending scalar destination")
+        self.s[scalar_reg] = self.spill_slots[slot]
+
     def vector_op(self, op, args, expressions):
         d, *src = args
         live = [i for i in range(64) if self.exec & (1 << i)]
@@ -389,6 +442,15 @@ class Wave:
             pc += 1
             op, _, tail = line.partition(" ")
             args = tail.split(", ")
+            if op in LANE_SPILL_OPS:
+                self.lane_spill(op, args)
+                continue
+            if self.spill_vgprs:
+                # Only a subsequent reload makes an ordinary use part of a spill interval.
+                for single, first, last in VGPR_OPERAND.findall(tail):
+                    regs = (int(single),) if single else range(int(first), int(last) + 1)
+                    for reg in self.spill_vgprs.intersection(regs):
+                        self.spill_vector_uses.setdefault(reg, (offset, op))
             if op == "s_endpgm":
                 return
             if op in ("s_inst_prefetch", "s_nop"):
@@ -578,8 +640,11 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     if attributes and attributes.keys() != pos.keys():
         raise ValueError("Incomplete vertex attribute")
     idx = waves[0].indices | waves[1].indices
-    if (nv, np) != (3, 1):
-        raise ValueError("Expected a single three-vertex triangle")
+    # The native mesh shader writes any allocation within the PSV0 bounds. Each of the
+    # 128 threads exports at most one vertex and one primitive, so every allocated
+    # slot must be exported exactly once and nothing outside the allocation may be.
+    if compute_fallback and (nv, np) != (3, 1):
+        raise ValueError("The compute fallback translates only a single three-vertex triangle")
     if (
         not 0 < nv <= limits[0]
         or not 0 < np <= limits[1]
@@ -673,7 +738,7 @@ def require_mesh_stage(chunks):
             )
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+def decode_mesh(blob, library):
     chunks = parts(blob)
     require_mesh_stage(chunks)
     p = chunks[b"PSV0"]
@@ -689,15 +754,12 @@ def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=F
     if any(not 0 < n <= 256 for n in limits):
         raise ValueError("Invalid mesh declaration")
     code = container_code(chunks[b"DXIL"], stage=13)
-    return lower(
-        disassemble(
-            code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"
-        ),
-        geometry,
-        limits,
-        vertex_header,
-        compute_fallback=compute_fallback,
-    )
+    return disassemble(code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"), limits
+
+
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+    decoded, limits = decode_mesh(blob, library)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
 
 
 if __name__ == "__main__":
