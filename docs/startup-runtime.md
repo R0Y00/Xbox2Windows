@@ -189,7 +189,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-10`, so translations paired by number are not reused.
+The shader cache revision is `x2w-startup-shader-12`. Older translations can carry a stale scalar
+symbol across a join, read a stale SCC after an operation on a descriptor word, or lack the vertex buffer-store lowering.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
@@ -2004,15 +2005,20 @@ These are measured on one executable; treat them as hypotheses for others.
 - Depth-stencil registers are decoded, and applied only with `X2W_DEPTH_STATE=1` (#1999, item A;
   see the next bullet). State block A of a
   slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
-  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
-  covered. `src/startup_stubs/pipeline_state_decode.h`
+  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally, when the word at +0x004 is 4
+  (vertex pipelines). Mesh pipelines carry 6 there and a second layout, also measured locally: every
+  field from +0x058 on is 0x54 bytes later (`DB_DEPTH_CONTROL` at +0x10C); the reader adds that
+  shift. A block with another value at +0x004 is read at the vertex offsets. The blend reader
+  (`state_block_blend.h`, +0xD0) does not take the shift yet. `src/startup_stubs/pipeline_state_decode.h`
   reads the four words and decodes them into a `D3D12_DEPTH_STENCIL_DESC` and a stencil reference
   with the field layouts of Mesa's `src/amd/registers/gfx10.json`. It refuses stencil ops D3D12
   can't express (`ONES`, `REPLACE_OP`, the logic ops, add or subtract by other than one) and colour
   writes tied to the depth result. It flags, without applying, `DEPTH_BOUNDS_ENABLE` and back-face
   masks or references that differ from the front. A device-free check decodes hand-built words for
   each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
-  Its `_offset_control` run (words one word later) is the negative control
+  Its `_offset_control` run (words one word later) is the negative control. A vertex block and a mesh
+  block each hold a different decodable state at the other layout's offsets; `_mesh_shift_control`
+  (the mesh words at the vertex offsets) is that case's negative control
   (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
 - `X2W_DEPTH_STATE=1` (off by default) takes that decoded state for translated draws of slot 57
   pipelines (`src/startup_stubs/depth_state_apply.h`, applied in `translation_for` in

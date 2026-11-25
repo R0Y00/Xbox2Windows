@@ -105,6 +105,8 @@ The full Linux CI list is in the `Run Python checks` step of the `python-linux`
 job in the [CI workflow](.github/workflows/windows.yml). To run it locally,
 copy the step's `tools/run_checks_parallel.py` command with all its arguments
 and replace the leading `python` with `./out/pe-env/bin/python`.
+See the [Linux quick start](docs/non-windows-hosts.md#quick-start-on-linux)
+for how skips affect the runner's exit status.
 
 ```bash
 python3 -m venv out/pe-env
@@ -177,6 +179,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
@@ -185,6 +188,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compare_dst_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_build_rev_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_root_check.py

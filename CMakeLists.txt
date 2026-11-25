@@ -294,6 +294,9 @@ add_dependencies(xmem_section_lease_check xmem_shim)
 foreach(adapter warp hardware)
   add_test(NAME xmem_section_lease_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>")
   set_tests_properties(xmem_section_lease_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  add_test(NAME xmem_section_lease_mesh_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>" mesh)
+  add_test(NAME xmem_section_lease_vertex_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>" vertex)
+  set_tests_properties(xmem_section_lease_vertex_${adapter} xmem_section_lease_mesh_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 endforeach()
 add_executable(xmem_startup_below_40_check tests/xmem_startup_below_40_check.cpp)
 target_link_libraries(xmem_startup_below_40_check PRIVATE OneCore)
@@ -1318,12 +1321,39 @@ add_test(NAME startup_slice_footprints_padded_control COMMAND startup_slice_foot
 set_tests_properties(startup_slice_footprints_padded_control PROPERTIES WILL_FAIL TRUE)
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
+foreach(stage mesh vertex pixel)
+    if(stage STREQUAL mesh)
+        set(profile ms_6_5)
+    elseif(stage STREQUAL vertex)
+        set(profile vs_6_0)
+    else()
+        set(profile ps_6_0)
+    endif()
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/xmem_mesh_root_srv_${stage}.h")
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T ${profile} -E ${stage}
+        -Vn xmem_mesh_root_srv_${stage} -Fh "${header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/xmem_mesh_root_srv.hlsl"
+        DEPENDS tests/xmem_mesh_root_srv.hlsl VERBATIM)
+    target_sources(xmem_section_lease_check PRIVATE "${header}")
+endforeach()
+target_include_directories(xmem_section_lease_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME startup_mesh86_srv_proof COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh86_srv_proof_check.py"
+        "${DXC_EXECUTABLE}" "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(startup_mesh86_srv_proof PROPERTIES TIMEOUT 60)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_indirect_mesh_cache_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
             "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend})
         set_tests_properties(startup_indirect_mesh_cache_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        foreach(mode IN ITEMS ordered_control skip-wait)
+            set(test_name startup_indirect_mesh_lease_${backend}_${mode})
+            add_test(NAME ${test_name} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
+                "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend}
+                "$<TARGET_FILE:xmem_shim>" ${mode})
+            set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        endforeach()
     endforeach()
 endif()
 foreach(stage IN ITEMS mesh amplify amplified_mesh pixel)
@@ -1340,7 +1370,13 @@ foreach(stage IN ITEMS mesh amplify amplified_mesh pixel)
         DEPENDS tests/startup_indirect_mesh.hlsl VERBATIM)
     target_sources(startup_indirect_draw_indexed PRIVATE "${header}")
 endforeach()
-target_include_directories(startup_indirect_draw_indexed PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(startup_indirect_draw_indexed PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
+add_dependencies(startup_indirect_draw_indexed xmem_shim)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_mesh_xmem_writer_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh-lease-writer)
+    set_tests_properties(startup_mesh_xmem_writer_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_MESH86_FIXTURE_XMEM=$<TARGET_FILE:xmem_shim>")
+endforeach()
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
@@ -1403,11 +1439,15 @@ if(OFFSCREEN_AGILITY_620_DIR)
         file(ARCHIVE_EXTRACT INPUT "${OFFSCREEN_AGILITY_620_DIR}/sdk.nupkg" DESTINATION "${agility_headers}"
              PATTERNS "build/native/include/*.h")
         target_include_directories(offscreen_check BEFORE PRIVATE "${agility_headers}/build/native/include")
+        target_include_directories(startup_indirect_draw_indexed BEFORE PRIVATE "${agility_headers}/build/native/include")
+        target_include_directories(d3d12_xs_shim BEFORE PRIVATE "${agility_headers}/build/native/include")
+        target_compile_definitions(d3d12_xs_shim PRIVATE X2W_MESH_XMEM_AGILITY_620)
     endif()
     foreach(dll IN ITEMS D3D12Core.dll d3d12SDKLayers.dll)
         configure_file("${OFFSCREEN_AGILITY_620_DIR}/${dll}" "${CMAKE_CURRENT_BINARY_DIR}/D3D12/${dll}" COPYONLY)
     endforeach()
     target_compile_definitions(offscreen_check PRIVATE OFFSCREEN_AGILITY_620)
+    target_compile_definitions(startup_indirect_draw_indexed PRIVATE OFFSCREEN_AGILITY_620)
 endif()
 set(OFFSCREEN_WARP_DIR "" CACHE PATH "Directory containing an app-local x64 d3d10warp.dll (Microsoft.Direct3D.WARP)")
 if(OFFSCREEN_WARP_DIR)
@@ -1717,6 +1757,9 @@ target_compile_features(startup_pipeline_state_check PRIVATE cxx_std_17)
 add_test(NAME startup_pipeline_state COMMAND startup_pipeline_state_check)
 add_test(NAME startup_pipeline_state_offset_control COMMAND startup_pipeline_state_check --mutate offset)
 set_tests_properties(startup_pipeline_state_offset_control PROPERTIES WILL_FAIL TRUE)
+# Mesh-pipeline layout (+0x004 == 6, fields 0x54 later): a mesh block read at the vertex offsets must fail.
+add_test(NAME startup_pipeline_state_mesh_shift_control COMMAND startup_pipeline_state_check --mutate mesh-shift)
+set_tests_properties(startup_pipeline_state_mesh_shift_control PROPERTIES WILL_FAIL TRUE)
 # X2W_DEPTH_STATE (src/startup_stubs/depth_state_apply.h): off takes nothing from the block, on takes a decodable one.
 add_executable(startup_depth_state_check tests/startup_depth_state_check.cpp)
 target_include_directories(startup_depth_state_check PRIVATE src)
@@ -2825,6 +2868,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: v_add/sub/subrev_co_u32 against ISA references.
     add_test(NAME startup_gfx2hlsl_add_sub_co_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_check.py")
+    # Startup shader translator: a VOPC compare into vcc_hi, exec_hi or m0 is refused, not a crash.
+    add_test(NAME startup_gfx2hlsl_compare_dst_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compare_dst_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_cvt_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py" draw "${DXC_EXECUTABLE}"
@@ -3344,6 +3390,20 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: scalar constants are dropped at a branch join that another path writes (loop counters).
     add_test(NAME startup_gfx2hlsl_loop_constants COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loop_constants_check.py")
+    # Startup shader translator: symbols that are not constants (descriptors, pointers, pairs) at a branch join.
+    add_test(NAME startup_gfx2hlsl_join_symbols_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_join_symbols_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_join_symbols_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_join_symbols_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        add_test(NAME startup_gfx2hlsl_join_symbols_folded_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_join_symbols_check.py" control "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_join_symbols_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_gfx2hlsl_join_symbols_folded_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "control OUTSIDE: 3 in all four channels")
+    endforeach()
     # Startup shader translator: uniform sources of v_readfirstlane_b32 in straight-line code and entry blocks (#1723).
     add_test(NAME startup_gfx2hlsl_readfirstlane_uniform COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_uniform_check.py")
@@ -4160,6 +4220,36 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx2_regs_original>"
         "$<TARGET_FILE:cpu_avx2_regs_original_lifted>"
         "$<TARGET_FILE:cpu_avx2_regs_altered_lifted>")
+    set(cpu_avx2_mem_exports
+        "op_extracti128_mem_lo,op_extracti128_mem_hi,op_extracti128_mem_disp,"
+        "op_inserti128_mem_lo,op_inserti128_mem_hi_disp,op_perm2i128_mem,"
+        "op_pbroadcastb_xmm_mem,op_pbroadcastb_ymm_mem,op_pbroadcastw_xmm_mem,op_pbroadcastw_ymm_mem,"
+        "op_pbroadcastd_xmm_mem,op_pbroadcastd_ymm_mem,op_pbroadcastq_xmm_mem,op_pbroadcastq_ymm_mem,"
+        "op_permd_mem,op_permps_mem,op_permq_mem,op_permpd_mem,"
+        "op_pblendd_xmm_mem,op_pblendd_ymm_mem,"
+        "op_psllvd_xmm_mem,op_psllvd_ymm_mem,op_psllvq_xmm_mem,op_psllvq_ymm_mem,"
+        "op_psravd_xmm_mem,op_psravd_ymm_mem,op_psrlvd_xmm_mem,op_psrlvd_ymm_mem,"
+        "op_psrlvq_xmm_mem,op_psrlvq_ymm_mem,op_discarded_mem_read,op_mem_pipeline")
+    string(CONCAT cpu_avx2_mem_exports ${cpu_avx2_mem_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx2_mem_${variant} avx2_mem)
+        set(avx2_mem_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx2_mem_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${avx2_mem_lifted}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_avx2_aot.py"
+                "$<TARGET_FILE:cpu_avx2_mem_${variant}>" "${cpu_avx2_mem_exports}" "${avx2_mem_lifted}" --mem-ops
+            DEPENDS cpu_avx2_mem_${variant} tools/cpu_avx2_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_library(cpu_avx2_mem_${variant}_lifted SHARED "${avx2_mem_lifted}")
+    endforeach()
+    target_compile_definitions(cpu_avx2_mem_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx2_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx2_mem_check.py"
+        "$<TARGET_FILE:cpu_avx2_mem_original>"
+        "$<TARGET_FILE:cpu_avx2_mem_original_lifted>"
+        "$<TARGET_FILE:cpu_avx2_mem_altered_lifted>")
+    set_tests_properties(cpu_aot_avx2_mem PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx2_mem.txt")
     set(cpu_avx_int_exports
         "op_pabsb,op_pabsw,op_pabsd,"
         "op_packsswb,op_packssdw,op_packusdw,"
@@ -4340,6 +4430,39 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_move_mem_original_lifted>"
         "$<TARGET_FILE:cpu_avx_move_mem_altered_lifted>")
     set_tests_properties(cpu_aot_avx_move_mem PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_avx_move_ext_mem_exports
+        "op_vblendpd_xmm_mem,op_vblendpd_ymm_mem,op_vblendps_xmm_mem,op_vblendps_ymm_mem,"
+        "op_vblendvpd_xmm_mem,op_vblendvpd_ymm_mem,op_vblendvps_xmm_mem,op_vblendvps_ymm_mem,"
+        "op_vextractf128_mem_lo,op_vextractf128_mem_hi,op_vextractf128_mem_disp,"
+        "op_vinsertf128_mem_lo,op_vinsertf128_mem_hi,op_vextractps_mem,op_vinsertps_mem,"
+        "op_vperm2f128_mem,op_vpermilpd_imm_xmm_mem,op_vpermilpd_imm_ymm_mem,op_vpermilpd_var_ymm_mem,"
+        "op_vpermilps_imm_xmm_mem,op_vpermilps_imm_ymm_mem,op_vpermilps_var_ymm_mem,"
+        "op_vshufpd_xmm_mem,op_vshufpd_ymm_mem,op_vshufps_xmm_mem,op_vshufps_ymm_mem,"
+        "op_vunpcklpd_xmm_mem,op_vunpcklpd_ymm_mem,op_vunpckhpd_xmm_mem,op_vunpckhpd_ymm_mem,"
+        "op_vunpcklps_xmm_mem,op_vunpcklps_ymm_mem,op_vunpckhps_xmm_mem,op_vunpckhps_ymm_mem,"
+        "op_vmovddup_xmm_mem,op_vmovddup_ymm_mem,op_vmovshdup_xmm_mem,op_vmovshdup_ymm_mem,"
+        "op_vmovsldup_xmm_mem,op_vmovsldup_ymm_mem,op_discarded_mem_read")
+    string(CONCAT cpu_avx_move_ext_mem_exports ${cpu_avx_move_ext_mem_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_move_ext_mem_${variant} avx_move_ext_mem)
+        set(avx_move_ext_mem_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_move_ext_mem_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${avx_move_ext_mem_lifted}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_avx_move_aot.py"
+                "$<TARGET_FILE:cpu_avx_move_ext_mem_${variant}>" "${cpu_avx_move_ext_mem_exports}"
+                "${avx_move_ext_mem_lifted}" --mem-ops
+            DEPENDS cpu_avx_move_ext_mem_${variant} tools/cpu_avx_move_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_library(cpu_avx_move_ext_mem_${variant}_lifted SHARED "${avx_move_ext_mem_lifted}")
+    endforeach()
+    target_compile_definitions(cpu_avx_move_ext_mem_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx_move_ext_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_move_ext_mem_check.py"
+        "$<TARGET_FILE:cpu_avx_move_ext_mem_original>"
+        "$<TARGET_FILE:cpu_avx_move_ext_mem_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_move_ext_mem_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_move_ext_mem PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_move_ext_mem.txt")
     set(cpu_avx_pcmpstr_exports
         "vpcmpestri_ub_eqany_pos_lsb,vpcmpestri_sw_ranges_neg_msb,vpcmpestri_sb_eqeach_mpos_msb,"
         "vpcmpestri_uw_eqord_mneg_lsb,vpcmpestri_mem_ub_eqany_pos_lsb,vpcmpestri_alias_xmm0,"
