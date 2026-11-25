@@ -656,6 +656,12 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+MODIFIER_FREE_HANDLERS = frozenset((
+    'op_v_mov_b32', 'op_v_cvt_pkrtz_f16_f32', 'op_v_interp_p1_f32',
+    'op_v_interp_p2_f32', 'op_v_interp_mov_f32',
+))
+
+
 def smem_mods(mods):
     """Non-negative 21-bit signed immediate byte offset from SMEM modifiers, refusing unknown or negative forms."""
     imm = None
@@ -2539,6 +2545,8 @@ class Stage:
             return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
+            if mods and handler.__name__ in MODIFIER_FREE_HANDLERS:
+                raise Unsupported('%s with %s' % (base, mods))
             return handler(ops, mods)
         if base in MUBUF_ATOMIC_OPS:
             return self.buffer_atomic(base, ops, mods)
@@ -4635,11 +4643,15 @@ class Stage:
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         attr, comp = self.note_attr(ops[2], 'linear')
         self.set_v(reg_range(ops[0])[1], 'U(i.param%d.%s)' % (attr, comp))
 

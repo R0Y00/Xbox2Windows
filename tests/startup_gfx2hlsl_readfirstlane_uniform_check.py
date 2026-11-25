@@ -176,7 +176,11 @@ check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7
 got = run(MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')
 check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 = s2;'], repr(got))
 # Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
-EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
+# Since #1771 the dispatch refuses modifiers on modifier-free handlers, including v_mov_b32, before the read.
+EARLIER = {
+    'op_sel overwrite': 'modifier op_sel:[0,0]',
+    'modified move overwrite': "v_mov_b32 with ['clamp']",
+}
 for label, instructions in REFUSED:
     got = run(*instructions)
     check(f'{label} refused', got == EARLIER.get(label, REFUSAL), repr(got))
