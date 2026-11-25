@@ -38,6 +38,10 @@ struct RootViewStore {
 
     void clear() { *this = RootViewStore{}; }
 
+    // True when every parameter in required (one bit each) holds a view. A Dispatch that needs these roots
+    // must be recorded only when this holds.
+    bool covers(std::uint32_t required) const { return (bound & required) == required; }
+
     // declared: the type the root signature gives parameter, or ~0u when it has no such parameter.
     RootViewResult set(bool root_set, unsigned declared, unsigned wanted, unsigned parameter, std::uint64_t value)
     {

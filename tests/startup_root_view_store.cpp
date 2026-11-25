@@ -37,6 +37,9 @@ int main()
     expect(store.set(true, root_type_cbv, root_type_cbv, 3, 0) == RootViewResult::stored, "zero address stored");
     expect(store.bound == (1u << 15) && store.address[3] == 0, "zero address clears the bit");
 
+    expect(store.covers(1u << 15) && store.covers(0), "bound parameter covered");
+    expect(!store.covers((1u << 15) | (1u << 4)), "a missing root is not covered");
+
     store.clear();
     expect(store.bound == 0 && store.address[15] == 0, "clear empties the store");
 

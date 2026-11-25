@@ -3007,6 +3007,25 @@ void log_root_view_refusal(const char* what, UINT parameter, x2w_startup::RootVi
     static LONG refused;
     if (first_calls(refused, 6)) log("x2w-render %s %u ignored: %s", what, parameter, x2w_startup::root_view_reason(result));
 }
+// Desktop GPU address of a title address inside a live aliased placed buffer that is tracked from COMMON and
+// allows unordered access, or 0. Reads and writes through it reach the same memory the title sees, at the
+// offset of the title address in the buffer; the extent is the rest of that buffer.
+D3D12_GPU_VIRTUAL_ADDRESS placed_root_gpu(Wrapper* self, u64 address, bool writable)
+{
+    if (!address) return 0;
+    const auto placed = placed_buffer_range(self->own().list_device, address, 1);
+    if (placed.reject || !placed.owner || !placed.alias) return 0;
+    const auto* info = resource_info(placed.owner);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) return 0;
+    const auto base = reinterpret_cast<u64>(placed.owner->own().title_memory);
+    if (!base || address < base) return 0;
+    const u64 offset = address - base;
+    if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT || !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0)) return 0;
+    const D3D12_RESOURCE_DESC desc = placed.alias->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || offset >= desc.Width) return 0;
+    if (writable && !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return 0;
+    return placed.alias->GetGPUVirtualAddress() + offset;
+}
 // List slots 41 / 43 (desktop 37 / 39 + 4), SetComputeRootConstantBufferView / SetComputeRootShaderResourceView.
 // A CBV never exceeds 64 KiB, so its bytes at the title address are copied to desktop memory and the copy is
 // bound, as for slot 44. A root SRV has no such bound (a shader may read any offset of the buffer behind it) and
@@ -3028,7 +3047,13 @@ void compute_read_view(Wrapper* self, UINT parameter, u64 address, unsigned want
     const auto result = pass.compute_views.set(pass.compute_root, declared, wanted, parameter, kept);
     if (result != x2w_startup::RootViewResult::stored) return log_root_view_refusal(what, parameter, result);
     if (direct) {
+        if (parameter < pass.desktop_compute_upload_srvs.size()) pass.desktop_compute_upload_srvs[parameter] = own_page;
         list->SetComputeRootShaderResourceView(parameter, own_page);
+        return;
+    }
+    if (wanted == x2w_startup::root_type_srv) {
+        // A live placed buffer keeps its known offset and extent; any other address stays recorded only.
+        if (const auto gpu = placed_root_gpu(self, address, false)) list->SetComputeRootShaderResourceView(parameter, gpu);
         return;
     }
     if (!bytes) return;
@@ -3044,15 +3069,18 @@ void __stdcall list_compute_root_srv(Wrapper* self, UINT parameter, u64 address)
     compute_read_view(self, parameter, address, x2w_startup::root_type_srv, "compute root SRV");
 }
 // List slots 45 / 46 (desktop 41 / 42 + 4), SetComputeRootUnorderedAccessView / SetGraphicsRootUnorderedAccessView.
-// Recorded only. A copy would lose the writes the shader makes, so nothing is forwarded until the address maps
-// to a placed desktop buffer.
+// Always recorded. Compute is forwarded when the address lies in a live aliased placed buffer (placed_root_gpu);
+// graphics UAVs are recorded only.
 void __stdcall list_compute_root_uav(Wrapper* self, UINT parameter, u64 address)
 {
     if (!recording(self)) return;
     Pass& pass = pass_of(self);
     const auto result = pass.compute_views.set(pass.compute_root, declared_root_type(pass.compute_params, parameter),
                                                x2w_startup::root_type_uav, parameter, address);
-    if (result != x2w_startup::RootViewResult::stored) log_root_view_refusal("compute root UAV", parameter, result);
+    if (result != x2w_startup::RootViewResult::stored) return log_root_view_refusal("compute root UAV", parameter, result);
+    // Only a live placed buffer is forwarded; a copy would lose the shader's writes.
+    if (auto* list = recording(self))
+        if (const auto gpu = placed_root_gpu(self, address, true)) list->SetComputeRootUnorderedAccessView(parameter, gpu);
 }
 void __stdcall list_graphics_root_uav(Wrapper* self, UINT parameter, u64 address)
 {

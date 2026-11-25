@@ -13958,6 +13958,6 @@ root signature declares it with the same view type; otherwise it is refused and 
 
 Implementation boundary:
 - Compute CBV (slot 41): the bytes at the title address (at most 64 KiB, the CBV limit) are copied to desktop memory and the copy is bound.
-- Compute SRV (slot 43): the title address is recorded only. A root SRV has no 64 KiB bound and the buffer extent is not known, so nothing is copied or bound.
-- Compute UAV (slot 45) and graphics UAV (slot 46): addresses are recorded only. A stored UAV address is not a working GPU write.
-- Not yet measured on a live compute dispatch; that needs a placed buffer with a known offset (see #1441, #1974, #1975).
+- Compute SRV (slot 43): an address in this recording's own upload pages or in a live aliased placed buffer (tracked from COMMON, 16-byte aligned offset) is bound at its desktop address; any other address is recorded only, because a root SRV has no 64 KiB bound and a prefix copy would let reads past it return unrelated memory.
+- Compute UAV (slot 45): bound only when the address lies in a live aliased placed buffer that allows unordered access, so writes reach the title-visible memory at the known offset; otherwise recorded only. Graphics UAV (slot 46): recorded only.
+- Not yet measured on a live compute dispatch. The acceptance check (fenced UAV readback at a nonzero offset, and a Dispatch refused while a declared root is unbound, using `RootViewStore::covers`) needs the direct Dispatch of #1974 and the root constants and views of #1975 (see #1441).
