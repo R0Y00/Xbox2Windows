@@ -1413,9 +1413,12 @@ presented texture that must stay retained, alongside slot 133 title-memory textu
 `CopyTextureRegion`/`CopyResource` upload holds, same-address slot 70 (`existing_memory_texture`)
 reuse with `X2W_RESOURCE_INDEX_CHECK=1`, stale `written_textures` `bc7_width` cleanup,
 slot-18 SRV `CopyDescriptorsSimple` / overwrite / heap-release lifetime, and, with the
-switch on, a newer `written_textures` generation kept when the older generation retires;
-the `_off_` case checks that an ordinary committed texture (no title memory) still
-records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
+switch on, a newer `written_textures` generation kept when the older generation retires
+and a translated draw that samples such a texture through a descriptor table (the view
+token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
+a clear sentinel corner, and the texture leaves the budget only after the closed draw
+recording is dropped); the `_off_` case checks that an ordinary committed texture (no
+title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
 `x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
 `x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`

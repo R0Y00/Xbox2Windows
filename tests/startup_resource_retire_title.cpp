@@ -19,9 +19,14 @@
 //   6 written_textures generation keeping: a live view keeps the older generation's entry, and a newer generation of
 //     the same address survives the older generation's retirement (case runs with the switch on, which is what
 //     retires resources).
+//   7 draw path (review finding B1): a translated pixel shader samples a slot 133 title-memory texture through a
+//     descriptor table. The readback must hold the sampled texels and a clear sentinel corner, the draw must record
+//     a retire hold (so removing it fails here), and after the final Release and the descriptor overwrite the
+//     texture leaves the budget only when the closed draw recording is dropped (case runs with the switch on).
 #include "startup_stubs/resource_budget.h"
 
 #include <d3d12sdklayers.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -31,6 +36,7 @@
 #include <cstring>
 #include <cwchar>
 #include <deque>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -356,6 +362,185 @@ void fill_title_memory(void* address, int seed)
     for (UINT i = 0; i < image_bytes; ++i) dst[i] = pattern_byte(seed, i);
 }
 
+// Case 7 (reviewer JB2WIN, finding B1): the fixture had no draw path, so retire_hold() in the translated draw and
+// the view-token resolution that picks the sampled texture were untested. The case samples a slot 133
+// title-memory texture through a descriptor table with a host-built translated pipeline: the draw must bind the
+// texture the token names, the closed recording must hold it (so its final Release cannot drop it from the budget
+// before the recording is dropped), and the readback must hold the exact texel content throughout.
+constexpr UINT draw_side = 4;      // 4x4 R8G8B8A8_UNORM target
+constexpr UINT draw_covered = 3;   // scissor leaves the last row and column untouched as the sentinel
+constexpr int draw_seed = 77;
+constexpr UINT draw_clear_pixel = 0xffff00ffu;  // ClearRenderTargetView({1, 0, 1, 1}) in R8G8B8A8_UNORM
+constexpr char draw_revision[] = "x2w-startup-shader-14";  // d3d12_draw.inl cached_translation
+
+constexpr char draw_vertex_shader[] = R"(
+struct Varying { float4 position : SV_Position; };
+Varying main(uint id : SV_VertexID)
+{
+    Varying result;
+    result.position = float4(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0, 0.0, 1.0);
+    return result;
+}
+)";
+
+// Samples the texture the title's descriptor table names at the pixel it covers, so an unresolved or wrongly
+// resolved view token shows up as wrong texels rather than as a draw that silently binds nothing.
+constexpr char draw_pixel_shader[] = R"(
+Texture2D<float4> sampled : register(t0);
+float4 main(float4 position : SV_Position) : SV_Target
+{
+    return sampled.Load(int3(uint2(position.xy), 0));
+}
+)";
+
+constexpr char draw_manifest[] =
+    "x2w-manifest 1\nud 1\nudsrc 0 rect\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
+
+std::uint64_t fnv_bytes(const void* data, std::size_t bytes, std::uint64_t hash = 1469598103934665603ull)
+{
+    const auto* p = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ p[i]) * 1099511628211ull;
+    return hash;
+}
+
+bool write_file(const std::wstring& path, const void* data, std::size_t bytes)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool complete = WriteFile(file, data, static_cast<DWORD>(bytes), &written, nullptr) && written == bytes;
+    CloseHandle(file);
+    return complete;
+}
+
+ComPtr<ID3DBlob> compile_stage(const char* source, const char* entry, const char* profile)
+{
+    ComPtr<ID3DBlob> code, errors;
+    const HRESULT hr = D3DCompile(source, std::strlen(source), nullptr, nullptr, nullptr, entry, profile, 0, 0,
+                                  code.GetAddressOf(), errors.GetAddressOf());
+    if (FAILED(hr)) {
+        std::printf("FAIL: %s %s compile 0x%08lx%s%s\n", entry, profile, static_cast<unsigned long>(hr),
+                    errors ? ": " : "", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
+        return nullptr;
+    }
+    return code;
+}
+
+// Writes the source-built translation the shim looks up by the hash of the pipeline's two code blobs and its root
+// signature (d3d12_draw.inl cached_translation), and creates the guest root signature and placeholder pipeline
+// that name it. The shim loads the .vs/.ps bytecode and builds the desktop pipeline itself.
+bool prepare_draw_translation(Context& c, ComPtr<IUnknown>& root, ComPtr<IUnknown>& pipeline)
+{
+    wchar_t temporary[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temporary)) return false;
+    const std::wstring directory =
+        std::wstring(temporary) + L"x2w-retire-title-" + std::to_wstring(GetCurrentProcessId());
+    if (!CreateDirectoryW(directory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+    if (!SetEnvironmentVariableW(L"X2W_SHADER_CACHE", directory.c_str())) return false;
+
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable = {1, &range};
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    const D3D12_ROOT_SIGNATURE_DESC descriptor{1, &parameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> blob, errors;
+    if (!require(D3D12SerializeRootSignature(&descriptor, D3D_ROOT_SIGNATURE_VERSION_1, blob.GetAddressOf(),
+                                            errors.GetAddressOf()),
+                 "draw root serialize"))
+        return false;
+    if (!require(invoke(c.guest, 16, UINT{0}, blob->GetBufferPointer(), blob->GetBufferSize(),
+                        &__uuidof(ID3D12RootSignature), root.GetAddressOf()),
+                 "draw root signature"))
+        return false;
+
+    const auto vertex = compile_stage(draw_vertex_shader, "main", "vs_5_1");
+    const auto pixel = compile_stage(draw_pixel_shader, "main", "ps_5_1");
+    if (!vertex || !pixel) return false;
+    // The opaque guest programs only identify the cache entry: the shim hashes these bytes with the root blob.
+    static std::uint32_t vertex_key[] = {0x7a1b0001, 0x2c3d4e5f};
+    static std::uint32_t pixel_key[] = {0x7a1b0002, 0x5e4d3c2b};
+    std::uint64_t key = fnv_bytes(draw_revision, sizeof(draw_revision) - 1);
+    key = fnv_bytes(vertex_key, sizeof(vertex_key), key);
+    key = fnv_bytes(pixel_key, sizeof(pixel_key), key);
+    key = fnv_bytes(blob->GetBufferPointer(), blob->GetBufferSize(), key);
+    wchar_t stem[64]{};
+    swprintf(stem, 64, L"\\%016llx", static_cast<unsigned long long>(key));
+    const std::wstring prefix = directory + stem;
+    if (!write_file(prefix + L".txt", draw_manifest, sizeof(draw_manifest) - 1) ||
+        !write_file(prefix + L".vs.cso", vertex->GetBufferPointer(), vertex->GetBufferSize()) ||
+        !write_file(prefix + L".ps.cso", pixel->GetBufferPointer(), pixel->GetBufferSize()))
+        return false;
+
+    std::array<UINT64, 0x300 / sizeof(UINT64)> description{};
+    description[0] = reinterpret_cast<UINT64>(root.Get());
+    description[5] = reinterpret_cast<UINT64>(vertex_key);
+    description[6] = sizeof(vertex_key);
+    description[9] = reinterpret_cast<UINT64>(pixel_key);
+    description[10] = sizeof(pixel_key);
+    return require(invoke(c.guest, 57, description.data(), &__uuidof(ID3D12PipelineState), pipeline.GetAddressOf()),
+                   "draw pipeline");
+}
+
+// Reads a desktop target through the fixture's own desktop queue and readback buffer, as holds() does.
+bool read_target(Context& c, ID3D12Resource* target, const D3D12_RESOURCE_DESC& desc, std::uint8_t* bytes,
+                 UINT& row_pitch)
+{
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total = 0;
+    c.device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+    if (!total || total > image_bytes) {
+        std::puts("FAIL: target readback does not fit the fixture's readback buffer");
+        return false;
+    }
+    if (!require(c.own_allocator->Reset(), "target allocator") ||
+        !require(c.own_list->Reset(c.own_allocator.Get(), nullptr), "target list"))
+        return false;
+    D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE, {}};
+    barrier.Transition = {target, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE};
+    c.own_list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION to{c.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    to.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION from{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    c.own_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    c.own_list->ResourceBarrier(1, &barrier);
+    if (!c.own_run()) return false;
+    void* mapped = nullptr;
+    const D3D12_RANGE all{0, static_cast<SIZE_T>(total)};
+    if (!require(c.readback->Map(0, &all, &mapped), "target readback map")) return false;
+    std::memcpy(bytes, mapped, static_cast<std::size_t>(total));
+    c.readback->Unmap(0, nullptr);
+    row_pitch = footprint.Footprint.RowPitch;
+    return true;
+}
+
+std::uint32_t expected_target_pixel(UINT x, UINT y)
+{
+    if (x >= draw_covered || y >= draw_covered) return draw_clear_pixel;
+    std::uint32_t word = 0;
+    for (UINT byte = 0; byte < 4; ++byte)
+        word |= std::uint32_t{pattern_byte(draw_seed, y * pitch + x * 4 + byte)} << (8 * byte);
+    return word;
+}
+
+bool check_target(const char* stage, const std::uint8_t* bytes, UINT row_pitch)
+{
+    for (UINT y = 0; y < draw_side; ++y)
+        for (UINT x = 0; x < draw_side; ++x) {
+            std::uint32_t got = 0;
+            std::memcpy(&got, bytes + y * row_pitch + x * 4, sizeof(got));
+            const std::uint32_t want = expected_target_pixel(x, y);
+            if (got == want) continue;
+            std::printf("FAIL: %s: pixel (%u,%u) got %08lx want %08lx\n", stage, x, y,
+                        static_cast<unsigned long>(got), static_cast<unsigned long>(want));
+            return false;
+        }
+    return true;
+}
+
 // 1: slot 133 title_memory texture upload & copy lifetime across closed list and gated submission.
 bool case1_slot133_copy_and_upload(Context& c, bool on, void* title_mem)
 {
@@ -662,6 +847,121 @@ bool case6_written_generation_preserved(Context& c, void* title_mem)
     return true;
 }
 
+// 7 (B1): a translated draw samples a slot 133 title-memory texture through a descriptor table. The draw's view
+// token must resolve to that texture (a broken resolution binds the wrong view and the readback disagrees), and
+// the recording holds it so its final Release cannot drop it from the budget before the recording is dropped.
+bool case7_draw_samples_slot133_texture(Context& c, void* title_mem)
+{
+    ComPtr<IUnknown> root, pipeline;
+    if (!prepare_draw_translation(c, root, pipeline)) return false;
+
+    fill_title_memory(title_mem, draw_seed);
+    // No COM reference to the desktop object here: it would keep the budget ticket of the retired texture alive.
+    Res& T = c.make_slot133("T_draw", title_mem);
+
+    D3D12_RESOURCE_DESC target_desc = c.desc;
+    target_desc.Width = target_desc.Height = draw_side;
+    target_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    ComPtr<ID3D12Resource> target;
+    if (!require(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &target_desc,
+                                                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target)),
+                 "draw target"))
+        return false;
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
+    ComPtr<IUnknown> rtv_heap;
+    if (!require(invoke(c.guest, 14, &rtv_heap_desc, &__uuidof(ID3D12DescriptorHeap), rtv_heap.GetAddressOf()),
+                 "draw rtv heap"))
+        return false;
+    const UINT64 rtv = invoke<UINT64>(rtv_heap.Get(), 9);
+    invoke<void>(c.guest, 20, target.Get(), static_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(nullptr), rtv);
+
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } view_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    ComPtr<IUnknown> views;
+    if (!require(invoke(c.guest, 14, &view_heap_desc, &__uuidof(ID3D12DescriptorHeap), views.GetAddressOf()),
+                 "draw view heap"))
+        return false;
+    const UINT64 view_cpu = invoke<UINT64>(views.Get(), 9);
+    const UINT64 view_gpu = invoke<UINT64>(views.Get(), 10);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    invoke<void>(c.guest, 18, T.guest.Get(), &srv, view_cpu);
+
+    GuestList L;
+    if (!c.make_list(L)) return false;
+    const D3D12_CPU_DESCRIPTOR_HANDLE target_view{static_cast<SIZE_T>(rtv)};
+    const float clear[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(draw_side), static_cast<float>(draw_side), 0, 1};
+    const D3D12_RECT scissor{0, 0, draw_covered, draw_covered};  // the last row and column stay clear
+    invoke<void>(L.list.Get(), 52, rtv, clear, 0u, static_cast<const D3D12_RECT*>(nullptr));
+    invoke<void>(L.list.Get(), 50, 1u, &target_view, FALSE, static_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(nullptr));
+    invoke<void>(L.list.Get(), 25, pipeline.Get());
+    invoke<void>(L.list.Get(), 34, root.Get());
+    IUnknown* heaps[] = {views.Get()};
+    invoke<void>(L.list.Get(), 32, 1u, heaps);
+    invoke<void>(L.list.Get(), 36, 0u, view_gpu);
+    invoke<void>(L.list.Get(), 20, static_cast<UINT>(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
+    invoke<void>(L.list.Get(), 21, 1u, &viewport);
+    invoke<void>(L.list.Get(), 22, 1u, &scissor);
+    invoke<void>(L.list.Get(), 12, 3u, 1u, 0u, 0u);
+    if (!c.close(L)) return false;
+    c.execute(c.direct, L);
+    if (!c.sync(c.direct)) return false;
+
+    std::array<std::uint8_t, 1024> target_bytes{};
+    UINT row_pitch = 0;
+    if (!read_target(c, target.Get(), target_desc, target_bytes.data(), row_pitch)) return false;
+    if (!check_target("slot 133 texture sampled by a translated draw", target_bytes.data(), row_pitch)) return false;
+
+    // The draw path records the bind as a hold on the list, so the closed recording keeps the texture alive. The
+    // wrapper outlives its guest release, so the raw pointer still probes the list's holds afterwards.
+    IUnknown* const t_guest = T.guest.Get();
+
+    // Release the guest resource, then drop the descriptor that holds its slot 18 SRV reference by overwriting it
+    // with a view of the target. Only the draw's hold is left.
+    c.release(T);
+    D3D12_SHADER_RESOURCE_VIEW_DESC replaced = srv;
+    invoke<void>(c.guest, 18, target.Get(), &replaced, view_cpu);
+
+    // Draining while the closed list still names the texture keeps it retained, after its final Release too.
+    for (int i = 0; i < 8; ++i) {
+        c.drain_once();
+        if (!c.sync(c.direct)) return false;
+    }
+    if (!c.expect("slot 133 texture held by the closed draw list",
+                  "slot 133 texture left the budget before its draw recording was dropped"))
+        return false;
+
+    RetireProbe held{};
+    if (!x2w_d3d12_retire_probe(t_guest, L.list.Get(), &held) || held.list_holds == 0) {
+        std::printf("FAIL: translated draw recorded no retire hold on the slot 133 texture (list_holds=%u)\n",
+                    held.list_holds);
+        return false;
+    }
+
+    // The readback is still the sampled texel content after the release and the drains.
+    if (!read_target(c, target.Get(), target_desc, target_bytes.data(), row_pitch)) return false;
+    if (!check_target("readback after the guest release and drain", target_bytes.data(), row_pitch)) return false;
+
+    // Dropping the recording releases the hold; only then may the texture leave the budget.
+    if (!SUCCEEDED(c.reset_list(L))) return false;
+    T.freed = true;
+    if (!c.settle("slot 133 draw hold dropped", "slot 133 texture kept after its draw recording was dropped"))
+        return false;
+
+    if (!read_target(c, target.Get(), target_desc, target_bytes.data(), row_pitch)) return false;
+    return check_target("readback after the texture left the budget", target_bytes.data(), row_pitch);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -751,6 +1051,8 @@ int main(int argc, char** argv)
         } else {
             if (!case6_written_generation_preserved(c, mem3)) return 5;
             std::puts("6 written_textures generation: newer generation of an address kept by the older one's retirement");
+            if (!case7_draw_samples_slot133_texture(c, mem1)) return 5;
+            std::puts("7 translated draw: slot 133 texture sampled through a descriptor table, held until the recording drained");
         }
     } catch (int code) {
         VirtualFree(mem1, 0, MEM_RELEASE);
