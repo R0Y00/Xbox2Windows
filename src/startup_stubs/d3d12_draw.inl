@@ -204,7 +204,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-7";
+    constexpr char revision[] = "x2w-startup-shader-8";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -700,7 +700,9 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+    // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
+    const bool single = resource->own().tiled_address_srv && x2w_startup::single_element_bytes(desc) != 0;
+    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || single ||
         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.DepthOrArraySize == 1 && desc.Height == 1);
     {
         static LONG reasons;
@@ -741,13 +743,14 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
             desc.Height != surface.rows * surface.block_texels) return;
     }
-    if (tiled && !tiled_chain && (plan.count != 1 || plan.rows[0] != surface.rows ||
+    if (tiled && !tiled_chain && !single && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled ? surface.size() : stride * (slices - 1) + slice_total;
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    const bool recheck = (tiled_address || tiled_chain) ? elapsed != 0
-        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    // A single texel (at most 16 bytes) is rehashed on every bind, so a write between two draws is seen.
+    const bool recheck = single || ((tiled_address || tiled_chain) ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed));
     if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
@@ -778,7 +781,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 plan.upload(list, texture, upload_ring, mips, slices, slice, i, offset);
             }
         }
-    } else if (tiled) {
+    } else if (tiled && !single) {
         u64 offset = 0;
         const auto bytes = plan.bytes(0);
         auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);

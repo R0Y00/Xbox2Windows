@@ -387,7 +387,7 @@ def check_shader_records():
     sop1_scalar_alu_forms = {("SOP1", op) for op in pixel.SCALAR_ALU_SOP1_OPS}
     sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
     rejected_forms = {
-        "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
+        "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "v_mul_i32_i24_sdwa",
         "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
@@ -397,6 +397,9 @@ def check_shader_records():
         "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
+    # The wave32 masked region opener is lowered under the wave32 profile (check_wave32_region_controls).
+    assert "s_and_saveexec_b32" in pixel.ACCEPTED
+    assert ("SOP1", "s_and_saveexec_b32") in fc.gfx_forms(pixel.ACCEPTED, fc.load_reference("gfx1013.tsv"))
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)

@@ -183,7 +183,7 @@ class Probe(G.Stage):
     """A Stage with no pipeline: enough state for decoded instructions to be translated."""
 
     def __init__(self, kind='ps', exec_known=True, has_branches=False, wqm_exec=True):
-        self.lines, self.sym = [], {}
+        self.lines, self.sym, self.blocks = [], {}, []
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
         self.kind, self.exec_known, self.has_branches = kind, exec_known, has_branches
         self.wqm_exec = wqm_exec
@@ -249,10 +249,10 @@ def controls():
     accepted = 'v_mov_b32_dpp v2, v1 quad_perm:[1,1,3,3] row_mask:0xf bank_mask:0xf'
     check('accepted form translates', refused(accepted) is None, str(refused(accepted)))
     check('bound_ctrl does not change the lowering', refused(accepted + ' bound_ctrl:1') is None)
+    check('quad swap also translates', refused(accepted.replace('[1,1,3,3]', '[1,0,3,2]')) is None)
+    check('quad broadcast also translates', refused(accepted.replace('[1,1,3,3]', '[0,0,0,0]')) is None)
     for label, asm, kwargs in (
             ('the identity permutation stays with the lane-local forms', accepted.replace('[1,1,3,3]', '[0,1,2,3]'), {}),
-            ('a quad swap is item B', accepted.replace('[1,1,3,3]', '[1,0,3,2]'), {}),
-            ('a quad broadcast is item A', accepted.replace('[1,1,3,3]', '[0,0,0,0]'), {}),
             ('another pair pattern', accepted.replace('[1,1,3,3]', '[3,3,1,1]'), {}),
             ('a row control', 'v_mov_b32_dpp v2, v1 row_shr:1 row_mask:0xf bank_mask:0xf', {}),
             ('a wave control', 'v_mov_b32_dpp v2, v1 wave_shl:1 row_mask:0xf bank_mask:0xf', {}),

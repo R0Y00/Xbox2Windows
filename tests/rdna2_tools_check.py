@@ -5466,6 +5466,8 @@ class TestRdna2Scanner(unittest.TestCase):
                 "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400",
                 "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
                 "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0",
+                "s_round_mode 0xc",
+                "s_round_mode 0x0",
                 *base_pixel_tail,
             ],
         )
@@ -5480,6 +5482,8 @@ class TestRdna2Scanner(unittest.TestCase):
         for label, line in (
             ("getreg", "s_getreg_b32 s4, hwreg(HW_REG_MODE)"),
             ("setreg", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4"),
+            ("round_mode_binary32", "s_round_mode 0x3"),
+            ("round_mode_directed", "s_round_mode 0x4"),
         ):
             with self.subTest(form=label):
                 self.assertFalse(is_instruction_supported(line), line)
