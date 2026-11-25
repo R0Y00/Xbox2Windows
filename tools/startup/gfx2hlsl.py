@@ -2606,7 +2606,8 @@ class Stage:
 
     def half_src(self, tok):
         """float expression for the binary16 value in the low half of a 32-bit operand."""
-        neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+        # -0x3800 is the NEG modifier on the literal 0x3800 (the half 0.5); -1 and -0.5 are inline constants.
+        neg = (tok.startswith('-') and not re.match(r'-[\d.]', tok)) or re.fullmatch(r'-0x[0-9a-fA-F]+', tok) is not None
         if neg:
             tok = tok[1:]
         absolute = tok.startswith('|') and tok.endswith('|')

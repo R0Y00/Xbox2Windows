@@ -7,6 +7,7 @@ source, compute it in binary32, round the result to binary16 and write it to the
 cleared. Each must translate in both the VOP1 and the VOP3 spelling, take inline constants and the neg/abs source
 modifiers, and refuse a modifier or a wrong operand count instead of dropping it.
 """
+import struct
 import sys
 from pathlib import Path
 
@@ -64,6 +65,29 @@ for op, template in OPS.items():
     check('%s refuses a clamp' % op, translate('%s_e64 v1, v2 clamp' % op) == 'refused')
     check('%s refuses a missing source' % op, translate('%s v1' % op) == 'refused')
     check('%s refuses an extra source' % op, translate('%s v1, v2, v3' % op) == 'refused')
+
+# Machine code, through the decoder: a VOP1 word and a VOP3 word with a NEG-modified literal.
+OPCODES = {'v_rcp_f16': 0x54, 'v_sqrt_f16': 0x55, 'v_rsq_f16': 0x56, 'v_log_f16': 0x57, 'v_exp_f16': 0x58,
+           'v_floor_f16': 0x5b, 'v_ceil_f16': 0x5c, 'v_trunc_f16': 0x5d, 'v_rndne_f16': 0x5e, 'v_fract_f16': 0x5f,
+           'v_sin_f16': 0x60, 'v_cos_f16': 0x61}
+
+
+def translate_words(words):
+    stage = Probe()
+    try:
+        for _, _, name, asm in G.decode(struct.pack('<%dI' % len(words), *words)):
+            stage.one(name, asm)
+    except G.Unsupported:
+        return 'refused'
+    return stage.lines
+
+
+for op, code in OPCODES.items():
+    got = translate_words([0x7e000000 | (1 << 17) | (code << 9) | 0x102])  # op v1, v2
+    check('%s decodes from VOP1 machine code' % op, got == ['v1 = f32tof16rne(%s);' % (OPS[op] % 'f16tof32(v2 & 0xffffu)')], repr(got))
+    got = translate_words([0xd4000000 | ((0x180 + code) << 16) | 1, 0xff | (1 << 29), 0x3800])  # op_e64 v1, -0x3800
+    check('%s negates a literal as a half, not as an integer' % op,
+          got == ['v1 = f32tof16rne(%s);' % (OPS[op] % '(-f16tof32(0x00003800u & 0xffffu))')], repr(got))
 
 print('f16 transcendental checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)
