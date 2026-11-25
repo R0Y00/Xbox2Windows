@@ -9,6 +9,11 @@ Without arguments: translation controls and refusals. With draw: also compile th
 draw it through offscreen_check --startup-image-store, which reads every texel of a 4x4 image back. Negative
 controls: the translator refuses the program when the lowering is removed, and the translated shader with
 its store deleted, or with x and y exchanged, leaves texel (1, 2) at its starting value.
+
+The store runs under the lane's exec bit. Two variants put v_cmpx_eq_u32 before the store, so exec is not
+known at translation time: with 1 == v0 the lane stays on and the texel is written, with 2 == v0 every lane
+is off and the texel keeps its starting value. A control draws the exec-off variant with the guard removed
+from the store and must see the texel written.
 """
 import struct
 import subprocess
@@ -45,6 +50,17 @@ PREFIX = bytes.fromhex('04040cf4000000fa' '8102007e' '8202027e' 'f202087e' 'f402
 SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050607' '000081bf')
 WORDS = PREFIX + STORE + SUFFIX
 STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
+GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
+
+
+def cmpx_eq(constant):
+    """v_cmpx_eq_u32_e32 <constant>, v0: VOPC (bits 31:25 = 0x3e), opcode 0xd2, VSRC1 v0, SRC0 an inline
+    integer 1..64 (0x80 + n). In gfx10 the VOPC v_cmpx form writes only exec."""
+    return struct.pack('<I', 0x7c000000 | (0xd2 << 17) | (0 << 9) | (0x80 + constant))
+
+
+EXEC_ON = PREFIX + cmpx_eq(1) + STORE + SUFFIX   # v0 is 1: the lane stays active
+EXEC_OFF = PREFIX + cmpx_eq(2) + STORE + SUFFIX  # v0 is 1: every lane is turned off before the store
 
 
 def translate(words):
@@ -151,6 +167,18 @@ def controls():
     assert translate(PREFIX + load + SUFFIX).manifest().startswith('x2w-manifest 1\n')
     print('refused a load and a store of the same image')
 
+    # Exec not known at translation time: the store, and only the store line, is guarded by the lane's bit.
+    for constant, words in ((1, EXEC_ON), (2, EXEC_OFF)):
+        decoded = D.decode_instruction(cmpx_eq(constant), 0)[2]
+        assert decoded == 'v_cmpx_eq_u32_e32 %d, v0' % constant, decoded
+        ps = translate(words).hlsl_ps()
+        assert '    exec = ((0x%08xu == v0) ? 1u : 0u);' % constant in ps, ps
+        assert '    ' + GUARDED_LINE in ps, ps
+        assert ps.count(STORE_LINE) == 1, ps
+    # With exec known (the entry mask) the store is not guarded.
+    assert GUARDED_LINE not in translate(WORDS).hlsl_ps()
+    print('exec after v_cmpx: %s' % GUARDED_LINE)
+
     # Negative control: without the lowering the program is refused as before.
     lowering = G.Stage.op_image_store
     del G.Stage.op_image_store
@@ -175,9 +203,9 @@ def check_draw(dxc, renderer, adapter):
         directory = Path(tmp)
         vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'fullscreen', 'vs_6_0', directory)
 
-        def draw(text, label):
+        def draw(text, label, want=expected):
             ps = compile_hlsl(dxc, 'dxc', text, label, 'ps_6_0', directory)
-            return subprocess.run([renderer, adapter, '--startup-image-store', str(vs), str(ps), '1,2', expected],
+            return subprocess.run([renderer, adapter, '--startup-image-store', str(vs), str(ps), '1,2', want],
                                   capture_output=True, text=True)
 
         run = draw(source, 'store')
@@ -196,6 +224,23 @@ def check_draw(dxc, renderer, adapter):
             if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
             print('control %s: fails as expected (%s)' % (label, run.stderr.strip().splitlines()[0]))
+
+        # Exec after v_cmpx: an active lane writes the texel, an inactive one leaves it at its starting value.
+        untouched_bits = ','.join(['bf800000'] * 4)
+        on, off = translate(EXEC_ON).hlsl_ps(), translate(EXEC_OFF).hlsl_ps()
+        for label, text, want in (('exec on', on, expected), ('exec off', off, untouched_bits)):
+            run = draw(text, label.replace(' ', '_'), want)
+            if run.returncode:
+                raise AssertionError('%s draw failed\n%s\n%s' % (label, run.stdout, run.stderr))
+            print('draw %s: texel (1, 2) = %s, all other texels untouched' % (label, want))
+        # Control: the exec-off shader with the guard removed from the store writes the texel.
+        unguarded = off.replace(GUARDED_LINE, STORE_LINE)
+        assert unguarded != off
+        run = draw(unguarded, 'exec_off_unguarded', untouched_bits)
+        needle = 'texel_mismatch x=1 y=2 expected=%s actual=%s' % (untouched_bits, expected)
+        if run.returncode == 0 or needle not in run.stderr:
+            raise AssertionError('control exec guard removed was not detected\n%s\n%s' % (run.stdout, run.stderr))
+        print('control exec guard removed: fails as expected (%s)' % run.stderr.strip().splitlines()[0])
 
 
 def main():
