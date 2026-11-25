@@ -9134,6 +9134,11 @@ the writer. `order` records a cross-queue wait, a shared wait, same-queue
 ordering or an omitted wait in a control. A `recorded` call reaches a
 desktop command list. A `forwarded` submission reaches the desktop queue.
 
+The paired trace fixture runs on WARP and hardware. An additional WARP
+control leaves the selector unset, supplies a nondecimal suffix, and supplies
+a value that would truncate to the ordered call's ordinal. Each control must
+pass the paired pixel readback without emitting any trace rows.
+
 The recent-copy rows search the last 1,024 submitted copy destinations
 recorded by the XMem lease tracker. These cover forwarded slot 15 and slot 17
 copies into eligible copied placements. A placement overlap is a candidate
@@ -9176,6 +9181,11 @@ translated pair, so the dispatch stays unforwarded.
 The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
+
+The pending scan checks the DXContainer header and file length for both
+slot 57 bytecode artifacts. A missing or truncated artifact leaves the
+request pending even if its manifest exists. In manifest-only mode the
+manifest still completes the request.
 
 Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
 slot 57 creation. The descriptor must name a registered root, have an empty
