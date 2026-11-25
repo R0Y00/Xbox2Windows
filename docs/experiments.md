@@ -4821,9 +4821,30 @@ compares all 320 output words each time. The stale reference fails on exactly
 eight stored words. The binding is limited to unsigned 32-bit words and fixed
 byte offsets.
 
+### Mesh containers with two reachable exits
+
+The static and runtime-geometry mesh CLIs pass the gfx1013 wave64 profile to
+the bounded FSSM extractor. For two decoded `s_endpgm` instructions it follows
+direct branches from the entry and checks that both exits are reachable. A
+mesh allocation message and `s_barrier` fall through in this control-flow
+check. The wave model subsequently verifies allocation, synchronization and
+exports. The allocation message is required for this two-exit mesh profile.
+
+In the source-built fixture both waves reach the allocation barrier. Wave 1
+then ends, and wave 0 skips that exit and emits a quad. Both CLIs must emit
+the same HLSL as the single-exit version. Run the binary and draw checks with:
+
+```sh
+python -B tests/mesh_two_exits_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R '^mesh_two_exits_(warp|hardware)$' -V
+```
+
+The draws require LLVM 15, DXC and a mesh-capable adapter. Each lowering
+matches 1,024 pixels and rejects the triangle reference at exactly 528 pixels.
+
 ### Compute programs with two exits
 
-Compute programs (stage 5) now use the [pixel two-exit check](#pixel-programs-with-two-exits) from #477 when LLVM is supplied. Only exactly two aligned `s_endpgm` markers qualify. One marker is unchanged, three or more are rejected, and mesh programs (stage 13) with more than one marker are still rejected. `compute_store_aot.py` now passes `--llvm` to the extractor, and `shader_profile_audit.py` already did. This step extracts the code span only. The store profile does not lower branches, so a two-exit program now stops at its first unsupported instruction instead of at extraction.
+Compute programs (stage 5) use the [pixel two-exit check](#pixel-programs-with-two-exits) from #477 when LLVM is supplied. Only exactly two aligned `s_endpgm` markers qualify for this check. `compute_store_aot.py` passes `--llvm` to the extractor, as does `shader_profile_audit.py`. This step extracts the code span only. At the time of this experiment the store profile stopped at its first unsupported branch.
 
 The fixtures are original kernels compiled with LLVM 15 and reassembled with `llvm-mc-15`:
 
@@ -8371,20 +8392,44 @@ counts. It requires a direct list and a desktop mesh and pixel pipeline using
 an empty root signature, one matching single-sample color target, a viewport,
 and a scissor. Producers that bypass wrapper state tracking return the argument
 buffer to `COMMON` before slot 61. The mesh path uses the record's group counts
-without binding an input assembler topology or an index buffer. Amplification
-and console shader pipelines are tracked in
+without binding an input assembler topology or an index buffer. Slot 86 accepts
+desktop DXIL mesh programs under desktop tag 25 or console tag 24. Tag 24 with
+desktop amplification DXIL stays an amplification subobject and requires a
+desktop mesh stage. Any other payload under the shared tag is refused. Translation
+of console shader programs and support for other console mesh paths are tracked in
 [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 
 The fixture writes its group counts at byte offset four on the GPU and checks
 all eight pixels and the surrounding argument words. One group paints the
 left half. Two groups paint both halves. An omitted writer, a short argument
-range, and a missing viewport each leave the target clear. Adapters without
-mesh shader support report a capability skip.
+range, and a missing viewport each leave the target clear. The console tag
+fixture repeats the readback with a mesh program under tag 24 and checks that
+a pixel program under the same tag leaves the target clear. The amplified
+fixture passes a group index through an amplification payload and checks the
+same pixels. Adapters without mesh shader support report a capability skip.
+
+A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
+separate translation request. The descriptor must have a mesh program, an
+empty vertex slot, and a recorded root signature that matches the bound
+root. The pixel program is optional for depth-only work. The cache stores
+the root in `.root`, the pixel program (or an empty file) in `.ps57`, and
+writes the mesh program last in `.m57`. The offline reader validates the
+request key and stage exports. It reports unsupported mesh code and leaves
+the dispatch unforwarded until mesh code emission and binding are available.
+The request fixture checks paired and mesh-only requests, duplicate
+publication, a mismatched root, a populated vertex slot, and an incomplete
+pixel span.
 
 ```powershell
 cmake --build --preset release --target startup_indirect_draw_indexed
-ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(warp|hardware)$' -V
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_request_' -V
+.\out\pe-env\Scripts\python.exe -B tests/startup_gfx2hlsl_watch_check.py
+```
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_' -V
 ```
 
 On Windows build 26100, WARP 10.0.26100.33648 with the debug layer enabled
@@ -8392,6 +8437,13 @@ passed all four indirect fixtures. The baseline rejected the mesh shader stream
 and left the first mesh case clear. Physical adapter coverage is pending.
 [Candidate run](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45487176129)
 [Negative control](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45486140968)
+
+The slot 86 tag checks passed on Windows 11 build 26200.9974 with WARP
+10.0.26100.9818 and GeForce RTX 4060 Laptop GPU driver 32.0.16.1656, both
+with the debug layer enabled. Each mesh tag and the amplification payload
+produced 4/8 and 8/8 colored pixels for one and two groups. Pixel DXIL under
+tag 24 left 0/8 colored pixels on both adapters. The previous shim rejected
+the new console-tag fixture on WARP and left 0/8 colored pixels.
 
 #### D3D12.X graphics command list (XCL-12)
 
@@ -12734,6 +12786,86 @@ in X, Y and Z, point XY and mip filtering, and `MIP_POINT_PRECLAMP` set.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hardware)?$' -V
+```
+
+## Startup translator: fixed-mip 2D comparison gathers
+
+The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D
+texture with three contiguous address registers: the comparison reference
+first, then `u` and `v`. Only red `dmask:0x1` is in contract, because
+`gather4_c` compares the resource's red component and Direct3D's
+`gather4_c` takes a single-component view. The four per-tap comparison
+results go to consecutive destination registers in the same order as the
+ordinary gather: lower left, lower right, upper right, upper left.
+
+The comparison function lives in the sampler's word 0 bits 14:12
+(`SQ_TEX_DEPTH_COMPARE`, NEVER through ALWAYS in D3D12 comparison order).
+D3D compares `reference {function} texel.R` and returns `0.0` or `1.0` for
+each tap. The translator binds the guest's own four sampler words as a
+`SamplerComparisonState` and writes `smpc N w0 w1 w2 w3`; it reuses
+`pixel_aot.check_gather_sampler(..., comparison=True)`, so the profile is a
+constant sampler with normalized coordinates, CLAMP_LAST_TEXEL in X and Y,
+bilinear XY, point mip filtering, zero MIN_LOD and bias, no anisotropy and
+no TRUNC_COORD. All eight comparison functions are accepted and each has its
+own manifest line. Cache-policy bits (`glc`, `slc`, `dlc`) do not change the
+compared value; MAX_LOD is accepted but never carried into the static
+sampler, because a fixed-mip gather never selects a level.
+
+Both the guest `_lz` instruction and Direct3D gather compare at mip zero of
+the bound view. For a view that starts at a later resource mip, view mip
+zero is that first visible mip. The lowering emits
+`t = r0.GatherCmp(q0, float2(F(u), F(v)), F(reference));` and writes
+`t.x` through `t.w` to the four destination registers after the gather is
+read, so overlapping address and destination registers keep their original
+operands.
+
+The translator does not decode the image descriptor's format. The verified
+fixture contract is a single-component 32-bit float depth view
+(`R32_FLOAT`) with the reference and texels in `[0, 1]`; that is also the
+format that advertises `D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON`
+(RGBA32_FLOAT does not). Reference quantization, denormal and NaN behavior
+outside that contract, console equivalence and title-level execution are not
+claimed. The implicit-LOD, explicit-LOD, offset, array and non-red forms,
+sampler heaps and non-constant samplers stay refused by name.
+
+The source-built fixture is assembled from gfx1013 with LLVM 15 and decoded
+through the startup decoder:
+`0xf13c0108 0x00c40400` for
+`image_gather4_c_lz v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D`.
+`tests/startup_image_gather_c_lz_check.py` also compiles the translated
+stage as FXC `ps_5_1` and DXC `ps_6_0`, draws an 8×8 target with up to three
+view mips, and compares all 64 pixels and four channels bitwise against a
+CPU reference computed from the Direct3D gather footprint. The positive
+matrix distinguishes all four destination positions: each position has its
+own result sequence across the cases, and the check that requires four
+distinct sequences fails on an earlier matrix whose lower-right and
+upper-right references coincided. On WARP
+10.0.26100.9818 and an Intel Iris Xe Graphics (driver 31.0.101.5333) on
+Windows 11 build 26300, both compiler paths passed all 23 positive cases and
+all 8 output-sensitivity mutants with the debug layer enabled and zero errors
+or warnings. The evidence run keeps, for every executed case, its own
+generated HLSL, compiled object, sampler and resource manifest, texture data
+and renderer log. The
+refusal controls cover zero, multi-bit and non-red DMASK, non-2D dimensions,
+destination/address/descriptor widths and ranges, NSA, A16/D16/TFE/LWE/R128/
+unorm/reserved modifiers, malformed sampler words (15 sets) and the still
+refused gather variants. The control that removes the destination-width,
+red-DMASK or sampler-profile guard makes the corresponding malformed form
+translate, so the checks cannot pass without those guards. One sensitivity
+control swaps the lower-right and upper-right destination lanes in a
+temporary copy of the translated stage; it compiles, draws and is rejected
+by the comparator. The wrong-visible-mip control changes the expectation
+only and is not a wrong-SRV mutation. This is a bounded
+slice; the whole of the comparison-gather issue is not resolved, and the
+form-coverage denominator is unchanged.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_image_gather_c_lz(_warp|_hardware)?$' -V
+```
+
+```bash
+python3 -B tests/startup_image_gather_c_lz_check.py --llvm-mc llvm-mc-15
 ```
 
 ## Startup translator: per-lane bit operations

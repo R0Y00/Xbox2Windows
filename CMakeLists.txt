@@ -1144,6 +1144,10 @@ foreach(backend IN ITEMS warp hardware)
 endforeach()
 
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
+add_executable(startup_compute_binding_trace tests/startup_compute_binding_trace.cpp)
+target_compile_features(startup_compute_binding_trace PRIVATE cxx_std_20)
+target_link_libraries(startup_compute_binding_trace PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+
 add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
 target_link_libraries(startup_indirect_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
@@ -1179,14 +1183,22 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_copy_provenance_off_${backend} COMMAND startup_indirect_draw_indexed ${backend} copy-provenance-off)
     add_test(NAME startup_indirect_translated_indexed_${backend} COMMAND startup_indirect_draw_indexed ${backend} translated-indexed)
     add_test(NAME startup_indirect_mesh_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+    add_test(NAME startup_indirect_mesh_console_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh-console)
+    add_test(NAME startup_indirect_mesh_amplified_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh-amplified)
     set_tests_properties(startup_indirect_draw_indexed_${backend} startup_indirect_draw_${backend} PROPERTIES TIMEOUT 30)
-    set_tests_properties(startup_indirect_mesh_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_indirect_mesh_${backend} startup_indirect_mesh_console_${backend}
+        startup_indirect_mesh_amplified_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_draw_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_copy_provenance_${backend} startup_indirect_copy_provenance_off_${backend}
         PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_indexed_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
 set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_indirect_mesh_request_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+    set_tests_properties(startup_indirect_mesh_request_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_MESH_REQUEST_FIXTURE=1")
+endforeach()
 # Negative control for the x2w-render indirect line: one forwarded call too many must be reported as a mismatch.
 add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw_indexed warp count-control)
 # "got" is printed only for a mismatch, and the pattern holds the real counts. No semicolons: CMake would split it.
@@ -1250,9 +1262,11 @@ add_test(NAME startup_slice_footprints_padded_control COMMAND startup_slice_foot
 set_tests_properties(startup_slice_footprints_padded_control PROPERTIES WILL_FAIL TRUE)
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
-foreach(stage IN ITEMS mesh pixel)
-    if(stage STREQUAL mesh)
+foreach(stage IN ITEMS mesh amplify amplified_mesh pixel)
+    if(stage STREQUAL mesh OR stage STREQUAL amplified_mesh)
         set(profile ms_6_5)
+    elseif(stage STREQUAL amplify)
+        set(profile as_6_5)
     else()
         set(profile ps_6_0)
     endif()
@@ -2546,6 +2560,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_gather_lz_check.py")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
+    add_test(NAME startup_image_gather_c_lz COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_gather_c_lz_check.py")
     # image_sample_b (#1996): translation controls, then a desktop draw whose mip level the bias selects.
     add_test(NAME startup_image_sample_b_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_b_check.py")
@@ -2995,6 +3011,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
     # Device slot 67 compute pipelines publish req_<key>.{desc,sa,sb,data,root,c67}; the control (render mode off) must fail.
+    add_test(NAME startup_compute_binding_trace_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_binding_trace_check.py"
+        "$<TARGET_FILE:startup_compute_binding_trace>")
+    set_tests_properties(startup_compute_binding_trace_warp PROPERTIES TIMEOUT 30)
     add_test(NAME startup_compute_request_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>")
     add_test(NAME startup_compute_request_disabled_control COMMAND "${INTAKE_PYTHON}" -B
@@ -7292,6 +7312,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_dynamic_aot_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(NAME mesh_two_exits_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_two_exits_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_two_exits_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME mesh_pixel_pipeline_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_pixel_pipeline_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -8232,6 +8256,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_image_gather_lz_check.py" --draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_image_gather_lz_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_image_gather_c_lz_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_gather_c_lz_check.py" --draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_image_gather_c_lz_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_compare_gather_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_compare_gather_check.py" --draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" "${adapter}")

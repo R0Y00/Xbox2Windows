@@ -12,7 +12,7 @@ import re
 import struct
 from pathlib import Path
 
-from pixel_aot import container_code, disassemble
+from pixel_aot import MESH_WAVE64, container_code, disassemble
 from resource_inventory import parts
 
 U32 = (1 << 32) - 1
@@ -819,8 +819,8 @@ def decode_mesh(blob, library):
     limits = struct.unpack_from("<HH", p, 16)
     if any(not 0 < n <= 256 for n in limits):
         raise ValueError("Invalid mesh declaration")
-    code = container_code(chunks[b"DXIL"], stage=13)
-    return disassemble(code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"), limits
+    code = container_code(chunks[b"DXIL"], stage=13, llvm=library, features=MESH_WAVE64)
+    return disassemble(code, library, offsets=True, features=MESH_WAVE64), limits
 
 
 def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
