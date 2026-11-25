@@ -1480,7 +1480,8 @@ class Stage:
             if t in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') or (r and r[0] == 's' and r[1] in self.masks):
                 raise Unsupported('%s on a lane mask' % base)
             sym = self.sym.get(r[1]) if r and r[0] == 's' else None
-            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            word_kinds = ('const', 'ud', 'fixed_buffer_word')   # symbolic values that still hold a plain word
+            if sym and sym[0] not in word_kinds:
                 raise Unsupported('%s on descriptor data' % base)
             out.append(self.u(t))
         return out
