@@ -546,11 +546,19 @@ OperationResult run_compute_store_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// The store case with both raw buffers bound as descriptor-table views of the full 1280 bytes, so a
-// shader reading a descriptor's size sees the view size (root descriptors carry none).
+// The store case with both raw buffers bound as descriptor-table views (defaulting to the full 1280
+// bytes, or an explicit uav_words count in [1, 320]), so a shader reading a descriptor's size sees
+// the view size (root descriptors carry none).
 OperationResult run_compute_store_sized_case(const OperationContext& ctx)
 {
-    check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4], false, true);
+    UINT uav_words = 0;
+    if (ctx.argc == 6) {
+        const std::string_view text = ctx.argv[5];
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), uav_words);
+        if (error != std::errc{} || end != text.data() + text.size() || uav_words == 0)
+            throw std::runtime_error("Invalid compute UAV word count");
+    }
+    check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4], false, true, uav_words);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1578,7 +1586,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
-    {"--compute-store-sized-case", 5, 5, nullptr, kNoGate, run_compute_store_sized_case},
+    {"--compute-store-sized-case", 5, 6, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
     {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},

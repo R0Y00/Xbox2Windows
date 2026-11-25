@@ -42,7 +42,7 @@ void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
-                        bool dpp_case = false, bool sized_views = false);
+                        bool dpp_case = false, bool sized_views = false, UINT uav_words = 0);
 void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
 bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
                                      const char* vs_path, const char* ps_path);
@@ -133,6 +133,9 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
 struct ComputeCommands {
     ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline,
                     D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    // Records on a new list for an existing queue of the list's type. Releasing the commands then
+    // leaves that queue alive.
+    ComputeCommands(ID3D12Device* device, ID3D12CommandQueue* existing, ID3D12PipelineState* pipeline);
     void submit_and_wait(ID3D12Device* device);
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;

@@ -497,6 +497,24 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
+// The lease fixtures hold a writer queue behind a CPU-signalled gate while run() clears and reads back
+// its targets. With NVIDIA driver 32.0.16.2124, releasing a queue during that hold blocks until the test
+// times out when another process releases a queue during its own hold. Those clears and copies therefore
+// share one DIRECT queue per device that lives until the process exits.
+ID3D12CommandQueue* kept_direct_queue(ID3D12Device* device)
+{
+    static std::mutex lock;
+    static std::vector<std::pair<ID3D12Device*, ComPtr<ID3D12CommandQueue>>> queues;
+    const std::lock_guard guard(lock);
+    for (const auto& [owner, queue] : queues)
+        if (owner == device) return queue.Get();
+    const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    ComPtr<ID3D12CommandQueue> queue;
+    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "create kept readback queue");
+    queues.emplace_back(device, queue);
+    return queue.Get();
+}
+
 struct MeshLeaseDraw {
     UINT64 address;
     IUnknown* queue;
@@ -900,7 +918,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         if (leased && leased->before_submit) {
             // A submission-level refusal skips the entire wrapped list,
             // including its clear. Initialize the readback target separately.
-            ComputeCommands clear_targets(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            ComputeCommands clear_targets(device, kept_direct_queue(device), nullptr);
             for (std::size_t i = 0; i < targets.size(); ++i) {
                 auto* target = targets[i].Get();
                 transition(clear_targets.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1147,7 +1165,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
     for (const auto& target : targets) {
         const auto pixel_readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        ComputeCommands copy(device, kept_direct_queue(device), nullptr);
         transition(copy.list.Get(), target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION source{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         D3D12_TEXTURE_COPY_LOCATION destination{pixel_readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
