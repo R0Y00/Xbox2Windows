@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
 #include <fstream>
 #include <limits>
@@ -1317,21 +1318,25 @@ OperationResult run_startup_packed_position(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+unsigned long pixel_extent(const char* text)
+{
+    char* end = nullptr;
+    const long value = std::strtol(text, &end, 10);
+    return *end == '\0' && value >= 1 && value <= 64 ? static_cast<unsigned long>(value) : 0;
+}
+
+bool validate_pixel_words_args(int, char** argv)
+{
+    return pixel_extent(argv[5]) != 0 && pixel_extent(argv[6]) != 0;
+}
+
 // --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
 // width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
 // value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
 // row by row. Reports the first differing pixel and the number of differing pixels.
 OperationResult run_startup_pixel_words(const OperationContext& ctx)
 {
-    unsigned long width = 0, height = 0;
-    try {
-        width = std::stoul(ctx.argv[5]);
-        height = std::stoul(ctx.argv[6]);
-    } catch (const std::exception&) {
-        return {OutcomeKind::fail, "width and height must be numbers"};
-    }
-    if (width == 0 || height == 0 || width > 64 || height > 64)
-        return {OutcomeKind::fail, "width and height must be 1..64"};
+    const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
     std::vector<std::uint32_t> expected(size_t(width) * height * 4);
     std::ifstream file(ctx.argv[7], std::ios::binary);
     file.read(reinterpret_cast<char*>(expected.data()), std::streamsize(expected.size() * sizeof(std::uint32_t)));
@@ -1494,7 +1499,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
-    {"--startup-pixel-words", 8, 8, nullptr, kNoGate, run_startup_pixel_words},
+    {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
@@ -1768,6 +1773,14 @@ int run_self_test()
         return !expected_tmin || require(parse_dxr_opacity_tmin(static_cast<int>(mut_argv.size()), mut_argv.data()) ==
                                          expected_tmin, "effective opacity TMin");
     };
+
+    const auto check_extent = [&](const char* width, const char* height, CliAction action) {
+        return check_cli({"offscreen_check", "warp", "--startup-pixel-words", "vs", "ps", width, height, "ref"}, action);
+    };
+    if (!check_extent("1", "64", CliAction::operation) || !check_extent("08", "+4", CliAction::operation)) return 1;
+    for (const char* bad : {"", "8x4", "4junk", "4.5", "0", "65", "-1", "999999999999999999999"}) {
+        if (!check_extent(bad, "4", CliAction::usage_error) || !check_extent("8", bad, CliAction::usage_error)) return 1;
+    }
 
     for (const char* op : {"--dxr-opacity", "--dxr-opacity-pipeline"}) {
         if (!check_cli({"offscreen_check", "warp", op}, CliAction::operation, {}, 0.25f) ||
