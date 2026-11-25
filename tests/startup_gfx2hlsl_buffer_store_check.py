@@ -87,7 +87,7 @@ def main():
             check('declares the writable view', 'RWByteAddressBuffer u0 : register(u0);' in hlsl)
             check('stores three words at the address', 'a = 8;' in hlsl and 'u0.Store3(a, uint3(v1, v2, v3));' in hlsl)
             check('manifest is version 2 with the uav line',
-                  manifest[0] == 'x2w-manifest 2' and 'uav 0 buf table 0 16' in manifest and not any(l.startswith('srv') for l in manifest),
+                  manifest[0] == 'x2w-manifest 2' and 'uav 0 raw table 0 16' in manifest and not any(l.startswith('srv') for l in manifest),
                   repr(manifest))
 
         # 2. The other widths use the matching Store call.
@@ -148,8 +148,8 @@ def main():
               '%s %s' % (result, fail_reason(name)))
 
         # 8. The cache revision moved, so a translation from before the store lowering is never loaded.
-        check('cache key uses revision 9', G.pipeline_key(b'a', b'b', ROOT) ==
-              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.fnv(b'x2w-startup-shader-9')))))
+        check('cache key uses revision 10', G.pipeline_key(b'a', b'b', ROOT) ==
+              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.fnv(b'x2w-startup-shader-10')))))
 
     if failures:
         print('FAILED: ' + ', '.join(failures))
