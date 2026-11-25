@@ -65,6 +65,8 @@ def main():
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
     host_cpu_sites = {}
+    host_cpu_rewritten = set()  # sites replaced in place; a thread may still fault on one (see the handler)
+    host_cpu_resumed = set()  # (site, thread) pairs continued once for that reason
     flushopt_missing = [False]  # set when a CLFLUSHOPT faults: CLWB then becomes a NOP instead
     stub_area = [0, 0]  # next free address and end of the block the stubs go to
     os.makedirs(logdir, exist_ok=True)
@@ -602,8 +604,16 @@ def main():
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
                     and main_base <= ex_addr < main_base + 0x10000000):
                 name = rewrite_for_host(ex_addr)
-                if not name and sha_for_host(tid, ex_addr):
+                if name:
+                    host_cpu_rewritten.add(ex_addr)
+                elif sha_for_host(tid, ex_addr):
                     name = "sha (per hit)"
+                elif ex_addr in host_cpu_rewritten and (ex_addr, tid) not in host_cpu_resumed:
+                    # Another thread ran the old instruction before the rewrite and its fault arrived after:
+                    # continued, it runs the replacement. Once per thread, so a fault that stays is reported.
+                    host_cpu_resumed.add((ex_addr, tid))
+                    k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
+                    continue
                 if name:
                     host_cpu_sites[name] = host_cpu_sites.get(name, 0) + 1
                     if sum(host_cpu_sites.values()) <= 40:
@@ -733,6 +743,8 @@ def main():
             print("  asserts continued: " + ", ".join(f"{where(a)} x{n}" for a, n in asserts_seen.items()))
     if host_cpu_sites:
         print("  host-cpu sites rewritten: " + ", ".join(f"{name} x{n}" for name, n in sorted(host_cpu_sites.items())))
+    if host_cpu_resumed:
+        print(f"  host-cpu threads resumed at a site another thread had rewritten: {len(host_cpu_resumed)}")
     bink_report()
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
