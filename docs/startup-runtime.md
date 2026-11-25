@@ -1135,6 +1135,17 @@ These are measured on one executable; treat them as hypotheses for others.
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
+- **Pixel-stage image stores.** In a pixel stage, `image_store` with `dim:SQ_RSRC_IMG_2D` and
+  `dmask:0xf` becomes a typed store to a `RWTexture2D<float4>` at its own `u` register, under the
+  lane's exec bit, and the manifest becomes version 2 with a `uav <index> tex2d table <table> <offset>`
+  line. The cache-policy
+  bits are accepted. A partial channel mask (a typed store writes all four channels), other dimensions,
+  `d16`, `a16`, `tfe`, `lwe`, `r128`, `unorm`, `image_store_mip`, a store outside a pixel stage, and a
+  program that loads and stores the same image are refused by name. The runtime does not bind UAVs on the
+  translated graphics path yet: it logs and does not use a translation whose manifest has a `uav` line.
+  A hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
+  texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
+  `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
 - **Explicit mip loads.** For 2D textures, 2D arrays and 3D textures, `image_load_mip` passes the final
   address register to `Texture.Load` as the mip level (`int4(x, y, slice, mip)` for an array, whose four
   registers are x, y, slice and mip). Ordinary `image_load` still reads mip zero.

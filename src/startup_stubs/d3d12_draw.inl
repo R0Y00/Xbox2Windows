@@ -173,6 +173,12 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 log("x2w-draw invalid write mask manifest line for %016llx: %s", tr.key, line.c_str());
                 return;
             }
+        } else if (line.compare(0, 4, "uav ") == 0) {
+            // tools/startup/gfx2hlsl.py lowers a pixel-stage image_store to a u-register store, but the
+            // translated root signature has no UAV range and no view is made from the title's descriptor yet.
+            log("x2w-draw pipeline %016llx stores to an image (%s); pixel-stage UAVs are not bound yet, translation not used",
+                tr.key, line.c_str());
+            return;
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
