@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from mesh_entry_aot import U32, UNDEF, Wave, decode_mesh, float4, live_barriers_agree
+from mesh_entry_aot import U32, UNDEF, Wave, decode_mesh, float4, live_barriers_agree, run_group
 
 
 MAX_VARIANTS = 32
@@ -312,7 +312,7 @@ class RuntimeWave(Wave):
             value = values[bool(mask & (1 << lane))]
             if isinstance(value, RuntimeWord):
                 raise ValueError(f"Unproven runtime geometry word {value.index} in {op}")
-            if (lane, dest) in self.pending_v:
+            if self.vector_pending(lane, dest):
                 raise ValueError("Pending vector destination")
             self.v[lane][int(dest[1:])] = value & U32 if isinstance(value, int) else value
 
@@ -330,8 +330,7 @@ class Variant:
 def run_variant(decoded, geometry, limits, conditions):
     expressions = {}
     first, second = RuntimeWave(0, geometry), RuntimeWave(1, geometry)
-    for wave in (first, second):
-        wave.run(decoded, expressions)
+    run_group([first, second], decoded, expressions)
     if not live_barriers_agree(first, second) or len(first.counts) != 1 or second.counts:
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = first.counts[0]

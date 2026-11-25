@@ -156,6 +156,7 @@ public:
             log("x2w-red producer readback allocation failed hr=0x%08lx", static_cast<unsigned long>(hr));
             return 0;
         }
+        x2w_budget::committed(device_of(the_device), entry.readback.Get(), D3D12_HEAP_TYPE_READBACK);
         entries_.push_back(std::move(entry));
         copy_pixel(owner, entries_.back(), 0);
         return ordinal;

@@ -25,11 +25,11 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 
 namespace {
 using Microsoft::WRL::ComPtr;
-using Words = std::array<std::uint32_t, 7>;
+using Words = std::array<std::uint32_t, 9>;
 constexpr UINT width = 4, height = 2;
 constexpr auto format = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr std::uint32_t black = 0xff000000, red = 0xff0000ff, green = 0xff00ff00;
-constexpr Words initial{0xa5a5a5a5, 0, 0, 0, 0, 0, 0x5a5a5a5a};
+constexpr Words initial{0xa5a5a5a5, 0, 0, 0, 0, 0, 0x5a5a5a5a, 0x12345678, 0x9abcdef0};
 constexpr std::array<std::uint16_t, 10> indices{99, 99, 99, 0, 1, 2, 3, 4, 5, 99};
 constexpr std::array<std::uint32_t, 10> wide_indices{99, 99, 99, 0, 1, 2, 3, 4, 5, 99};
 constexpr UINT argument_offset = sizeof(std::uint32_t);
@@ -48,6 +48,24 @@ void write_left() {
 void write_right() {
     data.Store4(4, uint4(3, 1, 4, 0));
     data.Store(20, 0);
+}
+
+[numthreads(1, 1, 1)]
+void write_indexed_base() {
+    data.Store4(8, uint4(3, 1, 1, 3));
+    data.Store(24, 0);
+}
+
+[numthreads(1, 1, 1)]
+void write_four_rectangle_indices() {
+    data.Store4(4, uint4(4, 1, 1, 0));
+    data.Store(20, 0);
+}
+
+[numthreads(1, 1, 1)]
+void write_indexed_overrun() {
+    data.Store4(8, uint4(3, 1, 1, 5));
+    data.Store(24, 0);
 }
 
 [numthreads(1, 1, 1)]
@@ -109,6 +127,7 @@ float4 pixel(Varying input) : SV_Target {
 cbuffer entry : register(b0) { uint ud0; uint ud1; uint ud2; };
 Texture2D<float4> translated_texture : register(t0);
 ByteAddressBuffer translated_buffer : register(t0);
+Texture2D<float4> translated_indexed_texture : register(t1);
 
 float4 translated_vertex(uint id : SV_VertexID) : SV_Position {
     return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1);
@@ -125,6 +144,37 @@ float4 translated_pixel() : SV_Target {
 float4 translated_buffer_pixel() : SV_Target {
     uint value = translated_buffer.Load(ud2);
     return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
+}
+
+struct RectVarying {
+    float4 pos : SV_Position;
+    float4 uv : PARAM0;
+    nointerpolation uint4 flat : FPARAM0;
+};
+RectVarying translated_rect_vertex(uint id : SV_VertexID) {
+    RectVarying o = (RectVarying)0;
+    if (ud0) return o;
+    const uint offset = (id + ud1) * ud2;
+    o.pos = asfloat(translated_buffer.Load4(offset));
+    const uint uv = translated_buffer.Load(offset + 16);
+    o.uv.xy = float2(f16tof32(uv & 65535), f16tof32(uv >> 16));
+    o.flat.x = translated_buffer.Load(offset + 20);
+    return o;
+}
+float4 translated_rect_pixel(RectVarying input) : SV_Target {
+    const float2 quantizedUv = floor(input.uv.xy * 255 + .5) / 255;
+    return float4(quantizedUv, float(input.flat.x) / 255, 1);
+}
+
+Varying translated_indexed_vertex(uint id : SV_VertexID) {
+    return vertex(translated_buffer.Load((id + ud1) * ud2));
+}
+
+float4 translated_indexed_pixel(Varying input) : SV_Target {
+    if ((input.side == 0 && input.position.x < 2) || (input.side == 1 && input.position.x >= 2))
+        return translated_indexed_texture.Load(int3(0, 0, 0));
+    discard;
+    return 0;
 }
 
 )";
@@ -174,14 +224,14 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
 }
 
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
-                                    bool needs_start, bool table_buffer = false)
+                                    bool needs_start, bool table_buffer = false, bool indexed = false, bool rect = false)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
     constexpr char revision[] = "x2w-startup-shader-8";
-    static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102};
-    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203};
-    auto& vertex_id = vertex_ids[needs_start];
-    auto& pixel_id = pixel_ids[table_buffer];
+    static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
+    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000204};
+    auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
+    auto& pixel_id = pixel_ids[indexed ? 2 : table_buffer];
     std::uint64_t key = 1469598103934665603ull;
     const auto add = [&key](const void* data, std::size_t bytes) {
         const auto* p = static_cast<const unsigned char*>(data);
@@ -202,13 +252,15 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
         file.write(static_cast<const char*>(bytes), count);
         check(file.good() ? S_OK : E_FAIL, "write fixture cache");
     };
-    const auto vs = compile(needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
-    const auto ps = compile(table_buffer ? "translated_buffer_pixel" : "translated_pixel", "ps_5_1");
+    const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
+    const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_buffer ? "translated_buffer_pixel" : "translated_pixel", "ps_5_1");
     write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
     write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
     constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
     constexpr char buffer_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
-    if (table_buffer) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
+    constexpr char indexed_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nparams 1\ntargets 0\n";
+    if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
+    else if (table_buffer) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
     else write(".txt", manifest, sizeof(manifest) - 1);
     const std::array<UINT64, 0x300 / sizeof(UINT64)> desc{
         reinterpret_cast<UINT64>(root), 0, 0, 0, 0,
@@ -340,10 +392,12 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
-enum class Refusal { none, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending,
-                     insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy, invalid_mesh_tag };
-enum class DrawKind { indexed, vertices, mesh };
+enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
+                     insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
+                     indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
+                     rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending };
+enum class DrawKind { indexed, vertices, mesh, indexed_rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
 {
@@ -433,6 +487,7 @@ struct ReplayCopy {
 constexpr UINT command_stride(DrawKind kind)
 {
     switch (kind) {
+    case DrawKind::indexed_rect:
     case DrawKind::indexed: return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
     case DrawKind::vertices: return sizeof(D3D12_DRAW_ARGUMENTS);
     case DrawKind::mesh: return sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
@@ -451,18 +506,32 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
+         bool upload_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false)
 {
-    const bool indexed = kind == DrawKind::indexed;
+    const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
+    const bool translated_indexed = translated && indexed;
+    const UINT indexed_argument_offset = translated_indexed && draw_right ? 8 : argument_offset;
     const bool mesh = kind == DrawKind::mesh;
     const UINT index_bytes = indexed ? (draw_right ? sizeof(wide_indices) : sizeof(indices)) : 0;
     const UINT index_offset = 2 * (draw_right ? sizeof(std::uint32_t) : sizeof(std::uint16_t));
-    const void* index_data = draw_right ? static_cast<const void*>(wide_indices.data()) : indices.data();
+    const bool rect = kind == DrawKind::indexed_rect;
+    auto narrow = indices;
+    auto wide = wide_indices;
+    if (rect) {
+        narrow[3] = 2;
+        narrow[4] = 0;
+        narrow[5] = refusal == Refusal::rect_bad_index ? 9 : 1;
+        wide[3] = 0;
+        wide[4] = 2;
+        wide[5] = 1;
+    }
+    const void* index_data = draw_right ? static_cast<const void*>(wide.data()) : narrow.data();
     Words initial_words = initial;
     if (!indexed) initial_words[1 + command_stride(kind) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
     const PlacedBuffer arguments(device, guest, sizeof(initial_words), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     std::optional<PlacedBuffer> index_buffer;
-    if (indexed) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
+    if (indexed && !upload_index) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
     const auto upload = make_buffer(device, sizeof(initial_words) + index_bytes, D3D12_HEAP_TYPE_UPLOAD,
                                     D3D12_RESOURCE_STATE_GENERIC_READ);
     const auto arg_readback = make_buffer(device, sizeof(initial), D3D12_HEAP_TYPE_READBACK,
@@ -581,7 +650,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     using Index = void (WINAPI*)(IUnknown*, const D3D12_INDEX_BUFFER_VIEW*);
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
     const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
-    const D3D12_RECT scissor{0, 0, width, height};
+    const D3D12_RECT scissor{rect ? 1 : 0, 0, width, height};
     if (cached_depth_only) {
         slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, rtvs.data());
         list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -608,9 +677,33 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
         slot<Table>(wrapped, 36)(wrapped, 0, translated->gpu);
     }
-    if (!mesh) slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (!mesh) slot<Topology>(wrapped, 20)(wrapped,
+        rect ? static_cast<D3D12_PRIMITIVE_TOPOLOGY>(0x11) : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (refusal != Refusal::missing_viewport) slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
     slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
+    if (translated_indexed) {
+        using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+        using VertexBuffer = void (WINAPI*)(IUnknown*, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW*);
+        constexpr std::uint32_t vertex_values[]{0, 1, 2, 3, 4, 5};
+        struct RectVertex { float x, y, z, w; std::uint16_t u, v; UINT flat; };
+        static_assert(sizeof(RectVertex) == 24);
+        constexpr RectVertex top_left{-2, 1, 0.5f, 1, 0x0000, 0x3400, 53};
+        constexpr RectVertex bottom_left{-2, -1, 0.5f, 1, 0x0000, 0x3a00, 7};
+        constexpr RectVertex bottom_right{0.5f, -1, 0.5f, 1, 0x3900, 0x3a00, 11};
+        constexpr RectVertex top_right{0.5f, 1, 0.5f, 1, 0x3900, 0x3400, 29};
+        RectVertex rectangle[]{bottom_left, bottom_right, top_left, top_left, top_right, bottom_left};
+        if (refusal == Refusal::rect_bad_w) rectangle[1].w = 2;
+        if (refusal == Refusal::rect_bad_shape) rectangle[0].y = -0.25f;
+        const UINT vertex_bytes = rect ? sizeof(rectangle) : sizeof(vertex_values);
+        void* allocation = slot<Allocate>(wrapped, 148)(wrapped, vertex_bytes, 16);
+        if (!allocation) return false;
+        const void* contents = rect ? static_cast<const void*>(rectangle) : vertex_values;
+        std::memcpy(allocation, contents, vertex_bytes);
+        const UINT bytes = vertex_bytes + (refusal == Refusal::indexed_vertex_range ? 4 : 0);
+        const D3D12_VERTEX_BUFFER_VIEW vertex{reinterpret_cast<UINT64>(allocation), bytes,
+            rect ? sizeof(RectVertex) : sizeof(std::uint32_t)};
+        slot<VertexBuffer>(wrapped, 48)(wrapped, 0, 1, &vertex);
+    }
     if (index_buffer) {
         const auto address = reinterpret_cast<UINT64>(index_buffer->address);
         const auto start = refusal == Refusal::invalid_index ? index_bytes : index_offset;
@@ -618,10 +711,62 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                                          draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
         slot<Index>(wrapped, 47)(wrapped, &view);
     }
+    ComPtr<ID3D12CommandAllocator> foreign_allocator;
+    ComPtr<IUnknown> foreign_list;
+    std::array<std::uint32_t, 4> unregistered{};
+    void* late_index_write = nullptr;
+    if (upload_index) {
+        using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+        const UINT element_size = draw_right ? sizeof(std::uint32_t) : sizeof(std::uint16_t);
+        const UINT size = 4 * element_size;
+        auto* owner = wrapped;
+        if (refusal == Refusal::index_upload_foreign) {
+            check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&foreign_allocator)),
+                "create another recording allocator");
+            foreign_list = begin_guest_list(guest, foreign_allocator.Get());
+            owner = foreign_list.Get();
+        }
+        const UINT subview_offset = refusal == Refusal::index_upload_unaligned ? 2 : 4;
+        const UINT allocation_size = subview_offset + size - (refusal == Refusal::index_upload_cross ? 2 : 0);
+        auto* allocation = refusal == Refusal::index_unregistered ? reinterpret_cast<char*>(unregistered.data())
+            : static_cast<char*>(slot<Allocate>(owner, 148)(owner, allocation_size, 16));
+        if (!allocation) return false;
+        // An invalid index is deliberately visible while ExecuteIndirect records.
+        // The current recording upload is GPU-readable and the caller finalizes
+        // the contents before submission.
+        if (refusal == Refusal::none) {
+            std::memset(allocation + subview_offset, 0xff, size);
+            late_index_write = allocation + subview_offset;
+        }
+        const D3D12_INDEX_BUFFER_VIEW view{reinterpret_cast<UINT64>(allocation + subview_offset), size,
+            draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+        slot<Index>(wrapped, 47)(wrapped, &view);
+    }
     const UINT64 offset = refusal == Refusal::short_argument
-        ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : argument_offset;
+        ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), offset, nullptr, 0);
-    check(slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped), "close guest command list");
+    if (late_index_write) {
+        constexpr std::uint16_t narrow_upload[]{99, 0, 1, 2};
+        constexpr std::uint32_t wide_upload[]{99, 0, 1, 2};
+        if (draw_right) std::memcpy(late_index_write, wide_upload, sizeof(wide_upload));
+        else std::memcpy(late_index_write, narrow_upload, sizeof(narrow_upload));
+    }
+    if (foreign_list) check(slot<HRESULT (WINAPI*)(IUnknown*)>(foreign_list.Get(), 9)(foreign_list.Get()),
+        "close other recording");
+    const HRESULT closed = slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped);
+    if (FAILED(closed)) {
+        ComPtr<ID3D12InfoQueue> messages;
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) {
+            for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
+                SIZE_T size = 0;
+                if (FAILED(messages->GetMessage(i, nullptr, &size))) continue;
+                std::vector<char> storage(size);
+                auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                if (SUCCEEDED(messages->GetMessage(i, message, &size))) std::fprintf(stderr, "%s\n", message->pDescription);
+            }
+        }
+    }
+    check(closed, "close guest command list");
     submit(device, list);
 
     if (translated) {
@@ -639,9 +784,14 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     arg_readback->Unmap(0, &untouched);
     Words expected = initial_words;
     if (writer) {
-        expected[1] = !translated && !indexed && draw_right ? 6 : 3;
-        expected[2] = 1;
-        if (indexed) expected[3] = draw_right ? 4 : 1;
+        const UINT word = indexed_argument_offset / sizeof(std::uint32_t);
+        expected[word] = refusal == Refusal::rect_bad_count ? 4 : !translated && !indexed && draw_right ? 6 : 3;
+        expected[word + 1] = 1;
+        if (indexed) expected[word + 2] = draw_right && !translated_indexed ? 4 : 1;
+        if (translated_indexed && draw_right) {
+            expected[word + 3] = refusal == Refusal::indexed_base_overrun ? 5 : 3;
+            expected[word + 4] = 0;
+        }
         if (mesh) {
             expected[1] = draw_right ? 2 : 1;
             expected[3] = 1;
@@ -677,11 +827,18 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * pixel_bytes,
                             pixel_bytes);
                 const bool right_half = x >= width / 2;
-                const bool covered = cached_depth_only || translated || (indexed ? right_half == draw_right : !right_half || draw_right);
+                const bool covered = cached_depth_only || (indexed ? right_half == draw_right : translated || !right_half || draw_right);
                 const bool drawn = writer && refusal == Refusal::none && covered;
                 const std::uint32_t background = cached_depth_only ? 0xffff : black;
-                const auto wanted = drawn ? (cached_depth_only ? 0u :
+                auto wanted = drawn ? (cached_depth_only ? 0u :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
+                if (rect) {
+                    // NDC pixel centers are x=(-.75,-.25,.25,.75), y=(.5,-.5).
+                    // UV follows the clipped original rectangle, not the viewport/scissor.
+                    constexpr UINT u[]{80, 112, 143, 175}, v[]{96, 159};
+                    wanted = writer && refusal == Refusal::none && (x == 1 || x == 2)
+                        ? (0xff350000 | (v[y] << 8) | u[x]) : black;
+                }
                 if (actual != background) ++painted;
                 if (actual == wanted) continue;
                 std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
@@ -741,13 +898,17 @@ int main(int argc, char** argv) try
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
     const bool copy_on = argc == 3 && std::strcmp(argv[2], "copy-provenance") == 0;
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
-    const bool translated = copy_on || copy_off || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
+    const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
+    const bool translated_indexed = upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
+    const bool translated = copy_on || copy_off || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
-    if (translated || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
+    if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0)) kind = DrawKind::mesh;
-    else if (argc != 2 && !count_control) return 2;
-    const bool indexed = kind == DrawKind::indexed;
+    else if (rect) kind = DrawKind::indexed_rect;
+    else if (argc != 2 && !count_control && !translated_indexed) return 2;
+    const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool mesh = kind == DrawKind::mesh;
     const bool warp = std::strcmp(argv[1], "warp") == 0;
     if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
@@ -837,7 +998,7 @@ int main(int argc, char** argv) try
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
         const auto verify = [&](Refusal control, const char* label) {
             return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
-                       DrawKind::mesh, false, control, label, nullptr, false, nullptr, depth_only ? 0 : 3, depth_only);
+                       DrawKind::mesh, false, control, label, nullptr, false, nullptr, false, depth_only ? 0 : 3, depth_only);
         };
         if (!GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0))
             return verify(Refusal::mesh_pending, "unavailable cached mesh") ? 0 : 1;
@@ -926,6 +1087,55 @@ int main(int argc, char** argv) try
         const D3D12_ROOT_SIGNATURE_DESC title_desc{1, &table, 0, nullptr, root_flags};
         ComPtr<ID3DBlob> root_blob;
         const auto title_root = create_root(guest.Get(), title_desc, &root_blob);
+        if (translated_indexed) {
+            const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true, false, true, rect);
+            const auto left = writer_pipeline(device.Get(), writer.Get(), "write_left");
+            const auto right = writer_pipeline(device.Get(), writer.Get(), "write_indexed_base");
+            const auto invalid = writer_pipeline(device.Get(), writer.Get(), "write_indexed_overrun");
+            D3D12_INDIRECT_ARGUMENT_DESC argument{};
+            argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+            const D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DRAW_INDEXED_ARGUMENTS), 1, &argument, 0};
+            ComPtr<ID3D12CommandSignature> signature;
+            check(guest->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)), "create translated indexed signature");
+            const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
+            const auto verify = [&](ID3D12PipelineState* producer, bool green, Refusal refusal, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), producer, title_root.Get(), pso.Get(), signature.Get(),
+                    kind, green, refusal, label, green ? &green_binding : &red_binding, false, nullptr, upload_index);
+            };
+            if (upload_index) {
+                const bool ok =
+                    verify(left.Get(), false, Refusal::none, "R16 eight-byte current recording index span with late write") &&
+                    verify(right.Get(), true, Refusal::none, "R32 current recording index span with offset and base") &&
+                    verify(left.Get(), false, Refusal::index_upload_cross, "index view crosses logical upload span") &&
+                    verify(left.Get(), false, Refusal::index_upload_foreign, "index view owned by a different list recording") &&
+                    verify(left.Get(), false, Refusal::index_upload_unaligned, "R16 index upload starts at a half-word offset") &&
+                    verify(left.Get(), false, Refusal::index_unregistered, "readable CPU memory without recording ownership refused");
+                if (ok) std::filesystem::remove_all(cache);
+                return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+            }
+            if (rect) {
+                const auto wrong_count = writer_pipeline(device.Get(), writer.Get(), "write_four_rectangle_indices");
+                const bool ok =
+                    verify(left.Get(), false, Refusal::none, "R16 rectangle with corner 1, permuted indices, FP16 UV, flat and scissor") &&
+                    verify(right.Get(), true, Refusal::none, "R32 rectangle with corner 0, base 3 and clipping") &&
+                    verify(left.Get(), false, Refusal::rect_bad_index, "refuse an out-of-range rectangle index") &&
+                    verify(wrong_count.Get(), false, Refusal::rect_bad_count, "refuse four rectangle indices") &&
+                    verify(left.Get(), false, Refusal::rect_bad_w, "refuse rectangle with differing clip-space w") &&
+                    verify(left.Get(), false, Refusal::rect_bad_shape, "refuse an unmatched rectangle corner");
+                if (ok) std::filesystem::remove_all(cache);
+                return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+            }
+            const bool ok = verify(left.Get(), false, Refusal::none, "translated indexed R16, base zero") &&
+                verify(right.Get(), true, Refusal::none, "translated indexed R32, base 3, new argument and IB offsets") &&
+                verify(invalid.Get(), true, Refusal::indexed_base_overrun, "GPU rejects vertex index past the bound stream") &&
+                verify(right.Get(), true, Refusal::indexed_vertex_range, "refuse a vertex extent that crosses its allocation") &&
+                verify(left.Get(), false, Refusal::invalid_index, "refuse an index view outside its placement") &&
+                verify(left.Get(), false, Refusal::short_argument, "refuse a short argument record") &&
+                verify(nullptr, false, Refusal::none, "omitted GPU writer leaves target clear");
+            if (ok) std::filesystem::remove_all(cache);
+            DeleteFileW(log_path.c_str());
+            return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
         const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
         const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
         const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, true);

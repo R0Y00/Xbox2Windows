@@ -16,6 +16,7 @@
 // sampling_wanted is set (a script with a picture wait asks for it); otherwise it creates no GPU
 // objects and submits nothing, and only counts presents.
 #pragma once
+#include "resource_budget.h"
 
 #include "startup_stubs/present_signature.h"
 #include "startup_stubs/present_view_format.h"
@@ -193,7 +194,10 @@ private:
             buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                  IID_PPV_ARGS(&readback_));
-            if (SUCCEEDED(hr)) readback_bytes_ = bytes;
+            if (SUCCEEDED(hr)) {
+                x2w_budget::committed(device, readback_, D3D12_HEAP_TYPE_READBACK);
+                readback_bytes_ = bytes;
+            }
         }
         if (FAILED(hr)) failed_ = true;
         return SUCCEEDED(hr);

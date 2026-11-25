@@ -363,6 +363,40 @@ by reading a render log. The device prints the counts by cause value, so
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
+### Refused slot 70 calls and token nulls in the five-second report
+
+Three census lines follow the five-second report whenever their counts changed
+(`src/startup_stubs/memory_srv_census.h`):
+
+- `x2w-d3d12 memory SRV refusals (slot 70): total N; <reason> n, ...; distinct shapes K` counts every
+  refused slot 70 call by reason. It then prints one `x2w-d3d12 memory SRV refused shape i:` line per
+  distinct `reason`, dimension, format, size, mips, layout and flags, for the reasons that depend on the
+  description (all but `null_destination`, `unreadable_resource`, `unreadable_view`, `null_address` and
+  `destination_outside_view_heaps`). The reasons include the partial-tile holds (`partial_tile_*`) and the
+  console-layout holds (`unsupported_desktop_format`, `console_layout_*`, `overlapping_resource`).
+  Up to 128 shapes are kept; later shapes are only counted. The periodic report lists the shapes counted
+  since it last ran.
+- `x2w-d3d12 memory SRV writes (slot 70): calls N, distinct entries D` counts successful slot 70
+  calls and the distinct destination descriptors they wrote.
+- `x2w-draw token texture nulls: total N in P pipelines; <pipeline key>=n ...` counts the texture SRVs
+  bound null with cause token, per translated pipeline (up to 16, then `other`).
+
+The first refusal of each of the first eight distinct shapes logs its `Device::slot70` line even after
+the first eight refusal lines are spent. The first write to each of the first eight distinct entries
+logs `x2w-d3d12 memory SRV written i: dest=<handle> address=<address> res{...} view{...}`. The first
+token null of each of the first four pipelines logs
+`x2w-draw token texture null: pipeline <key> srv <i> entry <address> words <w0> ... <w7>`. All-zero
+words mean nothing wrote the entry, for example a refused slot 70 call. Other words may be a
+descriptor the title wrote itself. These lines only count and print; a refusal still leaves the
+destination descriptor as it was.
+
+`ctest --preset dev --no-tests=error -R '^startup_memory_srv_(census|diag_warp|diag_supported_control_warp)$' -V`
+checks this. `startup_memory_srv_census` covers the limits without a device. `startup_memory_srv_diag_warp`
+spends the line limit with eight zero-address refusals, has a 2048x2048 BC1 10-mip texture refused, and
+draws from the untouched entry. It then publishes a supported 1-mip R8 texture and draws from it. It
+expects one counted and named BC1 shape, its line past the limit, one write line for the R8 entry, one
+token null with zero words, and the R8 texels. The control publishes the supported R8 texture in place of the BC1 one and must fail.
+
 ## Root constant buffer views
 
 Command-list slot 42 (desktop `SetGraphicsRootConstantBufferView` plus four) records the title address for a root
@@ -1065,12 +1099,13 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
+| `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
-| `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
+| `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
@@ -1099,6 +1134,38 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
+
+## D3D12 resource budget
+
+Set `X2W_D3D12_BUDGET=1` before startup to add one `x2w-budget` line to each
+D3D12 present heartbeat. `local` and `nonlocal` show DXGI current usage and
+budget in bytes for node 0 of the adapter matching the desktop device LUID.
+An unavailable segment reads `n/a`.
+
+Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
+The categories are desktop placed resources, committed textures, committed
+buffers, upload buffers, readback buffers, and explicit heaps. Resource sizes
+come from the desktop allocation info for the created description. A slot 133
+texture or buffer with committed backing counts in its committed category.
+Each opened or created heap uses its desktop heap size once, even when several
+placements share it. Placed resource sizes describe the objects occupying
+heaps, so adding both columns would count the backing twice.
+
+Final guest release moves a wrapped allocation to the retained column when
+the shim still owns the desktop reference. An explicit heap stays live while
+its wrapper or a live placement uses it. A cached opened heap moves to
+retained when its last placement retires. Internal resources such as the draw
+upload ring, slot 148 pages, tiled SRV materializations, and readback buffers
+stay live until their desktop references are released. The diagnostic leaves
+those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
+also include allocations outside these categories, such as swap chain and
+descriptor heap backing.
+
+The source-built fixture reads the process-wide counters through
+`x2w_d3d12_budget_snapshot` and checks allocation sizes, final guest release,
+and slot 148 page retirement after queue completion. See
+[D3D12 budget accounting](experiments.md#d3d12-budget-accounting) for the test
+command.
 
 ## Input script
 
@@ -1537,6 +1604,17 @@ These are measured on one executable; treat them as hypotheses for others.
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
+- **Pixel-stage image stores.** In a pixel stage, `image_store` with `dim:SQ_RSRC_IMG_2D` and
+  `dmask:0xf` becomes a typed store to a `RWTexture2D<float4>` at its own `u` register, under the
+  lane's exec bit, and the manifest becomes version 2 with a
+  `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
+  channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
+  `lwe`, `r128`, `unorm`, `image_store_mip`, a store outside a pixel stage, and a program that loads
+  and stores the same image are refused by name. The runtime does not bind UAVs on the translated
+  graphics path yet: it logs and does not use a translation whose manifest has a `uav` line. A
+  hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
+  texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
+  `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
 - **Explicit mip loads.** For 2D textures, 2D arrays and 3D textures, `image_load_mip` passes the final
   address register to `Texture.Load` as the mip level (`int4(x, y, slice, mip)` for an array, whose four
   registers are x, y, slice and mip). Ordinary `image_load` still reads mip zero.
@@ -1762,8 +1840,11 @@ These are measured on one executable; treat them as hypotheses for others.
   independent evidence. `CopyIntoSubresource` writes the visible BC7 blocks from pitched source rows
   and preserves tile padding. In render mode, a successful copy marks the backing so the D3D12
   stand-in can detile BC7 blocks into the desktop upload footprint. The companion D3D12
-  stand-in must be loaded for render-mode copies. The reported pitch describes the padded
-  block-row extent of the surface. Synthetic copy and draw checks run with
+  stand-in must be loaded for render-mode copy-in. `CopyFromSubresource` with the Scarlett
+  option set to zero reads visible blocks back into pitched rows, preserving row padding.
+  This CPU readback also works with rendering enabled and the XG stand-in alone.
+  The reported pitch describes the padded block-row extent of the surface.
+  Synthetic copy and draw checks run with
   `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_' -V`.
   Those checks use only accepted descriptions at 81x69 and 64x64 (square 2x2 and 1x1 tile grids),
   and the draw check tiles and detiles with the same block offsets. `tests/startup_bc7_4k_s_check.cpp`
@@ -1794,8 +1875,15 @@ These are measured on one executable; treat them as hypotheses for others.
 - `image_sample_b` in a pixel stage lowers to `SampleBias(sampler, uv, bias)` for 2D, 2D-array and 3D textures; the bias is the
   first address register. Offset, clamp, compare and gather forms, other stages, code after a branch, a sampler with a
   LOD bias, mip filter 0 or MIN_LOD above MAX_LOD, and any sampler from the heap or a register are refused. The descriptor's
-  MIN_LOD and MAX_LOD reach the static sampler through an `smpl` manifest line (MinLOD, MaxLOD); other sample forms do not carry them. `ctest --preset dev --no-tests=error -R '^startup_image_sample_b'` draws bias -1, 0 and +1 on a
+  MIN_LOD and MAX_LOD reach the static sampler through an `smpl` manifest line (MinLOD, MaxLOD). `ctest --preset dev --no-tests=error -R '^startup_image_sample_b'` draws bias -1, 0 and +1 on a
   three-mip array (WARP) and requires mip 0, 1 and 2 (`docs/experiments.md`, "biased image sampling").
+- `image_sample`, `image_sample_l` and `image_sample_lz` through a constant sampler carry the descriptor's MIN_LOD and MAX_LOD
+  through the same `smpl` line (#2177). A constant sampler with a LOD bias or MIN_LOD above MAX_LOD is now refused for these forms;
+  a mip filter of 0 is not (the sampler stays an ordinary `smp` line). A sampler from the heap, including the default-sampler
+  shortcut, still translates as before with an unbounded LOD range: its MIN_LOD, MAX_LOD and bias are not validated, and
+  `gfx2hlsl.py` logs that once per translated module (#2221). `image_sample_c` is unchanged.
+  `ctest --preset dev --no-tests=error -R '^startup_image_sample_lod'` draws each form on its own against a plain-`smp` control
+  (`docs/experiments.md`, "constant-sampler LOD limits").
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
   reloads the compiled stages. A second fixture draws a clipped triangle through the translated
@@ -1914,13 +2002,14 @@ and `XApuDisconnect`, refuses null or unreadable command headers (`E_POINTER`), 
 entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
 index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
 connection; additional enqueues return `E_OUTOFMEMORY` without dropping queued entries).
-`XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` zeroes the
-`0x58`-byte result buffer and writes the retired command's type at `+0x00` and slot index at
-`+0x04` (keeping decoded bytes at `+0x34` zero because no audio/XMA decoder runs here). An empty
+`XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` retires one entry
+and zeroes the `0x58`-byte result buffer. The experimental `X2W_XAPU_TYPED_COMPLETIONS=1`
+also writes the command type at `+0x00` and slot index at `+0x04`. Decoded bytes at `+0x34`
+remain zero in both modes. An empty
 queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
 
 Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
-observed callers; the queue intentionally echoes any 32-bit type value at `+0x00` verbatim
+observed callers. The experimental mode echoes any 32-bit type value at `+0x00` verbatim
 (including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
 outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export

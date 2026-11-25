@@ -53,4 +53,30 @@ with tempfile.TemporaryDirectory() as tmp:
     # -j 0 is clamped to one worker instead of reaching ThreadPoolExecutor(max_workers=0).
     serial = run(good, jobs="0")
     assert serial.returncode == 0 and "all 1 checks passed" in serial.stdout, serial.stdout
+
+# Per-command arguments and environment overrides must not affect siblings.
+with tempfile.TemporaryDirectory() as tmp:
+    echo = os.path.join(tmp, "echo.py")
+    with open(echo, "w") as f:
+        f.write("import os, sys\nprint(sys.argv[1], os.environ.get('RCPC_TEST_TOKEN', 'missing'))\n")
+    checks = [
+        ([echo, "first"], {"RCPC_TEST_TOKEN": "alpha"}),
+        ([echo, "second"], None),
+    ]
+    driver = os.path.join(tmp, "driver.py")
+    with open(driver, "w") as f:
+        f.write("import runpy, sys\n")
+        f.write("module = runpy.run_path(sys.argv[1], run_name='run_checks_parallel')\n")
+        f.write("checks = " + repr(checks) + "\n")
+        f.write("sys.exit(module['run_checks'](checks, jobs=2))\n")
+    env = {**os.environ, "RCPC_TEST_TOKEN": "inherited"}
+    out = subprocess.run([sys.executable, "-B", driver, RUNNER], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert out.returncode == 0, out.stdout
+    # Both commands run the same script, so the groups tie on their header; check the bodies.
+    assert out.stdout.count("::group::" + echo) == 2, out.stdout
+    assert out.stdout.splitlines().count("::endgroup::") == 2, out.stdout
+    assert out.stdout.index("first alpha") < out.stdout.index("second inherited"), out.stdout
+    assert "first alpha\n" in out.stdout and "second inherited\n" in out.stdout, out.stdout
+    assert "all 2 checks passed" in out.stdout, out.stdout
 print("run_checks_parallel_check: ok")
