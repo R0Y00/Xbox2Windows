@@ -168,6 +168,9 @@ public:
         const auto& placed = titles_.at(which);
         build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
         build.SourceAccelerationStructureData = placed.dest;
+        std::printf("placed update %u: dest=%llx scratch=%llx result=%llu build_scratch=%llu update_scratch=%llu\n", which,
+            placed.dest, placed.scratch, placed.sizes.ResultDataMaxSizeInBytes, placed.sizes.ScratchDataSizeInBytes,
+            placed.sizes.UpdateScratchDataSizeInBytes);
         check(x2w_startup::resolve_placed_build(guest_.Get(), placed.dest, placed.scratch, placed.sizes, build),
             "Resolve placed in-place update");
     }
