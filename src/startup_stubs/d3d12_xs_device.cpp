@@ -4360,6 +4360,30 @@ struct ExistingHeap {
 };
 std::vector<std::pair<void*, ExistingHeap>> existing_heaps;
 
+// Lifetime boundary: one cross-adapter page alias per (heap, page) at a title address, kept for as long as
+// this module is loaded, because the GPU may still read a page the title keeps live for the device's
+// lifetime. The cache is a function-local static in indirect_address_alias() below, so it is destroyed
+// during this module's CRT teardown -- see startup_stubs/d3d12_teardown.h for the two detaches. On
+// process exit the display driver may already be stopped, so the placed buffers are detached and nothing
+// reaches it; FreeLibrary leaves the process and the driver alive and the pages release their objects
+// normally. The heap and page words are plain addresses, not owned.
+struct PlacedPageAliases {
+    struct Page {
+        ID3D12Heap* heap;
+        u64 page;
+        x2w_startup::ComPtr<ID3D12Resource> resource;
+    };
+    using iterator = std::array<Page, 64>::iterator;
+    iterator begin() { return entries.begin(); }
+    iterator end() { return entries.end(); }
+    ~PlacedPageAliases()
+    {
+        if (!x2w_startup::d3d12_process_terminating) return;
+        for (auto& entry : entries) entry.resource.Detach();
+    }
+    std::array<Page, 64> entries{};
+};
+
 IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 bytes)
 {
     static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS");
@@ -4383,8 +4407,8 @@ IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 by
         [&](const auto& entry) { return entry.first == memory.base; });
     if (known == existing_heaps.end()) return {};
     auto* heap = known->second.real;
-    struct Page { ID3D12Heap* heap; u64 page; x2w_startup::ComPtr<ID3D12Resource> resource; };
-    static std::array<Page, 64> pages{};
+    using Page = PlacedPageAliases::Page;
+    static PlacedPageAliases pages{};
     auto it = std::find_if(pages.begin(), pages.end(), [&](const Page& entry) { return entry.heap == heap && entry.page == page; });
     if (it != pages.end()) return {it->resource.Get(), offset};
     it = std::find_if(pages.begin(), pages.end(), [](const Page& entry) { return !entry.heap; });

@@ -3,6 +3,8 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "startup_stubs/d3d12_teardown.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
@@ -100,6 +102,21 @@ public:
             it = entries_.erase(it);
         }
         return complete;
+    }
+
+    // Lifetime boundary, same contract as the caches in startup_stubs/d3d12_teardown.h: a recorded copy and
+    // its fence live for as long as this module is loaded, because a list that was resubmitted still holds
+    // them. This object is a function-local static in draw_dumps(), so it is destroyed during the module's
+    // CRT teardown. On process exit the display driver is already detached and a release there faults
+    // inside it, so the references are detached; FreeLibrary keeps the process and the driver alive and
+    // the entries release their objects normally.
+    ~DrawReadbacks()
+    {
+        if (!d3d12_process_terminating) return;
+        for (auto& entry : entries_) {
+            entry.dump.buffer.Detach();
+            entry.fence.Detach();
+        }
     }
 };
 }  // namespace x2w_startup

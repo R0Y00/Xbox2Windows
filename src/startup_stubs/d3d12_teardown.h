@@ -1,8 +1,10 @@
 // Lifetime boundary of the desktop D3D12 objects the stand-in keeps in function-local statics:
-// the indexed-validation pipeline (startup_stubs/d3d12_draw.inl) and the rectangle-list argument
-// converter (startup_stubs/rect_indirect_args.h). #2572.
+// the indexed-validation pipeline (startup_stubs/d3d12_draw.inl), the rectangle-list argument
+// converter (startup_stubs/rect_indirect_args.h), the placed page aliases of the translated
+// indirect address route (startup_stubs/d3d12_xs_device.cpp) and the draw-dump readbacks
+// (startup_stubs/draw_dump_tracking.h). #2572.
 //
-// Both caches hold their objects for as long as this module is loaded -- a conversion or a validation
+// These caches hold their objects for as long as this module is loaded -- a conversion or a validation
 // may still be queued when the call that built the entry returns -- so they are destroyed during this
 // module's CRT teardown. That teardown runs at two different moments:
 //
