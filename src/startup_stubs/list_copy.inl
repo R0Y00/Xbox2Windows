@@ -83,12 +83,18 @@ bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // A target or UAV holds what the GPU wrote; its title memory is never uploaded.
         if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return true;
-        const auto written = texture_uploads().find(source.resource);
         if (list_wrote(self, source.resource)) return true;
-        if (written != texture_uploads().end() && written->second.gpu_written) return true;
-        if (!upload_texture(self, source.wrapper, source.resource)) return false;
-        const auto found = texture_uploads().find(source.resource);
-        return found != texture_uploads().end() && found->second.staged;
+        AcquireSRWLockExclusive(&draw_lock);
+        const auto written = texture_uploads().find(source.resource);
+        bool ok = false;
+        if (written != texture_uploads().end() && written->second.gpu_written) {
+            ok = true;
+        } else if (upload_texture(self, source.wrapper, source.resource)) {
+            const auto found = texture_uploads().find(source.resource);
+            ok = found != texture_uploads().end() && found->second.staged;
+        }
+        ReleaseSRWLockExclusive(&draw_lock);
+        return ok;
     }
     const auto* info = resource_info(source.wrapper);
     return info && info->placement == Placement::aliased_buffer;

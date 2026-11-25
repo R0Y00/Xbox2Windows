@@ -675,7 +675,7 @@ bool classes(Context& c, bool on)
 
     struct Control { Res* resource; const char* fail; };
     const Control controls[] = {
-        {&B, "a buffer was freed"}, {&G, "a render target was freed"}, {&T, "a texture with title memory was freed"},
+        {&B, "a buffer was freed"}, {&G, "a render target was freed"},
         {&V, "a resource with a view was freed"}, {&M, "a resource passed to MakeResident was freed"},
         {&P, "the presented surface was freed"}};
     for (const Control& control : controls) {
@@ -685,8 +685,9 @@ bool classes(Context& c, bool on)
     }
     c.release(Z127);
     c.release(Z27);
+    c.release(T);
     if (!c.sync(c.direct) || !c.sync(c.other) || !c.sync(c.gated) || !c.sync(c.copy)) return false;
-    if (on) Z127.freed = Z27.freed = true;
+    if (on) Z127.freed = Z27.freed = T.freed = true;
     if (!c.settle("class released", "a resource of the class kept its desktop object")) return false;
     VirtualFree(title_memory, 0, MEM_RELEASE);
     return true;

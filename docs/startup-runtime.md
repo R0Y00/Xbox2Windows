@@ -1344,33 +1344,47 @@ those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
 
-`X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for one class: a
-texture created by device slot 27 or 127 that is two-dimensional, has one
-sample, no render-target, depth-stencil or unordered-access flag, lives in a
-default heap without heap flags and has no title memory. If the title exports
-`__XMemAllocationHooks__`, every slot 127 resource gets title memory and none is in the class; the fixture runs
-without that export. Every other resource
-keeps the lifetime described above. A resource leaves the class for good when a
-view is created for it (slots 18 to 21, also a refused one), when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. Only
-wrappers can be in the class; a raw desktop pointer never is. Sampler feedback
-is not checked: no device slot of the stand-in reaches it.
+`X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for committed
+2D textures that have one sample, no render-target, depth-stencil or
+unordered-access flag, and live in a default heap without heap flags:
+- **Slice 1**: slot 27 and slot 127 textures without title memory (if the title
+  exports `__XMemAllocationHooks__`, every slot 127 resource gets title memory
+  and stays out of the class).
+- **Slice 2**: slot 133 (`CreatePlacedResourceX`) committed 2D textures with
+  title memory. Before their desktop `ID3D12Resource` is destroyed, they are
+  erased from `resource_address_index` and `texture_uploads`, and stale
+  `written_textures` entries whose generation has not changed are cleared so
+  reusing the same title address or desktop pointer does not skip uploads or
+  resolve a retired wrapper.
+
+Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
+targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
+described above. A resource leaves the class for good when a UAV/RTV/DSV view is
+created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
+an untracked descriptor slot or is copied out of tracked heaps, when it is passed
+to MakeResident or Evict (slots 34 and 35), or when it is presented. Tracked
+slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+while any descriptor slot in `HeapInfo::shadow` names it (updated across
+`note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
+bound textures via `retire_hold`. Only wrappers can be in the class; a raw
+desktop pointer never is. Sampler feedback is not checked: no device slot of the
+stand-in reaches it.
 
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
-passed and nothing else names it. A copy (list slot 17), texture copy (16) or
-resolve destination (19) that the stand-in forwards makes the list hold a
-desktop reference to each resource of the class it names, source and
-destination, until the list is Reset, fails to Close or is destroyed. A list
+passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
+recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+resolve destination (19), or translated draw SRV bind that the stand-in forwards
+makes the list hold a desktop reference to each resource of the class it names,
+source and destination, until the list is Reset, fails to Close or is destroyed. A list
 that is closed and never submitted is thus discarded without any submission.
 Each submission holds the same references until its queue passes a fence
 signalled behind it. A release with no registered queue, and a hold, marker or
 submission fence that cannot be recorded, keep the resource retained. Nothing
 waits: `ExecuteCommandLists` and `Present` check and release without blocking.
 The wrapper stays allocated, and a guest that uses a resource after its final
-release is not supported with the switch. Buffers, placed and reserved
-resources, slot 133 and all resources with title memory are not in the class.
-Slot 18 (`CopyTiles`) is not forwarded at all and is outside this change.
+release is not supported with the switch. Slot 18 (`CopyTiles`) is not
+forwarded at all and is outside this change.
 
 The source-built fixture reads the process-wide counters through
 `x2w_d3d12_budget_snapshot` and checks allocation sizes, final guest release,
@@ -1386,8 +1400,12 @@ its own fence, a destination released after recording (slots 17, 16 and 19), a
 list destroyed while its submission is held, a copy queue, an open list that
 D3D12 refuses to Reset and one that is destroyed, a release that no list
 refers to behind a held queue, and, in one run with the class, a buffer,
-render target, title-memory texture, viewed texture, resident texture and
-presented texture that must stay retained. The fixture-only export
+render target, viewed texture (while its slot-18 SRV stays live), resident texture and
+presented texture that must stay retained, alongside slot 133 title-memory textures.
+`startup_resource_retire_title_{warp,hardware}_debug{0,1}` additionally test slot 133
+`CopyTextureRegion`/`CopyResource` upload holds, same-address slot 70 (`existing_memory_texture`)
+reuse with `X2W_RESOURCE_INDEX_CHECK=1`, stale `written_textures` `bc7_width` cleanup,
+and slot-18 SRV `CopyDescriptorsSimple` / overwrite / heap-release lifetime. The fixture-only export
 `x2w_d3d12_retire_probe` returns FALSE without the switch, like
 `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
