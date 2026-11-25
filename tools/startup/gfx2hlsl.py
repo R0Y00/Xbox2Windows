@@ -1246,7 +1246,7 @@ class Stage:
         if absolute:
             tok = tok[1:-1]
         if tok in FLOATS:
-            text = repr(FLOATS[tok])
+            text = repr(struct.unpack('<e', struct.pack('<e', FLOATS[tok]))[0])  # inline constants are binary16 here
         elif tok == '-0':
             text = '0.0'
         else:
