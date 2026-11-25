@@ -37,23 +37,42 @@ void convert() {
 
 class RectIndirectArguments {
 public:
-    // Records the conversion of the four draw words at `source_address` and returns the scratch resource now
-    // in INDIRECT_ARGUMENT state, or nullptr if the pass could not be set up (nothing was recorded then).
-    // The scratch buffer rests in COMMON between draws; `finish` puts it back there.
-    ID3D12Resource* convert(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS source_address)
+    // A fresh scratch buffer (rests in COMMON). The caller owns one per recording and keeps it alive until every
+    // queue that runs that recording has passed its fence, so concurrent recordings never share arguments.
+    static Microsoft::WRL::ComPtr<ID3D12Resource> make_scratch(ID3D12Device* device)
+    {
+        Microsoft::WRL::ComPtr<ID3D12Resource> scratch;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 256;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (!device || FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                              D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&scratch))))
+            scratch.Reset();
+        return scratch;
+    }
+    // Records the conversion of the four draw words at `source_address` into `scratch` (from make_scratch, in
+    // COMMON) and leaves it in INDIRECT_ARGUMENT state. Returns false if the pass could not be set up (nothing
+    // was recorded then). The compute root signature and pipeline of the list are replaced: the caller refuses
+    // first when the title has live compute root arguments. `finish` puts the scratch back in COMMON.
+    bool convert(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS source_address, ID3D12Resource* scratch)
     {
         Microsoft::WRL::ComPtr<ID3D12Device> device;
-        if (!list || !source_address || FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
+        if (!list || !scratch || !source_address || FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return false;
         Entry* entry = entry_for(device.Get());
-        if (!entry) return nullptr;
-        transition(list, entry->scratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!entry) return false;
+        transition(list, scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->SetComputeRootSignature(entry->root.Get());
         list->SetPipelineState(entry->pipeline.Get());
         list->SetComputeRootShaderResourceView(0, source_address);
-        list->SetComputeRootUnorderedAccessView(1, entry->scratch->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(1, scratch->GetGPUVirtualAddress());
         list->Dispatch(1, 1, 1);
-        transition(list, entry->scratch.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-        return entry->scratch.Get();
+        transition(list, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        return true;
     }
     static void finish(ID3D12GraphicsCommandList* list, ID3D12Resource* scratch)
     {
@@ -65,7 +84,6 @@ private:
         ID3D12Device* device = nullptr;
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
-        Microsoft::WRL::ComPtr<ID3D12Resource> scratch;
     };
     static void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
                            D3D12_RESOURCE_STATES after)
@@ -78,17 +96,17 @@ private:
         barrier.Transition.StateAfter = after;
         list->ResourceBarrier(1, &barrier);
     }
-    // Entries are never freed: a conversion may still be queued when its list is released.
+    // Root signature and pipeline per device. Entries are never freed: a conversion may still be queued when its list is released.
     Entry* entry_for(ID3D12Device* device)
     {
         std::lock_guard<std::mutex> guard(lock_);
         for (auto& known : entries_)
-            if (known->device == device) return known->scratch ? known.get() : nullptr;
+            if (known->device == device) return known->pipeline ? known.get() : nullptr;
         auto entry = std::make_unique<Entry>();
         entry->device = device;
         build(device, *entry);
         entries_.push_back(std::move(entry));
-        return entries_.back()->scratch ? entries_.back().get() : nullptr;
+        return entries_.back()->pipeline ? entries_.back().get() : nullptr;
     }
     static void build(ID3D12Device* device, Entry& entry)
     {
@@ -110,18 +128,7 @@ private:
         D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
         pipeline.pRootSignature = entry.root.Get();
         pipeline.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-        if (FAILED(device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&entry.pipeline)))) return;
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC buffer{};
-        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer.Width = 256;
-        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
-        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COMMON,
-                                                   nullptr, IID_PPV_ARGS(&entry.scratch))))
-            entry.scratch.Reset();
+        if (FAILED(device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&entry.pipeline)))) entry.pipeline.Reset();
     }
     std::mutex lock_;
     std::vector<std::unique_ptr<Entry>> entries_;

@@ -12797,9 +12797,12 @@ unchanged) into a scratch record, and the desktop draw reads that record. The ti
 modified. A count that would not fit 32 bits becomes 0 vertices. The model is
 `convert_indirect_draw_arguments` in [`rectlist_topology.py`](../tools/rectlist_topology.py).
 
-The compute pass replaces the list's compute root signature (the runtime re-sets the title's last one, without its
-arguments). An indexed draw with `0x11` is still refused, as in the direct draw. Other console-only topologies are
-not handled.
+The scratch record belongs to the recording, not the device: it is created on the recording's first conversion and
+retained by the recording's desktop allocator, which is reused only after every queue that ran the recording has
+passed its fence. Two recordings on two queues therefore never read each other's converted count. The compute pass
+replaces the list's compute root signature and pipeline, which drops compute root arguments, so the draw is refused
+before anything is recorded when the title has set a compute root argument since its last compute root signature.
+An indexed draw with `0x11` is still refused, as in the direct draw. Other console-only topologies are not handled.
 
 ```powershell
 cmake --build --preset dev --target startup_indirect_draw_indexed
@@ -12809,7 +12812,8 @@ ctest --preset dev --no-tests=error -R '^startup_indirect_rectlist_(warp|hardwar
 [The fixture](../tests/startup_indirect_draw_indexed.cpp) (`rect` mode) has a compute producer write one or two
 rectangles into a 4x2 target through a vertex shader that builds `(v0, v1, v2)` and `(v0, v2, v0 + v2 - v1)`. It
 reads the pixels back (left half red, right half green) and the argument words (unchanged). An omitted producer, a
-short argument range, a missing viewport and an overflowing count must leave the target clear. Without the
+short argument range, a missing viewport and an overflowing count must leave the target clear. Two threads then
+record and submit one- and two-rectangle draws on separate queues 24 times each; every target must match its own count. Without the
 conversion the runtime refuses the draw and the first case stays clear.
 
 Not covered by this experiment: geometry or tessellation shader stages preceding the

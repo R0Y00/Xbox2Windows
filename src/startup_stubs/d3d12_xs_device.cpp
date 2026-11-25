@@ -140,6 +140,7 @@ struct alignas(16) WrapperOwn {
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
+    ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
@@ -1246,6 +1247,9 @@ struct DesktopAllocator {
     bool close_failed;
     std::vector<std::unique_ptr<x2w_upload::Arena>> uploads;
     std::vector<x2w_startup::ComPtr<ID3D12Resource>> indexed_validation;
+    // Rectangle-list argument scratch of the recordings on this allocator. Retained with the recording, so until every
+    // queue that ran it has passed its fence (the allocator is reused only when idle).
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratches;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1303,6 +1307,32 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
     return reinterpret_cast<void*>(allocation.cpu);
 }
 
+// The rectangle-list argument scratch of this recording: created on first use, owned by the recording's desktop
+// allocator (so it outlives every queue fence of the recording) and never shared with another recording.
+ID3D12Resource* recording_rect_scratch(Wrapper* self)
+{
+    ID3D12Resource* scratch = nullptr;
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (state.list_open && state.list_device && found != list_recordings.end() && found->second) {
+        if (!state.list_scratch) {
+            try {
+                auto created = x2w_startup::RectIndirectArguments::make_scratch(device_of(state.list_device));
+                if (created) {
+                    found->second->scratches.push_back(std::move(created));
+                    state.list_scratch = found->second->scratches.back().Get();
+                }
+            } catch (const std::bad_alloc&) {
+                // No scratch: the caller refuses the draw.
+            }
+        }
+        scratch = state.list_scratch;
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return scratch;
+}
+
 x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 bytes)
 {
     AcquireSRWLockShared(&allocator_lock);
@@ -1349,6 +1379,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
         if (SUCCEEDED(hr)) {
             next->uploads.clear();
             next->indexed_validation.clear();
+            next->scratches.clear();
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -1441,6 +1472,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
                 if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
                     spare->uploads.clear();
                     spare->indexed_validation.clear();
+                    spare->scratches.clear();
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -1484,6 +1516,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             on = title.current;
             ++on->lists;
             state.list_uploads = nullptr;
+            state.list_scratch = nullptr;
             state.list_ready = false;
             state.list_open = true;
         }
@@ -2150,6 +2183,7 @@ struct Pass {
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
+    bool compute_args_live = false;  // a compute root argument was set on the desktop list since slot 33
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -2331,6 +2365,7 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
+    pass.compute_args_live = false;
     if (pass.compute_root) {
         if (pass.desktop_compute_root.Get() != pass.compute_root)
             pass.desktop_compute_upload_srvs.fill(0);
@@ -2658,8 +2693,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         const auto source = resource->GetGPUVirtualAddress();
         if (!source || offset > ~u64{} - source) return refuse("argument buffer has no desktop address");
         require_state(self, resource, argument_state | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        scratch = x2w_startup::rect_indirect_arguments().convert(list, source + offset);
-        if (!scratch) return refuse("rectangle-list argument conversion is unavailable");
+        // The conversion replaces the compute root signature, which drops the title's compute root arguments; they
+        // cannot be restored, so a live set is refused before anything is recorded.
+        if (pass.compute_args_live) return refuse("rectangle-list conversion would drop live compute root arguments");
+        scratch = recording_rect_scratch(self);
+        if (!scratch || !x2w_startup::rect_indirect_arguments().convert(list, source + offset, scratch))
+            return refuse("rectangle-list argument conversion is unavailable");
         if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         draw_arguments = scratch;
@@ -2979,6 +3018,7 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
         pass.desktop_compute_upload_srvs[parameter] = gpu;
         list->SetComputeRootShaderResourceView(parameter, gpu);
+        pass.compute_args_live = true;
     }
 }
 

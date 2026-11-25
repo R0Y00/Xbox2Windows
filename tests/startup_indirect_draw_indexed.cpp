@@ -11,6 +11,7 @@
 #include "startup_indirect_mesh_pixel.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -1504,6 +1506,25 @@ int main(int argc, char** argv) try
     if (kind == DrawKind::rect &&
         !run(device.Get(), guest.Get(), writer.Get(), overflow.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
              false, Refusal::overflowing_count, "overflowing rectangle count")) return 1;
+    if (kind == DrawKind::rect) {
+        // Two recordings on two queues convert different argument counts at the same time. Each must draw its own
+        // count: the conversion scratch belongs to the recording, never to the device.
+        std::atomic<bool> concurrent_ok{true};
+        const auto worker = [&](ID3D12PipelineState* producer, bool draw_right, const char* label) {
+            try {
+                for (int round = 0; round < 24 && concurrent_ok; ++round)
+                    if (!run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
+                             kind, draw_right, Refusal::none, label)) concurrent_ok = false;
+            } catch (...) {
+                concurrent_ok = false;
+            }
+        };
+        std::thread one(worker, left.Get(), false, "concurrent one rectangle");
+        std::thread two(worker, right.Get(), true, "concurrent two rectangles");
+        one.join();
+        two.join();
+        if (!concurrent_ok) return 1;
+    }
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;
