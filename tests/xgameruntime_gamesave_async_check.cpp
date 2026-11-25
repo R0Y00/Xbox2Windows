@@ -62,6 +62,8 @@ using CloseProvider = void(WINAPI*)(XGameSaveProviderHandle);
 using CloseContainer = void(WINAPI*)(XGameSaveContainerHandle);
 struct XTaskQueueHandleStorage;
 using XTaskQueueHandle = XTaskQueueHandleStorage*;
+// Shared manual queue: a null XAsyncBlock queue is refused, so every block uses it.
+XTaskQueueHandle shared_queue = nullptr;
 constexpr std::uint32_t mode_manual = 0;
 constexpr std::uint32_t mode_thread_pool = 1;
 constexpr std::uint32_t port_work = 0;
@@ -101,6 +103,7 @@ XAsyncBlock make_block(CallbackProbe* probe, CompletionRoutine* callback)
     XAsyncBlock block{};
     block.context = probe;
     block.callback = callback;
+    block.queue = shared_queue;
     std::memset(block.opaque, sentinel, sizeof(block.opaque));
     return block;
 }
@@ -209,10 +212,12 @@ bool positive_completion(const Api& api, XUserHandle user)
     XAsyncBlock block = make_block(&probe, record_completion);
     bool ok = expect_hr(api.initialize_async(user, configuration_id, false, &block), S_OK,
                         "async initialize");
-    ok = expect(probe.calls == 1 && probe.seen == &block,
-                "callback ran once with the caller's block before the call returned") && ok;
+    ok = expect(probe.calls == 0, "no callback before the completion port is pumped") && ok;
+    ok = expect(api.queue_dispatch(shared_queue, port_completion, 0) && probe.calls == 1 &&
+                    probe.seen == &block,
+                "callback ran once with the caller's block after dispatch") && ok;
     ok = expect(opaque_untouched(block) && block.context == &probe &&
-                    block.callback == record_completion,
+                    block.callback == record_completion && block.queue == shared_queue,
                 "the caller's block fields are left as written") && ok;
 
     XGameSaveProviderHandle provider = reinterpret_cast<XGameSaveProviderHandle>(1);
@@ -249,6 +254,7 @@ bool null_callback_and_callback_claim(const Api& api, XUserHandle user)
     XAsyncBlock block = make_block(&claimed, claim_in_callback);
     ok = expect_hr(api.initialize_async(user, configuration_id, false, &block), S_OK,
                    "async initialize claimed inside the callback") && ok;
+    ok = expect(api.queue_dispatch(shared_queue, port_completion, 0), "dispatch ran the callback") && ok;
     ok = expect(claimed.calls == 1 && claimed.result_status == S_OK &&
                     claimed.result_inside != nullptr,
                 "the callback can retrieve the result") && ok;
@@ -298,7 +304,10 @@ bool reuse_and_capacity(const Api& api, XUserHandle user)
                         "first start");
     ok = expect_hr(api.initialize_async(user, configuration_id, false, &block),
                    e_illegal_state_change, "reusing an unclaimed block") && ok;
-    ok = expect(probe.calls == 1, "refused reuse does not complete again") && ok;
+    ok = expect(probe.calls == 0, "refused reuse queues nothing more") && ok;
+    ok = expect(api.queue_dispatch(shared_queue, port_completion, 0) &&
+                    !api.queue_dispatch(shared_queue, port_completion, 0) && probe.calls == 1,
+                "exactly one callback for the original start") && ok;
     XGameSaveProviderHandle held = nullptr;
     ok = expect_hr(api.initialize_result(&block, &held), S_OK, "original result survives") && ok;
 
@@ -374,8 +383,8 @@ std::size_t fill_providers(const Api& api, XUserHandle user, std::array<XAsyncBl
 }
 
 // Manual completion port: no callback before XTaskQueueDispatch, one after, and
-// the callback claims the provider. The early-callback control is a block with no
-// queue: it fires inline, so the same "zero before dispatch" check must catch it.
+// the callback claims the provider. A null queue is refused, so every block here
+// uses a queue and the zero-before-dispatch checks stand in for an inline callback.
 bool manual_queue(const Api& api, XUserHandle user)
 {
     XTaskQueueHandle queue = nullptr;
@@ -399,15 +408,53 @@ bool manual_queue(const Api& api, XUserHandle user)
                 "second dispatch runs nothing") && ok;
     if (probe.result_inside) api.close_provider(probe.result_inside);
 
-    // Negative control: a block without a queue calls back before any dispatch.
-    CallbackProbe early;
-    XAsyncBlock inline_block = make_block(&early, record_completion);
-    ok = expect_hr(api.initialize_async(user, configuration_id, false, &inline_block), S_OK,
-                   "control start") && ok;
-    ok = expect(early.calls == 1, "control: early callback is visible to the zero-callback check") && ok;
-    XGameSaveProviderHandle held = nullptr;
-    api.initialize_result(&inline_block, &held);
-    if (held) api.close_provider(held);
+    // Early result retrieval (Manual/Manual): the result is refused, nothing is lost.
+    CallbackProbe early_claim;
+    XAsyncBlock early_block = make_block(&early_claim, record_completion);
+    early_block.queue = queue;
+    ok = expect_hr(api.initialize_async(user, configuration_id, false, &early_block), S_OK,
+                   "start before an early result") && ok;
+    XGameSaveProviderHandle early_provider = reinterpret_cast<XGameSaveProviderHandle>(1);
+    ok = expect_hr(api.initialize_result(&early_block, &early_provider), E_PENDING,
+                   "result before dispatch is refused") && ok;
+    ok = expect(early_provider == nullptr && early_claim.calls == 0,
+                "early result hands out no provider and fires nothing") && ok;
+    api.queue_close(queue);
+    ok = expect(api.queue_dispatch(queue, port_completion, 0) && early_claim.calls == 1,
+                "the queued callback still dispatches after an early result") && ok;
+    ok = expect(!api.queue_dispatch(queue, port_completion, 0) && early_claim.calls == 1,
+                "second dispatch finds nothing") && ok;
+    ok = expect_hr(api.initialize_result(&early_block, &early_provider), S_OK,
+                   "result after dispatch") && ok;
+    ok = expect(early_provider != nullptr, "provider delivered once") && ok;
+    XGameSaveProviderHandle twice = reinterpret_cast<XGameSaveProviderHandle>(1);
+    ok = expect_hr(api.initialize_result(&early_block, &twice), E_INVALIDARG,
+                   "provider is not delivered twice") && ok;
+    ok = expect(twice == nullptr, "second delivery clears the output") && ok;
+    if (early_provider) api.close_provider(early_provider);
+
+    // Early-callback mutant: a callback fired inline would be counted, so the
+    // zero-before-dispatch checks above can fail. Prove the probe sees one.
+    CallbackProbe mutant;
+    XAsyncBlock mutant_block = make_block(&mutant, record_completion);
+    mutant_block.callback(&mutant_block);
+    ok = expect(mutant.calls == 1, "control: an early callback is visible to the probe") && ok;
+
+    // Finite wait: the timeout is ignored, an empty port returns false at once and a
+    // queued callback runs once.
+    const ULONGLONG started = GetTickCount64();
+    ok = expect(!api.queue_dispatch(queue, port_completion, 5000) && GetTickCount64() - started < 2500,
+                "finite wait on an empty port returns false without waiting") && ok;
+    CallbackProbe timed;
+    XAsyncBlock timed_block = make_block(&timed, record_completion);
+    timed_block.queue = queue;
+    ok = expect_hr(api.initialize_async(user, configuration_id, false, &timed_block), S_OK,
+                   "start for finite wait") && ok;
+    ok = expect(api.queue_dispatch(queue, port_completion, 5000) && timed.calls == 1,
+                "finite wait dispatches the queued callback once") && ok;
+    XGameSaveProviderHandle timed_provider = nullptr;
+    api.initialize_result(&timed_block, &timed_provider);
+    if (timed_provider) api.close_provider(timed_provider);
 
     // A pending callback keeps its queue open.
     CallbackProbe pending;
@@ -442,6 +489,14 @@ bool unsupported_queue(const Api& api, XUserHandle user)
     XGameSaveProviderHandle none_provider = nullptr;
     ok = expect_hr(api.initialize_result(&block, &none_provider), E_INVALIDARG,
                    "refusal left no async state") && ok;
+    // A null queue means the process default queue in the public API: refused too.
+    block.queue = nullptr;
+    ok = expect_hr(api.initialize_async(user, configuration_id, false, &block), not_implemented,
+                   "null queue refused") && ok;
+    ok = expect(probe.calls == 0 && opaque_untouched(block), "null queue fires and writes nothing") && ok;
+    ok = expect_hr(api.initialize_result(&block, &none_provider), E_INVALIDARG,
+                   "null queue left no async state") && ok;
+    block.queue = &stray;
     // Capacity untouched: the whole provider pool is still free after many refusals.
     for (int i = 0; i < 3; ++i) api.initialize_async(user, configuration_id, false, &block);
     std::array<XAsyncBlock, 8> blocks{};
@@ -491,10 +546,13 @@ bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* nor
     if (passed) {
         clear_log();
         passed = expect_hr(api.find_user(synthetic_user_id, &user), S_OK, "find user") &&
+                 expect_hr(api.queue_create(mode_manual, mode_manual, &shared_queue), S_OK,
+                           "create shared queue") &&
                  positive_completion(api, user) && null_callback_and_callback_claim(api, user) &&
                  argument_errors(api, user) && reuse_and_capacity(api, user) &&
                  log_checks(module) && manual_queue(api, user) && (clear_log(), true) &&
                  unsupported_queue(api, user) && refusal_log_checks(module);
+        if (shared_queue) api.queue_close(shared_queue);
         if (user) api.close_user(user);
     }
     FreeLibrary(module);

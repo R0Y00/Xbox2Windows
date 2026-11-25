@@ -42,13 +42,13 @@
 // XAsyncGetStatus. XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
 // XTaskQueueDispatch (completion port) and XTaskQueueCloseHandle model one
 // shim-owned manual queue. XGameSaveInitializeProviderAsync is implemented for
-// two queue configurations: no queue, where it completes before it returns and
-// calls the block's callback once on the calling thread; and a live manual queue
-// from XTaskQueueCreate, where it completes before it returns but fires NO
-// callback until XTaskQueueDispatch on the completion port runs it once. Any
-// other non-null queue is refused with E_NOTIMPL before the block or provider
-// capacity is touched. XGameSaveInitializeProviderResult hands the provider over
-// exactly once. The
+// one queue configuration: a live manual queue from XTaskQueueCreate, where it
+// completes before it returns but fires NO callback until XTaskQueueDispatch on
+// the completion port runs it once. A null queue (the public API's process
+// default queue) and any other queue are refused with E_NOTIMPL before the block
+// or provider capacity is touched. XGameSaveInitializeProviderResult returns
+// E_PENDING while that callback is still waiting, without consuming anything,
+// and then hands the provider over exactly once. The
 // shim reads only the three leading public XAsyncBlock fields (queue, context,
 // callback) and keeps its own state in a side table keyed by the block
 // address, so the remaining opaque bytes of the block are never touched. XPackageMount is documented as a
@@ -849,10 +849,9 @@ XTaskQueueHandle find_live_task_queue(void* handle) noexcept
     return nullptr;
 }
 
-// Only two queue configurations are recognized: no queue (the callback runs
-// inline on the caller's stack) and a live manual queue made by XTaskQueueCreate
-// in this shim (the callback waits for XTaskQueueDispatch on the completion
-// port). Any other queue value is refused with E_NOTIMPL before anything is
+// Only a live manual queue made by XTaskQueueCreate in this shim is recognized
+// (the callback waits for XTaskQueueDispatch on the completion port). A null
+// queue and any other queue value are refused with E_NOTIMPL before anything is
 // consumed. Other argument errors come back from the call itself, like the
 // synchronous path, and consume nothing. A started operation always completes
 // before this returns.
@@ -860,14 +859,14 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
                                             bool sync_on_demand, XAsyncBlock* async_block) noexcept
 {
     if (!async_block) return E_INVALIDARG;
+    // A null queue selects the process default task queue in the public API,
+    // which this shim does not model: refuse before any block or provider state.
+    if (!async_block->queue) return not_implemented;
     AcquireSRWLockExclusive(&runtime_state.lock);
-    XTaskQueueHandle queue = nullptr;
-    if (async_block->queue) {
-        queue = find_live_task_queue(async_block->queue);
-        if (!queue) {
-            ReleaseSRWLockExclusive(&runtime_state.lock);
-            return not_implemented;
-        }
+    XTaskQueueHandle queue = find_live_task_queue(async_block->queue);
+    if (!queue) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return not_implemented;
     }
     if (find_provider_async(async_block)) {
         ReleaseSRWLockExclusive(&runtime_state.lock);
@@ -925,7 +924,9 @@ HRESULT game_save_initialize_provider_result(XAsyncBlock* async_block,
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return E_INVALIDARG;
     }
-    if (!slot->completed) {
+    // Early retrieval is refused while the completion callback still waits for
+    // XTaskQueueDispatch: the slot, its queue link and the provider stay intact.
+    if (!slot->completed || slot->callback_pending) {
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return E_PENDING;
     }
@@ -959,6 +960,9 @@ HRESULT task_queue_create(XTaskQueueDispatchMode work_mode, XTaskQueueDispatchMo
 
 // Runs at most one waiting completion callback, oldest first, on the calling
 // thread, and reports whether it ran one. The work port never holds anything.
+// timeoutInMs is accepted and ignored on purpose: every operation completes
+// before its start call returns, so there is nothing to wait for and a finite
+// or infinite wait returns false at once when no callback is queued.
 bool task_queue_dispatch(XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t) noexcept
 {
     if (port != XTaskQueuePort_Completion) return false;
@@ -986,7 +990,8 @@ bool task_queue_dispatch(XTaskQueueHandle queue, XTaskQueuePort port, std::uint3
     return true;
 }
 
-// A queue with callbacks still waiting stays alive, so they are never stranded.
+// A queue with a start in flight (slot reserved, not yet completed) or a callback
+// still waiting stays alive, so neither is stranded.
 HRESULT task_queue_close_handle(XTaskQueueHandle queue) noexcept
 {
     AcquireSRWLockExclusive(&runtime_state.lock);
@@ -994,7 +999,9 @@ HRESULT task_queue_close_handle(XTaskQueueHandle queue) noexcept
     if (find_live_task_queue(queue)) {
         result = S_OK;
         for (const auto& slot : runtime_state.provider_asyncs) {
-            if (slot.live && slot.callback_pending && slot.queue == queue) result = e_illegal_state_change;
+            if (slot.live && slot.queue == queue && (!slot.completed || slot.callback_pending)) {
+                result = e_illegal_state_change;
+            }
         }
         if (result == S_OK) queue->live = false;
     }

@@ -11174,16 +11174,27 @@ names are `xgameruntime_thunks`, `xgameruntime_contracts`,
 `XGameSaveInitializeProviderAsync` and `XGameSaveInitializeProviderResult` are
 implemented on top of the synchronous provider path. Argument errors (null
 block, null or empty configuration id, null or closed user) return from the call
-and leave the block untouched. A started operation completes before the call
-returns, calls the block's callback once on the calling thread, and the result
-is claimed exactly once (a second claim returns `E_INVALIDARG`). Reusing a block
-whose result is unclaimed returns `E_ILLEGAL_STATE_CHANGE` (0x8000000D). The shim keeps its
-state in a side table keyed by the block address and reads only the leading
-queue, context and callback fields. `XAsyncGetStatus`, `XTaskQueueCreate`,
-`XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs, and
-queue dispatch modes are not modeled. `xgameruntime_gamesave_async` covers the
-positive completion, callback and in-callback claim, the error paths, reuse and
-provider exhaustion.
+and leave the block untouched. Only a live manual queue from `XTaskQueueCreate`
+(Manual/Manual) is accepted in `XAsyncBlock.queue`. A null queue selects the
+process default task queue in the public API, which is not modeled, so it is
+refused with `E_NOTIMPL` before any block or provider state is touched, as is
+any other queue. A started operation completes before the call returns, but its
+callback fires only when `XTaskQueueDispatch` runs the completion port, once,
+oldest first. Until then `XGameSaveInitializeProviderResult` returns
+`E_PENDING` without consuming anything (this restricted implementation refuses
+early retrieval rather than losing the queued callback); after the callback the
+provider is handed over exactly once (a second claim returns `E_INVALIDARG`).
+Reusing a block whose result is unclaimed returns `E_ILLEGAL_STATE_CHANGE`
+(0x8000000D). `XTaskQueueCloseHandle` on a queue with a start in flight or a
+callback still waiting returns `E_ILLEGAL_STATE_CHANGE` and keeps the queue.
+`XTaskQueueDispatch` ignores its timeout argument: nothing is ever waiting on
+work, so a finite wait returns `false` at once when no callback is queued. The
+shim keeps its state in a side table keyed by the block address and reads only
+the leading queue, context and callback fields. `XAsyncGetStatus`,
+`XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.
+`xgameruntime_gamesave_async` covers the positive completion, the callback and
+in-callback claim, the error paths, reuse, provider exhaustion, early result
+retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
 ```powershell
 cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check
