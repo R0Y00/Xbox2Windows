@@ -8,9 +8,16 @@ target, an explicit viewport and scissor, and the root signature used to create 
 The translated path binds its usual pipeline, root and sampled textures, then forwards the placed
 desktop argument buffer and offset. Its producer supplies legal D3D12 draw arguments. The shim checks
 the placed buffer range without reading the draw fields or limiting the GPU-generated vertex count.
-The path refuses vertex streams, buffer SRVs, dynamic sampler heaps, unknown texture bindings and
-shaders whose reflected constants depend on the draw's start vertex or instance. It also refuses
-non-reflectable shader bytecode. A missing cached translation retains the request publishing path.
+The path refuses vertex streams, root buffer SRVs, dynamic sampler heaps, unknown bindings and shaders
+whose reflected constants depend on the draw's start vertex or instance. It also refuses non-reflectable
+shader bytecode. A deferred guest root can still supply the recorded tables to the translated root.
+A missing cached translation retains the request publishing path.
+
+Table buffer views bind their complete byte range from the recording's upload allocation, one unique
+aliased placed buffer, or a wrapped committed resource with desktop backing and no title shadow.
+The runtime refuses non-DWORD ranges, misaligned offsets, cross-device views, views that overlap the
+indirect argument resource, and copied placed buffers whose desktop contents are unproven. It binds
+the accepted resource directly as a desktop raw SRV and uses its recorded stride for the shader entry.
 
 Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
 `ctest --preset release -j1 --no-tests=error -R '^startup_indirect_translated_draw_' -V`.
@@ -19,7 +26,10 @@ A compute writer records one triangle at a nonzero offset in a placed GPU buffer
 title backing. A fenced readback compares the argument, guard words and every colour pixel.
 Changing the sampled texture from red to green changes every pixel. Omitting the writer or texture,
 binding the wrong root, using a short argument range or using a shader that reads the start vertex
-leaves the target clear.
+leaves the target clear. A second compute writer supplies distinguishing colours to a table buffer.
+The table's nonzero offset and stride select the second colour, the short view reads zero, and a
+non-aliased placement is refused. A raw descriptor over a recording-owned upload page reads the
+same colour and refuses a view that crosses its allocation.
 
 ### Packed pixel position in a source-built shader
 

@@ -1225,14 +1225,15 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
     return reinterpret_cast<void*>(allocation.cpu);
 }
 
-UINT64 list_upload_gpu(Wrapper* self, UINT64 address, UINT64 bytes)
+x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 bytes)
 {
     AcquireSRWLockShared(&allocator_lock);
     const auto& state = self->own();
-    const auto gpu = state.list_open && state.list_uploads ? state.list_uploads->translate(address, bytes) : 0;
+    const auto allocation = state.list_open && state.list_uploads ? state.list_uploads->range(address, bytes) : x2w_upload::Allocation{};
     ReleaseSRWLockShared(&allocator_lock);
-    return gpu;
+    return allocation;
 }
+UINT64 list_upload_gpu(Wrapper* self, UINT64 address, UINT64 bytes) { return list_upload_range(self, address, bytes).gpu; }
 
 // Fixture lookup. The full range must belong to this list's open recording.
 extern "C" __declspec(dllexport) UINT64 x2w_d3d12_upload_gpu_address(void* list, const void* cpu, UINT64 bytes)
@@ -2236,7 +2237,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
     const bool translated = command == IndirectCommand::draw && pass.pipeline && !pass.pipeline->own().real &&
-        pass.graphics_root && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
+        (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer)) return refuse("indirect graphics requires one command and no count buffer");
     if (graphics) {

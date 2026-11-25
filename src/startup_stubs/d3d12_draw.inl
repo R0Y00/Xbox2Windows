@@ -1358,8 +1358,10 @@ bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation)
             std::snprintf(name, sizeof(name), "ud%u", static_cast<unsigned>(word));
             if (var.StartOffset % sizeof(UINT) || var.Size != sizeof(UINT) || word >= translation.uds.size() ||
                 !var.Name || std::strcmp(var.Name, name)) return false;
-            const int kind = translation.uds[word].kind;
-            if (kind != Translation::root_constant && kind != Translation::rect && kind != Translation::d16_unorm16)
+            const auto& ud = translation.uds[word];
+            if (ud.kind == Translation::stride && ud.a >= 0 && static_cast<std::size_t>(ud.a) < translation.srvs.size() &&
+                translation.srvs[ud.a].source == 0 && translation.srvs[ud.a].kind == 0) continue;
+            if (ud.kind != Translation::root_constant && ud.kind != Translation::rect && ud.kind != Translation::d16_unorm16)
                 return false;
         }
     }
@@ -1373,6 +1375,92 @@ struct TranslatedIndirectDraw {
     u64 shader_key = 0;
     const char* refusal = "translated pipeline or target unavailable";
 };
+
+struct IndirectBufferView {
+    ID3D12Resource* resource = nullptr;
+    u64 offset = 0, bytes = 0;
+    UINT stride = 0;
+    bool upload = false;
+};
+
+// For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
+// fallback to copying an unrelated or stale title allocation into the draw upload ring.
+IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words)
+{
+    constexpr u64 limit = 16u << 20;
+    u64 address = 0, offset = 0, bytes = 0;
+    UINT stride = 0;
+    const Wrapper* owner = nullptr;
+    if (words[0] == view_token_magic) {
+        ViewRecord record{};
+        AcquireSRWLockShared(&note_lock);
+        if (words[1] < view_records().size()) record = view_records()[words[1]];
+        ReleaseSRWLockShared(&note_lock);
+        if (record.slot == 17 && record.desc_bytes >= 12) {
+            UINT size = 0;
+            std::memcpy(&address, record.desc, 8);
+            std::memcpy(&size, record.desc + 8, 4);
+            bytes = size;
+        } else if (record.slot == 18 && record.desc_bytes >= 40) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            std::memcpy(&view, record.desc, 40);
+            owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
+            if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
+                view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return {};
+            const bool raw = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW && !view.Buffer.StructureByteStride &&
+                view.Format == DXGI_FORMAT_R32_TYPELESS;
+            const bool structured = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && view.Buffer.StructureByteStride &&
+                view.Format == DXGI_FORMAT_UNKNOWN;
+            const bool typed = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && !view.Buffer.StructureByteStride;
+            const UINT element = raw ? 4 : structured ? view.Buffer.StructureByteStride :
+                typed ? x2w_startup::typed_buffer_format_bytes(view.Format) : 0;
+            if (!element || view.Buffer.FirstElement > UINT64_MAX / element) return {};
+            offset = view.Buffer.FirstElement * element;
+            bytes = u64{view.Buffer.NumElements} * element;
+            stride = raw ? 0 : element;
+            if (const auto base = reinterpret_cast<u64>(owner->own().title_memory)) {
+                if (offset > UINT64_MAX - base) return {};
+                address = base + offset;
+            }
+        }
+    } else {
+        address = words[0] | (u64{words[1] & 0xffff} << 32);
+        stride = (words[1] >> 16) & 0x3fff;
+        bytes = u64{stride ? stride : 1} * words[2];
+    }
+    if (!bytes || bytes > limit || bytes % 4) return {};
+    ID3D12Resource* native = nullptr;
+    bool upload = false;
+    Wrapper* device = self->own().list_device;
+    if (address) {
+        if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
+            if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
+            return {};
+        }
+        const auto placed = placed_buffer_range(device, address, bytes);
+        if (placed.reject || !placed.alias || (owner && owner != placed.owner)) return {};
+        owner = placed.owner;
+        native = placed.alias;
+        offset = address - reinterpret_cast<u64>(owner->own().title_memory);
+    } else if (owner && !owner->own().title_memory) {
+        native = static_cast<ID3D12Resource*>(owner->own().real);
+        D3D12_HEAP_PROPERTIES props{};
+        D3D12_HEAP_FLAGS flags{};
+        if (FAILED(native->GetHeapProperties(&props, &flags)) ||
+            (props.Type != D3D12_HEAP_TYPE_DEFAULT && props.Type != D3D12_HEAP_TYPE_UPLOAD)) return {};
+        upload = props.Type == D3D12_HEAP_TYPE_UPLOAD;
+    }
+    if (!native || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT ||
+        !InterlockedCompareExchange(&owner->own().refs, 0, 0)) return {};
+    const auto* info = resource_info(owner);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) return {};
+    x2w_startup::ComPtr<ID3D12Device> native_device;
+    if (FAILED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device)) return {};
+    const auto desc = native->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        offset > desc.Width || bytes > desc.Width - offset) return {};
+    return {native, offset, bytes, stride, upload};
+}
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
@@ -1399,7 +1487,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (!tr->independent_indirect_entry.has_value()) {
             tr->independent_indirect_entry = indirect_shader_entry(tr->vs, *tr) && indirect_shader_entry(tr->ps, *tr) &&
                 std::all_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) {
-                    return srv.kind > 0 && srv.source == 0;
+                    return srv.source == 0;
                 });
         }
         if (!*tr->independent_indirect_entry || tr->samplers.heap) {
@@ -1556,6 +1644,19 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }
+        if (indirect) {
+            const auto view = entry_ok ? indirect_table_buffer(self, words) : IndirectBufferView{};
+            if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
+                indirect->refusal = "translated draw requires a complete GPU-backed table buffer range";
+                ReleaseSRWLockExclusive(&draw_lock);
+                return false;
+            }
+            if (!view.upload)
+                require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            strides[i] = view.stride;
+            buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
+            continue;
+        }
         if (srv.source == 0 && words[0] == view_token_magic && entry) {
             // A view the title created: a constant buffer view names its memory directly; a buffer
             // shader-resource view names a range of its resource's title memory.
@@ -1697,7 +1798,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         require_state(self, indirect->argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ExecuteIndirect(indirect->signature, 1, indirect->argument, indirect->offset, nullptr, 0);
         // The translated root invalidated the desktop arguments of the tracked guest root.
-        list->SetGraphicsRootSignature(pass.graphics_root);
+        if (pass.graphics_root) list->SetGraphicsRootSignature(pass.graphics_root);
         pass.srv_bound = 0;
         drawn = true;
     } else if (indexed) {
@@ -1739,7 +1840,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset)
 {
     TranslatedIndirectDraw draw{signature, argument, offset};
-    if (!draw_translated(self, false, 0, 0, 0, 0, 0, &draw)) return draw.refusal;
+    if (!draw_translated(self, false, 0, 0, 0, 0, 0, &draw)) {
+        static LONG refused;
+        if (draw.shader_key && first_calls(refused, 32))
+            log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);
+        return draw.refusal;
+    }
     InterlockedIncrement(&translated_draws);
     static LONG reported;
     if (first_calls(reported, 16))
