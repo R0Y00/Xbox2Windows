@@ -1570,6 +1570,52 @@ def check_sdwa_int_extra_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_f16_exact_extra_forms():
+    """The 25 exact binary16 min, max, fract, frexp_mant, and frexp_exp_i16 forms (VOP1/VOP2, VOP3,
+    DPP16, DPP8, SDWA) count as covered once the translator accepts their fixtures."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in pixel.F16_EXACT_EXTRA_PROGRAMS.values():
+            pixel.translate_f16(pixel.uncompressed_export(body))
+        forms = {
+            ("VOP2", "v_min_f16"), ("VOP2", "v_max_f16"),
+            ("VOP1", "v_fract_f16"), ("VOP1", "v_frexp_mant_f16"), ("VOP1", "v_frexp_exp_i16_f16"),
+            ("VOP3", "v_min_f16_e64"), ("VOP3", "v_max_f16_e64"),
+            ("VOP3", "v_fract_f16_e64"), ("VOP3", "v_frexp_mant_f16_e64"), ("VOP3", "v_frexp_exp_i16_f16_e64"),
+            *{
+                (group, f"{op}_dpp")
+                for group in ("DPP16", "DPP8")
+                for op in ("v_min_f16", "v_max_f16", "v_fract_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16")
+            },
+            *{
+                ("SDWA", f"{op}_sdwa")
+                for op in ("v_min_f16", "v_max_f16", "v_fract_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16")
+            },
+        }
+        assert len(forms) == 25
+        neighbours = {
+            ("VOP1", "v_rcp_f16"), ("VOP3", "v_rcp_f16_e64"),
+            ("DPP16", "v_rcp_f16_dpp"), ("DPP8", "v_rcp_f16_dpp"), ("SDWA", "v_rcp_f16_sdwa"),
+            ("DPP16", "v_cvt_norm_i16_f16_dpp"), ("DPP8", "v_cvt_norm_i16_f16_dpp"),
+            ("SDWA", "v_cvt_norm_i16_f16_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        stripped = pixel.ACCEPTED - {"v_frexp_mant_f16_dpp"}
+        assert not {("DPP16", "v_frexp_mant_f16_dpp"), ("DPP8", "v_frexp_mant_f16_dpp")} & fc.gfx_forms(
+            stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1594,6 +1640,7 @@ if __name__ == "__main__":
     check_dpp_f16_cvt_fmac_ldexp_forms()
     check_sdwa_f16_forms()
     check_sdwa_int_extra_forms()
+    check_f16_exact_extra_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sdwa_cmp_coverage()
