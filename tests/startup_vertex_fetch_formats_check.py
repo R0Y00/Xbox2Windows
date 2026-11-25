@@ -229,25 +229,31 @@ def controls():
         assert len(alignments) > 1 if bits < 32 else alignments == {0}, name
 
 
-def run(directory, compiler, consumer, adapter, name, source, words):
-    hlsl, binary, case = (directory / n for n in ('fetch.hlsl', 'fetch.cso', 'fetch.case'))
-    translated = pipeline(name)
-    constants = [0] * 16
-    constants[translated.uds.index(('stride', 0))] = FORMATS[name][1]
-    case.write_bytes(struct.pack('<337I', 1, *words, *constants))
+def compile_fetch(directory, compiler, name, source):
+    hlsl, binary = directory / 'fetch.hlsl', directory / 'fetch.cso'
     hlsl.write_text(source, encoding='ascii')
     # Compile the vertex entry as the startup tools do, then the same body in the compute wrapper.
     subprocess.run([compiler, '-T', 'vs_6_0', '-E', 'main', '-Fo', binary, hlsl], check=True)
     with hlsl.open('a', encoding='ascii') as handle:
         handle.write(wrapper(name))
     subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'readback', '-Fo', binary, hlsl], check=True)
+    return binary
+
+
+def run_reference(directory, consumer, adapter, binary, name, words):
+    case = directory / 'fetch.case'
+    constants = [0] * 16
+    constants[pipeline(name).uds.index(('stride', 0))] = FORMATS[name][1]
+    case.write_bytes(struct.pack('<337I', 1, *words, *constants))
     return subprocess.run([consumer, adapter, '--compute-store-case', binary, case], capture_output=True, text=True)
 
 
 def check(directory, compiler, consumer, adapter):
     for name in FORMATS:
         source = pipeline(name).hlsl_vs()
-        result = run(directory, compiler, consumer, adapter, name, source, expected(name))
+        binary = compile_fetch(directory, compiler, name, source)
+        correct = expected(name)
+        result = run_reference(directory, consumer, adapter, binary, name, correct)
         if result.returncode == 77:
             print(result.stdout, result.stderr)
             return 77
@@ -258,15 +264,16 @@ def check(directory, compiler, consumer, adapter):
             [line for line in result.stdout.splitlines() if 'mismatches=' in line][0]))
         for label, wrong in WRONG:
             words = expected(name, **wrong)
-            if words == expected(name):
+            if words == correct:
                 continue
-            first = next(i for i, (a, b) in enumerate(zip(words, expected(name))) if a != b)
-            bad = run(directory, compiler, consumer, adapter, name, source, words)
+            first = next(i for i, (a, b) in enumerate(zip(words, correct)) if a != b)
+            bad = run_reference(directory, consumer, adapter, binary, name, words)
             if bad.returncode != 1 or 'word=%d expected=' % first not in bad.stderr:
                 raise AssertionError('%s: reference %r escaped detection\n%s' % (name, label, bad.stderr))
     for name, label, old, new in MUTATIONS:
         source = pipeline(name).hlsl_vs()
-        bad = run(directory, compiler, consumer, adapter, name, source.replace(old, new, 1), expected(name))
+        binary = compile_fetch(directory, compiler, name, source.replace(old, new, 1))
+        bad = run_reference(directory, consumer, adapter, binary, name, expected(name))
         if bad.returncode != 1 or 'Compute readback differs' not in bad.stderr:
             raise AssertionError('%s: mutation %r escaped detection\n%s' % (name, label, bad.stderr))
         print('%s: mutation %r fails' % (name, label))

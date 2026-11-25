@@ -15,6 +15,9 @@ import zlib
 from resource_inventory import parts
 
 
+MESH_WAVE64 = b"+wavefrontsize64,-wavefrontsize32"
+
+
 def inflate(data, size, window):
     if not 0 < size <= 16 << 20:
         raise ValueError("Invalid decoded size")
@@ -75,12 +78,17 @@ def _bounded_code(image, start):
     return image[start:end]
 
 
-def _check_two_exits(code, llvm, *, cpu, features):
+def _check_two_exits(code, llvm, *, cpu, features, mesh=False):
     """Both decoded exits must be reachable from the single entry."""
     instructions = dict(disassemble(code, llvm, offsets=True, cpu=cpu, features=features))
     exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
     if len(exits) != 2 or exits[-1] + 4 != len(code):
         raise ValueError("Expected two decoded exits")
+    # Match the full mesh barrier and allocation instructions so extra operands
+    # or a different message cannot inherit their fall-through behavior.
+    mesh_alloc = "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"
+    if mesh and mesh_alloc not in instructions.values():
+        raise ValueError("Unverified multi-exit program: missing mesh allocation")
     # An aligned word can be a literal or the second half of an instruction.
     # Follow branches only from decoded PCs and reject unresolved transfers.
     pcs = list(instructions)
@@ -103,7 +111,8 @@ def _check_two_exits(code, llvm, *, cpu, features):
             pending.append(target)
             if op == "s_branch":
                 continue
-        elif not (op.startswith(("v_", "image_", "buffer_", "tbuffer_", "ds_", "flat_", "global_",
+        elif not ((mesh and instructions[pc] in ("s_barrier", mesh_alloc))
+                  or op.startswith(("v_", "image_", "buffer_", "tbuffer_", "ds_", "flat_", "global_",
                                  "scratch_", "exp", "s_load_", "s_buffer_load_", "s_cmp", "s_bitcmp",
                                  "s_mov_", "s_and", "s_or_", "s_xor_", "s_not_", "s_lsh", "s_ash",
                                  "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
@@ -178,10 +187,9 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
         markers = sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code))
         if markers == 1:
             return code
-        # Exactly two exits, verified for pixel (0) and compute (5) only. Mesh and other
-        # stages, and three or more markers, stay rejected.
-        if stage in (0, 5) and markers == 2 and llvm is not None:
-            _check_two_exits(code, llvm, cpu=cpu, features=features)
+        mesh = stage == 13 and cpu == b"gfx1013" and features == MESH_WAVE64
+        if (stage in (0, 5) or mesh) and markers == 2 and llvm is not None:
+            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh)
             return code
         raise ValueError("Unverified multi-exit program")
     # Older fixtures lack the section extent; preserve their unique-marker rule.

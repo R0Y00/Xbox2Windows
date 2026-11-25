@@ -692,6 +692,29 @@ after building `startup_stream_consumer`. On WARP:
 - A request whose first four parts already exist is completed without rewriting them.
 - The control runs without render mode and must print `FAIL: no compute request`.
 
+
+### Compute binding evidence at Dispatch
+
+With render mode and `X2W_D3D12_COMPUTE_BINDINGS=1`, the shim logs selected slot 62
+pipeline creations and samples the root arguments seen when list slot 14 consumes
+those pipelines. Supply comma-separated 16-digit lowercase container hashes in
+place of `1` to select specific pipelines. The log prefix is `x2w-compute-bindings`.
+The trace records the root match, desktop PSO and root availability, up to 16
+root parameters, and a 64-bit mask of DWORDs covered by constant setters.
+Binding entries report the setter slot and address category, including aligned
+or unaligned upload, aliased or copied placement, and unresolved addresses.
+
+The address category describes ownership at the first byte. Full range, current
+GPU contents, descriptor table contents and resource state need separate
+validation. The trace leaves command recording unchanged and captures no
+constant data or buffer contents. It logs up to 32 creation records and 16
+dispatch samples per pipeline, with a 256-dispatch process limit.
+
+```powershell
+cmake --build --preset release --target startup_compute_binding_trace
+ctest --preset release --no-tests=error -R '^startup_compute_binding_trace_warp$' --output-on-failure
+```
+
 ### Compute pipeline translation
 
 `gfx2hlsl.py --pending` and `--watch` translate a `.c67` request with the compute stage instead of recording
