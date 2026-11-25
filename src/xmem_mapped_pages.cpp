@@ -129,6 +129,7 @@ struct LazyBlocks {
     std::map<ULONG_PTR, SIZE_T> blocks;
 };
 LazyBlocks lazy_blocks;
+volatile LONG lazy_block_releases = 0;  // lazy blocks the title has released (keys the fault handler's retry)
 
 // The lazy block holding address, as base and size; false when there is none.
 bool lazy_block_at(ULONG_PTR address, ULONG_PTR& base, SIZE_T& bytes)
@@ -179,8 +180,6 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     const ULONG_PTR address = record->ExceptionInformation[1];
-    // A thread that raced another one to the same slot finds it committed: retry once, then pass the fault on.
-    thread_local ULONG_PTR retried = 0;
     if (lazy_startup()) {
         ULONG_PTR base = 0;
         SIZE_T bytes = 0;
@@ -188,18 +187,26 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
         if (lazy_block_at(address, base, bytes) && VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) &&
             info.State == MEM_RESERVE) {
             if (!commit_block_chunks(base, bytes, address, address + 1)) return EXCEPTION_CONTINUE_SEARCH;
-            retried = 0;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Another thread committed this chunk (or the whole block, which then leaves the list) between the fault
-        // and the query: committed read-write memory cannot fault, so retry once.
+        // and the query: committed read-write memory cannot fault, so retry once. The retry is keyed on the chunk
+        // and on the release count, so a fault that stays is passed on, while a new block later placed at the same
+        // addresses can still be raced once (separate from the slot path's retry below).
+        thread_local ULONG_PTR retried_chunk = 0;
+        thread_local LONG retried_releases = 0;
         const ULONG_PTR chunk = address & ~(ULONG_PTR{lazy_chunk} - 1);
+        const LONG releases = lazy_block_releases;
         if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) && info.Type == MEM_PRIVATE &&
-            info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE && retried != chunk) {
-            retried = chunk;
+            info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE &&
+            !(retried_chunk == chunk && retried_releases == releases)) {
+            retried_chunk = chunk;
+            retried_releases = releases;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+    // A thread that raced another one to the same slot finds it committed: retry once, then pass the fault on.
+    thread_local ULONG_PTR retried = 0;
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
     const std::lock_guard guard(memory.mutex);
     Backing* backing = backing_at(address);
@@ -913,15 +920,16 @@ extern "C" BOOL WINAPI x2w_xmem_commit_range(const void* address, SIZE_T bytes)
     if (!lazy_commit() || !address || !bytes) return TRUE;
     const auto start = reinterpret_cast<ULONG_PTR>(address);
     const ULONG_PTR end = bytes > ~ULONG_PTR{0} - start ? ~ULONG_PTR{0} : start + bytes;
+    ULONG_PTR from = start;  // the part of the range past any lazy startup blocks it starts in
     if (lazy_startup()) {
-        ULONG_PTR from = start, base = 0;
+        ULONG_PTR base = 0;
         SIZE_T block_bytes = 0;
         for (; from < end && lazy_block_at(from, base, block_bytes); from = base + block_bytes)
             if (!commit_block_chunks(base, block_bytes, from, end)) return FALSE;
         if (from >= end) return TRUE;  // the range lies in lazy startup blocks
     }
     const std::lock_guard guard(memory.mutex);
-    for (ULONG_PTR page = start & ~(ULONG_PTR{page_bytes} - 1); page < end; page += page_bytes) {
+    for (ULONG_PTR page = from & ~(ULONG_PTR{page_bytes} - 1); page < end; page += page_bytes) {
         Backing* backing = backing_at(page);
         if (backing && !commit_backing(*backing)) return FALSE;
         if (page > ~ULONG_PTR{0} - page_bytes) break;
@@ -967,8 +975,9 @@ BOOL WINAPI virtual_free_lazy(LPVOID address, SIZE_T bytes, DWORD type)
 {
     if (type & MEM_RELEASE) {
         AcquireSRWLockExclusive(&lazy_blocks.lock);
-        lazy_blocks.blocks.erase(reinterpret_cast<ULONG_PTR>(address));
+        const bool listed = lazy_blocks.blocks.erase(reinterpret_cast<ULONG_PTR>(address)) != 0;
         ReleaseSRWLockExclusive(&lazy_blocks.lock);
+        if (listed) InterlockedIncrement(&lazy_block_releases);
     }
     return real_virtual_free(address, bytes, type);
 }

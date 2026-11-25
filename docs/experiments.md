@@ -8869,7 +8869,7 @@ Experimental, for [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199). Ph
 
 Some writers cannot fault a slot in, so they commit the range first through the experimental export `x2w_xmem_commit_range(address, bytes)`:
 
-- **Kernel-mode I/O.** `ReadFile` into an uncommitted mapped page fails with `ERROR_NOACCESS` instead of faulting. The main module's `ReadFile` import is wrapped to commit the buffer first.
+- **Kernel-mode I/O.** `ReadFile` into an uncommitted mapped page fails with `ERROR_NOACCESS` instead of faulting. The main module's `ReadFile` import is wrapped to commit the buffer first. Only that import is wrapped. Other kernel-mode accessors of an untouched page fail the same way: `ReadFileEx`, overlapped reads issued elsewhere, `WriteFile` from a lazy page, and calls from other modules' imports. The startup runs reached only the main module's `ReadFile`.
 - **GPU placement.** Device slot 133 commits a placed buffer's range before it measures the allocation.
 - **Stand-in writes behind a commit check**, such as the DirectStorage destination check.
 
@@ -8910,11 +8910,10 @@ Measured in startup runs on Windows 10 22H2 (16 GB RAM, RTX 3080 Ti), same input
 |---|---|
 | `xmem_lazy_startup` | With both switches: a 64 MiB block of type `0x20403000` and a 32 MiB large-page block are reserved, the second 2 MiB aligned; a 16 MiB block is committed. A CPU write commits only its 256 KiB chunk, reads back, and the rest of the chunk reads zero. `ReadFile` into an untouched chunk fails with `ERROR_NOACCESS`; after `x2w_xmem_commit_range` over a range that crosses into the next chunk, the read succeeds. Eight threads writing to the same 32 untouched chunks at once all succeed. `x2w_xmem_commit_block` commits a whole block, a write to its last bytes succeeds, and an address outside the lazy blocks returns TRUE. |
 | `xmem_lazy_startup_off` | Control, with `X2W_XMEM_LAZY_STARTUP=0` and `X2W_XMEM_LAZY_COMMIT=1`: the same 64 MiB and 32 MiB blocks are committed when they are allocated, and `x2w_xmem_commit_block` returns TRUE. |
-
-The `VirtualFree` wrapper patches the main module's import, so the Python test does not reach it: it was checked only in the startup runs.
+| `xmem_lazy_imports` | Source-built ([`tests/xmem_lazy_imports_check.cpp`](../tests/xmem_lazy_imports_check.cpp)), because the import wrappers patch the main module, which is `python.exe` in the checks above. With both switches, the program's own `ReadFile` reads a file into a mapped page that was never touched, and the bytes match. A 64 MiB startup block is released through its own `VirtualFree` and the same addresses are reserved again; a read there must still fault, and the range must stay reserved. Without the commit in the `ReadFile` wrapper the read fails with `ERROR_NOACCESS`; without the list removal in the `VirtualFree` wrapper the handler commits the new reservation. |
 
 ```powershell
-cmake --build --preset release --target xmem_shim
+cmake --build --preset release --target xmem_shim xmem_lazy_imports_check
 ctest --preset release --no-tests=error -R '^xmem_lazy' -V
 ```
 

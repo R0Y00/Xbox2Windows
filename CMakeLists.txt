@@ -275,6 +275,13 @@ endforeach()
 # startup blocks entirely below 2^40 or refuses them. The check loads xmem.dll by path; the deployed
 # shim must ignore the test-build mutants, and each mutant in the test-controls build must make the
 # named check fail.
+# The import wrappers of X2W_XMEM_LAZY_COMMIT / X2W_XMEM_LAZY_STARTUP (#1199): ReadFile and VirtualFree of the
+# main module, which the Python checks cannot reach.
+add_executable(xmem_lazy_imports_check tests/xmem_lazy_imports_check.cpp)
+target_compile_features(xmem_lazy_imports_check PRIVATE cxx_std_17)
+add_dependencies(xmem_lazy_imports_check xmem_shim)
+add_test(NAME xmem_lazy_imports COMMAND xmem_lazy_imports_check "$<TARGET_FILE:xmem_shim>")
+set_tests_properties(xmem_lazy_imports PROPERTIES TIMEOUT 60)
 add_executable(xmem_startup_below_40_check tests/xmem_startup_below_40_check.cpp)
 target_link_libraries(xmem_startup_below_40_check PRIVATE OneCore)
 target_compile_features(xmem_startup_below_40_check PRIVATE cxx_std_17)
