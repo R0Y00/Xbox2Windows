@@ -25,6 +25,7 @@
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/indexed_indirect_guard.h"
+#include "startup_stubs/indexed_rect_geometry.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
@@ -2331,8 +2332,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
             return refuse("indirect graphics requires one matching target, viewport and scissor");
-        if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-            return refuse("indirect draw requires triangle-list topology");
+        if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
+            !(translated && indexed && pass.topology == 0x11))
+            return refuse("indirect draw requires triangle-list topology or a translated indexed rectangle");
         const auto samples = pass.target0->GetDesc().SampleDesc;
         if (samples.Count != 1 || samples.Quality)
             return refuse("draw requires a single-sample render target");

@@ -25,6 +25,8 @@ struct Translation {
     ID3D12RootSignature* root = nullptr;
     std::optional<bool> independent_indirect_entry;
     std::optional<bool> indexed_indirect_entry;
+    bool indexed_rect_geometry_attempted = false;
+    x2w_startup::ComPtr<ID3DBlob> indexed_rect_geometry;
     int indirect_base_word = -1;
     x2w_startup::ComPtr<ID3D12CommandSignature> indexed_signature;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
@@ -658,7 +660,7 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
 }
 
-ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
 {
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
@@ -667,12 +669,25 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
     const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
+    key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
+    if (indexed_rect) {
+        if (!tr.indexed_rect_geometry_attempted) {
+            tr.indexed_rect_geometry_attempted = true;
+            x2w_startup::ComPtr<ID3DBlob> errors;
+            const HRESULT hr = x2w_startup::compile_indexed_rect_geometry(tr.vs, tr.ps, &tr.indexed_rect_geometry, &errors);
+            if (FAILED(hr))
+                log("x2w-draw %016llx: indexed rectangle geometry unavailable (0x%08lx) %s", tr.key,
+                    static_cast<unsigned long>(hr), errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
+        }
+        if (!tr.indexed_rect_geometry) return nullptr;
+        desc.GS = {tr.indexed_rect_geometry->GetBufferPointer(), tr.indexed_rect_geometry->GetBufferSize()};
+    }
     // Blend state as found in the pipeline's state block, else opaque. Depth-stencil state and
     // DSVFormat come from the stream PSO (or bound DSV), else disabled. Raster state: no culling.
     for (auto& target : desc.BlendState.RenderTarget)
@@ -1619,7 +1634,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
-    if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
+    const bool indexed_rect = rect && indexed && indirect;
+    if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) ||
+        (rect && indexed && !indexed_rect)) return false;
     AcquireSRWLockExclusive(&draw_lock);
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
@@ -1662,7 +1679,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             return false;
         }
     }
-    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
+    if (indexed_rect && !pipeline) indirect->refusal = "translated indexed rectangle geometry unavailable";
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
@@ -1931,7 +1949,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
-        values[i] = ud.kind == Translation::rect ? (rect ? 1u : 0u)
+        values[i] = ud.kind == Translation::rect ? (rect && !indexed_rect ? 1u : 0u)
             : ud.kind == Translation::base_vertex ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == Translation::start_instance ? start_instance
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)

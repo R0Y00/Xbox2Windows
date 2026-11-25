@@ -12357,6 +12357,24 @@ cmake --build --preset dev --target rectlist_draw_check
 ctest --preset dev --no-tests=error -R 'rectlist' -V
 ```
 
+For translated, GPU-written indexed indirect rectangle draws, the graphics
+pipeline runs the validated index record unchanged and inserts a geometry shader
+after the translated vertex shader. The vertex shader sees the original index
+and base vertex. The geometry shader requires finite clip-space positions, a
+common positive `w`, and three axis-aligned corners. It locates the shared
+corner, emits two triangles with the original winding, reconstructs float
+parameters for the fourth vertex, and takes flat parameters from the original
+first vertex. The desktop rasterizer clips the expanded geometry and applies
+the recorded scissor. Other clip-space shapes emit no geometry. The geometry
+shader supports the startup translator's `SV_Position`, float `PARAM` and
+flat unsigned `FPARAM` interface. Other system values and signatures are
+refused.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed
+ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed(_rect)?_(warp|hardware)$' --output-on-failure
+```
+
 ### Measured results and open scope
 
 [The topology check fixture](../tests/rectlist_topology_check.py) exercises 14 verification
