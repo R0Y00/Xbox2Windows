@@ -62,6 +62,9 @@ INPUTS.update({
     'v_exp_f16': [0.0, 1.0, -1.0, 0.5, -0.5, 2.5, 3.0, -3.0, 0.3, 7.0, -7.0, 10.0],
 })
 GARBAGE = 0xdead0000
+# A binary16 result below 0x8000 is a binary32 denormal and the render target flushes it. The fixture sets bit 30
+# of the word (v_or_b32 with this literal) so the target keeps all 32 bits; the expected word has it set too.
+MARK = 0x40000000
 
 
 def source_words(op):
@@ -69,7 +72,7 @@ def source_words(op):
 
 
 def expected_word(op, word):
-    return bits(REF[op](half(word & 0xffff)))
+    return MARK | bits(REF[op](half(word & 0xffff)))
 
 
 def words_text(values):
@@ -77,23 +80,48 @@ def words_text(values):
 
 
 BODY_WORDS = {
-    'v_ceil_f16': bytes.fromhex('00b9187e0d00dcd50101000002b91c7e0f00dcd503010000'),
-    'v_floor_f16': bytes.fromhex('00b7187e0d00dbd50101000002b71c7e0f00dbd503010000'),
-    'v_trunc_f16': bytes.fromhex('00bb187e0d00ddd50101000002bb1c7e0f00ddd503010000'),
-    'v_rndne_f16': bytes.fromhex('00bd187e0d00ded50101000002bd1c7e0f00ded503010000'),
-    'v_fract_f16': bytes.fromhex('00bf187e0d00dfd50101000002bf1c7e0f00dfd503010000'),
-    'v_rcp_f16': bytes.fromhex('00a9187e0d00d4d50101000002a91c7e0f00d4d503010000'),
-    'v_rsq_f16': bytes.fromhex('00ad187e0d00d6d50101000002ad1c7e0f00d6d503010000'),
-    'v_sqrt_f16': bytes.fromhex('00ab187e0d00d5d50101000002ab1c7e0f00d5d503010000'),
-    'v_sin_f16': bytes.fromhex('00c1187e0d00e0d50101000002c11c7e0f00e0d503010000'),
-    'v_cos_f16': bytes.fromhex('00c3187e0d00e1d50101000002c31c7e0f00e1d503010000'),
-    'v_exp_f16': bytes.fromhex('00b1187e0d00d8d50101000002b11c7e0f00d8d503010000'),
-    'v_log_f16': bytes.fromhex('00af187e0d00d7d50101000002af1c7e0f00d7d503010000'),
+    'v_ceil_f16': bytes.fromhex(
+        '00b9187ef41818380d00dcd501010000f41a1a3802b91c7ef41c1c380f00dcd5'
+        '03010000f41e1e38'),
+    'v_floor_f16': bytes.fromhex(
+        '00b7187ef41818380d00dbd501010000f41a1a3802b71c7ef41c1c380f00dbd5'
+        '03010000f41e1e38'),
+    'v_trunc_f16': bytes.fromhex(
+        '00bb187ef41818380d00ddd501010000f41a1a3802bb1c7ef41c1c380f00ddd5'
+        '03010000f41e1e38'),
+    'v_rndne_f16': bytes.fromhex(
+        '00bd187ef41818380d00ded501010000f41a1a3802bd1c7ef41c1c380f00ded5'
+        '03010000f41e1e38'),
+    'v_fract_f16': bytes.fromhex(
+        '00bf187ef41818380d00dfd501010000f41a1a3802bf1c7ef41c1c380f00dfd5'
+        '03010000f41e1e38'),
+    'v_rcp_f16': bytes.fromhex(
+        '00a9187ef41818380d00d4d501010000f41a1a3802a91c7ef41c1c380f00d4d5'
+        '03010000f41e1e38'),
+    'v_rsq_f16': bytes.fromhex(
+        '00ad187ef41818380d00d6d501010000f41a1a3802ad1c7ef41c1c380f00d6d5'
+        '03010000f41e1e38'),
+    'v_sqrt_f16': bytes.fromhex(
+        '00ab187ef41818380d00d5d501010000f41a1a3802ab1c7ef41c1c380f00d5d5'
+        '03010000f41e1e38'),
+    'v_sin_f16': bytes.fromhex(
+        '00c1187ef41818380d00e0d501010000f41a1a3802c11c7ef41c1c380f00e0d5'
+        '03010000f41e1e38'),
+    'v_cos_f16': bytes.fromhex(
+        '00c3187ef41818380d00e1d501010000f41a1a3802c31c7ef41c1c380f00e1d5'
+        '03010000f41e1e38'),
+    'v_exp_f16': bytes.fromhex(
+        '00b1187ef41818380d00d8d501010000f41a1a3802b11c7ef41c1c380f00d8d5'
+        '03010000f41e1e38'),
+    'v_log_f16': bytes.fromhex(
+        '00af187ef41818380d00d7d501010000f41a1a3802af1c7ef41c1c380f00d7d5'
+        '03010000f41e1e38'),
 }
 
 
 def body_source(op):
-    return ''.join('%s%s v%d, v%d\n' % (op, '_e64' if lane % 2 else '', 12 + lane, lane) for lane in range(4))
+    return ''.join('%s%s v%d, v%d\nv_or_b32 v%d, 0x%x, v%d\n' % (op, '_e64' if lane % 2 else '', 12 + lane, lane,
+                                                                  12 + lane, MARK, 12 + lane) for lane in range(4))
 
 
 def chunks(op):
@@ -130,11 +158,11 @@ def controls():
         check('%s: %d inputs are finite binary16 and far from a rounding tie' % (op, len(words)),
               len(words) == 12 and all(math.isfinite(half(w & 0xffff)) and far_from_tie(op, w) for w in words))
         check('%s: the reference results are finite' % op,
-              all(math.isfinite(half(expected_word(op, w))) for w in words))
+              all(math.isfinite(half(expected_word(op, w) & 0xffff)) for w in words))
         for chunk in chunks(op):
             text = translate(op, chunk).hlsl_ps()
             check('%s: the pixel stage translates and rounds to binary16' % op, 'f32tof16' in text)
-    check('fract stops below one', expected_word('v_fract_f16', GARBAGE | bits(-0.0001)) == bits(FRACT_MAX))
+    check('fract stops below one', expected_word('v_fract_f16', GARBAGE | bits(-0.0001)) == MARK | bits(FRACT_MAX))
 
 
 def check_binary(llvm_mc):
