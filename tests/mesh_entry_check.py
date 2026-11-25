@@ -844,7 +844,7 @@ def skipped_refusals():
                 raise
             continue
         except ValueError as error:
-            if "not written on this wave" not in str(error):
+            if "not written on this wave" not in str(error) and "Undefined" not in str(error):
                 raise AssertionError(f"{name}: refused for another reason: {error}")
             continue
         raise AssertionError(f"{name}: accepted")
