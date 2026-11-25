@@ -283,16 +283,19 @@ class Wave:
         else:
             join = target
         before = (self.exec, self.vcc, self.m0)
-        base = (dict(self.s), set(self.pending))
+        base = (dict(self.s), set(self.pending), set(self.pending_v))
         outcomes = []
         for start, stop in ((pc, end), (target, join)):
             self.s, self.pending = dict(base[0]), set(base[1])
+            self.pending_v = set(base[2])
             self.scc = None
             self.exec_range(decoded, expressions, jumps, start, stop, arm=True)
-            outcomes.append((self.s, self.pending))
-        if (self.exec, self.vcc, self.m0) != before:
-            raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
-        (true_s, true_p), (false_s, false_p) = outcomes
+            # Each arm is checked on its own so two changes cannot cancel.
+            if (self.exec, self.vcc, self.m0) != before:
+                raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
+            outcomes.append((self.s, self.pending, self.pending_v))
+        (true_s, true_p, true_v), (false_s, false_p, false_v) = outcomes
+        self.pending_v = true_v | false_v
         if true_s.keys() != false_s.keys():
             raise ValueError("A scalar register is defined in only one join arm")
         merged = {}

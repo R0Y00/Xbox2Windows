@@ -80,6 +80,21 @@ def checks():
         program(table(POINT) + ["s_mov_b64 exec, 1"], table(MATRIX)),
         "changed EXEC, VCC or M0",
     )
+    # Changes in the two arms must not cancel each other out.
+    refused(
+        program(table(POINT) + ["s_mov_b64 exec, 1"], table(MATRIX) + ["s_mov_b64 exec, -1"]),
+        "changed EXEC, VCC or M0",
+    )
+    # A vector load waited for in only one arm is still pending after the join.
+    lines = program(table(POINT) + ["s_waitcnt vmcnt(0)"], table(MATRIX))
+    start = lines.index("s_buffer_load_dword s14, s[16:19], null")
+    lines[start:start] = [
+        "v_mov_b32_e32 v10, 0",
+        "buffer_load_dword v10, v10, s[24:27], 0 offen",
+    ]
+    use = lines.index("s_buffer_load_dword s30, s[36:39], 0x4")
+    lines[use:use] = ["v_readfirstlane_b32 s9, v10"]
+    refused(lines, "Vector load used before wait")
     refused(
         program(table(POINT), ["s_branch 0"] + table(MATRIX)),
         "Unsupported instruction inside a descriptor join arm",
