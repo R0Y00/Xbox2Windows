@@ -1,6 +1,7 @@
 """Absolute-value source modifier `|vN|` on the vector select in tools/startup/gfx2hlsl.py (#1723).
 
 usage: startup_gfx2hlsl_abs_mod_check.py
+       startup_gfx2hlsl_abs_mod_check.py draw <dxc> <offscreen_check> <warp|hardware> [fxc]
 
 A VOP3 `v_cndmask_b32` can carry the abs source modifier, which clears the source's sign bit before any
 negation. The select handler passed the printed `|v30|` to the uint helper and was refused with
@@ -102,3 +103,78 @@ if failures:
     print('FAILED: ' + ', '.join(failures))
     sys.exit(1)
 print('PASS')
+
+# ---- WARP / hardware draws: the emitted select against the ISA reference ------------------------------------
+sys.path.insert(0, here)
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+from startup_flat_param_check import compile_hlsl, draw, root_blob  # noqa: E402
+from startup_gfx2hlsl_bit_alu_check import PRE_WORDS, POST_WORDS, vs_words, words_text  # noqa: E402
+
+SIGN, MAGNITUDE = 0x80000000, 0x7fffffff
+S_MOV_B32 = 0xbe800300  # SOP1 s_mov_b32; sdst in [22:16], ssrc0 in [7:0]
+# Four lanes, one select each: mask s11 = 0 takes src0, mask s10 = 1 takes src1; the other source is untouched.
+DRAW_SETS = (
+    [(0x80000001, 0x00000002, 0), (0x7fffffff, 0xfffffffe, 0), (0xc0490fdb, 0x40490fdb, 0), (0xffc00000, 0x80000000, 0)],
+    [(0x00000000, 0x80000000, 0), (0xffffffff, 0x7fffffff, 0), (0x00000000, 0xffffffff, 0), (0x80000000, 0x00000000, 0)],
+)
+
+
+def vop3_cndmask(vdst, src0, src1, mask_sgpr, **mods):
+    """v_cndmask_b32_e64 vdst, src0, src1, s<mask_sgpr> with VGPR sources and abs/neg flags."""
+    code = encode_vop2_e64(CNDMASK, vdst, V0 + src0, V0 + src1, **mods)
+    w0, w1 = struct.unpack('<II', code)
+    return struct.pack('<II', w0, w1 | (mask_sgpr << 18))
+
+
+V0 = 256
+PS_BODY = (struct.pack('<2I', S_MOV_B32 | (10 << 16) | 0x81, S_MOV_B32 | (11 << 16) | 0x80)
+           + vop3_cndmask(12, 0, 4, 11, abs0=1)
+           + vop3_cndmask(13, 1, 5, 10, abs1=1)
+           + vop3_cndmask(14, 2, 6, 11, abs0=1, neg0=1)
+           + vop3_cndmask(15, 3, 7, 10, abs1=1, neg1=1))
+PS_WORDS = PRE_WORDS + PS_BODY + POST_WORDS
+
+
+def reference(sets):
+    """ISA result per lane: |a0|, |b1|, -|a2|, -|b3| (abs clears the sign bit, then neg flips it)."""
+    return [sets[0][0] & MAGNITUDE, sets[1][1] & MAGNITUDE, (sets[2][0] & MAGNITUDE) ^ SIGN,
+            (sets[3][1] & MAGNITUDE) ^ SIGN]
+
+
+def without_abs(sets):
+    return [sets[0][0], sets[1][1], sets[2][0] ^ SIGN, sets[3][1] ^ SIGN]
+
+
+def check_draw(dxc, renderer, adapter, fxc=None):
+    text = G.Pipeline(vs_words(DRAW_SETS[0]), PS_WORDS, root_blob()).hlsl_ps()
+    if text.count('0x7fffffffu') != 4:
+        raise AssertionError('expected four abs masks in the emitted select\n' + text)
+    mutated = text.replace('& 0x7fffffffu', '& 0xffffffffu')
+    compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        for kind, compiler, vs_profile, ps_profile in compilers:
+            good_ps = compile_hlsl(compiler, kind, text, 'ps_abs_%s' % kind, ps_profile, directory)
+            bad_ps = compile_hlsl(compiler, kind, mutated, 'ps_abs_mut_%s' % kind, ps_profile, directory)
+            for index, sets in enumerate(DRAW_SETS):
+                vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(sets), PS_WORDS, root_blob()).hlsl_vs(),
+                                  'vs_abs_%d_%s' % (index, kind), vs_profile, directory)
+                expected = words_text(reference(sets))
+                run = draw(renderer, adapter, vs, good_ps, expected)
+                if run.returncode:
+                    raise AssertionError('%s draw %d\n%s\n%s' % (kind, index, run.stdout, run.stderr))
+                print('%s draw %d: %s' % (kind, index, expected), flush=True)
+                wrong = words_text(without_abs(sets))
+                if wrong == expected:
+                    continue
+                run = draw(renderer, adapter, vs, bad_ps, expected)
+                if run.returncode == 0 or 'actual=%s' % wrong not in run.stderr:
+                    raise AssertionError('%s mutation did not read %s\n%s\n%s' % (kind, wrong, run.stdout, run.stderr))
+                print('%s mutation: fails as expected, reads %s' % (kind, wrong), flush=True)
+
+
+if len(sys.argv) > 1:
+    if sys.argv[1] != 'draw':
+        raise SystemExit(__doc__)
+    check_draw(*sys.argv[2:])
