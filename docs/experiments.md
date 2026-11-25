@@ -9704,6 +9704,17 @@ Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 
 `tools/ttpf_batch_export.py` runs batch export over a range of texture indices in a TTPF (RDS5) pool. It enforces strict export by default, optionally retrying with fitted provisional calibration history when `--allow-provisional` is specified. Exports are written to temporary paths and published atomically on completion. Entry status, dimensions, DXGI codec, output DDS file size and SHA-256 are recorded in `manifest.json`. A failed export preserves existing DDS files. Use successful entries in the current manifest to identify this run's output.
 
+Build the standalone Rust exporter from this checkout with Cargo. From the repository root on Windows, run
+
+```powershell
+cargo build --locked --release --manifest-path third_party/ttpf-export/tools/bcpack_dds/Cargo.toml --target-dir out/bcpack-dds
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --xbox-1.0.2.1 --threads 8
+```
+
+The preset selects the shared profile and asset-key recipes. Use `--profile-dir PATH` for a local pair of JSON files. Use `--rust-exporter PATH` to select a different binary, or pass that option alone for strict export. Each successful output from the in-tree binary records its mode, SHA-256 and selected recipe path in the manifest. The recipe values are `strict`, `entry_strict`, `shared_profile` and `entry_fit`. These describe the texture-level selection, including textures that contain raw mip levels. See the [source notices](../third_party/ttpf-export/README.md) and [profile provenance](../tools/bcpack_profiles/xbox-1.0.2.1/README.md).
+
+The optional Python reference workflow uses the following commands.
+
 ```powershell
 python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --allow-provisional --history "$out/history.json" --tools-path "$out/Leonida/tools"
 ```

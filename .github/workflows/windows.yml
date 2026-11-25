@@ -150,6 +150,10 @@ jobs:
           cache-dependency-path: 'requirements-dev.txt'
       - name: Install fixture dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: Build the standalone DDS exporter for the batch tests
+        run: |
+          cargo build --release --locked --manifest-path third_party/ttpf-export/tools/bcpack_dds/Cargo.toml --target-dir out/bcpack-dds
+          echo "TTPF_RUST_EXPORTER=$PWD/out/bcpack-dds/release/bcpack_dds" >> "$GITHUB_ENV"
       - name: Run Python checks
         run: |
           python -B tools/run_checks_parallel.py \

@@ -60,6 +60,27 @@ def make_synthetic_ttpf_archive() -> bytearray:
     return archive
 
 
+def synthetic_bc4_pool():
+    """Two 4x4 BC4 textures with identical packed data and different synthetic keys."""
+    # Twelve 512-symbol lanes encoded with rANS model 15. All symbols are zero
+    # except lane 0, symbol 0 = 2 (distance one, predictor slot 255).
+    # Selector rank zero selects endpoint 1 for all sixteen visible pixels.
+    packed = bytes.fromhex(
+        "1f1f1f1f1f1f1f1f0502020202020202070707070101010160676767a5a5a5a5"
+        "ffecececdfdfdfdf021f1f1f1f8402020202ff01010101a5a5a5a5dfdfdfdf"
+    )
+    archive = make_synthetic_ttpf_archive()[:4352]
+    struct.pack_into("<QQ", archive, 304, 17, 34)
+    for i in range(2):
+        word = (4 << 23) | (1 << 21) | (80 << 3) | 1
+        struct.pack_into("<I", archive, 276 + i * 16, word)
+        chunk = ((i + 1) << 30) | (4 << 26) | (17 + i) | ((256 - len(packed)) << 52)
+        struct.pack_into("<Q", archive, 24 + i * 8, chunk)
+        archive.extend(packed.ljust(256, bytes(1)))
+    struct.pack_into("<Q", archive, 40, (3 << 30) | 19)
+    return archive
+
+
 def decode_bc1_block(block: bytes) -> bytes:
     """Decode an 8-byte BC1 block into 64 bytes of RGBA8 pixels."""
     c0, c1, bits = struct.unpack("<HHI", block)
@@ -422,6 +443,69 @@ class BatchExportTests(unittest.TestCase):
                 self.assertNotIn("sha256", failed_entry)
             finally:
                 batch.load_tools = orig_load
+
+    @unittest.skipUnless(os.environ.get("TTPF_RUST_EXPORTER"), "set TTPF_RUST_EXPORTER to the built CLI")
+    def test_rust_exporter_selection_and_failure_preserve_dds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "synthetic.ttpf"
+            archive = make_synthetic_ttpf_archive()
+            source.write_bytes(archive)
+            out = root / "dds"
+            manifest = root / "custom-manifest.json"
+            exporter = Path(os.environ["TTPF_RUST_EXPORTER"])
+            with patch.object(batch, "load_tools", side_effect=AssertionError("loaded Python decoder")):
+                summary = batch.batch_export(source, out, start=0, count=1, threads=2,
+                                             manifest_path=manifest, rust_exporter=exporter)
+                (row,) = json.loads(manifest.read_bytes())
+                self.assertEqual(summary["stats"]["strict"], 1)
+                self.assertEqual(row["index"], 0)
+                self.assertEqual(row["recipe"], "strict")
+                prev = (out / row["file"]).read_bytes()
+                self.assertEqual(row["sha256"], hashlib.sha256(prev).hexdigest())
+                self.assertEqual(decode_bc1_block(prev[148:]), bytes([255, 0, 0, 255] * 16))
+                self.assertFalse((out / "manifest.json").exists())
+                self.assertFalse((out / "tex_00001.dds").exists())
+
+                source.write_bytes(archive[:24])
+                with self.assertRaises(RuntimeError):
+                    batch.batch_export(source, out, indices=[0], rust_exporter=exporter)
+                self.assertEqual((out / row["file"]).read_bytes(), prev)
+                self.assertFalse((out / "manifest.json").exists())
+
+    @unittest.skipUnless(os.environ.get("TTPF_RUST_EXPORTER"), "set TTPF_RUST_EXPORTER to the built CLI")
+    def test_bc4_cli_profile_and_asset_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pair.ttpf"
+            pool.write_bytes(synthetic_bc4_pool())
+            out = root / "dds"
+            args = [sys.executable, "-IB", str(ROOT / "tools/ttpf_batch_export.py"), str(pool),
+                    "-o", str(out), "--rust-exporter", os.environ["TTPF_RUST_EXPORTER"]]
+            subprocess.run(args, check=True, capture_output=True)
+            rows = json.loads((out / "manifest.json").read_bytes())
+            self.assertEqual([row["status"] for row in rows], ["failed", "failed"])
+            for row in rows:
+                self.assertIn("255", row["reason"])
+                self.assertNotIn("file", row)
+
+            profile = {"version": 1, "bc4": {"base": {"255": [80, 40]}}}
+            fits = {"0000000000000011": {"bc4Endpoints": {"255": [90, 60]}}}
+            (root / "calibration-v1.json").write_text(json.dumps(profile), encoding="utf-8")
+            (root / "entry-fits.json").write_text(json.dumps(fits), encoding="utf-8")
+            subprocess.run(args + ["--profile-dir", str(root)], check=True, capture_output=True)
+            rows = json.loads((out / "manifest.json").read_bytes())
+            self.assertEqual([row["recipe"] for row in rows], ["entry_fit", "shared_profile"])
+            for row, expected in zip(rows, (60, 40)):
+                self.assertEqual(row["mode"], "fitted")
+                data = (out / row["file"]).read_bytes()
+                self.assertEqual(hashlib.sha256(data).hexdigest(), row["sha256"])
+                self.assertEqual(len(data), 156)
+                self.assertEqual(struct.unpack_from("<I", data, 128)[0], 80)
+                # A selector of 1 chooses the second endpoint in either BC4 palette.
+                selectors = int.from_bytes(data[150:], "little")
+                self.assertEqual([(selectors >> (3 * j)) & 7 for j in range(16)], [1] * 16)
+                self.assertEqual(data[149], expected)
 
     def test_real_exporter_dds_and_pixel_verification(self):
         """Verify real pinned exporter with generated synthetic TTPF input and independent pixel decoding."""

@@ -15,7 +15,9 @@ import importlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import time
 
 FORMAT_NAMES = {
@@ -244,8 +246,49 @@ def batch_export(pool_path: Path, out_dir: Path,
                  manifest_path: Path | None = None,
                  tools_path: Path | None = None,
                  require_rust: bool = False,
-                 calibration_path: Path | None = None) -> dict:
+                 calibration_path: Path | None = None,
+                 rust_exporter: Path | None = None,
+                 xbox_profile: bool = False,
+                 profile_dir: Path | None = None) -> dict:
     """Run batch export over a range of texture pool indices and write manifest.json."""
+    if xbox_profile or profile_dir is not None:
+        if calibration_path is not None or (xbox_profile and profile_dir is not None):
+            raise ValueError("Choose one of --profile-dir, --xbox-1.0.2.1 and --calibration")
+        if profile_dir is None:
+            profile_dir = Path(__file__).with_name("bcpack_profiles") / "xbox-1.0.2.1"
+        if rust_exporter is None:
+            name = "bcpack_dds.exe" if os.name == "nt" else "bcpack_dds"
+            rust_exporter = Path(__file__).resolve().parents[1] / "out/bcpack-dds/release" / name
+            if not rust_exporter.is_file():
+                raise ValueError("Build the exporter with cargo build --locked --release "
+                                 "--manifest-path third_party/ttpf-export/tools/bcpack_dds/Cargo.toml "
+                                 "--target-dir out/bcpack-dds")
+    if rust_exporter is not None:
+        if allow_provisional or history_path is not None:
+            raise ValueError("--rust-exporter accepts --calibration for fitted export")
+        if require_rust:
+            raise ValueError("--require-rust checks the Python backend's library. Choose --rust-exporter separately.")
+        with tempfile.TemporaryDirectory(prefix="ttpf-selection-") as tmp:
+            selection = Path(tmp, "selection.json")
+            selection.write_text(json.dumps({"indices": indices, "start": max(0, start),
+                                             "prefer_fitted": profile_dir is not None,
+                                             "count": None if count is None else max(0, count)}),
+                                 encoding="utf-8")
+            command = [str(rust_exporter.resolve()), str(pool_path), str(out_dir), "--jobs",
+                       str(max(1, min(threads, 256))), "--selection", str(selection)]
+            if profile_dir is not None:
+                calibration_path = (profile_dir / "calibration-v1.json").resolve(strict=True)
+                fits = (profile_dir / "entry-fits.json").resolve(strict=True)
+                command += ["--entry-fits", str(fits)]
+            if manifest_path is not None:
+                command += ["--manifest", str(manifest_path)]
+            if calibration_path is not None:
+                command += ["--calibration", str(calibration_path)]
+            result = subprocess.run(command, capture_output=True, encoding="utf-8")
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or f"Rust exporter exited {result.returncode}")
+            return json.loads(result.stdout)
+
     ttpf = load_tools(tools_path)
     if ttpf is None:
         raise RuntimeError("Could not find ttpf_mips module. Provide --tools-path or set TTPF_TOOLS_DIR.")
@@ -365,8 +408,14 @@ def main():
                         help="Path to directory containing ttpf_mips.py and bcpack.py")
     parser.add_argument("--require-rust", action="store_true",
                         help="Require the optional Rust BCPack library to load before exporting")
+    parser.add_argument("--rust-exporter", type=Path,
+                        help="Delegate the complete batch to the Leonida bcpack_dds executable")
     parser.add_argument("--calibration", type=Path,
                         help="Retry strict failures with a local version-1 Leonida calibration profile")
+    parser.add_argument("--xbox-1.0.2.1", dest="xbox_profile", action="store_true",
+                        help="Use the bundled Xbox 1.0.2.1 predictors and per-asset fits with the Rust exporter")
+    parser.add_argument("--profile-dir", type=Path,
+                        help="Directory containing calibration-v1.json and entry-fits.json for fitted export")
     args = parser.parse_args()
 
     if not args.pool.exists():
@@ -391,6 +440,9 @@ def main():
             tools_path=args.tools_path,
             require_rust=args.require_rust,
             calibration_path=args.calibration,
+            rust_exporter=args.rust_exporter,
+            xbox_profile=args.xbox_profile,
+            profile_dir=args.profile_dir,
         )
     except (RuntimeError, OSError, ValueError) as exc:
         parser.error(str(exc))
