@@ -134,8 +134,26 @@ const PipelineInfo* pipeline_info(const Wrapper* w)
 void note_root_blob(Wrapper* w, const void* blob, std::size_t bytes)
 {
     if (!blob || !bytes || bytes > (1u << 20)) return;
+    std::vector<unsigned char> copy(static_cast<const unsigned char*>(blob), static_cast<const unsigned char*>(blob) + bytes);
+    // The blob the d3d12_xs serializer returned after removing the title's heap-indexing flags (see
+    // serialize_for_runtime in src/d3d12_xs_shim.cpp): the copy kept for shader translation gets that
+    // call's bits back, because the title's shaders take the heap pointers in the registers they add.
+    if (const std::uint32_t stripped = x2w_stripped_root_flags(blob, bytes); stripped && bytes >= 32 && !std::memcmp(copy.data(), "DXBC", 4)) {
+        std::uint32_t parts = 0;
+        std::memcpy(&parts, copy.data() + 28, 4);
+        for (std::uint32_t i = 0; i < parts && 32 + 4 * (i + 1) <= bytes; ++i) {
+            std::uint32_t at = 0;
+            std::memcpy(&at, copy.data() + 32 + 4 * i, 4);
+            if (std::size_t{at} + 8 + 24 <= bytes && !std::memcmp(copy.data() + at, "RTS0", 4)) {
+                std::uint32_t flags = 0;
+                std::memcpy(&flags, copy.data() + at + 8 + 20, 4);
+                flags |= stripped;
+                std::memcpy(copy.data() + at + 8 + 20, &flags, 4);
+            }
+        }
+    }
     AcquireSRWLockExclusive(&note_lock);
-    root_blobs()[w].assign(static_cast<const unsigned char*>(blob), static_cast<const unsigned char*>(blob) + bytes);
+    root_blobs()[w] = std::move(copy);
     ReleaseSRWLockExclusive(&note_lock);
 }
 // This index only lists active slot-133 wrappers. The existing resource record
@@ -176,7 +194,7 @@ void retire_placement(Wrapper* w)
     ReleaseSRWLockExclusive(&note_lock);
 }
 
-PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes)
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false)
 {
     PlacedVertexView result{};
     if (!start || !bytes) return result;
@@ -189,7 +207,8 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
         for (auto it = group.by_start.lower_bound(earliest); it != group.by_start.end() && it->first < end; ++it) {
             const auto* owner = it->second;
             const auto& info = resource_infos().at(owner);
-            if (info.placement_device != device) continue;
+            if (info.placement_device != device || (aliases_only && info.placement != Placement::aliased_buffer))
+                continue;
             const u64 base = it->first;
             if (base <= start && start - base >= info.bytes) continue;
             if (result.owner || start < base || bytes > info.bytes - (start - base)) {

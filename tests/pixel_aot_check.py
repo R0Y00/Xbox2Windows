@@ -345,6 +345,15 @@ def expect_unbound_operand(function, program, bank, register, index, offset, ins
         raise AssertionError(f"An unbound {register} was accepted")
 
 
+# draw-core-vulkan sets this to the extra DXC arguments that make compile_shader emit SPIR-V for Vulkan 1.2
+# instead of DXIL. The bindings follow tests/vk_pixel_draw.c: b0 to b2 at 0 to 2, t0 and t1 at 16 and 17, s0 at 32.
+# It stays None for every other mode, and compile_shader then builds exactly the DXIL command it always built.
+SPIRV_ARGS = None
+SPIRV_TARGET_ARGS = ["-spirv", "-fspv-target-env=vulkan1.2", "-fvk-use-dx-layout",
+                     "-fvk-b-shift", "0", "0", "-fvk-t-shift", "16", "0",
+                     "-fvk-s-shift", "32", "0", "-fvk-u-shift", "48", "0"]
+
+
 def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MODE, ieee=True):
     """Run DXC on one translated shader under an explicit binary32 denormal mode."""
     # DXC accepts -denorm only at shader model 6.2 and above; ps_6_2 is the minimum target.
@@ -352,8 +361,12 @@ def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MO
                "-T", "ps_6_2", "-E", "main", "-Fo", shader]
     if listing is not None:
         command += ["-Fc", listing]
+    if SPIRV_ARGS is not None:
+        command += SPIRV_ARGS
     command.append(source)
     subprocess.run(command, check=True)
+    if SPIRV_ARGS is not None:
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", shader], check=True)
 
 
 def flush_ftz(value):
@@ -821,6 +834,7 @@ WAVE32_LINES = (
     (r"s_mov_b64 s\[50:51\], exec", "s_mov_b32 s50, exec_lo"),
     (r"s_wqm_b64 exec, exec", "s_wqm_b32 exec_lo, exec_lo"),
     (r"s_and_b64 exec, exec, s\[50:51\]", "s_and_b32 exec_lo, exec_lo, s50"),
+    (r"s_mov_b64 s\[(\d+):\d+\], exec", r"s_mov_b32 s\1, exec_lo"),
     (r"s_and_saveexec_b64 s\[(\d+):\d+\], vcc", r"s_and_saveexec_b32 s\1, vcc_lo"),
     (r"s_or_b64 exec, exec, s\[(\d+):\d+\]", r"s_or_b32 exec_lo, exec_lo, s\1"),
     (r"s_mov_b64 exec, s\[(\d+):\d+\]", r"s_mov_b32 exec_lo, s\1"),
@@ -848,31 +862,66 @@ def translate_w64(program):
     return lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=64)
 
 
+def translate_w32_int(program):
+    """translate_int() under the wave32 profile."""
+    return lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True, wave_size=32)
+
+
+def translate_w32_f64(program):
+    """translate_f64() under the wave32 profile."""
+    return lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                 half_denorm="preserve", wave_size=32)
+
+
 def wave32_region_families():
-    """(family, wave64 program) for every saveexec region shape the region controls lower."""
-    yield from (("plain", build(restore)) for build in (masked_region, masked_complementary, masked_skip)
+    """(family, wave64 program, wave64 lowering, wave32 lowering) for every region shape the region controls lower:
+    the s_and_saveexec opener and the v_cmpx opener after its exec save."""
+    pair = (translate, translate_w32)
+    yield from (("plain", build(restore), *pair) for build in (masked_region, masked_complementary, masked_skip)
                 for restore in (MASKED_OR_RESTORE, MASKED_MOV_RESTORE))
-    yield from (("else", else_region("saveexec", restore, skips))
-                for restore in (MASKED_MOV_RESTORE, MASKED_OR_RESTORE) for skips in ELSE_SKIPS)
-    yield from (("scalar-alu", region_scalar_alu_program(opener="saveexec", skip=skip)) for skip in (False, True))
-    yield from (("wait", region_wait_program((form,), "saveexec", skip)) for form in REGION_WAIT_FORMS
-                for skip in (False, True))
-    yield from (("scalar-load", region_load_program(REGION_LOAD_INSIDE, "saveexec", skip)) for skip in (False, True))
-    yield from (("body", region_body_program(body, approximate, "saveexec"))
-                for _, body, _, approximate in REGION_BODY_FORMS)
+    for opener in ("saveexec", "cmpx"):
+        yield from (("else", else_region(opener, restore, skips), *pair)
+                    for restore in (MASKED_MOV_RESTORE, MASKED_OR_RESTORE) for skips in ELSE_SKIPS)
+        yield from (("scalar-alu", region_scalar_alu_program(opener=opener, skip=skip), *pair) for skip in (False, True))
+        yield from (("wait", region_wait_program((form,), opener, skip), *pair) for form in REGION_WAIT_FORMS
+                    for skip in (False, True))
+        yield from (("scalar-load", region_load_program(REGION_LOAD_INSIDE, opener, skip), *pair)
+                    for skip in (False, True))
+        yield from (("body", region_body_program(body, approximate, opener), *pair)
+                    for _, body, _, approximate in REGION_BODY_FORMS)
+    # The v_cmpx fixtures of check_cmpx_controls and the binary round trip, with their own export profiles.
+    yield from (("cmpx", program, *pair) for program in (
+        cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_skip(), cmpx_observables(), cmpx_class_region(),
+        cmpx_class_region(CMPX_OR_RESTORE),
+        *(cmpx_predicate_group(kind, first, encoding) for kind, first in CMPX_PREDICATE_GROUPS
+          for encoding in ("e32", "e64")),
+        *(cmpx_class_group(kind=kind, encoding=encoding) for kind in ("f32", "f16") for encoding in ("e32", "e64"))))
+    yield from (("cmpx", cmpx64_group(kind, group, encoding), translate_int, translate_w32_int)
+                for kind in ("i64", "u64") for group in (0, 1) for encoding in ("e32", "e64"))
+    yield from (("cmpx", cmpxf64_group(group, encoding), translate_f64, translate_w32_f64)
+                for encoding, group in CMPF64_GROUPS)
+
+
+def wave32_save(program):
+    """Whether program holds a wave32 region save: s_and_saveexec_b32, or s_mov_b32 of exec_lo before a v_cmpx."""
+    lines = [line[1] if isinstance(line, tuple) else line for line in program]
+    return any(line.startswith("s_and_saveexec_b32 ") for line in lines) or any(
+        re.fullmatch(r"s_mov_b32 s\d+, exec_lo", line) and following.startswith("v_cmpx_")
+        for line, following in zip(lines, lines[1:]))
 
 
 def check_wave32_region_controls():
     """The wave32 masked region lowers exactly like its wave64 twin, only under the wave32 profile."""
     families = set()
-    for family, program in wave32_region_families():
+    for family, program, wave64_lower, wave32_lower in wave32_region_families():
         families.add(family)
         wave32 = to_wave32(program)
-        assert wave32 != program and any("s_and_saveexec_b32" in str(line) for line in wave32), family
-        assert translate_w32(wave32) == translate(program), (family, program)
-        for refuse in (translate, translate_w64):
+        assert wave32 != program and wave32_save(wave32), family
+        assert wave32_lower(wave32) == wave64_lower(program), (family, program)
+        for refuse in {wave64_lower, translate_w64}:
             expect_value_error(refuse, wave32, "32-bit execution mask save requires a validated wave32 guest profile")
-    assert families == {"plain", "else", "scalar-alu", "wait", "scalar-load", "body"}, families
+    assert families == {"plain", "else", "scalar-alu", "wait", "scalar-load", "body", "cmpx"}, families
+    check_wave32_cmpx_refusals()
     region = to_wave32(masked_region(MASKED_MOV_RESTORE))
     opener, close = "s_and_saveexec_b32 s60, vcc_lo", "s_mov_b32 exec_lo, s60"
     at = region.index(close)
@@ -956,6 +1005,44 @@ def check_wave32_region_controls():
         translate_w32(to_wave32(uncompressed_export([*masked_region_body(restore), "s_cmp_eq_u32 s44, s45",
                                                      "s_cmov_b64 s[44:45], s[46:47]"])))
 
+
+
+def check_wave32_cmpx_refusals():
+    """The wave32 v_cmpx opener: its save must be exec_lo of the entry mask, directly before it, in one free SGPR."""
+    region = to_wave32(cmpx_region())
+    save, close = "s_mov_b32 s60, exec_lo", "s_mov_b32 exec_lo, s60"
+    compare = region.index(CMPX_COMPARE)
+    assert region[compare - 1] == save
+    at = region.index(close)
+
+    def changed(index, *lines, drop=0):
+        return region[:index] + list(lines) + region[index + drop:]
+    # The save must directly precede the v_cmpx, hold the entry mask (not a whole-quad mask) and name exec_lo.
+    for program in (changed(compare, "v_mov_b32_e32 v15, s47"), changed(compare - 1, "s_wqm_b32 exec_lo, exec_lo"),
+                    changed(compare - 1, "s_mov_b32 s60, exec", drop=1)):
+        expect_value_error(translate_w32, program, "Unsupported v_cmpx execution mask save")
+    # The save register may not be pending, and the compare may not read it.
+    expect_value_error(translate_w32, to_wave32(region_load_program(
+        REGION_LOAD_INSIDE, "cmpx", before=("s_buffer_load_dword s60, s[68:71], 0x2c",))),
+        "Write overlaps an outstanding scalar load")
+    reads = [line.replace("s60", "s44") if line in (save, close) else line for line in region]
+    expect_value_error(translate_w32, reads, "Expected a numeric register")
+    # The close names the saved SGPR, and each region accepts only the spellings of its width.
+    expect_value_error(translate_w32, changed(at, "s_mov_b32 exec_lo, s58", drop=1), "Unexpected execution mask restore")
+    for line in (CMPX_MOV_RESTORE, CMPX_OR_RESTORE, "s_andn2_b64 exec, s[60:61], exec"):
+        expect_value_error(translate_w32, changed(at, line), f"Instruction cannot run in a masked region: {line}")
+    wave64 = cmpx_region()
+    for line in (close, "s_or_b32 exec_lo, exec_lo, s60", "s_andn2_b32 exec_lo, s60, exec_lo"):
+        expect_value_error(translate_w32, wave64[:wave64.index(CMPX_MOV_RESTORE)] + [line]
+                           + wave64[wave64.index(CMPX_MOV_RESTORE):],
+                           f"Instruction cannot run in a masked region: {line}")
+    # Inside the region the saved SGPR may not be rewritten by a scalar load or ALU; s61 is an ordinary register.
+    expect_value_error(translate_w32, to_wave32(region_load_program(
+        ("s_buffer_load_dword s60, s[68:71], 0x20", "s_waitcnt lgkmcnt(0)"), "cmpx")),
+        "Masked scalar load overwrites the saved execution pair")
+    expect_value_error(translate_w32, changed(at, "s_mov_b32 s60, 0"),
+                       "Masked scalar ALU overwrites the saved execution pair")
+    translate_w32(changed(at, "s_mov_b32 s61, 0"))
 
 # Uniform skips (issue #1413): a forward s_cbranch_scc0/scc1 on a tracked scalar compare jumps over a block of
 # vector ALU. The flag in constant word 6 (s47) decides per draw whether the block runs. The block writes v13 and
@@ -1610,8 +1697,11 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
     shader = directory / "cmpx.cso"
     constants = bytearray(256)
     # Mixed (0.5), full (10) and empty (-1) masks through each restore and the skip.
-    for label, program in (("mov", cmpx_region()), ("or", cmpx_region(CMPX_OR_RESTORE)), ("skip", cmpx_skip())):
-        source.write_text(translate(program), encoding="ascii")
+    for label, program in (("mov", cmpx_region()), ("or", cmpx_region(CMPX_OR_RESTORE)), ("skip", cmpx_skip()),
+                           # The same regions as wave32 twins (s_mov_b32 of exec_lo), which lower to the same HLSL.
+                           ("mov-w32", to_wave32(cmpx_region())), ("or-w32", to_wave32(cmpx_region(CMPX_OR_RESTORE))),
+                           ("skip-w32", to_wave32(cmpx_skip()))):
+        source.write_text(translate_w32(program) if label.endswith("-w32") else translate(program), encoding="ascii")
         compile_shader(compiler, source, shader)
         cases = []
         for threshold in (0.5, 10.0, -1.0):
@@ -1623,16 +1713,19 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
     struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
     expected = masked_pixels(0.5, (0.25, 0.75), False)
     unmasked = [line for line in cmpx_region() if line not in (CMPX_SAVE, CMPX_COMPARE, CMPX_MOV_RESTORE)]
-    for label, mutant in (("reversed", cmpx_region(compare="v_cmpx_le_f32_e32 s44, v12")), ("unmasked", unmasked)):
-        source.write_text(translate(mutant), encoding="ascii")
+    for label, mutant in (("reversed", cmpx_region(compare="v_cmpx_le_f32_e32 s44, v12")), ("unmasked", unmasked),
+                          ("reversed-w32", to_wave32(cmpx_region(compare="v_cmpx_le_f32_e32 s44, v12")))):
+        source.write_text(translate_w32(mutant) if label.endswith("-w32") else translate(mutant), encoding="ascii")
         compile_shader(compiler, source, shader)
         case = directory / f"cmpx-{label}.case"
         write_case(case, constants, expected)
         run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
     # v_cmpx_class_f32 openers: the +normal class of s44 - sample.x on mixed, full and empty masks through both
     # restores. The -normal mask (the reversed region) and a mask-free body must mismatch on the mixed mask.
-    for label, program in (("class-mov", cmpx_class_region()), ("class-or", cmpx_class_region(CMPX_OR_RESTORE))):
-        source.write_text(translate(program), encoding="ascii")
+    for label, program in (("class-mov", cmpx_class_region()), ("class-or", cmpx_class_region(CMPX_OR_RESTORE)),
+                           ("class-mov-w32", to_wave32(cmpx_class_region())),
+                           ("class-or-w32", to_wave32(cmpx_class_region(CMPX_OR_RESTORE)))):
+        source.write_text(translate_w32(program) if label.endswith("-w32") else translate(program), encoding="ascii")
         compile_shader(compiler, source, shader)
         cases = []
         for threshold in (0.5, 10.0, -1.0):
@@ -1645,8 +1738,9 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
     class_unmasked = [line for line in cmpx_class_region() if line not in (CMPX_SAVE, CMPX_CLASS_COMPARE,
                                                                            CMPX_MOV_RESTORE)]
     for label, mutant in (("class-negative-normal", cmpx_class_region(classes=0x8)),
-                          ("class-unmasked", class_unmasked)):
-        source.write_text(translate(mutant), encoding="ascii")
+                          ("class-unmasked", class_unmasked),
+                          ("class-negative-normal-w32", to_wave32(cmpx_class_region(classes=0x8)))):
+        source.write_text(translate_w32(mutant) if label.endswith("-w32") else translate(mutant), encoding="ascii")
         compile_shader(compiler, source, shader)
         case = directory / f"cmpx-{label}.case"
         write_case(case, constants, expected)
@@ -19106,6 +19200,9 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((cmpx64_group(kind, group, encoding), translate_int) for kind in ("i64", "u64") for group in (0, 1)
                     for encoding in ("e32", "e64"))
     fixtures.append((cmpx_skip_asm(), translate, "gfx1013", "", cmpx_skip()))
+    fixtures.extend((to_wave32(cmpx_region(restore)), translate_w32, "gfx1013", W32_FEATURES)
+                    for restore in (CMPX_MOV_RESTORE, CMPX_OR_RESTORE))
+    fixtures.append((to_wave32(cmpx_skip_asm()), translate_w32, "gfx1013", W32_FEATURES, to_wave32(cmpx_skip())))
     fixtures.extend((program, translate) for program in (cmpx_class_region(), cmpx_class_region(CMPX_OR_RESTORE),
                                                          cmpx_class_group()))
     fixtures.extend((cmpxf64_group(group, encoding), translate_f64) for encoding, group in CMPF64_GROUPS)
@@ -21425,6 +21522,11 @@ def check_cvt_flr_rpi_draw(directory, compiler, renderer, backend):
     # Runtime sources: s44 and s45 come from the constant buffer, so DXC cannot fold the conversion.
     words = [word for word, _, _ in CVT_FLR_RPI_EXCEPTIONAL]
     pairs = list(zip(words[0::2], words[1::2]))
+    pairs += [
+        (0x007fffff, 0x807fffff),  # largest positive and negative subnormals
+        (0x00000000, 0x80000000),  # both signed zeros
+        (0x00800000, 0x80800000),  # smallest positive and negative normals
+    ]
     for tag, e64 in (("e32", False), ("e64", True)):
         body = cvt_flr_rpi_pair_body(0, 0, e64=e64)[2:]
         assert not any(line.startswith("s_mov_b32") for line in body)
@@ -21442,14 +21544,20 @@ def check_cvt_flr_rpi_draw(directory, compiler, renderer, backend):
                                  (0x7fffffff, 0x7fffffff, 0x80000000, 0x80000000))
     inf_case = make_runtime_case("runtime_inf_ref", (0x7f800000, 0x4f000001, 0, 0), (0x7fffffff,) * 4)
 
-    # Helper mutants on the runtime e32 shader: each must fail on the NaN or the +inf case.
+    subnormal_case = make_runtime_case("runtime_largest_subnormal_ref", (0x007fffff, 0x807fffff, 0, 0),
+                                       (0, 0, 0xffffffff, 0))
+
+    # Helper mutants on the runtime e32 shader must fail their respective case.
     runtime_hlsl = translate_int(uncompressed_export(cvt_flr_rpi_pair_body(0, 0, e64=False)[2:]))
-    for label, old, new, case in (
-        ("drop the NaN sign select", "return nan ? 0x7fffffffu + (bits >> 31) : word;", "return word;", nan_case),
-        ("reverse the NaN sign select", "0x7fffffffu + (bits >> 31)", "0x80000000u - (bits >> 31)", nan_case),
-        ("drop the 2^31 saturation", "x >= 2147483648.0f ? 0x7fffffffu : ", "", inf_case),
+    negative_subnormal = "if (bits > 0x80000000u && bits < 0x80800000u) return "
+    for label, old, new, count, case in (
+        ("drop the NaN sign select", "return nan ? 0x7fffffffu + (bits >> 31) : word;", "return word;", 2, nan_case),
+        ("reverse the NaN sign select", "0x7fffffffu + (bits >> 31)", "0x80000000u - (bits >> 31)", 2, nan_case),
+        ("drop the 2^31 saturation", "x >= 2147483648.0f ? 0x7fffffffu : ", "", 2, inf_case),
+        # Force the GPU-flush result even on hardware that preserves subnormals.
+        ("flush negative subnormals", negative_subnormal + "0xffffffffu;", negative_subnormal + "0u;", 1, subnormal_case),
     ):
-        assert runtime_hlsl.count(old) == 2, label
+        assert runtime_hlsl.count(old) == count, label
         source.write_text(runtime_hlsl.replace(old, new), encoding="ascii")
         compile_shader(compiler, source, shader)
         wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)
@@ -23647,6 +23755,48 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     return check_blend_and_scalar_draws(directory, compiler, renderer, backend)
 
 
+def check_render_vulkan(directory, compiler, device, *options):
+    """draw-core on a Vulkan device: SPIR-V from the same DXC options, drawn through tests/vk_offscreen.py.
+
+    The renderer is the Python interpreter and the backend is the adapter, so check_render and its negative
+    controls run unchanged. A device without shaderDenormPreserveFloat32 is a capability skip (77), because
+    every program here is compiled with -denorm preserve; --allow-denorm-mismatch draws anyway for a diagnostic run.
+    """
+    global SPIRV_ARGS
+    if set(options) - {"--allow-denorm-mismatch"}:
+        raise SystemExit("usage: pixel_aot_check.py draw-core-vulkan <dxc> <device> [--allow-denorm-mismatch]")
+    tests = Path(__file__).resolve().parent
+    out = tests.parent / "out"
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="vk-core-", dir=out) as work_name:
+        work = Path(work_name)
+        host = work / "vk_pixel_draw"
+        subprocess.run(["cc", "-std=c11", "-O1", "-o", host, tests / "vk_pixel_draw.c", "-lvulkan"], check=True)
+        vertex = work / "pixel_aot_vs.spv"
+        subprocess.run([compiler, *SPIRV_TARGET_ARGS, "-fvk-invert-y", "-T", "vs_6_2", "-E", "main",
+                        "-Fo", vertex, tests / "pixel_aot_vs.hlsl"], check=True)
+        caps = subprocess.run([host, "--caps", device], capture_output=True, text=True)
+        if caps.returncode:
+            sys.stderr.write(caps.stderr)
+            return caps.returncode
+        print(caps.stdout.strip())
+        environment = {"X2W_VK_HOST": str(host), "X2W_VK_VS": str(vertex), "X2W_VK_DEVICE": device,
+                       "X2W_VK_WORK": str(work),
+                       "X2W_VK_ALLOW_NO_DENORM": "1" if "--allow-denorm-mismatch" in options else "0"}
+        SPIRV_ARGS = SPIRV_TARGET_ARGS
+        try:
+            with patch.dict(os.environ, environment):
+                try:
+                    return check_render(directory, compiler, sys.executable, str(tests / "vk_offscreen.py"),
+                                        core_only=True)
+                except subprocess.CalledProcessError as error:
+                    if error.returncode == 77 and str(error.cmd[0]) == sys.executable:
+                        return 77
+                    raise
+        finally:
+            SPIRV_ARGS = None
+
+
 def check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend):
     source = directory / "sopk_cmpk_cmovk.hlsl"
     shader = directory / "sopk_cmpk_cmovk.cso"
@@ -25350,6 +25500,8 @@ def main():
                 return check_bit_draws(directory, *args)
             elif mode in ("draw", "draw-core"):
                 return check_render(directory, *args, core_only=mode == "draw-core")
+            elif mode == "draw-core-vulkan":
+                return check_render_vulkan(directory, *args)
             elif mode == "three-way":
                 return check_three_way_draw(directory, *args)
             elif mode == "buffer-color":
