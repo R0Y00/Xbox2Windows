@@ -25,6 +25,7 @@ constexpr long hr_ok = 0;
 constexpr long hr_pointer = static_cast<long>(0x80004003);
 constexpr long hr_handle = static_cast<long>(0x80070006);
 constexpr long hr_out_of_memory = static_cast<long>(0x8007000E);
+constexpr long hr_invalid_arg = static_cast<long>(0x80070057);
 constexpr long hr_pending_results = static_cast<long>(0x8AC81001);
 constexpr DWORD trap_connect_exit = 0xE2570300u;
 constexpr std::size_t result_bytes = 0x58;
@@ -139,6 +140,7 @@ int main(int argc, char** argv)
     check_non_permissive_trap(argv[0], dll_path);
 
     SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", "1");
+    SetEnvironmentVariableA("X2W_XAPU_TYPED_COMPLETIONS", nullptr);
     HMODULE module = LoadLibraryA(dll_path);
     if (!module) return std::printf("FAIL: cannot load %s\n", dll_path), 2;
 
@@ -152,7 +154,14 @@ int main(int argc, char** argv)
         return std::printf("FAIL: missing export\n"), 2;
     }
 
-    const std::array<unsigned char, 0x18> input{};
+    // XApuConnect input as the observed caller passes it: the shared buffer size is the u32 at +0x0C.
+    constexpr std::uint32_t buffer_bytes = 0x104000;
+    const auto sized_input = [](std::uint32_t bytes) {
+        std::array<unsigned char, 0x18> in{};
+        std::memcpy(in.data() + 0x0C, &bytes, sizeof(bytes));
+        return in;
+    };
+    const auto input = sized_input(buffer_bytes);
     std::array<unsigned char, 0x10> output{};
     std::array<unsigned char, 0x60> cmd{};
     std::array<unsigned char, result_bytes> result{};
@@ -160,6 +169,18 @@ int main(int argc, char** argv)
 
     // Invalid-handle and null-pointer negative controls before any connection exists.
     check(connect(input.data(), output.data(), nullptr) == hr_pointer, "XApuConnect(null handle*) -> E_POINTER");
+    void* refused = nullptr;
+    check(connect(nullptr, output.data(), &refused) == hr_pointer && !refused, "XApuConnect(null input) -> E_POINTER");
+    check(connect(input.data(), nullptr, &refused) == hr_pointer && !refused, "XApuConnect(null output) -> E_POINTER");
+    for (std::uint32_t bad_size : {0u, (64u << 20) + 1}) {
+        const auto bad_input = sized_input(bad_size);
+        output.fill(0x5A);
+        check(connect(bad_input.data(), output.data(), &refused) == hr_invalid_arg && !refused,
+              "XApuConnect(buffer size 0 or over 64 MiB) -> E_INVALIDARG without a handle");
+        bool untouched = true;
+        for (unsigned char b : output) untouched &= b == 0x5A;
+        check(untouched, "refused XApuConnect leaves its output alone");
+    }
     check(get_count(nullptr, 0) == 0, "XApuGetResultCount(null) -> 0");
     check(get_count(bogus, 0) == 0, "XApuGetResultCount(bogus) -> 0");
     check(enqueue(nullptr, cmd.data(), 0, 0) == hr_handle, "XApuEnqueueCommand(null) -> E_HANDLE");
@@ -174,7 +195,22 @@ int main(int argc, char** argv)
     std::array<unsigned char, result_bytes> sentinel;
     sentinel.fill(0xA5);
     void* h1 = nullptr;
+    output.fill(0x5A);
+    std::memset(output.data(), 0, sizeof(void*));  // an unwritten pointer reads as null, not as the 0x5A fill
     check(connect(input.data(), output.data(), &h1) == hr_ok && h1 != nullptr, "XApuConnect h1 succeeds");
+    // The caller reads only output +0 and copies packets and samples into that buffer.
+    unsigned char* shared = nullptr;
+    std::memcpy(&shared, output.data(), sizeof(shared));
+    bool second_untouched = true;
+    for (std::size_t i = 8; i < output.size(); ++i) second_untouched &= output[i] == 0x5A;
+    check(shared != nullptr && second_untouched, "XApuConnect writes the shared buffer to output +0 and leaves +8 alone");
+    if (shared) {
+        bool zeroed = true;
+        for (std::uint32_t i = 0; i < buffer_bytes; ++i) zeroed &= shared[i] == 0;
+        check(zeroed, "shared buffer starts zeroed");
+        shared[0] = 1;
+        shared[buffer_bytes - 1] = 1;
+    }
     check(get_count(h1, 0) == 0, "initial XApuGetResultCount == 0");
     result = sentinel;
     check(dequeue(h1, result.data()) == hr_pending_results, "empty queue XApuDequeueResult -> XAPU_E_PENDING_RESULTS");
@@ -195,6 +231,18 @@ int main(int argc, char** argv)
     }
     check(get_count(h1, 0) == 0, "rejected command headers do not enqueue entries");
 
+    write_cmd(cmd, 1, 7);
+    check(enqueue(h1, cmd.data(), 0, 0) == hr_ok, "default: enqueue an open command with nonzero type and slot");
+    check(get_count(h1, 0) == 1, "default: open command enters the queue");
+    result = sentinel;
+    check(dequeue(h1, result.data()) == hr_ok && all_zero(result),
+          "default: retire the open command without publishing a typed completion");
+    check(get_count(h1, 0) == 0, "default: zeroed result still consumes the queued command");
+    result = sentinel;
+    check(dequeue(h1, result.data()) == hr_pending_results && result == sentinel,
+          "default: empty dequeue leaves its result untouched");
+
+    check(SetEnvironmentVariableA("X2W_XAPU_TYPED_COMPLETIONS", "1") != FALSE, "enable experimental typed completions");
     // Zero command yields all-zero 0x58-byte result; typed commands echo (+0x00 type, +0x04 slot) in FIFO order.
     write_cmd(cmd, 0, 0);
     check(enqueue(h1, cmd.data(), 0x11, 0x22) == hr_ok, "enqueue zero command on h1");
@@ -309,6 +357,9 @@ int main(int argc, char** argv)
     // Second independent handle + disconnect invalidation.
     void* h2 = nullptr;
     check(connect(input.data(), output.data(), &h2) == hr_ok && h2 != nullptr && h2 != h1, "XApuConnect h2 distinct");
+    unsigned char* shared2 = nullptr;
+    std::memcpy(&shared2, output.data(), sizeof(shared2));
+    check(shared2 != nullptr && shared2 != shared, "each connection gets its own shared buffer");
     write_cmd(cmd, 1, 11);
     check(enqueue(h1, cmd.data(), 0, 0) == hr_ok, "enqueue on h1 before disconnect");
     write_cmd(cmd, 3, 21);

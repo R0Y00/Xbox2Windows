@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include "resource_budget.h"
 
 namespace x2w_upload {
 using Microsoft::WRL::ComPtr;
@@ -25,6 +26,7 @@ inline HRESULT make_page(ID3D12Device* device, UINT64 bytes, Page& page) {
     HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&page.resource));
     if (FAILED(hr)) return hr;
+    x2w_budget::committed(device, page.resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
     D3D12_RANGE no_reads{};
     void* mapped = nullptr;
     hr = page.resource->Map(0, &no_reads, &mapped);

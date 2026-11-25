@@ -48,10 +48,10 @@ REQUIRED_IMPLEMENTED_FUNCTIONS = {
     "XTaskQueueCreate",
     "XTaskQueueDispatch",
     "XTaskQueueCloseHandle",
-}
-REQUIRED_STUBS = {
     "XPackageMountWithUiAsync",
+    "XPackageMountWithUiResult",
 }
+REQUIRED_STUBS = set()
 STATES = {"stub", "implemented_hr", "implemented_void", "implemented_value"}
 
 ROW_RE = re.compile(

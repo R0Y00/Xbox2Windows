@@ -32,7 +32,7 @@ The profile accepts:
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
-instruction outside the profile (including FLDCW, FNINIT, FBLD, FNSTSW with an operand other than AX or an m16, environment access, a
+instruction outside the profile (including FLDCW, FNINIT, FBLD, FNSTSW with an operand other than AX or an m16, FNSAVE, FLDENV, FRSTOR, a
 popping form with ST(0) as the destination, and the undocumented FSTP, FXCH, FCOM and FCOMP alias
 encodings), a stack overflow or underflow, a depth that differs where control flow joins, an x87
 instruction it cannot reach from the entry through direct edges, and x87 state that is live at a call, a
@@ -67,6 +67,15 @@ x87 (WAIT, FNSTCW, FNSTSW, a comparison and every other x87 instruction leave C0
 FPREM and FPREM1 may raise an exception flag). Anywhere else the translation is rejected with the unknown
 bits named, and the fixed profile rejects it. The stored word is x87_sw with TOP, which is 8 minus the
 depth, modulo 8, in bits 11 to 13; it is a guest store of two bytes like FNSTCW m16.
+
+FNSTENV and FNSAVE (the 28-byte and 108-byte 32-bit protected-mode layouts; the 16-bit operand-size forms are
+rejected) store the status word too, so they follow the FNSTSW m16 rule: only right after FNINIT, where the
+stack is empty and the word, the instruction and data pointers and the opcode are all clear. They store the
+control word, the status word 0, the tag word 0xFFFF and zero pointers; FNSAVE then stores ST(0) to ST(7), the
+profile's slots 7 to 0 (the SDM does not define the bytes of an empty register), and initializes as FNINIT does
+(control word 0x037F, status word clear), so only the checked entry accepts it and the function must restore
+0x027F before it returns. FSTENV and FSAVE are WAIT and the store; the WAIT leaves C0 to C3 undefined, as for
+FSTSW, so they are rejected with the unknown bits named. FINIT then FNSTENV is accepted.
 
 The checked entry, lower(..., x87=Checked(reject)), also accepts FLDCW m16. The control word becomes a
 local of the lowered function, and every rounding helper, FNSTCW and the constant loads follow it. FLDCW
@@ -119,7 +128,7 @@ X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FR
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM, M.FINCSTP,
                      M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP,
-                     M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT, M.FBLD, M.FBSTP, *LEGACY_CONTROLS, M.FFREEP, M.FFREE})
+                     M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT, M.FNSTENV, M.FNSAVE, M.FBLD, M.FBSTP, *LEGACY_CONTROLS, M.FFREEP, M.FFREE})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
 STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP})
 STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2}
@@ -148,13 +157,16 @@ CHECKED_DECLARATION = "X87Value x87_slot[8]{}; uint16_t x87_cw = 0x027f;"
 STATUS = {"unmasked": 1, "precision": 2, "unrestored": 3, "partial": 4, "nanremainder": 5, "bcddigit": 6}
 # The checked entry's partial remainders.
 REMAINDERS = frozenset({M.FPREM, M.FPREM1})
+# FNSTENV and FNSAVE store the 32-bit protected-mode environment (28 bytes: control word, status word, tag word,
+# instruction and data pointers); FNSAVE follows it with the eight registers (108 bytes) and then initializes.
+ENVIRONMENT = {M.FNSTENV: S.FPU_ENV28, M.FNSAVE: S.FPU_STATE108}
 
 
 def declaration(body, checked=None):
     """The x87 locals of a lowered function: the slots, the control word and, in a function that compares
     into the status word or stores it, the condition bits of the status word."""
     text = DECLARATION if checked is None else CHECKED_DECLARATION
-    if any(i.mnemonic in STATUS_WRITERS or i.mnemonic in REMAINDERS or i.mnemonic in (M.FNSTSW, M.FNINIT) for i in body):
+    if any(i.mnemonic in STATUS_WRITERS or i.mnemonic in REMAINDERS or i.mnemonic in (M.FNSTSW, M.FNINIT, *ENVIRONMENT) for i in body):
         text += " uint16_t x87_sw = 0; (void)x87_sw;"
     return text
 
@@ -248,6 +260,12 @@ def _effect(i, depth, checked=None, paired=False):
     if op in (M.FNSTCW, M.WAIT) or (op == M.FLDCW and checked is not None):  # no register stack access
         return depth
     if op == M.FNINIT and checked is not None:  # every register becomes empty
+        return 0
+    if op == M.FNSTENV or (op == M.FNSAVE and checked is not None):
+        if i.op0_kind != K.MEMORY or i.memory_size != ENVIRONMENT[op]:
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
+        if depth:  # the status word is known only after FNINIT, which leaves the stack empty (check_flags)
+            raise ValueError(f"{i} at {i.ip:#x} stores the tag word of a non-empty x87 stack")
         return 0
     if op in (M.FNOP, M.FNCLEX, M.FXAM, *LEGACY_CONTROLS):  # no register stack change; FXAM also classifies an empty ST(0)
         return depth
@@ -396,7 +414,7 @@ def depths(body, exits, checked=None):
     pairs = _discard_pairs(body)
     depth = {body[0].ip: 0}
     work = [body[0].ip]
-    loads_cw = checked is not None and any(i.mnemonic in (M.FLDCW, M.FNINIT) for i in body)
+    loads_cw = checked is not None and any(i.mnemonic in (M.FLDCW, M.FNINIT, M.FNSAVE) for i in body)
     while work:
         i = index[work.pop()]
         before = depth[i.ip]
@@ -439,7 +457,7 @@ def depths(body, exits, checked=None):
 
 # Instructions that put a function under the flag and status-word rules. SETP, SETNP, CMOVP and CMOVNP read PF as
 # JP and JNP do (ffx_version_query.PF_CONSUMERS).
-GATED = frozenset({*FCMOV, M.FNSTSW, M.SAHF, M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP})
+GATED = frozenset({*FCMOV, M.FNSTSW, *ENVIRONMENT, M.SAHF, M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP})
 
 
 # The six status flags. FCMOV reads ZF and CF; DF is not tracked, because the Windows x64 calling
@@ -570,7 +588,7 @@ def _after(i, s):
         ax |= _ax_access(i)[1]
     if op in STATUS_WRITERS:
         c = C_BITS
-    elif op == M.FNINIT:  # the whole status word is clear
+    elif op in (M.FNINIT, M.FNSAVE):  # the whole status word is clear
         c = STATUS_BITS
     elif op in REMAINDERS:  # quotient bits and C2 = 0; the exception flags may be raised
         c = C_BITS | C1_BIT
@@ -636,7 +654,8 @@ def check_flags(body, exits):
         if i.rflags_read & F.PF and not s.parity:
             raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF, "
                              "FCOMI, FCOMIP, FUCOMI, FUCOMIP and an 8-bit TEST or AND")
-        if i.mnemonic == M.FNSTSW and i.op0_kind == K.MEMORY and s.c & STATUS_BITS != STATUS_BITS:
+        if (i.mnemonic == M.FNSTSW or i.mnemonic in ENVIRONMENT) and i.op0_kind == K.MEMORY \
+                and s.c & STATUS_BITS != STATUS_BITS:
             raise ValueError(f"{i} at {i.ip:#x} stores status-word bits {_bits(STATUS_BITS & ~s.c)}, which are not "
                              "known on every path from the entry (only FNINIT leaves all of them known)")
         unknown = 0xFFFF & ~s.ax
@@ -655,6 +674,25 @@ def check_flags(body, exits):
             if target in exits:
                 raise ValueError(f"RAX holds unknown status-word bits {_bits(unknown)} at the external edge "
                                  f"{i.ip:#x} -> {target:#x}")
+
+
+def _environment(i, address, checked):
+    """FNSTENV and FNSAVE right after FNINIT: control word, status word 0, tag word 0xFFFF (every register empty)
+    and the instruction and data pointers and opcode, which FNINIT clears; the reserved halfwords read 0xFFFF. FNSAVE adds ST(0) to ST(7), which are
+    the slots 7 down to 0, and initializes as FNINIT does."""
+    word = "0x027f" if checked is None else "x87_cw"
+    # Native FNINIT; FNSTENV/FNSAVE write 0xffff in the reserved halfwords at 2, 6, 10 and 26 (measured on two hosts).
+    stores = [f"store<uint16_t>(a, {word});", "store<uint16_t>(a + 2, 0xffff);",
+              "store<uint16_t>(a + 4, 0);", "store<uint16_t>(a + 6, 0xffff);",
+              "store<uint16_t>(a + 8, 0xffff);", "store<uint16_t>(a + 10, 0xffff);"]
+    stores += [f"store<uint32_t>(a + {offset}, 0);" for offset in (12, 16, 20)]
+    stores += ["store<uint16_t>(a + 24, 0);", "store<uint16_t>(a + 26, 0xffff);"]
+    if i.mnemonic == M.FNSTENV:
+        return f"{{ const word a = {address()}; {' '.join(stores)} }}  // fnstenv"
+    for k in range(8):
+        stores.append(f"store<uint64_t>(a + {28 + 10 * k}, x87_slot[{7 - k}].sig); "
+                      f"store<uint16_t>(a + {36 + 10 * k}, x87_slot[{7 - k}].se);")
+    return f"{{ const word a = {address()}; {' '.join(stores)} }} x87_cw = 0x037f; x87_sw = 0;  // fnsave"
 
 
 def statement(i, depth, address, checked=None, parity=False, read="load", status_word=False):
@@ -682,6 +720,8 @@ def _statement(i, depth, address, checked, parity, status_word=False):
                 "x87_cw = static_cast<uint16_t>((w & 0x1f3f) | 0x40); }  // fldcw")
     if op == M.FNINIT:  # only the checked entry reaches this; the registers are empty from here on
         return "x87_cw = 0x037f; x87_sw = 0;  // fninit"
+    if op in ENVIRONMENT:  # only after FNINIT (check_flags), so the stack is empty and the word is exact
+        return _environment(i, address, checked)
     if op == M.WAIT:  # every exception is masked, so none is pending
         return ";  // wait"
     if op in (M.FNOP, M.FNCLEX):  # the profile keeps no exception flag, so clearing them changes nothing
