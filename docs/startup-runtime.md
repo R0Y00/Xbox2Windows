@@ -204,8 +204,10 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-14`. Older translations evaluate `s_brev_b32` of a
+The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
 constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
+rounding mode.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
@@ -2969,7 +2971,8 @@ check only:
 - Argument checks (`src/startup_stubs/list_copy_texture.h`): footprint on both sides, empty or inverted box,
   source and destination bounds, row pitch (multiple of 256), offset (multiple of 512), footprint end inside
   the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
-  block alignment, every multiply and add in the footprint arithmetic checked for wrapping.
+  block alignment, every multiply and add in the footprint arithmetic checked for wrapping. Block-compressed
+  bounds are whole 4x4 blocks, as in D3D12: a 2x2 or 1x1 mip takes the 4x4 footprint GetCopyableFootprints gives it.
 - Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
   `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
   (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).

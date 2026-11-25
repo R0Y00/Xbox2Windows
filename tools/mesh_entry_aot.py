@@ -198,6 +198,12 @@ class Wave:
             if self.vcc is None:
                 raise ValueError("Undefined wave predicate")
             return self.vcc
+        if t == "src_scc":
+            if self.scc is None:
+                raise ValueError("Undefined scalar predicate in src_scc")
+            if isinstance(self.scc, Dyn):
+                raise ValueError("Dynamic scalar predicate in src_scc")
+            return int(self.scc)
         if re.fullmatch(r"-?\d+\.\d+", t):
             return struct.unpack("<I", struct.pack("<f", float(t)))[0]
         return int(t, 0)

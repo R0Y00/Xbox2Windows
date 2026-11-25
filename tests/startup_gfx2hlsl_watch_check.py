@@ -104,7 +104,8 @@ mesh = struct.pack('<6I', 0xbf900009, *position, *primitive, endpgm)
 pixel = struct.pack('<3I', 0xf800080f, 0x03020100, endpgm)
 vertex = struct.pack('<3I', *position, endpgm)
 mesh57_fixture(mesh, pixel, 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
-mesh57_fixture(mesh, b'', 'slot 57 mesh without a pixel stage is not covered')
+# A pair without a pixel stage is translated when the mesh has the accepted shape; this synthetic mesh does not.
+mesh57_fixture(mesh, b'', 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
 mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
 # A pixel stage whose only export is the null target (done, vm, no channels) is a depth-only stage and passes the role check.
 null_export = struct.pack('<3I', 0xf8001890, 0, endpgm)
