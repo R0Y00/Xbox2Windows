@@ -407,6 +407,8 @@ def check(directory, compiler, consumer, adapter):
             raise AssertionError('descriptor mutation %r escaped detection' % label)
     for name, label, old, new in MUTATIONS:
         translated = pipeline_mubuf(FORMATS[name][2])
+        # The descriptor switch names its components c0..c3 where the tbuffer translation names v4..v7.
+        old, new = (re.sub(r'\bv([4-7]) =', lambda m: 'c%d =' % (int(m.group(1)) - 4), t) for t in (old, new))
         source = mutate_case(translated.hlsl_vs(), FORMATS[name][0], old, new)
         # An xyz load never reads W, so a W-only mutation needs a word routing W into the third register.
         for selects in ((4, 5, 6, 7), (4, 5, 7, 7)):
