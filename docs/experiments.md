@@ -11994,7 +11994,7 @@ adapter, with zero D3D12 debug errors and warnings. The fractional case on the s
   must fail at pixel (0, 0).
 
 `spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It requires
-mip 1 at 1.4375 and mip 3 at 3.75. At 1.5 and 1.5625 it checks for exact
+mip 1 at 1.4375, mip 2 at 2 and mip 3 at 3.75. At 1.49609375, 1.5, 1.5625 and 1.99609375 it checks for exact
 readback of mip 1 or 2, then requires the translated and direct HLSL shaders
 to agree and reports the selected mip. The wrong-mip control at 1.5625
 must reject mip 0 at pixel (0, 0) under either rounding rule. To test
@@ -12002,6 +12002,13 @@ nearest-mip selection away from the tie, append `--strict-rounding` to
 the normal arguments to `tests/spirv_window/minlod_fractional.py`.
 [Issue #809](https://github.com/R0Y00/Xbox2Windows/issues/809) records why the
 fractional point cases run separately.
+
+On a 1/256 grid the UHD Graphics 770 (32.0.101.5973) last read mip 1 at 1.99609375 and first read
+mip 2 at 2. On the RTX 4060 (32.0.15.9579) and in-box WARP (10.0.26100.9711) these adjacent
+clamps were 1.49609375 and 1.5. The translated SPIR-V and direct HLSL matched all 64 pixels
+at each sampled clamp (Windows 11 build 26100.9711, DXC 1.9.2609.5, debug layer unavailable).
+Rounding the translated clamp to the nearest 1/128 changes the selected mip at 1.99609375 on the UHD
+and at 1.49609375 on RTX and WARP. The four original fractional fixture inputs are all exact multiples of 1/128.
 
 In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
 10.0.19041.5794 selected green mip 1 for a per-sample clamp of 1.5625 under
