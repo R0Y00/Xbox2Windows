@@ -4396,7 +4396,8 @@ bool retire_address_has_live_user(u64 address, const Wrapper* skip)
     AcquireSRWLockShared(&note_lock);
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         if (wrapper == skip || reinterpret_cast<u64>(wrapper->own().title_memory) != address) return false;
-        if (InterlockedCompareExchange(const_cast<LONG*>(&wrapper->own().refs), 0, 0) > 0) {
+        if (InterlockedCompareExchange(const_cast<LONG*>(&wrapper->own().refs), 0, 0) > 0 ||
+            InterlockedCompareExchange(const_cast<LONG*>(&wrapper->own().retire_view_refs), 0, 0) > 0) {
             other_live = true;
             return true;
         }

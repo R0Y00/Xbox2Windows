@@ -800,9 +800,8 @@ bool case5_ordinary_upload_switch_off(Context& c)
     return true;
 }
 
-// 6: written_textures() generation keeping (switch on). A live slot-18 SRV keeps the older resource's entry while it
-// is pending; a newer generation of the same address then arrives and must survive the older generation's retirement
-// (the snapshot-generation check), so the newer write is not mistaken for the older one's stale state.
+// 6: A live slot-18 SRV keeps the current format metadata even after both same-address guest wrappers are released.
+// The older wrapper's eventual retirement must also leave the newer generation intact.
 bool case6_written_generation_preserved(Context& c, void* title_mem)
 {
     x2w_d3d12_bc7_4k_s_written(title_mem, side, side);  // generation 1 of this address
@@ -833,6 +832,18 @@ bool case6_written_generation_preserved(Context& c, void* title_mem)
     }
     // A newer generation of the same address while the older resource is still pending behind its view.
     x2w_d3d12_bc7_4k_s_written(title_mem, side, side);
+    Res& Tnew = c.make_slot133("T_gen_new", title_mem);
+    c.release(Tnew);
+    if (!x2w_d3d12_written_probe(title_mem, &generation, &bc7_width, nullptr) || generation != 2 || bc7_width != side) {
+        std::puts("FAIL: releasing the newer wrapper erased metadata used by the older wrapper's live SRV");
+        return false;
+    }
+    Tnew.freed = true;
+    if (!c.settle("newer wrapper retired with older SRV live", "newer wrapper kept or older SRV retired")) return false;
+    if (!x2w_d3d12_written_probe(title_mem, &generation, &bc7_width, nullptr) || generation != 2 || bc7_width != side) {
+        std::puts("FAIL: draining the newer wrapper erased metadata used by the older wrapper's live SRV");
+        return false;
+    }
     heap.Reset();  // drops the view reference: the older resource can retire now
     Told.freed = true;
     if (!c.settle("older generation retired", "older generation kept after its view was released")) return false;
