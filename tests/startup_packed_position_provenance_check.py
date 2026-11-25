@@ -4,7 +4,8 @@
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        translate the requests below through translate_request, compile the
                                        pixel stage (DXC ps_6_0, and FXC ps_5_1 when given) and draw it with the
-                                       #1634 gradient: every pixel must read back its own packed x | (y << 16)
+                                       #1634 gradient: every pixel must read back its own packed x | (y << 16);
+                                       with fxc, also the compiled-result path of a rewritten description
 
 Two source-built requests share one cache directory. Each has a stream description, req_<key>.psin:
   target  exports v4; enable 0x8002 (PERSP_CENTER, POS_FIXED_PT) and address 0x8003 (PERSP_SAMPLE allocated
@@ -15,6 +16,14 @@ Both draw correctly only when each translation takes the masks of its own descri
 and no mask taken from the other description passes. The controls also refuse, by name, a description that
 names another pipeline, a stale description whose stage blobs changed, a missing enable or address mask,
 contradictory masks (an enabled input not allocated) and a malformed line.
+
+The masks are part of the request identity (pipeline_key with ps_inputs). In the same cache, pipelines with
+the target's exact stage bytes, root signature and input layout but another mask pair are requests of their
+own: 0x8003/0x8003 also places the position in v4 and draws the gradient; 0x8002/0x8002 places it in v2, so
+the v4 this code reads is not the position and the draw fails at (1,0) as expected. They arrive after the
+target's result exists and are translated as new requests, leaving that result untouched. A description
+rewritten in place with another pair after its result was published is checked again, refused by name and
+its old result withdrawn.
 """
 import os
 import re
@@ -22,12 +31,14 @@ import struct
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, G, compile_hlsl, root_blob
 
 TARGET = (0x8002, 0x8003)  # (enable, address): the packed position in v4
 DECOY = (0x8002, 0x8002)   # the packed position in v2
+SAME_V4 = (0x8003, 0x8003)  # another valid pair with the packed position in v4 (PERSP_SAMPLE also enabled)
 
 
 def ps_words(reg):
@@ -35,13 +46,14 @@ def ps_words(reg):
     return struct.pack('<III', 0xf800180f, reg * 0x01010101, 0xbf810000)
 
 
-def put_request(cache, ps, description=None, key=None):
-    """Write req_<key>.a/.b/.root for VS_WORDS and `ps`, and the stream description line when given."""
-    real = G.pipeline_key(VS_WORDS, ps, root_blob())
-    key = real if key is None else key
+def put_request(cache, ps, masks=None, line=None):
+    """Write req_<key>.a/.b/.root for VS_WORDS and `ps` under pipeline_key() with `masks`, and the stream
+    description: `line` when given, else the line naming that key and `masks` (none without masks)."""
+    key = G.pipeline_key(VS_WORDS, ps, root_blob(), ps_inputs=masks)
     name = cache / ('req_%016x' % key)
     for ext, blob in (('.b', ps), ('.root', root_blob()), ('.a', VS_WORDS)):
         name.with_suffix(ext).write_bytes(blob)
+    description = line if line is not None else describe(key, masks) if masks else None
     if description is not None:
         name.with_suffix('.psin').write_bytes(description.encode('ascii'))
     return key
@@ -51,17 +63,38 @@ def describe(key, masks):
     return 'psin1 %016x ena=0x%04x addr=0x%04x\n' % (key, *masks)
 
 
-def translated_ps(cache, key):
-    """translate_request with the manifest-only path (X2W_FXC=''): the pixel HLSL, or the refusal."""
+@contextmanager
+def fxc_setting(fxc=''):
+    """X2W_FXC for the translator: by default the manifest-only path (''), where a published manifest is a
+    finished result without bytecode; with an fxc path, the compile path."""
     previous = os.environ.get('X2W_FXC')
-    os.environ['X2W_FXC'] = ''
+    os.environ['X2W_FXC'] = fxc
     try:
-        result = G.translate_request(str(cache), key)
+        yield
     finally:
         if previous is None:
             del os.environ['X2W_FXC']
         else:
             os.environ['X2W_FXC'] = previous
+
+
+def pending(cache, fxc=''):
+    """The keys a later --watch pass would translate (failures already written are skipped)."""
+    with fxc_setting(fxc):
+        return G.pending_keys(str(cache), True)
+
+
+def translated_ps(cache, key, through_pending=False):
+    """translate_request with the manifest-only path: the pixel HLSL, or the refusal. With through_pending, a
+    translate_pending pass (as --pending and --watch run it) translates whatever it finds pending instead."""
+    with fxc_setting():
+        if through_pending:
+            G.translate_pending(str(cache), skip_failed=True, jobs=1)
+            fail = cache / ('%016x.fail' % key)
+            result = 'ok' if (cache / ('%016x.txt' % key)).is_file() else (
+                'unsupported: ' + fail.read_text().strip() if fail.is_file() else 'not translated')
+        else:
+            result = G.translate_request(str(cache), key)
     if result != 'ok':
         return None, result
     return (cache / ('%016x.ps.hlsl' % key)).read_text(), result
@@ -73,12 +106,7 @@ def packed_line(text):
 
 
 def build_pair(cache, target=TARGET, decoy=DECOY):
-    target_ps, decoy_ps = ps_words(4), ps_words(2)
-    t = G.pipeline_key(VS_WORDS, target_ps, root_blob())
-    d = G.pipeline_key(VS_WORDS, decoy_ps, root_blob())
-    put_request(cache, target_ps, describe(t, target))
-    put_request(cache, decoy_ps, describe(d, decoy))
-    return t, d
+    return put_request(cache, ps_words(4), target), put_request(cache, ps_words(2), decoy)
 
 
 def controls():
@@ -139,15 +167,11 @@ def controls():
         (cache / ('req_%016x.psin' % t)).write_bytes((cache / ('req_%016x.psin' % d)).read_bytes())
         refused('decoy description under the target name refused', cache, t,
                 'pixel input description names another pipeline')
-        # A stale description: the line names the key, but the stored pixel stage changed after capture. The
-        # translation refuses the request first by its source key (#2595); the refusal report by its description.
+        # A stale description: the line names the key, but the stored pixel stage changed after capture.
         (cache / ('req_%016x.psin' % t)).write_bytes(describe(t, TARGET).encode('ascii'))
         (cache / ('req_%016x.b' % t)).write_bytes(ps_words(2))
-        text, result = translated_ps(cache, t)
-        rows = G.request_refusals(str(cache), t)
-        check('stale description (stage blob changed) refused',
-              text is None and 'shader request source key mismatch' in result
-              and any('pixel input description names another pipeline' in r for r, _ in rows))
+        refused('stale description (stage blob changed) refused', cache, t,
+                'pixel input description names another pipeline')
 
     for label, line, reason in (
         ('missing address mask', 'psin1 {k} ena=0x8002\n', 'pixel input address mask missing from the stream description'),
@@ -160,14 +184,78 @@ def controls():
     ):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
-            t = G.pipeline_key(VS_WORDS, ps_words(4), root_blob())
-            put_request(cache, ps_words(4), line.format(k='%016x' % t))
+            masks = tuple(int(m, 16) for m in re.findall(r'(?:ena|addr)=(0x[0-9a-f]+)', line))
+            masks = masks if len(masks) == 2 else None
+            t = G.pipeline_key(VS_WORDS, ps_words(4), root_blob(), ps_inputs=masks)
+            put_request(cache, ps_words(4), masks, line=line.format(k='%016x' % t))
             refused(label + ' refused by name', cache, t, reason)
+
+    # One cache, pipelines with identical stage bytes, root signature and input layout but different masks.
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        bare = G.pipeline_key(VS_WORDS, ps_words(4), root_blob())
+        check('without a description the key is unchanged',
+              bare == G.fnv(root_blob(), G.fnv(ps_words(4), G.fnv(VS_WORDS, G.fnv(b'x2w-startup-shader-17')))))
+        keys = [put_request(cache, ps_words(4), masks) for masks in (TARGET, SAME_V4, DECOY)]
+        check('same stages, root and layout with three mask pairs: three request identities',
+              len(set(keys)) == 3 and bare not in keys
+              and all(len(list(cache.glob('req_%016x.*' % key))) == 4 for key in keys))
+        texts = [translated_ps(cache, key)[0] for key in keys]
+        # Under the third pair the position is v2, so the v4 this code reads is not the position.
+        check('same cache: each pipeline takes its own masks (position v4, v4, not v4), each result under its own key',
+              None not in texts and [packed_line(text) for text in texts] == [[4], [4], []]
+              and all((cache / ('%016x.txt' % key)).is_file() for key in keys))
+
+    # A different mask pair for the same stage bytes after a result exists.
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        t = put_request(cache, ps_words(4), TARGET)
+        translated_ps(cache, t, through_pending=True)
+        published = {ext: (cache / ('%016x%s' % (t, ext))).read_bytes() for ext in ('.txt', '.ps.hlsl')}
+        w = put_request(cache, ps_words(4), DECOY)
+        check('another mask pair after the result exists is a pending request of its own', pending(cache) == [w])
+        text, _ = translated_ps(cache, w, through_pending=True)
+        check('it is translated with its own masks (position not v4), the existing result untouched',
+              text is not None and packed_line(text) == []
+              and all((cache / ('%016x%s' % (t, ext))).read_bytes() == data for ext, data in published.items()))
+        # The target's own description rewritten in place with the other pair, its line still naming the target.
+        manifest = cache / ('%016x.txt' % t)
+        stamp = manifest.stat().st_mtime - 100
+        os.utime(manifest, (stamp, stamp))
+        (cache / ('req_%016x.psin' % t)).write_bytes(describe(t, DECOY).encode('ascii'))
+        check('a description rewritten after the result is published is checked again', pending(cache) == [t])
+        text, result = translated_ps(cache, t, through_pending=True)
+        check('the rewritten mask pair is refused by name and the old result withdrawn, not reused',
+              text is None and 'pixel input description names another pipeline' in result and not manifest.is_file())
+        check('the refusal is not retried while the request stays the same', pending(cache) == [])
+        # A description rewritten with the same masks is checked once, then the result counts as done again.
+        manifest = cache / ('%016x.txt' % w)
+        stamp = manifest.stat().st_mtime - 100
+        os.utime(manifest, (stamp, stamp))
+        (cache / ('req_%016x.psin' % w)).write_bytes(describe(w, DECOY).encode('ascii'))
+        first = pending(cache)
+        text, _ = translated_ps(cache, w, through_pending=True)
+        check('a description rewritten unchanged is checked once, then done',
+              first == [w] and text is not None and packed_line(text) == [] and pending(cache) == [])
+
+    # Re-keying a cache keeps both pipelines and their descriptions, each naming its own key.
+    with tempfile.TemporaryDirectory() as tmp:
+        old, new = Path(tmp) / 'old', Path(tmp) / 'new'
+        old.mkdir()
+        keys = [put_request(old, ps_words(4), masks) for masks in (TARGET, DECOY)]
+        import io
+        import shader_cache_rekey
+        status = shader_cache_rekey.rekey(str(old), str(new), jobs=1, out=io.StringIO())
+        check('re-keying keeps both mask pairs as requests with their own descriptions',
+              status == 0 and all((new / ('req_%016x.psin' % key)).read_bytes() == describe(key, masks).encode('ascii')
+                                  for key, masks in zip(keys, (TARGET, DECOY)))
+              and sorted(p.name for p in new.glob('req_*.psin')) == sorted('req_%016x.psin' % key for key in keys))
 
     if failures:
         print('%d control(s) failed' % len(failures))
         return 1
-    print('controls: masks from the exact pipeline description; decoy, stale, missing and contradictory refused')
+    print('controls: masks from the exact pipeline description; decoy, stale, missing and contradictory refused; '
+          'masks in the request identity')
     return 0
 
 
@@ -180,18 +268,25 @@ def draw(dxc, renderer, adapter, fxc=None):
         cache = folder / 'cache'
         cache.mkdir()
         t, d = build_pair(cache)
-        wrong = cache / 'wrong'
-        wrong.mkdir()
-        # Wrong register: the target's code with a description whose masks place the position in v2.
-        w = put_request(wrong, ps_words(4), describe(G.pipeline_key(VS_WORDS, ps_words(4), root_blob()), DECOY))
         sources = {}
-        for label, where, key in (('target', cache, t), ('decoy', cache, d), ('wrong register', wrong, w)):
-            text, result = translated_ps(where, key)
+        for label, key in (('target', t), ('decoy', d)):
+            text, result = translated_ps(cache, key)
+            assert text is not None, (label, result)
+            sources[label] = text
+        # After those results exist, two more pipelines with the target's exact stage bytes, root signature and
+        # input layout arrive in the same cache: one whose masks also place the position in v4, and one whose
+        # masks place it in v2 (wrong register for this code). Each is a request of its own and is translated.
+        same = put_request(cache, ps_words(4), SAME_V4)
+        wrong = put_request(cache, ps_words(4), DECOY)
+        assert len({t, d, same, wrong}) == 4 and pending(cache) == sorted([same, wrong]), 'identities'
+        for label, key in (('same bytes, other masks (v4)', same), ('same bytes, other masks (v2)', wrong)):
+            text, result = translated_ps(cache, key, through_pending=True)
             assert text is not None, (label, result)
             sources[label] = text
         for kind, compiler, profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'vs', 'vs_' + profile, folder)
-            for label, good in (('target', True), ('decoy', True), ('wrong register', False)):
+            for label, good in (('target', True), ('decoy', True), ('same bytes, other masks (v4)', True),
+                                ('same bytes, other masks (v2)', False)):
                 ps = compile_hlsl(compiler, kind, sources[label], 'ps', 'ps_' + profile, folder)
                 run = subprocess.run([renderer, adapter, '--startup-packed-position', vs, ps],
                                      capture_output=True, text=True)
@@ -205,7 +300,30 @@ def draw(dxc, renderer, adapter, fxc=None):
                 device = [line for line in run.stdout.splitlines() if line.startswith(('backend=', 'adapter=', 'debug_'))]
                 print(f'{kind} {adapter} {label}: ' + ('91 pixels matched' if good else 'expected mismatch at (1,0)')
                       + ' [%s]' % '; '.join(device))
+        if fxc:
+            compiled_results(folder / 'compiled', fxc)
     return 0
+
+
+def compiled_results(cache, fxc):
+    """With bytecode (FXC), an unchanged manifest is not rewritten. A description rewritten unchanged is still
+    checked once and then done, and one rewritten with another mask pair withdraws the published result."""
+    cache.mkdir()
+    t = put_request(cache, ps_words(4), TARGET)
+    with fxc_setting(fxc):
+        G.translate_pending(str(cache), skip_failed=True, jobs=1)
+    manifest = cache / ('%016x.txt' % t)
+    assert manifest.is_file() and (cache / ('%016x.ps.cso' % t)).is_file() and pending(cache, fxc) == [], 'compiled'
+    for masks, done in ((TARGET, True), (DECOY, False)):
+        stamp = manifest.stat().st_mtime - 100
+        os.utime(manifest, (stamp, stamp))
+        (cache / ('req_%016x.psin' % t)).write_bytes(describe(t, masks).encode('ascii'))
+        assert pending(cache, fxc) == [t], ('checked again', masks)
+        with fxc_setting(fxc):
+            G.translate_pending(str(cache), skip_failed=True, jobs=1)
+        assert pending(cache, fxc) == [] and manifest.is_file() == done, ('checked once', masks)
+    assert 'pixel input description names another pipeline' in (cache / ('%016x.fail' % t)).read_text()
+    print('fxc compiled result: rewritten description checked once; another mask pair withdraws the result')
 
 
 def main(argv):
