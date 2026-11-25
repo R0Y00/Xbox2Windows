@@ -13021,6 +13021,28 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hardware)?$' -V
 ```
 
+### Compute mip-zero gather
+
+The startup compute translator accepts `image_gather4_lz` on a 2D texture with
+the same constant sampler and one-hot component selection as the pixel form.
+The eight image descriptor words must come from one intact descriptor at a
+fixed table offset. The compute manifest records the texture SRV, sampler and
+raw output UAV. The fixture binds these on the standalone D3D12 compute runner.
+Runtime binding of translated slot-67 pipelines is tracked in #2274.
+
+One gfx1013 thread gathers at (0.5, 0.5) and stores four words. Each texel's
+bits encode its mip, position and channel. The reference checks the four center
+texels and all 316 untouched words. The fixture reads green with the view
+starting at resource mip 0 and each RGBA component with the view starting at
+mip 1. The controls drop the gather, select red in place of green, bind mip 0
+in place of mip 1, or swap the first and last taps. The reference predicts
+4, 4, 4 and 2 mismatching words respectively.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_gather_lz(_warp|_hardware)?$' -V
+```
+
 ## Startup translator: fixed-mip 2D comparison gathers
 
 The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D
