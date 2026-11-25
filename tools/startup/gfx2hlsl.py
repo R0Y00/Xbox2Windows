@@ -2699,6 +2699,7 @@ class Stage:
         dst = reg_range(ops[0])
         if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
             raise Unsupported('%s destination %s' % (name, ops[0]))
+        # Both halves use the tested constant-mask profile, even though HI only copies the base.
         mask = self.const_u32(ops[1])
         if mask is None:
             raise Unsupported('%s requires a known mask' % name)
