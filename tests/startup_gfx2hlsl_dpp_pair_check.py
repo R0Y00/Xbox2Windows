@@ -3,8 +3,9 @@
   (no arguments)                       translation controls and refusals, pure Python
   binary <llvm-mc>                     assemble the fixture sources with LLVM (gfx1013) and compare with the words here
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
-                                       compile the translated pixel stage with FXC ps_5_1 when given and with DXC
-                                       ps_6_0, draw 16 x 16 pixels and compare every pixel with a CPU reference
+                                       compile the translated pixel stage with DXC ps_6_0 (the lowering uses the shader
+                                       model 6.0 quad reads, so FXC is not used), draw 16 x 16 pixels and compare every
+                                       pixel with a CPU reference. The optional fxc argument is accepted and ignored.
 
 Semantics (RDNA 2 ISA, DPP16 and the quad_perm control): in a wave the lanes of a pixel quad are 0 1 / 2 3, that is
 the screen pixels (x, y) = (0, 0) (1, 0) / (0, 1) (1, 1) relative to the even corner, and lane i reads SRC0 of lane
@@ -18,8 +19,13 @@ The other lane of every pair keeps its own word. The reference below is written 
 and does not use the lowering.
 
 Helper lanes: the instruction reads lanes the pixel does not cover. In a pixel shader the four lanes of a quad run
-together and the hardware keeps the uncovered ones as helpers, which is what ddx_fine and ddy_fine rely on as well. The
-translator accepts the form only in straight-line pixel code with the full entry mask.
+together and the hardware keeps the uncovered ones as helpers, which is what QuadReadLaneAt relies on as well. The
+translator accepts the form only in straight-line pixel code after s_wqm exec, exec on the entry mask.
+
+Why not derivatives: a first version rebuilt the other lane's word from ddx_fine / ddy_fine of each 16-bit half. WARP
+agreed with the reference, but an RTX adapter returned other words for all four patterns, because a hardware derivative
+is not required to be the exact difference of the two pixels' values. The lowering now reads the four lanes with
+QuadReadLaneAt, the path the quad swaps already use, and selects the lane quad_perm names.
 
 The draw: a pixel program multiplies the packed screen position by a constant, so every pixel carries a different
 32-bit word with both halves in use, applies the DPP form to it and exports (v_mov_b32_dpp result, v_add_nc_u32_dpp
@@ -121,22 +127,27 @@ def image(perm):
 
 
 # ---- mutations of the translated text --------------------------------------------------------------------------------
-def flip_sign(text, perm):
-    old, new = (' + x2w_d', ' - x2w_d') if DPP_SIGN[perm] == '+' else (' - x2w_d', ' + x2w_d')
+CHAIN = re.compile(r'x2w_lane == 0u \? x2w_q(\d) : x2w_lane == 1u \? x2w_q(\d) : x2w_lane == 2u \? x2w_q(\d) : x2w_q(\d);')
+
+
+def with_sources(text, sources):
+    assert CHAIN.search(text)
+    return CHAIN.sub('x2w_lane == 0u ? x2w_q%d : x2w_lane == 1u ? x2w_q%d : x2w_lane == 2u ? x2w_q%d : x2w_q%d;'
+                     % tuple(sources), text)
+
+
+def opposite_lanes(text, perm):
+    return with_sources(text, [lane ^ 3 for lane in perm])
+
+
+def own_lane(text, perm):
+    return with_sources(text, (0, 1, 2, 3))
+
+
+def transposed_lane(text, perm):
+    old = '((uint(i.pos.y) & 1u) << 1u) | (uint(i.pos.x) & 1u)'
     assert old in text
-    return text.replace(old, new)
-
-
-def flip_lanes(text, perm):
-    old = '& 1u) == %du ?' % DPP_PARITY[perm]
-    assert old in text
-    return text.replace(old, '& 1u) == %du ?' % (1 - DPP_PARITY[perm]))
-
-
-def other_axis(text, perm):
-    old, new = ('ddx_fine', 'ddy_fine') if G.DPP_PAIR[perm][0] == 'x' else ('ddy_fine', 'ddx_fine')
-    assert old in text
-    return text.replace(old, new)
+    return text.replace(old, '((uint(i.pos.x) & 1u) << 1u) | (uint(i.pos.y) & 1u)')
 
 
 def read_other_source(text, perm):
@@ -146,36 +157,24 @@ def read_other_source(text, perm):
     return text.replace(old, 'v3 = v256 + v256;')
 
 
-DPP_SIGN = {perm: G.DPP_PAIR[perm][1] for perm in PERMS}
-DPP_PARITY = {perm: G.DPP_PAIR[perm][2] for perm in PERMS}
-MUTATIONS = {'opposite sign': flip_sign, 'opposite lanes': flip_lanes, 'other axis': other_axis,
+MUTATIONS = {'opposite lanes': opposite_lanes, 'own lane': own_lane, 'transposed lane index': transposed_lane,
              'second source permuted': read_other_source}
 
 
 def simulate(text):
-    """Run the translated broadcast statement on every pixel of the image, the way a quad of pixels would.
-
-    ddx_fine of a pixel is the value of the right pixel of its row pair minus the left one; ddy_fine is the lower
-    pixel of its column pair minus the upper one (D3D12 functional spec, derivative instructions); both are exact here
-    because the operands are 16-bit integers held in float32."""
-    block = re.search(r'\{ float x2w_lo.*? v256 = .*?; \}', text).group(0)
-    axis = re.search(r'dd([xy])_fine', block).group(1)
-    pick = re.search(r'\(uint\(i\.pos\.([xy])\) & 1u\) == (\d)u', block)
-    sign = re.search(r'x2w_lo ([+-]) x2w_dlo', block).group(1)
-    where = lambda x, y, a: x if a == 'x' else y
+    """Run the translated broadcast statement on every pixel of the image, the way a quad of pixels would: every lane
+    of the aligned 2 x 2 block holds its own word, QuadReadLaneAt(word, n) returns the word of lane n of the block."""
+    block = re.search(r'\{ uint x2w_q0 .*? \}', text).group(0)
+    sources = [int(n) for n in CHAIN.search(block).groups()]
+    a, b = re.search(r'x2w_lane = \(\(uint\(i\.pos\.([xy])\) & 1u\) << 1u\) \| \(uint\(i\.pos\.([xy])\) & 1u\)',
+                     block).groups()
     words = []
     for y in range(HEIGHT):
         for x in range(WIDTH):
-            own = word(x, y)
-            halves = []
-            for shift in (0, 16):
-                value = (own >> shift) & 0xffff
-                mate = (word(x ^ 1, y) if axis == 'x' else word(x, y ^ 1)) >> shift & 0xffff
-                first, second = (value, mate) if where(x, y, axis) & 1 == 0 else (mate, value)
-                derivative = second - first
-                halves.append(value + derivative if sign == '+' else value - derivative)
-            take = where(x, y, pick.group(1)) & 1 == int(pick.group(2))
-            words.append((halves[0] | (halves[1] << 16)) if take else own)
+            at = {'x': x, 'y': y}
+            lane = ((at[a] & 1) << 1) | (at[b] & 1)
+            source = sources[lane]
+            words.append(word((x & ~1) | (source & 1), (y & ~1) | (source >> 1)))
     return words
 
 
@@ -183,11 +182,11 @@ def simulate(text):
 class Probe(G.Stage):
     """A Stage with no pipeline: enough state for decoded instructions to be translated."""
 
-    def __init__(self, kind='ps', exec_known=True, has_branches=False, whole_quad=True):
+    def __init__(self, kind='ps', exec_known=True, has_branches=False, wqm_exec=True):
         self.lines, self.sym = [], {}
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
         self.kind, self.exec_known, self.has_branches = kind, exec_known, has_branches
-        self.whole_quad = whole_quad
+        self.wqm_exec = wqm_exec
 
 
 def refused(asm, **kwargs):
@@ -223,9 +222,9 @@ def pipeline_controls():
     # DPP is the only reader of v0: v0 must still be declared and initialized from the packed position input.
     only = struct.pack('<III', 0xf800180f, 0x02020202, 0xbf810000)  # exp mrt0 v2, v2, v2, v2 done vm; s_endpgm
     text, reason = translate(WQM_WORDS + vop1_dpp(V_MOV_B32, 2, 0, ctrl) + only)
-    check('a DPP-only source VGPR is declared', text is not None and 'v0' in text.split('x2w_lo', 1)[0], str(reason))
+    check('a DPP-only source VGPR is declared', text is not None and 'v0' in text.split('x2w_q0', 1)[0], str(reason))
     check('a DPP-only source VGPR is initialized before the lowering',
-          text is not None and 'uint v0' in text and text.index('uint v0') < text.index('x2w_lo'), str(text)[:300])
+          text is not None and 'uint v0' in text and text.index('uint v0') < text.index('x2w_q0'), str(text)[:300])
 
 
 def controls():
@@ -233,9 +232,8 @@ def controls():
         decoded = [text for _o, _s, _n, text in G.decode(ps_words(perm))]
         check('%s fixture decodes to its source' % spelling(perm), decoded == ps_source(perm).splitlines(), str(decoded))
         text = pixel_hlsl(perm)
-        derive = G.DPP_PAIR[perm][0]
-        check('%s uses one fine derivative on the %s axis' % (spelling(perm), derive),
-              text.count('dd%s_fine(' % derive) == 4 and 'dd%s_fine(' % ('y' if derive == 'x' else 'x') not in text, text)
+        check('%s reads the four lanes of each of the two forms with QuadReadLaneAt, no derivative' % spelling(perm),
+              text.count('QuadReadLaneAt(') == 8 and 'ddx' not in text and 'ddy' not in text, text)
         reference = image(perm)
         check('%s translated text moves the right lane (CPU quad model)' % spelling(perm),
               simulate(text) == reference[0::4])
@@ -266,7 +264,7 @@ def controls():
             ('a vertex stage', accepted, {'kind': 'vs'}),
             ('a program with branches', accepted, {'has_branches': True}),
             ('an unknown entry mask', accepted, {'exec_known': False}),
-            ('an entry mask not proven whole-quad', accepted, {'whole_quad': False}),
+            ('an entry mask not proven whole-quad', accepted, {'wqm_exec': False}),
             ('a scalar source', 'v_mov_b32_dpp v2, s1 quad_perm:[1,1,3,3] row_mask:0xf bank_mask:0xf', {})):
         reason = refused(asm, **kwargs)
         check('refuses %s' % label, reason is not None, 'translated')
@@ -296,7 +294,7 @@ def tag(perm):
 
 
 def check_draw(dxc, renderer, adapter, fxc=None):
-    compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
+    compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')]  # the quad reads need shader model 6.0, so no FXC leg
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:

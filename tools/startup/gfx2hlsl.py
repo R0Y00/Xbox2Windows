@@ -23,10 +23,9 @@ class Unsupported(Exception):
 
 PREFETCH = bytes.fromhex('0300a0bf')
 
-# DPP16 quad pair broadcasts: quad_perm -> (axis of the pair, sign of the fine derivative, quad coordinate parity of
-# the lane that takes the other lane's word). The lanes of a quad are the pixels 0 1 / 2 3, row by row.
-DPP_PAIR = {(1, 1, 3, 3): ('x', '+', 0), (0, 0, 2, 2): ('x', '-', 1),
-            (2, 3, 2, 3): ('y', '+', 0), (0, 1, 0, 1): ('y', '-', 1)}
+# DPP16 quad pair broadcasts (quad_perm of one lane of every horizontal or vertical pair into the other). The lanes of
+# a quad are the pixels 0 1 / 2 3, row by row; lane i reads lane quad_perm[i].
+DPP_PAIR = frozenset(((1, 1, 3, 3), (0, 0, 2, 2), (2, 3, 2, 3), (0, 1, 0, 1)))
 DPP_SCRATCH = 256
 
 # SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
@@ -357,6 +356,8 @@ UNIFORM_VALU = frozenset((
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
+    needs_sm6 = False   # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
+
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
         self.refusals = refusals
@@ -368,7 +369,7 @@ class Stage:
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
-        self.whole_quad = False   # s_wqm exec, exec ran on the entry mask and no exact mask was restored since
+        self.wqm_exec = False     # exec is proven whole-quad: an s_wqm of exec into itself ran while exec_known
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
@@ -683,12 +684,13 @@ class Stage:
 
         RDNA 2 ISA section 12.19 (DPP16): lane i of a quad reads SRC0 of lane quad_perm[i] of the same quad. A pair
         broadcast ([1,1,3,3], [0,0,2,2], [2,3,2,3], [0,1,0,1]) moves one lane of every horizontal or vertical pair
-        into the other and leaves the first lane alone. The model has one lane, so the other lane's word is rebuilt
-        from the quad's fine derivative of each 16-bit half (ddx_fine / ddy_fine over exactly representable floats:
-        the difference of the pair, added to or subtracted from this lane's half). That needs all four lanes of the
-        quad to run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and
-        a whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every other control (other permutations, row_*, wave_*, a partial row or bank mask,
-        fi, a vertex stage) is refused by name, since the single lane cannot read a neighbour."""
+        into the other and leaves the first lane alone. The word of each of the four lanes is read with the shader
+        model 6.0 QuadReadLaneAt (its lane argument must be a constant, so all four reads are unconditional) and this
+        lane keeps the one quad_perm names for its own position in the quad. That needs all four lanes of the quad to
+        run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and a
+        whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every
+        other control (other permutations, row_*, wave_*, a partial row or bank mask, fi, a vertex stage) is refused by
+        name, since the single lane cannot read a neighbour."""
         perms = [m for m in mods if m.startswith('quad_perm:')]
         rest = [m for m in mods if not m.startswith('quad_perm:')]
         if len(perms) != 1:
@@ -698,11 +700,10 @@ class Stage:
                 raise Unsupported('%s_dpp with %s' % (base, m))
         # With all four lanes active no source lane is disabled, so bound_ctrl has nothing to replace.
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
-        axis = DPP_PAIR.get(perm)
-        if axis is None:
+        if perm not in DPP_PAIR:
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
         if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
-                not getattr(self, 'whole_quad', False) or getattr(self, 'fetched', False)):
+                not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
             raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
                               % (base, perms[0]))
         if len(ops) < 2:
@@ -713,14 +714,14 @@ class Stage:
         if not src:
             raise Unsupported('%s_dpp source %s' % (base, ops[1]))
         word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
-        coord, sign, parity = axis
-        derive = 'ddx_fine' if coord == 'x' else 'ddy_fine'
+        self.needs_sm6 = True
         self.used_v.add(DPP_SCRATCH)
         self.uniform_v.discard(DPP_SCRATCH)
-        self.emit('{ float x2w_lo = float(%s & 0xffffu), x2w_hi = float(%s >> 16u);'
-                  ' float x2w_dlo = %s(x2w_lo), x2w_dhi = %s(x2w_hi);'
-                  ' v%d = (uint(i.pos.%s) & 1u) == %du ? (uint(x2w_lo %s x2w_dlo) | (uint(x2w_hi %s x2w_dhi) << 16u)) : %s; }'
-                  % (word, word, derive, derive, DPP_SCRATCH, coord, parity, sign, sign, word))
+        self.emit('{ uint x2w_q0 = QuadReadLaneAt(%s, 0), x2w_q1 = QuadReadLaneAt(%s, 1),'
+                  ' x2w_q2 = QuadReadLaneAt(%s, 2), x2w_q3 = QuadReadLaneAt(%s, 3);'
+                  ' uint x2w_lane = ((uint(i.pos.y) & 1u) << 1u) | (uint(i.pos.x) & 1u);'
+                  ' v%d = x2w_lane == 0u ? x2w_q%d : x2w_lane == 1u ? x2w_q%d : x2w_lane == 2u ? x2w_q%d : x2w_q%d; }'
+                  % ((word,) * 4 + (DPP_SCRATCH,) + perm))
         ops = [ops[0], '%sv%d%s' % (src.group(1), DPP_SCRATCH, src.group(3))] + ops[2:]
         return self.lower(base, asm, ops, [])
 
@@ -737,7 +738,7 @@ class Stage:
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
-                self.whole_quad = True  # every quad that has an active lane has all four lanes active
+                self.wqm_exec = True  # every quad that has an active lane has all four lanes active
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -943,7 +944,7 @@ class Stage:
                 copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
                     # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
-                    self.whole_quad = False
+                    self.wqm_exec = False
                     if hasattr(self, 'uniform_v'):
                         self.uniform_v.clear()
                     return None
@@ -2403,6 +2404,15 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
+def find_dxc():
+    """The dxc.exe for a stage that needs shader model 6.0: X2W_DXC, then PATH; None when neither exists."""
+    configured = os.environ.get('X2W_DXC')
+    if configured and os.path.isfile(configured):
+        return configured
+    import shutil
+    return shutil.which('dxc.exe') or shutil.which('dxc')
+
+
 def has_bytecode(path):
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
@@ -2433,14 +2443,28 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         return message
     manifest_path = name + '.txt'
     write_manifest = True
+    # A quad intrinsic exists from shader model 6.0 only, and a pipeline does not mix DXBC and DXIL stages.
+    sm6 = any(getattr(getattr(pipe, stage, None), 'needs_sm6', False) for stage in ('vs', 'ps'))
+    if fxc and sm6:
+        compiler = find_dxc()
+        if compiler is None:
+            message = 'dxc not found (X2W_DXC=%s): a quad swap needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            open(name + '.fail', 'w').write(message + '\n')
+            return message
+        profiles = (('vs', 'vs_6_0'), ('ps', 'ps_6_0'))
+    else:
+        compiler, profiles = fxc, (('vs', 'vs_5_1'), ('ps', 'ps_5_1'))
     if fxc:
         import subprocess
         # An existing manifest can already point at these paths. Publish only bytecode from a successful pair.
         with tempfile.TemporaryDirectory(prefix='.fxc-', dir=out_dir) as staging:
-            for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
+            for stage, profile in profiles:
                 bytecode = os.path.join(staging, stage + '.cso')
-                r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage],
-                                   capture_output=True, text=True)
+                if sm6:
+                    command = [compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.%s.hlsl' % stage]
+                else:
+                    command = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage]
+                r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
                     open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))

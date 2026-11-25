@@ -1084,14 +1084,13 @@ These are measured on one executable; treat them as hypotheses for others.
   the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
   The DPP16 pair broadcasts of a pixel stage (`quad_perm:[1,1,3,3]`, `[0,0,2,2]`, `[2,3,2,3]`, `[0,1,0,1]`, with
   `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
-  first source is a VGPR. The other lane of the pair is rebuilt from `ddx_fine` or `ddy_fine` of each 16-bit half of
-  the word, which are exact in float32, and the result goes through a scratch register so a second source naming the
+  first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
   same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
   shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, and so are the identity, quad
   swap and quad broadcast permutations, `row_*`, `wave_*`, partial masks and `fi`. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
   draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
-  with wrong-sign, wrong-lane, wrong-axis and permuted-second-source translations as failing controls.
+  with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
   [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
