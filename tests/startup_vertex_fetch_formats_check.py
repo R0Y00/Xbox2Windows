@@ -135,6 +135,7 @@ MUTATIONS = (
     ('BUF_FMT_8_8_8_8_UNORM', 'fourth byte as 255', 'U((w >> 24) / 255.0)', 'U(1.0)'),
     ('BUF_FMT_8_8_8_8_UINT', 'normalized green byte', 'v5 = (w >> 8) & 255u;', 'v5 = U(((w >> 8) & 255u) / 255.0);'),
     ('BUF_FMT_8_8_8_8_UINT', 'blue byte from green', 'v6 = (w >> 16) & 255u;', 'v6 = (w >> 8) & 255u;'),
+    ('BUF_FMT_8_8_8_8_UINT', 'alpha byte from blue', 'v7 = w >> 24;', 'v7 = (w >> 16) & 255u;'),
     ('BUF_FMT_8_8_UNORM', 'aligned load instead of ldu', 'ldu(r0, a)', 'r0.Load(a & ~3u)'),
     ('BUF_FMT_16_16_UNORM', 'high half over 65536', 'U((w >> 16) / 65535.0)', 'U((w >> 16) / 65536.0)'),
     ('BUF_FMT_16_16_SNORM', 'low half read unsigned', 'float(int(w << 16) >> 16)', 'float((w << 16) >> 16)'),
