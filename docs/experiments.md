@@ -13988,6 +13988,16 @@ python3 -B tests/rdna2_tools_check.py
 
 Scope: recognition only. No translator lowers these forms through this change, and no hardware or Windows run backs them.
 
+## RDNA2 lane permutations in the unsupported-shader report
+
+`tools/scan_unsupported_shaders.py` reports `v_permlane16_b32` and
+`v_permlanex16_b32` as `VALU (Cross-lane)` in `unsupported_details`.
+The former can gather a value from another lane in the same 16-lane row.
+The latter selects from the paired row. Both remain unsupported by the
+pixel translator with either a declared wave32 or wave64 layout. The
+lane-local byte-selection instruction `v_perm_b32` retains its ordinary
+VALU classification. [AMD RDNA 2 ISA, §12.12](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
 ## gfx1013 VOP1 rounding, frexp and operand-free opcodes
 
 `tools/disasm_rdna2.py` named only part of the VOP1 table; eleven opcodes in two contiguous gaps printed as `v_vop1_NN`
