@@ -1077,7 +1077,14 @@ class Stage:
 
     # ---- instruction translation -------------------------------------------------------------
     def translate(self):
-        self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
+        refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
+        try:
+            self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
+        except Unsupported as reason:
+            if refusals is None:
+                raise
+            refusals.append((str(reason), self.kind))
+            self.calculated_pc = {}
         targets = set()
         skipped = []  # compute: (branch, target) of each s_cbranch_execz
         targets.update(target for target in self.calculated_pc.values() if target is not None)
@@ -1098,7 +1105,6 @@ class Stage:
         self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
         self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
         start = 0
-        refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
                 self.pinned_low16_v.update(self.low16_only_v)

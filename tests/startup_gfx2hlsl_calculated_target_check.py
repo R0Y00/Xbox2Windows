@@ -63,6 +63,10 @@ OUTSIDE = (START, GET, ('s_add_u32 s20, s20, 64', '14c01480'), CARRY, SET,
            DECOY, TARGET, EXPORT, END)
 DIRECT = (START, ('s_branch 1', '010082bf'), DECOY, TARGET, EXPORT, END)
 
+READ_LANE = ('v_readfirstlane_b32 s2, v1', '0105047e')
+CENSUS = (START, SET, READ_LANE, EXPORT, END)
+CENSUS_CONTROL = (START, READ_LANE, EXPORT, END)
+
 # When ud0 == 1, SCC0 takes the direct branch around the entire PC chain.
 # The original root word s8 reaches the bypass read at byte 24 untouched.
 # On the other path, the calculated jump targets byte 32 and exports 3.
@@ -80,7 +84,8 @@ ROOT_DIRECT = (COMPARE, ('s_cbranch_scc0 2', '020084bf'), START,
                ('s_branch 1', '010082bf'), ROOT_READ, EXPORT, END)
 FIXTURES = {'positive': POSITIVE, 'competing entry': COMPETING, 'ambiguous': AMBIGUOUS,
             'clobber': CLOBBER, 'literal target': LITERAL_TARGET, 'outside': OUTSIDE, 'direct': DIRECT,
-            'root bypass': ROOT_BYPASS, 'root direct': ROOT_DIRECT}
+            'root bypass': ROOT_BYPASS, 'root direct': ROOT_DIRECT,
+            'refusal census': CENSUS, 'refusal census ordinary control': CENSUS_CONTROL}
 
 
 def words(fixture):
@@ -155,6 +160,30 @@ def check_root_bypass():
         raise AssertionError('elided PC write can destroy a bypassed root binding')
 
 
+def check_refusal_census():
+    calculated = 's_setpc_b64: unknown or ambiguous calculated target from s[20:21] at +0x4'
+    ordinary = 'v_readfirstlane_b32 requires a proven uniform source'
+    for fixture, expected in ((CENSUS_CONTROL, ordinary), (CENSUS, calculated)):
+        try:
+            translate(fixture)
+        except G.Unsupported as reason:
+            assert str(reason) == expected, str(reason)
+        else:
+            raise AssertionError('normal translation accepted a refused fixture')
+
+    refusals = []
+    diagnostic = G.Stage(Pipe(), 'ps', words(CENSUS), refusals=refusals)
+    assert refusals == [(calculated, 'ps'), ('s_setpc_b64', 'ps'), (ordinary, 'ps')], refusals
+    assert diagnostic.calculated_pc == {}, diagnostic.calculated_pc
+    assert [(off, term) for off, _, term in diagnostic.blocks] == [(0, ('end',))], diagnostic.blocks
+    assert diagnostic.blocks[0][1] == ['v0 = 0x00000003u;', 'o.mrt0 = uint4(v0, v0, v0, v0);']
+
+    refusals = []
+    proven = G.Stage(Pipe(), 'ps', words(POSITIVE), refusals=refusals)
+    assert refusals == [], refusals
+    assert_result(proven, (0, 20, 24), 24)
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == 'binary':
         for name, fixture in FIXTURES.items():
@@ -166,6 +195,7 @@ def main():
     assert_result(translate(POSITIVE), (0, 20, 24), 24)
     assert_result(translate(DIRECT), (0, 8, 12), 12)
     check_root_bypass()
+    check_refusal_census()
     for name in ('competing entry', 'ambiguous', 'clobber', 'literal target', 'outside'):
         try:
             translate(FIXTURES[name])
