@@ -10241,6 +10241,10 @@ Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --allow-provisional --history "$out/history.json" --tools-path "$out/Leonida/tools"
 ```
 
+With `--allow-provisional`, an explicit `--history` file must contain a UTF-8 JSON object.
+If it cannot be read, the command exits with status 2 before updating any DDS file or the manifest.
+Omit `--history` to use the decoder's default provisional history.
+
 The batch exporter uses the native BCPack kernels when the selected Leonida tools provide them. The commands below stage the measured revision separately from the reference checkout above. Pass `--require-rust` to check that the library loads before the batch starts. Individual chunks can still use the reference decoder. [Leonida native backend](https://github.com/ItsNotRexed/Leonida/pull/5116)
 
 ```powershell
