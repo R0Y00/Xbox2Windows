@@ -340,12 +340,19 @@ bool log_checks(HMODULE module)
     std::array<XGameRuntimeShimLogEntry, 256> entries{};
     const std::size_t count = get_log(entries.data(), entries.size());
     bool async_ok = false, async_handle = false, result_ok = false, result_invalid = false;
+    bool refused = false;
     for (std::size_t i = 0; i < count && i < entries.size(); ++i) {
         const auto& entry = entries[i];
         if (!entry.function) return false;
+        // Only the two refusal calls of unsupported_queue may report E_NOTIMPL.
+        const bool refusal_call = std::strcmp(entry.function, "XTaskQueueCreate") == 0 ||
+                                  std::strcmp(entry.function, "XGameSaveInitializeProviderAsync") == 0;
         if (entry.result == not_implemented) {
-            std::printf("FAIL: %s logged E_NOTIMPL\n", entry.function);
-            return false;
+            if (!refusal_call) {
+                std::printf("FAIL: %s logged E_NOTIMPL\n", entry.function);
+                return false;
+            }
+            refused = true;
         }
         if (std::strcmp(entry.function, "XGameSaveInitializeProviderAsync") == 0) {
             async_ok = async_ok || entry.result == S_OK;
@@ -356,8 +363,8 @@ bool log_checks(HMODULE module)
             result_invalid = result_invalid || entry.result == E_INVALIDARG;
         }
     }
-    return expect(async_ok && async_handle && result_ok && result_invalid,
-                  "log carries the positive and negative async calls");
+    return expect(async_ok && async_handle && result_ok && result_invalid && refused,
+                  "log carries the positive, negative and refused async calls");
 }
 
 // Fills every free provider slot, then returns how many fit.
