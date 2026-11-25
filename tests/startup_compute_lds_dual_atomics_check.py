@@ -639,7 +639,7 @@ def check_controls():
     refused('two single VGPRs', lambda: stage.lds_atomic('ds_min_u32', ['v[1:2]', 'v3'], []))
     refused('three single VGPRs', lambda: stage.lds_atomic('ds_add_rtn_u32', ['v1', 'v2'], []))
     refused('three single VGPRs', lambda: stage.lds_atomic('ds_wrxchg_rtn_b32', ['v[1:2]', 'v2', 'v3'], []))
-    refused('16-bit range', lambda: stage.lds_atomic('ds_add_u32', ['v1', 'v2'], ['offset:65536']))
+    refused('optional byte offset', lambda: stage.lds_atomic('ds_add_u32', ['v1', 'v2'], ['offset:65536']))
     refused('optional byte offset', lambda: stage.lds_atomic('ds_or_b32', ['v1', 'v2'], ['slc']))
 
     for stage_kind in ('vs', 'ps'):

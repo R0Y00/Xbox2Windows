@@ -3861,8 +3861,6 @@ class Stage:
             dst, addr_op, data_op = None, ops[0], ops[1]
         # Reuse ds_write_b32 single-offset validation (optional 16-bit byte offset, no gds/unknown mods).
         off, = lds_byte_offsets('ds_write_b32', mods)
-        if off > 0xffff:
-            raise Unsupported('%s immediate offset %d out of 16-bit range' % (name, off))
         if off % 4:
             raise Unsupported('%s requires 4-byte aligned immediate offset, got %d' % (name, off))
         lds_bytes = self._lds_require_alloc(name)
