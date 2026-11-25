@@ -1005,24 +1005,6 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
     auto* list = recording(self);
-    // Internal uploads must not obey the guest predicate: the cache marks the texture done, so a
-    // skipped copy would leave it stale for later unpredicated draws. Lift it, then restore it.
-    struct PredicationLift {
-        ID3D12GraphicsCommandList* list;
-        ID3D12Resource* buffer;
-        u64 offset;
-        UINT operation;
-        PredicationLift(ID3D12GraphicsCommandList* l, const Wrapper& w)
-            : list(l), buffer(l ? w.own().predication_buffer : nullptr), offset(w.own().predication_offset),
-              operation(w.own().predication_operation)
-        {
-            if (buffer) list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-        }
-        ~PredicationLift()
-        {
-            if (buffer) list->SetPredication(buffer, offset, static_cast<D3D12_PREDICATION_OP>(operation));
-        }
-    } lift(list, *self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
     const auto* original = resource_info(resource);
     const bool tiled_address = resource->own().tiled_address_srv;
@@ -1110,6 +1092,16 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         state.checked_frame = frame_number;
         state.generation = generation;
         return true;
+    }
+    // A copy recorded under the guest predicate could be skipped and leave the texture stale, and
+    // lifting the predicate for it would sample the predicate buffer a second time (desktop
+    // SetPredication samples when the GPU reaches the command), so a write in between could flip
+    // a later draw. Refuse the combination instead: nothing is recorded, the texture stays not
+    // done, and the next unpredicated draw uploads it.
+    if (list && self->own().predication_buffer) {
+        static LONG refused;
+        if (first_calls(refused, 6)) log("x2w-draw texture upload %p refused: a guest predicate is active on this list", static_cast<void*>(texture));
+        return false;
     }
     constexpr u64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     x2w_upload::Page owned;
