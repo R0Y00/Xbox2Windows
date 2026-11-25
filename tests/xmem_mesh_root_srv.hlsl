@@ -19,6 +19,24 @@ void mesh(out vertices Vertex verts[3], out indices uint3 triangles[1]) {
     triangles[0] = uint3(0, 1, 2);
 }
 
+[outputtopology("triangle")]
+[numthreads(1, 1, 1)]
+void mesh_groups(uint3 group : SV_GroupID, out vertices Vertex verts[4], out indices uint3 triangles[2]) {
+    SetMeshOutputCounts(4, 2);
+    uint word = source.Load(0);
+    float left = group.x == 0 ? -1 : 0;
+    verts[0].position = float4(left,     -1, 0, 1);
+    verts[1].position = float4(left,      1, 0, 1);
+    verts[2].position = float4(left + 1, -1, 0, 1);
+    verts[3].position = float4(left + 1,  1, 0, 1);
+    verts[0].word = word;
+    verts[1].word = word;
+    verts[2].word = word;
+    verts[3].word = word;
+    triangles[0] = uint3(0, 1, 2);
+    triangles[1] = uint3(2, 1, 3);
+}
+
 Vertex vertex(uint index : SV_VertexID) {
     Vertex result;
     result.position = float4(index == 2 ? 3 : -1, index == 1 ? 3 : -1, 0, 1);

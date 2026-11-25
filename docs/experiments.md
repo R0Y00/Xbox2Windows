@@ -8821,6 +8821,42 @@ cmake --build --preset release --target startup_indirect_draw_indexed xmem_shim
 ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_xmem_arguments' -V
 ```
 
+##### Cached mesh dispatch with two XMem ranges
+
+With `X2W_MESH86_XMEM_SRV=1` and `X2W_MESH_INDIRECT_XMEM=1`, one
+cached slot-86 mesh dispatch can consume a four-byte root SRV and one
+12-byte indirect record from distinct physical XMem pages. The COPY
+writer publishes the SRV word, and the COMPUTE writer publishes the
+argument record. Slot 61 validates both ranges before binding either.
+At submission DIRECT rechecks both live mappings, waits on each
+producer's fence, and holds both leases through its completion fence.
+Overlapping physical page windows are refused when opening the second
+lease. The cache proof permits the mesh shader to read its group ID,
+while still requiring one constant-offset DWORD read from the SRV.
+
+The source-built test extends [#2303](https://github.com/R0Y00/Xbox2Windows/pull/2303)
+and [#2332](https://github.com/R0Y00/Xbox2Windows/pull/2332). The SRV
+changes green to red and the group count changes from one to two. The
+tests read back eight red pixels with both waits, eight green pixels
+with the SRV wait omitted, and four red pixels with the argument wait
+omitted. The omitted writer remains gated through the readback. A
+missing argument publication and a remap of either physical page after
+recording leave the target clear. When both mappings are removed after
+submission, the gated consumer still reads eight red pixels. Neither
+page can be reused before that consumer completes, and both return to
+the allocator afterward.
+
+Release on Windows 10 build 19045.6456 with app-local WARP 1.0.22 and
+Agility SDK 1.620.2 passed all three cases with zero D3D12 debug warnings
+or errors. Physical GPU runs returned 77 on the available GTX 1080 Ti
+because it lacks mesh shader support. The application producers and their
+fences remain to be identified in a replay.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed xmem_shim
+ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_dual_' -V
+```
+
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
 empty vertex slot, and a recorded root signature that matches the bound

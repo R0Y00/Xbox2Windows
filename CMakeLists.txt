@@ -1406,6 +1406,15 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "$<TARGET_FILE:xmem_shim>" ${mode})
             set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         endforeach()
+        foreach(mode IN ITEMS ordered skip_srv skip_argument)
+            string(REPLACE "_" "-" fixture_mode "${mode}")
+            set(test_name startup_indirect_mesh_dual_${mode}_${backend})
+            add_test(NAME ${test_name} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
+                "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend}
+                "$<TARGET_FILE:xmem_shim>" dual-${fixture_mode})
+            set_tests_properties(${test_name} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endforeach()
     endforeach()
 endif()
 foreach(stage IN ITEMS mesh amplify amplified_mesh pixel)

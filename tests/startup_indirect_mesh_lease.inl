@@ -37,7 +37,8 @@ struct MeshLeaseWriter {
     }
 
     MeshLeaseWriter(ID3D12Device* d, ID3D12Device* g, const wchar_t* dll,
-                    ID3D12RootSignature* writer_root = nullptr, ID3D12PipelineState* writer = nullptr)
+                    ID3D12RootSignature* writer_root = nullptr, ID3D12PipelineState* writer = nullptr,
+                    const MeshLeaseWriter* shared = nullptr)
         : device(d), guest(g), xmem(LoadLibraryW(dll)), record_bytes(writer ? sizeof(old_groups) : sizeof(red)),
           alloc(function<Allocate>("XMemAllocatePhysicalPages")),
           map(function<Map>("XMemMapPhysicalPagesScatter")), free_pages(function<Free>("XMemFreePhysicalPages")),
@@ -45,11 +46,16 @@ struct MeshLeaseWriter {
     {
         check(SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", "1") &&
               SetEnvironmentVariableA("X2W_XMEM_GPU_MIRROR", "1") ? S_OK : E_FAIL, "enable XMem mirror");
-        const auto reserve = function<Reserve>("XMemVirtualAlloc");
-        constexpr UINT64 window = UINT64{16} << 30;
-        cpu = static_cast<unsigned char*>(reserve(nullptr, window, 0x20402000, 0x21, 4));
-        mirror = reinterpret_cast<UINT64>(reserve(nullptr, window, 0x20402000, 3, 0x801));
-        check(cpu && mirror ? S_OK : E_FAIL, "reserve mirrored XMem");
+        if (shared) {
+            cpu = shared->cpu + 3 * page;
+            mirror = shared->mirror + 3 * page;
+        } else {
+            const auto reserve = function<Reserve>("XMemVirtualAlloc");
+            constexpr UINT64 window = UINT64{16} << 30;
+            cpu = static_cast<unsigned char*>(reserve(nullptr, window, 0x20402000, 0x21, 4));
+            mirror = reinterpret_cast<UINT64>(reserve(nullptr, window, 0x20402000, 3, 0x801));
+            check(cpu && mirror ? S_OK : E_FAIL, "reserve mirrored XMem");
+        }
         ULONG_PTR count = 2;
         void* const addresses[]{cpu, cpu + page};
         check(alloc(0x280, &count, original) && count == 2 && map(addresses, 2, original) ? S_OK : E_FAIL,
@@ -239,6 +245,122 @@ void check_lease_debug(ID3D12InfoQueue* info)
         }
     }
     std::puts("D3D12 warnings/errors: 0");
+}
+
+bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar_t* xmem,
+                          ID3D12InfoQueue* info, const std::wstring& log_path,
+                          ID3D12RootSignature* writer_root, ID3D12PipelineState* group_writer,
+                          ID3D12RootSignature* root, IUnknown* pipeline, ID3D12CommandSignature* signature)
+{
+    MeshLeaseWriter srv(device, guest, xmem);
+    MeshLeaseWriter arguments(device, guest, xmem, writer_root, group_writer, &srv);
+    check(srv.published_page != arguments.published_page ? S_OK : E_FAIL, "writers use distinct XMem pages");
+    const auto queue = srv.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+    MeshLeaseDraw read{srv.address(), queue.Get(), black};
+    read.argument = arguments.placed.Get();
+    read.argument_offset = MeshLeaseWriter::word_offset;
+    const auto verify = [&](const char* label) {
+        return run(device, guest, nullptr, nullptr, root, pipeline, signature, DrawKind::mesh,
+                   false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false, &read);
+    };
+
+    srv.start();
+    if (!verify("cached mesh refuses missing argument writer with SRV producer held")) return false;
+    arguments.start();
+    const bool skip_srv = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT", nullptr, 0) != 0;
+    const bool skip_arguments = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT", nullptr, 0) != 0;
+    read.expected = skip_srv ? green : red;
+    read.expected_right = skip_arguments ? black : read.expected;
+    if (skip_srv || skip_arguments) {
+        auto& fresh = skip_srv ? arguments : srv;
+        auto& held = skip_srv ? srv : arguments;
+        fresh.finish();
+        if (!verify(skip_srv ? "cached mesh reads stale SRV and two fresh groups"
+                             : "cached mesh reads fresh SRV and one stale group")) return false;
+        check(held.completion->GetCompletedValue() == 0 ? S_OK : E_FAIL, "omitted writer stayed behind its gate");
+        held.finish();
+        check_lease_debug(info);
+        DeleteFileW(log_path.c_str());
+        return true;
+    }
+
+    read.queued = [&](ID3D12Fence* done) {
+        srv.finish();
+        arguments.open_after_wait_probe(done);
+    };
+    if (!verify("cached mesh reads fresh SRV and two fresh groups")) return false;
+    arguments.finish();
+    read.queued = {};
+    read.expected = black;
+    read.expected_right.reset();
+    for (auto* writer : {&srv, &arguments}) {
+        ULONG_PTR replacement{}, count = 1;
+        check(writer->alloc(0x280, &count, &replacement) && count == 1 ? S_OK : E_FAIL, "allocate replacement page");
+        void* const address = writer->cpu;
+        read.before_submit = [&] {
+            check(writer->map(&address, 1, &replacement) ? S_OK : E_FAIL, "remap live address after recording");
+            check(writer->inspect(writer->address()) != writer->published_page ? S_OK : E_FAIL,
+                  "submission sees a different physical page at the same address");
+        };
+        const bool ok = verify(writer == &srv ? "cached mesh refuses remapped SRV at submission"
+                                             : "cached mesh refuses remapped arguments at submission");
+        check(writer->map(&address, 1, writer->original) && writer->free_pages(1, &replacement) ? S_OK : E_FAIL,
+              "restore the writer's original mapping");
+        if (!ok) return false;
+    }
+    read.before_submit = {};
+
+    const auto gate = srv.create_fence();
+    struct ReleaseGate {
+        ID3D12Fence* gate;
+        ~ReleaseGate() { gate->Signal(1); }
+    } release{gate.Get()};
+    const auto native = native_object<ID3D12CommandQueue>(device, guest, queue.Get());
+    check(native->Wait(gate.Get(), 1), "hold the consumer of both leases");
+    const auto reusable_pages = [&] {
+        std::array<ULONG_PTR, 4> tokens{}, empty{};
+        std::array<void*, 4> addresses{};
+        ULONG_PTR count = tokens.size();
+        for (std::size_t i = 0; i < addresses.size(); ++i)
+            addresses[i] = srv.cpu + (8 + i) * MeshLeaseWriter::page;
+        check(srv.alloc(0x280, &count, tokens.data()) && count == tokens.size() &&
+              srv.map(addresses.data(), count, tokens.data()) ? S_OK : E_FAIL, "allocate four probe pages");
+        std::array<bool, 2> reusable{};
+        for (std::size_t i = 0; i < addresses.size(); ++i) {
+            const auto page = srv.inspect(srv.address() + (8 + i) * MeshLeaseWriter::page);
+            reusable[0] |= page == srv.published_page;
+            reusable[1] |= page == arguments.published_page;
+        }
+        check(srv.map(addresses.data(), count, empty.data()) && srv.free_pages(count, tokens.data()) ? S_OK : E_FAIL,
+              "release probe pages");
+        return reusable;
+    };
+    read.expected = red;
+    read.drop_recording = true;
+    read.queued = [&](ID3D12Fence*) {
+        srv.free_original();
+        arguments.free_original();
+        check(reusable_pages() == std::array<bool, 2>{false, false} ? S_OK : E_FAIL,
+              "neither leased page can be reused while the consumer is queued");
+        check(gate->Signal(1), "release the consumer of both leases");
+    };
+    if (!verify("cached mesh reads both leases after the guest unmaps them")) return false;
+    const auto deadline = GetTickCount64() + 3000;
+    while (reusable_pages() != std::array<bool, 2>{true, true}) {
+        check(GetTickCount64() < deadline ? S_OK : E_FAIL, "both slots return after the consumer fence");
+        Sleep(1);
+    }
+    std::puts("both XMem slots returned after the DIRECT consumer fence");
+
+    std::ifstream log{std::filesystem::path(log_path)};
+    const std::string lines{std::istreambuf_iterator<char>(log), {}};
+    log.close();
+    DeleteFileW(log_path.c_str());
+    check(lines.find("writer or live page identity changed (4 bytes)") != std::string::npos &&
+          lines.find("writer or live page identity changed (12 bytes)") != std::string::npos ? S_OK : E_FAIL,
+          "submission refused each remapped range independently");
+    check_lease_debug(info);
+    return true;
 }
 
 bool check_mesh_indirect_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar_t* xmem,

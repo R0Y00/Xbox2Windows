@@ -457,6 +457,7 @@ struct MeshLeaseDraw {
     IUnknown* argument{};
     UINT64 argument_offset{};
     std::optional<UINT> expected_right;
+    std::function<void()> before_submit;
 };
 
 void submit_wrapped(IUnknown* queue, IUnknown* list)
@@ -736,6 +737,19 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         rtv.ptr += device->GetDescriptorHandleIncrementSize(heap_kind);
     }
 
+    if (leased && leased->before_submit) {
+        // A submission refusal skips even the wrapped clear. Seed the color
+        // target separately to make the refusal readback deterministic.
+        check(!cached_depth_only ? S_OK : E_FAIL, "remap fixture requires a color target");
+        ComputeCommands seed(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            auto* target = targets[i].Get();
+            transition(seed.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            seed.list->ClearRenderTargetView(rtvs[i], clear, 0, nullptr);
+            transition(seed.list.Get(), target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+        }
+        seed.submit_and_wait(device);
+    }
     ComPtr<ID3D12CommandAllocator> allocator;
     check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create guest allocator");
     auto wrapped_list = begin_guest_list(guest, allocator.Get());
@@ -1002,6 +1016,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const auto queue = native_object<ID3D12CommandQueue>(device, guest, leased->queue);
         ComPtr<ID3D12Fence> completion;
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)), "create mesh consumer fence");
+        if (leased->before_submit) leased->before_submit();
         submit_wrapped(leased->queue, wrapped);
         check(queue->Signal(completion.Get(), 1), "signal mesh consumer completion");
         if (leased->drop_recording) wrapped_list.Reset();
@@ -1326,6 +1341,10 @@ int main(int argc, char** argv) try
     }
     wchar_t lease_xmem[MAX_PATH]{};
     const bool lease_fixture = GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_XMEM", lease_xmem, MAX_PATH) != 0;
+    const bool dual_lease = lease_fixture && GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DUAL", nullptr, 0) &&
+        GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0);
+    if (dual_lease)
+        check(SetEnvironmentVariableA("X2W_MESH_INDIRECT_XMEM", "1") ? S_OK : E_FAIL, "enable dual XMem dependencies");
     if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
@@ -1382,7 +1401,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || refusal_census) {
+    if (indexed || lease_arguments || dual_lease || refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1454,6 +1473,11 @@ int main(int argc, char** argv) try
             guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
             {}, depth_only ? 0 : lease_fixture ? 1 : 3, depth_only);
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
+        if (dual_lease) {
+            const auto groups = writer_pipeline(device.Get(), writer.Get(), "write_two_mesh_groups");
+            return check_mesh_dual_xmem(device.Get(), guest.Get(), lease_xmem, info.Get(), log_path,
+                                        writer.Get(), groups.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
+        }
         if (lease_fixture) {
             MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);
             const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);

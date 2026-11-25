@@ -2734,14 +2734,25 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         draw_arguments = scratch;
         draw_offset = 0;
     }
+    const auto& pipeline = pass.indirect_graphics;
+    const UINT srv = pipeline.cached_mesh ? pipeline.cached_srv_root : UINT_MAX;
+    const bool leased_arguments = mesh && mesh_xmem_indirect() && (!pipeline.cached_mesh || srv != UINT_MAX) &&
+        info->placement == Placement::copied_buffer;
+    std::array<MeshXMemRead, mesh_range_count> reads{};
+    if (srv != UINT_MAX)
+        reads[mesh_srv_range] = {pass.root_address[srv], sizeof(UINT), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    if (leased_arguments)
+        reads[mesh_argument_range] = {base + offset, bytes, argument_state};
+    if (srv != UINT_MAX || leased_arguments)
+        if (const char* failure = record_mesh_xmem_reads(self, reads))
+            return refuse(failure, srv != UINT_MAX ? indirect_graphics_pipeline : indirect_other);
     if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
         if (pass.indirect_graphics.cached_mesh) {
-            const UINT srv = pass.indirect_graphics.cached_srv_root;
             if (srv != UINT_MAX) {
-                if (const char* failure = bind_mesh_xmem_srv(self, srv, pass.root_address[srv]))
-                    return refuse(failure, indirect_graphics_pipeline);
+                const auto& read = reads[mesh_srv_range];
+                list->SetGraphicsRootShaderResourceView(srv, read.resource->GetGPUVirtualAddress() + read.offset);
             }
             for (UINT i = 0; i < pass.root->size(); ++i) {
                 if (i == srv) continue;
@@ -2767,10 +2778,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
-    if (mesh && !pass.indirect_graphics.cached_mesh && mesh_xmem_indirect() &&
-        info->placement == Placement::copied_buffer) {
-        if (const char* failure = record_mesh_xmem_read(self, base + offset, bytes, argument_state, draw_arguments, draw_offset))
-            return refuse(failure);
+    if (leased_arguments) {
+        draw_arguments = reads[mesh_argument_range].resource;
+        draw_offset = reads[mesh_argument_range].offset;
     } else if (!rect_list) {
         require_state(self, resource, argument_state);
     }
