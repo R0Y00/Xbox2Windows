@@ -31,10 +31,25 @@ records. The control expects the first blend patch to win and must fail.
 
 Command-list slot 24 (`OMSetStencilRef`, the desktop slot) passes its reference to the desktop list, as slots 21 to 23 do for viewports, scissors and the blend factor, so a translated draw whose pipeline enables the stencil test compares against it. A closed list ignores the call. The slot number is the desktop one and has not been seen in a title log; `startup_stream_depth_{warp,hardware}` checks the references 0x5A, 0x5B, 0 and 0xFF against a stencil cleared to the matching value.
 
+## Command-list UAV barriers
+
+Render-mode slot 26 forwards unflagged UAV barriers on an open direct or compute list. A null
+resource orders UAV accesses across resources. A named resource must be a wrapper around a local
+desktop resource with UAV access. Transition and aliasing records are skipped because desktop
+resource states and heap aliases are managed by the shim. The slot returns zero console actions.
+The console slot and record layout are also documented by the
+[ztrx command-list implementation](https://github.com/Zettrox/ztrx/blob/90b529f878a470fec9bf07b7be316bc769a12232/crates/victory-gpu/src/list.rs).
+
+Build `startup_present_producer` and run
+`ctest --preset release --no-tests=error -R '^startup_list_uav_barriers_(warp|hardware)$' -V`.
+The source-built caller submits both supported forms and checks the forwarding log, with refusal
+controls for other barrier types, flagged barriers, invalid resources and arrays, and closed lists.
+
 ## Occlusion queries
 
 Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
-shows only that four console methods sit in 26 to 31 (32 is `SetDescriptorHeaps`, desktop 28 plus four) and that
+places `ResourceBarrier` at 26 and four additional console methods in the 26 to 31 range
+(32 is `SetDescriptorHeaps`, desktop 28 plus four). It also shows that
 the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
 implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
 `ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a
@@ -419,11 +434,9 @@ token null with zero words, and the R8 texels. The control publishes the support
 
 ### Per-reason refusal census per pipeline key
 
-[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) is a standalone,
-device-free header ready to be wired into runtime refusal callers (such as slot-67 compute dispatch
-and binding paths; it is not yet wired into `d3d12_xs_device.cpp` or the five-second report). It
-tracks every distinct `(key, reason)` refusal pair separately instead of overwriting earlier reasons on
-the same key with the last refusal:
+[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) tracks every distinct
+`(key, reason)` refusal pair separately instead of overwriting earlier reasons on the same pipeline key
+with the last refusal:
 
 - Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
   call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
@@ -431,6 +444,17 @@ the same key with the last refusal:
 - `report(emit, true)` skips emission when nothing changed since the previous periodic report and emits
   the summary line plus only the `(key, reason)` entries whose counts grew; `report(emit, false)`
   prints the full table without hiding the next periodic delta.
+- [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) and
+  [`d3d12_draw.inl`](../src/startup_stubs/d3d12_draw.inl) wire an `indirect-draw` census instance into
+  `draw_translated_indirect`: each refused translated indirect draw with a resolved shader key records
+  `(shader_key, refusal_code)` (for example `missing_guest_root`, `sampled_texture_mismatch`,
+  `unsupported_resource_or_entry`, `incomplete_table_buffer`), keeps logging the first occurrence of
+  each of the first 8 distinct `(key, reason)` pairs even after the 32-call refusal log limit is spent,
+  emits deltas in the five-second report, and appends the full `x2w-d3d12 indirect-draw refusals:` lines
+  to `x2w_d3d12_census_report` whenever at least one refusal occurred (leaving zero-refusal runs at the
+  existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
+  are not counted in this census (matching the per-call log gate), so `total` counts only refusals
+  attributed to a resolved translated shader key rather than all `ExecuteIndirect` refusals.
 
 Check without a device via
 `ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
@@ -438,6 +462,14 @@ the pass run verifies interleaved reasons across two keys, detail limits, overfl
 reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCensus` with
 `X2W_CENSUS_KEEP_LAST` and `X2W_CENSUS_KEEP_FIRST`, print both expected reasons with counts in their
 mismatch output, and are marked `WILL_FAIL`.
+
+Check the runtime wiring on WARP and hardware via
+`ctest --preset dev --no-tests=error -R '^startup_indirect_translated_refusal_census_(warp|hardware|control_warp)$' -V`:
+the pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
+key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
+succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
+and both per-call log lines for the shared key; the control replaces the second refusal on key 1 with a
+valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.
 
 ## Root constant buffer views
 
@@ -617,6 +649,12 @@ that its fixture's module and export are in that list, that a source-built DLL l
 movie-player module name is not hooked by default, that each of its 7 export calls is counted with
 `--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
 
+`run.ps1 -TraceApi` sets `X2W_TRACE_API=1` for the child process and enables
+`x2w-api` lines for individual runtime provider methods. Use `-TraceCalls` for
+the debugger breakpoints described above. The switches work independently and
+can be combined. A line containing `x2w-runtime provider` and `(proxied as #…)`
+confirms that the runtime wrapped that provider even when method tracing is off.
+
 A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
 heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
 used, so every allocation and free costs more. The debugger starts the process with
@@ -663,7 +701,11 @@ requests. The watcher's first pass retries every earlier failure once, so a tran
 requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
 ready marker is not retried during the run (the runtime writes each request once and never rewrites
 it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
-to `<key>.fail` as `translator error: ...` instead of stopping the scan. A worker killed from outside
+to `<key>.fail` as `translator error: ...`, ending with the function, file name and line that raised
+it, skipping standard-library frames (`(in scalar_select, gfx2hlsl.py line 1234)`), instead of
+stopping the scan. An operand refusal
+in `<key>.fail` names the instruction that refused it (`operand '-v30' in v_and_b32_e64`); the
+refusal's own message, which `--refusals` counts, stays `operand '-v30'`. A worker killed from outside
 (for example out of memory) ends that watcher pass only; its requests are retried on the next pass.
 FXC is located as described for `X2W_SHADER_CACHE` under [Switches](#switches). A scan with more than
 one pending request translates them in parallel processes, one per logical processor (at most 61 on
@@ -1956,15 +1998,23 @@ These are measured on one executable; treat them as hypotheses for others.
   pipeline, submits the wrapped list, waits for its fence and checks all 32 RGBA pixels on WARP and
   hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
-  Other stage combinations and full stream rasterizer/depth state remain open.
+  A stream `RASTERIZER` or `RASTERIZER1` subobject sets the translated pipeline's fill, cull and depth
+  clip. `RASTERIZER1` stores depth bias as a float; a value that is not an integer in the desktop range
+  refuses the pipeline. The cull check is
+  `ctest --preset release --no-tests=error -R "^startup_stream_rasterizer_"`.
+  The ignore control expects the no-cull readback and fails. Stream depth-stencil state is already
+  applied on this path. Geometry, hull, domain and compute stages remain open.
 - Translated draws use the bound typed RTV formats to request colour-export variants. The
   manifest's `targets` line lists exported slots. A separate `rtv1` line identifies the base
   shader and the ordered RTV formats, and the draw rejects a variant with a mismatched line.
   Uncompressed `R32G32B32A32`, `R32G32` and `R32` UINT and SINT outputs use integer shader
   signatures (`startup_mrt_*` reads back every stored word on WARP and hardware). `R32G32_FLOAT` and
   `R32_FLOAT` use the same bit-preserving path as `R32G32B32A32_FLOAT`, covering a NaN payload and a
-  negative denormal. Integer formats with 8- or 16-bit channels are refused at translation with
-  `unverified UINT/SINT RTV format <n>`.
+  negative denormal. Uncompressed exports to `R8G8B8A8_UINT` and `R8G8B8A8_SINT` use unsigned
+  and signed integer shader outputs. The output merger clamps each channel to 0–255 or −128–127
+  respectively. With export words `ffffffff ffffff7f 00000080 00000100`, the stored bytes are
+  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The other 8- and 16-bit integer views
+  still return `unverified UINT/SINT RTV format <n>`.
   Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
   undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
@@ -2618,9 +2668,15 @@ descriptions with:
   alignment and bounds, adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards
   to `CreateShaderResourceView` (slot 18).
 
-Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`) are not
-supported and are refused. A view needs an actual built structure with the placed AS role and
-lifecycle checks, which has no device test yet.
+Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
+`src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's
+address when `Location` is zero, do not read the resource description, and require `DXGI_FORMAT_UNKNOWN`
+with `D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING` (`unsupported_description`). The view is published through
+slot 18 with no resource and the desktop GPU address of the same byte when the address is 256-byte aligned
+(`as_unaligned`), starts inside one live placed (slot 133) buffer (`as_not_placed`) and that buffer was
+created in `D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE` (`as_wrong_state`). Any other case
+leaves the destination descriptor unchanged and logs the reason. The pure checks run on any host
+(`ctest -R '^startup_memory_srv_as'`); publishing a view on a device has not been run yet.
 
 Typed element bytes come from the format (1 to 16 bytes). Formats that cannot back a typed buffer SRV
 (sRGB, BGRA, block-compressed, depth/stencil, typeless, planar) are refused with
@@ -2640,6 +2696,20 @@ element, and widths, addresses and first elements above 4 GiB. Its `_control` ru
 `exact-fit`, `first-32`) expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises
 only the resolve path with valid addresses on a device, so it does not cover the rejections.
 
-- `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
-- `ctest --preset release --no-tests=error -R '^startup_memory_srv_buffer_.*_control$' -V`
-- `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`
+`startup_memory_srv_volume` is device-free and validates volume (Texture3D) memory SRVs in
+device slot 70 (`supports_volume_memory_srv`, `address_view_fits`, `volume_texture_bytes`).
+It pins the supported layout to `D3D12_TEXTURE_LAYOUT_UNKNOWN`, enforces `D3D12_SRV_DIMENSION_TEXTURE3D`,
+validates block-compressed dimensions and sizing (BC3, BC7), and validates mip bounds. Its `_control`
+runs (`layout`, `2d-view`, `3d-view`, `mips-overflow`) expect wrong answers and must fail.
+In device runtime, `address_texture_bytes` uses `SliceFootprints::size` to account for desktop copyable
+footprint layout (256-byte row pitch alignment and 512-byte subresource placement alignment), while
+`volume_texture_bytes` provides device-free packed texel byte sizing.
+`startup_address_volume_srv_*` exercises volume SRVs on a device (WARP and hardware)
+with multiple depth slices and mip levels, where footprint row pitch (256 bytes) exceeds packed row bytes (16 bytes),
+and verifies refusal lines for mismatched view dimensions, short backings, out-of-bounds mips, explicit clamps,
+and console layouts. On Windows 11 Build 26100 with an AMD Radeon RX 6600M (driver 32.0.21045.11001),
+`startup_address_volume_srv_hardware` passed with all 32 RGBA pixels exact.
+
+- `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer|volume)$' -V`
+- `ctest --preset release --no-tests=error -R '^startup_memory_srv_(buffer|volume)_.*_control$' -V`
+- `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv|volume_srv)_' -V`
