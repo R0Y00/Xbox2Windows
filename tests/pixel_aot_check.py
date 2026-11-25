@@ -10356,13 +10356,17 @@ def rne_f16(value):
 
 # Mixed-precision VOP3P FMA fixture covering v_fma_mix_f32, v_fma_mixlo_f16, v_fma_mixhi_f16,
 # op_sel / op_sel_hi, |.| / -, clamp, inline f16 constants, and untouched-half preservation.
+# Field assignment as in LLVM 15 (SelectVOP3PMadMixModsImpl, printOpSelHi): op_sel_hi marks a
+# binary16 source and op_sel picks the high half of that source's register (#2054).
 FMA_MIX_BODY = [
     "v_mov_b32_e32 v19, s45",
     "v_mov_b32_e32 v20, s46",
     "v_mov_b32_e32 v21, s47",
     "v_mov_b32_e32 v22, 0x40003c00",
-    "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
-    "v_fma_mixlo_f16 v22, s44, 0.5, v21 op_sel:[1,1,0]",
+    # |s44.hi| * -(v19.lo) + v20: two binary16 sources, the first one high, then a binary32 addend.
+    "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,0,0] op_sel_hi:[1,1,0]",
+    # s44.lo * 0.5 + v21: binary16 low halves for src0 and src1, binary32 src2.
+    "v_fma_mixlo_f16 v22, s44, 0.5, v21 op_sel_hi:[1,1,0]",
     "v_fma_mix_f32 v23, v22, 1.0, 0 op_sel:[1,0,0] op_sel_hi:[1,0,0]",
     "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
     "v_cvt_f32_f16_e32 v13, v22",
@@ -10411,7 +10415,8 @@ def check_fma_mix_draw(directory, compiler, renderer, backend):
     for set_idx, old, new, label in (
         (0, "v_fma_mix_f32 v12, |s44|, -v19, v20", "v_fma_mix_f32 v12, s44, -v19, v20", "abs modifier"),
         (0, "v_fma_mix_f32 v12, |s44|, -v19, v20", "v_fma_mix_f32 v12, |s44|, v19, v20", "neg modifier"),
-        (0, "op_sel:[1,1,0] op_sel_hi:[1,0,0]", "op_sel:[1,1,0]", "op_sel_hi half select"),
+        (0, "op_sel:[1,0,0] op_sel_hi:[1,1,0]", "op_sel_hi:[1,1,0]", "op_sel half select"),
+        (0, "op_sel:[1,0,0] op_sel_hi:[1,1,0]", "op_sel:[1,0,0] op_sel_hi:[1,0,0]", "op_sel_hi binary16 source"),
         (0, "v_fma_mixhi_f16 v22, -|v19|", "v_fma_mixlo_f16 v22, -|v19|", "mixhi half preservation"),
         (1, "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
          "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0]", "mixhi clamp"),
@@ -10424,6 +10429,37 @@ def check_fma_mix_draw(directory, compiler, renderer, backend):
                                capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
+
+
+def check_fma_mix_operand_selection():
+    """v_fma_mix*: op_sel_hi makes a source binary16 and op_sel picks its high half, as in LLVM 15 (#2054).
+
+    Each source position is checked on its own, so a lowering that swaps the two fields, or reads
+    them for the wrong source, refuses or emits a different operand.
+    """
+    sources = ("alu20", "alu21", "alu22")
+
+    def operands(kind, mods):
+        program = with_constants(["v_mov_b32_e32 v19, s45", "v_mov_b32_e32 v20, s46", "v_mov_b32_e32 v21, s47",
+                                  f"v_fma_mix{kind} v12, v19, v20, v21 {mods}".rstrip()])
+        lines = [line for line in translate(program).splitlines() if "mad(" in line]
+        assert len(lines) == 1, lines
+        return lines[0].split("mad(", 1)[1]
+
+    for kind in ("_f32", "lo_f16"):
+        assert operands(kind, "").startswith(", ".join(sources) + ")"), kind
+        for pos in range(3):
+            bits = ",".join("1" if k == pos else "0" for k in range(3))
+            low = [f"widen16(asuint({s}))" if k == pos else s for k, s in enumerate(sources)]
+            high = [f"widen16(asuint({s}) >> 16)" if k == pos else s for k, s in enumerate(sources)]
+            got = operands(kind, f"op_sel_hi:[{bits}]")
+            assert got.startswith(", ".join(low) + ")"), (kind, pos, got)
+            got = operands(kind, f"op_sel:[{bits}] op_sel_hi:[{bits}]")
+            assert got.startswith(", ".join(high) + ")"), (kind, pos, got)
+            # op_sel without op_sel_hi names a half of a binary32 source, which has no defined meaning.
+            program = with_constants(["v_mov_b32_e32 v19, s45", "v_mov_b32_e32 v20, s46", "v_mov_b32_e32 v21, s47",
+                                      f"v_fma_mix{kind} v12, v19, v20, v21 op_sel:[{bits}]"])
+            expect_value_error(translate, program, "op_sel selects a half only for a binary16 (op_sel_hi) source")
 
 
 def sopc_group() -> list[str]:
@@ -18015,6 +18051,7 @@ def _run_controls_serial():
 
 def check_controls(directory, *, parallel=True):
     check_sampler_descriptor_refusals()
+    check_fma_mix_operand_selection()
     tasks = _control_tasks()
     cpu_count = os.cpu_count() or 1
     # ProcessPoolExecutor on Windows enforces max_workers <= 61 (_MAX_WINDOWS_WORKERS).

@@ -2616,6 +2616,13 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
 
 
 def parse_fma_mix(rest):
+    """Parse v_fma_mix* operands; return (operands, op_sel, op_sel_hi, clamp) as printed.
+
+    The field meaning follows LLVM 15 (AMDGPUDAGToDAGISel::SelectVOP3PMadMixModsImpl and
+    AMDGPUInstPrinter::printOpSelHi): op_sel_hi marks a binary16 source, and op_sel selects the
+    high half of that source's register. op_sel on a binary32 source is not a half selection,
+    so it is refused rather than given a meaning.
+    """
     parts_ = rest.split(", ")
     if len(parts_) != 3:
         raise ValueError("Invalid mixed-precision operand count")
@@ -2637,8 +2644,8 @@ def parse_fma_mix(rest):
             raise ValueError(f"Unsupported mixed-precision modifier {mod}")
     op_sel = opts.get("op_sel", [0, 0, 0])
     op_sel_hi = opts.get("op_sel_hi", [0, 0, 0])
-    if any(hi and not f16 for f16, hi in zip(op_sel, op_sel_hi)):
-        raise ValueError("High-half selection requires an f16 operand")
+    if any(hi and not f16 for hi, f16 in zip(op_sel, op_sel_hi)):
+        raise ValueError("op_sel selects a half only for a binary16 (op_sel_hi) source")
     return operands, op_sel, op_sel_hi, clamp
 
 
@@ -6076,8 +6083,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             tokens, op_sel, op_sel_hi, clamp = parse_fma_mix(rest)
+            # op_sel_hi makes a source binary16; op_sel then picks its high half (see parse_fma_mix).
             args = [fma_mix_operand(t, f16, hi, scalar, vector, pending, sample_dest)
-                    for t, f16, hi in zip(tokens, op_sel, op_sel_hi)]
+                    for t, f16, hi in zip(tokens, op_sel_hi, op_sel)]
             expr = f"mad({args[0]}, {args[1]}, {args[2]})"
             if clamp:
                 expr = f"saturate({expr})"
