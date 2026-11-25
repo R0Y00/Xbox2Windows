@@ -225,7 +225,7 @@ WRONG = (("UNORM divided by 2^n", ("unorm divisor",)), ("UNORM truncated", ("uno
          ("SNORM without the clamp", ("snorm unclamped",)), ("SINT16 zero-extended", ("sint zero-extended",)),
          ("FLOAT16 halves swapped", ("swap halves",)), ("FLOAT16 denormals flushed", ("flush halves",)),
          ("legacy format ignored", ("legacy ignored",)), ("neighbouring element", ("neighbour element",)))
-# 24 independent launches (13 of them also compile a mutated source); the Win2025 slots have 11 vCPUs.
+# Independent launches (the mutation ones also compile a mutated source); the Win2025 slots have 11 vCPUs.
 LAUNCH_THREADS = 6
 FIXED = f"{aot.DESCRIPTOR_LEGACY_FIXED:#x}u"
 # label, old, new, and the run it must fail: None for the valid two-group run, else an INVALID index.
