@@ -204,12 +204,14 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-13`. Older translations evaluate `s_brev_b32` of a
+The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
 constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
+rounding mode.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
-Earlier revisions can also carry a stale scalar symbol across a join or read a stale SCC after
-an operation on a descriptor word.
+Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
+an operation on a descriptor word, or lack the vertex buffer-store lowering.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
@@ -329,6 +331,28 @@ Checks:
   gets, so the check holds with and without the stand-in. R8G8B8A8_UNORM is drawn as a control
   and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
   B5G5R5A1 view of a B4G4R4A4 target must be refused.
+
+## Shared-exponent render and unordered-access targets
+
+The packed-target mapping also covers single-sample 2D textures and arrays in
+`R9G9B9E5_SHAREDEXP` (67) that request a render target, a typed UAV, or both.
+When the adapter lacks one of the requested uses and supports all of them for
+`R11G11B10_FLOAT` (26), the stand-in creates format 26. Sampled-only resources,
+depth-stencil, multisampled textures and other dimensions keep format 67.
+The format query also preserves native format 67 where it supports the requested
+uses. [Microsoft Direct3D format specification](https://microsoft.github.io/DirectX-Specs/d3d/D3D12R9G9B9E5Format.html)
+
+The stand-in carries a format-67 tag. RTVs, UAVs and SRVs naming 67 on that
+resource use format 26, including SRVs reconstructed by the translated draw.
+An optimized clear value naming 67 follows the replacement format. A format-67
+view on a native format-67 texture is passed through. A format-67 view on an
+incompatible texture is refused.
+
+Both formats use 32 bits per texel and clamp negative values to zero.
+Format 26 has 6/6/5 mantissa bits with a separate exponent per channel.
+Format 67 has three 9-bit mantissas with a shared exponent. Rendered and
+UAV-written values can round differently. Uploads and copies in the format-67
+bit layout are not converted.
 
 ## Descriptor heap starts that are not addresses
 
@@ -455,6 +479,16 @@ with the last refusal:
   existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
   are not counted in this census (matching the per-call log gate), so `total` counts only refusals
   attributed to a resolved translated shader key rather than all `ExecuteIndirect` refusals.
+- [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) also wires an `indirect-other`
+  census instance into `list_execute_indirect`: every `ExecuteIndirect` pre-check refusal counted under
+  `other` records `(key, reason_code)` (using the bound pipeline's known shader key when available, or
+  `0000000000000000` when no console pipeline key is resolved), distinguishes render-target and state
+  checks (`no_render_target`, `multiple_render_targets`, `depth_target_bound`,
+  `missing_viewport_or_scissor`, `target_format_mismatch`, `graphics_multi_command`,
+  `argument_outside_placed_buffer`, etc.), keeps logging the first occurrence of each of the first 8
+  distinct `(key, reason)` pairs even after the 16-call global refusal log limit is spent, emits deltas
+  in the five-second report, and appends the full `x2w-d3d12 indirect-other refusals:` lines to
+  `x2w_d3d12_census_report` whenever at least one `other` refusal occurred.
 
 Check without a device via
 `ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
@@ -464,12 +498,18 @@ reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCens
 mismatch output, and are marked `WILL_FAIL`.
 
 Check the runtime wiring on WARP and hardware via
-`ctest --preset dev --no-tests=error -R '^startup_indirect_translated_refusal_census_(warp|hardware|control_warp)$' -V`:
-the pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
+`ctest --preset dev --no-tests=error -R '^startup_indirect_(translated|other)_refusal_census_(warp|hardware|control_warp)$' -V`:
+the `translated` pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
 key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
 succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
-and both per-call log lines for the shared key; the control replaces the second refusal on key 1 with a
+and both per-call log lines for the shared key; its control replaces the second refusal on key 1 with a
 valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.
+The `other` pass runs warm up one translated pipeline key, interleave `missing_viewport_or_scissor` and
+`argument_outside_placed_buffer` on that key alongside `graphics_multi_command` on key `0` (plus
+non-`other` placeholder, graphics-pipeline and compute-pipeline refusals that must not be counted), and
+verify `x2w_d3d12_census_report` (4 refusals, 2 keys, 3 pairs, 0 overflow, no `indirect-draw` lines)
+and the three per-call log lines; its control replaces the second refusal on key 1 with a valid draw and
+must report `total 3; distinct keys 2, distinct pairs 2` as a mismatch.
 
 ## Root constant buffer views
 
@@ -886,6 +926,67 @@ Its `wrong_group` control swaps the group size in the state block and must misma
 request, translation, bytecode and dispatch fit together. It does not prove the state-block reading, because
 the fixture builds the block at the offsets the translator reads.
 
+### Shader requests from the archive, before a run
+
+`tools/startup/archive_requests.py <archive> <shader cache> [--roots <dir or req_*.root> ...]` writes
+requests without starting the title, then `gfx2hlsl.py --pending <shader cache>` translates them:
+
+```powershell
+python -B tools/startup/archive_requests.py <shader archive> out/startup/shader_cache
+python -B tools/startup/gfx2hlsl.py --pending out/startup/shader_cache
+```
+
+A startup run that traced every DirectStorage read showed where the native programs come from:
+zlib streams in the shader archive that start on 64-byte boundaries and inflate to 64 KiB. Inflated
+offline, those streams hold the exact bytes the runtime later records. Each program has a 36-byte
+header followed by `s_inst_prefetch`, is padded in 64-byte blocks and starts on a 256-byte step,
+and in every measured pipeline the vertex program directly follows the pixel program. The tool
+carves every program that ends in `s_endpgm` (an all-zero block inside a program would cut it
+short), pairs each pixel program with a vertex program that starts on the next 256-byte step
+and writes `req_<key>.{a,b,root}` with the runtime's key.
+
+What it cannot take from the archive:
+
+- **Root signatures.** None of the recorded root signatures occurs in the archive or the
+  executable; the title appears to serialize them at run time. The tool reads `req_*.root` files
+  from earlier runs (by default those in the cache) and writes each pair once per distinct root.
+  A key is only used when the title binds that pair with that root, so the extra requests cost
+  translation time and nothing else.
+- **Pipelines the title builds from other sources.** Programs embedded in the executable as DXBC
+  containers are not in the archive.
+- **Other pairings.** A program shared by several pipelines, or a pair that is not adjacent, is
+  only found by a run (`run.ps1 -Translate`).
+- **Programs cut off at the end of a stream.** A zlib stream that starts on the 64-byte boundary
+  right after the previous one continues it, and the two are carved as one, so a program split
+  between them is kept. A program that reaches the end of such a joined run is skipped.
+
+A stream that would inflate past 1 MiB is counted as `oversized` and skipped without inflating it in
+full, and a joined run stops growing at 64 MiB. A request is written as `.b`, `.root`, then `.a`;
+if one part cannot be written, no `.a` and no temporary file are left and the run exits with an
+error, as it does when the archive yields no pair at all.
+
+In one local measurement the tool joined 1,079 zlib streams into 800 runs, carved 4,982 programs
+(2,730 pixel, 2,115 vertex, 137 other) and wrote 3,774 requests for 1,258 pairs and three recorded
+root signatures in 22 s. Eight of the eleven pipelines that a cold run recorded were among them with
+identical keys, and their translations (`<key>.txt`, both `.hlsl` files and both `.cso` files) were
+byte-identical to those from the run. The other three were two pipelines whose programs are DXBC
+containers in the executable and one pipeline whose programs were not carved.
+
+Check with `python3 -B tests/startup_archive_requests_check.py` (ctest `startup_archive_requests`).
+On a synthetic archive built from documented instruction words, each adjacent pixel/vertex pair
+becomes one request per root, and the test computes the expected keys with its own copy of the
+runtime's hash. Controls that write nothing:
+
+- a pixel program followed by a pixel program, or a vertex program without a pixel program before it;
+- a vertex program one empty step after its pixel program, or after a pixel program without `s_endpgm`;
+- a program without the header tag, or a pair at offsets that are not a multiple of 4;
+- a pair that reaches the end of its stream, or a pair in a stream off the 64-byte grid;
+- an empty or duplicate root file, an oversized stream, or a run without root signatures.
+
+A pair split between two consecutive zlib streams is carved whole. A blocked `.root` write leaves no
+`.a` and no temporary file and fails the run, as does an archive without pairs. A second run writes
+nothing new.
+
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
 did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
@@ -913,6 +1014,21 @@ text is grouped as `other (text omitted)` and never copied; raw snippets stay in
 `aliased` or `not aliased` field. Those lines are not counted as unhandled; they are counted by
 outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
 (or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
+
+The `ExecuteIndirect` table reports the highest sampled cumulative count for each outcome and
+command-signature kind in the `x2w-render indirect:` census. A repeated snapshot does not increase
+any count. Each cell can come from a different sample, so avoid summing the cells as one run's total
+when scanning multiple runs. The section appears only after a complete census line and can show zero
+forwarded `dispatchmesh` calls alongside a graphics-pipeline refusal count. Forwarded counts describe
+the runtime's forwarding path. GPU completion and image readback require separate evidence.
+
+The GPU Memory Budget section uses complete `x2w-budget` heartbeat lines from
+`X2W_D3D12_BUDGET=1`. It counts samples above the local DXGI budget and prints
+the sample with the highest usage-to-budget ratio, plus the sample with the most
+retained texture bytes. Each row keeps the usage, budget and texture counters
+from that same heartbeat. Samples with an unavailable or zero local budget
+still contribute texture counts. The over-budget count describes observations
+in the supplied logs.
 
 The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
 memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not
@@ -978,6 +1094,20 @@ Archive each run's logs together with a copy of `shader_cache/`, and leave the c
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
 
+**Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies the graphics, RTV variant and slot 67 compute requests of the old cache under the keys of the current revision, computed with `pipeline_key` and `compute_key` of the `gfx2hlsl.py` next to it. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools\startup\shader_cache_rekey.py out\startup\shader_cache out\startup\shader_cache_rekeyed
+.\out\pe-env\Scripts\python.exe -B tools\startup\gfx2hlsl.py --pending out\startup\shader_cache_rekeyed
+robocopy out\startup\shader_cache_rekeyed out\startup\shader_cache /XC /XN /XO
+```
+
+1. The re-key step only reads the old cache and writes request files (`req_*`) only, never results or `.fail`. A file already in the new directory is left as it is, so a second run writes nothing. It reads every request before it writes: if a part is missing or unreadable, or an RTV variant is malformed or names a base that is not in the cache, it prints how many, writes nothing and exits with 1. Slot 57 and slot 86 mesh requests have their own key strings and are not re-keyed. `X2W_TRANSLATE_JOBS` sets the number of hashing processes.
+2. `--pending` translates the re-keyed requests offline, as it does for a running title's cache.
+3. The `robocopy` switches skip every file that already exists in the cache, so results the runtime or a later pass wrote are kept. A `robocopy` exit code below 8 means success: 1 is set when files were copied, and 2 is set because the cache holds files that the new directory does not. A code of 8 or more is a failure. On Linux, run the same steps with `./out/pe-env/bin/python` and merge with `cp -rn out/startup/shader_cache_rekeyed/. out/startup/shader_cache/`, which also keeps existing files.
+
+`tests/startup_shader_cache_rekey_check.py` checks the tool on synthetic requests only: the names match the current keys, a newer revision gives other names, a second run and a current cache change nothing, and an incomplete request or an RTV variant without its base writes nothing. Re-keying recovers the requests, not the translations: some re-keyed pipelines can still fail to translate, which is separate from the cache key. Nothing here shows that a title runs.
+
 When `fxc` is available, a request that later translates loses its `.fail`. In manifest-only mode (`X2W_FXC` empty) the old `.fail` stays, so on a kept cache the `.fail` categories in `triage.md` can include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
 
 ### 3. Measure a run against the previous one
@@ -997,6 +1127,18 @@ x2w-render indirect: forwarded: drawindexed 3; refused graphics-pipeline: drawin
 ```
 
 `graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal, counted under the signature's kind whenever the signature is known. The `x2w-render ExecuteIndirect refused` lines still stop after 16. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
+
+### Optional: Tracy zones
+
+For a timeline instead of the counters, configure a separate build tree with `-DX2W_TRACY=ON`. This is a developer-only build, off by default and in every preset and workflow. Do not use it for a run that must stay offline: the Tracy client opens a TCP listener (from port 8086 up, on 127.0.0.1 only) in each instrumented process.
+
+- **Source.** Configure fetches [Tracy](https://github.com/wolfpld/tracy) v0.15.0, pinned to commit `f2a4f2529e7e71844c9e434b877770a21ecf7587`, with `FetchContent` (network needed at configure time). `-DFETCHCONTENT_SOURCE_DIR_TRACY=<checkout>` uses an existing checkout instead, and `-DFETCHCONTENT_FULLY_DISCONNECTED=ON` forbids any download. Nothing from Tracy is committed here. Tracy is copyright Bartosz Taudul and others, 3-clause BSD license; its `LICENSE` ships in the fetched source, and a redistributed instrumented build must carry it.
+- **Client settings.** On-demand (nothing is recorded until a profiler connects), localhost only, no broadcast, no call stacks, no system tracing and no crash handler.
+- **Output.** One shared `TracyClient.dll` is linked into `d3d12_xs.dll`, `XCRDAPI.dll` and `xmem.dll`; copy it beside them.
+- **Zones.** `ExecuteCommandLists`, `Present` (with a frame mark), the frame-wait sleep, window present, desktop pipeline creation, `device_memory_srv` with its resource scans, each DirectStorage request, and the xmem page map and physical write. `src/startup_stubs/profile_zone.h` defines the macros.
+- **Off.** Without the option nothing is fetched, defined or linked, and the macros expand to nothing.
+
+To capture without a GUI, build Tracy's `capture` tool from the same checkout (`cmake -S <checkout>/capture -B <dir>`; that project fetches its own dependencies), start `capture -o run.tracy -a 127.0.0.1 -s <seconds>` and then the instrumented run. Open the file with the Tracy profiler, or export zone statistics with `csvexport`.
 
 ### 4. Census, then rank
 
@@ -1192,6 +1334,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
+| `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1254,11 +1397,86 @@ those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
 
+`X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for committed
+2D textures that have one sample, no render-target, depth-stencil or
+unordered-access flag, and live in a default heap without heap flags:
+- **Slice 1**: slot 27 and slot 127 textures without title memory (if the title
+  exports `__XMemAllocationHooks__`, every slot 127 resource gets title memory
+  and stays out of the class).
+- **Slice 2**: slot 133 (`CreatePlacedResourceX`) committed 2D textures with
+  title memory. Before their desktop `ID3D12Resource` is destroyed, they are
+  erased from `resource_address_index` and `texture_uploads`, and stale
+  `written_textures` entries whose generation has not changed are cleared so
+  reusing the same title address or desktop pointer does not skip uploads or
+  resolve a retired wrapper.
+
+Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
+targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
+described above. A resource leaves the class for good when a UAV/RTV/DSV view is
+created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
+an untracked descriptor slot or is copied out of tracked heaps, when it is passed
+to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
+SRV keeps the resource only when the desktop created the view: desktop view
+creation returns `void`, so a removed device is the only failure it reports, and
+a slot whose creation failed is recorded without a reference. Tracked
+slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+while any descriptor slot in `HeapInfo::shadow` names it (updated across
+`note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
+bound textures via `retire_hold`. Only wrappers can be in the class; a raw
+desktop pointer never is. Sampler feedback is not checked: no device slot of the
+stand-in reaches it.
+
+The final guest release signals a private desktop fence on every queue the
+stand-in created. The desktop object is released when all of those fences have
+passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
+recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+resolve destination (19), or translated draw SRV bind that the stand-in forwards
+makes the list hold a desktop reference to each resource of the class it names,
+source and destination, until the list is Reset, fails to Close or is destroyed. A list
+that is closed and never submitted is thus discarded without any submission.
+Each submission holds the same references until its queue passes a fence
+signalled behind it. A release with no registered queue, and a hold, marker or
+submission fence that cannot be recorded, keep the resource retained. A use that
+`retire_hold` cannot record (no desktop object left, or no room for the entry)
+leaves the class and marks the resource so the drain keeps its desktop object for
+the process, as an unfenced submission is kept, instead of dropping an object a
+list still names. Nothing waits: `ExecuteCommandLists` and `Present` check and
+release without blocking.
+The wrapper stays allocated, and a guest that uses a resource after its final
+release is not supported with the switch. Slot 18 (`CopyTiles`) is not
+forwarded at all and is outside this change.
+
 The source-built fixture reads the process-wide counters through
 `x2w_d3d12_budget_snapshot` and checks allocation sizes, final guest release,
 and slot 148 page retirement after queue completion. See
 [D3D12 budget accounting](experiments.md#d3d12-budget-accounting) for the test
 command.
+`startup_resource_retire_{warp,hardware}_debug{0,1}` use the retained column as
+the oracle that a desktop object is destroyed, and read results back through
+their own desktop queue. They cover two closed lists on one texture that are
+submitted separately after the release, a Reset or destroyed list with no
+submission (the destination stays unchanged), a second submission held behind
+its own fence, a destination released after recording (slots 17, 16 and 19), a
+list destroyed while its submission is held, a copy queue, an open list that
+D3D12 refuses to Reset and one that is destroyed, a release that no list
+refers to behind a held queue, and, in one run with the class, a buffer,
+render target, viewed texture (while its slot-18 SRV stays live), resident texture and
+presented texture that must stay retained, alongside slot 133 title-memory textures.
+`startup_resource_retire_title_{warp,hardware}_debug{0,1}` additionally test slot 133
+`CopyTextureRegion`/`CopyResource` upload holds, same-address slot 70 (`existing_memory_texture`)
+reuse with `X2W_RESOURCE_INDEX_CHECK=1`, stale `written_textures` `bc7_width` cleanup,
+slot-18 SRV `CopyDescriptorsSimple` / overwrite / heap-release lifetime, and, with the
+switch on, a newer `written_textures` generation kept when the older generation retires
+and a translated draw that samples such a texture through a descriptor table (the view
+token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
+a clear sentinel corner, and the texture leaves the budget only after the closed draw
+recording is dropped); the `_off_` case checks that an ordinary committed texture (no
+title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
+`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+`x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
+FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
+runs the same steps without the switch. The hardware cases report 77 without a
+physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
 
 ## Input script
 
@@ -2016,7 +2234,9 @@ These are measured on one executable; treat them as hypotheses for others.
   clip. `RASTERIZER1` stores depth bias as a float; a value that is not an integer in the desktop range
   refuses the pipeline. Run `ctest --preset release --no-tests=error -R "^startup_stream_rasterizer_"`
   to check all 32 pixels for front and back culling, with each front-face winding and both stream
-  subobject types.
+  subobject types. On a multi-GPU system, set `XBOX2WINDOWS_ADAPTER` to a case-insensitive substring of
+  the adapter description to select hardware for the startup stream, rasterizer and depth fixtures.
+  An unmatched hardware selector fails the test. The WARP fixtures always select the software adapter.
   The ignore control expects the no-cull readback and fails. Stream depth-stencil state is already
   applied on this path. Geometry, hull, domain and compute stages remain open.
 - Translated draws use the bound typed RTV formats to request colour-export variants. The
@@ -2028,12 +2248,14 @@ These are measured on one executable; treat them as hypotheses for others.
   negative denormal. Uncompressed exports to `R8G8B8A8_UINT` and `R8G8B8A8_SINT` use unsigned
   and signed integer shader outputs. The output merger clamps each channel to 0–255 or −128–127
   respectively. With export words `ffffffff ffffff7f 00000080 00000100`, the stored bytes are
-  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The other 8- and 16-bit integer views
-  still return `unverified UINT/SINT RTV format <n>`.
+  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The same conversion applies to one or two
+  8-bit channels and one, two or four 16-bit channels. An uncompressed UINT export to
+  `R10G10B10A2_UINT` clamps RGB to 0–1023 and alpha to 0–3 before storage. Three-channel
+  `R32G32B32_UINT` and `R32G32B32_SINT` views still require readback verification.
   Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
-  undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
-  unsupported by this path.
+  undergo float-to-UNORM conversion. Compressed gfx1013 integer exports remain unsupported,
+  including when the destination is `R10G10B10A2_UINT`.
 - A colour export that leaves channels `off` does not write them, so the target keeps what it held
   there (#1674). `gfx2hlsl.py` records the written channels per target and writes
   `wmask <target> 0x<mask>` to the manifest when an export leaves any channel unwritten. The draw
@@ -2122,6 +2344,16 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset dev --no-tests=error -R "^startup_(depth_state|slot57_depth)" -V`). Not covered:
   raster bias, depth bounds, back-face-only state, the title's own `OMSetStencilRef` order, clears
   (#1806), and any pipeline layout other than the measured one.
+- Rasterizer state (#1999, item B) has a decoder for the register value only:
+  `src/startup_stubs/rasterizer_state_decode.h` turns a `PA_SU_SC_MODE_CNTL` value into the cull mode,
+  front-face winding and fill mode of a `D3D12_RASTERIZER_DESC`, with the field positions of the amdgpu
+  `gc_10_3_0_sh_mask.h` header and Mesa's `gfx10.json`. Where a slot 57 pipeline keeps that word is not
+  part of it and is left open until independently established. It refuses both faces culled, point or
+  mixed polygon modes, polygon offset, last-vertex provoking and disabled perspective correction. The
+  caller's `flip_winding` inverts the FACE convention, which is not established against the D3D12
+  viewport. A device-free check covers each cull mode, winding and fill form and the refusals; its
+  `_face_control`, `_cull_control` and `_fill_control` runs read one field wrongly and must fail
+  (`ctest --preset dev --no-tests=error -R "^startup_rasterizer_decode" -V`). Not used by draws yet.
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
@@ -2739,7 +2971,8 @@ check only:
 - Argument checks (`src/startup_stubs/list_copy_texture.h`): footprint on both sides, empty or inverted box,
   source and destination bounds, row pitch (multiple of 256), offset (multiple of 512), footprint end inside
   the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
-  block alignment, every multiply and add in the footprint arithmetic checked for wrapping.
+  block alignment, every multiply and add in the footprint arithmetic checked for wrapping. Block-compressed
+  bounds are whole 4x4 blocks, as in D3D12: a 2x2 or 1x1 mip takes the 4x4 footprint GetCopyableFootprints gives it.
 - Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
   `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
   (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).
