@@ -1852,7 +1852,7 @@ VEC_F = {
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
-    'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
+    'v_med3_f32': (3, 'med3_32({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
@@ -2076,7 +2076,14 @@ class Pipeline:
                '    precise float sum = product + ftz32(c);',
                '    return ftz32(sum);',
                '}',
-               'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # v_med3_f32 with a NaN source is the minimum of the three (ISA "343 V_MED3_F32"), so the test is
+               # on the encoding: a float isnan() may be folded away by the compiler. D3D min() returns the
+               # other operand, so min(min(a, b), c) over a NaN source is the smallest of the non-NaN ones.
+               # Same body as med3_32 in tools/pixel_aot.py.
+               'float med3_32(float a, float b, float c) {',
+               '    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);',
+               '    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));',
+               '}',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'

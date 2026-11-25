@@ -1140,6 +1140,7 @@ foreach(mutation IN ITEMS sampler-alone bind-unrestorable)
 endforeach()
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
+target_sources(offscreen_check PRIVATE tests/startup_entry_words.cpp)
 # The storage root handed to the executable ends in a separator and is never cut off
 # (src/startup_stubs/storage_root.h); the mutated run is the negative control.
 add_executable(startup_storage_root_check tests/startup_storage_root_check.cpp)
@@ -2248,6 +2249,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: signed and unsigned three-source integer min, max and median.
     add_test(NAME startup_gfx2hlsl_int_med3_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_int_med3_check.py")
+    # v_med3_f32 with a NaN source is the minimum of the three (ISA p. 343): the preamble's med3_32 tests the
+    # encoding, the integer medians are unchanged, and the old branchless helper must be rejected.
+    add_test(NAME startup_gfx2hlsl_f32_med3_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_med3_check.py")
+    # The same four words drawn on WARP and the card, the NaN among them from the entry constants; the
+    # branchless lowering must mismatch on that lane.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_f32_med3_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_med3_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_f32_med3_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_cvt_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py" draw "${DXC_EXECUTABLE}"

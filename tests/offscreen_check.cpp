@@ -1307,6 +1307,47 @@ OperationResult run_startup_flat_param(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// Comma-separated 8-digit hex words, in order. An empty list or any other shape returns nothing.
+static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
+{
+    std::vector<std::uint32_t> words;
+    while (!text.empty()) {
+        std::uint32_t value = 0;
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+        if (parsed.ec != std::errc{} || parsed.ptr == text.data()) return {};
+        words.push_back(value);
+        text.remove_prefix(std::size_t(parsed.ptr - text.data()));
+        if (text.empty()) break;
+        if (text.front() != ',') return {};
+        text.remove_prefix(1);
+    }
+    return words;
+}
+
+// --startup-entry-words <vs.cso> <ps.cso> <entry words> <expected words>: draws one pixel with a gfx2hlsl
+// vertex and pixel pair that reads its operands from the entry constant buffer (tests/startup_entry_words.cpp).
+// <entry words> is 1..32 comma-separated 8-digit hex words, ud0 first; the translated vertex stage reads ud0
+// as its rectangle-list switch, so a plain triangle fixture keeps it 0. <expected words> is the four words the
+// target must hold, compared bit for bit.
+OperationResult run_startup_entry_words(const OperationContext& ctx)
+{
+    const auto entry = parse_hex_words(ctx.argv[5]);
+    const auto expected = parse_hex_words(ctx.argv[6]);
+    if (entry.empty() || entry.size() > 32)
+        return {OutcomeKind::fail, "entry constants are not 1..32 hex words"};
+    if (expected.size() != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::uint32_t words[4]{};
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words);
+    if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
+        std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
+                             "actual=%08x,%08x,%08x,%08x\n",
+                     expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
+        return {OutcomeKind::fail, "entry constant readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -1420,6 +1461,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
+    {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, nullptr, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},

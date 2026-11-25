@@ -12041,4 +12041,66 @@ On Intel UHD Graphics (TGL GT1) with Mesa 26.2.7, DXC 1.10.2605.37 and SPIRV-Too
 python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device Intel
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device llvmpipe
+## v_med3_f32 with a NaN source
+
+The RDNA 2 ISA defines `V_MED3_F32` (p. "343 V_MED3_F32") as a NaN branch first:
+
+```
+if (isNan(S0.f) || isNan(S1.f) || isNan(S2.f))
+   D.f = V_MIN3_F32(S0.f, S1.f, S2.f);
+else if (V_MAX3_F32(S0.f, S1.f, S2.f) == S0.f)
+   D.f = V_MAX_F32(S1.f, S2.f);
+...
+```
+
+A NaN source therefore makes the result the smallest of the three. `tools/startup/gfx2hlsl.py` lowered
+`v_med3_f32` to `max(min(a, b), min(max(a, b), c))`, which returns the larger of the non-NaN sources instead.
+Drawn with `med3(a, 2.0, 1.0)` on a Radeon RX 9070 XT (driver `32.0.32029.2010`):
+
+| `a` | emitted form | ISA rule |
+|---|---|---|
+| NaN (`0x7fc00000`) | 2.0 | **1.0** |
+| 3.0 | 2.0 | 2.0 |
+| 1.5 | 1.5 | 1.5 |
+| 0.5 | 1.0 | 1.0 |
+
+The only divergence is the NaN source. The table now points `v_med3_f32` at `med3_32`, whose body is the one
+`tools/pixel_aot.py` already uses:
+
+```hlsl
+float med3_32(float a, float b, float c) {
+    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);
+    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));
+}
+```
+
+The NaN test is on the encoding rather than on `isnan()`, because some desktop compilers fold float NaN
+tests, and `min(min(a, b), c)` over operands whose sources D3D's `min()` keeps gives the smallest non-NaN
+source. The integer medians (`v_med3_u32`, `v_med3_i32`) are untouched: they compare words and have no NaN.
+
+What the measurement establishes and what it does not: the emitted form rendered 2.0 on the card for a NaN
+operand, and the ISA rule is the lower of the non-NaN sources. That the hardware instruction itself computes
+`V_MIN3_F32` on a NaN source is **not** established here: HLSL cannot emit `v_med3_f32` (the compiler does not
+select it from the median pattern), so the fixture compares the translated text against the ISA rule, not
+against the instruction. Reading the instruction directly needs a captured shader or the ISA simulator.
+
+`tests/startup_gfx2hlsl_f32_med3_check.py` holds the controls and the draw. The controls read the emitted
+HLSL: the preamble carries `med3_32` with the `0x7f800000u` threshold and the `asuint(x) & 0x7fffffffu` test,
+the binary32 table points at it, both the bare and the `_e64` spellings lower to it, and the integer medians
+keep their own lowering. Four mutations are rejected: the branchless helper, a `>=` threshold, an `isnan(`
+test and a table pointing back at a helper without the branch. The `decode` mode builds
+`v_med3_f32 v12, v1, v2, v3` as `0c0057d501050e04` and proves it with `tools/disasm_rdna2.py`.
+
+The draw is a source-built gfx1013 pair whose pixel stage moves the four entry constants s8..s11 into
+s44..s47 and applies `v_med3_f32 v(12+lane), v1, v2, v3` with `v2 = 2.0` and `v3 = 1.0`. The inputs arrive as
+root 32-bit constants written per draw by `offscreen_check --startup-entry-words`, not as literals: a literal
+would be folded at compile time and the lowering under test would never run. The four inputs are
+`0x7fc00000`, `0x40400000`, `0x3fc00000` and `0x3f000000`; the expected words are `0x3f800000`,
+`0x40000000`, `0x3fc00000` and `0x3f800000`. The control that counts restores the branchless helper in the
+same pair and requires a mismatch on the NaN lane alone: `0x40000000` where the ISA asks `0x3f800000`, the
+other three lanes unchanged. A negative control that passes is reported as a failure, not accepted.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_med3' -V
 ```
