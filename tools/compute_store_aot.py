@@ -592,6 +592,20 @@ def descriptor_store_hlsl():
     )
 
 
+def linear_uav_address(tag, dims, idxen, offen, stride, offset, size):
+    """Address one lane's field within an indexed or shifted dispatch element."""
+    if not isinstance(tag, tuple):
+        return None
+    if idxen and not offen and tag[0] == "thread" and stride is not None and offset + size <= stride:
+        axis = tag[1]
+        return ("index", axis), axis, f"tid.{AXES[axis]} * {stride}u + {offset}u"
+    if offen and not idxen and tag[0] == "thread_bytes":
+        _, axis, shift = tag
+        if 2 <= shift <= 31 and offset + size <= 1 << shift and dims[axis] << shift <= 1 << 32:
+            return ("byte_offset", axis, shift), axis, f"(tid.{AXES[axis]} << {shift}u) + {offset}u"
+    return None
+
+
 def descriptor_load_hlsl():
     """One load function shared by every descriptor-format buffer_load_format opcode.
 
@@ -978,7 +992,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         scalar[reg] = ("group", axis)
     vector = {axis: ("local", axis) for axis in range(local_axes) if axis == 0 or dims[axis] > 1}
     pending = set()
-    # VGPRs a buffer read still writes, with the word they receive (None when unknown);
+    # Pending VMEM results, with the word they receive (None when unknown);
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
@@ -986,6 +1000,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     format_store_index = 0
     atomic_update = False
     buffer_float_update = False
+    shared_atomic_offset = None
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
     staged_steps = []
     ds_step_count = 0
@@ -1124,6 +1139,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             else:
                 scalar[sdst_reg] = ("cond", cond_expr)
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
+            if cpu == "gfx1013" and atomic_update:
+                raise ValueError("gfx1013 buffer atomics require an unguarded program")
             saved = int(m[1])
             if vcc == ("invalid",) and guard_span is None and saved <= 105 and saved not in pending:
                 raise ValueError("Unverified lane guard compare")
@@ -2719,28 +2736,58 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 reg = first + index
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
-        elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_METHODS)})(_x2)? "
-                               r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?( glc)?", line):
-            if cpu != "gfx1030" or stride is not None or output_format is not None or image_output:
+        elif m := re.fullmatch(rf"buffer_atomic_(?P<op>{'|'.join(MUBUF_ATOMIC_METHODS)})(?P<wide>_x2)? "
+                               r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
+                               r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+                               r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?(?P<glc> glc)?", line):
+            op, wide, glc = m["op"], bool(m["wide"]), bool(m["glc"])
+            fixed = m["addr"] == "off" and not (m["idxen"] or m["offen"])
+            if cpu == "gfx1030" and not fixed:
+                raise ValueError(f"Unsupported compute instruction: {line}")
+            if output_format is not None or image_output or (cpu == "gfx1030" and stride is not None):
                 raise ValueError("Unsupported atomic reduction target or binding")
+            # One atomic per program, and no UAV write before it. The atomic itself is appended to
+            # stores, so a second atomic is refused here too. That keeps the single atomicOld or
+            # ignoredAtomic declaration below unique. On gfx1013, plain DWORD stores of the
+            # returned value may follow it.
             if stores:
                 raise ValueError("An atomic reduction must be the only UAV operation")
-            op, wide = m[1], bool(m[2])
-            if op in ("fmin", "fmax") and (buffer_float_domain != "finite-normal" or wide or m[7]):
-                raise ValueError("buffer_atomic fmin/fmax require a finite-normal domain, "
-                                 "a single 32-bit operand and no glc")
-            if op == "csub" and (wide or not m[7]):
-                raise ValueError("Conditional subtract requires 32-bit glc")
-            if op != "csub" and m[7]:
-                raise ValueError(f"Unsupported compute instruction: {line}")
-            base, high = int(m[4]), int(m[5])
-            offset = int(m[6] or 0)
+            if cpu == "gfx1013":
+                if wide or op not in ("add", "umax", "cmpswap"):
+                    raise ValueError("Unsupported atomic reduction target or binding: "
+                                     "gfx1013 buffer atomics require 32-bit add, umax or cmpswap")
+                if guard_span is not None or image_descriptor is not None:
+                    raise ValueError("Unsupported atomic reduction target or binding: "
+                                     "gfx1013 requires an unguarded raw-buffer program")
+            else:
+                if op in ("fmin", "fmax") and (buffer_float_domain != "finite-normal" or wide or glc):
+                    raise ValueError("buffer_atomic fmin/fmax require a finite-normal domain, "
+                                     "a single 32-bit operand and no glc")
+                if op == "csub" and (wide or not glc):
+                    raise ValueError("Conditional subtract requires 32-bit glc")
+                if op != "csub" and glc:
+                    raise ValueError(f"Unsupported compute instruction: {line}")
+            base, high = int(m["base"]), int(m["high"])
+            offset = int(m["offset"] or 0)
             if (high != base + 3 or base % 4 or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified atomic reduction descriptor")
             if offset > 4095 or offset % (8 if wide else 4):
                 raise ValueError("Unverified atomic reduction address")
-            src, *last = map(int, re.findall(r"\d+", m[3]))
+            address = f"{offset}u"
+            if cpu == "gfx1013":
+                if fixed:
+                    shared_atomic_offset = offset
+                else:
+                    tag = vector.get(int(m["addr"][1:])) if re.fullmatch(r"v\d+", m["addr"]) else None
+                    access = linear_uav_address(tag, dims, m["idxen"], m["offen"], stride, offset, 4)
+                    if access is None:
+                        raise ValueError("Unverified per-thread atomic address")
+                    layout, axis, address = access
+                    if any(dims[other] > 1 for other in range(3) if other != axis):
+                        raise ValueError("Atomic address does not separate every invocation of the group")
+                    written_spans.append((offset, offset + 4))
+            src, *last = map(int, re.findall(r"\d+", m["data"]))
             width = 2 if wide else 1
             count = 2 * width if op == "cmpswap" else width
             if last != ([src + count - 1] if count > 1 else []) or src + count > 256:
@@ -2757,11 +2804,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 word = f"int64_t({word})" if wide else f"asint({word})"
             elif op == "sub":
                 word = f"({'0ull' if wide else '0u'} - {word})"
-            # Both overloads discard the old value. Raw UAV atomics on pairs require SM 6.6.
+            # Raw UAV atomics on pairs require SM 6.6.
             kind = ("int64_t" if signed else "uint64_t") if wide else ("int" if signed else "uint")
             method = MUBUF_ATOMIC_METHODS[op] + ("64" if wide else "")
             if op == "cmpswap":
-                # The ISA places replacement before compare, unlike the HLSL argument order.
+                # RDNA 2 MUBUF opcode 49 takes replacement in VDATA and compare in VDATA+1.
+                # HLSL takes compare first.
                 word = f"{operands[1]}, {word}"
             if op in ("fmin", "fmax"):
                 # Raw-word finite-normal binary32 min/max on the raw UAV, under the caller's
@@ -2786,8 +2834,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                f"        outputData.Interlocked{method}({offset}u, expected, next, observed);",
                                "    } while (observed != expected);"))
             else:
-                stores.extend((f"    {kind} ignoredAtomic;",
-                               f"    outputData.Interlocked{method}({offset}u, {word}, ignoredAtomic);"))
+                result = "atomicOld" if glc else "ignoredAtomic"
+                stores.extend((f"    {kind} {result};",
+                               f"    outputData.Interlocked{method}({address}, {word}, {result});"))
+                if cpu == "gfx1013":
+                    # Without GLC the source is unchanged. This profile refuses consumers of
+                    # that register until an explicit rewrite instead of supplying an old value.
+                    vector.pop(src, None)
+                    if glc:
+                        loading[src] = ("alu", result)
             atomic_update = True
             if op in ("fmin", "fmax"):
                 buffer_float_update = True
@@ -2797,7 +2852,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(typed) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
-            if atomic_update:
+            if atomic_update and (cpu == "gfx1030" or not line.startswith("buffer_store_dword ")):
                 raise ValueError("An atomic reduction must be the only UAV operation")
             if image_output:
                 raise ValueError("Buffer stores require a raw UAV binding")
@@ -2872,6 +2927,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             addr = m["addr"]
             addr_regs = list(map(int, re.findall(r"\d+", addr)))
             tags = [vector.get(reg) for reg in addr_regs]
+            linear = (linear_uav_address(tags[0], dims, idxen, offen, stride, offset, span)
+                      if heap_store_view is None and len(tags) == 1 and (idxen or atomic_update) else None)
             if heap_store_view is not None:
                 if not formatted or len(tags) != 1 or not isinstance(tags[0], tuple) or tags[0][0] != "thread":
                     raise ValueError("Heap store view needs a formatted store indexed by dispatch thread ID")
@@ -2881,14 +2938,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             elif addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
                 store_layout = ("fixed",)
                 covered = set()
-            elif (stride is not None and idxen and not offen and len(addr_regs) == 1
-                    and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + span <= stride):
+            elif linear is not None:
                 # One index axis: every other group dimension must be one, so no two
                 # invocations of a group share an address.
-                index = tags[0][1]
-                store_layout = ("index", index)
+                store_layout, index, address = linear
                 covered = {index}
-                address = f"tid.{AXES[index]} * {stride}u + {offset}u"
             elif (stride is not None and idxen and offen and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
                     and all(isinstance(tag, tuple) for tag in tags)
                     and tags[0][0] == "thread" and tags[1][0] == "thread_bytes" and tags[0][1] != tags[1][1]):
@@ -2929,6 +2983,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unsupported store address")
             if any(dims[axis] > 1 for axis in range(3) if axis not in covered):
                 raise ValueError("Store address does not separate every invocation of the group")
+            if shared_atomic_offset is not None and (linear is None or offset <= shared_atomic_offset):
+                raise ValueError("Return record can overlap the fixed atomic address")
             if layout not in (None, store_layout):
                 raise ValueError("Stores use different address layouts")
             layout = store_layout
