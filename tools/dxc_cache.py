@@ -106,6 +106,16 @@ def _resolve(compiler):
     return os.path.abspath(found) if found else None
 
 
+def _is_wrapper(resolved):
+    """True for a shell/script launcher that delegates to a compiler we cannot fingerprint (Wine)."""
+    try:
+        with open(resolved, "rb") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return True
+    return head.startswith(b"#!") and b"wine" in head.lower()
+
+
 COMPILER_LIBRARIES = ("dxcompiler.dll", "dxil.dll", "libdxcompiler.so", "libdxil.so")
 
 
@@ -135,7 +145,7 @@ def run_dxc(compiler, args, **options):
     resolved = None
     if cache_dir and not extra:
         resolved = _resolve(compiler)
-        if resolved is not None:
+        if resolved is not None and not _is_wrapper(resolved):
             plan = _plan(compiler, args)
     if plan is None:
         return subprocess.run(command, **_passthrough(options, check))
@@ -168,10 +178,11 @@ def run_dxc(compiler, args, **options):
             stdout = _restore(bytes.fromhex(cached["stdout"]), mapping)
             stderr = _restore(bytes.fromhex(cached["stderr"]), mapping)
             returncode = int(cached["returncode"])
+            if returncode != 0:
+                raise ValueError("failures are never replayed")
         except (KeyError, ValueError, TypeError):
             cached = None
     if cached is None:
-        existed = any(os.path.lexists(path) for path in outputs.values())
         done = subprocess.run(command, capture_output=True, timeout=timeout)
         stdout, stderr, returncode = done.stdout, done.stderr, done.returncode
         files = {}
@@ -179,10 +190,8 @@ def run_dxc(compiler, args, **options):
             if os.path.isfile(path):
                 with open(path, "rb") as handle:
                     files[flag] = handle.read()
-        # A failure is cached only when no output existed beforehand, and never with files.
-        if returncode != 0:
-            files = {}
-        if returncode == 0 or not existed:
+        # Only successes are cached: a failure may be transient (I/O, resources, bad output directory).
+        if returncode == 0:
             os.makedirs(cache_dir, exist_ok=True)
             record = {"returncode": returncode, "stdout": _scrub(stdout, mapping).hex(),
                       "stderr": _scrub(stderr, mapping).hex(),

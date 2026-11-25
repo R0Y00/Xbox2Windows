@@ -95,48 +95,49 @@ def main():
         if rig.calls() != before + 2:
             fail("resized compiler library reused a stale entry")
 
-        bad1, none1 = rig.compile("BROKEN")
-        bad2, none2 = rig.compile("BROKEN")
-        if rig.calls() != before + 3 or bad1.returncode != 3 or bad2.returncode != 3:
-            fail("failing compile not replayed with the same return code")
-        if bad1.stderr != bad2.stderr or "in.hlsl" not in bad2.stderr:
-            fail("failing compile stderr differs on replay")
+        before = rig.calls()
+        bad1, _ = rig.compile("BROKEN")
+        bad2, _ = rig.compile("BROKEN")
+        if rig.calls() != before + 2 or bad1.returncode != 3 or bad2.returncode != 3:
+            fail("a failing compile must run for real every time with its own return code")
+        if "in.hlsl" not in bad2.stderr:
+            fail("failing compile stderr lost")
         try:
             rig.compile("BROKEN", check=True)
         except subprocess.CalledProcessError as error:
             if error.returncode != 3:
-                fail("replayed failure raised the wrong return code")
+                fail("failure raised the wrong return code")
         else:
-            fail("replayed failure did not raise with check=True")
+            fail("failure did not raise with check=True")
 
-        stale = Path(root) / "stale.cso"
-        _, seeded = rig.compile("void main(){ /*seed*/ }", out=stale)
-        if seeded is None:
-            fail("seed compile wrote no output")
-        rig.compile("BROKEN stale", out=stale)
-        absent = Path(root) / "absent.cso"
-        replay, nothing = rig.compile("BROKEN stale", out=absent)
-        if replay.returncode != 3 or nothing is not None or absent.exists():
-            fail("failed compile replayed an output file the compiler never wrote")
+        missing = Path(root) / "no-such-dir" / "x.cso"
+        rig.compile("void main(){ /*late dir*/ }", out=missing)
+        (Path(root) / "no-such-dir").mkdir()
+        _, late = rig.compile("void main(){ /*late dir*/ }", out=missing)
+        if late is None:
+            fail("a failure caused by a missing output directory poisoned the cache")
 
-        def seed_legacy_failure(source, version):
-            """Write the failure record an older build stored: returncode 3 with a non-empty files map."""
-            cache_dir = Path(rig.cache)
-            known = set(cache_dir.glob("*.json"))
-            with mock.patch.object(dxc_cache, "KEY_VERSION", version):
-                rig.compile(source)
-            (entry,) = set(cache_dir.glob("*.json")) - known
-            record = json.loads(entry.read_text())
-            record["files"] = {"-Fo": b"OLD-SHADER".hex()}
-            entry.write_text(json.dumps(record))
+        cache_dir = Path(rig.cache)
+        known = set(cache_dir.glob("*.json"))
+        rig.compile("BROKEN seeded")
+        if set(cache_dir.glob("*.json")) != known:
+            fail("a failure was written to the cache")
+        rig.compile("void main(){ /*seeded*/ }")
+        (entry,) = set(cache_dir.glob("*.json")) - known
+        record = json.loads(entry.read_text())
+        record["returncode"] = 3
+        entry.write_text(json.dumps(record))
+        before = rig.calls()
+        replay, _ = rig.compile("void main(){ /*seeded*/ }")
+        if replay.returncode != 0 or rig.calls() != before + 1:
+            fail("a stored failure record was replayed")
 
-        seed_legacy_failure("BROKEN legacy same key", dxc_cache.KEY_VERSION)
-        old_path = Path(root) / "legacy_same.cso"
-        replay, nothing = rig.compile("BROKEN legacy same key", out=old_path)
-        if replay.returncode != 3 or nothing is not None or old_path.exists():
-            fail("cached failure with files restored an output file")
+        wine = Path(root) / "winedxc"
+        wine.write_text('#!/bin/bash\nexec wine "$DXC" "$@"\n' + FAKE.split("\n", 1)[1].replace("\n", "\n# "))
+        os.chmod(wine, os.stat(wine).st_mode | stat.S_IEXEC)
+        if dxc_cache._is_wrapper(str(wine)) is not True or dxc_cache._is_wrapper(rig.compiler) is not False:
+            fail("a Wine launcher must bypass the cache, a plain compiler must not")
 
-        seed_legacy_failure("BROKEN legacy v1", "1")
         before = rig.calls()
         old_path = Path(root) / "legacy_v1.cso"
         replay, nothing = rig.compile("BROKEN legacy v1", out=old_path)
