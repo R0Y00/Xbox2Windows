@@ -111,8 +111,8 @@ def controls():
         (unsupported + "v_bcnt_u32_b32_e32", ((FIRST, "v_bcnt_u32_b32_e32 v2, v1, v3"),)),
         (unsupported + "v_bcnt_u32_b32_e64", ((FIRST, "v_bcnt_u32_b32_e64 v2, v1, s0"),)),
         (unsupported + "v_mbcnt_lo_u32_b32", ((FIRST, "v_mbcnt_lo_u32_b32 v2, v1, s0"),)),
-        # The scalar count stays limited to exec_lo.
-        ("Unsupported active lane count source: s0", ((FIRST, "s_bcnt1_i32_b32 s9, s0"),)),
+        # The scalar count takes exec_lo or a known scalar word, not the high half or an unknown register.
+        ("Unsupported active lane count source: exec_hi", ((FIRST, "s_bcnt1_i32_b32 s9, exec_hi"),)),
         # Source modifiers and an output modifier, which LLVM does not accept for this opcode.
         (unsupported + "v_bcnt_u32_b32", ((FIRST, "v_bcnt_u32_b32 v2, -v1, s0"),)),
         (unsupported + "v_bcnt_u32_b32", ((FIRST, "v_bcnt_u32_b32 v2, |v1|, s0"),)),

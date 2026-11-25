@@ -8,10 +8,14 @@ remain GPU inputs. Only forward control flow decided by static values is accepte
 
 import argparse
 import json
+import os
+from pathlib import Path
 import re
 import struct
-from pathlib import Path
+import tempfile
+import zlib
 
+from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
 from pixel_aot import MESH_WAVE64, container_code, disassemble
 from resource_inventory import parts
 
@@ -20,6 +24,23 @@ WAVE = (1 << 64) - 1
 LANE_SPILL_OPS = {"v_writelane_b32", "v_readlane_b32"}
 VGPR_OPERAND = re.compile(r"\bv(?:(\d+)\b|\[(\d+):(\d+)\])")
 LDS_BYTES = 1 << 16
+FLAT_SCRATCH_WRITE = re.compile(r"s_setreg_imm32_b32 hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\), (.+)")
+# The immediate spellings compute_store_aot accepts for the same write (a copy of its pattern).
+IMM32_LITERAL = re.compile(
+    r"-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|nan|inf(?:inity)?)",
+    re.IGNORECASE,
+)
+
+
+def flat_scratch_write(line):
+    """A whole-register immediate write of either half of the scratch base."""
+    match = FLAT_SCRATCH_WRITE.fullmatch(line)
+    return match is not None and IMM32_LITERAL.fullmatch(match[1]) is not None
+
+
+def branch_target(offset, operand):
+    """Byte offset a branch at `offset` jumps to. LLVM 15 prints the SIMM16 unsigned (s_branch 65535 is -1)."""
+    return offset + 4 + 4 * (((int(operand) & 0xFFFF) ^ 0x8000) - 0x8000)
 
 
 def span(token):
@@ -144,6 +165,8 @@ class Wave:
         self.indices = {}
         self.m0 = None
         self.written = set()
+        # Position exports per vertex in program order: (target, values, done).
+        self.position_exports = {}
 
     def scalar(self, t, allow_undef=False):
         if t.startswith("s["):
@@ -175,6 +198,12 @@ class Wave:
             if self.vcc is None:
                 raise ValueError("Undefined wave predicate")
             return self.vcc
+        if t == "src_scc":
+            if self.scc is None:
+                raise ValueError("Undefined scalar predicate in src_scc")
+            if isinstance(self.scc, Dyn):
+                raise ValueError("Dynamic scalar predicate in src_scc")
+            return int(self.scc)
         if re.fullmatch(r"-?\d+\.\d+", t):
             return struct.unpack("<I", struct.pack("<f", float(t)))[0]
         return int(t, 0)
@@ -296,7 +325,7 @@ class Wave:
             )
         return [f"({cond.expr} ? {t} : {f})" for t, f in zip(*arms)]
 
-    def join_arms(self, decoded, expressions, jumps, pc, offset, target_offset, cond):
+    def join_arms(self, decoded, expressions, jumps, pc, target_offset, cond, *, branch_on_true):
         """Run both arms of a uniform branch on a constant predicate and merge them.
 
         Only scalar ALU and loads may appear inside an arm; the arms write no
@@ -308,7 +337,7 @@ class Wave:
         end = target
         last = decoded[target - 1][1] if target - 1 >= pc else ""
         if last.startswith("s_branch "):
-            join_offset = decoded[target - 1][0] + 4 + 4 * int(last.split()[1])
+            join_offset = branch_target(decoded[target - 1][0], last.split()[1])
             if join_offset not in jumps or jumps[join_offset] <= target:
                 raise ValueError("Expected a forward mesh branch")
             end, join = target - 1, jumps[join_offset]
@@ -327,6 +356,9 @@ class Wave:
             if (self.exec, self.vcc, self.m0) != before:
                 raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
             outcomes.append((self.s, self.pending, self.pending_v))
+        # Outcomes are in fall-through, taken order. Select needs true, false.
+        if branch_on_true:
+            outcomes.reverse()
         (true_s, true_p, true_v), (false_s, false_p, false_v) = outcomes
         self.pending_v = true_v | false_v
         if true_s.keys() != false_s.keys():
@@ -353,6 +385,20 @@ class Wave:
             "s_buffer_load_dwordx16",
         ):
             self.load(op, args)
+            return
+        if op in ("s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"):
+            if len(args) != 2:
+                raise ValueError(f"Expected two operands for {op}")
+            a, b = (self.scalar(t, True) for t in args)
+            if a is UNDEF or b is UNDEF:
+                self.scc = None
+                return
+            if type(a) is not int or type(b) is not int:
+                raise ValueError("Dynamic scalar predicate")
+            mask = 63 if op.endswith("_b64") else 31
+            width = WAVE if op.endswith("_b64") else U32
+            bit = ((a & width) >> (b & mask)) & 1
+            self.scc = bit == (1 if op.startswith("s_bitcmp1_") else 0)
             return
         if op.startswith("s_cmp_"):
             a, b = (self.scalar(t, True) for t in args)
@@ -713,6 +759,8 @@ class Wave:
             offset, line = decoded[pc]
             pc += 1
             op, _, tail = line.partition(" ")
+            if flat_scratch_write(line):
+                continue
             args = tail.split(", ")
             if op in LANE_SPILL_OPS:
                 self.lane_spill(op, args)
@@ -733,6 +781,10 @@ class Wave:
                 return True
             if op in ("s_inst_prefetch", "s_nop"):
                 continue
+            if op == "s_clause":
+                if not re.fullmatch(r"0x[0-9a-fA-F]+|0|[1-9]\d*", tail) or not 0 <= int(tail, 0) <= 0x3F:
+                    raise ValueError(f"Invalid s_clause operand: {tail}")
+                continue
             if op == "s_barrier":
                 if self.ds_writes_pending:
                     raise ValueError("LDS store not waited before the barrier")
@@ -750,10 +802,10 @@ class Wave:
                     self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
-            elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
+            elif op in ("s_cbranch_scc0", "s_cbranch_scc1") and isinstance(self.scc, Dyn):
                 pc = self.join_arms(
-                    decoded, expressions, jumps, pc, offset,
-                    offset + 4 + 4 * int(tail), self.scc,
+                    decoded, expressions, jumps, pc, branch_target(offset, tail),
+                    self.scc, branch_on_true=op == "s_cbranch_scc1",
                 )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
@@ -772,7 +824,7 @@ class Wave:
                     "s_cbranch_execz": not self.exec,
                     "s_cbranch_vccnz": bool(self.vcc),
                 }[op]
-                target = jumps[offset + 4 + 4 * int(tail)]
+                target = jumps[branch_target(offset, tail)]
                 if target < pc:
                     raise ValueError("Expected a forward mesh branch")
                 if take:
@@ -832,10 +884,11 @@ class Wave:
             elif op in ("ds_write_b32", "ds_read_b32"):
                 self.lds_op(op, tail)
             elif op == "exp":
-                m = re.fullmatch(r"(prim|pos0|param0),? (.+?)( done)?", tail)
+                m = re.fullmatch(r"(prim|pos[0-3]|param0),? (.+?)( done)?", tail)
                 if not m:
                     raise ValueError("Unsupported mesh export")
-                if not m[3] and m[1] != "param0":
+                # A position export may leave done to a later clip or cull distance export.
+                if not m[3] and m[1] == "prim":
                     raise ValueError("Expected completed primitive or position export")
                 operands = m[2].split(", ")
                 for lane in range(64):
@@ -853,6 +906,10 @@ class Wave:
                         if i in self.positions:
                             raise ValueError("Duplicate position")
                         self.positions[i] = [self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], None, bool(m[3])))
+                    elif m[1].startswith("pos") and len(operands) == 4:
+                        values = [None if t == "off" else self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], values, bool(m[3])))
                     elif m[1] == "param0" and len(operands) == 4 and all(re.fullmatch(r"v\d+", t) for t in operands):
                         if i in self.attributes:
                             raise ValueError("Duplicate vertex attribute")
@@ -898,6 +955,16 @@ def run_group(waves, decoded, expressions):
     Each wave runs to its next barrier before any wave goes on. Stores become
     visible to every wave only when all of them have reached the barrier.
     """
+    # Whole-register immediate writes of the scratch base lower to nothing when
+    # nothing can read either half: scratch_* and flat_* memory forms and
+    # s_getreg_* (which these lowerers do not lower for any register). Check every
+    # instruction, including skipped arms, since the wave model does not track the
+    # written value and only checks the instructions it executes.
+    if any(flat_scratch_write(line) for _, line in decoded):
+        for _, line in decoded:
+            op = line.partition(" ")[0]
+            if op.startswith(("scratch_", "flat_", "s_getreg_")):
+                raise ValueError(f"Mesh scratch-base write may be observed by {op}")
     lds = {}
     for wave in waves:
         wave.lds = lds
@@ -958,7 +1025,8 @@ def emit_compute_draw(bindings, expressions, positions, indices, attributes):
     return "\n".join(lines) + "\n"
 
 
-def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False):
+def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
+    layout = None if vs_out_cntl is None else decode_vs_out_cntl(vs_out_cntl)
     if vertex_header is not None and (
         type(vertex_header) != int or not 0 <= vertex_header <= U32
     ):
@@ -997,6 +1065,9 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         or any(max(tri) >= nv for tri in idx.values())
     ):
         raise ValueError("Conflicting mesh counts, vertices or primitive indices")
+    distances = vertex_distances(waves[0].position_exports | waves[1].position_exports, layout)
+    if compute_fallback and layout and layout.vectors:
+        raise ValueError("The compute fallback has no room for clip or cull distances")
     bindings = [
         "cbuffer Points : register(b0) { float4 pointData[32]; };",
         "cbuffer Matrices : register(b1) { float4 matrixData[32]; };",
@@ -1010,7 +1081,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         "#ifdef TRACE_EXPORTS",
         "RWByteAddressBuffer trace : register(u0);",
         "#endif",
-        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "") + "};",
+        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "")
+        + hlsl_fields(layout) + "};",
         '[outputtopology("triangle")]',
         f"[numthreads(128,1,1)] void main(uint id:SV_GroupIndex, out vertices Vertex v[{nv}], out indices uint3 p[{np}]) {{",
         f"  SetMeshOutputCounts({nv},{np});",
@@ -1029,6 +1101,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         )
         if attributes:
             lines.append(f"  if(id=={i}) v[{i}].attr={float4(attributes[i])};")
+        if i in distances:
+            lines.append(f"  if(id=={i}) {{ {hlsl_writes(f'v[{i}]', distances[i])} }}")
     for i, tri in idx.items():
         lines.extend(
             [
@@ -1101,12 +1175,19 @@ def decode_mesh(blob, library):
     return disassemble(code, library, offsets=True, features=MESH_WAVE64), limits
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
     decoded, limits = decode_mesh(blob, library)
-    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback,
+                 vs_out_cntl=vs_out_cntl)
 
 
-if __name__ == "__main__":
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("container", type=Path)
     p.add_argument(
@@ -1121,19 +1202,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Emit SM 6.0 compute (main) and vertex (vertex_main) entry points",
     )
-    p.add_argument("--output", type=Path, required=True)
-    a = p.parse_args()
-    if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
-        a.container.resolve(),
-        a.geometry_words.resolve(),
-    ):
-        p.error("Expected a separate HLSL output")
-    src = translate(
-        a.container.read_bytes(),
-        json.loads(a.geometry_words.read_text()),
-        a.llvm,
-        a.vertex_header,
-        compute_fallback=a.compute_fallback,
+    p.add_argument(
+        "--pa-cl-vs-out-cntl",
+        type=lambda s: int(s, 0),
+        help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2",
     )
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    a.output.write_text(src, encoding="ascii")
+    p.add_argument("--output", type=Path, required=True)
+    a = p.parse_args(argv)
+    try:
+        if a.output.exists() and a.output.is_dir():
+            raise ValueError(f"Output path is an existing directory: {a.output}")
+        if a.output.suffix.lower() != ".hlsl":
+            raise ValueError("Expected a separate HLSL output")
+        if _same_path(a.output, a.container) or _same_path(a.output, a.geometry_words):
+            raise ValueError("Expected a separate HLSL output")
+        src = translate(
+            a.container.read_bytes(),
+            json.loads(a.geometry_words.read_text(encoding="utf-8")),
+            a.llvm,
+            a.vertex_header,
+            compute_fallback=a.compute_fallback,
+            vs_out_cntl=a.pa_cl_vs_out_cntl,
+        )
+        a.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=a.output.parent) as staging_dir:
+            staged = Path(staging_dir) / a.output.name
+            staged.write_text(src, encoding="ascii")
+            os.replace(staged, a.output)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, struct.error, zlib.error) as exc:
+        p.exit(1, f"{type(exc).__name__}: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
