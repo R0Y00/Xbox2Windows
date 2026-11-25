@@ -441,6 +441,12 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     return Path(path)
 
 
+def write_uint_case(path, constants, words):
+    """Broadcast a raw uint4 to all 64 expected texels of a UINT readback case."""
+    path.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+    return path
+
+
 def check_container_selector(directory: Path, code: bytes, library: str | None = None) -> None:
     archive = directory / "same-name.rpf"
     records = [envelope(code, private_data=metadata) for metadata in (b"first", b"second")]
@@ -19605,11 +19611,7 @@ def check_integer_readback_draw(directory, compiler, renderer, backend):
     """Round-trip v_mov_b32 bit copies bit-for-bit through the integer readback target."""
     source = directory / "integer_readback.hlsl"
     shader = directory / "integer_readback.cso"
-    pass_case = directory / "integer_readback-pass.case"
-    corrupted_case = directory / "integer_readback-corrupted.case"
     words = (0x7fc00001, 0xffc00003, 0x00000001, 0x80000000)
-    constants = bytearray(256)
-    struct.pack_into("<I", constants, 12, words[0])
     program = uncompressed_export([
         "v_mov_b32_e32 v12, s44",
         f"v_mov_b32_e32 v13, {words[1]:#x}",
@@ -19619,12 +19621,20 @@ def check_integer_readback_draw(directory, compiler, renderer, backend):
     source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
                             integer_export=True), encoding="ascii")
     compile_shader(compiler, source, shader)
-    expected = tuple(struct.unpack("<f", struct.pack("<I", word))[0] for word in words)
-    write_case(pass_case, constants, expected, integer_rt=True)
-    corrupted = list(expected)
-    corrupted[2] = struct.unpack("<f", struct.pack("<I", words[2] ^ 3))[0]
-    write_case(corrupted_case, constants, corrupted, integer_rt=True)
-    run_pixel_batch(renderer, backend, shader, [(corrupted_case, "mismatch"), (pass_case, "pass")])
+    cases = []
+    for name, red, channel, changed_bits in (
+        ("subnormal", words[0], 2, 3),
+        ("positive-snan", 0x7f800001, 0, 0x00400000),
+        ("negative-snan", 0xff812345, 0, 0x00400000),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<I", constants, 12, red)
+        expected = (red, *words[1:])
+        wrong = list(expected)
+        wrong[channel] ^= changed_bits
+        cases.append((write_uint_case(directory / f"{name}-wrong.case", constants, wrong), "mismatch"))
+        cases.append((write_uint_case(directory / f"{name}-exact.case", constants, expected), "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
 
 
 def check_subrev_u32_draw(directory, compiler, renderer, backend):
@@ -25034,6 +25044,7 @@ FLAT_SCRATCH_WORDS = (
     (0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10),
     (0xdeadbeef, 0xcafebabe, 0xfeedface, 0xbaadf00d),
     (0x00000000, 0x11111111, 0x22222222, 0x33333333),
+    (0x7f800001, 0xff812345, 0x7fcabcde, 0xffe76543),
 )
 
 
@@ -25150,9 +25161,7 @@ def check_flat_scratch_draws(directory, compiler, renderer, backend):
             struct.pack_into("<4I", constants, 12, *words)
             case_path = directory / f"scratch-{group}-{idx}.case"
             expected_words = words if group == 0 else (words[0], words[1], words[1], words[3])
-            expected = tuple(as_float(w) for w in expected_words)
-            write_case(case_path, bytes(constants), expected, integer_rt=True)
-            cases.append(case_path)
+            cases.append(write_uint_case(case_path, constants, expected_words))
         return cases
 
     cases = [make_cases(0), make_cases(1)]

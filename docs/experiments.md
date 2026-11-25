@@ -7610,6 +7610,12 @@ A sampled program can also read attr0.z/w, as plain values from a P1/P2 pair in 
 
 The integer readback profile declares the primary constant buffer as `uint4`. Integer consumers read its words directly, and floating-point consumers reinterpret the same bits. The byte layout is unchanged. The constant-index bitset draw checks copying `0xffffffff` through a VGPR and overwriting the destination with a floating-point result. On RTX 4060 Laptop (driver 32.0.16.1656), the previous float-typed load returned `0x7fffffff` for the immediate-index-31 copy; the integer load preserves `0xffffffff`. [Original report and independent reproduction](https://github.com/R0Y00/Xbox2Windows/pull/680#issuecomment-7099515543)
 
+The integer-copy and flat-scratch fixtures write expected UINT texels directly as
+four little-endian words. On Windows with CPython 3.11.9, converting the word
+`0xff812345` to a Python float and back writes `0xffc12345`. The copy fixture
+checks both signs and rejects changing just the quiet bit. The scratch fixtures
+carry the same payloads through their loads and stores.
+
 For normalized compressed whole-pair exports, the Python API can return `(source, mask)` via `return_write_mask=True`. The caller applies the returned RT0 mask (RG = `0x3`, BA = `0xC`, RGBA = `0xF`) in the PSO. Disabled components in the emitted `float4` are placeholders. The regular API still returns `float2` for its existing RG form and rejects a BA-only export. Because disassembly text can hide raw enable-bit differences, this API requires known whole-pair input. The draw fixture uses distinct clear sentinels and checks that a full PSO mask or incorrect enabled-channel values fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_compressed_export_(warp|hardware)$' -V`.
 
 The LLVM 15 binary fixture for #361 changes only the four EN bits of an assembled gfx1013 export and checks all 16 raw values. Reassembling the printed text keeps a packed pair when its first printed operand is enabled: raw 0x2 and 0xA reassemble as 0x0, and 0x5 reassembles as 0xF. Fully disabled source fields reassemble as zero. The normal lowering accepts 0x3, 0xC and 0xF through its explicit RT0-mask API. Other masks are rejected. These checks characterize the encoding and LLVM 15 behavior; they establish no gfx1013 channel-write semantics for non-pair masks.
