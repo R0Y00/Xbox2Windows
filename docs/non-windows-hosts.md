@@ -339,7 +339,10 @@ not Windows verification; report it as such.
   on a sampler heap). This is an open difference; the stand-ins hand out the desktop handle for
   those heap types.
 - **Two top-level windows.** The executable's own window can sit above the stand-in's output
-  window under an X11 window manager. Minimise it to see the output.
+  window under an X11 window manager. With `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`),
+  the stand-in hides it while frames are shown in the output window
+  ([Switches](startup-runtime.md#switches)). Keyboard input to the title after the hide is not
+  measured. Otherwise, minimise it to see the output.
 
 Known cost under Wine: one section per 64 KiB physical page
 (`src/xmem_mapped_pages.cpp`) is slow there. A request for about 100,000 pages did not finish

@@ -189,7 +189,7 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-8`, so translations paired by number are not reused.
+The shader cache revision is `x2w-startup-shader-9`, so translations paired by number are not reused.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
@@ -229,6 +229,21 @@ windows, build `startup_overlay_window` and run
 `ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
 The same run raises each of two guests in turn and checks that the raised one is
 selected.
+With `X2W_HIDE_TITLE_WINDOW=1` (exactly `1`), a 500 ms timer on the output window's thread hides the
+title's own visible, unowned windows while presents reach the output window, and hides them again when
+the title shows them. The hide is asynchronous (`ShowWindowAsync`), so a busy title thread does not
+stall the output window. Dialogs (class `#32770`) stay visible. When the latest present did not reach
+the output window, the windows are shown again, so that the GDI fallback above has a window to draw its
+status into. When a hidden window was in front, the output window is asked to take the foreground
+before the hide, and the log says so once when that is refused. Whether keyboard input still reaches
+the title after the hide has not been measured. The switch is opt-in and off by default; without it no
+timer is created. `startup_overlay_window` checks the helper (`TitleWindowHider` in
+`src/startup_stubs/overlay_window.h`) with source-built windows: the switch is off when unset, `0` or
+`10`; the timer is armed only with the switch and its `WM_TIMER` arrives; nothing is hidden before the
+first shown present; the guest is hidden twice and shown again after a present that was not shown; the
+presenter, its owned window and a dialog stay visible. Where the host lets the test set the foreground,
+it also checks that the foreground moves to the output window. A run under Wine did; the fixture prints
+which case applied.
 
 ## Null Texture2D descriptors
 
@@ -807,6 +822,14 @@ the process could not be created, 0 when the debugger finished its report, whate
 did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
 runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
 script text only.
+`tools/startup/run.sh` is the Linux counterpart ([Launch environment](wine.md#launch-environment)).
+`python3 -B tests/startup_run_sh_check.py` (ctest `startup_run_sh`, a skip on Windows) runs it under bash
+with a stub Wine, debugger and watcher. It checks the exit code, the debugger's arguments and environment,
+and that the watcher and its child run during the debugger call and are gone after the script exits. The
+watcher stub ignores SIGTERM, so the SIGKILL fallback is exercised. After a Ctrl-C, run.sh ends by
+SIGINT; a TERM sent to run.sh alone waits for the debugger and ends by SIGTERM. Mutated copies of the
+script must fail. run.sh and its check need bash 4.4 or newer, GNU `realpath` and `setsid`, so they run
+on Linux, not on a stock macOS.
 
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
@@ -1104,6 +1127,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
+| `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
@@ -1874,9 +1898,11 @@ These are measured on one executable; treat them as hypotheses for others.
   The control expects all three axes to use the U field and must fail.
   Table entries take their LOD range from word 1, as `smpl` static samplers do: `MIN_LOD` (bits 11:0) and
   `MAX_LOD` (bits 23:12), unsigned 4.8 fixed point. An entry with word 1 = 0 samples mip 0 only; the border
-  fallback is not a title descriptor and keeps the full mip range. `startup_sampler_lod_{warp,hardware}`
-  decode two table entries that differ only in word 1 (`MIN_LOD` 2, `MAX_LOD` 1) and read a four-mip
-  texture with one value per mip at explicit LODs; a
+  fallback is not a title descriptor and keeps the full mip range. A `MIN_LOD` above `MAX_LOD` is passed
+  through unchanged; D3D12 documents `MaxLOD >= MinLOD`, and the console behaviour for that case is not
+  established here. `startup_sampler_lod_{warp,hardware}` decode two table entries that differ only in
+  word 1, both with `MinLOD <= MaxLOD`: entry 0 is `MIN_LOD` 2 with `MAX_LOD` 4095/256, entry 1 is
+  `MIN_LOD` 0 with `MAX_LOD` 1. They read a four-mip texture with one value per mip at explicit LODs, and a
   static `smpc` sampler must keep `LESS`. The `_dropped_` control resets the decoded range and must read
   mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to

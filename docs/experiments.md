@@ -3821,6 +3821,43 @@ mutants must draw something else. The `binary` mode reassembles the source with
 LLVM 15 and is not part of ctest. The draw tests and the `binary` check were
 not run on Linux. They need Windows verification.
 
+### Loop census of mesh-stage programs
+
+`tools/mesh_loop_census.py` reads a directory of DXBC containers, keeps the
+mesh-stage programs that `tools/mesh_entry_aot.py` decodes, and prints aggregate
+tables only: no file name, digest, offset or instruction of an input. It lowers
+nothing.
+
+Every backward branch is counted as an observed back-edge, with the body taken
+from the branch target to the branch. Per back-edge it reports a group barrier
+in the body, LDS access in the body, an EXEC write in the body (an upper bound
+on a loop-carried EXEC: a save/restore pair counts too), a latch that tests
+EXEC, a scalar read before the body writes it, and the trip count as a pattern
+(a constant start, step and bound with no second exit), not as a proof. A loop
+the pattern does not match is reported as `other`, with nothing claimed.
+
+It then runs both bounded lowerers once per program and places the first
+refusal: at a latch, in a loop body, before the first loop or after one. The
+run is repeated with the two flat-scratch setup writes replaced by `s_nop`,
+because the lowerers refuse `s_setreg_imm32_b32` and that refusal otherwise
+hides what follows. LLVM 15 prints a negative branch offset unsigned
+(`s_branch 65535`); the census reads it signed.
+The SCC-writer filter excludes scalar instructions by mnemonic prefix, so a later
+`s_mul_*` or `s_cselect_*` variant that writes SCC would be skipped.
+
+```sh
+python3 -B tools/mesh_loop_census.py <directory> --llvm libLLVM-15.so.1
+python3 -B tools/mesh_loop_census.py <directory> --llvm-mc llvm-mc-15
+python3 -B tests/mesh_loop_census_check.py
+python3 -B tests/mesh_loop_census_check.py binary llvm-mc-15 llvm-objcopy-15
+```
+
+`tests/mesh_loop_census_check.py` holds 14 hand-written programs assembled
+with LLVM 15: 13 with a loop, one per shape, and a loop-free control. A
+barrier placed before the header instead of in the body is a second control.
+14 mutants each move one loop across one category boundary. The fixtures carry
+a loop and nothing else; they are not complete mesh programs.
+
 ## Amplification and mesh pipeline forms
 
 `tests/mesh_amplified_check.py` builds an amplification shader (`as_6_5`) and a
@@ -12218,8 +12255,20 @@ user-table exhaustion, and that `XAsyncGetStatus` and `XAsyncGetResultSize` repo
 in-callback claim, the error paths, reuse, provider exhaustion, early result
 retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
+`XGameSaveEnumerateBlobInfo` and `XGameSaveEnumerateBlobInfoByName` walk the
+committed blobs of an open container in slot order and call the public
+`bool(const XGameSaveBlobInfo*, void*)` callback for each; returning `false`
+stops the walk with `S_OK`. The by-name form matches a case-sensitive prefix
+(an empty prefix matches every blob). The names and sizes are copied under the
+shared lock and the callback runs after it is released, so a callback may call
+back into the shim. A null container, prefix or callback returns `E_INVALIDARG`;
+a closed handle returns `E_HANDLE`; a handle whose provider closed returns
+`E_HANDLE` or `E_GS_HANDLE_EXPIRED`. Container enumeration and asynchronous
+reads are not implemented. `xgameruntime_gamesave_enumerate` covers these
+cases, including sibling-container isolation.
+
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check xgameruntime_user_async_check xgameruntime_package_async_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_gamesave_enumerate_check xgameruntime_async_status_check xgameruntime_user_async_check xgameruntime_package_async_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```

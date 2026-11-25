@@ -4404,6 +4404,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         // Render mode: the presented surface goes to the title's window through a swap chain.
         if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
             shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        InterlockedExchange(&last_frame_shown, shown_in_window ? 1 : 0);
         if (render_mode()) present_signature(self, surface, frame);
     }
     const ULONGLONG now = GetTickCount64();

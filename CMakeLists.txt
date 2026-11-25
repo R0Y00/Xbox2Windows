@@ -403,6 +403,13 @@ add_test(NAME xgameruntime_gamesave_async COMMAND xgameruntime_gamesave_async_ch
     "$<TARGET_FILE_DIR:xmem_shim>")
 set_tests_properties(xgameruntime_gamesave_async PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
 
+add_executable(xgameruntime_gamesave_enumerate_check tests/xgameruntime_gamesave_enumerate_check.cpp)
+add_dependencies(xgameruntime_gamesave_enumerate_check xgameruntime_shim)
+target_compile_features(xgameruntime_gamesave_enumerate_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_gamesave_enumerate COMMAND xgameruntime_gamesave_enumerate_check
+    "$<TARGET_FILE:xgameruntime_shim>")
+set_tests_properties(xgameruntime_gamesave_enumerate PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
+
 add_executable(xgameruntime_async_status_check tests/xgameruntime_async_status_check.cpp)
 add_dependencies(xgameruntime_async_status_check xgameruntime_shim)
 target_compile_features(xgameruntime_async_status_check PRIVATE cxx_std_17)
@@ -3335,6 +3342,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py")
+    # The Linux launcher's check exits 77 on Windows; the Ubuntu job runs it.
+    add_test(NAME startup_run_sh COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_sh_check.py")
+    set_tests_properties(startup_run_sh PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
     # Large batches: pages as slots of shared sections, adjacent pages in one view.
@@ -7483,6 +7494,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" skipped)
     add_test(NAME mesh_scc_any_lane_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_scc_any_lane_check.py")
+    add_test(NAME mesh_loop_census COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_loop_census_check.py")
     add_test(NAME mesh_entry_exec_restore_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" exec-restore)
     add_test(NAME mesh_amplification_refusal COMMAND "${INTAKE_PYTHON}" -B
