@@ -23,7 +23,9 @@ own: 0x8003/0x8003 also places the position in v4 and draws the gradient; 0x8002
 the v4 this code reads is not the position and the draw fails at (1,0) as expected. They arrive after the
 target's result exists and are translated as new requests, leaving that result untouched. A description
 rewritten in place with another pair after its result was published is checked again, refused by name and
-its old result withdrawn.
+its old result withdrawn. The watcher follows the description each translation reads (an RTV variant reads its
+source pipeline's): a wrong pair in a base description withdraws the base and its variant, and the corrected
+description, newer than their failures, publishes both again without touching the request files.
 """
 import os
 import re
@@ -82,6 +84,12 @@ def pending(cache, fxc=''):
     """The keys a later --watch pass would translate (failures already written are skipped)."""
     with fxc_setting(fxc):
         return G.pending_keys(str(cache), True)
+
+
+def watch_pass(cache):
+    """One translate_pending pass as --watch runs it, on the manifest-only path."""
+    with fxc_setting():
+        G.translate_pending(str(cache), skip_failed=True, jobs=1)
 
 
 def translated_ps(cache, key, through_pending=False):
@@ -237,6 +245,50 @@ def controls():
         text, _ = translated_ps(cache, w, through_pending=True)
         check('a description rewritten unchanged is checked once, then done',
               first == [w] and text is not None and packed_line(text) == [] and pending(cache) == [])
+
+    # The watcher follows the description each translation reads: an RTV variant depends on its source's.
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        t = put_request(cache, ps_words(4), TARGET)
+        request = 'rtv1 %d 28' % t
+        v = G.fnv(request.encode('ascii'))
+        (cache / ('req_%016x.rtv' % v)).write_text(request, encoding='ascii')
+        for path in cache.glob('req_*'):  # captured well before anything below
+            stamp = path.stat().st_mtime - 1000
+            os.utime(path, (stamp, stamp))
+        sources = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                   for path in (cache / ('req_%016x.a' % t), cache / ('req_%016x.rtv' % v))}
+        watch_pass(cache)
+        manifests = [cache / ('%016x.txt' % key) for key in (t, v)]
+        description = cache / ('req_%016x.psin' % t)
+        check('base and RTV variant published, nothing pending', all(m.is_file() for m in manifests) and pending(cache) == [])
+        # The base description rewritten with the wrong pair (its line still naming the base), newer than both manifests.
+        for path in manifests:
+            if path.is_file():
+                stamp = path.stat().st_mtime - 100
+                os.utime(path, (stamp, stamp))
+        description.write_bytes(describe(t, DECOY).encode('ascii'))
+        check('a wrong pair in the base description queues the base and its RTV variant', pending(cache) == sorted([t, v]))
+        watch_pass(cache)
+        fails = [cache / ('%016x.fail' % key) for key in (t, v)]
+        check('both refused by name and both published results withdrawn',
+              not any(m.is_file() for m in manifests) and all(f.is_file() for f in fails)
+              and 'pixel input description names another pipeline' in fails[0].read_text()
+              and 'RTV variant source key mismatch' in fails[1].read_text())
+        check('the refusals are not retried while the description stays the same', pending(cache) == [])
+        # The valid description restored, newer than both failures.
+        for path in fails:
+            if path.is_file():
+                stamp = path.stat().st_mtime - 100
+                os.utime(path, (stamp, stamp))
+        description.write_bytes(describe(t, TARGET).encode('ascii'))
+        check('the restored description, newer than the failures, queues both again', pending(cache) == sorted([t, v]))
+        watch_pass(cache)
+        texts = [(cache / ('%016x.ps.hlsl' % key)).read_text() if m.is_file() else '' for key, m in zip((t, v), manifests)]
+        check('both republished from the restored description (position v4), .a and .rtv untouched',
+              all(m.is_file() for m in manifests) and [packed_line(text) for text in texts] == [[4], [4]]
+              and all((path.read_bytes(), path.stat().st_mtime_ns) == state for path, state in sources.items())
+              and pending(cache) == [])
 
     # Re-keying a cache keeps both pipelines and their descriptions, each naming its own key.
     with tempfile.TemporaryDirectory() as tmp:

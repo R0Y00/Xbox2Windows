@@ -65,7 +65,7 @@ def current_key(job):
     if kind == 'g':
         # The pixel input masks of a stream description are part of the key; the description names its key.
         try:
-            masks = g.read_ps_inputs(request_name(src, key), key)
+            masks = g.read_ps_inputs(request_name(src, key, '.psin'), key)
         except g.Unsupported as reason:
             return kind, key, None, str(reason)
         return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b''), masks), None
@@ -186,7 +186,7 @@ def rekey(src, dst, jobs=None, out=None):
                 for ext, data in read_parts(src, kind, old).items():
                     if ext == '.psin':  # the line names the new key
                         data = ('psin1 %016x ena=0x%04x addr=0x%04x\n' % (
-                            key, *g.read_ps_inputs(request_name(src, old), old))).encode('ascii')
+                            key, *g.read_ps_inputs(request_name(src, old, '.psin'), old))).encode('ascii')
                     publish(request_name(dst, key, ext), data, stats)
             current = sum(old == key for old, key in new[kind].items())
             print('%s: %d requests, %d already current -> %d keys' % (label, len(new[kind]), current, len(done)), file=out)
