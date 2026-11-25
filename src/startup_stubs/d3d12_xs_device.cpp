@@ -2135,15 +2135,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list");
-<<<<<<< HEAD
-    if (count != 1 || count_buffer || count_offset) return refuse("requires one command and no count buffer");
-=======
     // Only a desktop Dispatch signature runs more than one command or reads a count buffer here.
     constexpr UINT max_dispatch_commands = 1u << 16;
     if (!count || count > max_dispatch_commands) return refuse("command count is zero or above the supported maximum");
     if (!count_buffer && count_offset) return refuse("count offset without a count buffer");
-    Wrapper* sig = as_wrapper(signature);
->>>>>>> c7fdc208 (startup: run GPU-counted indirect Dispatch records through slot 61)
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
         return refuse("missing or placeholder signature", indirect_placeholder);
     const Wrapper* device = self->own().list_device;
@@ -2240,13 +2235,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
     require_state(self, resource, argument_state);
-<<<<<<< HEAD
-    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
-    InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
-=======
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, counts,
                           counts ? count_offset : 0);
->>>>>>> c7fdc208 (startup: run GPU-counted indirect Dispatch records through slot 61)
+    InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
 // draws either way. A root signature that indexes a descriptor heap directly is not set on the desktop list: the
