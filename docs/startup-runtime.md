@@ -1798,8 +1798,8 @@ These are measured on one executable; treat them as hypotheses for others.
   stand-in must be loaded for render-mode copy-in. `CopyFromSubresource` with the Scarlett
   option set to zero reads visible blocks back into pitched rows, preserving row padding.
   This CPU readback also works with rendering enabled and the XG stand-in alone.
-  The reported pitch describes the padded
-  block-row extent of the surface. Synthetic copy and draw checks run with
+  The reported pitch describes the padded block-row extent of the surface.
+  Synthetic copy and draw checks run with
   `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_' -V`.
   Those checks use only accepted descriptions at 81x69 and 64x64 (square 2x2 and 1x1 tile grids),
   and the draw check tiles and detiles with the same block offsets. `tests/startup_bc7_4k_s_check.cpp`
