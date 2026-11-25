@@ -617,6 +617,12 @@ that its fixture's module and export are in that list, that a source-built DLL l
 movie-player module name is not hooked by default, that each of its 7 export calls is counted with
 `--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
 
+`run.ps1 -TraceApi` sets `X2W_TRACE_API=1` for the child process and enables
+`x2w-api` lines for individual runtime provider methods. Use `-TraceCalls` for
+the debugger breakpoints described above. The switches work independently and
+can be combined. A line containing `x2w-runtime provider` and `(proxied as #…)`
+confirms that the runtime wrapped that provider even when method tracing is off.
+
 A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
 heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
 used, so every allocation and free costs more. The debugger starts the process with
