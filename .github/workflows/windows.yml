@@ -249,6 +249,7 @@ jobs:
             tests/startup_gfx2hlsl_int_med3_check.py \
             tests/startup_gfx2hlsl_cselect_mask_check.py \
             tests/startup_gfx2hlsl_mask_overwrite_check.py \
+            tests/startup_gfx2hlsl_mask_data_check.py \
             tests/startup_gfx2hlsl_image_get_lod_check.py \
             tests/startup_gfx2hlsl_add_sub_co_check.py \
             tests/startup_gfx2hlsl_add_sub_co_ci_check.py \
@@ -308,6 +309,7 @@ jobs:
             tests/startup_gfx2hlsl_mul_hi_check.py \
             tests/startup_gfx2hlsl_sad_check.py \
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
+            tests/startup_gfx2hlsl_pack_b32_f16_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_buffer_format_word3_table_check.py \

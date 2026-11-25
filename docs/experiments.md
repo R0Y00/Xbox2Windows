@@ -14163,11 +14163,20 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cselect_mask_controls$
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mask_overwrite_controls$' -V
 ```
 
+## Startup translator: lane masks used as vector data
+
+The one-lane model stores a mask as the current lane's bit. RDNA 2 reads the whole mask word when the register is
+a data source. For example, after `v_cmp_eq_u32_e64 s[30:31], 0, v0`, reading s30 as data gives
+`0xffffffff` if all 32 lanes pass. The translator refuses lane masks in either data operand of
+`v_cndmask_b32` and in the source of `v_mov_b32`, including SDWA DWORD. Source modifiers still identify the
+underlying mask register. Lane masks remain valid as selectors, and ordinary scalar words remain valid as data.
+The synthetic controls run under `startup_gfx2hlsl_mask_data_controls`.
+
 ## Startup translator: 32-bit add and subtract with a carry out
 
 `tools/startup/gfx2hlsl.py` refused the VOP3b forms `v_add_co_u32`, `v_sub_co_u32` and `v_subrev_co_u32` as unknown instructions. It now lowers them from the AMD RDNA 2 ISA description: `D = S0 + S1` with the carry out of bit 31, `D = S0 - S1` with a borrow when `S1 > S0`, and `SUBREV` with the sources swapped. These forms take no carry-in. The carry goes to the lane's bit of VCC or of the SGPR destination, which becomes a lane mask and is never a uniform source. The result and the carry are computed into the scratch registers `a` and `w` before either destination is written, so a destination may overlap a source. When `exec` is not known, an inactive lane keeps D and writes a 0 carry, as the compare lowering does. `clamp`, other modifiers, an EXEC carry-out and a wrong operand count are refused.
 
-`tests/startup_gfx2hlsl_add_sub_co_check.py` decodes synthetic VOP3b words for the three forms with an SGPR and a VCC carry-out, evaluates the emitted lines with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py` on a grid of edge values, and compares them with Python references written from the ISA description. It also checks that the carry-out SGPR is a lane mask, that a readfirstlane of a copy of it is refused, the exec-masked form, an overlapping destination and the refusals. Negative control: a borrow with the comparison reversed disagrees with the reference on the grid. On the translator before this change every form is refused. Test: `startup_gfx2hlsl_add_sub_co_controls`. Not covered: DXC compilation and a draw through a translated pipeline; the check evaluates the emitted HLSL text only.
+`tests/startup_gfx2hlsl_add_sub_co_check.py` decodes synthetic VOP3b words for the three forms with an SGPR and a VCC carry-out, evaluates the emitted lines with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py` on a grid of edge values, and compares them with Python references written from the ISA description. It also checks that the carry-out SGPR is a lane mask, that moving it as vector data is refused, the exec-masked form, an overlapping destination and the refusals. Negative control: a borrow with the comparison reversed disagrees with the reference on the grid. On the translator before this change every form is refused. Test: `startup_gfx2hlsl_add_sub_co_controls`. Not covered: DXC compilation and a draw through a translated pipeline; the check evaluates the emitted HLSL text only.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_add_sub_co_controls$' -V

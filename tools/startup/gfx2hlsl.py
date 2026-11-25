@@ -1871,6 +1871,22 @@ class Stage:
             return True, tok[1:]
         return False, tok
 
+    def reject_lane_mask_data(self, op, tok):
+        """The lane bit cannot represent a mask's word when it is read as data."""
+        source = tok
+        while True:
+            neg, operand = self.split_neg(source)
+            if neg:
+                source = operand
+            elif source.startswith('|') and source.endswith('|') and len(source) >= 2:
+                source = source[1:-1]
+            elif source.startswith(('abs(', 'sext(')) and source.endswith(')'):
+                source = source[source.index('(') + 1:-1]
+            else:
+                break
+        if self.is_lane_mask(source):
+            raise Unsupported('%s data operand %s is a lane mask' % (op, tok))
+
     def u_src(self, tok):
         """uint expression for an integer-context source that the disassembler may print negated."""
         # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
@@ -3341,7 +3357,9 @@ class Stage:
         elif base == 'v_mov_b32':
             arity, text = 1, '{0}'
             # A lane mask is one bit per lane here, so a byte or word of it is not the hardware's field.
-            if fields.get('src0_sel') != 'DWORD' and self.is_lane_mask(ops[1].removeprefix('sext(').removesuffix(')')):
+            if fields.get('src0_sel') == 'DWORD':
+                self.reject_lane_mask_data(base, ops[1])
+            elif self.is_lane_mask(ops[1].removeprefix('sext(').removesuffix(')')):
                 raise Unsupported('v_mov_b32 SDWA %s of lane mask %s' % (fields.get('src0_sel'), ops[1]))
         else:
             raise Unsupported('SDWA form of %s' % base)
@@ -5289,6 +5307,44 @@ class Stage:
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
 
+    def op_v_pack_b32_f16(self, ops, mods):
+        """D[15:0] = S0.f16, D[31:16] = S1.f16 (AMD RDNA 2 ISA, VOP3 V_PACK_B32_F16).
+
+        op_sel[i] selects the high half of source i (LLVM 15 VOP3Instructions.td: V_PACK_B32_F16 is VOP3_OPSEL).
+        The neg and abs source modifiers act on the sign bit (bit 15) of the selected half, abs first. The halves
+        are copied as bits, like pixel_aot's lowering of the same instruction: no binary16 denormal flush and no
+        NaN quieting is modelled (an assumption, not measured). Register sources only: an inline float constant
+        on a binary16 operand is a binary16 value, not the binary32 word u() would give. A destination op_sel bit
+        and clamp are refused, and so is any modifier other than the one op_sel:[a,b,c] spelling the decoder
+        prints."""
+        sel = [0, 0, 0]
+        for m in mods:
+            match = re.fullmatch(r'op_sel:\[([01]),([01]),([01])\]', m)
+            if not match:
+                raise Unsupported('v_pack_b32_f16 modifier %s' % m)
+            sel = [int(x) for x in match.groups()]
+        dst = reg_range(ops[0]) if ops else None
+        if sel[2] or len(ops) != 3 or not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            raise Unsupported('v_pack_b32_f16 form %s %s' % (', '.join(ops), ' '.join(mods)))
+        halves = []
+        for i, tok in enumerate(ops[1:3]):
+            neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+            tok = tok[1:] if neg else tok
+            absolute = tok.startswith('|') and tok.endswith('|')
+            tok = tok[1:-1] if absolute else tok
+            reg = reg_range(tok)
+            if not reg or reg[1] != reg[2] or reg[0] not in ('v', 's'):
+                raise Unsupported('v_pack_b32_f16 source %s' % ops[1 + i])
+            # The high half needs the whole word; the low half reads only bits 15:0, so a register whose high half
+            # is undefined (after an odd-count d16 load) stays readable here.
+            half = '(%s >> 16)' % self.u(tok) if sel[i] else '(%s & 0xffffu)' % self.u(tok, low16_only=True)
+            if absolute:
+                half = '(%s & 0x7fffu)' % half
+            if neg:
+                half = '(%s ^ 0x8000u)' % half
+            halves.append(half)
+        self.set_v(dst[1], '%s | (%s << 16)' % (halves[0], halves[1]))
+
     def op_v_cvt_pk_u8_f32(self, ops, mods):
         # VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides:
         #   D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])
@@ -5507,6 +5563,7 @@ class Stage:
     def op_v_mov_b32(self, ops, mods):
         if len(ops) != 2:
             raise Unsupported('v_mov_b32 with %d operands, expected 2' % len(ops))
+        self.reject_lane_mask_data('v_mov_b32', ops[1])
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_swap_b32(self, ops, mods):
@@ -5541,6 +5598,8 @@ class Stage:
             raise Unsupported('v_cndmask_b32 with %s' % mods)
         if len(ops) not in (3, 4):
             raise Unsupported('v_cndmask_b32 with %d operands, expected 3 or 4' % len(ops))
+        for source in ops[1:3]:
+            self.reject_lane_mask_data('v_cndmask_b32', source)
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
         self.set_v(reg_range(ops[0])[1],
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
