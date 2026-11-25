@@ -1,5 +1,26 @@
 # Experiment notes and reproduction commands
 
+### Translated indirect triangles
+
+`X2W_TRANSLATED_INDIRECT_DRAW=1` lets a slot 57 cached translation record one non-indexed
+`ExecuteIndirect` Draw on a direct list with triangle-list topology, one single-sample colour
+target, an explicit viewport and scissor, and the root signature used to create the guest pipeline.
+The translated path binds its usual pipeline, root and sampled textures, then forwards the placed
+desktop argument buffer and offset. Its producer supplies legal D3D12 draw arguments. The shim checks
+the placed buffer range without reading the draw fields or limiting the GPU-generated vertex count.
+The path refuses vertex streams, buffer SRVs, dynamic sampler heaps, unknown texture bindings and
+shaders whose reflected constants depend on the draw's start vertex or instance. It also refuses
+non-reflectable shader bytecode. A missing cached translation retains the request publishing path.
+
+Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
+`ctest --preset release -j1 --no-tests=error -R '^startup_indirect_translated_draw_' -V`.
+The fixture compiles source-built desktop shaders and installs their translation-cache manifest.
+A compute writer records one triangle at a nonzero offset in a placed GPU buffer with separate
+title backing. A fenced readback compares the argument, guard words and every colour pixel.
+Changing the sampled texture from red to green changes every pixel. Omitting the writer or texture,
+binding the wrong root, using a short argument range or using a shader that reads the start vertex
+leaves the target clear.
+
 ### Packed pixel position in a source-built shader
 
 Run `ctest --preset dev --no-tests=error -R '^startup_packed_screen_position_(hardware|warp)$' -V`.
