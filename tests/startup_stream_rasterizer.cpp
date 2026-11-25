@@ -145,7 +145,7 @@ int execute_guest_list(void* queue, void* list, void* fence, UINT64 fence_value)
 
 int main(int argc, char** argv)
 {
-    if (argc != 5 && argc != 13) return 2;
+    if (argc != 5 && argc != 13 && argc != 17) return 2;
     std::vector<char> vs, ps;
     if (!read_bytes(argv[1], vs) || !read_bytes(argv[2], ps)) return 3;
     const bool hardware = std::strcmp(argv[4], "hardware") == 0;
@@ -248,5 +248,18 @@ int main(int argc, char** argv)
     if (const int rc = run_case(6, argv[10], pso_bias)) return rc;
     if (const int rc = run_case(7, argv[11], mixed_10_27)) return rc;
     if (const int rc = run_case(8, argv[12], mixed_27_10)) return rc;
+    if (argc == 17) {
+        int output = 13;
+        for (int kind : {1, 2}) {
+            for (auto cull : {D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT}) {
+                auto raster = raster_desc(cull, TRUE);
+                raster.FrontCounterClockwise = TRUE;
+                void* pso = create_stream_pso(guest, root, vs, ps, kind, raster, 0);
+                if (!pso) return 9;
+                if (const int rc = run_case(output - 4, argv[output], pso)) return rc;
+                ++output;
+            }
+        }
+    }
     return 0;
 }
