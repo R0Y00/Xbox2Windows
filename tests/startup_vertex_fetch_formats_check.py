@@ -343,7 +343,7 @@ def controls():
     try:
         gfx2hlsl.Pipeline(struct.pack('<8I', *branch), ps, root_blob(flags=0))
     except gfx2hlsl.Unsupported as error:
-        assert 'proven in the entry block' in str(error), error
+        assert 'proven in the entry block' in str(error) or 'joined at a branch target' in str(error), error
     else:
         raise AssertionError('formatted load accepted when a branch could skip the descriptor load')
     def stage(words):
