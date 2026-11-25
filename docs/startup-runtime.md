@@ -1218,6 +1218,10 @@ ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|
 It exits 77 (skip) after the parser checks when XInput pad 0 is connected, because that pad's
 values merge into every reading.
 
+`IGameInput::GetTemporalReading` uses the v0 ABI and returns `E_NOTIMPL` as
+[documented by Microsoft](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/deprecated/interfaces/igameinput/methods/igameinput_gettemporalreading). The
+`startup_gameinput_contracts_check` fixture covers the refusal.
+
 ### Waiting for the presented picture
 
 Fixed times drift when a run gets slower or faster. A script can instead wait until the presented
