@@ -1532,6 +1532,7 @@ class Stage:
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
+    # v_mov_b32 is the same path with the selected source as its result,
     # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
     # dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
@@ -1551,6 +1552,11 @@ class Stage:
             arity, text = VEC_U_TO_F[base]
         elif base in VEC_U:
             arity, text = VEC_U[base]
+        elif base == 'v_mov_b32':
+            arity, text = 1, '{0}'
+            # A lane mask is one bit per lane here, so a byte or word of it is not the hardware's field.
+            if fields.get('src0_sel') != 'DWORD' and self.is_lane_mask(ops[1].removeprefix('sext(').removesuffix(')')):
+                raise Unsupported('v_mov_b32 SDWA %s of lane mask %s' % (fields.get('src0_sel'), ops[1]))
         else:
             raise Unsupported('SDWA form of %s' % base)
         sources = []
@@ -2552,8 +2558,8 @@ class Stage:
 
     def op_image_gather4_lz(self, ops, mods):
         name = 'image_gather4_lz'
-        if self.kind != 'ps' or len(ops) != 4:
-            raise Unsupported('%s requires a pixel stage and four operands' % name)
+        if self.kind not in ('ps', 'cs') or len(ops) != 4:
+            raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
         for modifier in mods:
             if not (modifier.startswith(('dim:', 'dmask:')) or modifier in ('dlc', 'glc', 'slc')):
                 raise Unsupported('%s modifier %s' % (name, modifier))
@@ -2578,6 +2584,17 @@ class Stage:
             check_gather_sampler(gather_2d_profile_words(words), 1, comparison=False)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
+        if self.kind == 'cs':
+            # The compute manifest binds the original table view. Each of its eight
+            # words must still belong to the same image descriptor.
+            image = reg_range(ops[2])
+            first = self.sym.get(image[1]) if image and image[0] == 's' and image[2] - image[1] == 7 else None
+            if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 8:
+                raise Unsupported('%s requires a fixed table image descriptor' % name)
+            for i in range(8):
+                word = first[:3] + (first[3] + i,)
+                if self.sym.get(image[1] + i) != word or desc_key(word) in self.pipe.modified:
+                    raise Unsupported('%s through a modified image descriptor' % name)
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))

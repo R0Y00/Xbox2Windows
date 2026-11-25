@@ -172,16 +172,25 @@ def check_lowerers():
             {("before the first loop", "with loops"): 1}, {(SETREG, "with loops"): 1}), lowerer
         assert refusal(counters, lowerer, skipped) == (
             {("at a latch", "with loops"): 1}, {(BACK_EDGE, "with loops"): 1}), lowerer
-        # A latch the branch table does not hold is an exception, counted under its type and instruction.
+        # An unsupported latch is counted by name at its own instruction.
         latch = [(pc, text.replace("s_cbranch_scc1", "s_cbranch_execnz")) for pc, text in program("counted")]
         counters = census.census([(latch, LIMITS)])
         assert refusal(counters, lowerer, as_decoded)[0] == {("at a latch", "with loops"): 1}, lowerer
-        assert list(refusal(counters, lowerer, as_decoded)[1]) == [
-            ("exception KeyError at s_cbranch_execnz", "with loops")], lowerer
+        assert refusal(counters, lowerer, as_decoded)[1] == {
+            ("Unsupported mesh branch s_cbranch_execnz", "with loops"): 1}, lowerer
         # A program without a back-edge is never placed relative to a loop.
         counters = census.census([(program("loop free"), LIMITS)])
         assert set(refusal(counters, lowerer, as_decoded)[0]) <= {
             ("after execution", "loop-free"), ("before the first loop", "loop-free")}, lowerer
+
+    def exec_range():
+        offset = 12
+        return {}[offset]
+
+    message, offset = census.first_refusal(exec_range)
+    assert (message, offset) == ("exception KeyError", 12)
+    assert census.location(message, offset, [(4, 12)]) == "at a latch"
+    assert census.normalise(message, "s_cbranch_execnz -3") == "exception KeyError at s_cbranch_execnz"
 
 
 def check_totals_and_output():

@@ -12,6 +12,7 @@ import re
 import struct
 from pathlib import Path
 
+from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
 from pixel_aot import MESH_WAVE64, container_code, disassemble
 from resource_inventory import parts
 
@@ -20,6 +21,11 @@ WAVE = (1 << 64) - 1
 LANE_SPILL_OPS = {"v_writelane_b32", "v_readlane_b32"}
 VGPR_OPERAND = re.compile(r"\bv(?:(\d+)\b|\[(\d+):(\d+)\])")
 LDS_BYTES = 1 << 16
+
+
+def branch_target(offset, operand):
+    """Byte offset a branch at `offset` jumps to. LLVM 15 prints the SIMM16 unsigned (s_branch 65535 is -1)."""
+    return offset + 4 + 4 * (((int(operand) & 0xFFFF) ^ 0x8000) - 0x8000)
 
 
 def span(token):
@@ -96,9 +102,19 @@ SUPPORTED_SCALAR_OPS = frozenset(
         "s_mov_b32", "s_mov_b64", "s_movk_i32", "s_cselect_b32", "s_cselect_b64",
         "s_bfe_u32", "s_lshl_b32", "s_lshr_b32", "s_add_i32", "s_add_u32",
         "s_sub_u32", "s_mul_i32", "s_and_b32", "s_and_b64", "s_or_b32",
-        "s_or_b64", "s_xor_b64", "s_andn2_b64",
+        "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_not_b64",
     )
 )
+
+# Lane-mask updates that keep the previous exec in the destination pair. The complemented forms negate the
+# old exec, not the source: ANDN2 is SRC0 & ~EXEC and ORN2 is SRC0 | ~EXEC.
+SAVEEXEC = {
+    "s_and_saveexec_b64": lambda old, a: old & a,
+    "s_andn2_saveexec_b64": lambda old, a: a & ~old,
+    "s_or_saveexec_b64": lambda old, a: old | a,
+    "s_orn2_saveexec_b64": lambda old, a: a | ~old,
+    "s_xor_saveexec_b64": lambda old, a: old ^ a,
+}
 
 
 class Wave:
@@ -134,6 +150,8 @@ class Wave:
         self.indices = {}
         self.m0 = None
         self.written = set()
+        # Position exports per vertex in program order: (target, values, done).
+        self.position_exports = {}
 
     def scalar(self, t, allow_undef=False):
         if t.startswith("s["):
@@ -151,12 +169,16 @@ class Wave:
             if i in self.pending:
                 raise ValueError("Scalar load used before wait")
             # A register no instruction ever writes is a bad operand, not a skipped write.
-            value = self.s.get(i, UNDEF) if i in self.written else self.s[i]
+            if i not in self.written and i not in self.s:
+                raise ValueError(f"Scalar register s{i} used before it is written")
+            value = self.s.get(i, UNDEF)
             if value is UNDEF and not allow_undef:
                 raise ValueError(UNDEFINED_SCALAR)
             return value
         if t == "exec":
             return self.exec
+        if t in ("exec_lo", "exec_hi"):
+            return self.exec >> (32 if t == "exec_hi" else 0) & U32
         if t == "vcc":
             if self.vcc is None:
                 raise ValueError("Undefined wave predicate")
@@ -170,6 +192,12 @@ class Wave:
             raise ValueError(UNDEFINED_SCALAR)
         if dest == "exec":
             self.exec = value & WAVE
+        elif dest in ("exec_lo", "exec_hi"):
+            # A 32-bit write replaces one half of the 64-bit lane mask and keeps the other.
+            if wide:
+                raise ValueError("Unsupported scalar destination")
+            shift = 32 if dest == "exec_hi" else 0
+            self.exec = self.exec & ~(U32 << shift) | (value & U32) << shift
         elif dest == "vcc":
             self.vcc = value & WAVE
         elif dest == "m0":
@@ -288,7 +316,7 @@ class Wave:
         end = target
         last = decoded[target - 1][1] if target - 1 >= pc else ""
         if last.startswith("s_branch "):
-            join_offset = decoded[target - 1][0] + 4 + 4 * int(last.split()[1])
+            join_offset = branch_target(decoded[target - 1][0], last.split()[1])
             if join_offset not in jumps or jumps[join_offset] <= target:
                 raise ValueError("Expected a forward mesh branch")
             end, join = target - 1, jumps[join_offset]
@@ -364,10 +392,12 @@ class Wave:
                 raise ValueError(f"Unsupported scalar compare {op}")
             self.scc = relation[op]
             return
-        if op == "s_and_saveexec_b64":
+        if op in SAVEEXEC:
             a = self.scalar(src[0])
+            if type(a) is not int:
+                raise ValueError("Scalar ALU requires concrete operands")
             old = self.exec
-            self.exec &= a
+            self.exec = SAVEEXEC[op](old, a) & WAVE
             self.put(d, old, True)
             self.scc = self.exec != 0
             return
@@ -417,6 +447,10 @@ class Wave:
             v = a ^ b
         elif op == "s_andn2_b64":
             v = a & ~b
+        elif op == "s_orn2_b64":
+            v = a | ~b
+        elif op == "s_not_b64":
+            v = ~a
         else:
             raise ValueError(f"Unsupported scalar instruction {op}")
         wide = op.endswith("_b64")
@@ -727,7 +761,7 @@ class Wave:
             elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
                 pc = self.join_arms(
                     decoded, expressions, jumps, pc, offset,
-                    offset + 4 + 4 * int(tail), self.scc,
+                    branch_target(offset, tail), self.scc,
                 )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
@@ -737,6 +771,8 @@ class Wave:
                     and self.vcc is None
                 ):
                     raise ValueError("Undefined branch predicate")
+                if op not in ("s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_execz", "s_cbranch_vccnz"):
+                    raise ValueError(f"Unsupported mesh branch {op}")
                 take = {
                     "s_branch": True,
                     "s_cbranch_scc0": not self.scc,
@@ -744,7 +780,7 @@ class Wave:
                     "s_cbranch_execz": not self.exec,
                     "s_cbranch_vccnz": bool(self.vcc),
                 }[op]
-                target = jumps[offset + 4 + 4 * int(tail)]
+                target = jumps[branch_target(offset, tail)]
                 if target < pc:
                     raise ValueError("Expected a forward mesh branch")
                 if take:
@@ -804,10 +840,11 @@ class Wave:
             elif op in ("ds_write_b32", "ds_read_b32"):
                 self.lds_op(op, tail)
             elif op == "exp":
-                m = re.fullmatch(r"(prim|pos0|param0),? (.+?)( done)?", tail)
+                m = re.fullmatch(r"(prim|pos[0-3]|param0),? (.+?)( done)?", tail)
                 if not m:
                     raise ValueError("Unsupported mesh export")
-                if not m[3] and m[1] != "param0":
+                # A position export may leave done to a later clip or cull distance export.
+                if not m[3] and m[1] == "prim":
                     raise ValueError("Expected completed primitive or position export")
                 operands = m[2].split(", ")
                 for lane in range(64):
@@ -825,6 +862,10 @@ class Wave:
                         if i in self.positions:
                             raise ValueError("Duplicate position")
                         self.positions[i] = [self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], None, bool(m[3])))
+                    elif m[1].startswith("pos") and len(operands) == 4:
+                        values = [None if t == "off" else self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], values, bool(m[3])))
                     elif m[1] == "param0" and len(operands) == 4 and all(re.fullmatch(r"v\d+", t) for t in operands):
                         if i in self.attributes:
                             raise ValueError("Duplicate vertex attribute")
@@ -930,7 +971,8 @@ def emit_compute_draw(bindings, expressions, positions, indices, attributes):
     return "\n".join(lines) + "\n"
 
 
-def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False):
+def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
+    layout = None if vs_out_cntl is None else decode_vs_out_cntl(vs_out_cntl)
     if vertex_header is not None and (
         type(vertex_header) != int or not 0 <= vertex_header <= U32
     ):
@@ -969,6 +1011,9 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         or any(max(tri) >= nv for tri in idx.values())
     ):
         raise ValueError("Conflicting mesh counts, vertices or primitive indices")
+    distances = vertex_distances(waves[0].position_exports | waves[1].position_exports, layout)
+    if compute_fallback and layout and layout.vectors:
+        raise ValueError("The compute fallback has no room for clip or cull distances")
     bindings = [
         "cbuffer Points : register(b0) { float4 pointData[32]; };",
         "cbuffer Matrices : register(b1) { float4 matrixData[32]; };",
@@ -982,7 +1027,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         "#ifdef TRACE_EXPORTS",
         "RWByteAddressBuffer trace : register(u0);",
         "#endif",
-        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "") + "};",
+        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "")
+        + hlsl_fields(layout) + "};",
         '[outputtopology("triangle")]',
         f"[numthreads(128,1,1)] void main(uint id:SV_GroupIndex, out vertices Vertex v[{nv}], out indices uint3 p[{np}]) {{",
         f"  SetMeshOutputCounts({nv},{np});",
@@ -1001,6 +1047,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         )
         if attributes:
             lines.append(f"  if(id=={i}) v[{i}].attr={float4(attributes[i])};")
+        if i in distances:
+            lines.append(f"  if(id=={i}) {{ {hlsl_writes(f'v[{i}]', distances[i])} }}")
     for i, tri in idx.items():
         lines.extend(
             [
@@ -1073,9 +1121,10 @@ def decode_mesh(blob, library):
     return disassemble(code, library, offsets=True, features=MESH_WAVE64), limits
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
     decoded, limits = decode_mesh(blob, library)
-    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback,
+                 vs_out_cntl=vs_out_cntl)
 
 
 if __name__ == "__main__":
@@ -1093,6 +1142,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Emit SM 6.0 compute (main) and vertex (vertex_main) entry points",
     )
+    p.add_argument(
+        "--pa-cl-vs-out-cntl",
+        type=lambda s: int(s, 0),
+        help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2",
+    )
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
     if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
@@ -1106,6 +1160,7 @@ if __name__ == "__main__":
         a.llvm,
         a.vertex_header,
         compute_fallback=a.compute_fallback,
+        vs_out_cntl=a.pa_cl_vs_out_cntl,
     )
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_text(src, encoding="ascii")

@@ -1610,7 +1610,7 @@ struct IndirectBufferView {
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
-IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words)
+IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false)
 {
     constexpr u64 limit = 16u << 20;
     u64 address = 0, offset = 0, bytes = 0;
@@ -1663,7 +1663,12 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             return {};
         }
         const auto placed = placed_buffer_range(device, address, bytes);
-        if (placed.reject || !placed.owner || (owner && owner != placed.owner)) return {};
+        if (placed.reject || (owner && owner != placed.owner)) return {};
+        if (!placed.owner) {
+            const auto alias = allow_address_alias && !list_upload_range(self, address, 1).resource
+                ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
+            return {alias.resource, alias.offset, bytes, stride};
+        }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
@@ -1903,7 +1908,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     vb.BufferLocation <= 0xffffffffffffull) {
                     const std::uint32_t stream[]{static_cast<UINT>(vb.BufferLocation),
                         static_cast<UINT>(vb.BufferLocation >> 32) | vb.StrideInBytes << 16, vb.SizeInBytes / vb.StrideInBytes, 0};
-                    view = indirect_table_buffer(self, stream);
+                    view = indirect_table_buffer(self, stream, true);
                     indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
                 }
             } else if (entry_ok) {
