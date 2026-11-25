@@ -23,6 +23,11 @@ class Unsupported(Exception):
 
 PREFETCH = bytes.fromhex('0300a0bf')
 
+# DPP16 quad pair broadcasts (quad_perm of one lane of every horizontal or vertical pair into the other). The lanes of
+# a quad are the pixels 0 1 / 2 3, row by row; lane i reads lane quad_perm[i].
+DPP_PAIR = frozenset(((1, 1, 3, 3), (0, 0, 2, 2), (2, 3, 2, 3), (0, 1, 0, 1)))
+DPP_SCRATCH = 256
+
 # SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
 # selection is zero-extended, or sign-extended under sext(); a destination selection writes the low
 # bits of the result into that field, UNUSED_PAD zeroes the others and UNUSED_PRESERVE keeps them.
@@ -767,6 +772,52 @@ class Stage:
             self.uniform_v.add(dst)
         return term
 
+    def dpp_pair(self, base, asm, ops, mods):
+        """A DPP16 spelling whose SRC0 is a quad pair broadcast (#2125 item C).
+
+        RDNA 2 ISA section 12.19 (DPP16): lane i of a quad reads SRC0 of lane quad_perm[i] of the same quad. A pair
+        broadcast ([1,1,3,3], [0,0,2,2], [2,3,2,3], [0,1,0,1]) moves one lane of every horizontal or vertical pair
+        into the other and leaves the first lane alone. The word of each of the four lanes is read with the shader
+        model 6.0 QuadReadLaneAt (its lane argument must be a constant, so all four reads are unconditional) and this
+        lane keeps the one quad_perm names for its own position in the quad. That needs all four lanes of the quad to
+        run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and a
+        whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every
+        other control (other permutations, row_*, wave_*, a partial row or bank mask, fi, a vertex stage) is refused by
+        name, since the single lane cannot read a neighbour."""
+        perms = [m for m in mods if m.startswith('quad_perm:')]
+        rest = [m for m in mods if not m.startswith('quad_perm:')]
+        if len(perms) != 1:
+            raise Unsupported('%s_dpp with %s' % (base, ' '.join(mods)))
+        for m in rest:
+            if m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
+                raise Unsupported('%s_dpp with %s' % (base, m))
+        # With all four lanes active no source lane is disabled, so bound_ctrl has nothing to replace.
+        perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
+        if perm not in DPP_PAIR:
+            raise Unsupported('%s_dpp with %s' % (base, perms[0]))
+        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
+                not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
+            raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
+                              % (base, perms[0]))
+        if len(ops) < 2:
+            raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
+        # The permuted word goes to a scratch register (v256, beyond the 256 hardware registers), so a second source
+        # naming the same register, or a destination that is the source, still reads the right lane.
+        src = re.fullmatch(r'([-|]*)v(\d+)(\|?)', ops[1])
+        if not src:
+            raise Unsupported('%s_dpp source %s' % (base, ops[1]))
+        word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
+        self.needs_sm6 = True
+        self.used_v.add(DPP_SCRATCH)
+        self.uniform_v.discard(DPP_SCRATCH)
+        self.emit('{ uint x2w_q0 = QuadReadLaneAt(%s, 0), x2w_q1 = QuadReadLaneAt(%s, 1),'
+                  ' x2w_q2 = QuadReadLaneAt(%s, 2), x2w_q3 = QuadReadLaneAt(%s, 3);'
+                  ' uint x2w_lane = ((uint(i.pos.y) & 1u) << 1u) | (uint(i.pos.x) & 1u);'
+                  ' v%d = x2w_lane == 0u ? x2w_q%d : x2w_lane == 1u ? x2w_q%d : x2w_lane == 2u ? x2w_q%d : x2w_q%d; }'
+                  % ((word,) * 4 + (DPP_SCRATCH,) + perm))
+        ops = [ops[0], '%sv%d%s' % (src.group(1), DPP_SCRATCH, src.group(3))] + ops[2:]
+        return self.lower(base, asm, ops, [])
+
     def lower(self, base, asm, ops, mods):
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
@@ -912,7 +963,7 @@ class Stage:
     # map onto the SM 6.0 quad intrinsics, which read the other lane of the 2x2 pixel quad and keep
     # helper lanes active. Only a pixel stage at entry EXEC qualifies, and only after `s_wqm exec, exec`
     # proved whole-quad EXEC: the hardware can return 0 or the old value for a source lane whose EXEC bit
-    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Pair permutations, DPP8, row shifts and partial masks stay refused.
+    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Other permutations, DPP8, row shifts and partial masks stay refused.
     def dpp(self, base, ops, mods):
         if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
             return self.dpp_broadcast(base, ops, mods)
@@ -923,6 +974,8 @@ class Stage:
                 perm = tuple(int(x) for x in match.groups())
             elif m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
                 raise Unsupported('%s_dpp with %s' % (base, m))
+        if perm in DPP_PAIR:
+            return self.dpp_pair(base, '%s %s' % (base, ', '.join(ops)), ops, mods)
         intrinsic = QUAD_SWAPS.get(perm)
         if not intrinsic:
             raise Unsupported('%s_dpp quad_perm %s: only the swaps [1,0,3,2], [2,3,0,1] and [3,2,1,0] are lowered'
@@ -1019,10 +1072,14 @@ class Stage:
             srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
-        word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16')
+        # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
+        word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
         if shift_add or word_complement or word_pack:
-            # The per-lane mask cannot supply the full word needed by these operations.
-            if self.is_lane_mask(dname) or any(self.is_lane_mask(t) for t in srcs):
+            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
+            # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
+            mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
+                         else self.is_lane_mask(dname))
+            if mask_dest or any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
@@ -2307,6 +2364,8 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((({1} >> 16) & 127) >= 32 ? 0xffffffffu : ((1u << (({1} >> 16) & 31)) - 1))', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
+    # s_mul_hi_u32: high 32 bits of the unsigned 64-bit product; SCC unchanged.
+    's_mul_hi_u32': ('mul_hi_u32({0}, {1})', None),
     # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
     's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
     's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
@@ -2491,6 +2550,10 @@ class Pipeline:
                '    return ftz32(sum);',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # High half of an unsigned 32x32 product, by halfword products so it fits 32-bit HLSL.
+               'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
+               ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
+               ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'

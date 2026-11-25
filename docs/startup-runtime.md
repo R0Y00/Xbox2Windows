@@ -493,7 +493,13 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
-socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
+socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). Offline mode
+applies to the title's process only. Runtime calls can still be serviced by Gaming Services
+components outside that process, which can use a signed-in Xbox, Store or Gaming Services account.
+Prefer a Windows user or machine with none of those accounts signed in, or the isolated VM in
+[Iterating on start-up runs](#iterating-on-start-up-runs). The live log window already notes that it
+does not establish that all network activity is blocked; see
+[Startup memory accounting](#startup-memory-accounting).
 
 The file hooks that offline mode needs are always armed. The gaming-runtime call hooks
 (`QueryApiImpl`, `InitializeApiImpl*`, `XErrorReport`) and the movie-player call hooks (open,
@@ -667,6 +673,14 @@ x2w-render totals: ... translated draws N (not drawn M), pipelines translated P 
 ```
 
 Compare the last line of each run. More translated draws and fewer "not drawn" mean a translator change reached real draws. "missing" is a live count of pipelines still waiting for a manifest. It can grow while things improve, if the run gets further and requests new pipelines.
+
+Beside the totals line, one line counts every `ExecuteIndirect` call (command-list slot 61) since the start, forwarded or by refusal reason, then by signature kind (`draw`, `drawindexed`, `dispatch`, `dispatchmesh`, or `other` for a placeholder or unknown signature); a reason with no calls reads `0`:
+
+```
+x2w-render indirect: forwarded: drawindexed 3; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; other: drawindexed 3
+```
+
+`graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal, counted under the signature's kind whenever the signature is known. The `x2w-render ExecuteIndirect refused` lines still stop after 16. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
 
 ### 4. Census, then rank
 
@@ -1170,6 +1184,14 @@ Slot 21 reserves the caller's async block on that same XAsync service, with its 
 
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_read_async_'` commits two blobs in one process and reads them in a second through slots 21 and 22. It checks the completion callback, the required size, the count and the exact bytes, a missing blob, a short buffer that leaves the output unchanged, and two overlapping reads. The controlled fixture always runs. The system variant uses an immediate Windows gaming runtime queue and skips only when that runtime is unavailable. `ctest --preset dev --no-tests=error -R '^startup_save_blob_pack'` checks `src/startup_stubs/save_blob_pack.h` directly without a runtime or disk store, including layout, `uint32_t` payload-size and `size_t` overflow refusals, and a negative control for the earlier size check.
 
+### Completion on a manual queue
+
+A completed XAsync operation can sit unconsumed when its block names a queue whose completion port is manual and nobody dispatches that port. `tests/startup_async_manual_completion.cpp` separates this from an operation that is still pending. It starts one synthetic operation on a queue whose work and completion ports are both manual. The provider completes it with an 8-byte payload on another thread. The test then prints four observations for each phase: the Begin return, the non-waiting `XAsyncGetStatus`, `XAsyncGetResultSize` and the callback count with what the callback retrieved. The phases are before completion (`pending`), after the provider thread completes the block, with no work-port callback and no completion-port dispatch (`unpumped`), and after one completion-port dispatch (`dispatched`). The callback count must be 0 until the completion port is dispatched. One dispatch must then run exactly one callback that retrieves the payload, and a second dispatch must find no work. A second block on an immediate queue is the contrast: its callback runs at completion with no dispatch. The `system` variant uses the installed Windows gaming runtime's XAsync service (`073b7dcb`) and prints its status and result-size answers. It accepts `E_PENDING` or `S_OK` before completion-port dispatch and requires `S_OK` after it. It reports a capability skip (77) when the runtime or its XAsync service is unavailable. Queue creation errors after obtaining the service fail the test. One measurement used Gaming Services 39.118.30001.0 (`xgameruntime.dll` 10.0.26100.9656) on Windows 10 build 19045. Before completion, both answers were `E_PENDING` (`0x8000000a`). Once the operation was complete but undispatched, the status was `S_OK`, the result size was 8 bytes and no callback had run. After the dispatched callback retrieved the result, the status stayed `S_OK` and the result size was 0. So a non-waiting status call separates an operation that is still pending from one whose completion has not been dispatched. The `controlled` variant uses a stand-in service in the test. In `inline_control` that stand-in runs the callback inside `XAsyncComplete`, as an immediate port would, and the control must print `FAIL: callback ran before the completion port was dispatched`. [XAsyncGetStatus](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus) · [XTaskQueueDispatch](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch)
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_async_manual_completion_(controlled|system|inline_control)$' -V
+```
+
 ## Findings
 
 These are measured on one executable; treat them as hypotheses for others.
@@ -1212,6 +1234,14 @@ These are measured on one executable; treat them as hypotheses for others.
   integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
   that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
   the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
+- **DPP quad pair broadcasts.** The four pair permutations of a pixel stage (`quad_perm:[1,1,3,3]`, `[0,0,2,2]`, `[2,3,2,3]`, `[0,1,0,1]`, with
+  `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
+  first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
+  same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, as are `row_*`, `wave_*`, partial masks and `fi`. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
+  draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
+  with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
 - **DPP quad broadcasts.** `quad_perm:[k,k,k,k]` for k = 0, 1, 2 or 3, with full `row_mask` and
   `bank_mask` and `bound_ctrl:1` or none, lowers on `v_mov_b32` and the VOP1/VOP2 float, integer and
   integer-to-float tables as one read of lane k of the quad, `QuadReadLaneAt`. The four lanes of a pixel
@@ -1219,8 +1249,7 @@ These are measured on one executable; treat them as hypotheses for others.
   stages that ran `s_wqm exec, exec` with EXEC unchanged since, so no lane of the quad is off; without that proof the broadcast is refused. `QuadReadLaneAt` is shader model
   6.0, so such a pixel stage compiles as `ps_6_0` with DXC (set `X2W_DXC`, or put `dxc.exe` in the Windows
   Kits `bin` folder or on `PATH`), and its vertex stage as `vs_6_0` too, because D3D12 rejects a pipeline
-  state that mixes DXBC and DXIL; every other pixel stage stays `ps_5_1` with FXC. Swaps, pair broadcasts,
-  row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages stay
+  state that mixes DXBC and DXIL; every other pixel stage stays `ps_5_1` with FXC. For single-lane broadcasts, row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages stay
   refused. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast"`: the controls
   check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
   fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.

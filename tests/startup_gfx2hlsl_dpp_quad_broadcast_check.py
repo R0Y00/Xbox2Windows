@@ -214,8 +214,8 @@ def controls():
     check('accepted forms translate', not any(refused(a) for a in accepted), str([a for a in accepted if refused(a)]))
     sane = 'v_mov_b32_dpp v1, v0 quad_perm:[1,1,1,1]' + DPP
     check('the merged quad swap also translates', not refused('v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2]' + DPP))
+    check('the pair broadcast also translates', not refused('v_mov_b32_dpp v1, v0 quad_perm:[1,1,3,3]' + DPP))
     bad = {
-        'pair broadcast': 'v_mov_b32_dpp v1, v0 quad_perm:[1,1,3,3]' + DPP,
         'identity': 'v_mov_b32_dpp v1, v0 quad_perm:[0,1,2,3]' + DPP,
         'row_shl': 'v_mov_b32_dpp v1, v0 row_shl:1' + DPP,
         'row_mirror': 'v_mov_b32_dpp v1, v0 row_mirror' + DPP,

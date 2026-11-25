@@ -2112,11 +2112,21 @@ HRESULT __stdcall device_create_query_heap(Wrapper* self, const D3D12_QUERY_HEAP
     return hr;
 }
 
+// Slot-61 calls by outcome and signature kind (IndirectCommand; none counts placeholder and unknown
+// signatures), reported with the render totals. 64-bit and never reset, so they neither wrap nor stall.
+enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline, indirect_placeholder, indirect_other,
+       indirect_outcomes };
+volatile LONG64 indirect_calls[indirect_outcomes][5];
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
 {
-    const auto refuse = [](const char* reason) {
+    // Every refusal is counted under the signature's kind, including those before the signature is checked.
+    Wrapper* sig = as_wrapper(signature);
+    IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
+    const auto refuse = [&kind](const char* reason, int outcome = indirect_other) {
+        InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
         static LONG refusals;
         if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
     };
@@ -2126,9 +2136,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list");
     if (count != 1 || count_buffer || count_offset) return refuse("requires one command and no count buffer");
-    Wrapper* sig = as_wrapper(signature);
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
-        return refuse("missing or placeholder signature");
+        return refuse("missing or placeholder signature", indirect_placeholder);
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
         return refuse("requires a supported signature from this device");
@@ -2144,7 +2153,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
         if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
             pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh)
-            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root");
+            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
+                          indirect_graphics_pipeline);
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             pass.target_formats[0] != pass.indirect_graphics.target_format ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
@@ -2155,7 +2165,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (samples.Count != 1 || samples.Quality)
             return refuse("draw requires a single-sample render target");
     } else if (!pass.compute_pipeline || !pass.compute_root) {
-        return refuse("requires a desktop compute pipeline and root");
+        return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
         return refuse("signature root constants require the bound compute root");
     }
@@ -2201,6 +2211,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     }
     require_state(self, resource, argument_state);
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
+    InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
 // draws either way. A root signature that indexes a descriptor heap directly is not set on the desktop list: the
@@ -3776,6 +3787,23 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)]);
+    if (render_mode() && frame % 300 == 0) {
+        // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
+        static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
+                                               "placeholder-signature", "other"};
+        static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
+        char line[1024];  // fits every outcome with five 19-digit counts
+        int n = std::snprintf(line, sizeof(line), "x2w-render indirect:");
+        for (int o = 0; o < indirect_outcomes; ++o) {
+            n += std::snprintf(line + n, sizeof(line) - n, "%s %s:", o ? ";" : "", outcomes[o]);
+            const int start = n;
+            for (int k = 0; k < 5; ++k)
+                if (const LONG64 calls = indirect_calls[o][k])
+                    n += std::snprintf(line + n, sizeof(line) - n, " %s %lld", kinds[k], static_cast<long long>(calls));
+            if (n == start) n += std::snprintf(line + n, sizeof(line) - n, " 0");
+        }
+        log("%s", line);
+    }
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];

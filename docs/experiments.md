@@ -6514,6 +6514,18 @@ and match their own plain-integer image. Run `ctest --preset dev --no-tests=erro
 `tests/startup_gfx2hlsl_vopc_sdwa_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip every accepted
 form through LLVM 15.
 
+**DPP16 quad pair broadcasts (#2125 item C).** A `_dpp` spelling used to stop translation, because the one-lane model
+cannot read a neighbour. In a pixel stage, `quad_perm:[1,1,3,3]`, `[0,0,2,2]`, `[2,3,2,3]` and `[0,1,0,1]` now lower:
+each lane reads the four lanes of its quad with the shader model 6.0 `QuadReadLaneAt` (constant lane arguments, so all four reads are unconditional) and keeps the one `quad_perm` names for its position in the quad (`SV_Position` parity). A first version rebuilt the other lane from `ddx_fine` / `ddy_fine`; it passed on WARP and failed on an RTX adapter, because a hardware derivative is not required to be the exact difference of two pixels, so it was replaced. The stage compiles with DXC `ps_6_0`, as the quad swaps do. The permuted word lives in a scratch register, so `v_add_nc_u32_dpp v3, v1, v1`
+adds the permuted word to the pixel's own. Straight-line pixel code after `s_wqm_b64 exec, exec` on the entry mask is required (an entry mask or a restored exact mask may leave a neighbour inactive, which native DPP16 treats differently), as the quad
+must run together with its helper lanes. Everything else stays refused by name. `startup_gfx2hlsl_dpp_pair` models a
+quad on the CPU for the emitted text and checks the refusals; `startup_gfx2hlsl_dpp_pair_{warp,hardware}` draw 16 x 16
+pixels per pattern, each pixel carrying a different 32-bit word, and compare every word with a reference written from
+the lane table. Mutations (opposite lanes, the lane's own word, a transposed lane index, the second source permuted) must fail the
+same draws. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_dpp_pair' -V`;
+`tests/startup_gfx2hlsl_dpp_pair_check.py binary <llvm-mc>` assembles the fixtures. This does not measure console
+behavior or a title, and the hardware draw is what checks a given adapter.
+
 **f32 lg and nlg compares with a NaN source (#1920).** `V_CMP_LG_F32` is less or greater: ordered and not equal,
 false when either source is NaN, and `V_CMP_NLG_F32` is its negation. `compare()` lowered them as `a != b` and
 `!(a != b)`, and HLSL `!=` is unordered, so both gave the opposite result on every NaN pair. They now read
@@ -6597,6 +6609,19 @@ sources, with source 0 in the low result half and source 1 in the high result
 half. SCC is unchanged. The fixture covers in-place, immediate and `m0` forms.
 Disabling the lowering or swapping the sources fails the check. Wave masks,
 symbolic descriptors and reserved scalar encodings stay refused. [Refs #1996](https://github.com/R0Y00/Xbox2Windows/issues/1996)
+
+**Scalar unsigned multiply-high.** The same check covers `s_mul_hi_u32`, the
+high 32 bits of the unsigned 64-bit product of two scalar words, with SCC
+unchanged. Startup HLSL has no 64-bit integer type, so a `mul_hi_u32` helper in
+the common preamble builds the high word from halfword products, as the
+`pixel_aot` scalar helper does. The check runs the emitted helper text on the
+CPU against `(a * b) >> 32` over the SOP2 forms above, edge pairs such as all
+ones squared and `0x80000000 x 2`, and seeded random pairs. The low word, the
+signed high word, a helper without either carry term, an added SCC write and a
+disabled lowering each fail. Wave-mask sources, a vcc or exec destination,
+symbolic descriptors and reserved scalar encodings stay refused; an SGPR that
+held a compare mask may be overwritten and loses its mask mark.
+`s_mul_hi_i32` is still refused by name.
 
 **Scalar bit tests.** Startup translation sets SCC for `s_bitcmp0_b32` and
 `s_bitcmp1_b32` by comparing the selected bit of the first word to zero or

@@ -183,8 +183,8 @@ def controls():
     check('the plain swap is accepted', refused(base) is None)
     check('bound_ctrl:1 is accepted (a quad_perm source is always in range)', refused(base + ' bound_ctrl:1') is None)
     check('quad broadcast also translates', refused(base.replace('[1,0,3,2]', '[0,0,0,0]')) is None)
+    check('pair broadcast also translates', refused(base.replace('[1,0,3,2]', '[1,1,3,3]')) is None)
     cases = [
-        ('pair broadcast [1,1,3,3] (item C)', base.replace('[1,0,3,2]', '[1,1,3,3]'), {}),
         ('identity [0,1,2,3]', base.replace('[1,0,3,2]', '[0,1,2,3]'), {}),
         ('partial row_mask', base.replace('row_mask:0xf', 'row_mask:0x3'), {}),
         ('partial bank_mask', base.replace('bank_mask:0xf', 'bank_mask:0x5'), {}),
