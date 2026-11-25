@@ -69,6 +69,7 @@ jobs:
               (["tests/pixel_attribute_sampled_check.py", *COMMON_LLVM], {}),
               (["tests/compute_mimg_msaa_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/compute_mimg_float_store_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
+              (["tests/compute_mimg_image_uav_load_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/compute_mimg_float_store_d16_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/compute_image_atomics_gfx1013_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/mesh_indexed_check.py", *COMMON_LLVM], {}),
@@ -82,6 +83,7 @@ jobs:
               (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_pk_u8_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_sample_b_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
@@ -206,6 +208,7 @@ jobs:
             tests/rectlist_topology_check.py \
             tests/startup_sampler_heap_check.py \
             tests/startup_image_sample_l_check.py \
+            tests/startup_image_sample_b_check.py \
             tests/startup_image_gather_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
