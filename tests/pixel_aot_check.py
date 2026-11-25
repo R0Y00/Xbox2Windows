@@ -21509,6 +21509,11 @@ def check_cvt_flr_rpi_draw(directory, compiler, renderer, backend):
     # Runtime sources: s44 and s45 come from the constant buffer, so DXC cannot fold the conversion.
     words = [word for word, _, _ in CVT_FLR_RPI_EXCEPTIONAL]
     pairs = list(zip(words[0::2], words[1::2]))
+    pairs += [
+        (0x007fffff, 0x807fffff),  # largest positive and negative subnormals
+        (0x00000000, 0x80000000),  # both signed zeros
+        (0x00800000, 0x80800000),  # smallest positive and negative normals
+    ]
     for tag, e64 in (("e32", False), ("e64", True)):
         body = cvt_flr_rpi_pair_body(0, 0, e64=e64)[2:]
         assert not any(line.startswith("s_mov_b32") for line in body)
@@ -21526,14 +21531,20 @@ def check_cvt_flr_rpi_draw(directory, compiler, renderer, backend):
                                  (0x7fffffff, 0x7fffffff, 0x80000000, 0x80000000))
     inf_case = make_runtime_case("runtime_inf_ref", (0x7f800000, 0x4f000001, 0, 0), (0x7fffffff,) * 4)
 
-    # Helper mutants on the runtime e32 shader: each must fail on the NaN or the +inf case.
+    subnormal_case = make_runtime_case("runtime_largest_subnormal_ref", (0x007fffff, 0x807fffff, 0, 0),
+                                       (0, 0, 0xffffffff, 0))
+
+    # Helper mutants on the runtime e32 shader must fail their respective case.
     runtime_hlsl = translate_int(uncompressed_export(cvt_flr_rpi_pair_body(0, 0, e64=False)[2:]))
-    for label, old, new, case in (
-        ("drop the NaN sign select", "return nan ? 0x7fffffffu + (bits >> 31) : word;", "return word;", nan_case),
-        ("reverse the NaN sign select", "0x7fffffffu + (bits >> 31)", "0x80000000u - (bits >> 31)", nan_case),
-        ("drop the 2^31 saturation", "x >= 2147483648.0f ? 0x7fffffffu : ", "", inf_case),
+    negative_subnormal = "if (bits > 0x80000000u && bits < 0x80800000u) return "
+    for label, old, new, count, case in (
+        ("drop the NaN sign select", "return nan ? 0x7fffffffu + (bits >> 31) : word;", "return word;", 2, nan_case),
+        ("reverse the NaN sign select", "0x7fffffffu + (bits >> 31)", "0x80000000u - (bits >> 31)", 2, nan_case),
+        ("drop the 2^31 saturation", "x >= 2147483648.0f ? 0x7fffffffu : ", "", 2, inf_case),
+        # Force the GPU-flush result even on hardware that preserves subnormals.
+        ("flush negative subnormals", negative_subnormal + "0xffffffffu;", negative_subnormal + "0u;", 1, subnormal_case),
     ):
-        assert runtime_hlsl.count(old) == 2, label
+        assert runtime_hlsl.count(old) == count, label
         source.write_text(runtime_hlsl.replace(old, new), encoding="ascii")
         compile_shader(compiler, source, shader)
         wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)

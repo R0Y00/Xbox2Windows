@@ -194,7 +194,7 @@ void retire_placement(Wrapper* w)
     ReleaseSRWLockExclusive(&note_lock);
 }
 
-PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes)
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false)
 {
     PlacedVertexView result{};
     if (!start || !bytes) return result;
@@ -207,7 +207,8 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
         for (auto it = group.by_start.lower_bound(earliest); it != group.by_start.end() && it->first < end; ++it) {
             const auto* owner = it->second;
             const auto& info = resource_infos().at(owner);
-            if (info.placement_device != device) continue;
+            if (info.placement_device != device || (aliases_only && info.placement != Placement::aliased_buffer))
+                continue;
             const u64 base = it->first;
             if (base <= start && start - base >= info.bytes) continue;
             if (result.owner || start < base || bytes > info.bytes - (start - base)) {
