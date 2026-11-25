@@ -666,7 +666,7 @@ class Stage:
         # pattern a float negation produces. Only handlers that model it ask for this; other integer
         # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
         neg, tok = self.split_neg(tok)
-        #`|vN|` clears the sign bit before any negation, so `-|vN|` is always negative.
+        # `|vN|` clears the sign bit before any negation, so `-|vN|` is always negative.
         if len(tok) > 2 and tok.startswith('|') and tok.endswith('|'):
             text = '(%s & 0x7fffffffu)' % self.u(tok[1:-1])
         else:
