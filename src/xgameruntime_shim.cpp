@@ -10,6 +10,7 @@
 //   XUserDuplicateHandle                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xuserduplicatehandle?view=gdk-2604
 //   XUserCloseHandle                    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xuser/functions/xuserclosehandle?view=gdk-2604
 //   XGameSaveInitializeProviderAsync    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveinitializeproviderasync?view=gdk-2610
+//   XGameSaveInitializeProviderResult  https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveinitializeproviderresult?view=gdk-2604
 //   XGameSaveInitializeProvider         https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveinitializeprovider?view=gdk-2604
 //   XGameSaveCreateContainer            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecreatecontainer?view=gdk-2604
 //   XGameSaveCreateUpdate               https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecreateupdate?view=gdk-2610
@@ -35,11 +36,15 @@
 //   XAsyncGetStatus                     https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus?view=gdk-2604
 //   XTaskQueueCreate                    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuecreate?view=gdk-2604
 //
-// Async gap: XUserAddAsync, XGameSaveInitializeProviderAsync and
-// XPackageMountWithUiAsync remain stubs. Their public completion contract
-// depends on XAsyncBlock plus user/save/package result queue, callback and
-// result semantics. This repository has no GDK headers, so the shim does not
-// invent that async completion state. XPackageMount is documented as a
+// Async gap: XUserAddAsync and XPackageMountWithUiAsync remain stubs, as do
+// XAsyncGetStatus and XTaskQueueCreate. XGameSaveInitializeProviderAsync is
+// implemented for the one contract this repository can state without GDK
+// headers: it runs the synchronous provider path, completes before it returns,
+// calls the block's callback once on the calling thread, and
+// XGameSaveInitializeProviderResult hands the provider over exactly once. The
+// shim reads only the three leading public XAsyncBlock fields (queue, context,
+// callback) and keeps its own state in a side table keyed by the block
+// address, so the remaining opaque bytes of the block are never touched. XPackageMount is documented as a
 // deprecated synchronous alternative; the shim implements it against a local
 // synthetic package directory. The implemented surface is the synchronous
 // XUser, XGameSave, PLS, XPackage, XSystem and XGame subset below. The public
@@ -60,6 +65,13 @@
 #include <windows.h>
 
 struct XAsyncBlock;
+using XAsyncCompletionRoutine = void CALLBACK(XAsyncBlock*);
+// Leading public XAsync.h fields. Only these are read; see the async note below.
+struct XAsyncBlock {
+    void* queue;
+    void* context;
+    XAsyncCompletionRoutine* callback;
+};
 namespace xgameruntime_shim {
 struct XUserHandleStorage;
 struct XGameSaveProviderStorage;
@@ -145,7 +157,8 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XUserGetId, XUser, HRESULT, (XUserHandle user, std::uint64_t* userId), implemented_hr, (user, userId), user_get_id) \
     X(XUserDuplicateHandle, XUser, HRESULT, (XUserHandle handle, XUserHandle* duplicatedHandle), implemented_hr, (handle, duplicatedHandle), user_duplicate_handle) \
     X(XUserCloseHandle, XUser, void, (XUserHandle user), implemented_void, (user), user_close_handle) \
-    X(XGameSaveInitializeProviderAsync, XGameSave, HRESULT, (XUserHandle, const char*, bool, XAsyncBlock*), stub, (), stub) \
+    X(XGameSaveInitializeProviderAsync, XGameSave, HRESULT, (XUserHandle requestingUser, const char* configurationId, bool syncOnDemand, XAsyncBlock* asyncBlock), implemented_hr, (requestingUser, configurationId, syncOnDemand, asyncBlock), game_save_initialize_provider_async) \
+    X(XGameSaveInitializeProviderResult, XGameSave, HRESULT, (XAsyncBlock* asyncBlock, XGameSaveProviderHandle* provider), implemented_hr, (asyncBlock, provider), game_save_initialize_provider_result) \
     X(XGameSaveInitializeProvider, XGameSave, HRESULT, (XUserHandle requestingUser, const char* configurationId, bool syncOnDemand, XGameSaveProviderHandle* provider), implemented_hr, (requestingUser, configurationId, syncOnDemand, provider), game_save_initialize_provider) \
     X(XGameSaveCreateContainer, XGameSave, HRESULT, (XGameSaveProviderHandle provider, const char* containerName, XGameSaveContainerHandle* containerContext), implemented_hr, (provider, containerName, containerContext), game_save_create_container) \
     X(XGameSaveCreateUpdate, XGameSave, HRESULT, (XGameSaveContainerHandle container, const char* containerDisplayName, XGameSaveUpdateHandle* updateContext), implemented_hr, (container, containerDisplayName, updateContext), game_save_create_update) \
@@ -200,12 +213,15 @@ constexpr std::size_t blob_name_capacity = 64;
 constexpr std::size_t blob_bytes_capacity = 1024;
 constexpr std::size_t package_identifier_capacity = 64;
 constexpr std::size_t package_mount_capacity = 4;
+constexpr std::size_t async_capacity = 16;
 constexpr wchar_t pls_directory_name[] = L"xbox-recomp-pls";
 constexpr wchar_t synthetic_pls_app_name[] = L"x2w-synthetic-title-0001";
 constexpr wchar_t package_directory_name[] = L"xbox-recomp-packages";
 constexpr std::uint64_t synthetic_pls_available_free_bytes = 32ull * 1024 * 1024;
 constexpr std::uint64_t synthetic_pls_total_free_bytes = 48ull * 1024 * 1024;
 constexpr std::uint64_t synthetic_pls_total_bytes = 64ull * 1024 * 1024;
+// E_ILLEGAL_STATE_CHANGE; named locally because not every SDK header declares it.
+constexpr HRESULT e_illegal_state_change = static_cast<HRESULT>(0x8000000DL);
 constexpr HRESULT e_gs_invalid_container_name = static_cast<HRESULT>(0x80830001L);
 // https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2610
 constexpr HRESULT e_gs_handle_expired = static_cast<HRESULT>(0x8083000DL);
@@ -302,7 +318,6 @@ static_assert(has_implemented(thunks, "XPackage"));
 static_assert(has_implemented(thunks, "XSystem"));
 static_assert(has_implemented(thunks, "XGame"));
 static_assert(has_stub(thunks, "XUserAddAsync"));
-static_assert(has_stub(thunks, "XGameSaveInitializeProviderAsync"));
 static_assert(has_stub(thunks, "XPackageMountWithUiAsync"));
 
 struct XUserHandleStorage {
@@ -355,6 +370,16 @@ struct XPackageMountStorage {
     char identifier[package_identifier_capacity]{};
 };
 
+// One in-flight or completed-but-unclaimed XGameSaveInitializeProviderAsync.
+// The slot lives from the call until XGameSaveInitializeProviderResult.
+struct ProviderAsyncSlot {
+    bool live = false;
+    bool completed = false;
+    const XAsyncBlock* block = nullptr;
+    HRESULT status = S_OK;
+    XGameSaveProviderHandle provider = nullptr;
+};
+
 struct RuntimeState {
     SRWLOCK lock = SRWLOCK_INIT;
     std::uint64_t next_provider_scope = 1;
@@ -367,6 +392,7 @@ struct RuntimeState {
     std::array<XGameSaveContainerStorage, container_handle_capacity> containers{};
     std::array<XGameSaveUpdateStorage, update_capacity> updates{};
     std::array<XPackageMountStorage, package_mount_capacity> package_mounts{};
+    std::array<ProviderAsyncSlot, async_capacity> provider_asyncs{};
 };
 
 RuntimeState runtime_state;
@@ -778,6 +804,82 @@ HRESULT game_save_initialize_provider(XUserHandle requesting_user, const char* c
     }
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return E_OUTOFMEMORY;
+}
+
+ProviderAsyncSlot* find_provider_async(const XAsyncBlock* block) noexcept
+{
+    for (auto& slot : runtime_state.provider_asyncs) {
+        if (slot.live && slot.block == block) return &slot;
+    }
+    return nullptr;
+}
+
+// Argument errors come back from the call itself, like the synchronous path,
+// and consume nothing. A started operation always completes before this returns.
+HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const char* configuration_id,
+                                            bool sync_on_demand, XAsyncBlock* async_block) noexcept
+{
+    if (!async_block) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    if (find_provider_async(async_block)) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return e_illegal_state_change;
+    }
+    ProviderAsyncSlot* reserved = nullptr;
+    for (auto& slot : runtime_state.provider_asyncs) {
+        if (!slot.live) {
+            reserved = &slot;
+            break;
+        }
+    }
+    if (!reserved) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_OUTOFMEMORY;
+    }
+    *reserved = ProviderAsyncSlot{};
+    reserved->live = true;
+    reserved->block = async_block;
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+
+    XGameSaveProviderHandle provider = nullptr;
+    const HRESULT status = game_save_initialize_provider(requesting_user, configuration_id,
+                                                         sync_on_demand, &provider);
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    if (FAILED(status)) {
+        *reserved = ProviderAsyncSlot{};
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return status;
+    }
+    reserved->provider = provider;
+    reserved->status = status;
+    reserved->completed = true;
+    XAsyncCompletionRoutine* const callback = async_block->callback;
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    if (callback) callback(async_block);
+    return S_OK;
+}
+
+HRESULT game_save_initialize_provider_result(XAsyncBlock* async_block,
+                                             XGameSaveProviderHandle* provider) noexcept
+{
+    if (!provider) return E_POINTER;
+    *provider = nullptr;
+    if (!async_block) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    ProviderAsyncSlot* slot = find_provider_async(async_block);
+    if (!slot) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_INVALIDARG;
+    }
+    if (!slot->completed) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_PENDING;
+    }
+    const HRESULT status = slot->status;
+    *provider = slot->provider;
+    *slot = ProviderAsyncSlot{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return status;
 }
 
 HRESULT game_save_create_container(XGameSaveProviderHandle provider, const char* container_name,

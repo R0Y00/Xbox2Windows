@@ -11080,10 +11080,9 @@ does not write into any newly created container such as `slot-b`. The contract
 test covers both controls plus independent `slot-a`/`slot-b` names on one
 provider.
 
-`XUserAddAsync` and `XGameSaveInitializeProviderAsync` remain explicit stubs.
-Their completion contract requires the public `XAsyncBlock`, `XUserAddResult`,
-and `XGameSaveInitializeProviderResult` queue/callback/result semantics, which
-this repository does not model without GDK headers.
+`XUserAddAsync` remains an explicit stub. Its completion contract needs the public
+`XAsyncBlock` and `XUserAddResult` semantics, which this repository does not model
+without GDK headers. `XGameSaveInitializeProviderAsync` is implemented; see below.
 
 The same fixture adds the smallest documented synchronous persistent local
 storage and package subset. `XPersistentLocalStorageGetPathSize`,
@@ -11105,7 +11104,7 @@ handle. `XPackageGetMountPathSize` and `XPackageGetMountPath` report that path,
 and `XPackageCloseMountHandle` invalidates the handle; later path queries return
 `E_HANDLE`. The mapping is shim-only and does not read or verify a real package
 manifest. `XPackageMountWithUiAsync` remains an explicit stub, as do
-`XUserAddAsync` and `XGameSaveInitializeProviderAsync`, because the
+`XUserAddAsync`, because the
 `XAsyncBlock` completion contract is not modeled without GDK headers.
 
 The same fixture adds the synchronous XSystem and XGame identity subset.
@@ -11144,10 +11143,25 @@ repeats each call for stability, checks the short-buffer and null-pointer errors
 and asserts that `XUserAddAsync` still logs `E_NOTIMPL`. The DLL remains under
 `out/build/dev/fixture-shims/` and is loaded by explicit path. The exact CTest
 names are `xgameruntime_thunks`, `xgameruntime_contracts`,
-`xgameruntime_pls_xpackage`, and `xgameruntime_identity`.
+`xgameruntime_pls_xpackage`, `xgameruntime_identity`, and
+`xgameruntime_gamesave_async`.
+
+`XGameSaveInitializeProviderAsync` and `XGameSaveInitializeProviderResult` are
+implemented on top of the synchronous provider path. Argument errors (null
+block, null or empty configuration id, null or closed user) return from the call
+and leave the block untouched. A started operation completes before the call
+returns, calls the block's callback once on the calling thread, and the result
+is claimed exactly once (a second claim returns `E_INVALIDARG`). Reusing a block
+whose result is unclaimed returns `E_ILLEGAL_STATE_CHANGE` (0x8000000D). The shim keeps its
+state in a side table keyed by the block address and reads only the leading
+queue, context and callback fields. `XAsyncGetStatus`, `XTaskQueueCreate`,
+`XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs, and
+queue dispatch modes are not modeled. `xgameruntime_gamesave_async` covers the
+positive completion, callback and in-callback claim, the error paths, reuse and
+provider exhaustion.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
