@@ -47,6 +47,7 @@
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/rect_indirect_args.h"
+#include "startup_stubs/profile_zone.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -3315,6 +3316,7 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
 {
+    X2W_ZONE("ExecuteCommandLists");
     static LONG calls;
     if (render_mode()) {
         // A closed list stays submittable until its next Reset, as on the desktop.
@@ -4504,6 +4506,7 @@ HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, voi
     ReleaseSRWLockExclusive(&lock);
     if (timeout != 0 && wait_ticks > 0) {
         // High-resolution timer where available (Sleep is too coarse for a 33 ms frame).
+        X2W_ZONE("frame wait (sleep)");
         static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
         LARGE_INTEGER due;
         due.QuadPart = -(wait_ticks * 10000000 / frequency.QuadPart);
@@ -4664,6 +4667,8 @@ void report_budget(ID3D12CommandQueue* queue)
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
 {
     Timed timed(time_present);
+    X2W_ZONE("Present");
+    X2W_FRAME_MARK;
     static LONG frames;
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);

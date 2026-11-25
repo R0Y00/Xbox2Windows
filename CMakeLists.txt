@@ -3,9 +3,31 @@ project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
 
+# Python never caches the bytecode of the script it is started with, so every start of a big
+# tests/<name>.py recompiled it. tests/pyc_main.py <name> runs that file through the import system,
+# which reuses a valid .pyc. The add_test calls below keep naming the script; this wrapper swaps in
+# the entry plus the module name in one place. Other add_test calls pass through unchanged.
+set(x2w_pyc_main_modules pixel_aot_check compute_store_check)
+function(add_test)
+  list(LENGTH ARGV x2w_test_argc)
+  if(NOT x2w_test_argc EQUAL ARGC)
+    message(FATAL_ERROR "add_test wrapper: an argument is empty or holds ';'; call _add_test directly")
+  endif()
+  set(x2w_test_args "${ARGV}")
+  foreach(x2w_module IN LISTS x2w_pyc_main_modules)
+    string(REPLACE "/tests/${x2w_module}.py" "/tests/pyc_main.py;${x2w_module}" x2w_test_args "${x2w_test_args}")
+  endforeach()
+  _add_test(${x2w_test_args})
+endfunction()
+
 # Defined before the first Python-driven test so a fresh configure registers all of them.
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME pyc_main_entry COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pyc_main_check.py")
+    set_tests_properties(pyc_main_entry PROPERTIES TIMEOUT 60)
+endif()
 
 set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
 if(DSTORAGE_SDK_ROOT)
@@ -523,6 +545,34 @@ target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_bu
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Developer-only measurement build: Tracy zones in the stand-ins (src/startup_stubs/profile_zone.h).
+# One shared TracyClient.dll serves every instrumented DLL. Off (the default), nothing is fetched, defined or linked.
+# On, Tracy (BSD-3-Clause, see docs/startup-runtime.md) is fetched at the pinned commit below, or taken from an existing
+# checkout with -DFETCHCONTENT_SOURCE_DIR_TRACY=<path>. The client opens a local socket; see docs/startup-runtime.md.
+option(X2W_TRACY "Instrument the startup stand-ins with Tracy zones (fetches Tracy v0.15.0)" OFF)
+if(X2W_TRACY)
+    include(FetchContent)
+    set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)  # Tracy's 3.13 minimum would otherwise ignore MSVC_RUNTIME_LIBRARY
+    set(TRACY_ENABLE ON)
+    set(TRACY_STATIC OFF)
+    set(TRACY_ON_DEMAND ON)
+    set(TRACY_ONLY_LOCALHOST ON)
+    set(TRACY_NO_BROADCAST ON)
+    set(TRACY_NO_CRASH_HANDLER ON)
+    # Symbol and kernel-tracing setup cost seconds per process in the D3D12 fixtures; sampling is ETW's job.
+    set(TRACY_NO_CALLSTACK ON)
+    set(TRACY_NO_SYSTEM_TRACING ON)
+    # v0.15.0, pinned by commit so the tag cannot move.
+    FetchContent_Declare(tracy GIT_REPOSITORY https://github.com/wolfpld/tracy.git
+        GIT_TAG f2a4f2529e7e71844c9e434b877770a21ecf7587)
+    FetchContent_MakeAvailable(tracy)
+    set_target_properties(TracyClient PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    foreach(target IN ITEMS d3d12_xs_shim startup_stub_xcrdapi xmem_shim)
+        target_link_libraries(${target} PRIVATE Tracy::TracyClient)
+        target_compile_definitions(${target} PRIVATE X2W_TRACY=1)
+    endforeach()
+endif()
 add_executable(startup_null_views_check tests/startup_null_views_check.cpp)
 target_compile_features(startup_null_views_check PRIVATE cxx_std_17)
 target_link_libraries(startup_null_views_check PRIVATE d3d12_xs_shim d3d12 dxgi)
@@ -2879,6 +2929,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_capture_check.py")
     set_tests_properties(startup_gfx2hlsl_capture PROPERTIES TIMEOUT 120)
+    # archive_requests.py writes runtime-keyed shader requests from a synthetic archive.
+    add_test(NAME startup_archive_requests COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_archive_requests_check.py")
+    set_tests_properties(startup_archive_requests PROPERTIES TIMEOUT 120)
     # Two integer operations whose refusal was never reached: v_cvt_i32_f32 with an output
     # modifier, and v_readfirstlane_b32 without a proven uniform source.
     add_test(NAME startup_gfx2hlsl_op_refusals COMMAND "${INTAKE_PYTHON}" -B
@@ -2973,6 +3027,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_neg_operand COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_neg_operand_check.py")
     set_tests_properties(startup_gfx2hlsl_neg_operand PROPERTIES TIMEOUT 60)
+    # Vertex-stage buffer stores lower to RWByteAddressBuffer Store* under manifest version 2 (#1723).
+    add_test(NAME startup_gfx2hlsl_buffer_store COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_buffer_store_check.py")
     # Output modifiers on float-result conversions (#1705).
     add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vcvt_omod_check.py")
@@ -3355,6 +3412,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_small_texture_4k_xg startup_small_texture_4k_xg_no_limit_control
         PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
     set_tests_properties(startup_small_texture_4k_xg_no_limit_control PROPERTIES WILL_FAIL TRUE)
+    # gfx2hlsl v_mul_hi_u32 (#870): CPU helper evaluation, refusal and mutation controls, then desktop draw (FXC 5_1 and DXC 6_0).
+    add_test(NAME startup_gfx2hlsl_mul_hi_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_mul_hi_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_mul_hi_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_xg_bc_tiling COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_xg_bc_tiling_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
     set_tests_properties(startup_xg_bc_tiling PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
@@ -3648,6 +3714,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Device slot 67 compute requests offline: key vector, --pending and --refusals (pure Python).
     add_test(NAME startup_compute_request_offline COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_offline_check.py")
+    add_test(NAME compute_container_index COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute_container_index_check.py")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
@@ -4760,7 +4828,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_avx_pcmpstr PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_xsave_state_original_exports
         "op_xrstor_xsave,op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_xsave,"
-        "op_xrstor64_disp,op_xrstor64_mask_sse,op_vzeroupper_xsave64,op_pipeline,"
+        "op_xrstor64_disp,op_xrstor64_mask_sse,op_vzeroupper_xsave64,op_pipeline,op_xrstor64_xsave64_avx,"
+        "op_xrstor64_movq_read_xsave64,"
         "op_discarded_read,op_xrstor64_xsavec,op_xrstor64_xsavec64,"
         "op_xrstor64_xsavec64_sse,op_xrstor64_xsavec64_x87_avx,op_xsavec64_dynmask,"
         "op_xrstor64_xsaveopt,op_xrstor64_xsaveopt64,op_xrstor64_xsaveopt64_sse,"
@@ -4888,6 +4957,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     string(CONCAT cpu_sse2_exports ${cpu_sse2_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_sse2_regs_${variant} sse2_regs)
+        target_sources(cpu_sse2_regs_${variant} PRIVATE tests/cpu/sse2_mxcsr_test.asm)
         cpu_translation(cpu_sse2_regs_${variant} cpu_sse2_aot "${cpu_sse2_exports}")
     endforeach()
     target_compile_definitions(cpu_sse2_regs_altered PRIVATE ALTER_IMM)
@@ -5152,7 +5222,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_integer_flags PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_sse_fxsave_exports
         "op_fxrstor_fxsave,op_fxrstor64_fxsave64,op_fxrstor_fxsave64,"
-        "op_fxrstor64_fxsave,op_fxrstor64_disp,op_pipeline,op_discarded_read")
+        "op_fxrstor64_fxsave,op_fxrstor64_disp,op_pipeline,op_discarded_read,"
+        "op_fxrstor64_movq_store,op_fxrstor64_movq_gpr")
     string(CONCAT cpu_sse_fxsave_exports ${cpu_sse_fxsave_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_sse_fxsave_${variant} sse_fxsave)
@@ -8099,6 +8170,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/gfx10_texture_roundtrip_check.py" controls)
     add_test(NAME texture_bc_volume COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/texture_bc_volume_check.py")
+    add_test(NAME bc7_blocks_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/bc7_blocks_cli_check.py")
     add_test(NAME texture_descriptors_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/texture_descriptors_check.py")
     add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
