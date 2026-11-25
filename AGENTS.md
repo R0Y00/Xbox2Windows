@@ -150,6 +150,8 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/bidi_controls_check.py
 # With no arguments, this tests result classification without Vulkan or DXC.
 ./out/pe-env/bin/python -B tests/pixel_denorm_vulkan_check.py
+# With no arguments, this tests the Vulkan offscreen adapter without a device or DXC.
+./out/pe-env/bin/python -B tests/vk_offscreen.py
 ./out/pe-env/bin/python -B tests/gpu_report_format_check.py
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
 ./out/pe-env/bin/python -B tests/rectlist_topology_check.py
@@ -187,7 +189,9 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_get_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_saveexec_same_reg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compare_dst_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_build_rev_check.py

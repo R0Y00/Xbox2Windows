@@ -235,9 +235,10 @@ def check_controls():
     refused('PTR_OFFSETS', "s_load through s8 holding ('joined at a branch target',)")
     user = lines('USER_ONE_PATH')
     assert '        v0 = s12;' in user and not any('v0 = 0x00000002u' in l for l in user), user
-    # The readfirstlane recompute (uniform since the last join) gets no folded constant from across a join: both are
-    # refused as unproven. Main folded the loop counter to 0 + 1 at the header and read s24 = s23 from it.
-    refused('LOOP_RFL', 'v_readfirstlane_b32 requires a proven uniform source')
+    # LOOP_RFL reads a uniform loop counter via v_readfirstlane_b32 dynamically (not constant-folded);
+    # JOIN_RFL writes both paths before the forward join and stays refused.
+    loop_rfl = lines('LOOP_RFL')
+    assert '        s23 = s23 + 0x00000001u;' in loop_rfl and '        s24 = s23;' in loop_rfl, loop_rfl
     refused('JOIN_RFL', 'v_readfirstlane_b32 requires a proven uniform source')
     # Equal tuples that do not name one value are not kept: a word modified on both paths (the written value is not
     # in the symbol) and descnum.
