@@ -3609,6 +3609,35 @@ they were skipped and the reload left its SGPR unwritten. The runtime geometry
 translator now refuses them explicitly. Not measured: the fixture exercises the
 CPU interpreter only; no DXIL was compiled and nothing was drawn.
 
+### Group-uniform "any lane active" branch in a mesh program
+
+The mesh wave model also runs a group-uniform branch. Each wave computes
+whether one of its lanes is live and stores the flag in LDS (`ds_write_b32`).
+After `s_barrier` both waves read both flags (`ds_read_b32`), combine them with
+`v_readfirstlane_b32` and `s_or_b32`, and branch on SCC (`s_cmp_lg_u32`,
+`s_cbranch_scc0` or `s_cbranch_scc1`). The lowering also accepts the 64-bit
+mask compares `s_cmp_lg_u64` and `s_cmp_eq_u64` on VCC and EXEC.
+
+Waves run in lockstep between barriers. LDS stores become visible only at the
+barrier. The model refuses a read before any wave published, a store that was
+not waited on before the barrier, a read before its wait, a load of the wave's own
+store before a barrier, conflicting stores, dynamic or unaligned addresses, an
+address outside the 64 KiB group allocation, and unsupported compares.
+
+```text
+python3 -B tests/mesh_scc_any_lane_check.py
+python3 -B tests/mesh_scc_any_lane_check.py binary llvm-mc llvm-objcopy libLLVM-15.so.1
+ctest --preset release --no-tests=error -R "mesh_scc_any_lane" -V
+```
+
+The CPU check compares the allocation with an independent group model for nine
+thresholds and runs three mutants (own flag only, flipped branch, 32-bit mask
+compare). The draw check renders six thresholds with the lowered shader on
+WARP or hardware and compares the pixels with the reference. The same three
+mutants must draw something else. The `binary` mode reassembles the source with
+LLVM 15 and is not part of ctest. The draw tests and the `binary` check were
+not run on Linux. They need Windows verification.
+
 ## Amplification and mesh pipeline forms
 
 `tests/mesh_amplified_check.py` builds an amplification shader (`as_6_5`) and a
