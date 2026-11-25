@@ -169,11 +169,41 @@ PlacementIndex& placement_group(u64 width)
     return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
 }
 
+// Resources by the title memory they start at (note_lock held), for the memory SRV lookups. An entry stays
+// as long as the resource's record in resource_infos does (never pruned); every lookup applies its own
+// live-reference filter, so a released resource is skipped there and found again if it is referenced again.
+x2w_startup::AddressIndex<const Wrapper*>& resource_address_index() { static x2w_startup::AddressIndex<const Wrapper*> m; return m; }
+// X2W_RESOURCE_INDEX_CHECK=1 checks the index on every memory SRV call (check_resource_address_index);
+// =2 is the negative control: the same check with index inserts skipped, which it must report.
+int resource_index_check_mode()
+{
+    // Only "1" and "2" turn it on; anything else, including a value too long for the buffer, is off.
+    static const int mode = [] {
+        char v[4]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_RESOURCE_INDEX_CHECK", v, sizeof(v));
+        return n == 1 && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+    }();
+    return mode;
+}
+u64 resource_index_extent(const ResourceInfo& info)
+{
+    return (std::max)(info.bytes, info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0);
+}
+// The index entry of a resource whose record is already published (publish_placement's hook); may throw.
+void index_resource(const Wrapper* w, const ResourceInfo& info)
+{
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    if (!base || resource_index_check_mode() == 2) return;
+    resource_address_index().insert(base, resource_index_extent(info), w);
+}
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
-    resource_infos()[w] = ResourceInfo{*console, bytes};
+    const ResourceInfo info{*console, bytes};
+    // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
+    x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
+        resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);
 }
 void retire_placement(Wrapper* w)
 {

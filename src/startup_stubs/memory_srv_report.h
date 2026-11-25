@@ -51,6 +51,9 @@ inline int report_view(char* out, std::size_t size, const D3D12_SHADER_RESOURCE_
                              v->Texture2DArray.MostDetailedMip, v->Texture2DArray.MipLevels,
                              v->Texture2DArray.FirstArraySlice, v->Texture2DArray.ArraySize,
                              v->Texture2DArray.PlaneSlice, static_cast<double>(v->Texture2DArray.ResourceMinLODClamp));
+    case D3D12_SRV_DIMENSION_TEXTURE3D:
+        return std::snprintf(tail, room, "mostmip=%u mips=%u clamp=%g", v->Texture3D.MostDetailedMip,
+                             v->Texture3D.MipLevels, static_cast<double>(v->Texture3D.ResourceMinLODClamp));
     case D3D12_SRV_DIMENSION_BUFFER:
         return std::snprintf(tail, room, "first=%llu count=%u stride=%u flags=0x%x (buffer views are not supported)",
                              static_cast<unsigned long long>(v->Buffer.FirstElement), v->Buffer.NumElements,
