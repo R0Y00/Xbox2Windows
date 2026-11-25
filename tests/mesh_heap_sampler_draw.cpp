@@ -48,7 +48,7 @@ struct Stream {
 
 // The stand-in's decoder plus the LOD clamp: SQ_IMG_SAMP_WORD1 holds MIN_LOD in bits 11:0 and
 // MAX_LOD in bits 23:12, both unsigned 4.8 fixed point (RDNA2 ISA, image sampler descriptor).
-// decode_sampler does not read them yet, so the fixture decodes them here.
+// dynamic_sampler() now applies them as well; the fixture keeps its own decode.
 bool fixture_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& out)
 {
     out = x2w_startup::dynamic_sampler(words);

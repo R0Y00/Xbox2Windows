@@ -1872,6 +1872,13 @@ These are measured on one executable; treat them as hypotheses for others.
   snapshot equality: build `startup_translated_sampler_bindings_check` and run
   `ctest --preset dev --no-tests=error -R "^startup_translated_sampler_bindings(_shared_axis_control)?$" -V`.
   The control expects all three axes to use the U field and must fail.
+  Table entries take their LOD range from word 1, as `smpl` static samplers do: `MIN_LOD` (bits 11:0) and
+  `MAX_LOD` (bits 23:12), unsigned 4.8 fixed point. An entry with word 1 = 0 samples mip 0 only; the border
+  fallback is not a title descriptor and keeps the full mip range. `startup_sampler_lod_{warp,hardware}`
+  decode two table entries that differ only in word 1 (`MIN_LOD` 2, `MAX_LOD` 1) and read a four-mip
+  texture with one value per mip at explicit LODs; a
+  static `smpc` sampler must keep `LESS`. The `_dropped_` control resets the decoded range and must read
+  mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
   gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked

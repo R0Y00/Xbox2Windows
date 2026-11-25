@@ -1453,6 +1453,16 @@ target_compile_features(cpu_srv_upload_check PRIVATE cxx_std_17)
 add_test(NAME cpu_srv_upload COMMAND cpu_srv_upload_check)
 add_test(NAME cpu_srv_upload_written_range_control COMMAND cpu_srv_upload_check --mutate written-range)
 set_tests_properties(cpu_srv_upload_written_range_control PROPERTIES WILL_FAIL TRUE)
+# Sampler word 1 LOD limits through the startup stand-in's decoder (#2221).
+foreach(stage IN ITEMS vs ps)
+    set(startup_sampler_lod_${stage} "${CMAKE_CURRENT_BINARY_DIR}/startup_sampler_lod_${stage}.h")
+    add_custom_command(OUTPUT "${startup_sampler_lod_${stage}}" COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0
+        -E ${stage}_main -Vn startup_sampler_lod_${stage} -Fh "${startup_sampler_lod_${stage}}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_sampler_lod.hlsl"
+        DEPENDS tests/startup_sampler_lod.hlsl VERBATIM)
+    target_sources(offscreen_check PRIVATE "${startup_sampler_lod_${stage}}")
+endforeach()
+target_sources(offscreen_check PRIVATE tests/startup_sampler_lod.cpp)
 set(startup_sampler_x_cs "${CMAKE_CURRENT_BINARY_DIR}/startup_sampler_x_cs.h")
 add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
     -Vn startup_sampler_x_cs -Fh "${startup_sampler_x_cs}"
@@ -2445,6 +2455,13 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_sampler_x_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "startup_sampler_x swapped=0")
+    # The dropped control resets the decoded LOD limits and must read the wrong mip for both entries.
+    add_test(NAME startup_sampler_lod_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod)
+    add_test(NAME startup_sampler_lod_dropped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod-dropped)
+    set_tests_properties(startup_sampler_lod_${adapter} startup_sampler_lod_dropped_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_sampler_lod_dropped_${adapter}
+        PROPERTIES PASS_REGULAR_EXPRESSION "startup_sampler_lod dropped_clamp wrong_mip=2 unexpected=0")
     add_test(NAME startup_cb_blend_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend)
     add_test(NAME startup_cb_blend_swapped_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend-swapped)
     set_tests_properties(startup_cb_blend_${adapter} startup_cb_blend_swapped_${adapter}
