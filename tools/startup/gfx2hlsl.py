@@ -3087,7 +3087,7 @@ def _mul24_hi(signed):
         mask, wrap = '255', 'asuint(%s)'
     else:
         def top(n):
-            return '(({%d} >> 12) & 0xfffu)' % n
+            return '(({%d} << 8) >> 20)' % n
 
         def low(n):
             return '({%d} & 0xfffu)' % n
