@@ -2668,6 +2668,42 @@ foreach(mutant IN ITEMS skip_refresh skip_copy_back reuse_early)
     set_tests_properties(unified_buffer_paths_${mutant}_control PROPERTIES WILL_FAIL TRUE TIMEOUT 90
         SKIP_RETURN_CODE 77)
 endforeach()
+# The production slice (#1914): slot 133's opt-in linear-buffer backing (X2W_D3D12_LINEAR_BUFFERS,
+# src/startup_stubs/linear_buffer_backing.h) through the device and queue wrappers of d3d12_xs.dll, over
+# XMem pages and a private range: the default, real sharing, forced copying, host sharing refusal, a
+# copy without a submit fence (the default backing is kept and the refusal reported), a refresh that
+# cannot be staged (the submission runs, the buffer is reported stale) and a one-buffer staging pool
+# (a waiting refresh must not block release(), the info export or another queue). Refreshes run on an
+# internal copy queue; the copy path also reads on COMPUTE and COPY queues, reads one buffer on two
+# queues after one CPU write (both must see it), and follows a title-owned cross-queue fence without
+# deadlock. It also counts the backings in the D3D12 budget, keeps a buffer a submitted list copy wrote
+# (and refreshes one whose copy was discarded), orders a refresh behind an earlier read on another queue,
+# refuses a submission whose refresh would have to wait for a queue behind an unreached title Wait (also
+# when that Wait and the submission behind it arrive on two threads), publishes two threads' refreshes in execution order, skips a buffer released and freed mid-refresh, and
+# defers XMem placements to the mesh XMem lease path when that is on. Each mutant removes one guarantee in
+# the DLL and must fail its case.
+add_executable(linear_buffer_backing_check tests/linear_buffer_backing_check.cpp)
+target_include_directories(linear_buffer_backing_check PRIVATE tests)
+target_compile_features(linear_buffer_backing_check PRIVATE cxx_std_17)
+target_link_libraries(linear_buffer_backing_check PRIVATE xmem_shim d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(adapter IN ITEMS warp hardware)
+    foreach(path IN ITEMS default share copy refusal untracked stale contention lease)
+        add_test(NAME linear_buffer_backing_${path}_${adapter} COMMAND linear_buffer_backing_check ${adapter} ${path})
+        set_tests_properties(linear_buffer_backing_${path}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+foreach(control IN ITEMS copy:skip_refresh copy:reuse_early copy:copy_gpu_writes refusal:ignore_feature
+        copy:refusal_silent contention:hold_lock copy:skip_consumer_wait copy:refresh_gpu_written copy:gpuw_at_record
+        copy:skip_producer_wait copy:publish_out_of_order copy:copy_after_retire copy:accept_unsafe_refresh
+        copy:unlocked_title_wait)
+    string(REPLACE ":" ";" parts "${control}")
+    list(GET parts 0 path)
+    list(GET parts 1 mutant)
+    string(REPLACE "_" "-" flag "${mutant}")
+    add_test(NAME linear_buffer_backing_${mutant}_control COMMAND linear_buffer_backing_check warp ${path} --mutate ${flag})
+    set_tests_properties(linear_buffer_backing_${mutant}_control PROPERTIES WILL_FAIL TRUE TIMEOUT 120
+        SKIP_RETURN_CODE 77)
+endforeach()
 # The configured range's windows and GPU addresses (src/d3d12_xs_range.h) with a fake device and fake
 # windows. The mutated run is the negative control.
 add_executable(d3d12_xs_range_check tests/d3d12_xs_range_check.cpp src/d3d12_xs_range.cpp)
@@ -9505,6 +9541,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_f16_exact_extra_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_exact_extra_${adapter}.txt")
+        add_test(NAME pixel_aot_sdwa_cvt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-sdwa-cvt "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_sdwa_cvt_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_sdwa_cvt_${adapter}.txt")
         add_test(NAME pixel_aot_dpp_extra_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-dpp-extra "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

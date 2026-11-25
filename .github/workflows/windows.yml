@@ -210,6 +210,7 @@ jobs:
             tests/xmem_attribute_scan_check.py \
             tests/xgameruntime_table_check.py \
             tests/docs_links_check.py \
+            tests/dxc_cache_check.py \
             tests/bidi_controls_check.py \
             tests/pixel_denorm_vulkan_check.py \
             tests/vk_offscreen.py \
