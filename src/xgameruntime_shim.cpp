@@ -34,12 +34,14 @@
 //   XSystemDeviceType                   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/enums/xsystemdevicetype?view=gdk-2604
 //   XGameGetXboxTitleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgame/functions/xgamegetxboxtitleid?view=gdk-2604
 //   XAsyncGetStatus                     https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus?view=gdk-2604
+//   XAsyncGetResultSize                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetresultsize?view=gdk-2604
 //   XTaskQueueCreate                    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuecreate?view=gdk-2604
 //   XTaskQueueDispatch                  https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch
 //   XTaskQueueCloseHandle               https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueclosehandle
 //
-// Async gap: XUserAddAsync and XPackageMountWithUiAsync remain stubs, as do
-// XAsyncGetStatus. XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
+// Async gap: XUserAddAsync and XPackageMountWithUiAsync remain stubs.
+// XAsyncGetStatus and XAsyncGetResultSize answer only for blocks the shim tracks
+// (today: XGameSaveInitializeProviderAsync blocks). XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
 // XTaskQueueDispatch (completion port) and XTaskQueueCloseHandle model one
 // shim-owned manual queue. XGameSaveInitializeProviderAsync is implemented for
 // one queue configuration: a live manual queue from XTaskQueueCreate, where it
@@ -198,7 +200,8 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XSystemGetConsoleId, XSystem, HRESULT, (std::size_t consoleIdSize, char* consoleId, std::size_t* consoleIdUsed), implemented_hr, (consoleIdSize, consoleId, consoleIdUsed), xsystem_get_console_id) \
     X(XSystemGetDeviceType, XSystem, XSystemDeviceType, (), implemented_value, (), xsystem_get_device_type) \
     X(XGameGetXboxTitleId, XGame, HRESULT, (std::uint32_t* titleId), implemented_hr, (titleId), xgame_get_xbox_title_id) \
-    X(XAsyncGetStatus, XAsync, HRESULT, (XAsyncBlock*, bool), stub, (), stub) \
+    X(XAsyncGetStatus, XAsync, HRESULT, (XAsyncBlock* asyncBlock, bool wait), implemented_hr, (asyncBlock, wait), async_get_status) \
+    X(XAsyncGetResultSize, XAsync, HRESULT, (XAsyncBlock* asyncBlock, std::size_t* bufferSize), implemented_hr, (asyncBlock, bufferSize), async_get_result_size) \
     X(XTaskQueueCreate, XTaskQueue, HRESULT, (XTaskQueueDispatchMode workDispatchMode, XTaskQueueDispatchMode completionDispatchMode, XTaskQueueHandle* queue), implemented_hr, (workDispatchMode, completionDispatchMode, queue), task_queue_create) \
     X(XTaskQueueDispatch, XTaskQueue, bool, (XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t timeoutInMs), implemented_value, (queue, port, timeoutInMs), task_queue_dispatch) \
     X(XTaskQueueCloseHandle, XTaskQueue, void, (XTaskQueueHandle queue), implemented_void, (queue), task_queue_close_handle)
@@ -897,6 +900,7 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
     AcquireSRWLockExclusive(&runtime_state.lock);
     if (FAILED(status)) {
         *reserved = ProviderAsyncSlot{};
+        WakeAllConditionVariable(&task_queue_changed);
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return status;
     }
@@ -908,8 +912,8 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
     if (defer) {
         reserved->callback_pending = true;
         reserved->order = runtime_state.next_async_order++;
-        WakeAllConditionVariable(&task_queue_changed);
     }
+    WakeAllConditionVariable(&task_queue_changed);
     ReleaseSRWLockExclusive(&runtime_state.lock);
     if (!defer && callback) callback(async_block);
     return S_OK;
@@ -936,6 +940,50 @@ HRESULT game_save_initialize_provider_result(XAsyncBlock* async_block,
     const HRESULT status = slot->status;
     *provider = slot->provider;
     *slot = ProviderAsyncSlot{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return status;
+}
+
+// Completion and callback dispatch are separate: once the provider work has
+// finished, both queries report it even while the callback still waits for
+// XTaskQueueDispatch. Only a block whose work is still in flight is pending.
+HRESULT async_get_status(XAsyncBlock* async_block, bool wait) noexcept
+{
+    if (!async_block) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const ProviderAsyncSlot* slot = find_provider_async(async_block);
+    if (!slot) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_INVALIDARG;
+    }
+    while (wait && !slot->completed) {
+        SleepConditionVariableSRW(&task_queue_changed, &runtime_state.lock, INFINITE, 0);
+        slot = find_provider_async(async_block);
+        if (!slot) break;  // the start failed and the block is no longer tracked
+    }
+    HRESULT status = E_INVALIDARG;
+    if (slot) status = slot->completed ? slot->status : E_PENDING;
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return status;
+}
+
+HRESULT async_get_result_size(XAsyncBlock* async_block, std::size_t* buffer_size) noexcept
+{
+    if (!buffer_size) return E_POINTER;
+    *buffer_size = 0;
+    if (!async_block) return E_INVALIDARG;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const ProviderAsyncSlot* slot = find_provider_async(async_block);
+    if (!slot) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return E_INVALIDARG;
+    }
+    HRESULT status = E_PENDING;
+    if (slot->completed) {
+        status = slot->status;
+        // The result is one provider handle; nothing is consumed here.
+        if (SUCCEEDED(status)) *buffer_size = sizeof(XGameSaveProviderHandle);
+    }
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return status;
 }

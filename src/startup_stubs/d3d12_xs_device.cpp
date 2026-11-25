@@ -21,6 +21,7 @@
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
 #include "startup_stubs/depth_state_apply.h"
+#include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
@@ -69,6 +70,12 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+// The heap-indexing bits src/d3d12_xs_shim.cpp removed for the blob it returned at exactly this
+// buffer. A build that compiles this file without the shim (offscreen_check) links the fallback, 0.
+extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t bytes);
+extern "C" std::uint32_t x2w_no_stripped_root_flags(const void*, std::size_t) { return 0; }
+#pragma comment(linker, "/alternatename:x2w_stripped_root_flags=x2w_no_stripped_root_flags")
 
 namespace {
 
@@ -1647,6 +1654,22 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     return S_OK;
 }
 
+// Fixtures: the copy of a root signature's blob kept for shader translation (the .root request and the
+// translation key). Returns its size and copies up to capacity bytes to out; 0 for anything else. The
+// heap-indexing flags slot 34 acts on (root_heap_flags, read from the desktop blob) go to heap_flags.
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_root_translation_blob(void* root, void* out, std::size_t capacity, UINT* heap_flags)
+{
+    Wrapper* w = as_wrapper(root);
+    if (!w || w->own().kind != root_signature_kind) return 0;
+    if (heap_flags) *heap_flags = root_heap_flags(w);
+    AcquireSRWLockShared(&note_lock);
+    const auto found = root_blobs().find(w);
+    const std::size_t bytes = found == root_blobs().end() ? 0 : found->second.size();
+    if (bytes && out) std::memcpy(out, found->second.data(), bytes < capacity ? bytes : capacity);
+    ReleaseSRWLockShared(&note_lock);
+    return bytes;
+}
+
 bool readable_shader_container(const D3D12_SHADER_BYTECODE& code)
 {
     return code.BytecodeLength >= 32 && code.BytecodeLength <= (1u << 20) &&
@@ -2146,7 +2169,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list");
-    if (count != 1 || count_buffer || count_offset) return refuse("requires one command and no count buffer");
+    // Only a desktop Dispatch signature runs more than one command or reads a count buffer here.
+    constexpr UINT max_dispatch_commands = 1u << 16;
+    if (!count || count > max_dispatch_commands) return refuse("command count is zero or above the supported maximum");
+    if (!count_buffer && count_offset) return refuse("count offset without a count buffer");
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
         return refuse("missing or placeholder signature", indirect_placeholder);
     const Wrapper* device = self->own().list_device;
@@ -2158,6 +2184,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
     u64 bytes = sig->own().indirect_bytes;
+    if (graphics && (count != 1 || count_buffer)) return refuse("indirect graphics requires one command and no count buffer");
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
@@ -2186,6 +2213,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
         return refuse("signature root constants require the bound compute root");
+    } else if (sig->own().signature_root && (count != 1 || count_buffer)) {
+        // Batched and count-buffer Dispatch is supported for rootless signatures only in this slice.
+        return refuse("a Dispatch signature with root constants requires one command and no count buffer");
     }
     Wrapper* buffer = as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
@@ -2193,7 +2223,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
     if (!base || (offset & 3) || offset > ~u64{} - base)
         return refuse("invalid argument offset or unmapped buffer");
-    const auto found = placed_buffer_range(device, base + offset, bytes);
+    // Every record up to the maximum must lie in the buffer: the count word can only lower the number executed.
+    const u64 span = u64{count - 1} * sig->own().indirect_bytes + bytes;
+    if (span < bytes || base + offset > ~u64{} - span) return refuse("argument records overflow the address space");
+    const auto found = placed_buffer_range(device, base + offset, span);
     if (found.reject || found.owner != buffer) return refuse("argument record is outside a unique placed buffer");
     const auto* info = resource_info(buffer);
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
@@ -2227,8 +2260,27 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
     }
+    ID3D12Resource* counts = nullptr;
+    if (count_buffer) {
+        // The count word is four bytes in a unique placed buffer that also tracks state from COMMON.
+        Wrapper* count_wrapper = as_wrapper(count_buffer);
+        if (!count_wrapper || count_wrapper->own().kind != resource_kind || !count_wrapper->own().real)
+            return refuse("count buffer has no desktop resource");
+        const auto count_base = reinterpret_cast<u64>(count_wrapper->own().title_memory);
+        if (!count_base || (count_offset & 3) || count_offset > ~u64{} - count_base - sizeof(UINT))
+            return refuse("invalid count offset or unmapped count buffer");
+        const auto count_found = placed_buffer_range(device, count_base + count_offset, sizeof(UINT));
+        if (count_found.reject || count_found.owner != count_wrapper)
+            return refuse("count word is outside a unique placed buffer");
+        const auto* count_info = resource_info(count_wrapper);
+        if (!count_info || count_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+            return refuse("count buffer does not use COMMON state tracking");
+        counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
+        if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    }
     require_state(self, resource, argument_state);
-    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
+    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, counts,
+                          counts ? count_offset : 0);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated

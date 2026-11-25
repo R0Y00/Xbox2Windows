@@ -256,7 +256,8 @@ int main(int argc, char** argv)
     void* device = nullptr;
     void* pso = nullptr;
     const bool hardware = draw && std::strcmp(argv[4], "hardware") == 0;
-    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, bc7.blocks != nullptr,
+    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0;
+    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, textured,
                                                 adapter, device, pso)) return rc;
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
     if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)
