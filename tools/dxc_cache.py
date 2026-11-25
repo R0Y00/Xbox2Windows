@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,15 @@ def _passthrough(options, check):
     return dict(options, check=check) if check is not None else dict(options)
 
 
+def _resolve(compiler):
+    """Absolute path of the compiler (a file, else found on PATH), or None when it is neither."""
+    name = os.fspath(compiler)
+    if os.path.isfile(name):
+        return os.path.abspath(name)
+    found = shutil.which(name)
+    return os.path.abspath(found) if found else None
+
+
 def run_dxc(compiler, args, **options):
     """Mirror subprocess.run([compiler, *args]) with an optional on-disk cache."""
     command = [compiler, *args]
@@ -106,8 +116,11 @@ def run_dxc(compiler, args, **options):
     extra = {k: v for k, v in options.items() if k not in SUPPORTED_KWARGS}
     cache_dir = os.environ.get(ENV_VAR)
     plan = None
+    resolved = None
     if cache_dir and not extra:
-        plan = _plan(compiler, args)
+        resolved = _resolve(compiler)
+        if resolved is not None:
+            plan = _plan(compiler, args)
     if plan is None:
         return subprocess.run(command, **_passthrough(options, check))
     key_args, source, outputs = plan
@@ -115,9 +128,12 @@ def run_dxc(compiler, args, **options):
         source_bytes = handle.read()
     if INCLUDE_RE.search(source_bytes):
         return subprocess.run(command, **_passthrough(options, check))
-    info = os.stat(compiler)
+    try:
+        info = os.stat(resolved)
+    except OSError:
+        return subprocess.run(command, **_passthrough(options, check))
     digest = hashlib.sha256()
-    digest.update(json.dumps([KEY_VERSION, os.path.abspath(compiler), info.st_size, info.st_mtime_ns,
+    digest.update(json.dumps([KEY_VERSION, resolved, info.st_size, info.st_mtime_ns,
                               key_args]).encode())
     digest.update(b"\0")
     digest.update(source_bytes)

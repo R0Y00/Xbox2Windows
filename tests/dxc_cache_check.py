@@ -4,6 +4,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -105,6 +106,17 @@ def main():
         rig.compile("void main(){}", extra=["-I", root])
         if rig.calls() != before + 4:
             fail("#include or -I compile was cached")
+
+        src = Path(root) / "stub.hlsl"
+        src.write_text("void main(){}")
+        os.environ[dxc_cache.ENV_VAR] = str(Path(root) / "cache-stub")
+        sentinel = subprocess.CompletedProcess(["stub-dxc"], 0, "patched", "")
+        with mock.patch.object(subprocess, "run", return_value=sentinel) as patched:
+            got = dxc_cache.run_dxc("stub-dxc", ["-T", "cs_6_0", "-Fo", str(Path(root) / "stub.cso"), str(src)],
+                                    check=True)
+        if got is not sentinel or patched.call_count != 1:
+            fail("a compiler that is not a file must run uncached through subprocess.run")
+        os.environ.pop(dxc_cache.ENV_VAR, None)
     print("dxc_cache_check: ok")
 
 
