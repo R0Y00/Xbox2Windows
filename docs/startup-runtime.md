@@ -662,7 +662,8 @@ requests that failed in an earlier run; after that, a request whose `<key>.fail`
 ready marker is not retried during the run (the runtime writes each request once and never rewrites
 it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
 to `<key>.fail` as `translator error: ...`, ending with the function, file name and line that raised
-it (`(in scalar_select, gfx2hlsl.py line 1234)`), instead of stopping the scan. An operand refusal
+it, skipping standard-library frames (`(in scalar_select, gfx2hlsl.py line 1234)`), instead of
+stopping the scan. An operand refusal
 in `<key>.fail` names the instruction that refused it (`operand '-v30' in v_and_b32_e64`); the
 refusal's own message, which `--refusals` counts, stays `operand '-v30'`. A worker killed from outside
 (for example out of memory) ends that watcher pass only; its requests are retried on the next pass.

@@ -10,6 +10,7 @@ failures as one worker, an unexpected translator error must become <key>.fail, a
 pool must end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE_JOBS must fall
 back to the processor count.
 """
+import json
 import os
 import re
 import struct
@@ -141,8 +142,23 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('translator error recorded', fail.read_text().startswith('translator error: ZeroDivisionError') if fail.exists() else None, True)
     # It names the function, file and line that raised it (the lambda above).
     expect('translator error located', bool(re.fullmatch(
-        r'translator error: ZeroDivisionError: division by zero \(in <lambda>, startup_gfx2hlsl_watch_check\.py '
-        r'line \d+\)\n', fail.read_text())) if fail.exists() else None, True)
+        r'translator error: ZeroDivisionError: division by zero \(in <lambda>, %s line \d+\)\n'
+        % re.escape(Path(__file__).name), fail.read_text())) if fail.exists() else None, True)
+
+# An error raised inside a standard-library call is located at the code that made the call, not in the library.
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    touch(d / ('req_%016x.rtv' % 9))
+    real = gfx2hlsl.translate_request
+    gfx2hlsl.translate_request = lambda out_dir, key: json.loads('{')
+    try:
+        gfx2hlsl.translate_pending(str(d), jobs=1)
+    finally:
+        gfx2hlsl.translate_request = real
+    fail = d / ('%016x.fail' % 9)
+    expect('library error located at its caller', bool(re.fullmatch(
+        r'translator error: JSONDecodeError: .* \(in <lambda>, %s line \d+\)\n'
+        % re.escape(Path(__file__).name), fail.read_text())) if fail.exists() else None, True)
 
 # An operand refusal's .fail names the instruction that refused it; the refusal message itself is unchanged.
 sys.path.insert(0, str(ROOT / 'tests'))
