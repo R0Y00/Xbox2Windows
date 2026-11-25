@@ -12509,6 +12509,21 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
 ```
 
+## Startup translator: statically proven calculated branches
+
+The startup translator resolves an exact `s_getpc_b64`, `s_add_u32`,
+`s_addc_u32`, `s_setpc_b64` PC-relative sequence only when every
+incoming path establishes the same instruction-boundary target.
+Address-derived register or SCC escapes, conflicting definitions and
+unproven bypass paths are refused. The source-built gfx1013 fixture selects
+arithmetic result 8 instead of the decoy 14; direct branches retain their
+existing behavior. This is a static translation proof, not GPU readback.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_calculated_target_check.py
+python3 -B tests/startup_gfx2hlsl_calculated_target_check.py binary llvm-mc-15
+```
+
 ## Compute stage in the startup translator
 
 `gfx2hlsl.ComputePipeline` translates one gfx1013 compute program with the root and resource model of

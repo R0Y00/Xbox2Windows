@@ -317,6 +317,14 @@ CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
 
 
 def check_encoding(code, off, n, name, asm):
+    # These SOP1 forms have an unused field that the disassembler does not print.
+    # Only the ordinary four-byte encodings (no literal or hidden operand) are used
+    # by the calculated-branch proof.
+    if name in ('s_getpc_b64', 's_setpc_b64'):
+        word, = struct.unpack_from('<I', code, off)
+        unused = word & (0xff if name == 's_getpc_b64' else 0x7f0000)
+        if n != 4 or unused:
+            raise Unsupported('s_setpc_b64: unsupported %s encoding at +0x%x' % (name, off))
     if name in ('v_interp_p1ll_f16', 'v_interp_p2_f16'):
         # The shared disassembler ignores op_sel (w0[14:11]) here, as LLVM 15 does. Mesa ACO's
         # v_interp_p2_hi_f16 is p2 with op_sel bit 3 (w0[14]): it writes the high half of the destination. The
@@ -497,6 +505,241 @@ def writes_exec(name, ops):
         if tok in ('exec', 'exec_lo', 'exec_hi') or r and r[0] == 's' and r[1] <= 127 and r[2] >= 126:
             return True
     return 'saveexec' in name or 'wrexec' in name or name.startswith(('v_cmpx', 's_movreld'))
+
+
+def pc_pair(token):
+    """Only aligned pairs of ordinary SGPRs can carry a symbolic code address."""
+    r = reg_range(token)
+    if r and r[0] == 's' and r[2] == r[1] + 1 <= 105 and r[1] % 2 == 0:
+        return r[1]
+    return None
+
+
+def pc_word(token):
+    """A displacement word, not a register or an inline floating-point constant."""
+    if re.fullmatch(r'-?(?:0x[0-9a-f]+|\d+)', token):
+        value = int(token, 16 if '0x' in token else 10)
+        if -0x80000000 <= value <= 0xffffffff:
+            return ((value & 0xffffffff) ^ 0x80000000) - 0x80000000
+    return None
+
+
+def scalar_registers(text):
+    """All explicit SGPR words in an operand, including modifiers and ranges."""
+    out = set()
+    for low, high, single in re.findall(r'\bs(?:\[(\d+):(\d+)\]|(\d+)\b)', text):
+        if single:
+            out.add(int(single))
+        else:
+            out.update(range(int(low), int(high) + 1))
+    return out
+
+
+def calculated_pc_proof(ins, kind):
+    """Return offset -> target for proven SETPCs, and offset -> None for their address arithmetic.
+
+    RDNA 2 GETPC returns the address of its successor. A low-word ADD_U32 and a
+    high-word ADDC_U32 with its matching sign extension add one signed byte
+    displacement, including any carry across the (unknown) loaded PC's low word.
+    A completed pair is therefore the shader's load address plus a known byte
+    offset, not an integer value that can be emitted to HLSL.
+
+    At a CFG join retain only pair facts that agree on every incoming edge;
+    retain *all* potentially address-dependent words and SCCs. A recognized
+    address instruction can be elided only if it is recognized on every path.
+    No other operation can observe an elided word or SCC. This also checks loops:
+    a newly discovered SETPC successor participates in the same worklist.
+    Ordinary reads of those SGPRs also need a single reaching non-PC definition
+    matching the definition seen in the linear lowering order: a path around an
+    elided write may still hold a symbolic root binding, not its zero-initialized
+    HLSL local.
+    """
+    if not any(name == 's_setpc_b64' for _, _, name, _ in ins):
+        return {}
+    by_off = {off: (n, name, asm) for off, n, name, asm in ins}
+    end = ins[-1][0] + ins[-1][1]
+    tracked = {reg for _, _, name, asm in ins if name == 's_getpc_b64' for reg in scalar_registers(asm)}
+    entry_defs = dict.fromkeys(tracked, -1)
+
+    def refuse(off, reason):
+        raise Unsupported('s_setpc_b64: %s at +0x%x' % (reason, off))
+
+    def boundary(off, target):
+        if target % 4:
+            refuse(off, 'unaligned calculated branch target %#x' % target)
+        if not 0 <= target < end:
+            refuse(off, 'target %#x outside decoded program' % target)
+        if target not in by_off:
+            refuse(off, 'target %#x in the interior of an instruction or undecoded bytes' % target)
+
+    if 0 not in by_off:
+        refuse(0, 'missing entry instruction')
+    if not any(name == 's_endpgm' for _, _, name, _ in ins):
+        refuse(0, 'decoded program has no s_endpgm')
+
+    def ordinary_accesses(name, ops, mods, refs):
+        # These scalar operations and loads have explicit unconditional destinations.
+        # Otherwise conservatively treat a mentioned PC word as a read, and any
+        # possible SGPR destination as an invalidation of its reaching definition.
+        written = (scalar_registers(ops[0]) if ops and
+                   (name in SCA or name.startswith(('s_load_dword', 's_buffer_load_dword'))
+                    or name in ('s_cselect_b32', 's_cselect_b64')) else set())
+        reads = scalar_registers(', '.join(ops[1:]) + ' ' + ' '.join(mods)) if written else refs
+        maybe_written = {reg for dst in destinations(name, ops) for reg in scalar_registers(dst)} - written
+        return written, reads, maybe_written
+
+    # Each state is (possibly elided SGPR words, definitely proven pairs, SCC,
+    # definitely reaching ordinary definitions of SGPRs the lowering can erase).
+    # pairs[low] = (target, None) for a complete pair, or (target, high immediate)
+    # for a partial low-word sum. SCC is None for ordinary state, the pair's low
+    # register for the corresponding carry, or -1 for an elided/unusable flag.
+    incoming = {0: (set(), {}, None, entry_defs)}
+    pending = [0]
+    lowered = {}
+
+    def propagate(off, words, pairs, scc, definitions):
+        state = incoming.get(off)
+        if state is None:
+            merged = (set(words), dict(pairs), scc, dict(definitions))
+        else:
+            old_words, old_pairs, old_scc, old_defs = state
+            merged = (old_words | words, {p: v for p, v in old_pairs.items() if pairs.get(p) == v},
+                      old_scc if old_scc == scc else -1,
+                      {reg: d for reg, d in old_defs.items() if definitions.get(reg) == d})
+        if state != merged:
+            incoming[off] = merged
+            pending.append(off)
+
+    while pending:
+        off = pending.pop()
+        n, name, asm = by_off[off]
+        _, ops, mods = parse(asm)
+        words, pairs, scc, definitions = incoming[off]
+        words, pairs, definitions = set(words), dict(pairs), dict(definitions)
+        refs = scalar_registers(asm)
+        successors = [off + n]
+
+        def clobber(written):
+            nonlocal scc
+            words.difference_update(written)
+            for reg in written:
+                definitions.pop(reg, None)
+            for p in list(pairs):
+                if p in written or p + 1 in written:
+                    del pairs[p]
+                    if scc == p:
+                        scc = -1
+
+        if name == 's_getpc_b64':
+            p = pc_pair(ops[0]) if len(ops) == 1 else None
+            if p is None or mods or n != 4:
+                refuse(off, 'unsupported GETPC destination/form')
+            clobber({p, p + 1})
+            words.update((p, p + 1))
+            pairs[p] = (off + n, None)
+            lowered[off] = None
+        elif name in ('s_add_u32', 's_addc_u32') and words & refs:
+            row = reg_range(ops[0]) if ops else None
+            p = row[1] if row and row[0] == 's' and row[1] == row[2] else None
+            imm = pc_word(ops[2]) if len(ops) == 3 else None
+            if p is None or imm is None or mods or n not in (4, 8) or ops[0] != ops[1]:
+                refuse(off, 'unsupported arithmetic on calculated PC words')
+            if name == 's_add_u32':
+                fact = pairs.get(p)
+                if fact is None or fact[1] is not None:
+                    refuse(off, 'unknown or ambiguous input pair for calculated PC low-word addition')
+                pairs[p] = (fact[0] + imm, -1 if imm < 0 else 0)
+                scc = p
+            else:
+                fact = pairs.get(p - 1)
+                if fact is None or fact[1] is None or scc != p - 1:
+                    refuse(off, 'missing matching low-word carry for calculated PC high-word addition')
+                if imm != fact[1]:
+                    refuse(off, 'calculated PC high word is not the signed displacement extension')
+                pairs[p - 1] = (fact[0], None)
+                scc = -1
+            lowered[off] = None
+        elif name == 's_setpc_b64':
+            p = pc_pair(ops[0]) if len(ops) == 1 else None
+            if p is None or mods or n != 4:
+                refuse(off, 'unsupported SETPC source/form')
+            fact = pairs.get(p)
+            if fact is None:
+                refuse(off, 'unknown or ambiguous calculated target from %s' % ops[0])
+            target, high = fact
+            if high is not None:
+                refuse(off, 'incomplete calculated target (missing high-word addition with carry)')
+            boundary(off, target)
+            lowered[off] = target
+            successors = [target]
+        else:
+            written, reads, maybe_written = ordinary_accesses(name, ops, mods, refs)
+            if words & reads or words and name.startswith(('s_movrels', 's_movreld')):
+                refuse(off, 'calculated PC word escapes into %s' % name)
+            clobber(written)
+            definitions.update((reg, off) for reg in written & tracked)
+            for reg in maybe_written:
+                definitions.pop(reg, None)
+            if scc is not None:
+                if ('src_scc' in asm or name.startswith(('s_cbranch_scc', 's_cmov', 's_cselect', 's_addc', 's_subb'))):
+                    refuse(off, 'calculated PC SCC escapes into %s' % name)
+                # These comparisons always emit a replacement SCC (or refuse).
+                # Other scalar writers may not model SCC, so they cannot make
+                # a tainted flag usable; they also invalidate any pending carry.
+                if re.fullmatch(r's_cmpk?_(eq|lg|gt|ge|lt|le)_[iu]32|s_bitcmp[01]_b32', name):
+                    scc = None
+                elif not name.startswith(('v_', 's_branch', 's_cbranch_', 's_mov_', 's_movk_', 's_load_',
+                                          's_buffer_load_', 's_nop', 's_waitcnt', 's_inst_prefetch', 's_clause',
+                                          'buffer_', 'tbuffer_', 'image_', 'exp', 'ds_')):
+                    scc = -1
+
+            if name in ('s_swappc_b64', 's_call_b64', 's_rfe_b64'):
+                # The only pre-existing exception is the vertex entry fetch call.
+                if not (name == 's_swappc_b64' and kind == 'vs' and off == 0
+                        and ops == ['s[4:5]', 's[4:5]'] and not mods):
+                    refuse(off, 'unsupported control transfer %s' % name)
+            if name == 's_endpgm':
+                successors = []
+            elif name == 's_branch' or name.startswith('s_cbranch_'):
+                try:
+                    target = int(ops[0].split('_')[1], 16)
+                except (IndexError, ValueError):
+                    refuse(off, 'unsupported direct branch operand')
+                boundary(off, target)
+                successors = [target] if name == 's_branch' else [target, off + n]
+
+        for successor in successors:
+            if successor not in by_off:
+                refuse(off, 'missing decoded successor %#x' % successor)
+            propagate(successor, words, pairs, scc, definitions)
+
+    for off, _, name, _ in ins:
+        if name == 's_setpc_b64' and off not in lowered:
+            refuse(off, 'unreachable SETPC has no proven target')
+
+    # Stage's existing resource/constant symbol table is intentionally linear.
+    # Do not substitute a symbolic address into it or pretend an erased symbol
+    # was a runtime word. Every later ordinary read must see the same *ordinary*
+    # definition in both the listing and on all reachable paths. Include writes
+    # in unreachable code when tracking the listing because Stage lowers those too.
+    linear_defs = dict(entry_defs)
+    for off, _, name, asm in ins:
+        _, ops, mods = parse(asm)
+        if off in lowered:
+            if lowered[off] is None:
+                for reg in scalar_registers(ops[0]):
+                    linear_defs.pop(reg, None)
+            continue
+        written, reads, maybe_written = ordinary_accesses(name, ops, mods, scalar_registers(asm))
+        if off in incoming:
+            reaching = incoming[off][3]
+            for reg in sorted(reads & tracked):
+                if reg not in linear_defs or reaching.get(reg) != linear_defs[reg]:
+                    refuse(off, 'elided PC register s%d has no matching ordinary definition on every incoming path' % reg)
+        for reg in maybe_written:
+            linear_defs.pop(reg, None)
+        linear_defs.update((reg, off) for reg in written & tracked)
+    return lowered
 
 
 class Stage:
@@ -834,8 +1077,10 @@ class Stage:
 
     # ---- instruction translation -------------------------------------------------------------
     def translate(self):
+        self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
         targets = set()
         skipped = []  # compute: (branch, target) of each s_cbranch_execz
+        targets.update(target for target in self.calculated_pc.values() if target is not None)
         for off, n, name, asm in self.ins:
             if name.startswith('s_cbranch') or name == 's_branch':
                 target = int(parse(asm)[1][0].split('_')[1], 16)
@@ -871,7 +1116,8 @@ class Stage:
             try:
                 if any(branch < off < target or target <= off < branch for branch, target in skipped) and (
                         name.startswith(('s_', 'v_readlane', 'v_readfirstlane', 'v_writelane'))
-                        and not name.startswith(SKIPPABLE_SCALAR)):
+                        and not name.startswith(SKIPPABLE_SCALAR)
+                        and not (name == 's_setpc_b64' and off in self.calculated_pc)):
                     # The wave runs this block when any lane is active, so its scalar state changes for every
                     # lane; the one-lane model would skip it for an inactive lane.
                     raise Unsupported('%s inside a block s_cbranch_execz skips per lane' % name)
@@ -1030,6 +1276,22 @@ class Stage:
             del self.uniform_expr[v]
 
     def lower(self, base, asm, ops, mods):
+        pc = getattr(self, 'pc', None)
+        calculated = getattr(self, 'calculated_pc', {})
+        if pc in calculated:
+            target = calculated[pc]
+            if target is not None:
+                return ('jump', target)
+            # The proof checked that the code address is never read as data.
+            # Do not materialize it as a fictional integer or keep an older
+            # entry constant/resource/lane-mask proof for the overwritten SGPR.
+            for reg in scalar_registers(ops[0]):
+                self.sym.pop(reg, None)
+                self.masks.discard(reg)
+                self.varying_s.add(reg)
+            if base in ('s_add_u32', 's_addc_u32'):
+                self.scc_uniform = False
+            return None
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
             # s_wqm of exec into itself only adds lanes, so it stays a no-op; other s_wqm forms (a no-op here) and
@@ -2344,8 +2606,10 @@ class Stage:
             n, ops, mods = parse(asm)
             n = re.sub(r'_e(32|64)$', '', n)
             rows.append((off, n, ops, mods))
+            target = getattr(self, 'calculated_pc', {}).get(off)
             if n.startswith('s_cbranch') or n == 's_branch':
                 target = int(ops[0].split('_')[1], 16)
+            if target is not None:
                 if target <= off:
                     raise Unsupported('a backward branch in a program with v_interp_p1ll_f16 / v_interp_p2_f16')
                 targets.add(target)
@@ -2356,7 +2620,7 @@ class Stage:
 
         pending, stale, high_undefined = {}, set(), set()
         for off, n, ops, mods in rows:
-            branch_boundary = off in targets or n.startswith('s_cbranch') or n == 's_branch'
+            branch_boundary = off in targets or n.startswith('s_cbranch') or n in ('s_branch', 's_setpc_b64')
             if branch_boundary and pending:
                 raise Unsupported('a branch between v_interp_p1ll_f16 %s and its v_interp_p2_f16: p2 could be '
                                   'reached without the matching p1ll' % ', '.join('v%d' % r for r in sorted(pending)))
