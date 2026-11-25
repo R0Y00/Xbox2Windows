@@ -64,7 +64,7 @@
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
-#include "xmem_section_lease.h"
+#include "startup_stubs/xmem_section_buffer.h"
 #include <d3d12sdklayers.h>
 #include <d3d12shader.h>
 #include <d3dcompiler.h>
@@ -753,7 +753,7 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
     }
     if (desc.Alignment != 0 && desc.Alignment != 0x10000 && desc.Alignment != 0x400000) copy.Alignment = 0;
     copy.Format = desktop_format(desc.Format);
-    // A 16-bit packed target the adapter cannot render to or write as a UAV: packed_target_format.h.
+    // A packed target the adapter cannot render to or write as a UAV: packed_target_format.h.
     if (the_device && x2w_startup::packed_target_format(copy.Format)) {
         ID3D12Device* const device = static_cast<ID3D12Device*>(the_device->own().real);
         const DXGI_FORMAT stand_in = x2w_startup::packed_target_stand_in(copy, [device](DXGI_FORMAT format) -> UINT {
@@ -770,6 +770,19 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
         }
     }
     return copy;
+}
+
+// An optimized clear belongs to the actual texture format, including when the
+// wrapper substitutes it. Preserve the caller's clear colour.
+const D3D12_CLEAR_VALUE* packed_clear_value(const D3D12_CLEAR_VALUE* clear, DXGI_FORMAT requested,
+                                          DXGI_FORMAT created, D3D12_CLEAR_VALUE& copy)
+{
+    const auto* mapping = x2w_startup::packed_target_mapping(requested);
+    if (!clear || !mapping || created != mapping->replacement || desktop_format(clear->Format) != requested)
+        return clear;
+    copy = *clear;
+    copy.Format = created;
+    return &copy;
 }
 
 bool release_retired_enabled()
@@ -801,11 +814,15 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     u64 args[8] = {a, b, c, d, e, f, g, h};
     for (int i = 0; i < R; ++i) args[i] = unwrap(args[i]);
     D3D12_RESOURCE_DESC desc_copy{};
+    D3D12_CLEAR_VALUE clear_copy{};
     DXGI_FORMAT requested_format = DXGI_FORMAT_UNKNOWN;
     if (Desc >= 0 && args[Desc]) {
         requested_format = desktop_format(reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc])->Format);
         desc_copy = sanitized(*reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]));
         args[Desc] = reinterpret_cast<u64>(&desc_copy);
+        if constexpr (K == device_kind && (N == 27 || N == 29))
+            args[4] = reinterpret_cast<u64>(packed_clear_value(reinterpret_cast<const D3D12_CLEAR_VALUE*>(args[4]),
+                                                               requested_format, desc_copy.Format, clear_copy));
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], args[4], args[5],
                                                 args[6], args[7]);
@@ -2702,9 +2719,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     Wrapper* sig = as_wrapper(signature);
     IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
     Wrapper* refusal_pipeline = nullptr;
-    const auto refuse = [&kind, &refusal_pipeline](const char* reason, int outcome = indirect_other,
-                                                   const char* code = nullptr) {
+    u64 trace_call = 0;
+    const auto refuse = [&kind, &refusal_pipeline, &trace_call](const char* reason, int outcome = indirect_other,
+                                                               const char* code = nullptr) {
         InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
+        if (trace_call)
+            log("x2w-mesh86-trace call=%llu stage=record outcome=refused reason=%s", trace_call, reason);
         static LONG refusals;
         if (outcome == indirect_other) {
             const u64 key = known_pipeline_key(refusal_pipeline);
@@ -2718,6 +2738,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     };
     auto* list = recording(self);
     if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
+    if (kind == IndirectCommand::dispatch_mesh && mesh_xmem_trace_ordinal()) {
+        const auto& pass = pass_of(self);
+        if (pass.pipeline && pass.pipeline->own().mesh86_key) trace_call = select_mesh_xmem_trace_call();
+        if (trace_call) trace_mesh_xmem_inputs(self, pass, trace_call, argument, offset);
+    }
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list", indirect_other, indirect_other_refusal_code::invalid_list_type);
@@ -2906,7 +2931,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (leased_arguments)
         inputs[input_count++] = {base + offset, bytes, argument_state};
     if (input_count) {
-        if (const char* failure = record_mesh_xmem_reads(self, inputs, input_count))
+        if (const char* failure = record_mesh_xmem_reads(self, inputs, input_count, trace_call))
             return refuse(failure, mesh_srv != UINT_MAX ? indirect_graphics_pipeline : indirect_other,
                           indirect_other_refusal_code::mesh_xmem_read);
         if (leased_arguments) {
@@ -2971,6 +2996,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
+    if (trace_call) log("x2w-mesh86-trace call=%llu stage=record outcome=recorded", trace_call);
     if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
@@ -3478,6 +3504,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             }
         }
         auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
+        bool split = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             red_producers().execute(queue, native_lists, [&] {
@@ -3494,8 +3521,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             retire_note_submission(queue, wrappers);
             for (Wrapper* w : wrappers) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
+            return trace_mesh_xmem_submission(queue, native_lists, split);
         };
-        bool split = false;
         if (mesh_xmem_tracking()) {
             const std::lock_guard lock(mesh_xmem_mutex);
             reap_mesh_xmem_flights();
@@ -3509,7 +3536,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             for (std::size_t i = 0; i < ready.size(); ++i) {
                 native_list[0] = ready[i];
                 wrapper[0] = submitted[i];
-                execute_mesh_xmem_recording(queue, ready[i], [&] { submit(native_list, wrapper); });
+                execute_mesh_xmem_recording(queue, ready[i], [&] { return submit(native_list, wrapper); });
             }
         } else if (!ready.empty()) {
             submit(ready, submitted);
@@ -3890,26 +3917,30 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         return 0;
     }
     // The view descriptions of slots 18-21 start with a DXGI_FORMAT.
-    unsigned char desc_copy[64];
+    alignas(D3D12_SHADER_RESOURCE_VIEW_DESC) unsigned char desc_copy[64];
     const int desc_index = N == 19 ? 2 : 1;
-    if (N >= 18 && N <= 21 && args[desc_index] && x2w_local::readable(reinterpret_cast<const void*>(args[desc_index]), sizeof(desc_copy))) {
-        std::memcpy(desc_copy, reinterpret_cast<const void*>(args[desc_index]), sizeof(desc_copy));
+    constexpr std::size_t view_bytes = N == 18 ? sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) :
+        N == 19 ? sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) :
+        N == 20 ? sizeof(D3D12_RENDER_TARGET_VIEW_DESC) : sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC);
+    if (N >= 18 && N <= 21 && args[desc_index] && x2w_local::readable(reinterpret_cast<const void*>(args[desc_index]), view_bytes)) {
+        std::memcpy(desc_copy, reinterpret_cast<const void*>(args[desc_index]), view_bytes);
         DXGI_FORMAT format;
         std::memcpy(&format, desc_copy, sizeof(format));
         DXGI_FORMAT mapped = desktop_format(format);
         if (args[0] && x2w_startup::packed_target_format(mapped)) {
             // A packed view follows a stand-in texture and is refused on any other texture of another format.
             auto* const resource = reinterpret_cast<ID3D12Resource*>(args[0]);
-            const auto verdict = x2w_startup::packed_view(mapped, resource->GetDesc().Format, x2w_startup::packed_stand_in_of(resource));
+            const auto actual = resource->GetDesc().Format;
+            const auto verdict = x2w_startup::packed_view(mapped, actual, x2w_startup::packed_stand_in_of(resource));
             if (verdict == x2w_startup::PackedView::refused) {
                 record_view(false);
                 static LONG refused;
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 Device::slot%d view skipped: packed format %d on a texture of format %d that does not stand in for it",
-                        N, mapped, resource->GetDesc().Format);
+                        N, mapped, actual);
                 return 0;
             }
-            if (verdict == x2w_startup::PackedView::stand_in) mapped = DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (verdict == x2w_startup::PackedView::stand_in) mapped = actual;
         }
         if (mapped != format) {
             std::memcpy(desc_copy, &mapped, sizeof(mapped));
@@ -4173,7 +4204,9 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             texture.Height = surface.rows * x2w_startup::Bc16Surface::block_texels;
         }
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
-        const auto* clear_value = static_cast<const D3D12_CLEAR_VALUE*>(clear);
+        D3D12_CLEAR_VALUE clear_copy{};
+        const auto* clear_value = packed_clear_value(static_cast<const D3D12_CLEAR_VALUE*>(clear),
+                                                    desktop_format(desc->Format), texture.Format, clear_copy);
         ID3D12Resource* created = nullptr;
         HRESULT texture_hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
                                                                       D3D12_RESOURCE_STATE_COMMON, clear_value,
@@ -5040,8 +5073,10 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     const D3D12_RESOURCE_STATES initial = props->Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
                                           : props->Type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
                                                                                     : D3D12_RESOURCE_STATE_COMMON;
+    D3D12_CLEAR_VALUE clear_copy{};
+    const auto* clear_value = packed_clear_value(clear, desktop_format(desc->Format), copy.Format, clear_copy);
     HRESULT hr = kind_for(*iid) == resource_kind
-        ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear, IID_PPV_ARGS(&resource))
+        ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear_value, IID_PPV_ARGS(&resource))
         : E_NOINTERFACE;
     bool cleared = clear != nullptr;
     if (FAILED(hr) && clear && kind_for(*iid) == resource_kind) {
