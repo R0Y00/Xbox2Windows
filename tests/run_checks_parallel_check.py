@@ -50,6 +50,20 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "AssertionError: fail ran" in group(many.stdout, fail, "exit 1"), many.stdout
     assert group(many.stdout, good, "ok").endswith("good ran\n"), many.stdout
     assert many.stdout.splitlines().count("::endgroup::") == 3, many.stdout
+    # Exit 77 is a skip: it is listed apart from failures, and the status stays 1 so a skip never
+    # turns a run green.
+    skip = os.path.join(tmp, "skip.py")
+    with open(skip, "w") as f:
+        f.write("import sys\nprint('SKIP missing tool')\nsys.exit(77)\n")
+    skipped = run(skip, good)
+    assert skipped.returncode == 1, skipped.stdout
+    assert "SKIPPED: " + skip + "\n" in skipped.stdout, skipped.stdout
+    assert "FAILED:" not in skipped.stdout and "checks passed" not in skipped.stdout, skipped.stdout
+    assert group(skipped.stdout, skip, "exit 77").endswith("SKIP missing tool\n"), skipped.stdout
+    both = run(skip, bad, good)
+    assert both.returncode == 1, both.stdout
+    assert "FAILED: " + bad + "\n" in both.stdout, both.stdout
+    assert "SKIPPED: " + skip + "\n" in both.stdout, both.stdout
     # -j 0 is clamped to one worker instead of reaching ThreadPoolExecutor(max_workers=0).
     serial = run(good, jobs="0")
     assert serial.returncode == 0 and "all 1 checks passed" in serial.stdout, serial.stdout
