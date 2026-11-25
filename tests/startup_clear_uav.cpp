@@ -161,10 +161,8 @@ int main(int argc, char** argv)
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 4;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe.desktop)))) return 4;
 
-    if (!probe.watch()) {
-        std::printf("no debug layer message callback: skipped\n");
-        return 77;
-    }
+    // Without the debug layer (no Graphics Tools) the error count stays 0; the clear and readback checks still run.
+    if (!probe.watch()) std::printf("no debug layer message callback: validation not counted\n");
 
     // Five 1x1 targets: four with unordered access (A, B, C, D) and one render target (E).
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
