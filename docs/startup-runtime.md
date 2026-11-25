@@ -1362,7 +1362,10 @@ targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
 described above. A resource leaves the class for good when a UAV/RTV/DSV view is
 created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
 an untracked descriptor slot or is copied out of tracked heaps, when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. Tracked
+to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
+SRV keeps the resource only when the desktop created the view: desktop view
+creation returns `void`, so a removed device is the only failure it reports, and
+a slot whose creation failed is recorded without a reference. Tracked
 slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
 while any descriptor slot in `HeapInfo::shadow` names it (updated across
 `note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
@@ -1380,8 +1383,12 @@ source and destination, until the list is Reset, fails to Close or is destroyed.
 that is closed and never submitted is thus discarded without any submission.
 Each submission holds the same references until its queue passes a fence
 signalled behind it. A release with no registered queue, and a hold, marker or
-submission fence that cannot be recorded, keep the resource retained. Nothing
-waits: `ExecuteCommandLists` and `Present` check and release without blocking.
+submission fence that cannot be recorded, keep the resource retained. A use that
+`retire_hold` cannot record (no desktop object left, or no room for the entry)
+leaves the class and marks the resource so the drain keeps its desktop object for
+the process, as an unfenced submission is kept, instead of dropping an object a
+list still names. Nothing waits: `ExecuteCommandLists` and `Present` check and
+release without blocking.
 The wrapper stays allocated, and a guest that uses a resource after its final
 release is not supported with the switch. Slot 18 (`CopyTiles`) is not
 forwarded at all and is outside this change.
@@ -1405,9 +1412,13 @@ presented texture that must stay retained, alongside slot 133 title-memory textu
 `startup_resource_retire_title_{warp,hardware}_debug{0,1}` additionally test slot 133
 `CopyTextureRegion`/`CopyResource` upload holds, same-address slot 70 (`existing_memory_texture`)
 reuse with `X2W_RESOURCE_INDEX_CHECK=1`, stale `written_textures` `bc7_width` cleanup,
-and slot-18 SRV `CopyDescriptorsSimple` / overwrite / heap-release lifetime. The fixture-only export
-`x2w_d3d12_retire_probe` returns FALSE without the switch, like
-`x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
+slot-18 SRV `CopyDescriptorsSimple` / overwrite / heap-release lifetime, and, with the
+switch on, a newer `written_textures` generation kept when the older generation retires;
+the `_off_` case checks that an ordinary committed texture (no title memory) still
+records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
+`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+`x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
+FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
 physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
 
