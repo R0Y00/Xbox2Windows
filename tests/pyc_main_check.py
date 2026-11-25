@@ -22,7 +22,8 @@ def run(argv, record=None):
 
 
 def pixel_aot_forwards_status_args_and_record():
-    args = ["binary"]  # wrong arity: the script itself prints a fixed English usage line
+    # Missing arguments: this mode is rejected before the script runs its control suite, so both runs stay fast.
+    args = ["draw-e64"]
     with tempfile.TemporaryDirectory() as tmp:
         direct_record = os.path.join(tmp, "direct.txt")
         entry_record = os.path.join(tmp, "entry.txt")
@@ -30,7 +31,7 @@ def pixel_aot_forwards_status_args_and_record():
         entry = run([os.path.join(TESTS, "pyc_main.py"), "pixel_aot_check", *args], entry_record)
         assert direct.returncode != 0, "control run unexpectedly passed"
         assert entry.returncode == direct.returncode, (entry.returncode, direct.returncode, entry.stderr[-400:])
-        assert "usage: pixel_aot_check.py binary" in entry.stderr, entry.stderr[-400:]
+        assert "check_e64_render() missing" in entry.stderr, entry.stderr[-400:]
         assert os.path.exists(entry_record), "exit record was not written"
         with open(direct_record, encoding="utf-8") as a, open(entry_record, encoding="utf-8") as b:
             assert a.read() == b.read()
