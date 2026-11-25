@@ -1,6 +1,6 @@
 // CopyTextureRegion (command list slot 16) through the wrapped list, read back (#870).
 //
-//   startup_list_copy_texture_warp <warp|hardware>     (X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_DEBUG=1)
+//   startup_list_copy_texture_warp <warp|hardware>     (X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_RENDER=1 X2W_D3D12_DEBUG=1)
 //
 // Through D3D12XboxCreateDevice the probe makes a 4x4 RGBA8 texture with 2 mips and 3 array slices (six
 // subresources), an upload buffer holding two distinct 4x4 images and a readback buffer, all as console
