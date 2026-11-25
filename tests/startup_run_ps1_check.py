@@ -72,7 +72,7 @@ STOP = "taskkill.exe /T /F /PID $translator.Id"
 # guard and the child scope that handles Windows PowerShell's native stderr.
 WATCH_CLEANUP = re.compile(
     r"if\s*\(\s*\$translator\s+-and\s+-not\s+\$translator\.HasExited\s*\)\s*\{\s*&\s*\{\s*"
-    r"""\$ErrorActionPreference\s*=\s*['"]Continue['"]\s+&\s+taskkill\.exe\b""", re.I)
+    r"""\$ErrorActionPreference\s*=\s*['"]Continue['"]\s+&\s+taskkill\.exe\b[^|#\n]*\s/T\b""", re.I)
 CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
@@ -234,7 +234,7 @@ def text_problems(script):
     if not FAKE_USER_WARN.search(code):
         found.append("missing Write-Warning when -FakeUser is not passed")
     if not WATCH_CLEANUP.search("\n".join(after)):
-        found.append("taskkill lacks its live-watcher guard or local Continue scope")
+        found.append("tree cleanup lacks taskkill /T, the live-watcher guard or the local Continue scope")
     return found
 
 
@@ -301,7 +301,7 @@ def main():
                     if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
                         failures.append(f"{name}: expected a surviving {who}, got {problems}")
             else:
-                for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"'):
+                for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"', '/T '):
                     if not text_problems(script.replace(removed, '')):
                         failures.append(f"text: removing {removed.strip()} escaped the cleanup check")
     for item in failures:
