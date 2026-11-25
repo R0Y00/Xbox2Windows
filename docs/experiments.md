@@ -9103,6 +9103,10 @@ stage. The check compiles and rejects shifted, dynamic, wider and wrong-space
 loads and a pixel-stage buffer read. Run it with
 `ctest --preset release --no-tests=error -R '^startup_mesh86_srv_proof$' -V`.
 
+Run `python -B tests/startup_mesh86_srv_proof_check.py` to check the load count
+without DXC. The synthetic DXIL dump passes with one DWORD load and is
+rejected when a second identical load uses the same SRV handle.
+
 On the Release worktree at `76aeef7f` plus these changes, the combined lease,
 SRV proof, export and mapped-page selection passed eight tests. The two mesh
 cases returned 77 on the adapters listed above. `dumpbin /exports` showed

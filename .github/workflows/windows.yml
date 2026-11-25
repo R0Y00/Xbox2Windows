@@ -179,6 +179,7 @@ jobs:
             tests/mesh_clip_cull_check.py \
             tests/mesh_dynamic_geometry_check.py \
             tests/mesh_dynamic_aot_check.py \
+            tests/startup_mesh86_srv_proof_check.py \
             tests/mesh_lane_spill_check.py \
             tests/mesh_join_descriptor_check.py \
             tests/mesh_loop_census_check.py \
