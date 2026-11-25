@@ -1,6 +1,6 @@
 // Loads the built xgameruntime.dll from its fixture-only directory, checks the
-// four explicit stub exports retained after the synchronous contracts, and validates the
-// deterministic E_NOTIMPL call log. It also rejects a DLL elsewhere or a copy
+// export table (no explicit stubs remain), and validates the deterministic call log: the
+// null-block call to XPackageMountWithUiAsync is refused with E_INVALIDARG and logged. It also rejects a DLL elsewhere or a copy
 // in the normal shim directory. The unknown-export lookup is a negative
 // control: a missing export returns null.
 #include <array>
@@ -21,9 +21,6 @@
 
 namespace {
 namespace fs = std::filesystem;
-
-constexpr HRESULT not_implemented = static_cast<HRESULT>(0x80004001L);
-static_assert(not_implemented == E_NOTIMPL);
 
 struct XAsyncBlock;
 struct XUserHandleStorage;
@@ -156,7 +153,7 @@ bool find_proc(HMODULE module, const char* name, Proc& proc)
     return true;
 }
 
-bool calls_return_not_implemented(HMODULE module)
+bool calls_are_refused(HMODULE module)
 {
     PackageMountWithUiAsync package_mount = nullptr;
 
@@ -169,11 +166,11 @@ bool calls_return_not_implemented(HMODULE module)
         HRESULT result;
     };
     const std::array<Call, 1> calls{{
-        {expected_thunks[0].name, package_mount(nullptr, nullptr)},
+        {expected_thunks[0].name, package_mount("x2w-synthetic-package-0001", nullptr)},
     }};
     for (const auto& call : calls) {
-        if (call.result != not_implemented) {
-            std::printf("FAIL: %s returned 0x%08lx, expected E_NOTIMPL\n", call.name,
+        if (call.result != E_INVALIDARG) {
+            std::printf("FAIL: %s returned 0x%08lx, expected E_INVALIDARG\n", call.name,
                         static_cast<unsigned long>(call.result));
             return false;
         }
@@ -195,7 +192,7 @@ bool log_matches_calls(HMODULE module)
         std::printf("FAIL: log was not empty after clear\n");
         return false;
     }
-    if (!calls_return_not_implemented(module)) return false;
+    if (!calls_are_refused(module)) return false;
 
     std::array<XGameRuntimeShimLogEntry, expected_thunks.size()> entries{};
     const std::size_t total = get_log(entries.data(), entries.size());
@@ -210,7 +207,7 @@ bool log_matches_calls(HMODULE module)
                         static_cast<unsigned long>(entry.sequence));
             return false;
         }
-        if (entry.result != not_implemented) {
+        if (entry.result != E_INVALIDARG) {
             std::printf("FAIL: log entry %zu has result 0x%08lx\n", i,
                         static_cast<unsigned long>(entry.result));
             return false;

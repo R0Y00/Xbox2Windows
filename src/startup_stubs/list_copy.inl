@@ -196,6 +196,12 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
+    if (mesh_xmem_handoff()) {
+        D3D12_HEAP_TYPE source_heap;
+        const bool upload = fixed_heap(from.resource, source_heap) && source_heap == D3D12_HEAP_TYPE_UPLOAD;
+        note_mesh_xmem_write(self, to.wrapper, destination_offset, bytes,
+                             upload ? from.resource : nullptr, source_offset);
+    }
     if (indirect_copy_ranges()) {
         const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;
         note_copy_gpu_range(self, to.resource, destination_offset, bytes, authoritative && info &&
@@ -220,9 +226,10 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to.resource, from.resource);
-    if (to_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    if (to_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        note_mesh_xmem_write(self, to.wrapper, 0, to_desc.Width);
         note_copy_gpu_range(self, to.resource, 0, to_desc.Width, false);
-    else mark_gpu_written(self, to);
+    } else mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
 }
 
