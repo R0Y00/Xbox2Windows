@@ -3284,7 +3284,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Scalar SOPK accumulate: s_addk_i32 signed-overflow SCC and s_mulk_i32 against an integer reference.
     add_test(NAME startup_gfx2hlsl_sopk_accum COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sopk_accum_check.py")
-    # s_pack_ll_b32_b16, s_pack_lh_b32_b16 and s_absdiff_i32 against an integer reference (#1723).
+    # s_pack_ll_b32_b16, s_pack_lh_b32_b16 and s_absdiff_i32 against an integer reference (#1723); the _warp/_hardware tests also draw them (D3D12 readback).
     add_test(NAME startup_gfx2hlsl_pack_absdiff COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_pack_absdiff_check.py")
     foreach(adapter IN ITEMS warp hardware)
@@ -3554,9 +3554,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(raster_winding_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
-    # s_bcnt0/1_i32_b32/b64, s_ff0/ff1_i32_b64 and s_flbit_i32_b64/i64 against an integer reference (#1723).
+    # s_bcnt0/1_i32_b32/b64, s_ff0/ff1_i32_b64 and s_flbit_i32_b64/i64 against an integer reference (#1723); the _warp/_hardware tests also draw them (D3D12 readback).
     add_test(NAME startup_gfx2hlsl_s_bit_scan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bit_scan_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_s_bit_scan_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bit_scan_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_s_bit_scan_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl per-lane bit operations: CPU evaluation of the translated text against an independent
     # reference with mutation controls, then a desktop draw of the translated pairs (FXC 5_1 and DXC 6_0).
     add_test(NAME startup_gfx2hlsl_bit_alu_controls COMMAND "${INTAKE_PYTHON}" -B
