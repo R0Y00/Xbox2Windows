@@ -22,6 +22,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -48,6 +49,13 @@ unsigned unresolved_now()
     return unresolved;
 }
 
+std::atomic<unsigned long long> debug_error_count{0};
+void WINAPI on_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID, LPCSTR text, void*)
+{
+    if (severity > D3D12_MESSAGE_SEVERITY_ERROR) return;
+    if (++debug_error_count <= 12) std::printf("debug layer: %.300s\n", text);
+}
+
 struct Probe {
     ComPtr<ID3D12Device> desktop;
     ComPtr<ID3D12Resource> readback;
@@ -68,23 +76,14 @@ struct Probe {
         }
         return true;
     }
-    UINT64 debug_errors()
+    // Cumulative error count from a message callback registered before any recording; the shim drains the
+    // stored queue at every submit, so the stored messages alone would miss the recording errors.
+    DWORD cookie = 0;
+    ComPtr<ID3D12InfoQueue1> queue1;
+    bool watch()
     {
-        ComPtr<ID3D12InfoQueue> info;
-        if (FAILED(desktop.As(&info))) return 0;
-        UINT64 errors = 0;
-        for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
-            SIZE_T bytes = 0;
-            if (FAILED(info->GetMessage(i, nullptr, &bytes))) continue;
-            std::vector<char> storage(bytes);
-            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-            if (FAILED(info->GetMessage(i, message, &bytes))) continue;
-            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
-                ++errors;
-                std::printf("debug layer: %.*s\n", static_cast<int>(message->DescriptionByteLength), message->pDescription);
-            }
-        }
-        return errors;
+        return SUCCEEDED(desktop.As(&queue1)) &&
+               SUCCEEDED(queue1->RegisterMessageCallback(on_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie));
     }
     // The one texel of a target (4 bytes), copied on a desktop queue.
     std::uint32_t texel(ID3D12Resource* target)
@@ -161,6 +160,11 @@ int main(int argc, char** argv)
     void* device = nullptr;
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 4;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe.desktop)))) return 4;
+
+    if (!probe.watch()) {
+        std::printf("no debug layer message callback: skipped\n");
+        return 77;
+    }
 
     // Five 1x1 targets: four with unordered access (A, B, C, D) and one render target (E).
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -263,7 +267,7 @@ int main(int argc, char** argv)
     if (bits_c != 0x3fc00000) return 20;
 
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
-    const UINT64 errors = probe.debug_errors();
+    const unsigned long long errors = debug_error_count.load();
     std::printf("device removed reason: 0x%08lx, debug layer errors: %llu\n", static_cast<unsigned long>(removed),
                 static_cast<unsigned long long>(errors));
     return removed == S_OK && errors == 0 ? 0 : 70;
