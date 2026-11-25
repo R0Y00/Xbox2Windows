@@ -13930,6 +13930,29 @@ VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device llvmpipe
 ```
 
+## Vulkan draw of the core translated pixel shaders
+
+`python3 -B tests/pixel_aot_check.py draw-core-vulkan <dxc> <device> [--allow-denorm-mismatch]` runs the `draw-core` set of `check_render`, with its negative controls, on a Vulkan 1.2 device. DXC compiles each translated shader to SPIR-V (`-spirv -fspv-target-env=vulkan1.2 -fvk-use-dx-layout`, b0 to b2 at 0 to 2, t0 and t1 at 16 and 17, s0 at 32) and `spirv-val` checks it. [`tests/vk_offscreen.py`](../tests/vk_offscreen.py) stands in for `offscreen_check` and draws through the `--draw` form of `tests/vk_pixel_draw.c`. It reproduces `--check-pixel`, `--check-pixel-case`, `--check-pixel-batch` and `--check-pixel-quad-lod` with the same exit codes, stderr words and batch status lines. It does not reproduce the other `offscreen_check` modes or title-memory trailers, and there is no debug layer. Every shader is compiled with `-denorm preserve`, so a device without `shaderDenormPreserveFloat32` is a capability skip (77) unless `--allow-denorm-mismatch` is given.
+
+Measured on 2026-11-25 with base `25317c63` plus this change, DXC 1.10.2605.37 and Mesa 26.2.7:
+
+| device | flag | result |
+|---|---|---|
+| Intel UHD Graphics (TGL GT1), ANV, `shaderDenormPreserveFloat32` = 1 | none | exit 0, every negative control detected, about 11 s |
+| lavapipe | none | exit 77 (module declares DenormPreserve 32, device lacks the capability) |
+| lavapipe | `--allow-denorm-mismatch` | exit 0 |
+| NVIDIA RTX 3060 Laptop, driver 620.70.06, `shaderDenormPreserveFloat32` = 0 | none | exit 77 |
+| NVIDIA RTX 3060 Laptop | `--allow-denorm-mismatch` | exit 1, `pixel_mismatch x=16 y=0` |
+
+The NVIDIA mismatch is a measurement: in that pixel, byte 37 reads back `0x3e14a000` where the reference has `0x3e148000`. The reference comes from `export16` in `tools/pixel_aot.py`, which converts with `f32tof16`, steps the half down by one when `f16tof32` of it exceeds the input in magnitude, and widens it again, so the value is rounded toward zero to a binary16. One hypothesis, not tested further, is that the NVIDIA compiler folds `f16tof32(f32tof16(x))` to `x`, so that rounding does not happen. A compute probe on the same device gave the correct binary16 `0x30a5` and a widened value `0x3e149495`, which is consistent with that hypothesis but does not prove it. It is not known whether the NVIDIA D3D12 driver behaves the same way. The run is a diagnostic and says nothing about NVIDIA's subnormal handling.
+
+This shows that these shaders produce the same bits on two Vulkan drivers for the covered modes. It does not cover the other `offscreen_check` modes or title-memory cases, and it is not a D3D12 result.
+
+```bash
+python3 -B tests/pixel_aot_check.py draw-core-vulkan /path/to/dxc Intel
+python3 -B tests/vk_offscreen.py
+```
+
 ## SAL (/6) lifting in cpu_switch_aot
 
 [The switch translator](../tools/cpu_switch_aot.py) adds `SAL` (the ModR/M `/6` encoding alias of `SHL` across `docs/coverage/x64_zen2.tsv` group `Integer` `sal`) to `SHIFTS` and `Lifter.lower` across 8-, 16-, 32-, and 64-bit register and memory destinations with immediate (`1`, `imm8`) and `CL` counts:

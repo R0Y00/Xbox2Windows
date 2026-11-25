@@ -185,6 +185,7 @@ jobs:
             tests/docs_links_check.py \
             tests/bidi_controls_check.py \
             tests/pixel_denorm_vulkan_check.py \
+            tests/vk_offscreen.py \
             tests/gpu_report_format_check.py \
             tests/hardware_reports_check.py \
             tests/rectlist_topology_check.py \
