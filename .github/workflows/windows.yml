@@ -132,6 +132,7 @@ jobs:
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_ngg_slice_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_dpp_row_shr_check.py", *COMMON_LLVM], {}),
+              (["tests/startup_compute_lds_dual_atomics_check.py", "binary", "llvm-mc-15"], {}),
           ]
           sys.exit(runpy.run_path("tools/run_checks_parallel.py",
                                   run_name="run_checks_parallel")["run_checks"](CHECKS))
@@ -302,6 +303,7 @@ jobs:
             tests/startup_gfx2hlsl_handler_arity_check.py \
             tests/startup_gfx2hlsl_getpc_refusal_check.py \
             tests/startup_gfx2hlsl_image_arity_check.py \
+            tests/startup_compute_lds_dual_atomics_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows
