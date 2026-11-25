@@ -154,6 +154,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_sampler_heap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_l_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_b_check.py
+./out/pe-env/bin/python -B tests/startup_image_sample_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_image_3d_check.py
 ./out/pe-env/bin/python -B tests/startup_image_load_mip_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
@@ -174,6 +175,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_request_offline_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
@@ -201,6 +203,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
 ./out/pe-env/bin/python -B tests/mesh_heap_sampler_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
+./out/pe-env/bin/python -B tests/mesh_join_descriptor_check.py
 ./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_c_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_alu_check.py

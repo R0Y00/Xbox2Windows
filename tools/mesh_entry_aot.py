@@ -49,6 +49,31 @@ UNARY_F32 = {f"{name}_e{width}": expr for name, expr in UNARY_F32_EXPR.items() f
 # stride, identity component selects, and the observed raw-buffer flags.
 VERTEX_DESCRIPTOR = [0x20000, 0x10000, U32, 0x11014FAC]
 VERTEX_BYTES = 512
+# A zero descriptor is the null resource; reads through it return zero.
+NULL_DESCRIPTOR = [0, 0, 0, 0]
+DYNAMIC_COMPARE = {"s_cmp_eq_u32": "==", "s_cmp_lt_u32": "<", "s_cmp_gt_u32": ">"}
+
+
+class Dyn:
+    """A scalar predicate that depends on a constant-buffer value (HLSL text)."""
+
+    def __init__(self, expr):
+        self.expr = expr
+
+
+class Select:
+    """A scalar register whose value depends on a Dyn predicate at a join."""
+
+    def __init__(self, cond, when_true, when_false):
+        self.cond, self.when_true, self.when_false = cond, when_true, when_false
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Select)
+            and self.cond is other.cond
+            and self.when_true == other.when_true
+            and self.when_false == other.when_false
+        )
 
 
 class _Undefined:
@@ -118,6 +143,8 @@ class Wave:
             lo, hi = (self.scalar(f"s{i}", allow_undef) for i in regs)
             if lo is UNDEF or hi is UNDEF:
                 return UNDEF
+            if type(lo) is not int or type(hi) is not int:
+                raise ValueError("Scalar pair requires concrete words")
             return lo | hi << 32
         if re.fullmatch(r"s\d+", t):
             i = int(t[1:])
@@ -203,10 +230,12 @@ class Wave:
                 self.pending.update(regs)
                 return
             kind = desc[0][0] if isinstance(desc[0], tuple) else None
-            if desc != [(kind, j) for j in range(4)]:
-                raise ValueError("Unbound buffer")
             first = off // 4
-            if kind == 32:
+            if any(isinstance(d, Select) for d in desc):
+                data = self.selected_words(desc, first, count)
+            elif desc != [(kind, j) for j in range(4)]:
+                raise ValueError("Unbound buffer")
+            elif kind == 32:
                 data = self.geometry[first : first + count]
             elif kind in (96, 128) and first + count <= 128:
                 name = "pointData" if kind == 96 else "matrixData"
@@ -220,6 +249,79 @@ class Wave:
                 raise ValueError("Geometry read outside binding")
         self.s.update(zip(regs, data))
         self.pending.update(regs)
+
+    def selected_words(self, desc, first, count):
+        """Read constant words through a descriptor chosen by a join predicate."""
+        conds = {id(d.cond): d.cond for d in desc if isinstance(d, Select)}
+        if len(conds) != 1:
+            raise ValueError("Descriptor words join different predicates")
+        cond = next(iter(conds.values()))
+        sides = [
+            [getattr(d, arm) if isinstance(d, Select) else d for d in desc]
+            for arm in ("when_true", "when_false")
+        ]
+        arms = []
+        for side in sides:
+            if side == NULL_DESCRIPTOR:
+                arms.append(["0.0f"] * count)
+                continue
+            kind = side[0][0] if isinstance(side[0], tuple) else None
+            if kind not in (96, 128) or side != [(kind, j) for j in range(4)]:
+                raise ValueError("Unsupported descriptor in a join")
+            if first + count > 128:
+                raise ValueError("Unsupported uniform read")
+            name = "pointData" if kind == 96 else "matrixData"
+            arms.append(
+                [f"{name}[{i // 4}].{'xyzw'[i % 4]}" for i in range(first, first + count)]
+            )
+        return [f"({cond.expr} ? {t} : {f})" for t, f in zip(*arms)]
+
+    def join_arms(self, decoded, expressions, jumps, pc, offset, target_offset, cond):
+        """Run both arms of a uniform branch on a constant predicate and merge them.
+
+        Only scalar ALU and loads may appear inside an arm; the arms write no
+        exports and leave EXEC, VCC and M0 as they were.
+        """
+        target = jumps[target_offset]
+        if target <= pc:
+            raise ValueError("Expected a forward mesh branch")
+        end = target
+        last = decoded[target - 1][1] if target - 1 >= pc else ""
+        if last.startswith("s_branch "):
+            join_offset = decoded[target - 1][0] + 4 + 4 * int(last.split()[1])
+            if join_offset not in jumps or jumps[join_offset] <= target:
+                raise ValueError("Expected a forward mesh branch")
+            end, join = target - 1, jumps[join_offset]
+        else:
+            join = target
+        before = (self.exec, self.vcc, self.m0)
+        base = (dict(self.s), set(self.pending), set(self.pending_v))
+        outcomes = []
+        for start, stop in ((pc, end), (target, join)):
+            self.s, self.pending = dict(base[0]), set(base[1])
+            self.pending_v = set(base[2])
+            self.scc = None
+            for _ in self.exec_range(decoded, expressions, jumps, start, stop, arm=True):
+                raise ValueError("Barrier inside a descriptor join arm")
+            # Each arm is checked on its own so two changes cannot cancel.
+            if (self.exec, self.vcc, self.m0) != before:
+                raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
+            outcomes.append((self.s, self.pending, self.pending_v))
+        (true_s, true_p, true_v), (false_s, false_p, false_v) = outcomes
+        self.pending_v = true_v | false_v
+        if true_s.keys() != false_s.keys():
+            raise ValueError("A scalar register is defined in only one join arm")
+        merged = {}
+        for reg, value in true_s.items():
+            other = false_s[reg]
+            if value == other:
+                merged[reg] = value
+            elif isinstance(value, Select) or isinstance(other, Select):
+                raise ValueError("Nested descriptor joins are not supported")
+            else:
+                merged[reg] = Select(cond, value, other)
+        self.s, self.pending, self.scc = merged, true_p | false_p, None
+        return join
 
     def scalar_op(self, op, args):
         d, *src = args
@@ -236,6 +338,14 @@ class Wave:
             a, b = (self.scalar(t, True) for t in args)
             if a is UNDEF or b is UNDEF:
                 self.scc = None
+                return
+            if (
+                op in DYNAMIC_COMPARE
+                and {type(a), type(b)} <= {int, str}
+                and str in (type(a), type(b))
+            ):
+                text = [f"asuint({v})" if type(v) is str else f"{v & U32}u" for v in (a, b)]
+                self.scc = Dyn(f"({text[0]} {DYNAMIC_COMPARE[op]} {text[1]})")
                 return
             if not isinstance(a, int) or not isinstance(b, int):
                 raise ValueError("Dynamic scalar predicate")
@@ -284,6 +394,8 @@ class Wave:
         elif op in ("s_cselect_b32", "s_cselect_b64"):
             if self.scc is None:
                 raise ValueError("Undefined scalar predicate")
+            if isinstance(self.scc, Dyn):
+                raise ValueError("Dynamic scalar predicate")
             v = a if self.scc else b
         elif op == "s_bfe_u32":
             v = ((a & U32) >> (b & 31)) & ((1 << ((b >> 16) & 127)) - 1)
@@ -565,8 +677,13 @@ class Wave:
                 self.written.add(int(dest[1:]))
             elif dest.startswith("s["):
                 self.written.update(span(dest))
-        pc = 0
-        while pc < len(decoded):
+        if (yield from self.exec_range(decoded, expressions, jumps, 0, len(decoded))):
+            return
+        raise ValueError("No program exit")
+
+    def exec_range(self, decoded, expressions, jumps, pc, stop, arm=False):
+        """Execute decoded[pc:stop]; return True at s_endpgm, else False."""
+        while pc < stop:
             offset, line = decoded[pc]
             pc += 1
             op, _, tail = line.partition(" ")
@@ -580,8 +697,14 @@ class Wave:
                     regs = (int(single),) if single else range(int(first), int(last) + 1)
                     for reg in self.spill_vgprs.intersection(regs):
                         self.spill_vector_uses.setdefault(reg, (offset, op))
+            if arm and (
+                not op.startswith("s_")
+                or op.startswith("s_cbranch_")
+                or op in ("s_branch", "s_endpgm", "s_barrier", "s_sendmsg")
+            ):
+                raise ValueError("Unsupported instruction inside a descriptor join arm")
             if op == "s_endpgm":
-                return
+                return True
             if op in ("s_inst_prefetch", "s_nop"):
                 continue
             if op == "s_barrier":
@@ -601,6 +724,11 @@ class Wave:
                     self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
+            elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
+                pc = self.join_arms(
+                    decoded, expressions, jumps, pc, offset,
+                    offset + 4 + 4 * int(tail), self.scc,
+                )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
                     op in ("s_cbranch_scc0", "s_cbranch_scc1")
@@ -711,7 +839,7 @@ class Wave:
                 self.vector_op(op, args, expressions)
             else:
                 raise ValueError(f"Unsupported mesh instruction {op}")
-        raise ValueError("No program exit")
+        return False
 
 
 def live_barriers_agree(first, second):

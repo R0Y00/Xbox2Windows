@@ -127,29 +127,44 @@ void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layou
     put32(mip + 0x3c, 1);
 }
 
+template <bool into>
 HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, const unsigned char* source,
                      UINT row_pitch, UINT slice_pitch)
 {
     const Bc16Surface surface(desc);
     const UINT row_bytes = surface.columns * Bc16Surface::block_bytes;
-    const u64 source_bytes = u64{surface.rows - 1} * row_pitch + row_bytes;
-    if (!dest || !source || row_pitch < row_bytes || (slice_pitch && slice_pitch < source_bytes))
+    const u64 linear_bytes = u64{surface.rows - 1} * row_pitch + row_bytes;
+    if (!dest || !source || row_pitch < row_bytes || (slice_pitch && slice_pitch < linear_bytes))
         return E_INVALIDARG;
 
+    const u64 dest_bytes = into ? surface.size() : linear_bytes;
+    const u64 source_bytes = into ? linear_bytes : surface.size();
     const auto dest_begin = reinterpret_cast<std::uintptr_t>(dest);
     const auto source_begin = reinterpret_cast<std::uintptr_t>(source);
-    const bool overlap = dest_begin <= source_begin ? source_begin - dest_begin < surface.size()
+    const bool overlap = dest_begin <= source_begin ? source_begin - dest_begin < dest_bytes
                                                     : dest_begin - source_begin < source_bytes;
     if (overlap) return E_INVALIDARG;
-    if (!x2w_local::readable(source, source_bytes) || !x2w_local::writable(dest, surface.size()))
+    if (!x2w_local::readable(source, source_bytes) || !x2w_local::writable(dest, dest_bytes))
         return E_FAIL;
 
-    for (UINT y = 0; y < surface.rows; ++y) {
-        const auto* row = source + u64{y} * row_pitch;
-        for (UINT x = 0; x < surface.columns; ++x)
-            std::memcpy(dest + surface.block_offset(x, y), row + x * Bc16Surface::block_bytes, Bc16Surface::block_bytes);
+    if constexpr (into) {
+        for (UINT y = 0; y < surface.rows; ++y) {
+            const auto* row = source + u64{y} * row_pitch;
+            for (UINT x = 0; x < surface.columns; ++x)
+                std::memcpy(dest + surface.block_offset(x, y), row + x * Bc16Surface::block_bytes, Bc16Surface::block_bytes);
+        }
+    } else {
+        surface.detile(source, dest, row_pitch);
     }
     return S_OK;
+}
+
+long __stdcall bc7_4k_s_copy_from(Computer* self, unsigned char* dest, UINT plane, UINT subresource,
+                                  UINT scarlett_option, const unsigned char* source, UINT row_pitch, UINT slice_pitch)
+{
+    if (scarlett_option) return E_NOTIMPL;
+    if (plane || subresource) return E_INVALIDARG;
+    return copy_bc7_4k_s<false>(self->desc, dest, source, row_pitch, slice_pitch);
 }
 
 // A description given the 4 KiB allocation answer (small_texture_4k.h): slot 2 describes the compact plan
@@ -353,7 +368,7 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
         const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
         const auto notify = d3d ? reinterpret_cast<NotifyBc7>(GetProcAddress(d3d, "x2w_d3d12_bc7_4k_s_written")) : nullptr;
         if (!notify && x2w_local::env_on("X2W_D3D12_RENDER")) return E_NOTIMPL;
-        const HRESULT hr = copy_bc7_4k_s(self->desc, base, linear, row_pitch, slice_pitch);
+        const HRESULT hr = copy_bc7_4k_s<true>(self->desc, base, linear, row_pitch, slice_pitch);
         if (SUCCEEDED(hr) && notify) notify(base, static_cast<UINT>(self->desc.Width), self->desc.Height);
         return hr;
     }
@@ -465,7 +480,16 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         slots[10] = reinterpret_cast<void*>(&bc64_tiling);
         return slots;
     }();
-    auto* computer = new Computer{bc64::supports(desc) ? bc_table.data() : table.data(), desc, 1, use_bc7_4k_s_layout(desc)};
+    static const auto bc7_4k_table = [] {
+        auto slots = table;
+        slots[9] = reinterpret_cast<void*>(&bc7_4k_s_copy_from);
+        return slots;
+    }();
+    const bool bc7_4k = use_bc7_4k_s_layout(desc);
+    // The 4 KiB profile requires UNKNOWN layout and one mip. BC64 requires layout 0x109 and six or nine mips.
+    const auto* slots = bc64::supports(desc) ? bc_table.data() : table.data();
+    if (bc7_4k) slots = bc7_4k_table.data();
+    auto* computer = new Computer{slots, desc, 1, bc7_4k};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
     if (x2w_local::first_calls(calls, 3))
