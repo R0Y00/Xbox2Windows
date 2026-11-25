@@ -1087,6 +1087,13 @@ class Stage:
                          else self.is_lane_mask(dname))
             if mask_dest or any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
+        elif word_complement:
+            operands = [dname] + srcs
+            if any(t in ('exec_hi', 'vcc_hi') for t in operands):
+                raise Unsupported('%s on the high half of a lane mask' % base)
+            # A raw scalar word (inline constant, plain SGPR) has no per-lane bit: keep it refused.
+            if any(self.is_lane_mask(t) for t in operands) and not all(self.is_lane_mask(t) for t in srcs):
+                raise Unsupported('%s mixes a lane mask with an unprojected scalar word' % base)
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
