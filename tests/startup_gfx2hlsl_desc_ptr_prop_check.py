@@ -108,6 +108,29 @@ check('s_addc_u32 without the low-word add is refused', isinstance(s, str), str(
 s = run(TABLE, [ADVANCE[0], ('s_cmp_eq_u32', '0, 0'), ADVANCE[1]])
 check('s_addc_u32 separated from its low-word add is refused', isinstance(s, str), str(s))
 
+# A fold needs the complete matching pair: the load must not trust the low word alone.
+LOW = ADVANCE[0]
+s = run(TABLE, [LOW] + LOAD)
+check('missing high-word add is refused', isinstance(s, str), str(s))
+
+s = run(TABLE, [('s_add_u32', 's8, s8, 0x20'), ('s_load_dwordx4', 's[4:7], s[8:9], 0')])
+check('missing high-word add in place is refused', isinstance(s, str), str(s))
+
+s = run(TABLE, ADVANCE + [('s_mov_b32', 's21, 0')] + LOAD)
+check('overwritten high word is refused', isinstance(s, str), str(s))
+
+mixed = dict(TABLE)
+mixed[10], mixed[11] = ('ptr', ('table', 1)), ('ptrhi', ('table', 1))
+s = run(mixed, [LOW, ('s_addc_u32', 's21, s11, 0')] + LOAD)
+check('high word from another pointer is refused', isinstance(s, str), str(s))
+
+s = run(mixed, [LOW, ('s_addc_u32', 's21, s10, 0')] + LOAD)
+check('high word from a different register pair is refused', isinstance(s, str), str(s))
+
+s = run(TABLE, [('s_add_u32', 's20, s8, 0xfffff'), ('s_addc_u32', 's21, s9, 0')] + LOAD)
+check('complete pair with a large low-word add is folded',
+      not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0xfffff + 0x10, 0), str(s))
+
 if failures:
     print('FAILED: %s' % ', '.join(failures))
     sys.exit(1)
