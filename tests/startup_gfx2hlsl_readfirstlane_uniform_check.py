@@ -79,6 +79,11 @@ ACCEPTED = [
      ['v7 = U(F(s2) * 2.0 + F(0x3f800000u));']),
     ('reciprocal', ('v_rcp_f32_e32 v7, s2',),
      ['v7 = U(1.0 / F(s2));']),
+    # The clamp to [0, 0.5] of a scalar, as compiled shaders write it.
+    ('median of three', ('v_med3_f32 v7, s2, 0, 0.5',),
+     ['v7 = U(med3(F(s2), F(0x00000000u), 0.5));']),
+    ('median of three scalar sources', ('v_med3_f32 v7, s2, -s3, |s2| clamp',),
+     ['v7 = U(saturate(med3(F(s2), (-F(s3)), abs(F(s2)))));']),
     ('move', ('v_mov_b32_e32 v7, s2',), ['v7 = s2;']),
     ('literal move', ('v_mov_b32_e32 v7, 0x1234',), ['v7 = 0x00001234u;']),
     ('chain with an in-place write', ('v_mul_f32_e64 v7, s2, 2.0', 'v_cvt_u32_f32_e32 v7, v7'),
@@ -114,6 +119,8 @@ REFUSED = [
     ('varying scalar buffer offset',
      (COMPARE, 's_buffer_load_dword s3, s[4:7], s2', 'v_mov_b32_e32 v7, s3', READ)),
     ('listed op with varying source', (MOVE, 'v_mul_f32_e64 v7, v0, 2.0', READ)),
+    ('median of three with a varying source', (MOVE, 'v_med3_f32 v7, s2, v0, 0.5', READ)),
+    ('median of three of a lane mask', (COMPARE, 'v_med3_f32 v7, s2, 0, 0.5', READ)),
     ('op_sel overwrite', (MOVE, 'v_mul_f32_e64 v7, s2, 2.0 op_sel:[0,0]', READ)),
     ('modified move overwrite', (MOVE, 'v_mov_b32_e32 v7, s2 clamp', READ)),
     ('multi-register read destination', (MOVE, 'v_readfirstlane_b32 s[8:9], v7')),
@@ -142,7 +149,6 @@ REFUSED = [
                                      'v_rcp_f32_e32 v7, v7', READ, 's_endpgm')),
     # A program with branches proves only before its first branch target or terminator (the entry block).
     ('read at the first branch target', (MOVE, 's_cbranch_scc0 label_000C', 's_nop 0', READ, 's_endpgm')),
-    ('read after the first terminator', (MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')),
     ('entry block re-entered by a loop', (MOVE, READ, 's_mov_b32 s2, vcc_lo', 's_cbranch_scc0 label_0000',
                                           's_endpgm')),
     ('exec write in the entry block', (MOVE, 's_and_saveexec_b32 s8, s2', READ, 's_branch label_0010',
@@ -165,6 +171,10 @@ for label, instructions in (('branch after read', (MOVE, READ, 's_branch label_0
 got = run('v_cvt_f32_u32_e32 v7, s3', 'v_rcp_f32_e32 v7, v7', READ, 's_cbranch_scc0 label_0010', 's_endpgm')
 check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7 = U(1.0 / F(v7));', 's9 = v7;'],
       repr(got))
+# Past the entry block the read recomputes the definition instead of copying the VGPR
+# (tests/startup_gfx2hlsl_readfirstlane_recompute_check.py covers that rule).
+got = run(MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')
+check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 = s2;'], repr(got))
 # Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
 EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
 for label, instructions in REFUSED:
