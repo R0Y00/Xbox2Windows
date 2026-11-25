@@ -47,7 +47,7 @@ IMAGE = {
     'offset': 'image_sample_l_o v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D',
     'compare': 'image_sample_c_l v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D',
     'gather': 'image_gather4_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
-    '1darray': 'image_sample_l v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_1D_ARRAY',
+    '1darray': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_1D_ARRAY',
     'a16': 'image_sample_l v[4:7], v[0:1], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D a16',
     'tfe': 'image_sample_l v[4:5], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
     'unorm': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D unorm',
