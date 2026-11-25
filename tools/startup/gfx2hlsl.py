@@ -2631,7 +2631,7 @@ class Stage:
         d = reg_range(ops[0])
         if not d or d[0] != 'v':
             raise Unsupported('%s destination %s' % (base, ops[0]))
-        self.set_v(d[1], 'f32tof16(%s)' % VEC_H1[base].format(self.half_src(ops[1])))
+        self.set_v(d[1], 'f32tof16rne(%s)' % VEC_H1[base].format(self.half_src(ops[1])))
 
     def i64_words(self, tok):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
@@ -3061,7 +3061,7 @@ VEC_F = {
     'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
 # binary16 one-source operations (VOP1, or VOP3 without modifiers): the source is the low half of the operand,
-# the result is rounded to binary16 and written to the low half with the high half cleared, as v_cvt_f16_f32 does.
+# the result is rounded to binary16 (to nearest even, not toward zero as f32tof16 does) and written to the low half with the high half cleared, as v_cvt_f16_f32 does.
 # v_fract_f16 stops at the largest binary16 below one; v_sin/cos take revolutions, as the binary32 forms do.
 VEC_H1 = {
     'v_ceil_f16': 'ceil({0})', 'v_floor_f16': 'floor({0})', 'v_trunc_f16': 'trunc({0})', 'v_rndne_f16': 'round({0})',
@@ -3353,6 +3353,16 @@ class Pipeline:
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
                ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
+               # f32tof16 truncates toward zero on D3D12; the binary16 operations round to nearest even.
+               'uint f32tof16rne(float x) {',
+               '    uint sign = (asuint(x) & 0x80000000u) >> 16;',
+               '    float a = abs(x);',
+               '    if (a != a) return sign | 0x7e00u;',
+               '    if (a >= 65520.0) return sign | 0x7c00u;',
+               '    uint t = f32tof16(a);',
+               '    float below = a - f16tof32(t), above = f16tof32(t + 1u) - a;',
+               '    return sign | ((above < below || (above == below && (t & 1u) != 0u)) ? t + 1u : t);',
+               '}',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'

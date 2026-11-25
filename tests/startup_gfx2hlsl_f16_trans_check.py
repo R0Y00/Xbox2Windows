@@ -52,15 +52,15 @@ def translate(line):
 
 
 for op, template in OPS.items():
-    expected = ['v1 = f32tof16(%s);' % (template % 'f16tof32(v2 & 0xffffu)')]
+    expected = ['v1 = f32tof16rne(%s);' % (template % 'f16tof32(v2 & 0xffffu)')]
     for spelling in (op, op + '_e64'):
         got = translate('%s v1, v2' % spelling)
         check('%s translates to a binary16 round of the low half' % spelling, got == expected, repr(got))
     check('%s with a constant source' % op,
-          translate('%s v1, 0.5' % op) == ['v1 = f32tof16(%s);' % (template % '0.5')], repr(translate('%s v1, 0.5' % op)))
+          translate('%s v1, 0.5' % op) == ['v1 = f32tof16rne(%s);' % (template % '0.5')], repr(translate('%s v1, 0.5' % op)))
     check('%s keeps neg and abs on its source' % op,
           translate('%s v1, -|v2|' % op) ==
-          ['v1 = f32tof16(%s);' % (template % '(-abs(f16tof32(v2 & 0xffffu)))')], repr(translate('%s v1, -|v2|' % op)))
+          ['v1 = f32tof16rne(%s);' % (template % '(-abs(f16tof32(v2 & 0xffffu)))')], repr(translate('%s v1, -|v2|' % op)))
     check('%s refuses a clamp' % op, translate('%s_e64 v1, v2 clamp' % op) == 'refused')
     check('%s refuses a missing source' % op, translate('%s v1' % op) == 'refused')
     check('%s refuses an extra source' % op, translate('%s v1, v2, v3' % op) == 'refused')
