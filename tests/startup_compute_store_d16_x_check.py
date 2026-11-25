@@ -552,6 +552,21 @@ def check_controls():
     finally:
         G.Stage.op_buffer_store_format_d16_x = saved
 
+    # 7. Debug-layer status handling (with and without Windows Graphics Tools).
+    assert _check_debug_layer('backend=hardware debug_layer=enabled\ndebug_errors=0 debug_warnings=0\n', 'unit-ok') == 'debug_errors=0 debug_warnings=0'
+    assert _check_debug_layer('backend=hardware debug_layer=unavailable\n', 'unit-unavail') == 'debug_layer=unavailable'
+    for bad_out in (
+        'backend=hardware debug_layer=enabled\ndebug_errors=1 debug_warnings=0\n',
+        'backend=hardware debug_layer=enabled\n',
+        'backend=hardware\ndebug_errors=0 debug_warnings=0\n',
+    ):
+        try:
+            _check_debug_layer(bad_out, 'unit-fail')
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError('unexpectedly accepted debug output: %r' % (bad_out,))
+
     print('buffer_store_format_d16_x unit, format, bounds, CAS, provenance and refusal checks pass')
 
 
@@ -665,6 +680,15 @@ def run_case(name, dxc, runner, adapter, directory, control=None, uav_words=None
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _check_debug_layer(stdout, label):
+    if 'debug_layer=enabled' in stdout:
+        assert 'debug_errors=0 debug_warnings=0' in stdout, (label, stdout)
+        return 'debug_errors=0 debug_warnings=0'
+    if 'debug_layer=unavailable' in stdout:
+        return 'debug_layer=unavailable'
+    raise AssertionError((label, 'missing debug_layer status', stdout))
+
+
 def check_dispatch(dxc, runner, adapter, control=None):
     runner = str(Path(runner).resolve())
     out = ROOT / 'out'
@@ -683,15 +707,16 @@ def check_dispatch(dxc, runner, adapter, control=None):
             if mutation:
                 if run.returncode != 1 or not any('expected=' in line for line in diagnostics):
                     raise AssertionError('control %s: not rejected (exit %d) %s' % (mutation, run.returncode, run.stderr))
+                suffix = ''
                 if mutation in ('b-short-binding', 'b-tight-host-guard'):
                     assert diagnostics[0].startswith('word=1 '), (mutation, diagnostics)
-                    assert 'debug_errors=0 debug_warnings=0' in run.stdout, (mutation, run.stdout)
-                print('control %s: rejected at %s' % (mutation, diagnostics[0]))
+                    suffix = ' (%s)' % _check_debug_layer(run.stdout, mutation)
+                print('control %s: rejected at %s%s' % (mutation, diagnostics[0], suffix))
             elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:
-                assert 'debug_errors=0 debug_warnings=0' in run.stdout, (name, run.stdout)
-                print('case %s: all %d words match' % (name, WORDS))
+                debug_note = _check_debug_layer(run.stdout, name)
+                print('case %s: all %d words match (%s)' % (name, WORDS, debug_note))
 
         if not control:
             # Case C: same-halfword concurrent contention (256 threads x 4 writes to both halves of dword 0).
@@ -702,7 +727,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
                 return 77
             diagnostics = [line for line in run.stderr.splitlines()
                            if not (adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '))]
-            assert 'debug_errors=0 debug_warnings=0' in run.stdout, run.stdout
+            debug_note = _check_debug_layer(run.stdout, 'C')
             assert 'mismatches=1' in run.stdout, (run.stdout, diagnostics)
             m = re.fullmatch(r'word=0 expected=deadbeef actual=([0-9a-f]{8})', diagnostics[0] if diagnostics else '')
             assert m, (diagnostics, run.stdout)
@@ -710,7 +735,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             lo, hi = actual & 0xffff, (actual >> 16) & 0xffff
             assert lo in CONTENTION_VALID_LO and hi in CONTENTION_VALID_HI, (
                 'case C: atomic CAS contention corrupted word 0: 0x%08x (lo=0x%04x hi=0x%04x)' % (actual, lo, hi))
-            print('case C: atomic CAS contention ok (word0=0x%08x, 319 sentinels untouched)' % actual)
+            print('case C: atomic CAS contention ok (word0=0x%08x, 319 sentinels untouched, %s)' % (actual, debug_note))
     return 0
 
 
