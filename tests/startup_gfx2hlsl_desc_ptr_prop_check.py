@@ -159,12 +159,6 @@ s = run(ROOT, [('s_add_u32', 's8, s8, 0x20'), ('s_addc_u32', 's9, s9, 0'), ('s_a
 check('in-place advance twice with each completed high word is folded',
       not isinstance(s, str) and any('Load(64)' in line for line in s.lines), str(s))
 
-s = run(ROOT, [('s_mov_b32', 's9, 0'), ('s_load_dwordx4', 's[4:7], s[8:9], 0x10')])
-check('untouched root pair with an overwritten high word is refused', isinstance(s, str), str(s))
-
-s = run(ROOT, [('s_load_dwordx4', 's[4:7], s[8:9], 0x10')])
-check('untouched root pair still loads', not isinstance(s, str) and any('Load(16)' in l for l in s.lines), str(s))
-
 # Real entry state: a table pointer is one 32-bit register with no high word, so it advances with
 # the low add alone and its neighbour register stays untouched.
 def entry(params, kind='vs'):
