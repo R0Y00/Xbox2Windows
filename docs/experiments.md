@@ -15751,3 +15751,18 @@ ctest --preset dev --no-tests=error -R '^(pixel_aot_f16_exact_extra_warp|pixel_a
 ```
 
 Linux controls, `form_coverage_check.check_f16_exact_extra_forms`, and Python reference/mutation checks ran locally; LLVM 15 `pixel_aot_binary` round-trips and Windows WARP/hardware D3D12 draws run in CI.
+
+## Startup translator: saturating 32-to-16-bit integer packs (`v_cvt_pk_u16_u32`, `v_cvt_pk_i16_i32`)
+
+`tools/startup/gfx2hlsl.py` lowers the VOP3A-only 32-to-16-bit saturating integer pack pair (`0x36a` / `0x36b`, #1723) via `VEC_U`:
+
+- `v_cvt_pk_u16_u32`: `min({0}, 0xffffu) | (min({1}, 0xffffu) << 16u)` (`S0` clamped to `[0, 65535]` in `[15:0]`, `S1` in `[31:16]`).
+- `v_cvt_pk_i16_i32`: `(asuint(clamp(asint({0}), -32768, 32767)) & 0xffffu) | (asuint(clamp(asint({1}), -32768, 32767)) << 16u)` (`S0` signed-clamped to `[-32768, 32767]` in `[15:0]`, `S1` in `[31:16]`).
+- Both instructions accept VGPRs, SGPRs (`s0..s105`), 32-bit inline constants, and 32-bit literals across `Pipeline` and `ComputePipeline` (including explicit `_e64` spelling), propagate scalar uniformity through `UNIFORM_VALU` for `v_readfirstlane_b32`, require whole-32-bit source definitions (`low16_only=False`), and clear `low16_only_v` on their destination VGPR.
+- `check_encoding` refuses VOP3A source `abs` (`w0[10:8]`), `neg` (`w1[31:29]`), and non-zero unused `src2` (`w1[26:18]`) on the raw words before disassembly; `Stage` refuses `clamp`, `omod`, `op_sel`, printed `|vN|`/`-vN` modifiers, lane-mask sources (`vcc_lo`, `exec_lo`), non-VOP3 spellings (`_e32`, `_sdwa`, `_dpp`), and invalid operand counts or widths.
+
+[`tests/startup_gfx2hlsl_cvt_pk_int16_check.py`](../tests/startup_gfx2hlsl_cvt_pk_int16_check.py) constructs synthetic gfx1013 VOP3A words (no game data), verifies all 676 `(S0, S1)` boundary pairs per opcode against independent Python saturation references, checks LLVM 15 `llvm-mc` / `libLLVM` round-trips in Linux CI, tests `ComputePipeline`, `UNIFORM_VALU`, `low16_only_v`, and encoding/Stage refusal controls, and runs four mutated-HLSL negative controls per opcode (`trunc_lo`, `trunc_hi`, `swap_halves`, and opposite-signedness clamp). On Windows 11 with the D3D12 debug layer enabled (`0` errors, `0` warnings) across both FXC `ps_5_1` and DXC `ps_6_0`, all 16 good draws and 16 mutated-HLSL negative controls matched on Microsoft WARP (`1414:008c`, driver `10.0.26100.9818`) and on an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`).
+
+```powershell
+ctest --test-dir out/build/release --no-tests=error -R "^startup_gfx2hlsl_cvt_pk_int16_(controls|warp|hardware)$" -V
+```
