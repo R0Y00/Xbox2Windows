@@ -209,7 +209,7 @@ struct Fixture {
         const DWORD start = GetTickCount();
         while (!complete(q, index)) {
             if (GetTickCount() - start > completion_timeout_ms) return false;
-            Sleep(1);
+            Sleep(5);
         }
         return true;
     }
@@ -346,7 +346,7 @@ bool worker_starts_at_submit(Fixture& f)
     f.submit(q);
     if (!f.wait(q, 0) || f.hresult(q, 0) != 0 || destination != f.plain) return fail("the retried worker did not run the request");
     const DWORD start = GetTickCount();
-    while (q.fence.signals == 0 && GetTickCount() - start < completion_timeout_ms) Sleep(1);
+    while (q.fence.signals == 0 && GetTickCount() - start < completion_timeout_ms) Sleep(5);
     if (q.fence.signals != 1 || q.fence.value != 7) return fail("the retried worker did not signal the fence");
     return true;
 }
@@ -561,7 +561,7 @@ bool ordered_failure(Fixture& f, bool status_first, int requests, int fail_enque
     if (f.hresult(q, 0) > 0 || (!untouched_bytes(destination) && destination != f.plain))
         return fail("a failed request left partial data or a success-like status");
     const DWORD start = GetTickCount();
-    while (q.fence.signals == 0 && GetTickCount() - start < completion_timeout_ms) Sleep(1);
+    while (q.fence.signals == 0 && GetTickCount() - start < completion_timeout_ms) Sleep(5);
     if (q.fence.signals != 1 || q.fence.value != 7) return fail("the fence was not signaled exactly once");
     return true;
 }
