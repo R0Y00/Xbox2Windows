@@ -35,13 +35,20 @@
 //   XGameGetXboxTitleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgame/functions/xgamegetxboxtitleid?view=gdk-2604
 //   XAsyncGetStatus                     https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus?view=gdk-2604
 //   XTaskQueueCreate                    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuecreate?view=gdk-2604
+//   XTaskQueueDispatch                  https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch
+//   XTaskQueueCloseHandle               https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueclosehandle
 //
 // Async gap: XUserAddAsync and XPackageMountWithUiAsync remain stubs, as do
-// XAsyncGetStatus and XTaskQueueCreate. XGameSaveInitializeProviderAsync is
-// implemented for the one contract this repository can state without GDK
-// headers: it runs the synchronous provider path, completes before it returns,
-// calls the block's callback once on the calling thread, and
-// XGameSaveInitializeProviderResult hands the provider over exactly once. The
+// XAsyncGetStatus. XTaskQueueCreate (Manual/Manual only, else E_NOTIMPL),
+// XTaskQueueDispatch (completion port) and XTaskQueueCloseHandle model one
+// shim-owned manual queue. XGameSaveInitializeProviderAsync is implemented for
+// two queue configurations: no queue, where it completes before it returns and
+// calls the block's callback once on the calling thread; and a live manual queue
+// from XTaskQueueCreate, where it completes before it returns but fires NO
+// callback until XTaskQueueDispatch on the completion port runs it once. Any
+// other non-null queue is refused with E_NOTIMPL before the block or provider
+// capacity is touched. XGameSaveInitializeProviderResult hands the provider over
+// exactly once. The
 // shim reads only the three leading public XAsyncBlock fields (queue, context,
 // callback) and keeps its own state in a side table keyed by the block
 // address, so the remaining opaque bytes of the block are never touched. XPackageMount is documented as a
@@ -80,14 +87,25 @@ struct XGameSaveUpdateStorage;
 struct XPackageMountStorage;
 }
 using XUserHandle = xgameruntime_shim::XUserHandleStorage*;
-struct XTaskQueueHandleStorage;
+// Shim-owned manual task queue. Only the shim creates these, so a queue handle
+// it does not own is never dereferenced.
+struct XTaskQueueHandleStorage {
+    bool live = false;
+};
 using XTaskQueueHandle = XTaskQueueHandleStorage*;
 using XGameSaveProviderHandle = xgameruntime_shim::XGameSaveProviderStorage*;
 using XGameSaveContainerHandle = xgameruntime_shim::XGameSaveContainerStorage*;
 using XGameSaveUpdateHandle = xgameruntime_shim::XGameSaveUpdateStorage*;
 using XPackageMountHandle = xgameruntime_shim::XPackageMountStorage*;
 enum XUserAddOptions : std::uint32_t;
-enum XTaskQueueDispatchMode : std::uint32_t;
+// Public XTaskQueue.h enumerations: Manual is the only mode the shim supports.
+enum XTaskQueueDispatchMode : std::uint32_t {
+    XTaskQueueDispatchMode_Manual = 0,
+    XTaskQueueDispatchMode_ThreadPool = 1,
+    XTaskQueueDispatchMode_SerializedThreadPool = 2,
+    XTaskQueueDispatchMode_Immediate = 3,
+};
+enum XTaskQueuePort : std::uint32_t { XTaskQueuePort_Work = 0, XTaskQueuePort_Completion = 1 };
 
 // Public XSystem.h enumeration. The shim reports Pc because it is a desktop
 // process; the remaining values are named so the ABI and switch sites use the
@@ -180,7 +198,9 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XSystemGetDeviceType, XSystem, XSystemDeviceType, (), implemented_value, (), xsystem_get_device_type) \
     X(XGameGetXboxTitleId, XGame, HRESULT, (std::uint32_t* titleId), implemented_hr, (titleId), xgame_get_xbox_title_id) \
     X(XAsyncGetStatus, XAsync, HRESULT, (XAsyncBlock*, bool), stub, (), stub) \
-    X(XTaskQueueCreate, XTaskQueue, HRESULT, (XTaskQueueDispatchMode, XTaskQueueDispatchMode, XTaskQueueHandle*), stub, (), stub)
+    X(XTaskQueueCreate, XTaskQueue, HRESULT, (XTaskQueueDispatchMode workDispatchMode, XTaskQueueDispatchMode completionDispatchMode, XTaskQueueHandle* queue), implemented_hr, (workDispatchMode, completionDispatchMode, queue), task_queue_create) \
+    X(XTaskQueueDispatch, XTaskQueue, bool, (XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t timeoutInMs), implemented_value, (queue, port, timeoutInMs), task_queue_dispatch) \
+    X(XTaskQueueCloseHandle, XTaskQueue, void, (XTaskQueueHandle queue), implemented_void, (queue), task_queue_close_handle)
 
 namespace xgameruntime_shim {
 constexpr HRESULT not_implemented = static_cast<HRESULT>(0x80004001L);
@@ -214,6 +234,7 @@ constexpr std::size_t blob_bytes_capacity = 1024;
 constexpr std::size_t package_identifier_capacity = 64;
 constexpr std::size_t package_mount_capacity = 4;
 constexpr std::size_t async_capacity = 16;
+constexpr std::size_t task_queue_capacity = 4;
 constexpr wchar_t pls_directory_name[] = L"xbox-recomp-pls";
 constexpr wchar_t synthetic_pls_app_name[] = L"x2w-synthetic-title-0001";
 constexpr wchar_t package_directory_name[] = L"xbox-recomp-packages";
@@ -375,6 +396,10 @@ struct XPackageMountStorage {
 struct ProviderAsyncSlot {
     bool live = false;
     bool completed = false;
+    // Set while the callback waits for XTaskQueueDispatch on the block's manual queue.
+    bool callback_pending = false;
+    std::uint64_t order = 0;
+    XTaskQueueHandle queue = nullptr;
     const XAsyncBlock* block = nullptr;
     HRESULT status = S_OK;
     XGameSaveProviderHandle provider = nullptr;
@@ -393,6 +418,8 @@ struct RuntimeState {
     std::array<XGameSaveUpdateStorage, update_capacity> updates{};
     std::array<XPackageMountStorage, package_mount_capacity> package_mounts{};
     std::array<ProviderAsyncSlot, async_capacity> provider_asyncs{};
+    std::array<XTaskQueueHandleStorage, task_queue_capacity> task_queues{};
+    std::uint64_t next_async_order = 1;
 };
 
 RuntimeState runtime_state;
@@ -814,13 +841,34 @@ ProviderAsyncSlot* find_provider_async(const XAsyncBlock* block) noexcept
     return nullptr;
 }
 
-// Argument errors come back from the call itself, like the synchronous path,
-// and consume nothing. A started operation always completes before this returns.
+XTaskQueueHandle find_live_task_queue(void* handle) noexcept
+{
+    for (auto& queue : runtime_state.task_queues) {
+        if (queue.live && &queue == handle) return &queue;
+    }
+    return nullptr;
+}
+
+// Only two queue configurations are recognized: no queue (the callback runs
+// inline on the caller's stack) and a live manual queue made by XTaskQueueCreate
+// in this shim (the callback waits for XTaskQueueDispatch on the completion
+// port). Any other queue value is refused with E_NOTIMPL before anything is
+// consumed. Other argument errors come back from the call itself, like the
+// synchronous path, and consume nothing. A started operation always completes
+// before this returns.
 HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const char* configuration_id,
                                             bool sync_on_demand, XAsyncBlock* async_block) noexcept
 {
     if (!async_block) return E_INVALIDARG;
     AcquireSRWLockExclusive(&runtime_state.lock);
+    XTaskQueueHandle queue = nullptr;
+    if (async_block->queue) {
+        queue = find_live_task_queue(async_block->queue);
+        if (!queue) {
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return not_implemented;
+        }
+    }
     if (find_provider_async(async_block)) {
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return e_illegal_state_change;
@@ -839,6 +887,7 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
     *reserved = ProviderAsyncSlot{};
     reserved->live = true;
     reserved->block = async_block;
+    reserved->queue = queue;
     ReleaseSRWLockExclusive(&runtime_state.lock);
 
     XGameSaveProviderHandle provider = nullptr;
@@ -854,8 +903,13 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
     reserved->status = status;
     reserved->completed = true;
     XAsyncCompletionRoutine* const callback = async_block->callback;
+    const bool defer = queue && callback;
+    if (defer) {
+        reserved->callback_pending = true;
+        reserved->order = runtime_state.next_async_order++;
+    }
     ReleaseSRWLockExclusive(&runtime_state.lock);
-    if (callback) callback(async_block);
+    if (!defer && callback) callback(async_block);
     return S_OK;
 }
 
@@ -880,6 +934,72 @@ HRESULT game_save_initialize_provider_result(XAsyncBlock* async_block,
     *slot = ProviderAsyncSlot{};
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return status;
+}
+
+HRESULT task_queue_create(XTaskQueueDispatchMode work_mode, XTaskQueueDispatchMode completion_mode,
+                          XTaskQueueHandle* queue) noexcept
+{
+    if (!queue) return E_POINTER;
+    *queue = nullptr;
+    if (work_mode != XTaskQueueDispatchMode_Manual || completion_mode != XTaskQueueDispatchMode_Manual) {
+        return not_implemented;
+    }
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    for (auto& slot : runtime_state.task_queues) {
+        if (!slot.live) {
+            slot.live = true;
+            *queue = &slot;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return E_OUTOFMEMORY;
+}
+
+// Runs at most one waiting completion callback, oldest first, on the calling
+// thread, and reports whether it ran one. The work port never holds anything.
+bool task_queue_dispatch(XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t) noexcept
+{
+    if (port != XTaskQueuePort_Completion) return false;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    if (!find_live_task_queue(queue)) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return false;
+    }
+    ProviderAsyncSlot* next = nullptr;
+    for (auto& slot : runtime_state.provider_asyncs) {
+        if (slot.live && slot.callback_pending && slot.queue == queue &&
+            (!next || slot.order < next->order)) {
+            next = &slot;
+        }
+    }
+    if (!next) {
+        ReleaseSRWLockExclusive(&runtime_state.lock);
+        return false;
+    }
+    next->callback_pending = false;
+    XAsyncBlock* const block = const_cast<XAsyncBlock*>(next->block);
+    XAsyncCompletionRoutine* const callback = block->callback;
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    if (callback) callback(block);
+    return true;
+}
+
+// A queue with callbacks still waiting stays alive, so they are never stranded.
+HRESULT task_queue_close_handle(XTaskQueueHandle queue) noexcept
+{
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    HRESULT result = E_INVALIDARG;
+    if (find_live_task_queue(queue)) {
+        result = S_OK;
+        for (const auto& slot : runtime_state.provider_asyncs) {
+            if (slot.live && slot.callback_pending && slot.queue == queue) result = e_illegal_state_change;
+        }
+        if (result == S_OK) queue->live = false;
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return result;
 }
 
 HRESULT game_save_create_container(XGameSaveProviderHandle provider, const char* container_name,

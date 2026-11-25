@@ -60,6 +60,15 @@ using CreateContainer = HRESULT(WINAPI*)(XGameSaveProviderHandle, const char*,
                                         XGameSaveContainerHandle*);
 using CloseProvider = void(WINAPI*)(XGameSaveProviderHandle);
 using CloseContainer = void(WINAPI*)(XGameSaveContainerHandle);
+struct XTaskQueueHandleStorage;
+using XTaskQueueHandle = XTaskQueueHandleStorage*;
+constexpr std::uint32_t mode_manual = 0;
+constexpr std::uint32_t mode_thread_pool = 1;
+constexpr std::uint32_t port_work = 0;
+constexpr std::uint32_t port_completion = 1;
+using QueueCreate = HRESULT(WINAPI*)(std::uint32_t, std::uint32_t, XTaskQueueHandle*);
+using QueueDispatch = bool(WINAPI*)(XTaskQueueHandle, std::uint32_t, std::uint32_t);
+using QueueClose = void(WINAPI*)(XTaskQueueHandle);
 using GetLog = std::size_t(WINAPI*)(XGameRuntimeShimLogEntry*, std::size_t);
 using ClearLog = void(WINAPI*)();
 
@@ -173,6 +182,9 @@ struct Api {
     CreateContainer create_container = nullptr;
     CloseProvider close_provider = nullptr;
     CloseContainer close_container = nullptr;
+    QueueCreate queue_create = nullptr;
+    QueueDispatch queue_dispatch = nullptr;
+    QueueClose queue_close = nullptr;
 };
 
 bool load_api(HMODULE module, Api& api)
@@ -183,7 +195,10 @@ bool load_api(HMODULE module, Api& api)
            find_proc(module, "XGameSaveInitializeProviderResult", api.initialize_result) &&
            find_proc(module, "XGameSaveCreateContainer", api.create_container) &&
            find_proc(module, "XGameSaveCloseProvider", api.close_provider) &&
-           find_proc(module, "XGameSaveCloseContainer", api.close_container);
+           find_proc(module, "XGameSaveCloseContainer", api.close_container) &&
+           find_proc(module, "XTaskQueueCreate", api.queue_create) &&
+           find_proc(module, "XTaskQueueDispatch", api.queue_dispatch) &&
+           find_proc(module, "XTaskQueueCloseHandle", api.queue_close);
 }
 
 constexpr char configuration_id[] = "synthetic-scid";
@@ -345,6 +360,98 @@ bool log_checks(HMODULE module)
                   "log carries the positive and negative async calls");
 }
 
+// Fills every free provider slot, then returns how many fit.
+std::size_t fill_providers(const Api& api, XUserHandle user, std::array<XAsyncBlock, 8>& blocks,
+                           std::array<XGameSaveProviderHandle, 8>& providers, CallbackProbe& probe)
+{
+    std::size_t filled = 0;
+    for (; filled < blocks.size(); ++filled) {
+        blocks[filled] = make_block(&probe, nullptr);
+        if (api.initialize_async(user, configuration_id, false, &blocks[filled]) != S_OK) break;
+        api.initialize_result(&blocks[filled], &providers[filled]);
+    }
+    return filled;
+}
+
+// Manual completion port: no callback before XTaskQueueDispatch, one after, and
+// the callback claims the provider. The early-callback control is a block with no
+// queue: it fires inline, so the same "zero before dispatch" check must catch it.
+bool manual_queue(const Api& api, XUserHandle user)
+{
+    XTaskQueueHandle queue = nullptr;
+    bool ok = expect_hr(api.queue_create(mode_manual, mode_manual, &queue), S_OK, "create manual queue");
+    if (!ok || !queue) return false;
+    CallbackProbe probe;
+    probe.result_proc = api.initialize_result;
+    XAsyncBlock block = make_block(&probe, claim_in_callback);
+    block.queue = queue;
+    ok = expect_hr(api.initialize_async(user, configuration_id, false, &block), S_OK,
+                   "start on manual queue") && ok;
+    ok = expect(probe.calls == 0, "zero callbacks before completion-port dispatch") && ok;
+    ok = expect(!api.queue_dispatch(queue, port_work, 0) && probe.calls == 0,
+                "work port dispatch runs nothing") && ok;
+    ok = expect(opaque_untouched(block), "opaque block bytes untouched") && ok;
+    ok = expect(api.queue_dispatch(queue, port_completion, 0), "completion dispatch ran a callback") && ok;
+    ok = expect(probe.calls == 1 && probe.seen == &block, "one callback after dispatch") && ok;
+    ok = expect_hr(probe.result_status, S_OK, "callback claimed the provider") && ok;
+    ok = expect(probe.result_inside != nullptr, "callback got a provider") && ok;
+    ok = expect(!api.queue_dispatch(queue, port_completion, 0) && probe.calls == 1,
+                "second dispatch runs nothing") && ok;
+    if (probe.result_inside) api.close_provider(probe.result_inside);
+
+    // Negative control: a block without a queue calls back before any dispatch.
+    CallbackProbe early;
+    XAsyncBlock inline_block = make_block(&early, record_completion);
+    ok = expect_hr(api.initialize_async(user, configuration_id, false, &inline_block), S_OK,
+                   "control start") && ok;
+    ok = expect(early.calls == 1, "control: early callback is visible to the zero-callback check") && ok;
+    XGameSaveProviderHandle held = nullptr;
+    api.initialize_result(&inline_block, &held);
+    if (held) api.close_provider(held);
+
+    // A pending callback keeps its queue open.
+    CallbackProbe pending;
+    XAsyncBlock pending_block = make_block(&pending, record_completion);
+    pending_block.queue = queue;
+    ok = expect_hr(api.initialize_async(user, configuration_id, false, &pending_block), S_OK,
+                   "pending start") && ok;
+    api.queue_close(queue);
+    ok = expect(api.queue_dispatch(queue, port_completion, 0) && pending.calls == 1,
+                "queue with a pending callback survives close") && ok;
+    XGameSaveProviderHandle pending_provider = nullptr;
+    api.initialize_result(&pending_block, &pending_provider);
+    if (pending_provider) api.close_provider(pending_provider);
+    api.queue_close(queue);
+    return ok;
+}
+
+// An unsupported queue is refused with E_NOTIMPL, and block and provider
+// capacity stay untouched: every slot is still usable afterwards.
+bool unsupported_queue(const Api& api, XUserHandle user)
+{
+    XTaskQueueHandle none = nullptr;
+    bool ok = expect_hr(api.queue_create(mode_thread_pool, mode_thread_pool, &none), not_implemented,
+                        "thread-pool queue is unsupported") && expect(none == nullptr, "no handle returned");
+    int stray = 0;
+    CallbackProbe probe;
+    XAsyncBlock block = make_block(&probe, record_completion);
+    block.queue = &stray;
+    ok = expect_hr(api.initialize_async(user, configuration_id, false, &block), not_implemented,
+                   "unknown queue refused") && ok;
+    ok = expect(probe.calls == 0 && opaque_untouched(block), "refusal fires nothing and writes nothing") && ok;
+    XGameSaveProviderHandle none_provider = nullptr;
+    ok = expect_hr(api.initialize_result(&block, &none_provider), E_INVALIDARG,
+                   "refusal left no async state") && ok;
+    // Capacity untouched: the whole provider pool is still free after many refusals.
+    for (int i = 0; i < 20; ++i) api.initialize_async(user, configuration_id, false, &block);
+    std::array<XAsyncBlock, 8> blocks{};
+    std::array<XGameSaveProviderHandle, 8> providers{};
+    const std::size_t filled = fill_providers(api, user, blocks, providers, probe);
+    ok = expect(filled == 4, "all four provider slots still free after refusals") && ok;
+    for (std::size_t i = 0; i < filled; ++i) api.close_provider(providers[i]);
+    return ok;
+}
+
 bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* normal_shim_dir)
 {
     if (!fixture_path_checks(dll_path, fixture_dir, normal_shim_dir)) return false;
@@ -362,6 +469,7 @@ bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* nor
         passed = expect_hr(api.find_user(synthetic_user_id, &user), S_OK, "find user") &&
                  positive_completion(api, user) && null_callback_and_callback_claim(api, user) &&
                  argument_errors(api, user) && reuse_and_capacity(api, user) &&
+                 manual_queue(api, user) && unsupported_queue(api, user) &&
                  log_checks(module);
         if (user) api.close_user(user);
     }

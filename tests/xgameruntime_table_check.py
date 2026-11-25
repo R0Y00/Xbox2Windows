@@ -41,6 +41,9 @@ REQUIRED_IMPLEMENTED_FUNCTIONS = {
     "XGameGetXboxTitleId",
     "XGameSaveInitializeProviderAsync",
     "XGameSaveInitializeProviderResult",
+    "XTaskQueueCreate",
+    "XTaskQueueDispatch",
+    "XTaskQueueCloseHandle",
 }
 REQUIRED_STUBS = {
     "XUserAddAsync",
