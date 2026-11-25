@@ -267,6 +267,7 @@ int main(int argc, char** argv)
     if (!readable_memory || !gone_memory) return 30;
     for (std::size_t i = 0; i < title_bytes / sizeof(std::uint32_t); ++i) readable_memory[i] = title_texel;
     VirtualFree(gone_memory, title_bytes, MEM_DECOMMIT);
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     const D3D12_RESOURCE_DESC title_desc = texture(4, DXGI_FORMAT_R8G8B8A8_UNORM, 1, none);
     void *title_readable = nullptr, *title_gone = nullptr;
     ComPtr<ID3D12Resource> dest_readable, dest_gone;
