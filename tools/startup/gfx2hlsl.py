@@ -447,6 +447,7 @@ class Stage:
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
+    byte_float_v = ()         # VGPRs proven to hold +0.0 or an integer in 1..255 (v_cvt_f32_ubyte0..3 result)
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -615,7 +616,8 @@ class Stage:
             self.low16_only_v.discard(n)
 
     def set_v(self, n, expr, *, low16_only=False):
-        getattr(self, 'byte_float_v', set()).discard(n)
+        if self.byte_float_v:
+            self.byte_float_v.discard(n)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
         if low16_only:
@@ -941,7 +943,11 @@ class Stage:
             if (base.startswith('v_cvt_f32_ubyte') and not mods and self.exec_known and
                     not getattr(self, 'has_branches', True)):
                 # The whole register now holds float(0..255), exactly +0.0 or an integer in 1..255, until the next write.
-                self.__dict__.setdefault('byte_float_v', set()).add(dst)
+                # Every VGPR write goes through set_v, which drops the proof; a path writing a VGPR without set_v
+                # would have to drop it too.
+                if not isinstance(self.byte_float_v, set):
+                    self.byte_float_v = set()
+                self.byte_float_v.add(dst)
             return None
         if base in VEC_U:
             arity, text = VEC_U[base]
@@ -1973,7 +1979,7 @@ class Stage:
             src = reg_range(ops[1])
             if src[0] != 'v' or src[1] != src[2]:
                 raise Unsupported('v_cvt_pk_u8_f32 source %s' % ops[1])
-            if src[1] not in getattr(self, 'byte_float_v', ()):
+            if src[1] not in self.byte_float_v:
                 if not getattr(getattr(self, 'pipe', None), 'pk_u8_s0_contract', False):
                     raise Unsupported('v_cvt_pk_u8_f32 source %s is not proven to be +0.0 or an integer in 1..255'
                                       % ops[1])
