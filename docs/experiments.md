@@ -7273,6 +7273,13 @@ following valid draw must pass. The fixture checks each status in order and
 checks the process exit code. This leaves four device creations for the
 predicate groups in place of 21, without changing the number of DXC calls.
 
+`offscreen_check <backend> --check-pixel-pairs <shader> <case> [<shader> <case> ...]`
+runs different compiled pixel shaders on one D3D12 device. Each pair reports
+its own indexed status and names both files on stderr. A mismatch or error
+sets the process exit code to 1. The remaining pairs still report a status.
+Run `ctest --preset dev --no-tests=error -R '^pixel_batch_pairs_(hardware|warp)$' -V`
+to compare two shaders with isolated draws and exercise mismatch and missing-file controls.
+
 The 32-bit integer, 16-bit integer and SDWA predicate draws use the same
 runner, one batch per compiled group, with the same references. The
 signed-against-unsigned control of the first `i32` e32 group and the
