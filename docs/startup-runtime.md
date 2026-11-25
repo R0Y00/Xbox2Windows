@@ -397,6 +397,25 @@ draws from the untouched entry. It then publishes a supported 1-mip R8 texture a
 expects one counted and named BC1 shape, its line past the limit, one write line for the R8 entry, one
 token null with zero words, and the R8 texels. The control publishes the supported R8 texture in place of the BC1 one and must fail.
 
+### Per-reason refusal census per pipeline key
+
+[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) tracks every distinct
+`(key, reason)` refusal pair separately instead of overwriting earlier reasons on the same key with the
+last refusal:
+
+- Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
+  call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
+  `total` and `overflow calls` without unbounded allocation.
+- `report(emit, true)` skips emission when nothing changed since the previous periodic report and emits
+  the summary line plus only the `(key, reason)` entries whose counts grew; `report(emit, false)`
+  prints the full table without hiding the next periodic delta.
+
+Check without a device via
+`ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep_(last|first)_control)?$' -V`:
+the pass run verifies interleaved reasons across two keys, detail limits, overflow accounting and delta
+reports; the `keep-last` and `keep-first` negative controls each keep only one reason per key, report
+both expected reasons and counts in their mismatch output, and are marked `WILL_FAIL`.
+
 ## Root constant buffer views
 
 Command-list slot 42 (desktop `SetGraphicsRootConstantBufferView` plus four) records the title address for a root

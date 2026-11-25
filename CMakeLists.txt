@@ -1514,6 +1514,17 @@ add_executable(startup_memory_srv_census_check tests/startup_memory_srv_census_c
 target_include_directories(startup_memory_srv_census_check PRIVATE src)
 target_compile_features(startup_memory_srv_census_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_census COMMAND startup_memory_srv_census_check)
+# Bounded per-(key, reason) refusal census (src/startup_stubs/per_reason_refusal_census.h), without a device.
+# Both mutated controls keep only one reason per key and must fail.
+add_executable(startup_per_reason_refusal_census_check tests/startup_per_reason_refusal_census_check.cpp)
+target_include_directories(startup_per_reason_refusal_census_check PRIVATE src)
+target_compile_features(startup_per_reason_refusal_census_check PRIVATE cxx_std_17)
+add_test(NAME startup_per_reason_refusal_census COMMAND startup_per_reason_refusal_census_check)
+foreach(mutation IN ITEMS keep-last keep-first)
+    add_test(NAME startup_per_reason_refusal_census_${mutation}_control
+        COMMAND startup_per_reason_refusal_census_check --mutate ${mutation})
+    set_tests_properties(startup_per_reason_refusal_census_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 add_executable(startup_heap_indexed_root_check tests/startup_heap_indexed_root_check.cpp)
 target_include_directories(startup_heap_indexed_root_check PRIVATE src)
 target_compile_features(startup_heap_indexed_root_check PRIVATE cxx_std_17)
