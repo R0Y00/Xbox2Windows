@@ -128,6 +128,11 @@ def main():
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
         return 2
     asserts_seen = {}
+    # X2W_NOP_SOFT_ASSERTS=1: after the first hit of a main-image int3 that is continued, replace the
+    # trap byte with NOP. DBG_CONTINUE already bypasses the title's handler, so the visible behavior is
+    # unchanged, but a long mapping that traps once per chunk then runs at native speed.
+    nop_soft_asserts = os.environ.get("X2W_NOP_SOFT_ASSERTS") == "1"
+    nop_sites = {}
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
     host_cpu_sites = {}
@@ -759,6 +764,8 @@ def main():
                   and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
                   and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
+                if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
+                    nop_sites[ex_addr] = 1
                 status = DBG_CONTINUE  # rip is already past the int3
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
                                                   main_base <= ex_addr < main_base + 0x10000000):
@@ -870,6 +877,8 @@ def main():
         print("  host-cpu sites rewritten: " + ", ".join(f"{name} x{n}" for name, n in sorted(host_cpu_sites.items())))
     if host_cpu_resumed:
         print(f"  host-cpu threads resumed at a site another thread had rewritten: {len(host_cpu_resumed)}")
+    if nop_sites:
+        print("  soft asserts NOP'd: " + ", ".join(where(addr) for addr in nop_sites))
     bink_report()
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
