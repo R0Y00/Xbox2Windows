@@ -2694,6 +2694,81 @@ class Stage:
 
     def op_v_ashrrev_i64(self, ops, mods):
         self.shift64(ops, mods, 'shr64i')
+    def f64_source(self, tok):
+        """double expression of a 64-bit float source: a VGPR/SGPR pair or an inline constant, with neg/abs."""
+        neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+        if neg:
+            tok = tok[1:]
+        absolute = tok.startswith('|') and tok.endswith('|') and len(tok) > 2
+        if absolute:
+            tok = tok[1:-1]
+        pair = reg_range(tok)
+        if pair:
+            low, high = self.i64_words(tok)
+            text = 'asdouble(%s, %s)' % (low, high)
+        elif tok in FLOATS and tok != '0.15915494':
+            text = repr(float(FLOATS[tok]))
+        elif tok == '0':
+            text = '0.0'
+        else:
+            raise Unsupported('64-bit float source %s' % tok)
+        if absolute:
+            text = 'abs(%s)' % text
+        return '(-%s)' % text if neg else text
+
+    def f64_pair_destination(self, name, tok):
+        dst = reg_range(tok)
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1 or dst[2] > 255:
+            raise Unsupported('%s destination %s' % (name, tok))
+        return dst[1], dst[2]
+
+    def f64_op(self, name, ops, mods, arity, text):
+        if mods:
+            raise Unsupported('%s with %s' % (name, mods))
+        if len(ops) != arity + 1:
+            raise Unsupported('%s with %d operands, expected %d' % (name, len(ops), arity + 1))
+        lo, hi = self.f64_pair_destination(name, ops[0])
+        value = text.format(*[self.f64_source(o) for o in ops[1:]])
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(lo)
+            self.uniform_v.discard(hi)
+        self.used_v.update((lo, hi))
+        body = '{ uint lo, hi; asuint(%s, lo, hi); v%d = lo; v%d = hi; }' % (value, lo, hi)
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
+    def op_v_add_f64(self, ops, mods):
+        self.f64_op('v_add_f64', ops, mods, 2, '{0} + {1}')
+
+    def op_v_mul_f64(self, ops, mods):
+        self.f64_op('v_mul_f64', ops, mods, 2, '{0} * {1}')
+
+    def op_v_fma_f64(self, ops, mods):
+        self.f64_op('v_fma_f64', ops, mods, 3, 'fma({0}, {1}, {2})')
+
+    def op_v_cvt_f32_f64(self, ops, mods):
+        if mods:
+            raise Unsupported('v_cvt_f32_f64 with %s' % (mods,))
+        if len(ops) != 2:
+            raise Unsupported('v_cvt_f32_f64 with %d operands, expected 2' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('v_cvt_f32_f64 destination %s' % ops[0])
+        self.set_v(dst[1], 'asuint((float)%s)' % self.f64_source(ops[1]))
+
+    def op_v_cvt_f64_f32(self, ops, mods):
+        if mods:
+            raise Unsupported('v_cvt_f64_f32 with %s' % (mods,))
+        if len(ops) != 2:
+            raise Unsupported('v_cvt_f64_f32 with %d operands, expected 2' % len(ops))
+        lo, hi = self.f64_pair_destination('v_cvt_f64_f32', ops[0])
+        value = 'double(%s)' % self.f(ops[1])
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(lo)
+            self.uniform_v.discard(hi)
+        self.used_v.update((lo, hi))
+        body = '{ uint lo, hi; asuint(%s, lo, hi); v%d = lo; v%d = hi; }' % (value, lo, hi)
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 

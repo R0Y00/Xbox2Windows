@@ -2540,6 +2540,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The 64-bit vector shifts (#1815).
     add_test(NAME startup_gfx2hlsl_b64_shift COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_b64_shift_check.py")
+    # The 64-bit float ALU slice: v_add_f64, v_mul_f64, v_fma_f64 and the f32/f64 conversions (#1723).
+    add_test(NAME startup_gfx2hlsl_f64_alu COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f64_alu_check.py")
     # The scalar shift-and-add forms s_lshl1..4_add_u32 (Run 20 census #16).
     add_test(NAME startup_gfx2hlsl_s_lshl_add COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_lshl_add_check.py")
