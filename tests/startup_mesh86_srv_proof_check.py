@@ -8,6 +8,29 @@ import tempfile
 from startup_indirect_mesh_cache_check import mesh86_cache, source_envelope
 
 
+def check_load_count():
+    mesh_dump = """; Resource Bindings:
+;
+; Name Type Format Dim ID HLSL Bind Count
+; ---------------------------------------
+; source texture byte r/o T0 t0 1
+
+%1 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 0, i32 0, i1 false)
+"""
+    # Both loads individually match the one-DWORD form and use the same handle.
+    load = ('%{result} = call %dx.types.ResRet.i32 @dx.op.rawBufferLoad.i32'
+            '(i32 139, %dx.types.Handle %1, i32 0, i32 undef, i8 1, i32 4)\n')
+    one_load = mesh_dump + load.format(result=2)
+    assert mesh86_cache.prove_mesh_root_srv(one_load, '') == 4
+    try:
+        mesh86_cache.prove_mesh_root_srv(one_load + load.format(result=3), '')
+    except ValueError as error:
+        assert str(error) == 'expected one DWORD load from the verified SRV handle', str(error)
+    else:
+        raise AssertionError('accepted two DWORD loads from the verified SRV handle')
+    print('accepted one DWORD load and rejected two loads from the same SRV handle')
+
+
 def main(dxc, work):
     original = Path(__file__).with_name('xmem_mesh_root_srv.hlsl').read_text(encoding='utf-8')
 
@@ -54,5 +77,7 @@ def main(dxc, work):
 
 
 if __name__ == '__main__':
-    with tempfile.TemporaryDirectory(prefix='mesh86-srv-proof-', dir=sys.argv[2]) as directory:
-        main(sys.argv[1], Path(directory))
+    check_load_count()
+    if len(sys.argv) > 1:
+        with tempfile.TemporaryDirectory(prefix='mesh86-srv-proof-', dir=sys.argv[2]) as directory:
+            main(sys.argv[1], Path(directory))

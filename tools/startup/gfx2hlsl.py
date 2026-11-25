@@ -2073,9 +2073,14 @@ class Stage:
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add(desc_key(own))
-                    # The word keeps its descriptor identity for loads; an exact-word check (unmodified_descriptor)
-                    # sees the mark.
-                    self.sym[d] = own[:4] + ('modified',)
+                    # The word keeps its descriptor identity for loads; the store check (store_descriptor) sees the
+                    # mark. In a compute stage, clearing the stride field of dword 1 (bits 29:16, keeping the base
+                    # address bits 15:0 and bits 31:30) is marked on its own: a raw byte-address store accepts it.
+                    stride0 = (getattr(self, 'kind', None) == 'cs' and base == 's_and_b32' and len(own) == 4
+                               and own[3] % 4 == 1 and sorted(srcs) == sorted([dname, '0xc000ffff']))
+                    self.sym[d] = own[:4] + ('stride0' if stride0 else 'modified',)
+                    if not stride0:
+                        getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
                 else:
                     self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
             else:
@@ -2588,6 +2593,24 @@ class Stage:
         self.emit('a = (%s%d) & 0xfffffffcu;' % (soffset, offset) if soffset else 'a = %d;' % offset)
         self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
 
+    def store_descriptor(self, tok, words, what, stride0_ok=False):
+        """Resource key of a store's descriptor operand: all its words must still be the loaded words of one
+        descriptor at a fixed table offset. A moved, overwritten or modified word (stride, num_records, format)
+        would change what the store does. With stride0_ok (a raw byte-address store), dword 1 may carry a cleared
+        stride field: that is the raw descriptor such a store already assumes."""
+        rsrc = reg_range(tok)
+        first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == words - 1 else None
+        if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
+            raise Unsupported('%s through %s holding %s' % (what, tok, first))
+        key = desc_key(first)
+        def word_ok(k):
+            sym, want = self.sym.get(rsrc[1] + k), first[:3] + (first[3] + k,)
+            return sym == want or (stride0_ok and k == 1 and sym == want + ('stride0',))
+        if (not all(word_ok(k) for k in range(words)) or key in getattr(self.pipe, 'other_modified', ())
+                or (key in self.pipe.modified and not stride0_ok)):
+            raise Unsupported('%s through a modified descriptor' % what)
+        return key
+
     def op_buffer_store_dword(self, ops, mods, count=1):
         if self.kind == 'vs':
             return self.op_buffer_store_vs(ops, mods, count)
@@ -2610,16 +2633,7 @@ class Stage:
             raise Unsupported('buffer store data %s' % ops[0])
         if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
             raise Unsupported('buffer store vaddr %s for offen' % ops[1])
-        # All four words must still be the loaded words of one descriptor at a fixed table offset: a moved,
-        # overwritten or modified word (stride, num_records) would change what the store does.
-        rsrc = reg_range(ops[2])
-        first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 3 else None
-        if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
-            raise Unsupported('buffer store through %s holding %s' % (ops[2], first))
-        if (any(self.sym.get(rsrc[1] + k) != first[:3] + (first[3] + k,) for k in range(4))
-                or desc_key(first) in self.pipe.modified):
-            raise Unsupported('buffer store through a modified descriptor')
-        key = desc_key(first)
+        key = self.store_descriptor(ops[2], 4, 'buffer store', stride0_ok=True)
         terms = [self.u(ops[1])]
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -2739,6 +2753,18 @@ class Stage:
                 if self.kind != 'ps' or not self.exec_known or len(self.blocks) > 0:
                     raise Unsupported('image_sample_b needs implicit derivatives: pixel stage, entry mask, no branches')
                 bias, cs = cs[0], cs[1:]
+        if how == 'get_lod':
+            # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
+            # (Mesa nir_texop_lod, which ACO emits as image_get_lod; GLSL textureQueryLod x/y). Only the 2D form with
+            # two address registers and dmask 0x1-0x3 is lowered; the cache-policy bits are the only other modifiers.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_get_lod modifier %s' % m)
+            if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
+                raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
+            # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
+            if not self.exec_known or len(self.blocks) > 0:
+                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage, entry mask, no branches')
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):
@@ -2796,6 +2822,12 @@ class Stage:
                 # from the heap or from a register is refused: its limits and bias cannot be shown to be irrelevant.
                 words = self.sample_b_sampler(heap, words)
                 smp = self.pipe.sampler(tuple(words), lod_limits=True)
+            elif how == 'get_lod':
+                # The clamped result depends on the sampler's MIN_LOD, MAX_LOD and bias, so the sampler must be a
+                # constant descriptor under the same validation as image_sample_b, with its limits carried.
+                if heap or not words or self.default_sampler_words(words):
+                    raise Unsupported('image_get_lod with a sampler that is not constant (LOD limits and bias unknown)')
+                smp = self.pipe.sampler(tuple(self.lod_sampler_words('image_get_lod', words)), lod_limits=True)
             elif how in ('sample', 'l', 'lz') and (heap or (words and self.default_sampler_words(words))):
                 # A heap sampler, or the fixed default that stands in for one, keeps its unbounded static LOD range: the
                 # descriptor is read at run time, so its MIN_LOD, MAX_LOD and bias are not validated here (#2221).
@@ -2828,6 +2860,11 @@ class Stage:
                 # computed"). The sampler's LOD limits are carried by the smpl line; its LOD bias is refused in
                 # sample_b_sampler.
                 call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
+            elif how == 'get_lod':
+                # HLSL CalculateLevelOfDetail (clamped) and CalculateLevelOfDetailUnclamped (SM 4.1+). Which clamps
+                # each side applies besides the sampler's (the view's mip range) is assumed to agree.
+                call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
+                    tex, smp, uv, tex, smp, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
@@ -2967,6 +3004,9 @@ class Stage:
 
     def op_image_sample_b(self, ops, mods):
         self.image(ops, mods, 'b')
+
+    def op_image_get_lod(self, ops, mods):
+        self.image(ops, mods, 'get_lod')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
@@ -4496,7 +4536,7 @@ class ComputePipeline(Pipeline):
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
-        self.notes, self.modified = set(), set()
+        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: anything but a stride clear
         self.lod_unvalidated = set()
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
