@@ -81,9 +81,9 @@ ACCEPTED = [
      ['v7 = U(1.0 / F(s2));']),
     # The clamp to [0, 0.5] of a scalar, as compiled shaders write it.
     ('median of three', ('v_med3_f32 v7, s2, 0, 0.5',),
-     ['v7 = U(med3(F(s2), F(0x00000000u), 0.5));']),
+     ['v7 = U(med3_32(F(s2), F(0x00000000u), 0.5));']),
     ('median of three scalar sources', ('v_med3_f32 v7, s2, -s3, |s2| clamp',),
-     ['v7 = U(saturate(med3(F(s2), (-F(s3)), abs(F(s2)))));']),
+     ['v7 = U(saturate(med3_32(F(s2), (-F(s3)), abs(F(s2)))));']),
     ('move', ('v_mov_b32_e32 v7, s2',), ['v7 = s2;']),
     ('literal move', ('v_mov_b32_e32 v7, 0x1234',), ['v7 = 0x00001234u;']),
     ('chain with an in-place write', ('v_mul_f32_e64 v7, s2, 2.0', 'v_cvt_u32_f32_e32 v7, v7'),
