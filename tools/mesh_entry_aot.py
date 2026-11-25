@@ -8,9 +8,12 @@ remain GPU inputs. Only forward control flow decided by static values is accepte
 
 import argparse
 import json
+import os
+from pathlib import Path
 import re
 import struct
-from pathlib import Path
+import tempfile
+import zlib
 
 from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
 from pixel_aot import MESH_WAVE64, container_code, disassemble
@@ -304,7 +307,7 @@ class Wave:
             )
         return [f"({cond.expr} ? {t} : {f})" for t, f in zip(*arms)]
 
-    def join_arms(self, decoded, expressions, jumps, pc, offset, target_offset, cond):
+    def join_arms(self, decoded, expressions, jumps, pc, target_offset, cond, *, branch_on_true):
         """Run both arms of a uniform branch on a constant predicate and merge them.
 
         Only scalar ALU and loads may appear inside an arm; the arms write no
@@ -335,6 +338,9 @@ class Wave:
             if (self.exec, self.vcc, self.m0) != before:
                 raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
             outcomes.append((self.s, self.pending, self.pending_v))
+        # Outcomes are in fall-through, taken order. Select needs true, false.
+        if branch_on_true:
+            outcomes.reverse()
         (true_s, true_p, true_v), (false_s, false_p, false_v) = outcomes
         self.pending_v = true_v | false_v
         if true_s.keys() != false_s.keys():
@@ -758,10 +764,10 @@ class Wave:
                     self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
-            elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
+            elif op in ("s_cbranch_scc0", "s_cbranch_scc1") and isinstance(self.scc, Dyn):
                 pc = self.join_arms(
-                    decoded, expressions, jumps, pc, offset,
-                    branch_target(offset, tail), self.scc,
+                    decoded, expressions, jumps, pc, branch_target(offset, tail),
+                    self.scc, branch_on_true=op == "s_cbranch_scc1",
                 )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
@@ -1127,7 +1133,13 @@ def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=F
                  vs_out_cntl=vs_out_cntl)
 
 
-if __name__ == "__main__":
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("container", type=Path)
     p.add_argument(
@@ -1148,19 +1160,31 @@ if __name__ == "__main__":
         help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2",
     )
     p.add_argument("--output", type=Path, required=True)
-    a = p.parse_args()
-    if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
-        a.container.resolve(),
-        a.geometry_words.resolve(),
-    ):
-        p.error("Expected a separate HLSL output")
-    src = translate(
-        a.container.read_bytes(),
-        json.loads(a.geometry_words.read_text()),
-        a.llvm,
-        a.vertex_header,
-        compute_fallback=a.compute_fallback,
-        vs_out_cntl=a.pa_cl_vs_out_cntl,
-    )
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    a.output.write_text(src, encoding="ascii")
+    a = p.parse_args(argv)
+    try:
+        if a.output.exists() and a.output.is_dir():
+            raise ValueError(f"Output path is an existing directory: {a.output}")
+        if a.output.suffix.lower() != ".hlsl":
+            raise ValueError("Expected a separate HLSL output")
+        if _same_path(a.output, a.container) or _same_path(a.output, a.geometry_words):
+            raise ValueError("Expected a separate HLSL output")
+        src = translate(
+            a.container.read_bytes(),
+            json.loads(a.geometry_words.read_text(encoding="utf-8")),
+            a.llvm,
+            a.vertex_header,
+            compute_fallback=a.compute_fallback,
+            vs_out_cntl=a.pa_cl_vs_out_cntl,
+        )
+        a.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=a.output.parent) as staging_dir:
+            staged = Path(staging_dir) / a.output.name
+            staged.write_text(src, encoding="ascii")
+            os.replace(staged, a.output)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, struct.error, zlib.error) as exc:
+        p.exit(1, f"{type(exc).__name__}: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
