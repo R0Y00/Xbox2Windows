@@ -23151,6 +23151,36 @@ def sdwa_movrel_reference(w0, w1, w2, w3):
     return (r, mix(g), mix(b), mix(a))
 
 
+def check_sdwa_movrel_overlap_draw(directory, compiler, renderer, backend):
+    bank = SDWA_MOVREL_BANK
+    program = uncompressed_export([
+        *(f"v_mov_b32_e32 v{24 + k}, {word:#x}" for k, word in enumerate(bank)),
+        "s_mov_b32 s84, s47", "s_mov_b32 s85, 0",
+        "s_and_b64 s[84:85], s[84:85], 0x30003", "s_mov_b32 m0, s84",
+        "v_movrelsd_2_b32_sdwa v24, v24 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0",
+        *(f"v_mov_b32_e32 v{12 + k}, v{24 + k}" for k in range(4)),
+    ])
+    source = directory / "sdwa_movrel_overlap.hlsl"
+    shader = source.with_suffix(".cso")
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    cases = []
+    for src in range(4):
+        for dst in range(4):
+            constants = bytearray(256)
+            struct.pack_into("<I", constants, 24, (dst << 16) | src)
+            expected = list(bank)
+            expected[dst] = (bank[dst] & 0xffff00ff) | ((bank[src] & 0xff) << 8)
+            path = directory / f"sdwa-overlap-{src}-{dst}.case"
+            cases.append((write_uint_case(path, constants, expected), "pass"))
+            if src == dst == 3:
+                # A self-copy still replaces BYTE_1 with BYTE_0.
+                wrong = directory / "sdwa-overlap-unchanged.case"
+                cases.append((write_uint_case(wrong, constants, bank), "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+
 def check_sdwa_movrel_draw(directory, compiler, renderer, backend):
     program = uncompressed_export(SDWA_MOVREL_BODY)
     source = directory / "sdwa_movrel.hlsl"
@@ -23187,6 +23217,7 @@ def check_sdwa_movrel_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         run_pixel_batch(renderer, backend, shader, [(good, "mismatch")])
         print(f"control {label}: pixel mismatch, as required")
+    check_sdwa_movrel_overlap_draw(directory, compiler, renderer, backend)
     return 0
 
 
