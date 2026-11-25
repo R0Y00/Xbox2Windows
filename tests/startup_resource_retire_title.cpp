@@ -11,9 +11,14 @@
 //   2 resource_address_index + slot 70 (existing_memory_texture) same-address reuse while T1 is pending behind a
 //     held fence, with X2W_RESOURCE_INDEX_CHECK=1 verifying live index consistency.
 //   3 written_textures stale bc7_width cleanup on address reuse (BC7 retired -> RGBA8 at same address uploads
-//     fresh CPU texels; newer generation preserved when a live view keeps an older resource pending).
+//     fresh CPU texels).
 //   4 descriptor & view reuse: view_slot<18> + CopyDescriptorsSimple + heap release + descriptor overwrite;
 //     stays retained while any tracked slot holds the SRV, retires once overwritten/freed and fences complete.
+//   5 switch-off control: an ordinary committed texture (no slot 133, no title memory) copied as a subresource still
+//     records its upload, as before the switch (case runs with the switch off, which is what selects the control).
+//   6 written_textures generation keeping: a live view keeps the older generation's entry, and a newer generation of
+//     the same address survives the older generation's retirement (case runs with the switch on, which is what
+//     retires resources).
 #include "startup_stubs/resource_budget.h"
 
 #include <d3d12sdklayers.h>
@@ -38,7 +43,11 @@ struct RetireProbe {
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_budget_snapshot(x2w_budget::Snapshot*, SIZE_T);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_retire_probe(void*, void*, RetireProbe*);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_resource_index_probe(void*);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_texture_upload_probe(void*);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_written_probe(void*, unsigned long long*, unsigned*, unsigned*);
 extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void*, UINT, UINT);
+extern "C" __declspec(dllimport) void x2w_d3d12_list_copy_texture_stats(LONG*, LONG*);
 
 namespace {
 using namespace x2w_budget;
@@ -352,6 +361,15 @@ bool case1_slot133_copy_and_upload(Context& c, bool on, void* title_mem)
 {
     fill_title_memory(title_mem, 5);
     Res& T1 = c.make_slot133("T1", title_mem);
+    auto t1_desktop = desktop_object<ID3D12Resource>(c.guest, c.device, T1.guest.Get());
+    if (!t1_desktop) {
+        std::puts("FAIL: slot 133 texture has no desktop object");
+        return false;
+    }
+    // The raw pointer only keys the upload cache after retirement: a COM reference here would keep the budget ticket
+    // of a retired desktop object alive (the fixture's expected retained count would then not drop).
+    ID3D12Resource* const t1_real = t1_desktop.Get();
+    t1_desktop.Reset();
     Res& D1 = c.make_committed("D1");
     Res& D2 = c.make_committed("D2");
     if (!c.fill_desktop(D1.guest.Get(), 99) || !c.fill_desktop(D2.guest.Get(), 99)) return false;
@@ -374,6 +392,10 @@ bool case1_slot133_copy_and_upload(Context& c, bool on, void* title_mem)
     }
     c.release(T1);
     if (!c.sync(c.direct) || !c.sync(c.gated)) return false;
+    if (!x2w_d3d12_texture_upload_probe(t1_real)) {
+        std::puts("FAIL: slot 133 CopyTextureRegion recorded no texture_uploads entry for T1");
+        return false;
+    }
     if (!c.stays("slot 133 released behind closed lists", "early release of slot 133 texture")) return false;
     c.execute(c.direct, L1);
     if (!c.sync(c.direct) || !c.holds(D1.guest.Get(), 5, "D1 CopyTextureRegion from slot 133")) return false;
@@ -389,6 +411,12 @@ bool case1_slot133_copy_and_upload(Context& c, bool on, void* title_mem)
     if (!require(invoke(gate.Get(), 10, UINT64{1}), "signal1") || !c.sync(c.gated)) return false;
     if (on) T1.freed = true;
     if (!c.settle("slot 133 retired", "slot 133 texture kept after fences passed")) return false;
+    // The texture_uploads() entry the copy recorded leaves with the desktop object; without the switch nothing
+    // retires and the entry stays, as before the switch existed.
+    if ((x2w_d3d12_texture_upload_probe(t1_real) != FALSE) == on) {
+        std::printf("FAIL: texture_uploads entry for retired T1 is %s\n", on ? "still present" : "missing");
+        return false;
+    }
     return c.holds(D2.guest.Get(), 5, "D2 CopyResource from slot 133");
 }
 
@@ -397,6 +425,8 @@ bool case2_same_address_and_slot70_reuse(Context& c, bool on, void* title_mem)
 {
     fill_title_memory(title_mem, 11);
     Res& T1 = c.make_slot133("T_addr1", title_mem, DXGI_FORMAT_R8_UNORM, pitch);
+    // The wrapper outlives its guest Release (the registry keeps it), so the raw pointer can be probed afterwards.
+    IUnknown* const t1_guest = T1.guest.Get();
     ComPtr<IUnknown> gate;
     if (!require(invoke(c.guest, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, &__uuidof(ID3D12Fence), gate.GetAddressOf()), "gate2") ||
         !require(invoke(c.gated.queue.Get(), 17, gate.Get(), UINT64{1}), "wait2"))
@@ -430,6 +460,16 @@ bool case2_same_address_and_slot70_reuse(Context& c, bool on, void* title_mem)
     if (!require(invoke(gate.Get(), 10, UINT64{1}), "signal2") || !c.sync(c.gated)) return false;
     if (on) T1.freed = true;
     if (!c.settle("T_addr1 retired while T_addr2 live", "T_addr1 did not retire")) return false;
+    // Retirement drops T1's resource_address_index entry (the canonical record stays); without the switch T1 stays
+    // live, so its index entry stays too. T2's own entry must be there in both modes.
+    if (!x2w_d3d12_resource_index_probe(T2.guest.Get())) {
+        std::puts("FAIL: T_addr2 has no resource_address_index entry");
+        return false;
+    }
+    if ((x2w_d3d12_resource_index_probe(t1_guest) != FALSE) == on) {
+        std::printf("FAIL: resource_address_index entry for retired T_addr1 is %s\n", on ? "still present" : "missing");
+        return false;
+    }
     // Verify T2 still uploads seed 22 properly after T1 retired.
     const D3D12_HEAP_PROPERTIES def_heap{D3D12_HEAP_TYPE_DEFAULT};
     Res& D = c.pool.emplace_back();
@@ -532,6 +572,96 @@ bool case4_descriptor_and_view_reuse(Context& c, bool on, void* mem1, void* mem2
     return c.settle("Tv2 retired after heap2 released", "Tv2 kept after heap2 released");
 }
 
+// 5: switch-off control. An ordinary committed texture (slot 127, no title memory, not a slot 133 resource) copied as
+// a subresource must still record its upload exactly as before the switch: upload_texture() is gated on the retire
+// class, not on title memory. The observable is the per-desktop-object texture_uploads() entry the no-title-memory
+// path records (a probe over the same map), plus the forwarded counter of the copy itself.
+bool case5_ordinary_upload_switch_off(Context& c)
+{
+    Res& source = c.make_committed("U_src");
+    Res& dest = c.make_committed("U_dst");
+    const auto source_real = desktop_object<ID3D12Resource>(c.guest, c.device, source.guest.Get());
+    const auto dest_real = desktop_object<ID3D12Resource>(c.guest, c.device, dest.guest.Get());
+    if (!source_real || !dest_real) {
+        std::puts("FAIL: an ordinary committed texture has no desktop object");
+        return false;
+    }
+    LONG forwarded_before = 0, refused_before = 0;
+    x2w_d3d12_list_copy_texture_stats(&forwarded_before, &refused_before);
+    GuestList L;
+    if (!c.make_list(L)) return false;
+    const D3D12_TEXTURE_COPY_LOCATION to{static_cast<ID3D12Resource*>(static_cast<void*>(dest.guest.Get())),
+                                         D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    const D3D12_TEXTURE_COPY_LOCATION from{static_cast<ID3D12Resource*>(static_cast<void*>(source.guest.Get())),
+                                           D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    invoke<void>(L.list.Get(), 16, &to, 0u, 0u, 0u, &from, static_cast<const D3D12_BOX*>(nullptr));
+    if (!c.close(L)) return false;
+    c.execute(c.direct, L);
+    if (!c.sync(c.direct)) return false;
+    LONG forwarded_after = 0, refused_after = 0;
+    x2w_d3d12_list_copy_texture_stats(&forwarded_after, &refused_after);
+    if (forwarded_after != forwarded_before + 1 || refused_after != refused_before) {
+        std::printf("FAIL: ordinary texture copy forwarded %ld refused %ld, expected one more forwarded and none refused\n",
+                    forwarded_after - forwarded_before, refused_after - refused_before);
+        return false;
+    }
+    const bool source_cached = x2w_d3d12_texture_upload_probe(source_real.Get()) != FALSE;
+    const bool dest_cached = x2w_d3d12_texture_upload_probe(dest_real.Get()) != FALSE;
+    if (!source_cached || !dest_cached) {
+        std::printf("FAIL: ordinary texture copy recorded no upload (source=%d destination=%d); "
+                    "upload_texture is gated on title memory instead of the retire class\n", source_cached, dest_cached);
+        return false;
+    }
+    return true;
+}
+
+// 6: written_textures() generation keeping (switch on). A live slot-18 SRV keeps the older resource's entry while it
+// is pending; a newer generation of the same address then arrives and must survive the older generation's retirement
+// (the snapshot-generation check), so the newer write is not mistaken for the older one's stale state.
+bool case6_written_generation_preserved(Context& c, void* title_mem)
+{
+    x2w_d3d12_bc7_4k_s_written(title_mem, side, side);  // generation 1 of this address
+    Res& Told = c.make_slot133("T_gen_old", title_mem);
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1}, 0, 0};
+    ComPtr<IUnknown> heap;
+    if (!require(invoke(c.guest, 14, &heap_desc, &__uuidof(ID3D12DescriptorHeap), heap.GetAddressOf()), "generation heap"))
+        return false;
+    const UINT64 handle = invoke<UINT64>(heap.Get(), 9);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    invoke<void>(c.guest, 18, Told.guest.Get(), &srv, handle);
+    c.release(Told);
+    // The live view keeps the entry: only its generation is snapshotted, the entry is not erased.
+    unsigned long long generation = 0;
+    unsigned bc7_width = 0;
+    if (!x2w_d3d12_written_probe(title_mem, &generation, &bc7_width, nullptr) || generation != 1 ||
+        bc7_width != side) {
+        std::printf("FAIL: a live view did not keep written_textures entry (found=%d generation=%llu bc7_width=%u)\n",
+                    x2w_d3d12_written_probe(title_mem, nullptr, nullptr, nullptr), generation, bc7_width);
+        return false;
+    }
+    // A newer generation of the same address while the older resource is still pending behind its view.
+    x2w_d3d12_bc7_4k_s_written(title_mem, side, side);
+    heap.Reset();  // drops the view reference: the older resource can retire now
+    Told.freed = true;
+    if (!c.settle("older generation retired", "older generation kept after its view was released")) return false;
+    unsigned long long kept_generation = 0;
+    unsigned kept_bc7_width = 0;
+    const BOOL found = x2w_d3d12_written_probe(title_mem, &kept_generation, &kept_bc7_width, nullptr);
+    if (!found || kept_generation != 2 || kept_bc7_width != side) {
+        std::printf("FAIL: retiring the older generation released the newer written generation "
+                    "(found=%d generation=%llu bc7_width=%u)\n", found, kept_generation, kept_bc7_width);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -581,7 +711,8 @@ int main(int argc, char** argv)
     constexpr SIZE_T page = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     auto* mem1 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     auto* mem2 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!mem1 || !mem2) return 4;
+    auto* mem3 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!mem1 || !mem2 || !mem3) return 4;
 
     Context c{guest.Get(), device.Get(), debug.Get()};
     try {
@@ -614,13 +745,22 @@ int main(int argc, char** argv)
         std::puts("3 written_textures cleanup: stale bc7_width cleared on address reuse");
         if (!case4_descriptor_and_view_reuse(c, on, mem1, mem2)) return 5;
         std::puts("4 descriptor and view reuse: tracked slot-18 SRV holds and retires on overwrite/heap release");
+        if (!on) {
+            if (!case5_ordinary_upload_switch_off(c)) return 5;
+            std::puts("5 switch-off ordinary texture copy: upload still recorded for a resource outside the retire class");
+        } else {
+            if (!case6_written_generation_preserved(c, mem3)) return 5;
+            std::puts("6 written_textures generation: newer generation of an address kept by the older one's retirement");
+        }
     } catch (int code) {
         VirtualFree(mem1, 0, MEM_RELEASE);
         VirtualFree(mem2, 0, MEM_RELEASE);
+        VirtualFree(mem3, 0, MEM_RELEASE);
         return code;
     }
     VirtualFree(mem1, 0, MEM_RELEASE);
     VirtualFree(mem2, 0, MEM_RELEASE);
+    VirtualFree(mem3, 0, MEM_RELEASE);
     const UINT64 errors = debug ? debug->GetNumStoredMessages() : 0;
     std::printf("debug_errors_or_warnings=%llu\n", errors);
     if (errors || FAILED(device->GetDeviceRemovedReason())) return 4;
