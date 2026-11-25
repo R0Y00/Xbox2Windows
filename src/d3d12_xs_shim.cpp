@@ -164,17 +164,21 @@ extern "C" std::uint32_t x2w_stripped_root_flags(const void* blob, std::size_t b
     if (!blob || !bytes) return 0;
     std::uint32_t bits = 0;
     bool same_bytes_elsewhere = false;
+    // The byte comparison below only feeds a once-only line; it stops once that line is logged.
+    static LONG logged;
     AcquireSRWLockShared(&stripped_lock);
     for (const StrippedBlob& entry : stripped_blobs)
         if (entry.data == blob && entry.bytes == bytes) bits = entry.bits;
     // Live entries' buffers stay valid while the lock is held (the destructor unregisters first).
-    if (!bits)
+    if (!bits && !InterlockedCompareExchange(&logged, 0, 0))
         for (const StrippedBlob& entry : stripped_blobs)
-            if (entry.bytes == bytes && std::memcmp(entry.data, blob, bytes) == 0) same_bytes_elsewhere = true;
+            if (entry.bytes == bytes && std::memcmp(entry.data, blob, bytes) == 0) {
+                same_bytes_elsewhere = true;
+                break;
+            }
     ReleaseSRWLockShared(&stripped_lock);
     // The bytes alone cannot say which it is, so the answer stays 0; the line says why bits may be missing.
-    static LONG logged;
-    if (same_bytes_elsewhere && InterlockedIncrement(&logged) == 1)
+    if (same_bytes_elsewhere && InterlockedExchange(&logged, 1) == 0)
         std::fprintf(stderr, "x2w-d3d12 root signature blob %p has the bytes of a retried blob at another address: a copy "
                              "(its heap-indexing bits are not restored for translation) or a call without them\n", blob);
     return bits;
