@@ -702,6 +702,8 @@ class Stage:
         self.has_branches = bool(targets)
         self.entry_loop = 0 in targets
         self.branch_proof, self.tainted_s = self.scan_branch_safety() if targets else (False, set())
+        self.later_written = self.scan_later_writes(targets) if targets else set()
+        self.block_sdef = set()   # scalar registers written so far in the current block
         start = 0
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         for off, n, name, asm in self.ins:
@@ -709,6 +711,7 @@ class Stage:
                 self.blocks.append((start, self.lines, None))
                 self.lines, start = [], off
                 self.uniform_v.clear()  # a join point: no VGPR proof survives from the code above it
+                self.block_sdef = set()
             self.pc = off
             # Before the first branch target or terminator every path has run exactly the instructions above, so
             # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
@@ -726,10 +729,12 @@ class Stage:
                     raise
                 refusals.append((handler_error(name, error, refusals), self.kind))
                 continue
+            self.block_sdef.update(self.scalar_dst(name, parse(asm)[1]))
             if term:
                 self.blocks.append((start, self.lines, term))
                 self.lines, start = [], off + n
                 self.uniform_v.clear()
+                self.block_sdef = set()
         if self.lines:
             self.blocks.append((start, self.lines, None))
 
@@ -779,6 +784,28 @@ class Stage:
                     changed = True
         return proof_ok, tainted
 
+    @staticmethod
+    def scalar_dst(name, ops):
+        """Scalar registers (and 'm0') an instruction may write: its first operand when that is scalar."""
+        if not ops or re.match(r's_(cmp|bitcmp|cbranch)', name):
+            return []
+        if ops[0] == 'm0':
+            return ['m0']
+        r = reg_range(ops[0])
+        return list(range(r[1], r[2] + 1)) if r and r[0] == 's' else []
+
+    def scan_later_writes(self, targets):
+        """Scalar registers written anywhere after the first block boundary. Such a register holds a different
+        value per incoming path at a join, so the value last seen in program order proves nothing there."""
+        ends = ('s_branch', 's_cbranch', 's_endpgm', 's_setpc', 's_swappc')
+        boundary = min([t for t in targets if t > 0] + [off + n for off, n, name, _ in self.ins
+                                                          if name.startswith(ends)])
+        written = set()
+        for off, _, name, asm in self.ins:
+            if off >= boundary:
+                written.update(self.scalar_dst(name, parse(asm)[1]))
+        return written
+
     def proof_allowed(self):
         """Entry-block code is exact in program order (merged entry proof). Later blocks need the branch scan to
         pass and no branch back to offset 0, so an entry loop keeps refusing."""
@@ -801,6 +828,9 @@ class Stage:
             if lo in getattr(self, 'masks', ()) or (getattr(self, 'has_branches', False) and
                                                     lo in getattr(self, 'tainted_s', ())):
                 return False
+            if (getattr(self, 'has_branches', False) and getattr(self, 'past_entry', False) and
+                    lo in getattr(self, 'later_written', ()) and lo not in getattr(self, 'block_sdef', ())):
+                return False  # per-path value at a join: redefine it in this block to prove it
             sym = self.sym.get(lo)
             if sym:
                 return sym[0] in ('const', 'ud', 'fixed_buffer_word')
