@@ -29,6 +29,9 @@ class Pipe:
         self.keys = []
         self.modified = set()
 
+    def ud(self, key):
+        return 'ud_%s' % '_'.join(map(str, key))
+
     def resource(self, key, kind):
         if (key, kind) not in self.keys:
             self.keys.append((key, kind))
@@ -61,22 +64,22 @@ def run(symbols, program, branches=False):
     return s
 
 
-TABLE = {8: ('ptr', ('table', 0)), 9: ('ptrhi', ('table', 0))}
+TABLE = {8: ('ptr', ('table', 0))}   # a table pointer is 32 bits wide: no high word
 ROOT = {8: ('ptr', ('root', 1)), 9: ('ptrhi', ('root', 1))}
 ADVANCE = [('s_add_u32', 's20, s8, 0x40'), ('s_addc_u32', 's21, s9, 0')]
+TABLE_ADVANCE = [('s_add_u32', 's20, s8, 0x40')]
 LOAD = [('s_load_dwordx4', 's[4:7], s[20:21], 0x10')]
 
-s = run(TABLE, ADVANCE + LOAD)
+s = run(TABLE, TABLE_ADVANCE + LOAD)
 check('table pointer advanced into another pair, descriptor read at pointer + 0x40 + 0x10',
       not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0x50, 0), str(s if isinstance(s, str) else s.sym))
 
-same = [('s_add_u32', 's8, s8, 0x20'), ('s_addc_u32', 's9, s9, 0')]
+same = [('s_add_u32', 's8, s8, 0x20')]
 s = run(TABLE, same + [('s_load_dwordx4', 's[4:7], s[8:9], 0')])
 check('table pointer advanced in place',
       not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0x20, 0), str(s if isinstance(s, str) else s.sym))
 
-twice = [('s_add_u32', 's20, s8, 0x40'), ('s_addc_u32', 's21, s9, 0'),
-         ('s_add_u32', 's22, s20, 0x10'), ('s_addc_u32', 's23, s21, 0')]
+twice = [('s_add_u32', 's20, s8, 0x40'), ('s_add_u32', 's22, s20, 0x10')]
 s = run(TABLE, twice + [('s_load_dwordx4', 's[4:7], s[22:23], 0x4')])
 check('two advances add up',
       not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0x54, 0), str(s if isinstance(s, str) else s.sym))
@@ -88,48 +91,83 @@ check('root constant-buffer pointer advanced, buffer read at the advanced offset
 s = run(TABLE, [('s_add_u32', 's8, s8, s2')])
 check('a register addend on a pointer is refused', isinstance(s, str) and 'non-literal' in s, str(s))
 
-s = run(TABLE, ADVANCE + [('s_load_dwordx4', 's[4:7], s[20:21], s2')])
+s = run(ROOT, ADVANCE + [('s_load_dwordx4', 's[4:7], s[20:21], s2')])
 check('a register offset through an advanced pointer is still refused', isinstance(s, str), str(s))
 
-s = run(TABLE, ADVANCE)
+s = run(ROOT, ADVANCE)
 try:
     s.descriptor('s[20:21]')
     check('an advanced pointer used whole as a descriptor is refused', False, 'accepted')
 except G.Unsupported:
     check('an advanced pointer used whole as a descriptor is refused', True)
 
-s = run(TABLE, ADVANCE, branches=True)
+s = run(ROOT, ADVANCE, branches=True)
 check('a pointer advance in a program with branches is refused', isinstance(s, str), str(s))
 
 # The high-word add is the carry of the low-word add right before it, never of an unrelated carry in SCC.
-s = run(TABLE, [('s_cmp_eq_u32', '0, 0'), ('s_addc_u32', 's9, s9, 0')])
+s = run(ROOT, [('s_cmp_eq_u32', '0, 0'), ('s_addc_u32', 's9, s9, 0')])
 check('s_addc_u32 without the low-word add is refused', isinstance(s, str), str(s))
 
-s = run(TABLE, [ADVANCE[0], ('s_cmp_eq_u32', '0, 0'), ADVANCE[1]])
+s = run(ROOT, [ADVANCE[0], ('s_cmp_eq_u32', '0, 0'), ADVANCE[1]])
 check('s_addc_u32 separated from its low-word add is refused', isinstance(s, str), str(s))
 
 # A fold needs the complete matching pair: the load must not trust the low word alone.
 LOW = ADVANCE[0]
-s = run(TABLE, [LOW] + LOAD)
+s = run(ROOT, [LOW] + LOAD)
 check('missing high-word add is refused', isinstance(s, str), str(s))
 
-s = run(TABLE, [('s_add_u32', 's8, s8, 0x20'), ('s_load_dwordx4', 's[4:7], s[8:9], 0')])
+s = run(ROOT, [('s_add_u32', 's8, s8, 0x20'), ('s_load_dwordx4', 's[4:7], s[8:9], 0')])
 check('missing high-word add in place is refused', isinstance(s, str), str(s))
 
-s = run(TABLE, ADVANCE + [('s_mov_b32', 's21, 0')] + LOAD)
+s = run(ROOT, ADVANCE + [('s_mov_b32', 's21, 0')] + LOAD)
 check('overwritten high word is refused', isinstance(s, str), str(s))
 
-mixed = dict(TABLE)
-mixed[10], mixed[11] = ('ptr', ('table', 1)), ('ptrhi', ('table', 1))
+mixed = dict(ROOT)
+mixed[10], mixed[11] = ('ptr', ('root', 2)), ('ptrhi', ('root', 2))
 s = run(mixed, [LOW, ('s_addc_u32', 's21, s11, 0')] + LOAD)
 check('high word from another pointer is refused', isinstance(s, str), str(s))
 
 s = run(mixed, [LOW, ('s_addc_u32', 's21, s10, 0')] + LOAD)
 check('high word from a different register pair is refused', isinstance(s, str), str(s))
 
-s = run(TABLE, [('s_add_u32', 's20, s8, 0xfffff'), ('s_addc_u32', 's21, s9, 0')] + LOAD)
+s = run(ROOT, [('s_add_u32', 's20, s8, 0xfffff'), ('s_addc_u32', 's21, s9, 0')] + LOAD)
 check('complete pair with a large low-word add is folded',
-      not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0xfffff + 0x10, 0), str(s))
+      not isinstance(s, str) and any('Load(%d)' % (0xfffff + 0x10) in line for line in s.lines), str(s))
+
+# Real entry state: a table pointer is one 32-bit register with no high word, so it advances with
+# the low add alone and its neighbour register stays untouched.
+def entry(params, kind='vs'):
+    s = stage({})
+    s.kind, s.pipe.root = kind, {'params': params, 'flags': 0}
+    s.setup_entry()
+    return s.sym
+
+
+REAL = entry([{'type': 0}, {'type': 2}])
+s = run(REAL, [('s_add_u32', 's20, s8, 0x40')] + LOAD)
+check('real table pointer advanced by the low add alone, descriptor read at +0x50',
+      not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0x50, 0), str(s))
+
+s = run(REAL, [('s_add_u32', 's8, s8, 0x40'), ('s_load_dwordx4', 's[4:7], s[8:9], 0x10')])
+check('real table pointer advanced in place keeps the next register symbol',
+      not isinstance(s, str) and s.sym.get(9) == REAL[9] and s.sym.get(4) == ('desc', ('table', 0), 0x50, 0), str(s))
+
+s = run(REAL, [('s_add_u32', 's20, s9, 0x40'), ('s_addc_u32', 's21, s10, 0')] + LOAD)
+check('real root pointer pair advanced through the load',
+      not isinstance(s, str) and any('Load(80)' in line for line in s.lines), str(s))
+
+s = run(REAL, [('s_add_u32', 's20, s9, 0x40')] + LOAD)
+check('real root pointer without its high add is refused', isinstance(s, str), str(s))
+
+copied = dict(ROOT)
+copied[30] = ('ptrhi', ('root', 1))
+s = run(copied, [LOW, ('s_addc_u32', 's21, s30, 0')] + LOAD)
+check('a copied high word completes the pair', not isinstance(s, str), str(s))
+
+viam0 = dict(ROOT)
+viam0['m0'] = ('ptr', ('root', 1))
+s = run(viam0, [('s_add_u32', 's20, m0, 0x40'), ('s_addc_u32', 's21, s9, 0')] + LOAD)
+check('a low word held in m0 completes the pair', not isinstance(s, str), str(s))
 
 if failures:
     print('FAILED: %s' % ', '.join(failures))

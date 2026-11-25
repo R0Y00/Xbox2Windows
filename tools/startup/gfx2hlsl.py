@@ -453,6 +453,10 @@ def fbits(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
 
+# Sources whose pointer is a 64-bit register pair (the low word 'ptr', the high word 'ptrhi').
+PTR64_SOURCES = ('root', 'vbtab')
+
+
 def reg_range(tok):
     """'s[8:11]' -> ('s', 8, 11); 's8' -> ('s', 8, 8); 'v[1:3]' -> ('v', 1, 3); 'exec'/'vcc' pairs too."""
     m = re.fullmatch(r'([sv])\[(\d+):(\d+)\]', tok)
@@ -2388,23 +2392,23 @@ class Stage:
             if added > 0xfffff:
                 raise Unsupported('descriptor pointer offset %s' % srcs[1])
             self.sym[d] = ('ptr', syms[0][1], (syms[0][2] if len(syms[0]) > 2 else 0) + added)
-            # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
-            # instruction starts so that the high-word add is accepted right behind it and nowhere else.
-            size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
-            src = reg_range(srcs[0])
-            self.ptr_low_add = (d, self.pc + size, src[1] if src and src[0] == 's' else None,
-                                self.sym.get(src[1] + 1) if src and src[0] == 's' else None, syms[0][1])
-            # The high word is stale until the matching s_addc_u32 completes the pair.
-            self.sym[d + 1] = ('ptrhi', syms[0][1], 'pending')
+            if syms[0][1][0] in PTR64_SOURCES and d + 1 <= 105:
+                # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
+                # instruction starts so that the high-word add is accepted right behind it and nowhere else.
+                size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
+                self.ptr_low_add = (d, self.pc + size, syms[0][1])
+                # The high word is stale until the matching s_addc_u32 completes the pair.
+                self.sym[d + 1] = ('ptrhi', syms[0][1], 'pending')
             return True
         low = self.sym.get(d - 1)
         mark = getattr(self, 'ptr_low_add', None)
         hi = reg_range(srcs[0])
+        # The high operand is judged by what it holds, not by where it sits: a copied high word still counts.
         if (not mark or srcs[1] != '0' or not low or low[0] != 'ptr' or not hi or hi[0] != 's'
-                or mark[:2] != (d - 1, getattr(self, 'pc', 0)) or mark[2] is None or hi[1] != mark[2] + 1
-                or mark[3] != ('ptrhi', mark[4]) or low[1] != mark[4]):
+                or mark[:2] != (d - 1, getattr(self, 'pc', 0)) or low[1] != mark[2]
+                or self.sym.get(hi[1]) != ('ptrhi', mark[2])):
             return False
-        self.sym[d] = ('ptrhi', mark[4])
+        self.sym[d] = ('ptrhi', mark[2])
         return True
 
     # scalar ALU with descriptor-word bookkeeping
@@ -2796,8 +2800,9 @@ class Stage:
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
         base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
-        if base_off or len(p) > 2:
-            # An advanced pointer needs its high word completed by the matching s_addc_u32.
+        if (base_off or len(p) > 2) and p[1][0] in PTR64_SOURCES:
+            # An advanced 64-bit pointer needs its high word completed by the matching s_addc_u32;
+            # a table pointer is 32 bits wide and has no high word.
             if self.sym.get(base[1] + 1) != ('ptrhi', p[1]):
                 raise Unsupported('s_load through s%d: its high word is not the matching advanced pair' % base[1])
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
