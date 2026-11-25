@@ -135,6 +135,8 @@ def check_branch_spelling():
     unsigned = [(pc, text.replace("s_cbranch_scc1 -3", "s_cbranch_scc1 65533")) for pc, text in decoded]
     assert unsigned != decoded and census.signed_branches(unsigned) == decoded
     assert census.signed_branches(decoded) == decoded
+    assert census.signed_branches([(0, "s_branch 32768")]) == [(0, "s_branch -32768")]
+    assert census.signed_branches([(0, "s_branch 32767")]) == [(0, "s_branch 32767")]
     try:
         census.loops(unsigned)
     except ValueError as error:

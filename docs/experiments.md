@@ -3842,6 +3842,8 @@ run is repeated with the two flat-scratch setup writes replaced by `s_nop`,
 because the lowerers refuse `s_setreg_imm32_b32` and that refusal otherwise
 hides what follows. LLVM 15 prints a negative branch offset unsigned
 (`s_branch 65535`); the census reads it signed.
+The SCC-writer filter excludes scalar instructions by mnemonic prefix, so a later
+`s_mul_*` or `s_cselect_*` variant that writes SCC would be skipped.
 
 ```sh
 python3 -B tools/mesh_loop_census.py <directory> --llvm libLLVM-15.so.1
