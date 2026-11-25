@@ -3428,6 +3428,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Handlers that do not model a modifier they can receive refuse it (#1771).
     add_test(NAME startup_gfx2hlsl_modifier_free COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_modifier_free_check.py")
+    # The src_scc scalar source (#1820).
+    add_test(NAME startup_gfx2hlsl_src_scc COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_check.py")
     # image_sample_c_lz with sampler word 2 bits 28-30 set (#1723).
     add_test(NAME startup_gfx2hlsl_sample_c_lz_mip COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sample_c_lz_mip_check.py")
