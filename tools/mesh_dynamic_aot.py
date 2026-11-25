@@ -312,7 +312,7 @@ class RuntimeWave(Wave):
             value = values[bool(mask & (1 << lane))]
             if isinstance(value, RuntimeWord):
                 raise ValueError(f"Unproven runtime geometry word {value.index} in {op}")
-            if (lane, dest) in self.pending_v:
+            if self.vector_pending(lane, dest):
                 raise ValueError("Pending vector destination")
             self.v[lane][int(dest[1:])] = value & U32 if isinstance(value, int) else value
 

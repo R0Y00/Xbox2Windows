@@ -164,9 +164,13 @@ class Wave:
             for j, i in enumerate(regs):
                 self.s[i] = UNDEF if value is UNDEF else (value >> (32 * j)) & U32
 
+    def vector_pending(self, lane, reg):
+        """True while a vector load or LDS read still owes this register."""
+        return (lane, reg) in self.pending_v or (lane, reg) in self.pending_ds
+
     def lane_value(self, t, lane):
         if re.fullmatch(r"v\d+", t):
-            if (lane, t) in self.pending_v or (lane, t) in self.pending_ds:
+            if self.vector_pending(lane, t):
                 raise ValueError("Vector load used before wait")
             return self.v[lane][int(t[1:])]
         return self.scalar(t)
@@ -498,7 +502,7 @@ class Wave:
                 v = expressions[expr]
             else:
                 raise ValueError(f"Unsupported lane instruction {op}")
-            if (lane, d) in self.pending_v:
+            if self.vector_pending(lane, d):
                 raise ValueError("Pending vector destination")
             self.v[lane][int(d[1:])] = v & U32 if isinstance(v, int) else v
 
@@ -538,7 +542,7 @@ class Wave:
                     raise ValueError("LDS load of this wave's store before a barrier")
                 if address not in self.lds:
                     raise ValueError("LDS load of a dword no wave published")
-                if (lane, dest) in self.pending_v or (lane, dest) in self.pending_ds:
+                if self.vector_pending(lane, dest):
                     raise ValueError("LDS load overwrites a pending result")
                 self.reads.add(address)
                 self.v[lane][int(dest[1:])] = self.lds[address]
@@ -646,7 +650,7 @@ class Wave:
                             )
                         for j, reg in enumerate(span(match[1])):
                             key = (lane, f"v{reg}")
-                            if key in self.pending_v:
+                            if self.vector_pending(*key):
                                 raise ValueError(
                                     "Vertex load overwrites an outstanding result"
                                 )
@@ -663,7 +667,7 @@ class Wave:
                 for lane in range(64):
                     if self.exec & (1 << lane):
                         addr = self.lane_value(match[2], lane)
-                        if (lane, match[1]) in self.pending_v:
+                        if self.vector_pending(lane, match[1]):
                             raise ValueError("Vector load overwrites pending result")
                         if addr % 4 or not 0 <= addr // 4 < len(self.geometry):
                             raise ValueError("Geometry address out of range")
@@ -716,6 +720,22 @@ def live_barriers_agree(first, second):
     return all(a == b for a, b in zip(first.barriers, second.barriers))
 
 
+def check_interval(waves):
+    """Validate one barrier interval of every wave; return the stores to publish."""
+    published = {}
+    for wave in waves:
+        for address, data in wave.staged.items():
+            if published.setdefault(address, data) != data:
+                raise ValueError("Waves store different values to one LDS dword")
+    for wave in waves:
+        others = {a for other in waves if other is not wave for a in other.staged}
+        if wave.reads & others:
+            raise ValueError("LDS dword read and stored by different waves without a barrier")
+    for wave in waves:
+        wave.staged, wave.reads = {}, set()
+    return published
+
+
 def run_group(waves, decoded, expressions):
     """Run the waves of one group in lockstep between barriers.
 
@@ -737,17 +757,10 @@ def run_group(waves, decoded, expressions):
             except StopIteration:
                 pass
         if not live:
+            check_interval(waves)
             return
         running = live
-        published = {}
-        for wave in waves:
-            for address, data in wave.staged.items():
-                if published.setdefault(address, data) != data:
-                    raise ValueError("Waves store different values to one LDS dword")
-        for wave in waves:
-            if wave.reads.intersection(address for other in waves if other is not wave for address in other.staged):
-                raise ValueError("LDS dword read and stored by different waves without a barrier")
-            wave.staged, wave.reads = {}, set()
+        published = check_interval(waves)
         lds.update(published)
 
 
