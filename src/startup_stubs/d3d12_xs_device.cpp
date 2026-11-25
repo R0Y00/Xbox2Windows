@@ -156,6 +156,8 @@ struct alignas(16) WrapperOwn {
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
                             // accesses: a race needs the guest to use a resource across its own final Release.
+    bool retire_hold_missed;  // Resource: retire_hold could not record a use (no desktop object or no room), so the
+                              // drain must keep it for the process instead of dropping a list's desktop object.
     volatile LONG retire_view_refs;  // Live tracked slot-18 SRV descriptor slots referencing this resource.
     bool retire_has_written_gen;     // Whether written_textures()[title_memory].generation was snapshotted at Release.
     u64 retire_written_gen;          // Snapshotted written_textures() generation for stale-entry cleanup.
@@ -3929,8 +3931,20 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
-    record_view(true);
-    if ((N == 20 || N == 21) && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]), N);
+    // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
+    // may keep the resource: on failure the slot is recorded unmaterialized, which releases the slot's previous view
+    // reference and adds none.
+    const HRESULT removed = removal_device ? removal_device->GetDeviceRemovedReason() : S_OK;
+    const bool created = SUCCEEDED(removed);
+    record_view(created);
+    if (!created) {
+        static LONG failed;
+        if (first_calls(failed, 6))
+            log("x2w-d3d12 Device::slot%d view not created: device removed, reason 0x%08lx", N,
+                static_cast<unsigned long>(removed));
+    }
+    if ((N == 20 || N == 21) && args[0] && created)
+        note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]), N);
     check_device("Device view", N);
     static LONG calls;
     if (first_calls(calls))
@@ -4418,10 +4432,12 @@ void retire_note_title_release(Wrapper* w)
 void retire_hold(Wrapper* list, Wrapper* resource)
 {
     if (!resource || !resource->own().retire_when_idle) return;
-    auto* real = static_cast<ID3D12Resource*>(resource->own().real);
     bool held = false;
+    AcquireSRWLockExclusive(&retire_lock);
+    // own().real is cleared by drain_retired_resources under this lock, so the read and the AddRef happen under it
+    // (retire_lock is a leaf: nothing else is taken inside).
+    auto* real = static_cast<ID3D12Resource*>(resource->own().real);
     if (real) {
-        AcquireSRWLockExclusive(&retire_lock);
         try {
             auto& held_by_list = retire_list_holds[list];
             if (std::find(held_by_list.begin(), held_by_list.end(), real) != held_by_list.end()) {
@@ -4435,10 +4451,14 @@ void retire_hold(Wrapper* list, Wrapper* resource)
             }
         } catch (const std::bad_alloc&) {
         }
-        ReleaseSRWLockExclusive(&retire_lock);
     }
-    // The guest still references the resource in this call, so it cannot be retired yet: leave the class instead.
-    if (!held) resource->own().retire_when_idle = false;
+    if (!held) {
+        // The use cannot be recorded: leave the class, and mark it so the drain keeps the desktop object for the
+        // process (as it keeps a submission it could not fence) rather than dropping one a list still names.
+        resource->own().retire_when_idle = false;
+        resource->own().retire_hold_missed = true;
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
 }
 
 void retire_discard_holds(Wrapper* list)
@@ -4557,6 +4577,15 @@ void drain_retired_resources()
     for (std::size_t i = 0; i < retired_resources.size() && dropped.size() < batch;) {
         RetiredResource& item = retired_resources[i];
         Wrapper* w = item.wrapper;
+        if (w->own().retire_hold_missed) {
+            // retire_hold could not record a list's use of this resource: keep its desktop object for the process,
+            // like a submission that could not be fenced, and drop only the retire bookkeeping.
+            InterlockedIncrement64(&retire_kept);
+            if (i + 1 != retired_resources.size()) item = std::move(retired_resources.back());
+            retired_resources.pop_back();
+            InterlockedDecrement(&retire_pending);
+            continue;
+        }
         if (InterlockedCompareExchange(&w->own().retire_view_refs, 0, 0) > 0) {
             ++i;
             continue;
@@ -4655,6 +4684,47 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
         ReleaseSRWLockShared(&retire_lock);
     }
     return TRUE;
+}
+
+// Fixture probes (startup_resource_retire_title) for state the retire bookkeeping maintains for one resource. They read
+// the same maps the shim reads and never change them; the address index and the upload cache exist with and without
+// the switch, so these answer in both modes.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_resource_index_probe(void* resource)
+{
+    Wrapper* w = as_wrapper(resource);
+    if (!w || w->own().kind != resource_kind) return FALSE;
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    if (!base) return FALSE;
+    AcquireSRWLockShared(&note_lock);
+    const bool indexed = resource_address_index().contains(base, static_cast<const Wrapper*>(w));
+    ReleaseSRWLockShared(&note_lock);
+    return indexed ? TRUE : FALSE;
+}
+
+// The desktop pointer is not dereferenced: the fixture keeps its own desktop reference to a retired resource.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_texture_upload_probe(void* desktop_resource)
+{
+    if (!desktop_resource) return FALSE;
+    AcquireSRWLockExclusive(&draw_lock);
+    const bool cached = texture_uploads().count(static_cast<ID3D12Resource*>(desktop_resource)) != 0;
+    ReleaseSRWLockExclusive(&draw_lock);
+    return cached ? TRUE : FALSE;
+}
+
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_written_probe(void* address, unsigned long long* generation, unsigned* bc7_width,
+                                                            unsigned* desktop_rows)
+{
+    if (!address) return FALSE;
+    AcquireSRWLockShared(&written_lock);
+    const auto found = written_textures().find(reinterpret_cast<u64>(address));
+    const bool present = found != written_textures().end();
+    if (present) {
+        if (generation) *generation = found->second.generation;
+        if (bc7_width) *bc7_width = found->second.bc7_width;
+        if (desktop_rows) *desktop_rows = found->second.desktop_rows ? 1u : 0u;
+    }
+    ReleaseSRWLockShared(&written_lock);
+    return present ? TRUE : FALSE;
 }
 
 // The title exports __XMemAllocationHooks__ = {alloc(size, attributes), free(ptr, attributes), ...}.

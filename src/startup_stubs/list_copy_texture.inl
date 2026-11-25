@@ -147,13 +147,17 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
     }
     // Bring a texture's desktop copy up to date with its guest backing before the copy reads or partly overwrites it,
     // and record that upload so a later sample does not replace the copied texels.
-    // A resource without title memory has nothing to upload and leaves no texture_uploads() entry behind.
-    if (side_src.kind == x2w_list_copy_texture::Kind::subresource && src_wrapper->own().title_memory) {
+    // A resource of the retire class that has no title memory has nothing to upload and leaves no texture_uploads()
+    // entry behind; every other resource uploads exactly as it did before the switch (switch off: nothing changes).
+    const auto needs_upload = [](const Wrapper* wrapper) {
+        return !wrapper->own().retire_when_idle || wrapper->own().title_memory;
+    };
+    if (side_src.kind == x2w_list_copy_texture::Kind::subresource && needs_upload(src_wrapper)) {
         AcquireSRWLockExclusive(&draw_lock);
         upload_texture(self, src_wrapper, real_src);
         ReleaseSRWLockExclusive(&draw_lock);
     }
-    if (side_dst.kind == x2w_list_copy_texture::Kind::subresource && dst_wrapper->own().title_memory) {
+    if (side_dst.kind == x2w_list_copy_texture::Kind::subresource && needs_upload(dst_wrapper)) {
         AcquireSRWLockExclusive(&draw_lock);
         upload_texture(self, dst_wrapper, real_dst);
         ReleaseSRWLockExclusive(&draw_lock);
