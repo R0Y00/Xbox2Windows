@@ -291,7 +291,7 @@ def controls():
             for word in words[:64]:
                 assert 0 < ((word >> 23) & 0xff) < 0xff, hex(word)
 
-    # 10. A complete s_add_u32/s_addc_u32 root-pointer pair goes through the full translate() (with its SCC
+    # 10. A complete s_add_u32/s_addc_u32 table-pointer pair goes through the full translate() (with its SCC
     #     check) and reads the same bytes as the single load at the summed offset; any other SCC reader is refused.
     assert build_smem_pointer_pair_pipeline().hlsl_vs() == build_smem_dwordx4_pipeline().hlsl_vs()
     vs_scc = b''.join((
@@ -326,7 +326,7 @@ def build_smem_dwordx4_pipeline():
 
 
 def build_smem_pointer_pair_pipeline():
-    """Same loads as build_smem_dwordx4_pipeline, but the root pointer is advanced by a complete
+    """Same loads as build_smem_dwordx4_pipeline, but the vertex-buffer table pointer s[0:1] is advanced by a complete
     s_add_u32 s20, s0, 8 / s_addc_u32 s21, s1, 0 pair and the load adds offset:0x8 (total 0x10)."""
     vs = b''.join((
         encode_sop2(0x00, 20, 0, 128 + 8),                           # s_add_u32 s20, s0, 8
@@ -450,13 +450,13 @@ def check_gpu(directory, compiler, consumer, adapter, fxc=None):
         print(f's_buffer_load_dwordx4 (soffset={soffset}, offset:0x18):',
               [l for l in res.stdout.splitlines() if 'mismatches=' in l][0])
 
-    # 1b. Root pointer advanced by a complete s_add_u32/s_addc_u32 pair must read the same bytes as case 1.
+    # 1b. Vertex-buffer table pointer advanced by a complete s_add_u32/s_addc_u32 pair must read the same bytes as case 1.
     p_pair = build_smem_pointer_pair_pipeline()
     res_pair = run_buffer_case(directory, compiler, consumer, adapter, p_pair, p_pair.hlsl_vs(),
                                expected_smem_dwordx4(soffset=32), soffset=32)
     if res_pair.returncode:
-        raise RuntimeError('advanced root pointer pair:\n' + res_pair.stdout + res_pair.stderr)
-    print('advanced root pointer (s_add_u32 + s_addc_u32, offset:0x8):',
+        raise RuntimeError('advanced vertex-buffer table pointer pair:\n' + res_pair.stdout + res_pair.stderr)
+    print('advanced vertex-buffer table pointer (s_add_u32 + s_addc_u32, offset:0x8):',
           [l for l in res_pair.stdout.splitlines() if 'mismatches=' in l][0])
 
     # 2. m0 + offset:0x14 dlc and destination-overlapping runtime SGPR s[20:21] + offset:0x1c glc.

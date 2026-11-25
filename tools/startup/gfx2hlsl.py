@@ -1967,7 +1967,7 @@ class Stage:
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
             if len(s) > 2 and s[2]:
-                raise Unsupported('descriptor operand %s is a pointer with offset %#x' % (tok, s[2]))
+                raise Unsupported('descriptor operand %s is a pointer with offset %s' % (tok, hex(s[2]) if isinstance(s[2], int) else s[2]))
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
