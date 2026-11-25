@@ -215,6 +215,46 @@ def validate_store_d16_x_word3(word3):
         raise Unsupported('buffer_store_format_d16_x unsupported descriptor FORMAT %d' % field)
     return code, info[0], info[1]
 
+
+# Compute buffer_store_format_xyzw (MUBUF 0x07) writes only formats with exactly four channels, the set and
+# conversions of tools/compute_store_aot.py: a channel-count mismatch writes nothing, since what the format unit
+# does with the extra components is not established here. Word 3 bounds and OOB_SELECT checks are those of
+# buffer_store_format_d16_x above; DST_SEL must be the identity X, Y, Z, W (0xfac).
+STORE_FORMAT_XYZW_FORMATS = {
+    50: ('BUF_FMT_2_10_10_10_UNORM', 4),
+    56: ('BUF_FMT_8_8_8_8_UNORM', 4),
+    71: ('BUF_FMT_16_16_16_16_FLOAT', 8),
+    75: ('BUF_FMT_32_32_32_32_UINT', 16),
+    77: ('BUF_FMT_32_32_32_32_FLOAT', 16),
+}
+STORE_FORMAT_XYZW_LEGACY_FORMATS = {
+    (9 << 3) | 0: 50,   # DFMT_2_10_10_10 + NFMT_UNORM
+    (10 << 3) | 0: 56,  # DFMT_8_8_8_8 + NFMT_UNORM
+    (12 << 3) | 7: 71,  # DFMT_16_16_16_16 + NFMT_FLOAT
+    (14 << 3) | 4: 75,  # DFMT_32_32_32_32 + NFMT_UINT
+    (14 << 3) | 7: 77,  # DFMT_32_32_32_32 + NFMT_FLOAT
+}
+
+
+def validate_store_format_xyzw_word3(word3):
+    """Validate V# word 3 for compute buffer_store_format_xyzw and return (code, name, elem_bytes)."""
+    name = 'buffer_store_format_xyzw'
+    if not isinstance(word3, int) or isinstance(word3, bool) or not 0 <= word3 <= 0xffffffff:
+        raise Unsupported('%s invalid descriptor word 3 %r' % (name, word3))
+    if word3 & STORE_D16_X_WORD3_ZERO_MASK:
+        raise Unsupported('%s unsupported descriptor word 3 flags 0x%08x' % (name, word3))
+    if (word3 & 0xfff) != 0xfac:
+        raise Unsupported('%s non-identity DST_SEL 0x%03x' % (name, word3 & 0xfff))
+    oob_select = (word3 >> 28) & 3
+    if oob_select not in (0, 3):
+        raise Unsupported('%s unsupported OOB_SELECT %d' % (name, oob_select))
+    field = (word3 >> DESC_FORMAT_SHIFT) & DESC_FORMAT_MASK
+    code = field if ((word3 >> 24) & 1) else STORE_FORMAT_XYZW_LEGACY_FORMATS.get(field)
+    info = STORE_FORMAT_XYZW_FORMATS.get(code)
+    if info is None:
+        raise Unsupported('%s descriptor FORMAT %d is not a handled 4-channel format' % (name, field))
+    return code, info[0], info[1]
+
 def starts_with_fetch_call(code):
     return len(code) >= 4 and struct.unpack_from('<I', code)[0] == FETCH_CALL
 
@@ -4693,6 +4733,66 @@ class Stage:
             uav, word3, stride, num_records, idx_expr, voff_expr, soff_expr, imm_offset, val_expr)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
+    def op_buffer_store_format_xyzw(self, ops, mods):
+        """Lower compute MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
+
+        FORMAT, stride and num_records are read at dispatch from the same entry constants as
+        buffer_store_format_d16_x, with its bounds and OOB_SELECT rules. Only 4-channel formats write
+        (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
+        """
+        name = 'buffer_store_format_xyzw'
+        if self.kind != 'cs':
+            raise Unsupported(name)  # the unknown-op refusal
+        raw = getattr(self, 'raw_code', b'')
+        pc = getattr(self, 'pc', None)
+        if raw and pc is not None and pc + 8 <= len(raw):
+            w0, w1 = struct.unpack_from('<II', raw, pc)
+            if (w0 & 0x00030000) or (w1 & 0x00200000):
+                raise Unsupported('%s illegal MUBUF encoding bits (lds/reserved)' % name)
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands, expected 4' % (name, len(ops)))
+        idxen = False
+        imm_offset = None
+        for m in mods:
+            if m == 'idxen' and not idxen:
+                idxen = True
+            elif m == 'offen':
+                raise Unsupported('%s offen address form (only idxen is modelled)' % name)
+            elif m.startswith('offset:') and imm_offset is None and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
+                imm_offset = int(m[7:], 0)
+                if imm_offset > 0xfff:
+                    raise Unsupported('%s modifier %s' % (name, m))
+            else:
+                raise Unsupported('%s modifier %s' % (name, m))
+        if not idxen:
+            raise Unsupported('%s without idxen (only the idxen address form is modelled)' % name)
+        src = reg_range(ops[0])
+        if not src or src[0] != 'v' or src[2] - src[1] != 3 or src[2] > 255:
+            raise Unsupported('%s data %s' % (name, ops[0]))
+        vaddr = reg_range(ops[1])
+        if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
+            raise Unsupported('%s vaddr %s for idxen' % (name, ops[1]))
+        if not re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
+            raise Unsupported('%s soffset %s (only a non-negative inline constant is modelled)' % (name, ops[3]))
+        rsrc = reg_range(ops[2])
+        if not rsrc or rsrc[0] != 's' or rsrc[2] - rsrc[1] != 3 or rsrc[2] > 105:
+            raise Unsupported('%s descriptor %s' % (name, ops[2]))
+        key = self.store_descriptor(ops[2], 4, name, stride0_ok=False)
+        first = self.sym.get(rsrc[1])
+        if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
+            raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
+        idx = self.u(ops[1])
+        data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        uav = self.pipe.uav(key, 'raw')
+        uav_index = self.pipe.uavs[key]['index']
+        word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
+        stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
+        num_records = 'ud%d' % self.pipe.ud(('uav_numrecords', uav_index))
+        self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
+        call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
+            uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
+        self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
+
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
 
@@ -6783,6 +6883,7 @@ class Pipeline:
     uses_gather_2d_lod = False
     uses_store_d16_x = False
     uses_sad = ()
+    uses_store_format_xyzw = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
@@ -6813,6 +6914,7 @@ class Pipeline:
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
+        self.uses_store_format_xyzw = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -7164,6 +7266,65 @@ class Pipeline:
             out.append(
                 'uint sad_u32(uint a, uint b, uint c) {'
                 ' return (a > b ? a - b : b - a) + c; }')
+        if self.uses_store_format_xyzw:
+            legacy = ['        %sif (field == %du) fmt = %du;' % ('' if i == 0 else 'else ', field, code)
+                      for i, (field, code) in enumerate(sorted(STORE_FORMAT_XYZW_LEGACY_FORMATS.items()))]
+            out.extend((
+                'uint store_unorm(uint bits, float scale) {',
+                '    float x = asfloat(bits);',
+                '    if (isnan(x)) return 0u;',
+                '    precise float saturated = saturate(x);',
+                '    precise float scaled = saturated * scale;',
+                '    return (uint)floor(scaled + 0.5f);',
+                '}',
+                'void store_format_xyzw(RWByteAddressBuffer buf, uint word3, uint stride, uint num_records, '
+                'uint idx, uint voff, uint soff, uint imm_off, uint4 v) {',
+                '    if ((word3 & 0xcef80000u) != 0u || (word3 & 0xfffu) != 0xfacu) return;',
+                '    uint oob_sel = (word3 >> 28u) & 3u;',
+                '    if ((oob_sel != 0u && oob_sel != 3u) || stride > 0x3fffu) return;',
+                '    uint field = (word3 >> 12u) & 127u;',
+                '    uint fmt = 0u;',
+                '    if (((word3 >> 24u) & 1u) != 0u) {',
+                '        fmt = field;',
+                '    } else {',
+                *legacy,
+                '    }',
+                '    uint elem_bytes = (fmt == 75u || fmt == 77u) ? 16u : fmt == 71u ? 8u : (fmt == 50u || fmt == 56u) ? 4u : 0u;',
+                '    if (elem_bytes == 0u) return;',
+                '    if (voff > 0xffffffffu - imm_off) return;',
+                '    uint rec_off = voff + imm_off;',
+                '    uint addr = 0u;',
+                '    if (oob_sel == 3u) {',
+                '        if (stride != 0u) return;',
+                '        if (soff > 0xffffffffu - rec_off) return;',
+                '        addr = soff + rec_off;',
+                '        if (elem_bytes > num_records || addr > num_records - elem_bytes) return;',
+                '    } else {',
+                '        if (stride == 0u) return;',
+                '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
+                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                '        uint elem_addr = idx * stride + rec_off;',
+                '        if (soff > 0xffffffffu - elem_addr) return;',
+                '        addr = elem_addr + soff;',
+                '    }',
+                '    if ((addr & 3u) != 0u) return;',
+                '    uint uav_bytes = 0u;',
+                '    buf.GetDimensions(uav_bytes);',
+                '    if (uav_bytes < elem_bytes || addr > uav_bytes - elem_bytes) return;',
+                '    if (elem_bytes == 16u) {',
+                '        buf.Store4(addr, v);',
+                '    } else if (fmt == 71u) {',
+                '        buf.Store2(addr, uint2(pack16_rne(asfloat(v.x)) | (pack16_rne(asfloat(v.y)) << 16u), '
+                'pack16_rne(asfloat(v.z)) | (pack16_rne(asfloat(v.w)) << 16u)));',
+                '    } else if (fmt == 56u) {',
+                '        buf.Store(addr, store_unorm(v.x, 255.0f) | (store_unorm(v.y, 255.0f) << 8u) '
+                '| (store_unorm(v.z, 255.0f) << 16u) | (store_unorm(v.w, 255.0f) << 24u));',
+                '    } else {',
+                '        buf.Store(addr, store_unorm(v.x, 1023.0f) | (store_unorm(v.y, 1023.0f) << 10u) '
+                '| (store_unorm(v.z, 1023.0f) << 20u) | (store_unorm(v.w, 3.0f) << 30u));',
+                '    }',
+                '}',
+            ))
         return out
 
     def interface(self, for_pixel):

@@ -14894,6 +14894,22 @@ python -B tests/startup_compute_store_d16_x_check.py binary llvm-mc-15
 
 Not covered here: `llvm-mc-15` assembly step on Linux CI (`binary`), `OOB_SELECT=3` with nonzero stride, multi-channel `buffer_store_format_d16_{xy,xyz,xyzw}`, `buffer_store_format_d16_hi_x`, and live runtime slot-67 dispatch binding of `uav_descword3`/`uav_stride`/`uav_numrecords`.
 
+### Startup compute formatted four-component buffer stores
+
+[The startup translator](../tools/startup/gfx2hlsl.py) (`op_buffer_store_format_xyzw`, refs `#2274`) lowers compute MUBUF `buffer_store_format_xyzw` (`0x07`) in the `idxen` form with a non-negative inline `soffset` and an optional `offset:`. The descriptor rules, entry constants (`uav_descword3`, `uav_stride`, `uav_numrecords`), RDNA 2 `OOB_SELECT` 0/3 bounds and the `if (exec & 1)` guard are those of `buffer_store_format_d16_x` above; the bounds lines of the two helpers are checked to be identical, and the same host-view guard (`GetDimensions`) drops an element that would pass the bound UAV. FORMAT is read at dispatch. Only the 4-channel formats of [`compute_store_aot.py`](../tools/compute_store_aot.py) write, with its conversions: `BUF_FMT_32_32_32_32_UINT`/`FLOAT` (75/77, `Store4`), `BUF_FMT_16_16_16_16_FLOAT` (71, binary32 to binary16 round to nearest even through `pack16_rne`), `BUF_FMT_8_8_8_8_UNORM` (56) and `BUF_FMT_2_10_10_10_UNORM` (50, x in bits 9:0), UNORM by the Direct3D half-away-from-zero rule with NaN to 0, in the unified and legacy `DFMT`/`NFMT` encodings, with identity `DST_SEL` `0xfac`. As in that tool, a format of another channel count writes nothing: what the format unit does with the extra components is not established here. All writes are whole aligned dwords, so no read-modify-write is needed. `offen`, `idxen offen`, `off`, a register `soffset`, `glc`/`slc`/`dlc`/`tfe`/`lds` and the descriptor cases refused for `d16_x` are refused by name; outside compute the opcode keeps the unknown-op refusal.
+
+[The `buffer_store_format_xyzw` check](../tests/startup_compute_store_format_xyzw_check.py) runs a CPU reference of the conversions (every binary16 value round-trips, every UNORM code of 2, 8 and 10 bits reads back, named ties and overflows), checks that the format set equals the 4-channel subset of `compute_store_aot.py`, the word 3 validator over every FORMAT field in both encodings, the exact emitted helper, calls and manifests (including separate entry constants for a second UAV), 32 translator refusals, and translator mutations (handler removed, legacy table changed, EXEC guard dropped) that turn it red. It dispatches three source-built `gfx1013` programs in 19 cases: `X` (six writing format cases and nine descriptors that must write nothing: 1- and 2-channel formats, `OOB_SELECT` 1/2, swapped `DST_SEL`, stride/OOB mismatches, `SWIZZLE_ENABLE`, element larger than the stride), `R` (`soffset` 4 and `offset:12` under raw and structured bounds) and `E` (`s_and_saveexec_b32` lane guard). On WARP (`Microsoft Basic Render Driver` `1414:008c`, driver `10.0.26100.10068`) with the D3D12 debug layer, through an `offscreen_check` built from an earlier tree and its root-descriptor `--compute-store-case` mode, all 19 cases matched all `320` words (`mismatches=0`, `debug_errors=0 debug_warnings=0`), and all nine shader mutants were rejected (`x-drop-store`, `x-swap-xy`, `x-drop-index-oob`, `unorm8-trunc`, `unorm10-w-scale`, `f16-drop-odd`, `mismatch-writes`, `r-drop-soffset`, `e-drop-exec`). The check now dispatches through `--compute-store-sized-case`, as the `d16_x` check does, because `GetDimensions` has no defined size on a root descriptor; that runner mode needs the per-case root constants of the `d16_x` change and was not run here.
+
+```powershell
+. .\tools\dev.ps1
+cmake --preset release
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -j 1 -R "^startup_compute_store_format_xyzw" -V
+python -B tests/startup_compute_store_format_xyzw_check.py binary llvm-mc-15
+```
+
+Not covered here: hardware adapters, the `llvm-mc-15` `binary` step, formats with fewer than four channels (they write nothing), `OOB_SELECT` 1, a dispatch against a host view shorter than the guest range (the guard is checked only as emitted text), and runtime binding of the three entry constants.
+
 ### First active lane at compute entry
 
 The startup compute translator accepts `s_ff1_i32_b32 sN, exec_lo` in the
