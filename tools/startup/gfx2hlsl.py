@@ -1951,6 +1951,22 @@ class Stage:
                 self.set_s(d + 1, '0x%08xu' % ((value >> 32) & 0xffffffff), ('const', (value >> 32) & 0xffffffff))
             self.masks.discard(d)
             return None
+        if base in SCALAR_CONST_FOLD:
+            # Constant operands give a known word, so a descriptor built from them (an inline sampler from
+            # s_movk_i32, s_bfm_b32, s_mov_b32 and s_brev_b32 into s[N:N+3]) is a constant descriptor.
+            def known(tok):
+                r = reg_range(tok)
+                if r and r[0] == 's' and r[1] == r[2]:
+                    return self.is_const(r[1])
+                if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', tok) and tok not in FLOATS:
+                    return int(tok, 0) & 0xffffffff
+                return None
+            operands = [known(t) for t in srcs]
+            if None not in operands:
+                value = SCALAR_CONST_FOLD[base](*operands) & 0xffffffff
+                self.set_s(d, '0x%08xu' % value, ('const', value))
+                self.masks.discard(d)
+                return None
         if base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known:
             self.set_s(d, 'exec')
             self.sym[d] = ('execcopy',)
@@ -3840,6 +3856,11 @@ SCA = {
     's_lshl3_add_u32': ('({0} << 3) + {1}', None), 's_lshl4_add_u32': ('({0} << 4) + {1}', None),
 }
 # shift amount of the scalar shift-and-add forms; their SCC is a carry from the sources, not a rule over the result
+# SCA operations folded when every operand is a known constant (Stage.scalar), computing what their SCA text
+# computes (AMD RDNA 2 ISA: S_BREV_B32 D.u[31:0] = S0.u[0:31], no SCC write). s_bfm_b32 has its own handler.
+SCALAR_CONST_FOLD = {
+    's_brev_b32': lambda a: int('{:032b}'.format(a)[::-1], 2),
+}
 SHIFT_ADD = {'s_lshl1_add_u32': 1, 's_lshl2_add_u32': 2, 's_lshl3_add_u32': 3, 's_lshl4_add_u32': 4}
 for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt', '<'), ('le', '<=')):
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
@@ -4342,7 +4363,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-11'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-13'))))
     return fnv(layout, key) if layout else key
 
 
@@ -4351,7 +4372,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-11cs')
+    key = fnv(b'x2w-startup-shader-13cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
