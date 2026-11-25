@@ -79,6 +79,7 @@ SRWLOCK draw_lock = SRWLOCK_INIT;
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
+LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
 
 void count_null_binding(x2w_local::NullCause cause)
@@ -711,6 +712,27 @@ void request_translation(Wrapper* pipeline)
     if (first_calls(lookups, 16))
         log("x2w-render ExecuteIndirect looks up translation for pipeline %p (%s)", static_cast<void*>(pipeline),
             known ? "already known" : "new");
+}
+
+// Side-effect-free pipeline key lookup for ExecuteIndirect refusal attribution: never writes
+// translation request files and returns 0 when the pipeline has no known console shader key.
+u64 known_pipeline_key(Wrapper* pipeline)
+{
+    if (!pipeline) return 0;
+    if (pipeline->own().mesh86_key) return pipeline->own().mesh86_key;
+    if (pipeline->own().compute_trace_key) return pipeline->own().compute_trace_key;
+    if (pipeline->own().real) return 0;
+    AcquireSRWLockShared(&draw_lock);
+    const auto& by_pipeline = translation_by_pipeline();
+    const auto known = by_pipeline.find(pipeline);
+    u64 key = known != by_pipeline.end() && known->second && known->second->translation
+        ? known->second->translation->key : 0;
+    ReleaseSRWLockShared(&draw_lock);
+    if (!key) {
+        const PipelineInfo* info = pipeline_info(pipeline);
+        if (info && info->path == 86 && info->stream_translation) key = info->stream_translation->key;
+    }
+    return key;
 }
 
 bool needs_rtv_variant(DXGI_FORMAT format)
@@ -1798,6 +1820,7 @@ struct FormattedBufferDescriptor {
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
     const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
+        InterlockedIncrement(&formatted_draws_refused);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-draw %016llx srv %d: formatted buffer refused (%s %u)", tr.key, slot, reason, detail);
@@ -1816,11 +1839,25 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
-        if (descriptor.words[0] == view_token_magic)
-            return refuse(ud.a, "missing hardware descriptor");
+        if (descriptor.words[0] == view_token_magic) {
+            // A typed buffer view the title created: the driver builds word 3 from its format and component mapping.
+            ViewRecord record{};
+            AcquireSRWLockShared(&note_lock);
+            const bool known = descriptor.words[1] < view_records().size();
+            if (known) record = view_records()[descriptor.words[1]];
+            ReleaseSRWLockShared(&note_lock);
+            if (!known || record.slot != 18 || record.desc_bytes < 40)
+                return refuse(ud.a, "missing hardware descriptor");
+            D3D12_SHADER_RESOURCE_VIEW_DESC view;
+            std::memcpy(&view, record.desc, 40);
+            if (const char* reason = x2w_startup::view_word3(view, descriptor.words[3])) return refuse(ud.a, reason);
+            descriptor.entry = entry;
+            continue;
+        }
         const auto format = x2w_startup::formatted_buffer_code(descriptor.words[3]);
         if (!x2w_startup::formatted_buffer_supported(format))
             return refuse(ud.a, "unsupported FORMAT", format);
+        if (const char* reason = x2w_startup::descriptor_word3_refusal(descriptor.words[3])) return refuse(ud.a, reason);
         descriptor.entry = entry;
     }
     return true;
@@ -1989,13 +2026,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
                 // The view recorded from the title names a packed format: follow a stand-in texture,
                 // and bind nothing for a texture the view does not fit (packed_target_format.h).
-                const auto verdict = x2w_startup::packed_view(desc.Format, texture->GetDesc().Format, x2w_startup::packed_stand_in_of(texture));
-                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                const auto actual = texture->GetDesc().Format;
+                const auto verdict = x2w_startup::packed_view(desc.Format, actual, x2w_startup::packed_stand_in_of(texture));
+                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = actual;
                 if (verdict == x2w_startup::PackedView::refused) {
                     static LONG refused;
                     if (first_calls(refused, 6))
                         log("x2w-draw   %016llx srv %u: packed format %d on a texture of format %d that does not stand in for it; binding null",
-                            tr->key, i, desc.Format, texture->GetDesc().Format);
+                            tr->key, i, desc.Format, actual);
                     texture = nullptr;
                     desc = {};
                     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2012,7 +2050,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 return false;
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
-            if (texture) require_state(self, texture, sampled_state(self, texture));
+            if (texture) {
+                require_state(self, texture, sampled_state(self, texture));
+                if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
+            }
             const bool had_texture = texture != nullptr;
             bool mismatched = false;
             static LONG shown;
@@ -2117,7 +2158,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
-        if (bytes > (16u << 20)) bytes = 16u << 20;
+        if (bytes > (16u << 20)) {
+            bytes = 16u << 20;
+            // Formatted loads past the copy would read zeros on the desktop; refuse the draw instead.
+            if (formatted.entry) {
+                InterlockedIncrement(&formatted_draws_refused);
+                static LONG refused;
+                if (first_calls(refused, 6))
+                    log("x2w-draw %016llx srv %u: formatted buffer refused (buffer larger than the 16 MiB draw copy)", tr->key, i);
+                ReleaseSRWLockExclusive(&draw_lock);
+                return false;
+            }
+        }
         // A buffer binding that ends up without a readable range counts as a null binding with its cause.
         const auto count_buffer = [&](bool bound) {
             x2w_local::BindingFacts buffer_facts;
@@ -2157,6 +2209,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // slot the title leaves empty here; why is not known yet.
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
         if (!have && formatted.entry) {
+            InterlockedIncrement(&formatted_draws_refused);
             static LONG refused;
             if (first_calls(refused, 6))
                 log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
