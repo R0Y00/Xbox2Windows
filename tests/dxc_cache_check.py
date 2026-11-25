@@ -37,12 +37,12 @@ class Rig:
         os.chmod(self.compiler, os.stat(self.compiler).st_mode | stat.S_IEXEC)
         self.n = 0
 
-    def compile(self, source, extra=(), cache=True, check=False):
-        """Compile into a fresh output path; return (result, object bytes, real call count)."""
+    def compile(self, source, extra=(), cache=True, check=False, out=None):
+        """Compile into a fresh (or given) output path; return (result, object bytes)."""
         self.n += 1
         src = self.root / "in.hlsl"
         src.write_text(source)
-        out = self.root / ("out%d.cso" % self.n)
+        out = out or self.root / ("out%d.cso" % self.n)
         if cache:
             os.environ[dxc_cache.ENV_VAR] = self.cache
         else:
@@ -107,6 +107,16 @@ def main():
                 fail("replayed failure raised the wrong return code")
         else:
             fail("replayed failure did not raise with check=True")
+
+        stale = Path(root) / "stale.cso"
+        _, seeded = rig.compile("void main(){ /*seed*/ }", out=stale)
+        if seeded is None:
+            fail("seed compile wrote no output")
+        rig.compile("BROKEN stale", out=stale)
+        absent = Path(root) / "absent.cso"
+        replay, nothing = rig.compile("BROKEN stale", out=absent)
+        if replay.returncode != 3 or nothing is not None or absent.exists():
+            fail("failed compile replayed an output file the compiler never wrote")
 
         before = rig.calls()
         rig.compile("void main(){}", cache=False)

@@ -171,6 +171,7 @@ def run_dxc(compiler, args, **options):
         except (KeyError, ValueError, TypeError):
             cached = None
     if cached is None:
+        existed = any(os.path.lexists(path) for path in outputs.values())
         done = subprocess.run(command, capture_output=True, timeout=timeout)
         stdout, stderr, returncode = done.stdout, done.stderr, done.returncode
         files = {}
@@ -178,11 +179,15 @@ def run_dxc(compiler, args, **options):
             if os.path.isfile(path):
                 with open(path, "rb") as handle:
                     files[flag] = handle.read()
-        os.makedirs(cache_dir, exist_ok=True)
-        record = {"returncode": returncode, "stdout": _scrub(stdout, mapping).hex(),
-                  "stderr": _scrub(stderr, mapping).hex(),
-                  "files": {flag: data.hex() for flag, data in files.items()}}
-        _store(entry, json.dumps(record).encode())
+        # A failure is cached only when no output existed beforehand, and never with files.
+        if returncode != 0:
+            files = {}
+        if returncode == 0 or not existed:
+            os.makedirs(cache_dir, exist_ok=True)
+            record = {"returncode": returncode, "stdout": _scrub(stdout, mapping).hex(),
+                      "stderr": _scrub(stderr, mapping).hex(),
+                      "files": {flag: data.hex() for flag, data in files.items()}}
+            _store(entry, json.dumps(record).encode())
     else:
         for flag, data in files.items():
             _write_file(outputs[flag], data)
