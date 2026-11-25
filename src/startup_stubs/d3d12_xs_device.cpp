@@ -41,6 +41,7 @@
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/list_copy.h"
+#include "startup_stubs/rect_indirect_args.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -2293,7 +2294,8 @@ void reset_list_dynamic_state(Wrapper* self)
     pass_of(self).default_viewport_h = pass_of(self).default_scissor_h = 0;
 }
 
-// List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).
+// List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list: translated draws and indirect
+// non-indexed draws expand it to triangles; the topology is not forwarded as such.
 void __stdcall list_topology(Wrapper* self, UINT topology)
 {
     pass_of(self).topology_ok = topology >= 1 && topology <= 5;
@@ -2557,9 +2559,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
             return refuse("indirect graphics requires one matching target, viewport and scissor");
-        if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
-            !(translated && indexed && pass.topology == 0x11))
-            return refuse("indirect draw requires triangle-list topology or a translated indexed rectangle");
+        const bool rect_list = !mesh && pass.topology == 0x11;
+        if (rect_list && indexed && !translated)
+            return refuse("indirect rectangle list requires a non-indexed draw");
+        if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+            return refuse("indirect draw requires triangle-list or rectangle-list topology");
         if (!pass.indirect_graphics.cached_mesh) {
             const auto samples = pass.target0->GetDesc().SampleDesc;
             if (samples.Count != 1 || samples.Quality)
@@ -2644,6 +2648,23 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         else require_state(self, index_view.resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         list->IASetIndexBuffer(&index_view.view);
     }
+    const bool rect_list = graphics && !mesh && pass.topology == 0x11;
+    ID3D12Resource* scratch = nullptr;
+    ID3D12Resource* draw_arguments = resource;
+    u64 draw_offset = offset;
+    if (rect_list) {
+        // The producer's count names three vertices per rectangle; the desktop draw needs six. Convert on the GPU
+        // into a scratch record and draw from that. The compute root signature and bindings of the list are replaced.
+        const auto source = resource->GetGPUVirtualAddress();
+        if (!source || offset > ~u64{} - source) return refuse("argument buffer has no desktop address");
+        require_state(self, resource, argument_state | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        scratch = x2w_startup::rect_indirect_arguments().convert(list, source + offset);
+        if (!scratch) return refuse("rectangle-list argument conversion is unavailable");
+        if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        draw_arguments = scratch;
+        draw_offset = 0;
+    }
     if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
@@ -2669,11 +2690,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
-    require_state(self, resource, argument_state);
+    if (!rect_list) require_state(self, resource, argument_state);
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
-    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, counts,
+    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
+    if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated

@@ -110,6 +110,21 @@ void write_two_mesh_groups() {
     data.Store3(4, uint3(2, 1, 1));
 }
 
+[numthreads(1, 1, 1)]
+void write_one_rect() {
+    data.Store4(4, uint4(3, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
+void write_two_rects() {
+    data.Store4(4, uint4(6, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
+void write_overflowing_rects() {
+    data.Store4(4, uint4(0xffffffff, 1, 0, 0));
+}
+
 struct Varying {
     float4 position : SV_Position;
     nointerpolation uint side : SIDE;
@@ -120,6 +135,22 @@ Varying vertex(uint id : SV_VertexID) {
     uint corner = id % 3;
     result.position = float4(corner == 2 ? 3 : -1, corner == 1 ? 3 : -1, 0, 1);
     result.side = id / 3;
+    return result;
+}
+
+// One rectangle is three console vertices (bottom-left, bottom-right, top-right); the desktop draw spends six
+// vertices on it: the triangles (v0, v1, v2) and (v0, v2, v3) with v3 = v0 + v2 - v1.
+Varying vertex_rect(uint id : SV_VertexID) {
+    Varying result;
+    const uint rect = id / 6;
+    const uint corner[6] = {0, 1, 2, 0, 2, 3};
+    const float2 v0 = float2(rect == 0 ? -1 : 0, -1);
+    const float2 v1 = float2(rect == 0 ? 0 : 1, -1);
+    const float2 v2 = float2(rect == 0 ? 0 : 1, 1);
+    const float2 v3 = v0 + v2 - v1;
+    const uint c = corner[id % 6];
+    result.position = float4(c == 0 ? v0 : c == 1 ? v1 : c == 2 ? v2 : v3, 0, 1);
+    result.side = rect;
     return result;
 }
 
@@ -402,8 +433,8 @@ enum class Refusal { none, index_upload_cross, index_upload_foreign, index_uploa
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending };
-enum class DrawKind { indexed, vertices, mesh, indexed_rect };
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count };
+enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
 {
@@ -495,7 +526,8 @@ constexpr UINT command_stride(DrawKind kind)
     switch (kind) {
     case DrawKind::indexed_rect:
     case DrawKind::indexed: return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
-    case DrawKind::vertices: return sizeof(D3D12_DRAW_ARGUMENTS);
+    case DrawKind::vertices:
+    case DrawKind::rect: return sizeof(D3D12_DRAW_ARGUMENTS);
     case DrawKind::mesh: return sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
     }
     return 0;
@@ -705,7 +737,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         slot<Table>(wrapped, 36)(wrapped, 0, translated->gpu);
     }
     if (!mesh) slot<Topology>(wrapped, 20)(wrapped,
-        rect ? static_cast<D3D12_PRIMITIVE_TOPOLOGY>(0x11) : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        rect || kind == DrawKind::rect ? static_cast<D3D12_PRIMITIVE_TOPOLOGY>(0x11)
+                                       : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (refusal != Refusal::missing_viewport) slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
     slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
     if (translated_indexed) {
@@ -871,7 +904,9 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     Words expected = initial_words;
     if (writer) {
         const UINT word = indexed_argument_offset / sizeof(std::uint32_t);
-        expected[word] = refusal == Refusal::rect_bad_count ? 4 : !translated && !indexed && draw_right ? 6 : 3;
+        expected[word] = refusal == Refusal::overflowing_count ? 0xffffffffu
+                       : refusal == Refusal::rect_bad_count ? 4
+                       : !translated && !indexed && draw_right ? 6 : 3;
         expected[word + 1] = 1;
         if (indexed) expected[word + 2] = draw_right && !translated_indexed ? 4 : 1;
         if (translated_indexed && draw_right) {
@@ -914,7 +949,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                             pixel_bytes);
                 const bool right_half = x >= width / 2;
                 const bool covered = cached_depth_only || (indexed ? right_half == draw_right : translated || !right_half || draw_right);
-                const bool drawn = writer && refusal == Refusal::none && covered;
+                const bool drawn = writer && refusal == Refusal::none && covered;  // overflowing_count draws nothing
                 const std::uint32_t background = cached_depth_only ? 0xffff : black;
                 auto wanted = drawn ? (cached_depth_only ? 0u :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
@@ -1061,6 +1096,7 @@ int main(int argc, char** argv) try
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
+    else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
     else if (console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0)) kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
     else if (argc != 2 && !count_control && !translated_indexed) return 2;
@@ -1390,6 +1426,10 @@ int main(int argc, char** argv) try
     const auto graphics = create_root(guest.Get(), graphics_desc);
     const char* left_entry = indexed ? "write_left" : "write_one_triangle";
     const char* right_entry = indexed ? "write_right" : "write_two_triangles";
+    if (kind == DrawKind::rect) {
+        left_entry = "write_one_rect";
+        right_entry = "write_two_rects";
+    }
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
     argument.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
     ComPtr<IUnknown> pso;
@@ -1410,13 +1450,14 @@ int main(int argc, char** argv) try
             pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS>(guest.Get(), graphics.Get(), ms, ps);
         }
     } else {
-        const auto vs = compile("vertex", "vs_5_0");
+        const auto vs = compile(kind == DrawKind::rect ? "vertex_rect" : "vertex", "vs_5_0");
         const auto ps = compile("pixel", "ps_5_0");
         pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS>(guest.Get(), graphics.Get(),
             {vs->GetBufferPointer(), vs->GetBufferSize()}, {ps->GetBufferPointer(), ps->GetBufferSize()});
     }
     const auto left = writer_pipeline(device.Get(), writer.Get(), left_entry);
     const auto right = writer_pipeline(device.Get(), writer.Get(), right_entry);
+    const auto overflow = kind == DrawKind::rect ? writer_pipeline(device.Get(), writer.Get(), "write_overflowing_rects") : nullptr;
     const D3D12_COMMAND_SIGNATURE_DESC signature_desc{command_stride(kind), 1, &argument, 0};
     ComPtr<ID3D12CommandSignature> signature;
     check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest draw signature");
@@ -1427,6 +1468,10 @@ int main(int argc, char** argv) try
     };
     const char* left_label = indexed ? "left writer" : "one triangle";
     const char* right_label = indexed ? "right writer" : "two triangles";
+    if (kind == DrawKind::rect) {
+        left_label = "one rectangle";
+        right_label = "two rectangles";
+    }
     if (mesh) {
         left_label = "one mesh group";
         right_label = "two mesh groups";
@@ -1456,6 +1501,9 @@ int main(int argc, char** argv) try
         }
         std::printf("%s\n", line.c_str());
     }
+    if (kind == DrawKind::rect &&
+        !run(device.Get(), guest.Get(), writer.Get(), overflow.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
+             false, Refusal::overflowing_count, "overflowing rectangle count")) return 1;
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;

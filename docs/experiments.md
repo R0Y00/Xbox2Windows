@@ -12787,6 +12787,31 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 - Raw desktop topology rejection: passing raw `0x11` to desktop `CreateGraphicsPipelineState`
   is rejected with `0x80070057` (`E_INVALIDARG`).
 
+### Indirect Draw with a rectangle list
+
+An indirect `Draw` whose recorded topology is `0x11` is forwarded as a triangle-list `ExecuteIndirect`
+([#1999](https://github.com/R0Y00/Xbox2Windows/issues/1999), item E). The producer's GPU-written
+`VertexCountPerInstance` names three vertices per rectangle, so the runtime records a one-thread compute pass
+([`rect_indirect_args.h`](../src/startup_stubs/rect_indirect_args.h)) that writes `count / 3 * 6` (other words
+unchanged) into a scratch record, and the desktop draw reads that record. The title's own argument buffer is not
+modified. A count that would not fit 32 bits becomes 0 vertices. The model is
+`convert_indirect_draw_arguments` in [`rectlist_topology.py`](../tools/rectlist_topology.py).
+
+The compute pass replaces the list's compute root signature (the runtime re-sets the title's last one, without its
+arguments). An indexed draw with `0x11` is still refused, as in the direct draw. Other console-only topologies are
+not handled.
+
+```powershell
+cmake --build --preset dev --target startup_indirect_draw_indexed
+ctest --preset dev --no-tests=error -R '^startup_indirect_rectlist_(warp|hardware)$' -V
+```
+
+[The fixture](../tests/startup_indirect_draw_indexed.cpp) (`rect` mode) has a compute producer write one or two
+rectangles into a 4x2 target through a vertex shader that builds `(v0, v1, v2)` and `(v0, v2, v0 + v2 - v1)`. It
+reads the pixels back (left half red, right half green) and the argument words (unchanged). An omitted producer, a
+short argument range, a missing viewport and an overflowing count must leave the target clear. Without the
+conversion the runtime refuses the draw and the first case stays clear.
+
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
 
