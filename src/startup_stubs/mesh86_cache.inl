@@ -62,6 +62,34 @@ bool mesh86_hardware_depth()
         !(desc.VendorId == 0x1414 && desc.DeviceId == 0x008c);
 }
 
+void mesh86_clear_state_padding(unsigned char* record, UINT type, std::size_t size)
+{
+    constexpr std::size_t tag_size = sizeof(UINT);
+    if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
+        constexpr auto targets = tag_size + offsetof(D3D12_BLEND_DESC, RenderTarget);
+        constexpr auto stride = sizeof(D3D12_RENDER_TARGET_BLEND_DESC);
+        constexpr auto fields = offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1;
+        static_assert(stride == 40 && fields == 37);
+        for (UINT i = 0; i < 8; ++i)
+            std::memset(record + targets + i * stride + fields, 0, stride - fields);
+        constexpr auto used = tag_size + sizeof(D3D12_BLEND_DESC);
+        std::memset(record + used, 0, size - used);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
+               type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+        constexpr auto masks = offsetof(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + 1;
+        constexpr auto faces = offsetof(D3D12_DEPTH_STENCIL_DESC, FrontFace);
+        static_assert(masks == offsetof(D3D12_DEPTH_STENCIL_DESC1, StencilWriteMask) + 1 &&
+                      faces == offsetof(D3D12_DEPTH_STENCIL_DESC1, FrontFace));
+        std::memset(record + tag_size + masks, 0, faces - masks);
+        const auto used = tag_size + (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL
+            ? sizeof(D3D12_DEPTH_STENCIL_DESC) : sizeof(D3D12_DEPTH_STENCIL_DESC1));
+        std::memset(record + used, 0, size - used);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
+        constexpr auto used = tag_size + sizeof(DXGI_SAMPLE_DESC);
+        std::memset(record + used, 0, size - used);
+    }
+}
+
 // Parse the entire stream and keep a pointer-free copy. The shared tag is only
 // recognized as Xbox MS when its shader container declares mesh and native code.
 bool mesh86_request(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Mesh86Request& result, bool& recognized)
@@ -122,9 +150,7 @@ bool mesh86_request(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Mesh86Request&
         if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE || mesh ||
             (type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS))
             std::memset(record + 4, 0, 4);
-        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)
-            std::memset(record + size - 4, 0, 4);
+        mesh86_clear_state_padding(record, type, size);
         offset += size;
     }
     return recognized && result.root && result.root->own().kind == root_signature_kind;
@@ -169,12 +195,21 @@ ID3D12PipelineState* try_cached_mesh86(const D3D12_PIPELINE_STATE_STREAM_DESC& d
         std::snprintf(why, why_size, "slot86 mesh request %016llx: root heap indexing (0x%x) has no verified binding", key, flags);
         return nullptr;
     }
-    if (!params || !request.root->own().real || params->size() > 16 ||
-        std::any_of(params->begin(), params->end(), [](const RootParameter& parameter) {
-            return parameter.type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
-                parameter.constants_count == 0 || parameter.constants_count > 8;
-        })) {
-        std::snprintf(why, why_size, "slot86 mesh request %016llx: root bindings outside tracked constants", key);
+    if (!params || !request.root->own().real || params->size() > 16) {
+        std::snprintf(why, why_size, "slot86 mesh request %016llx: untracked root", key);
+        return nullptr;
+    }
+    UINT srv_root = UINT_MAX;
+    for (UINT i = 0; i < params->size(); ++i) {
+        const auto& parameter = (*params)[i];
+        if (parameter.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+            parameter.constants_count && parameter.constants_count <= 8) continue;
+        if ((mesh_xmem_handoff() || mesh_xmem_loose_srv()) && srv_root == UINT_MAX && parameter.type == D3D12_ROOT_PARAMETER_TYPE_SRV &&
+            parameter.shader_register == 0 && parameter.space == 0 && !request.ps.empty()) {
+            srv_root = i;
+            continue;
+        }
+        std::snprintf(why, why_size, "slot86 mesh request %016llx: root bindings outside supported profile", key);
         return nullptr;
     }
     std::string ready;
@@ -199,9 +234,11 @@ ID3D12PipelineState* try_cached_mesh86(const D3D12_PIPELINE_STATE_STREAM_DESC& d
     const D3D12_SHADER_BYTECODE pixel = ps ? D3D12_SHADER_BYTECODE{ps->GetBufferPointer(), ps->GetBufferSize()} :
         D3D12_SHADER_BYTECODE{};
     char expected[96];
-    std::snprintf(expected, sizeof(expected), "x2w-mesh86 1 %016llx %016llx %016llx\n", key,
+    std::snprintf(expected, sizeof(expected), "x2w-mesh86 %u %016llx %016llx %016llx%s\n",
+        srv_root == UINT_MAX ? 1u : 2u, key,
         fnv_bytes(mesh.pShaderBytecode, mesh.BytecodeLength),
-        ps ? fnv_bytes(pixel.pShaderBytecode, pixel.BytecodeLength) : 0);
+        ps ? fnv_bytes(pixel.pShaderBytecode, pixel.BytecodeLength) : 0,
+        srv_root == UINT_MAX ? "" : " srv 0 0 4");
     if (ready != expected || desktop_dxil_mesh_stage(mesh) != DxilMeshStage::mesh ||
         (ps && desktop_dxil_mesh_stage(pixel) != DxilMeshStage::pixel)) {
         std::snprintf(why, why_size, "slot86 mesh request %016llx: cache key, stage or bytecode mismatch", key);
@@ -220,6 +257,7 @@ ID3D12PipelineState* try_cached_mesh86(const D3D12_PIPELINE_STATE_STREAM_DESC& d
     bool compute = false;
     auto* result = build_stream_pipeline(&desktop, why, why_size, compute, graphics,
         static_cast<ID3D12RootSignature*>(request.root->own().real));
+    if (result) graphics.cached_srv_root = srv_root;
     static LONG loaded;
     if (result && first_calls(loaded, 24))
         log("x2w-render slot86 mesh %016llx: cached pipeline loaded, %u color targets, depth format %u",
