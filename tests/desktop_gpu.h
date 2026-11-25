@@ -25,15 +25,19 @@ float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, 
                                  std::uint32_t byte_offset, const char* manifest, const char* binding_case);
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
-                            bool one_dimensional = false, bool two_dimensional = false);
+                            bool one_dimensional = false, bool two_dimensional = false,
+                            UINT first_mip = 0, UINT view_levels = 0);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t words[64]);
+                                  bool depth16, std::uint32_t words[64], bool array = false);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
                               const std::uint32_t expected[4]);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
                               UINT vertices = 3);
+void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                               const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
+                               UINT width = 1, UINT height = 1);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
@@ -41,7 +45,7 @@ void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
-                        bool dpp_case = false, bool sized_views = false);
+                        bool dpp_case = false, bool sized_views = false, UINT uav_words = 0);
 void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
 bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
                                      const char* vs_path, const char* ps_path);
@@ -118,6 +122,7 @@ void check_wave64_emulate(ID3D12Device* device);
 bool check_shader_wave(ID3D12Device* device, unsigned forced);
 bool check_dxr_address_ranges(ID3D12Device* device);
 bool check_dxr_placed_build(ID3D12Device* device);
+bool check_dxr_slot70_as(ID3D12Device* device);
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline);
 bool check_dxr_update(ID3D12Device* device, bool usePipeline);
 bool check_dxr_facing(ID3D12Device* device, bool usePipeline);
@@ -131,6 +136,9 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
 struct ComputeCommands {
     ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline,
                     D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    // Records on a new list for an existing queue of the list's type. Releasing the commands then
+    // leaves that queue alive.
+    ComputeCommands(ID3D12Device* device, ID3D12CommandQueue* existing, ID3D12PipelineState* pipeline);
     void submit_and_wait(ID3D12Device* device);
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
