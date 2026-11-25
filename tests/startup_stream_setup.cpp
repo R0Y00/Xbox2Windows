@@ -73,6 +73,45 @@ void* stream_root_signature() { return stream_root; }
 void* stream_alternate_root_signature() { return stream_alternate_root; }
 const std::vector<char>& stream_root_blob() { return stream_root_bytes; }
 
+int pick_stream_adapter(bool hardware, ComPtr<IDXGIAdapter>& adapter)
+{
+    ComPtr<IDXGIFactory4> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
+    if (!hardware) return SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))) ? 0 : 4;
+
+    wchar_t wanted[128]{};
+    const DWORD length = GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", wanted, 128);
+    if (length >= 128) {
+        std::fputs("XBOX2WINDOWS_ADAPTER is longer than 127 characters\n", stderr);
+        return 4;
+    }
+    ComPtr<IDXGIFactory6> factory6;
+    if (FAILED(factory.As(&factory6))) return 77;
+    for (UINT n = 0;; ++n) {
+        ComPtr<IDXGIAdapter1> candidate;
+        const HRESULT hr = factory6->EnumAdapterByGpuPreference(
+            n, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+            if (!length) return 77;
+            std::fprintf(stderr, "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
+            return 4;
+        }
+        if (FAILED(hr)) return 4;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(candidate->GetDesc1(&desc))) return 4;
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        bool matches = length == 0;
+        for (const wchar_t* p = desc.Description; !matches && *p; ++p) {
+            matches = _wcsnicmp(p, wanted, length) == 0;
+        }
+        if (matches && SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0,
+                                                    __uuidof(ID3D12Device), nullptr))) {
+            adapter = candidate;
+            return 0;
+        }
+    }
+}
+
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
                             void*& device, void*& pso)
@@ -91,25 +130,7 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
         debug->EnableDebugLayer();
     }
 
-    ComPtr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
-    if (hardware) {
-        ComPtr<IDXGIFactory6> factory6;
-        if (FAILED(factory.As(&factory6))) return 77;
-        for (UINT n = 0;; ++n) {
-            ComPtr<IDXGIAdapter1> candidate;
-            HRESULT hr = factory6->EnumAdapterByGpuPreference(n, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
-            if (hr == DXGI_ERROR_NOT_FOUND) return 77;
-            if (FAILED(hr)) return 4;
-            DXGI_ADAPTER_DESC1 desc{};
-            if (FAILED(candidate->GetDesc1(&desc))) return 4;
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-                SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
-                adapter = candidate;
-                break;
-            }
-        }
-    } else if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) return 4;
+    if (const int rc = pick_stream_adapter(hardware, adapter)) return rc;
     DXGI_ADAPTER_DESC desc{};
     LARGE_INTEGER driver{};
     if (FAILED(adapter->GetDesc(&desc))) return 4;
@@ -260,7 +281,9 @@ Word invoke(void* object, unsigned index, Word a, Word b, Word c, Word d,
 int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width, UINT height,
                        DXGI_FORMAT format, UINT scissor_width, StreamTarget& state)
 {
-    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    StreamMrtFormat mrt{};
+    const bool typed = stream_mrt_format(format, mrt);
+    const bool integer = typed && mrt.integer;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
     // A caller that wants a second RGBA8 target sets state.count to 2 before the call.
     const UINT count = state.count = integer || state.count == 2 ? 2 : 1;
@@ -281,7 +304,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     for (UINT i = 0; i < count; ++i) {
         auto& target = targets[i];
         const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
-        const auto resource_format = !i && integer ? DXGI_FORMAT_R32_TYPELESS : view_format;
+        const auto resource_format = !i && integer ? mrt.typeless : view_format;
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
             resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
@@ -290,7 +313,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
         D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
         rtvs[i] = {first_rtv + SIZE_T{i} * stride};
         invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
-        target.row_bytes = width * (view_format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16 : view_format == DXGI_FORMAT_A8_UNORM ||
+        target.row_bytes = width * (!i && typed ? mrt.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
                                     view_format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
     }
 
