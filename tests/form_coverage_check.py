@@ -306,7 +306,7 @@ def check_shader_records():
     shift64_forms = {("VOP3", "v_lshlrev_b64"), ("VOP3", "v_lshrrev_b64"), ("VOP3", "v_ashrrev_i64")}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         assert shift64_forms <= fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name)), name
-    masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
+    masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOP1", "s_and_saveexec_b32"), ("SOPP", "s_cbranch_execz")}
     assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     # Forward skips and if/else diamonds on a tracked scalar compare (issue #1413).
     scc_skip_forms = {("SOPP", "s_cbranch_scc0"), ("SOPP", "s_cbranch_scc1"), ("SOPP", "s_branch")}
@@ -387,7 +387,7 @@ def check_shader_records():
     sop1_scalar_alu_forms = {("SOP1", op) for op in pixel.SCALAR_ALU_SOP1_OPS}
     sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
     rejected_forms = {
-        "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
+        "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "v_mul_i32_i24_sdwa",
         "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",

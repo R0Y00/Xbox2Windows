@@ -667,19 +667,69 @@ def masked_pixels(threshold, inner, complementary):
     return pixels
 
 
+# Wave32 masked regions (issue #2137): the same regions spelled with one 32-bit saved register. Each wave32
+# fixture is derived line by line from a wave64 fixture; the encodings keep their size, so skip offsets are unchanged.
+WAVE32_SPELLINGS = (
+    (r"s_and_saveexec_b64 s\[(\d+):\d+\], vcc", r"s_and_saveexec_b32 s\1, vcc_lo"),
+    (r"s_or_b64 exec, exec, s\[(\d+):\d+\]", r"s_or_b32 exec_lo, exec_lo, s\1"),
+    (r"s_mov_b64 exec, s\[(\d+):\d+\]", r"s_mov_b32 exec_lo, s\1"),
+    (r"s_andn2_b64 exec, s\[(\d+):\d+\], exec", r"s_andn2_b32 exec_lo, s\1, exec_lo"),
+)
+
+
+def wave32_line(line):
+    for pattern, spelling in WAVE32_SPELLINGS:
+        if re.fullmatch(pattern, line):
+            return re.sub(pattern, spelling, line)
+    return line
+
+
+def wave32_program(program):
+    """A wave64 masked-region program (lines or (offset, text) pairs) with its region lines in wave32 form."""
+    return [(item[0], wave32_line(item[1])) if isinstance(item, tuple) else wave32_line(item) for item in program]
+
+
+WAVE32_PREFIX = (
+    ("s_mov_b64 s[50:51], exec", "s_mov_b32 s14, exec_lo"),
+    ("s_wqm_b64 exec, exec", "s_wqm_b32 exec_lo, exec_lo"),
+    ("s_and_b64 exec, exec, s[50:51]", "s_and_b32 exec_lo, exec_lo, s14"),
+)
+WAVE32_FEATURES = "+wavefrontsize32,-wavefrontsize64"
+
+
+def wave32_fixture(program):
+    """wave32_program with the quad-mask prologue of the reference export in its wave32 spelling too, so the
+    program assembles under +wavefrontsize32."""
+    names = dict(WAVE32_PREFIX)
+    return [(item[0], names.get(item[1], item[1])) if isinstance(item, tuple) else names.get(item, item)
+            for item in wave32_program(program)]
+
+
+def translate_wave32(program):
+    return lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=32)
+
+
+WAVE32_RESTORES = ((MASKED_OR_RESTORE, "s_or_b32 exec_lo, exec_lo, s60"), (MASKED_MOV_RESTORE, "s_mov_b32 exec_lo, s60"))
+
+
 def check_masked_draw(directory, compiler, renderer, backend):
     """Draw masked regions on WARP or hardware: threshold 0.5 mixes the mask across the ramp."""
     source = directory / "masked.hlsl"
     shader = directory / "masked.cso"
     constants = bytearray(256)
-    for label, program, complementary in (
+    wave64_draws = (
             ("region", masked_region(), False), ("skip", masked_skip(), False),
             ("complementary", masked_complementary(), True),
             # Issue #1315: the same regions closed by the s_mov_b64 copy of the saved pair.
             ("region-mov", masked_region(MASKED_MOV_RESTORE), False),
             ("skip-mov", masked_skip(MASKED_MOV_RESTORE), False),
-            ("complementary-mov", masked_complementary(MASKED_MOV_RESTORE), True)):
-        source.write_text(translate(program), encoding="ascii")
+            ("complementary-mov", masked_complementary(MASKED_MOV_RESTORE), True))
+    # Issue #2137: the same regions in their wave32 spelling must draw the same pixels.
+    wave32_draws = tuple((f"w32-{label}", wave32_program(program), complementary)
+                         for label, program, complementary in wave64_draws)
+    for label, program, complementary in (*wave64_draws, *wave32_draws):
+        lowerer = translate_wave32 if label.startswith("w32-") else translate
+        source.write_text(lowerer(program), encoding="ascii")
         compile_shader(compiler, source, shader)
         cases = []
         for threshold in (0.5, 10.0, -1.0):
@@ -697,8 +747,10 @@ def check_masked_draw(directory, compiler, renderer, backend):
         mutants += [("reversed" + suffix, [line.replace("v_cmp_lt_f32_e64", "v_cmp_ge_f32_e64")
                                            for line in masked_region(restore)]),
                     ("unmasked" + suffix, unmasked)]
+    mutants += [("w32-" + label, wave32_program(program)) for label, program in tuple(mutants)]
     for mutant in mutants:
-        source.write_text(translate(mutant[1]), encoding="ascii")
+        lowerer = translate_wave32 if mutant[0].startswith("w32-") else translate
+        source.write_text(lowerer(mutant[1]), encoding="ascii")
         compile_shader(compiler, source, shader)
         case = directory / f"masked-{mutant[0]}.case"
         write_case(case, constants, expected)
@@ -774,15 +826,20 @@ def check_masked_else_draw(directory, compiler, renderer, backend):
     source = directory / "else.hlsl"
     shader = directory / "else.cso"
     constants = bytearray(256)
-    variants = [(opener, restore, skips) for opener in ELSE_OPENERS for restore in (MASKED_MOV_RESTORE,
+    variants = [(opener, restore, skips, False) for opener in ELSE_OPENERS for restore in (MASKED_MOV_RESTORE,
                 MASKED_OR_RESTORE) for skips in ELSE_SKIPS]
-    for opener, restore, skips in variants:
-        source.write_text(translate(else_region(opener, restore, skips)), encoding="ascii")
+    # Issue #2137: every saveexec if/else shape again in its wave32 spelling.
+    variants += [(opener, restore, skips, True) for opener, restore, skips, _ in tuple(variants)
+                 if opener == "saveexec"]
+    for opener, restore, skips, wave32 in variants:
+        region = else_region(opener, restore, skips)
+        source.write_text(translate_wave32(wave32_program(region)) if wave32 else translate(region), encoding="ascii")
         compile_shader(compiler, source, shader)
         cases = []
         for threshold in (0.5, 10.0, -1.0):
             struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.5)
-            case = directory / f"else-{opener}-{'mov' if restore == MASKED_MOV_RESTORE else 'or'}-{skips}-{len(cases)}.case"
+            case = directory / (f"else-{opener}-{'mov' if restore == MASKED_MOV_RESTORE else 'or'}-{skips}"
+                                f"{'-w32' if wave32 else ''}-{len(cases)}.case")
             write_case(case, constants, else_pixels(threshold))
             cases.append((case, "pass"))
         run_pixel_batch(renderer, backend, shader, cases)
@@ -795,8 +852,9 @@ def check_masked_else_draw(directory, compiler, renderer, backend):
         # A correct shader against the stale-then expectation: the draw must tell the two apart.
         ("stale-then", base, else_pixels(0.5, stale_then=True)),
     )
+    mutants += tuple(("w32-" + label, wave32_program(program), expected) for label, program, expected in mutants)
     for label, program, expected in mutants:
-        source.write_text(translate(program), encoding="ascii")
+        source.write_text((translate_wave32 if label.startswith("w32-") else translate)(program), encoding="ascii")
         compile_shader(compiler, source, shader)
         case = directory / f"else-mutant-{label}.case"
         write_case(case, constants, expected)
@@ -13376,6 +13434,125 @@ def check_masked_else_controls():
                            f"Instruction cannot run in a masked region: {extra}")
 
 
+def check_masked_wave32_controls():
+    """Issue #2137: the wave32 spellings of the masked regions lower to exactly the HLSL of their wave64 originals,
+    only under the wave32 guest profile and only with the close and else spellings of the region's own width."""
+    # HLSL equality, derived line by line: the plain region, the complementary pair, the skip and every if/else shape.
+    for restore, _ in WAVE32_RESTORES:
+        for build in (masked_region, masked_skip, masked_complementary):
+            wave64 = build(restore)
+            assert translate_wave32(wave32_program(wave64)) == translate(wave64), (build.__name__, restore)
+        for skips in ELSE_SKIPS:
+            wave64 = else_region("saveexec", restore, skips)
+            assert translate_wave32(wave32_program(wave64)) == translate(wave64), (restore, skips)
+    # The saveexec variants of the wait, scalar-ALU, scalar-load and vector-body region families.
+    for skip in (False, True):
+        for forms in ((), REGION_WAIT_FORMS):
+            wave64 = region_wait_program(forms, "saveexec", skip)
+            assert translate_wave32(wave32_program(wave64)) == translate(wave64), (forms, skip)
+        for inside in (REGION_LOAD_INSIDE, (*REGION_LOAD_RESOLVE, "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v13, s76")):
+            wave64 = region_load_program(inside, "saveexec", skip)
+            assert translate_wave32(wave32_program(wave64)) == translate(wave64), (inside, skip)
+        wave64 = region_scalar_alu_program(opener="saveexec", skip=skip)
+        assert translate_wave32(wave32_program(wave64)) == translate(wave64), skip
+    wave64 = region_body_program("v_mul_f32_e32 v13, v12, v22", True, "saveexec")
+    assert translate_wave32(wave32_program(wave64)) == translate(wave64)
+
+    # The opener, the closes and the else exist only under wave_size=32; the other profiles keep today's refusal.
+    wave32 = wave32_program(masked_region())
+    for profile in (translate, lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, wave_size=64)):
+        expect_value_error(profile, wave32, "Unsupported instruction 21: s_and_saveexec_b32 s60, vcc_lo")
+
+    save, close = "s_and_saveexec_b32 s60, vcc_lo", "s_or_b32 exec_lo, exec_lo, s60"
+    compare = "v_cmp_lt_f32_e64 vcc_lo, v12, s44"
+    body = "v_mov_b32_e32 v13, s45"
+    # Every spelling and precondition of the opener other than the one admitted: one message for all of them.
+    refused = "Unsupported execution mask save"
+    expect_value_error(translate_wave32, uncompressed_export([save, body, close]), refused)  # no tracked condition
+    for source in ("vcc", "s[52:53]", "exec_lo"):
+        expect_value_error(translate_wave32, uncompressed_export([compare, f"s_and_saveexec_b32 s60, {source}", body, close]),
+                           f"Unsupported instruction 21: s_and_saveexec_b32 s60, {source}")
+    # A condition spread over a register pair is not a single-register condition.
+    expect_value_error(translate_wave32, uncompressed_export([
+        "v_cmp_lt_f32_e64 s[52:53], v12, s44", "s_and_saveexec_b32 s60, s52", body, close]), refused)
+    # A tracked condition in another register is not the one named.
+    expect_value_error(translate_wave32, uncompressed_export([
+        compare, "s_and_saveexec_b32 s60, s52", body, close]), refused)
+    # A pending scalar load on the save register, a nested opener and a non-entry mask.
+    expect_value_error(translate_wave32, uncompressed_export(["s_load_dwordx4 s[60:63], s[20:21], 0x40", compare, save, close]), refused)
+    expect_value_error(translate_wave32, uncompressed_export([compare, save, "s_and_saveexec_b32 s58, vcc_lo", body, close]),
+                       "Instruction cannot run in a masked region: s_and_saveexec_b32 s58, vcc_lo")
+    expect_value_error(translate_wave32, uncompressed_export([compare, "s_wqm_b32 exec_lo, exec_lo", save, body, close]),
+                       refused)
+    expect_value_error(translate_wave32, uncompressed_export([compare, "s_and_saveexec_b32 s106, vcc_lo", body, close]),
+                       "Scalar register out of range: s106")
+    # The condition may sit in one other register than VCC when it is tracked there.
+    translate_wave32(uncompressed_export(["v_cmp_lt_f32_e64 s52, v12, s44", "s_and_saveexec_b32 s60, s52", body, close]))
+
+    # An unclosed region, a second close and a close of another register are not restores.
+    region = uncompressed_export([compare, save, body, close])
+    expect_value_error(translate_wave32, [line for line in region if line != close],
+                       "Instruction cannot run in a masked region: exp mrt0 v12, v13, v14, v15 done vm")
+    expect_value_error(translate_wave32, uncompressed_export([compare, save, body, close, close]),
+                       "Unsupported instruction 24: s_or_b32 exec_lo, exec_lo, s60")
+    for other in ("s_or_b32 exec_lo, exec_lo, s58", "s_mov_b32 exec_lo, s58"):
+        expect_value_error(translate_wave32, [other if line == close else line for line in region],
+                           "Unexpected execution mask restore")
+    # Only the exec_lo spellings close, and only s_or_b32 and s_mov_b32 do.
+    for other in ("s_or_b32 exec_lo, exec_lo, s60, s60", "s_and_b32 exec_lo, exec_lo, s60", "s_xor_b32 exec_lo, exec_lo, s60"):
+        expect_value_error(translate_wave32, [other if line == close else line for line in region],
+                           f"Instruction cannot run in a masked region: {other}")
+
+    # Width: a region accepts the close and else spellings of its own width only.
+    wave64 = masked_region()
+    for text in ("s_or_b32 exec_lo, exec_lo, s60", "s_mov_b32 exec_lo, s60", "s_andn2_b32 exec_lo, s60, exec_lo"):
+        changed = list(wave64)
+        changed.insert(changed.index(MASKED_OR_RESTORE), text)
+        expect_value_error(translate_wave32, changed, f"Instruction cannot run in a masked region: {text}")
+        expect_value_error(translate, changed, f"Instruction cannot run in a masked region: {text}")
+    for wave64_text, message in ((MASKED_OR_RESTORE, "Unexpected execution mask restore"),
+                                 (MASKED_MOV_RESTORE, "Unexpected execution mask restore"),
+                                 (ELSE_TRANSITION, "Unexpected execution mask else transition")):
+        changed = list(region)
+        changed.insert(changed.index(close), wave64_text)
+        expect_value_error(translate_wave32, changed, message)
+    expect_value_error(translate_wave32, [MASKED_OR_RESTORE if line == close else line for line in region],
+                       "Unexpected execution mask restore")
+
+    # The else: once per region, on the saved register only.
+    else_wave32 = wave32_program([line for _, line in else_region("saveexec", MASKED_OR_RESTORE, "none")])
+    transition = "s_andn2_b32 exec_lo, s60, exec_lo"
+    assert transition in else_wave32
+    twice = list(else_wave32)
+    twice.insert(twice.index(transition) + 1, transition)
+    expect_value_error(translate_wave32, twice, "Unexpected execution mask else transition")
+    expect_value_error(translate_wave32, [transition.replace("s60", "s58") if line == transition else line
+                                          for line in else_wave32], "Unexpected execution mask else transition")
+    expect_value_error(translate_wave32, [ELSE_TRANSITION if line == transition else line for line in else_wave32],
+                       "Unexpected execution mask else transition")
+    expect_value_error(translate_wave32, uncompressed_export([transition]),
+                       "Unsupported instruction 20: s_andn2_b32 exec_lo, s60, exec_lo")
+
+    # The skip keeps its target: the close or else of the same register in the region's own width.
+    skip = wave32_program(masked_skip(MASKED_OR_RESTORE))
+    translate_wave32(skip)
+    # The s_mov_b32 close is a matching target too; another register is not.
+    translate_wave32([(offset, "s_mov_b32 exec_lo, s60" if line == close else line) for offset, line in skip])
+    expect_value_error(translate_wave32, [(offset, "s_or_b32 exec_lo, exec_lo, s58" if line == close else line)
+                                          for offset, line in skip],
+                       "Execution skip does not target the matching restore")
+    expect_value_error(translate_wave32, [(offset, MASKED_OR_RESTORE if line == close else line) for offset, line in skip],
+                       "Execution skip does not target the matching restore")
+
+    # SCC: neither close leaves a tracked SCC, so a reader after either is refused, as after the b64 closes.
+    for restore, wave32_restore in WAVE32_RESTORES:
+        for reader in ("s_cselect_b32 s58, 1, 0", "s_cmov_b64 s[58:59], 1"):
+            expect_value_error(translate_wave32, uncompressed_export([
+                "s_cmp_eq_u32 s47, 0", compare, save, body, wave32_restore, reader]),
+                "Select condition is not a tracked scalar result" if "cselect" in reader
+                else "Conditional move requires a tracked SCC")
+
+
 def check_masked_controls():
     """Exec-masked regions (#338): one forward masked-if, merged with per-lane selects."""
     save = "s_and_saveexec_b64 s[60:61], vcc"
@@ -18026,6 +18203,7 @@ _CONTROL_SUBCHECKS = (
     "check_masked_controls",
     "check_masked_mov_close_controls",
     "check_masked_else_controls",
+    "check_masked_wave32_controls",
     "check_scc_skip_controls",
     "check_scc_diamond_controls",
     "check_cmpx_controls",
@@ -18737,6 +18915,20 @@ def check_binary(directory, assembler, objcopy, library):
             bodies = else_wait_bodies(skips, after_wait=skips == "else")
             fixtures.append((else_region_asm(opener, skips=skips, **bodies), translate, "gfx1013", "",
                              else_region(opener, skips=skips, **bodies)))
+    # Issue #2137: the wave32 saveexec regions assembled under +wavefrontsize32, decoded and lowered as wave32.
+    for restore in (MASKED_OR_RESTORE, MASKED_MOV_RESTORE):
+        for build in (masked_region, masked_complementary):
+            fixtures.append((wave32_fixture(build(restore)), translate_wave32, "gfx1013", WAVE32_FEATURES))
+        fixtures.append((wave32_fixture(masked_skip_asm(restore)), translate_wave32, "gfx1013", WAVE32_FEATURES,
+                         wave32_fixture(masked_skip(restore))))
+        for skips in ELSE_SKIPS:
+            pairs = else_region("saveexec", restore, skips)
+            if skips == "none":
+                fixtures.append((wave32_fixture([line for _, line in pairs]), translate_wave32, "gfx1013",
+                                 WAVE32_FEATURES))
+            else:
+                fixtures.append((wave32_fixture(else_region_asm("saveexec", restore, skips)), translate_wave32,
+                                 "gfx1013", WAVE32_FEATURES, wave32_fixture(pairs)))
     for compare, branch in SCC_SKIP_FORMS.values():
         fixtures.append((scc_skip_asm(compare, branch), translate, "gfx1013", "", scc_skip(compare, branch)))
         fixtures.append((scc_diamond_asm(compare, branch), translate, "gfx1013", "", scc_diamond(compare, branch)))
