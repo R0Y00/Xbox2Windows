@@ -324,5 +324,5 @@ if __name__ == "__main__":
                     status = result
         if len(sys.argv) > 4 and status == 0:
             status = check_missing_stores(Path(tmp), *sys.argv[4:7])
-    print("sampler views: plain and renamed tables and a level-of-detail query validated; controls passed")
+    print("sampler views: validated plain and renamed SPIR-V tables and the level-of-detail query")
     sys.exit(status)
