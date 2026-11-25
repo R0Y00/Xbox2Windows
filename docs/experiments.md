@@ -8499,9 +8499,18 @@ The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
 
+Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
+slot 57 creation. The descriptor must name a registered root, have an empty
+VS slot and have a readable 16-byte to 64-KiB MS span. The PS span must be
+absent or fit the same bounds. With the pipeline IID, this shape returns
+`E_NOTIMPL` and clears the output. It lets callers that handle this result
+choose another pipeline creation path. The default returns the existing
+placeholder. Other fixed descriptors keep that result under the switch, and
+an unsupported IID still returns `E_NOINTERFACE`.
+
 ```powershell
 cmake --build --preset release --target startup_indirect_draw_indexed
-ctest --preset release --no-tests=error -R '^startup_indirect_mesh_request_' -V
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(request|create_result)_' -V
 .\out\pe-env\Scripts\python.exe -B tests/startup_gfx2hlsl_watch_check.py
 ```
 

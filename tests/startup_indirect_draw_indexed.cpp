@@ -794,6 +794,74 @@ std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
     while (!found.empty() && (found.back() == '\r' || found.back() == '\n')) found.pop_back();
     return found;
 }
+bool fixed_mesh_create_contract(ID3D12Device* guest)
+{
+    const D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    const auto root = create_root(guest, root_desc);
+    const std::array<UINT, 7> ms{0xbfa00003, 0xbf900009, 0xf80008cf, 0x03020100, 0xf8000941, 0, 0xbf810000};
+    const std::array<UINT, 4> ps{0xbfa00003, 0xf800080f, 0x03020100, 0xbf810000};
+    using Fields = std::array<UINT64, 0x300 / sizeof(UINT64)>;
+    Fields pair{};
+    pair[0] = reinterpret_cast<UINT64>(root.Get());
+    pair[5] = reinterpret_cast<UINT64>(ps.data());
+    pair[6] = sizeof(ps);
+    pair[13] = reinterpret_cast<UINT64>(ms.data());
+    pair[14] = sizeof(ms);
+    Fields mesh_only = pair;
+    mesh_only[5] = mesh_only[6] = 0;
+    Fields legacy = pair;
+    legacy[9] = reinterpret_cast<UINT64>(ps.data());
+    legacy[10] = sizeof(ps);
+    legacy[13] = legacy[14] = 0;
+    const auto pipeline_iid = __uuidof(ID3D12PipelineState);
+    const auto wrong_iid = __uuidof(ID3D12Resource);
+    using Create = HRESULT (WINAPI*)(IUnknown*, const void*, const GUID*, void**);
+    const auto create = slot<Create>(guest, 57);
+    const auto expect = [&](const char* label, const void* desc, const GUID& iid, HRESULT expected) {
+        void* result = guest;
+        const HRESULT hr = create(guest, desc, &iid, &result);
+        const bool output_ok = expected == S_OK ? result && result != guest : !result;
+        if (result && result != guest) static_cast<IUnknown*>(result)->Release();
+        if (hr == expected && output_ok) return true;
+        std::fprintf(stderr, "%s: got HRESULT 0x%08lx with %s output, expected 0x%08lx\n",
+            label, static_cast<unsigned long>(hr), output_ok ? "expected" : "unexpected",
+            static_cast<unsigned long>(expected));
+        return false;
+    };
+    check(SetEnvironmentVariableA("X2W_REFUSE_FIXED_MESH", nullptr) ? S_OK : E_FAIL, "clear fixed mesh switch");
+    if (!expect("default MS+PS", pair.data(), pipeline_iid, S_OK) ||
+        !expect("default MS-only", mesh_only.data(), pipeline_iid, S_OK) ||
+        !expect("default wrong IID", pair.data(), wrong_iid, E_NOINTERFACE)) return false;
+    check(SetEnvironmentVariableA("X2W_REFUSE_FIXED_MESH", "1") ? S_OK : E_FAIL, "enable fixed mesh switch");
+    if (!expect("opt-in MS+PS", pair.data(), pipeline_iid, E_NOTIMPL) ||
+        !expect("opt-in MS-only", mesh_only.data(), pipeline_iid, E_NOTIMPL) ||
+        !expect("opt-in wrong IID takes precedence", pair.data(), wrong_iid, E_NOINTERFACE) ||
+        !expect("ordinary VS+PS", legacy.data(), pipeline_iid, S_OK) ||
+        !expect("null description keeps legacy result", nullptr, pipeline_iid, S_OK) ||
+        !expect("unreadable description keeps legacy result", reinterpret_cast<const void*>(1), pipeline_iid, S_OK))
+        return false;
+    const auto field = [&](const char* label, std::size_t index, UINT64 value) {
+        auto invalid = pair;
+        invalid[index] = value;
+        return expect(label, invalid.data(), pipeline_iid, S_OK);
+    };
+    auto wrong_root = pair;
+    wrong_root[0] = reinterpret_cast<UINT64>(guest);
+    if (!expect("registered object with the wrong root kind", wrong_root.data(), pipeline_iid, S_OK) ||
+        !field("missing root", 0, 0) ||
+        !field("populated VS pointer", 9, pair[13]) ||
+        !field("populated VS length", 10, sizeof(ms)) ||
+        !field("missing MS pointer", 13, 0) ||
+        !field("unreadable MS span", 13, 1) ||
+        !field("oversized MS span", 14, 0x10001) ||
+        !field("truncated MS span", 14, 15) ||
+        !field("missing PS pointer", 5, 0) ||
+        !field("missing PS length", 6, 0) ||
+        !field("unreadable PS span", 5, 1) ||
+        create(guest, pair.data(), &pipeline_iid, nullptr) != E_POINTER) return false;
+    std::puts("slot 57 creation result and output matched all controls");
+    return true;
+}
 }  // namespace
 
 int main(int argc, char** argv) try
@@ -814,6 +882,7 @@ int main(int argc, char** argv) try
     else if (argc != 2 && !count_control && !translated_indexed) return 2;
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool mesh = kind == DrawKind::mesh;
+    const bool fixed_create_fixture = mesh && GetEnvironmentVariableA("X2W_FIXED_MESH_CREATE_FIXTURE", nullptr, 0);
     const bool warp = std::strcmp(argv[1], "warp") == 0;
     if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
     ComPtr<ID3D12Debug> debug;
@@ -839,7 +908,7 @@ int main(int argc, char** argv) try
             if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || basic_render_driver) continue;
             ComPtr<ID3D12Device> probe;
             if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe))) &&
-                (!mesh || supports_mesh(probe.Get()))) break;
+                (!mesh || fixed_create_fixture || supports_mesh(probe.Get()))) break;
         }
     }
     wchar_t directory[MAX_PATH];
@@ -860,7 +929,7 @@ int main(int argc, char** argv) try
 
     ComPtr<ID3D12Device> device, guest;
     check(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "create desktop device through d3d12_xs");
-    if (mesh && !supports_mesh(device.Get())) {
+    if (mesh && !fixed_create_fixture && !supports_mesh(device.Get())) {
         std::puts("indirect mesh capability skip: mesh shaders unavailable");
         return 77;
     }
@@ -869,6 +938,7 @@ int main(int argc, char** argv) try
     check(SetEnvironmentVariableA("X2W_D3D12_RENDER", "1") ? S_OK : HRESULT_FROM_WIN32(GetLastError()), "enable recording");
     const std::array<unsigned char, 64> parameters{};
     check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
+    if (fixed_create_fixture) return fixed_mesh_create_contract(guest.Get()) ? 0 : 1;
     ComPtr<ID3D12InfoQueue> info;
     if (debug) check(device.As(&info), "get debug message queue");
     const D3D12_ROOT_PARAMETER uav{D3D12_ROOT_PARAMETER_TYPE_UAV, {}, D3D12_SHADER_VISIBILITY_ALL};

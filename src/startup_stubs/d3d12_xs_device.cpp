@@ -3883,9 +3883,26 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     return S_OK;
 }
 
-// Device slots 57 and 67 (Xbox order): (desc*, riid, ppv) with the ID3D12PipelineState IID; pipeline
-// descriptions whose layout is not decoded yet. The result is a placeholder PipelineState. In render
-// mode a slot 67 (compute) description also publishes a translation request (d3d12_draw.inl).
+// The fixed prefix shared with request_slot57_mesh. Only apply the creation
+// refusal to the observed bounded spans, with a registered root and no VS.
+bool is_fixed_mesh57_descriptor(const void* desc)
+{
+    u64 words[15];
+    if (!x2w_local::readable(desc, sizeof(words)) || !copy_title_bytes(words, desc, sizeof(words))) return false;
+    const auto readable_stage = [](u64 address, u64 bytes) {
+        return bytes >= 16 && bytes <= 0x10000 &&
+            x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+    };
+    const auto* root = as_wrapper(reinterpret_cast<const void*>(words[0]));
+    return root && root->own().kind == root_signature_kind &&
+        !words[9] && !words[10] &&
+        readable_stage(words[13], words[14]) &&
+        ((!words[5] && !words[6]) || readable_stage(words[5], words[6]));
+}
+
+// Device slots 57 and 67 (Xbox order): (desc*, riid, ppv) with the pipeline
+// IID. These normally return a placeholder. In render mode slot 67 also
+// publishes a compute translation request (d3d12_draw.inl).
 template <int N>
 HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc, const GUID* iid, void** out)
 {
@@ -3895,13 +3912,21 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
     dump_pipeline("pipeline", N, desc, 0x300);
+    if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
+    if constexpr (N == 57) {
+        if (x2w_local::env_on("X2W_REFUSE_FIXED_MESH") && is_fixed_mesh57_descriptor(desc)) {
+            static LONG refusals;
+            if (first_calls(refusals, 6))
+                log("x2w-d3d12 Device::slot57: fixed mesh pipeline unavailable (E_NOTIMPL)");
+            return E_NOTIMPL;
+        }
+    }
     static LONG calls;
     if (first_calls(calls, 2)) {
         char bytes[3 * 96 + 1];
         hex_text(desc, 96, bytes, sizeof(bytes));
         log("x2w-d3d12 Device::slot%d(pipeline?) desc=[%s] riid=%s -> placeholder", N, bytes, text);
     }
-    if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     if constexpr (N == 67) publish_compute_request(desc);
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);

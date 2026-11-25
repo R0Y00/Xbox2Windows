@@ -1215,6 +1215,9 @@ endforeach()
 set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_mesh_request_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+    add_test(NAME startup_indirect_mesh_create_result_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
+    set_tests_properties(startup_indirect_mesh_create_result_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_FIXED_MESH_CREATE_FIXTURE=1")
     set_tests_properties(startup_indirect_mesh_request_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_MESH_REQUEST_FIXTURE=1")
 endforeach()
