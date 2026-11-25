@@ -90,6 +90,8 @@ jobs:
               (["tests/startup_compute_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_image_store_d16_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_readfirstlane_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_compute_gather_l_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_compute_buffer_atomics_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_c_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
@@ -201,6 +203,8 @@ jobs:
             tests/startup_image_gather_lz_check.py \
             tests/startup_compute_gather_lz_check.py \
             tests/startup_compute_image_store_d16_check.py \
+            tests/startup_compute_gather_l_check.py \
+            tests/startup_compute_buffer_atomics_check.py \
             tests/startup_image_gather_c_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
@@ -227,6 +231,7 @@ jobs:
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_compute_request_offline_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
+            tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_gfx2hlsl_loop_constants_check.py \
             tests/startup_gfx2hlsl_join_symbols_check.py \
@@ -255,6 +260,7 @@ jobs:
             tests/startup_gfx2hlsl_f32_sdwa_check.py \
             tests/startup_gfx2hlsl_root_check.py \
             tests/startup_gfx2hlsl_sopk_signext_check.py \
+            tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_smem_address_check.py \

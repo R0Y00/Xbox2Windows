@@ -22,6 +22,8 @@ reads the read buffer at that index and stores to its own destination:
   16-31 under partial EXEC. Two 4x2x4 groups write separate records to the raw buffer.
 - case E runs five SAVEEXEC forms with overlapping and distinct source registers. Four single-thread groups
   cover both input bits for EXEC and S0; each stores the saved EXEC, resulting SCC and new EXEC.
+- case F exchanges LDS dwords across the two halves of each 64-thread group and broadcasts lane 37.
+- case G reads two independently offset LDS dwords with the address in the first destination VGPR.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -209,6 +211,61 @@ def saveexec_fixture():
     return '\n'.join(line for line, _ in program) + '\n', bytes.fromhex(''.join(word for _, word in program))
 
 
+SOURCE_F = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 8
+v_add_nc_u32 v5, s20, v0
+v_lshlrev_b32 v4, 2, v0
+ds_write_b32 v4, v5 offset:16
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_xor_b32 v8, 0x80, v4
+v_and_b32 v8, 0xfc, v8
+ds_read_b32 v6, v8 offset:16
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v8, 0
+ds_read_b32 v7, v8 offset:164
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s21, s7, 6
+v_add_nc_u32 v9, s21, v0
+v_lshlrev_b32 v9, 3, v9
+buffer_store_dwordx2 v[6:7], v9, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_F = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0788148f14000a4a82000834100034d804050000'
+    '7fc08cbf00008abfff08103a80000000ff101036fc0000001000d8d8080000067fc08cbf8002107e'
+    'a400d8d8080000077fc08cbf0786158f1500124a83121234001074e009060480000081bf')
+
+SOURCE_G = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_xor_b32 v5, s20, v0
+v_and_b32 v5, 31, v5
+v_lshlrev_b32 v5, 2, v5
+v_lshlrev_b32 v4, 2, v0
+ds_write_b32 v4, v5 offset:16
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_and_b32 v6, 0x7c, v4
+ds_read2_b32 v[6:7], v6 offset0:5 offset1:36
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s21, s7, 6
+v_add_nc_u32 v9, s21, v0
+v_lshlrev_b32 v9, 3, v9
+buffer_store_dwordx2 v[6:7], v9, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_G = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f14000a3a9f0a0a36820a0a3482000834100034d804050000'
+    '7fc08cbf00008abfff080c367c0000000524dcd8060000067fc08cbf0786158f1500124a83121234001074e009060480000081bf')
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -217,6 +274,8 @@ CASES = {
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'E': (*saveexec_fixture(), USER7 | TGID_X | tidig(1), (1, 1, 1), (4, 1, 1)),
+    'F': (SOURCE_F, WORDS_F, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
+    'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -279,13 +338,19 @@ CASES['I'] = (SOURCE_A.replace('buffer_store_dword', STRIDE_CLEAR + '\nbuffer_st
               *CASES['A'][2:])
 
 
-def root_blob(constants=2):
-    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges."""
+def root_blob(constants=2, table_range=False):
+    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
+
+    table_range gives the table one SRV range (t0, one descriptor) for a blob that a device creates: the Windows 10
+    in-box D3D12 runtime (10.0.19041) corrupts its heap in CreateRootSignature for a table with no ranges. The
+    default bytes are unchanged because they are part of pinned request keys.
+    """
     params_at, constants_at = 24, 24 + 2 * 12
     table_at = constants_at + 12
-    rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8, 0)
+    ranges = struct.pack('<6I', 0, 1, 0, 0, 0, 0xffffffff) if table_range else b''  # SRV, 1, t0, space 0, append
+    rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8 + len(ranges), 0)
             + struct.pack('<3I', 1, 0, constants_at) + struct.pack('<3I', 0, 0, table_at)
-            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', 0, table_at + 8))
+            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', len(ranges) // 24, table_at + 8) + ranges)
     part = b'RTS0' + struct.pack('<I', len(rts0)) + rts0
     return b'DXBC' + bytes(16) + struct.pack('<III', 1, 32 + 4 + len(part), 1) + struct.pack('<I', 36) + part
 
@@ -299,6 +364,23 @@ def expected(name):
         return expected('A')
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    producer_offsets = {'G': (1, 32), 'G-offset0-only': (31, 0), 'G-offset1-only': (0, 31)}
+    if name in producer_offsets:
+        # The original fill begins at dword 4, the single-field variants at dword 0.
+        first, second = producer_offsets[name]
+        for group in range(2):
+            stored = [4 * ((lane ^ (8 * group)) & 31) for lane in range(64)]
+            for lane in range(64):
+                base = lane & 31
+                index = 2 * (64 * group + lane)
+                out[index:index + 2] = [stored[base + first], stored[base + second]]
+        return out
+    if name == 'F':
+        for group in range(2):
+            for lane in range(64):
+                index = (64 * group + lane) * 2
+                out[index:index + 2] = [256 * group + (lane ^ 32), 256 * group + 37]
+        return out
     if name == 'E':
         # Group IDs 0..3 encode (old EXEC, S0) = (0,0), (0,1), (1,0), (1,1).
         # Store old EXEC in bit 2, SCC in bit 1 and new EXEC in bit 0. Both operand layouts agree.
@@ -353,6 +435,16 @@ def patch(words, old, new):
     old, new = bytes.fromhex(old), bytes.fromhex(new)
     assert words.count(old) == 1, old.hex()
     return words.replace(old, new)
+
+
+# Move the fill to dword zero so either read field can be omitted. Both variants retain the
+# overlapping destination/address and participate in the regular LLVM reassembly and GPU dispatch.
+for field, offset_bytes in (('offset0', '1f00'), ('offset1', '001f')):
+    source = SOURCE_G.replace('ds_write_b32 v4, v5 offset:16', 'ds_write_b32 v4, v5')
+    source = source.replace('offset0:5 offset1:36', field + ':31')
+    words = patch(WORDS_G, '100034d804050000', '000034d804050000')
+    words = patch(words, '0524dcd806000006', offset_bytes + 'dcd806000006')
+    CASES[f'G-{field}-only'] = (source, words, *CASES['G'][2:])
 
 
 MBCNT_REFUSALS = (
@@ -415,7 +507,85 @@ def check_descriptor_scc():
     assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, move).hlsl_cs()
 
 
+def check_lds():
+    # Actual instruction substitutions in the LLVM-assembled exchange. Keep the prefix, except where the
+    # local-ID proof itself is under test; a different first refusal would hide the regression.
+    store = '100034d804050000'
+    peer = '1000d8d808000006'
+    broadcast = 'a400d8d808000007'
+    wait = '7fc08cbf'
+    barrier = '00008abf'
+    nop = '000080bf'
+    hlsl = translate('F').hlsl_cs()
+    sync = 'GroupMemoryBarrierWithGroupSync();'
+    assert hlsl.count(sync) == 1 and hlsl.index('] = v5;') < hlsl.index(sync) < hlsl.index('v6 = lds[')
+    for old, new, reason in (
+        ('82000834', '8002007e82000834', 'unchanged entry local X'),  # write v0 before computing the address
+        ('82000834', '00cb087e82000834', 'unchanged entry local X'),  # v_swap also writes its second operand
+        ('82000834', '82020834', 'one bounded dword'),              # use Y instead of X
+        (store, '040134d804050000', 'one bounded dword'),             # last lane exceeds the 512-byte allocation
+        (store, store + store, 'one bounded dword'),                  # overlapping fill
+        (wait + barrier, nop + barrier, 'completed fill'),
+        (barrier, '01008abf', 'one barrier'),                         # nonzero reserved immediate
+        (barrier, nop, 'after the fill barrier'),
+        (barrier, barrier + barrier, 'one barrier'),
+        (peer, '0c00d8d808000006', 'initialized span'),               # read before the filled span
+        (broadcast, '1001d8d808000007', 'initialized span'),          # first dword after the span
+        (broadcast, '1200d8d808000007', 'aligned'),
+        (broadcast, 'a400dad808000007', 'optional byte offset'),      # GDS
+        ('ff101036fc000000', 'ff101036ff000000', 'aligned'),          # mask leaves unaligned byte addresses
+        ('8002107e', '0403107e', 'literal or literal-masked'),        # unbounded VGPR address
+        (peer + wait, peer + nop, 'completed LGKM wait'),
+        (store, '8003febe' + store, 'entry EXEC'),
+        (store, '020084bf' + store, 'straight-line'),
+    ):
+        refused(reason, lambda: translate('F', code=patch(WORDS_F, old, new)))
+    base = USER7 | TGID_X
+    for units in (0, 65):
+        refused('allocation', lambda: translate('F', rsrc2=base | units << 15))
+    refused('1D group', lambda: translate('F', group=(32, 2, 1)))
+    # Slide the whole span to the end of the 512-byte allocation. Thread 63 now writes its last dword.
+    at_end = patch(WORDS_F, store, '000134d804050000')
+    at_end = patch(at_end, peer, '0001d8d808000006')
+    at_end = patch(at_end, broadcast, '9401d8d808000007')
+    assert 'lds[(v4 + 256u) >> 2] = v5;' in translate('F', code=at_end).hlsl_cs()
+    assert 'groupshared uint lds[8192];' in translate('F', rsrc2=base | 64 << 15).hlsl_cs()
+
+    pair = '0524dcd806000006'
+    # The first result overwrites v6. Both loads must use the address saved before that write.
+    body = translate('G').hlsl_cs()
+    assert 'a = v6;\n    v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];' in body, body
+    for other, reason in (
+        ('0324dcd806000006', 'initialized span'),  # offset0 alone precedes the fill
+        ('0525dcd806000006', 'initialized span'),  # offset1 alone crosses the upper end
+        ('0524ded806000006', 'ordinary dword offsets'),  # GDS
+        ('0524e0d806000006', 'does not cover'),  # stride-64 addressing
+        ('0524dcd8060000ff', 'VGPR pair'),  # v[255:256]
+        ('0505dcd806000006', 'distinct offsets'),
+        ('0000dcd806000006', 'distinct offsets'),
+    ):
+        refused(reason, lambda: translate('G', code=patch(WORDS_G, pair, other)))
+    # The binary decoder only emits unsigned 8-bit offsets and consecutive pairs. Exercise
+    # the proof's operand checks directly for inputs the instruction cannot encode.
+    decoded = list(G.decode(WORDS_G))
+    index, = (i for i, ins in enumerate(decoded) if ins[2] == 'ds_read2_b32')
+    prefix, assembly = decoded[index][:3], decoded[index][3]
+    for old, new, reason in (('offset0:5', 'offset0:256', 'ordinary dword offsets'),
+                             ('v[6:7]', 'v[6:8]', 'VGPR pair')):
+        assert old in assembly
+        decoded[index] = (*prefix, assembly.replace(old, new))
+        refused(reason, lambda: G.check_lds_exchange(decoded, (64, 1, 1), 128))
+    # Offset fields omitted by the disassembler default independently to zero. With the fill at zero,
+    # both zero and +31 dwords are valid from any masked base in this fixture.
+    for name, expected_offsets in (('G-offset0-only', (124, 0)), ('G-offset1-only', (0, 124))):
+        shader = translate(name).hlsl_cs()
+        for dest, offset in zip((6, 7), expected_offsets):
+            assert f'v{dest} = lds[(a + {offset}u) >> 2];' in shader
+    assert 'groupshared' not in translate('A', rsrc2=CASES['A'][2] | 1 << 15).hlsl_cs()
+
+
 def check_controls():
+    check_lds()
     check_descriptor_scc()
     check_mbcnt()
     a = translate('A')
@@ -569,17 +739,23 @@ CONTROLS = {
     'd-base': ('D', MBCNT_COUNT + ' + v6', MBCNT_COUNT),
     'd-hi': ('D', 'v9 = v8;', f'v9 = v8 + {MBCNT_COUNT};'),
     'd-exec': ('D', 'if (exec & 1) v10 =', 'v10 ='),
+    'f-peer': ('F', '0x00000080u ^ v4', 'v4'),
+    'f-broadcast': ('F', 'lds[(v8 + 164u) >> 2]', 'lds[(v8 + 160u) >> 2]'),
+    'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
+                          'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),
+    'g-overlap': ('G', 'v7 = lds[(a + 144u)', 'v7 = lds[(v6 + 144u)'),
 }
 
-# Independent first bad word for each D mutation, including lane zero and the
-# first lane on the next Y row. The two groups must repeat the same lane values.
-MBCNT_MISMATCH = {
+# First bad word for the masked bit-count and paired LDS read controls.
+CONTROL_MISMATCH = {
     'd-mask': 'word=8 expected=00000008 actual=00000009',
     'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
     'd-x-only': 'word=16 expected=00000009 actual=00000007',
     'd-base': 'word=0 expected=00000007 actual=00000000',
     'd-hi': 'word=5 expected=00000008 actual=00000009',
     'd-exec': 'word=2 expected=ffffffff actual=00000000',
+    'g-swapped-offsets': 'word=0 expected=00000004 actual=00000000',
+    'g-overlap': 'word=1 expected=00000000 actual=00000004',
 }
 
 
@@ -609,7 +785,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
         if control == 'mbcnt':
-            runs = [('D', mutation) for mutation in MBCNT_MISMATCH]
+            runs = [('D', mutation) for mutation, (case, _, _) in CONTROLS.items() if case == 'D']
         elif control:
             runs = [(CONTROLS[control][0], control)]
         else:
@@ -619,13 +795,19 @@ def check_dispatch(dxc, runner, adapter, control=None):
             print(run.stdout, end='')
             if run.returncode == 77:
                 return 77
+            diagnostics = []
+            for line in run.stderr.splitlines():
+                if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                    print(line, file=sys.stderr)
+                else:
+                    diagnostics.append(line)
             if mutation:
-                first = run.stderr.strip().splitlines()[:1]
-                if (run.returncode != 1 or 'expected=' not in run.stderr or
-                        mutation in MBCNT_MISMATCH and first != [MBCNT_MISMATCH[mutation]]):
+                first = diagnostics[:1]
+                if (run.returncode != 1 or not any('expected=' in line for line in diagnostics) or
+                        mutation in CONTROL_MISMATCH and first != [CONTROL_MISMATCH[mutation]]):
                     raise AssertionError('control %s: unexpected result (exit %d) %s' % (mutation, run.returncode, run.stderr))
                 print('control %s: rejected at %s' % (mutation, first[0]))
-            elif run.returncode or run.stderr:
+            elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:
                 print('case %s: all %d words match' % (name, WORDS))

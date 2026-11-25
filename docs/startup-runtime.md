@@ -189,8 +189,10 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-12`. Older translations can overwrite the
-source mask when a save-EXEC instruction uses the same source and destination register.
+The shader cache revision is `x2w-startup-shader-13`. Older translations evaluate `s_brev_b32` of a
+constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
+same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join or read a stale SCC after
 an operation on a descriptor word.
 
@@ -417,11 +419,9 @@ token null with zero words, and the R8 texels. The control publishes the support
 
 ### Per-reason refusal census per pipeline key
 
-[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) is a standalone,
-device-free header ready to be wired into runtime refusal callers (such as slot-67 compute dispatch
-and binding paths; it is not yet wired into `d3d12_xs_device.cpp` or the five-second report). It
-tracks every distinct `(key, reason)` refusal pair separately instead of overwriting earlier reasons on
-the same key with the last refusal:
+[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) tracks every distinct
+`(key, reason)` refusal pair separately instead of overwriting earlier reasons on the same pipeline key
+with the last refusal:
 
 - Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
   call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
@@ -429,6 +429,17 @@ the same key with the last refusal:
 - `report(emit, true)` skips emission when nothing changed since the previous periodic report and emits
   the summary line plus only the `(key, reason)` entries whose counts grew; `report(emit, false)`
   prints the full table without hiding the next periodic delta.
+- [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) and
+  [`d3d12_draw.inl`](../src/startup_stubs/d3d12_draw.inl) wire an `indirect-draw` census instance into
+  `draw_translated_indirect`: each refused translated indirect draw with a resolved shader key records
+  `(shader_key, refusal_code)` (for example `missing_guest_root`, `sampled_texture_mismatch`,
+  `unsupported_resource_or_entry`, `incomplete_table_buffer`), keeps logging the first occurrence of
+  each of the first 8 distinct `(key, reason)` pairs even after the 32-call refusal log limit is spent,
+  emits deltas in the five-second report, and appends the full `x2w-d3d12 indirect-draw refusals:` lines
+  to `x2w_d3d12_census_report` whenever at least one refusal occurred (leaving zero-refusal runs at the
+  existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
+  are not counted in this census (matching the per-call log gate), so `total` counts only refusals
+  attributed to a resolved translated shader key rather than all `ExecuteIndirect` refusals.
 
 Check without a device via
 `ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
@@ -436,6 +447,14 @@ the pass run verifies interleaved reasons across two keys, detail limits, overfl
 reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCensus` with
 `X2W_CENSUS_KEEP_LAST` and `X2W_CENSUS_KEEP_FIRST`, print both expected reasons with counts in their
 mismatch output, and are marked `WILL_FAIL`.
+
+Check the runtime wiring on WARP and hardware via
+`ctest --preset dev --no-tests=error -R '^startup_indirect_translated_refusal_census_(warp|hardware|control_warp)$' -V`:
+the pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
+key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
+succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
+and both per-call log lines for the shared key; the control replaces the second refusal on key 1 with a
+valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.
 
 ## Root constant buffer views
 
@@ -1942,8 +1961,10 @@ These are measured on one executable; treat them as hypotheses for others.
 - `image_sample`, `image_sample_l` and `image_sample_lz` through a constant sampler carry the descriptor's MIN_LOD and MAX_LOD
   through the same `smpl` line (#2177). A constant sampler with a LOD bias or MIN_LOD above MAX_LOD is now refused for these forms;
   a mip filter of 0 is not (the sampler stays an ordinary `smp` line). A sampler from the heap, including the default-sampler
-  shortcut, still translates as before with an unbounded LOD range: its MIN_LOD, MAX_LOD and bias are not validated, and
-  `gfx2hlsl.py` logs that once per translated module (#2221). `image_sample_c` is unchanged.
+  shortcut, still translates as before: its MIN_LOD, MAX_LOD and bias are not validated, and `gfx2hlsl.py` logs that once per
+  translated module (#2221). With the sampler-heap opt-in, a table entry applies its MIN_LOD and MAX_LOD at run time (see the
+  sampler-heap item above); its LOD bias is not carried, and a MIN_LOD above MAX_LOD is passed through unchanged. The
+  default-sampler shortcut keeps a static sampler with an unbounded LOD range. `image_sample_c` is unchanged.
   `ctest --preset dev --no-tests=error -R '^startup_image_sample_lod'` draws each form on its own against a plain-`smp` control
   (`docs/experiments.md`, "constant-sampler LOD limits").
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
@@ -2071,20 +2092,51 @@ pointer, and its later decode commands pointed into the buffer. A size of 0, or 
 or unreadable command headers (`E_POINTER`), null or unreadable inputs and null or unwritable outputs
 (`E_POINTER`), and unknown or disconnected handles (`E_HANDLE`), and records one `(type, slot)`
 entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
-index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
+index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (192 KiB per
 connection; additional enqueues return `E_OUTOFMEMORY` without dropping queued entries).
 `XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` retires one entry
 and zeroes the `0x58`-byte result buffer. The experimental `X2W_XAPU_TYPED_COMPLETIONS=1`
 also writes the command type at `+0x00` and slot index at `+0x04`. Decoded bytes at `+0x34`
-remain zero in both modes. An empty
+remain zero in both modes unless the optional Opus decode below is built in. An empty
 queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
 
 Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
 observed callers. The experimental mode echoes any 32-bit type value at `+0x00` verbatim
 (including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
-outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
+outside `+0x00` and `+0x04` zero (`+0x34` carries decoded bytes only in the optional Opus build below). Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
+
+The default build does not depend on libopus. Configuring with `-DX2W_WITH_OPUS=ON` (and `Opus_DIR` pointing at an
+installed libopus CMake package) links libopus into `xapu.dll`. The stand-ins link the static MSVC runtime, so libopus
+must be built with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>`. Tested with libopus 1.5.2;
+its notice is in [`src/startup_stubs/THIRD_PARTY_NOTICES.md`](../src/startup_stubs/THIRD_PARTY_NOTICES.md). With typed
+completions on, a type `3` command then decodes one Opus packet. The command fields as one title fills them:
+`+0x1C` sample rate (32-bit float: 8000, 12000, 16000, 24000 or 48000), `+0x24` frames, `+0x28` packet bytes,
+`+0x2C` packet pointer, `+0x34` output bytes (frames × channels × 4, 1 or 2 channels) and `+0x38` output pointer
+(interleaved 32-bit float). The result carries the decoded byte count at `+0x34`, which is smaller than the output
+size when the packet holds fewer frames. Each slot keeps its own decoder; type `5` resets it and type `2` frees it,
+as does `XApuDisconnect`. A command with no packet (null pointer and 0 bytes) completes with 0 bytes, as without
+libopus. Any other invalid field (rate, channel count, frames over 5760, packet over 64 KiB, unreadable packet,
+unwritable output, slot 256 or above) returns `E_INVALIDARG`. A packet that libopus rejects, or one holding more
+frames than `+0x24`, returns `E_FAIL`, and a command shorter than `0x40` readable bytes returns `E_POINTER`. A full
+queue returns `E_OUTOFMEMORY` before any decode, reset or close. A refused command queues no result, leaves the
+output untouched and keeps the existing decoder object. Invalid arguments and a full queue fail before calling
+libopus. If libopus fails while using an existing decoder, its internal state follows libopus. Decoded samples
+are copied from scratch only after the result is queued.
+
+```powershell
+cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
+cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check
+ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus)$' -V
+```
+
+`startup_xapu_opus` encodes generated 1 kHz tones with the same libopus and checks exact byte counts (3840 for
+48 kHz mono, 7680 for stereo, 1920 for a 10 ms packet in a 20 ms buffer, 1280 for 16 kHz), bit-exact PCM against
+a reference decoder, untouched guard floats past the decoded frames, a malformed packet, each refusal above with
+an untouched output and an empty queue, a full queue that leaves the slot's stream intact, reset and close each
+starting a fresh decoder, a rate change on a live slot, and that type `3` decodes nothing with typed completions
+off. It is registered only in the optional build.
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),

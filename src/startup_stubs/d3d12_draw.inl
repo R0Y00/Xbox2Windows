@@ -233,7 +233,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-12";
+    constexpr char revision[] = "x2w-startup-shader-13";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -353,7 +353,7 @@ void publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-12cs";  // tools/startup/gfx2hlsl.py compute_key
+    constexpr char compute_revision[] = "x2w-startup-shader-13cs";  // tools/startup/gfx2hlsl.py compute_key
     u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
@@ -1477,6 +1477,24 @@ bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation, bool 
     return true;
 }
 
+namespace indirect_refusal_code {
+constexpr const char* pipeline_or_target_unavailable = "pipeline_or_target_unavailable";
+constexpr const char* translation_not_ready = "translation_not_ready";
+constexpr const char* d16_srv_not_ready = "d16_srv_not_ready";
+constexpr const char* formatted_buffer_not_ready = "formatted_buffer_not_ready";
+constexpr const char* missing_guest_root = "missing_guest_root";
+constexpr const char* live_compute_pipeline = "live_compute_pipeline";
+constexpr const char* unsupported_resource_or_entry = "unsupported_resource_or_entry";
+constexpr const char* indexed_rect_unavailable = "indexed_rect_unavailable";
+constexpr const char* pipeline_unavailable = "pipeline_unavailable";
+constexpr const char* sampler_heap_unavailable = "sampler_heap_unavailable";
+constexpr const char* sampled_texture_mismatch = "sampled_texture_mismatch";
+constexpr const char* sampled_texture_unbindable = "sampled_texture_unbindable";
+constexpr const char* incomplete_vertex_stream = "incomplete_vertex_stream";
+constexpr const char* incomplete_table_buffer = "incomplete_table_buffer";
+constexpr const char* indexed_validation_failed = "indexed_validation_failed";
+}  // namespace indirect_refusal_code
+
 struct TranslatedIndirectDraw {
     ID3D12CommandSignature* signature;
     ID3D12Resource* argument;
@@ -1484,6 +1502,14 @@ struct TranslatedIndirectDraw {
     IndirectIndexView indices;
     u64 shader_key = 0;
     const char* refusal = "translated pipeline or target unavailable";
+    const char* refusal_code = indirect_refusal_code::pipeline_or_target_unavailable;
+
+    // Keep prose refusal text and census code updated together.
+    void set_refusal(const char* message, const char* code)
+    {
+        refusal = message;
+        refusal_code = code;
+    }
 };
 
 struct IndexedValidationPipeline {
@@ -1756,19 +1782,27 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (indirect && tr) indirect->shader_key = tr->key;
     std::uint32_t d16_unorm16[32] = {};
     FormattedBufferDescriptor formatted_buffers[32] = {};
-    if (!tr || tr->state != 1 || !d16_srvs_ready(*tr, pass, d16_unorm16) ||
-        !formatted_buffers_ready(*tr, pass, formatted_buffers)) {
+    const bool translation_ok = tr && tr->state == 1;
+    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
+    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
+    if (!formatted_ok) {
+        if (indirect && tr)
+            indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
+                                     : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
+                                                     : indirect_refusal_code::formatted_buffer_not_ready;
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
     if (indirect) {
         if (!bound->guest_root || bound->guest_root != pass.root) {
-            indirect->refusal = "translated draw requires the guest pipeline's root signature";
+            indirect->set_refusal("translated draw requires the guest pipeline's root signature",
+                                  indirect_refusal_code::missing_guest_root);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
         if (indexed && pass.compute_pipeline) {
-            indirect->refusal = "indexed validation cannot replace a live guest compute pipeline";
+            indirect->set_refusal("indexed validation cannot replace a live guest compute pipeline",
+                                  indirect_refusal_code::live_compute_pipeline);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
@@ -1789,14 +1823,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 });
         }
         if (!*entry || tr->samplers.heap) {
-            indirect->refusal = "translated draw uses an unsupported resource or draw-dependent entry value";
+            indirect->set_refusal("translated draw uses an unsupported resource or draw-dependent entry value",
+                                  indirect_refusal_code::unsupported_resource_or_entry);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
     }
     ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
-    if (indexed_rect && !pipeline) indirect->refusal = "translated indexed rectangle geometry unavailable";
+    if (indirect && indexed_rect && !pipeline) {
+        indirect->set_refusal("translated indexed rectangle geometry unavailable",
+                              indirect_refusal_code::indexed_rect_unavailable);
+    }
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+        if (indirect && !(indexed_rect && !pipeline))
+            indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
+                                               : indirect_refusal_code::sampler_heap_unavailable;
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -1906,7 +1947,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 }
             }
             if (indirect && (!texture || record.slot != 18 || texture == pass.target0)) {
-                indirect->refusal = "translated draw requires a matching sampled texture distinct from the target";
+                indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
+                                      indirect_refusal_code::sampled_texture_mismatch);
                 ReleaseSRWLockExclusive(&draw_lock);
                 return false;
             }
@@ -1932,7 +1974,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
             }
             if (indirect && !texture) {
-                indirect->refusal = "translated draw could not bind its sampled texture";
+                indirect->set_refusal("translated draw could not bind its sampled texture",
+                                      indirect_refusal_code::sampled_texture_unbindable);
                 ReleaseSRWLockExclusive(&draw_lock);
                 return false;
             }
@@ -1968,8 +2011,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 view = indirect_table_buffer(self, words);
             }
             if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
-                indirect->refusal = srv.source == 1 ? "translated indexed draw requires a complete GPU-backed vertex stream"
-                                                    : "translated draw requires a complete GPU-backed table buffer range";
+                indirect->set_refusal(
+                    srv.source == 1 ? "translated indexed draw requires a complete GPU-backed vertex stream"
+                                    : "translated draw requires a complete GPU-backed table buffer range",
+                    srv.source == 1 ? indirect_refusal_code::incomplete_vertex_stream
+                                    : indirect_refusal_code::incomplete_table_buffer);
                 ReleaseSRWLockExclusive(&draw_lock);
                 return false;
             }
@@ -2109,7 +2155,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (indirect && indexed) {
         validated = validate_indexed_arguments(self, list, *tr, *indirect, indexed_vertices);
         if (!validated) {
-            indirect->refusal = "translated indexed argument validation could not be recorded";
+            indirect->set_refusal("translated indexed argument validation could not be recorded",
+                                  indirect_refusal_code::indexed_validation_failed);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
@@ -2191,8 +2238,11 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
     TranslatedIndirectDraw draw{signature, argument, offset, indices};
     if (!draw_translated(self, indices.resource != nullptr, 0, 0, 0, 0, 0, &draw)) {
         static LONG refused;
-        if (draw.shader_key && first_calls(refused, 32))
-            log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);
+        if (draw.shader_key) {
+            const bool first_pair = indirect_draw_refusal_census.note(draw.shader_key, draw.refusal_code);
+            if (first_pair || first_calls(refused, 32))
+                log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);
+        }
         return draw.refusal;
     }
     InterlockedIncrement(&translated_draws);
