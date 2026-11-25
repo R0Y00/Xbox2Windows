@@ -2985,6 +2985,8 @@ check only:
   the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
   block alignment, every multiply and add in the footprint arithmetic checked for wrapping. Block-compressed
   bounds are whole 4x4 blocks, as in D3D12: a 2x2 or 1x1 mip takes the 4x4 footprint GetCopyableFootprints gives it.
+  An explicit box must also end on a block (`{0,0,2,2}` on a 2x2 mip is `bad_alignment`): forwarded, it makes the
+  desktop list's Close fail with E_INVALIDARG.
 - Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
   `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
   (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).
@@ -3002,6 +3004,7 @@ check only:
 Wrapped-list readback (`tests/startup_list_copy_texture_warp.cpp`): two images round-trip through array
 slices 1 and 2 of a 2-mip, 3-slice texture (upload buffer, texture, readback buffer, byte-for-byte), and a
 list with an out-of-range subresource, an index of `0xffffffff` and a footprint format mismatch is refused
-before any desktop copy, leaving a sentinel-filled readback buffer unchanged. Reproduce the portable check
-with its negative controls and the WARP and hardware runs with
+before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On a BC1 2x2 mip, the same
+list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
+all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.

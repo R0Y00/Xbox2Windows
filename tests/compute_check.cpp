@@ -40,10 +40,18 @@ constexpr UINT texture_view_mip1_flag = 1u << 31;
 // free below the format and view selectors.
 constexpr UINT texture_uav_load_flag = 1u << 21;
 constexpr UINT texture_rgba16_float_flag = 1u << 22;
-constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask | texture_rgba32_float_flag |
+constexpr UINT texture_array_flag = 1u << 31;
+constexpr UINT texture_volume_flag = texture_array_flag | texture_rgba32_float_flag;
+constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask | texture_volume_flag |
                                      texture_rgba16_float_flag | texture_uav_load_flag;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
-constexpr UINT texture_mip_levels = 3;
+constexpr UINT texture_mip_levels = 3, texture_layers = 4;
+
+UINT texture_subresources(const D3D12_RESOURCE_DESC& desc)
+{
+    // A volume mip contains all of its depth slices in one subresource.
+    return desc.MipLevels * (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1u : desc.DepthOrArraySize);
+}
 
 UINT texture_words_per_texel(DXGI_FORMAT format)
 {
@@ -82,36 +90,43 @@ static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>
 // buffer alive until the command list has executed.
 static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                              const std::vector<UINT>& texels,
-                                             DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging, bool writable = false)
+                                             DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging, bool writable = false,
+                                             D3D12_UAV_DIMENSION dimension = D3D12_UAV_DIMENSION_TEXTURE2D)
 {
     const UINT words_per_texel = texture_words_per_texel(format);
     const UINT base_words = texture_width * texture_height * words_per_texel;
     const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Dimension = dimension == D3D12_UAV_DIMENSION_TEXTURE3D
+        ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = texture_width;
     desc.Height = texture_height;
-    desc.DepthOrArraySize = desc.SampleDesc.Count = 1;
+    desc.DepthOrArraySize = dimension == D3D12_UAV_DIMENSION_TEXTURE2D ? 1 : texture_layers;
+    desc.SampleDesc.Count = 1;
     desc.MipLevels = static_cast<UINT16>(mips);
     desc.Format = format;
     if (writable) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     auto texture = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, texture_mip_levels> layouts{};
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(texture_subresources(desc));
     UINT64 upload_bytes = 0;
-    device->GetCopyableFootprints(&desc, 0, mips, 0, layouts.data(), nullptr, nullptr, &upload_bytes);
+    device->GetCopyableFootprints(&desc, 0, static_cast<UINT>(layouts.size()), 0,
+                                  layouts.data(), nullptr, nullptr, &upload_bytes);
     staging = make_buffer(device, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     const D3D12_RANGE no_reads{};
     check(staging->Map(0, &no_reads, &mapped), "Map texture upload");
     std::memset(mapped, 0, static_cast<std::size_t>(upload_bytes));
     std::size_t word = 0;
-    for (UINT level = 0; level < mips; ++level) {
-        const auto& layout = layouts[level];
-        const UINT row_words = (texture_width >> level) * words_per_texel;
-        for (UINT y = 0; y < (texture_height >> level); ++y) {
-            auto* row = static_cast<unsigned char*>(mapped) + layout.Offset + y * layout.Footprint.RowPitch;
-            std::memcpy(row, texels.data() + word, row_words * sizeof(UINT));
-            word += row_words;
+    for (const auto& layout : layouts) {
+        const auto& footprint = layout.Footprint;
+        const UINT row_words = footprint.Width * words_per_texel;
+        for (UINT z = 0; z < footprint.Depth; ++z) {
+            for (UINT y = 0; y < footprint.Height; ++y) {
+                auto* row = static_cast<unsigned char*>(mapped) + layout.Offset +
+                            (z * footprint.Height + y) * footprint.RowPitch;
+                std::memcpy(row, texels.data() + word, row_words * sizeof(UINT));
+                word += row_words;
+            }
         }
     }
     staging->Unmap(0, nullptr);
@@ -120,9 +135,9 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
     dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = staging.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    for (UINT level = 0; level < mips; ++level) {
-        dest.SubresourceIndex = level;
-        src.PlacedFootprint = layouts[level];
+    for (UINT subresource = 0; subresource < layouts.size(); ++subresource) {
+        dest.SubresourceIndex = subresource;
+        src.PlacedFootprint = layouts[subresource];
         list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
     }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -149,12 +164,21 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
     uav.Buffer.NumElements = capacity;
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     if (output_register >= uavs) throw std::runtime_error("Invalid output register");
+    const auto output_desc = output->GetDesc();
     for (UINT i = 0; i < uavs; ++i, cpu.ptr += stride) {
-        if (i == output_register && output->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (i == output_register && output_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             D3D12_UNORDERED_ACCESS_VIEW_DESC image{};
-            image.Format = output->GetDesc().Format;
-            image.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            image.Texture2D.MipSlice = output_mip;
+            image.Format = output_desc.Format;
+            if (output_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                image.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                image.Texture3D = {output_mip, 0, ~0u};
+            } else if (output_desc.DepthOrArraySize > 1) {
+                image.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                image.Texture2DArray = {output_mip, 0, output_desc.DepthOrArraySize, 0};
+            } else {
+                image.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                image.Texture2D.MipSlice = output_mip;
+            }
             device->CreateUnorderedAccessView(output, nullptr, &image, cpu);
         } else {
             device->CreateUnorderedAccessView(i == output_register ? output : nullptr, nullptr, &uav, cpu);
@@ -512,6 +536,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     const UINT selector = groups & texture_format_mask;
     groups &= ~texture_format_mask;
     DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_UINT;
+    D3D12_UAV_DIMENSION dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     UINT required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
     switch (selector) {
     case 0: break;
@@ -519,6 +544,14 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     case texture_uav_load_flag:
         format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         required |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+        break;
+    case texture_array_flag:
+        format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        dimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        break;
+    case texture_volume_flag:
+        format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
         break;
     case texture_rgba16_float_flag: format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
     case texture_rgba8_flag: format = DXGI_FORMAT_R8G8B8A8_UINT; break;
@@ -548,10 +581,16 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     }
     const bool float_image = selector == texture_rgba32_float_flag;
     const bool uav_load = selector == texture_uav_load_flag;
+    const bool layered = dimension != D3D12_UAV_DIMENSION_TEXTURE2D;
     const bool half_image = selector == texture_rgba16_float_flag;
     const UINT words_per_texel = texture_words_per_texel(format);
     const UINT base_words = texture_width * texture_height * words_per_texel;
-    const UINT all_words = base_words + base_words / 4 + base_words / 16;
+    UINT all_words = 0;
+    for (UINT level = 0; level < texture_mip_levels; ++level) {
+        UINT depth = layered ? texture_layers : 1;
+        if (dimension == D3D12_UAV_DIMENSION_TEXTURE3D) depth >>= level;
+        all_words += (base_words >> (2 * level)) * depth;
+    }
     std::vector<UINT> initial(all_words), expected(all_words);
     source.read(reinterpret_cast<char*>(initial.data()), all_words * sizeof(UINT));
     source.read(reinterpret_cast<char*>(expected.data()), all_words * sizeof(UINT));
@@ -573,9 +612,12 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
             return false;
         }
     }
-    if ((support.Support2 & required) != required) {
-        std::printf("format=%u required_support2=0x%x support1=0x%x support2=0x%x\n",
-                    static_cast<UINT>(format), required, static_cast<UINT>(support.Support1),
+    const UINT required_shape = dimension == D3D12_UAV_DIMENSION_TEXTURE3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
+        : layered ? D3D12_FORMAT_SUPPORT1_TEXTURE2D : 0;
+    if ((support.Support2 & required) != required || (support.Support1 & required_shape) != required_shape) {
+        std::printf("format=%u dimension=%u required_support1=0x%x required_support2=0x%x support1=0x%x support2=0x%x\n",
+                    static_cast<UINT>(format), static_cast<UINT>(dimension), required_shape, required,
+                    static_cast<UINT>(support.Support1),
                     static_cast<UINT>(support.Support2));
         return false;
     }
@@ -592,7 +634,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     ComputeCommands commands(device, pipeline.Get());
     auto* list = commands.list.Get();
     ComPtr<ID3D12Resource> staging, input_staging, input_image;
-    auto texture = upload_texture(device, list, initial, format, staging, true);
+    auto texture = upload_texture(device, list, initial, format, staging, true, dimension);
     if (float_image) input_image = upload_texture(device, list, input_texels, format, input_staging);
     auto constants_buffer = make_buffer(device, constants_offset + 4 * alignment, D3D12_HEAP_TYPE_UPLOAD,
                                         D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -602,19 +644,20 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     list->Dispatch(groups, 1, 1);
 
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, texture_mip_levels> layouts{};
-    UINT64 readback_bytes = 0;
     const auto desc = texture->GetDesc();
-    device->GetCopyableFootprints(&desc, 0, texture_mip_levels, 0, layouts.data(), nullptr, nullptr, &readback_bytes);
+    const UINT subresources = texture_subresources(desc);
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(subresources);
+    UINT64 readback_bytes = 0;
+    device->GetCopyableFootprints(&desc, 0, subresources, 0, layouts.data(), nullptr, nullptr, &readback_bytes);
     auto readback = make_buffer(device, readback_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION src{}, dest{};
     src.pResource = texture.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dest.pResource = readback.Get();
     dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    for (UINT level = 0; level < texture_mip_levels; ++level) {
-        src.SubresourceIndex = level;
-        dest.PlacedFootprint = layouts[level];
+    for (UINT subresource = 0; subresource < subresources; ++subresource) {
+        src.SubresourceIndex = subresource;
+        dest.PlacedFootprint = layouts[subresource];
         list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
     }
     commands.submit_and_wait(device);
@@ -623,29 +666,34 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     const D3D12_RANGE read{0, static_cast<SIZE_T>(readback_bytes)}, no_writes{};
     check(readback->Map(0, &read, &mapped), "Map image store readback");
     UINT word = 0, mismatches = 0;
-    for (UINT level = 0; level < texture_mip_levels; ++level) {
-        const auto& layout = layouts[level];
-        const UINT row_words = (texture_width >> level) * words_per_texel;
-        for (UINT y = 0; y < (texture_height >> level); ++y) {
-            const auto* row = reinterpret_cast<const UINT*>(static_cast<const unsigned char*>(mapped) +
-                                                             layout.Offset + y * layout.Footprint.RowPitch);
-            for (UINT x = 0; x < row_words; ++x, ++word) {
-                if (row[x] == expected[word]) continue;
-                if (half_image) {
-                    for (UINT half = 0; half < 2; ++half) {
-                        const UINT shift = 16u * half;
-                        const UINT want = (expected[word] >> shift) & 0xffffu;
-                        const UINT got = (row[x] >> shift) & 0xffffu;
-                        if (want == got) continue;
+    for (UINT subresource = 0; subresource < subresources; ++subresource) {
+        const auto& layout = layouts[subresource];
+        const auto& footprint = layout.Footprint;
+        const UINT level = subresource % desc.MipLevels;
+        const UINT row_words = footprint.Width * words_per_texel;
+        for (UINT z = 0; z < footprint.Depth; ++z) {
+            for (UINT y = 0; y < footprint.Height; ++y) {
+                const auto* row = reinterpret_cast<const UINT*>(static_cast<const unsigned char*>(mapped) +
+                    layout.Offset + (z * footprint.Height + y) * footprint.RowPitch);
+                for (UINT x = 0; x < row_words; ++x, ++word) {
+                    if (row[x] == expected[word]) continue;
+                    if (half_image) {
+                        for (UINT half = 0; half < 2; ++half) {
+                            const UINT shift = 16u * half;
+                            const UINT want = (expected[word] >> shift) & 0xffffu;
+                            const UINT got = (row[x] >> shift) & 0xffffu;
+                            if (want == got) continue;
+                            if (!mismatches)
+                                std::fprintf(stderr, "mip=%u half=%u expected=%04x actual=%04x\n",
+                                             level, 2 * word + half, want, got);
+                            ++mismatches;
+                        }
+                    } else {
                         if (!mismatches)
-                            std::fprintf(stderr, "mip=%u half=%u expected=%04x actual=%04x\n",
-                                         level, 2 * word + half, want, got);
+                            std::fprintf(stderr, "mip=%u word=%u expected=%08x actual=%08x\n",
+                                         level, word, expected[word], row[x]);
                         ++mismatches;
                     }
-                } else {
-                    if (!mismatches)
-                        std::fprintf(stderr, "mip=%u word=%u expected=%08x actual=%08x\n", level, word, expected[word], row[x]);
-                    ++mismatches;
                 }
             }
         }
