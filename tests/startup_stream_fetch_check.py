@@ -113,7 +113,7 @@ class Run:
                         X2W_SHADER_CACHE=str(self.cache), X2W_TEST_VERTEX_FETCH="1")
         self.env.setdefault("X2W_D3D12_DEBUG", "0")
         if layout:
-            self.env["X2W_TEST_INPUT_LAYOUT"] = "1"
+            self.env["X2W_TEST_INPUT_LAYOUT"] = layout if isinstance(layout, str) else "1"
         else:
             self.env.pop("X2W_TEST_INPUT_LAYOUT", None)
         subprocess.run(self.args, env=self.env, check=True)
@@ -191,6 +191,21 @@ def check(directory, consumer, backend):
     if "-> drawn;" in result.stderr:
         raise AssertionError("a vertex shader with a fetch call and no layout was drawn")
     print(f"{backend} no layout: refused and not drawn")
+
+    # empty layout: declared with no elements, so every fetched input reads zero; the vertices collapse and nothing
+    # but the blue clear reaches the readback (the fetched draw above is not blue everywhere).
+    empty = Run(directory / "empty", consumer, backend, vertex(), "empty")
+    layout = (empty.cache / ("req_%016x.ia" % empty.key)).read_bytes()
+    assert layout == b"ia1 0\n", layout
+    status = gfx2hlsl.translate_request(str(empty.cache), empty.key)
+    assert status == "ok", status
+    result = empty.draw()
+    if result.returncode or "-> drawn;" not in result.stderr:
+        raise RuntimeError(f"empty layout draw failed on {backend}: {result.returncode}\n{result.stderr}")
+    difference = first_difference(empty.output.read_bytes(), expected(lambda x, y: False))
+    if difference:
+        raise AssertionError(f"empty layout: {difference}")
+    print(f"{backend} empty layout: zero-fed vertices draw nothing, all {WIDTH * HEIGHT} pixels exact")
     return 0
 
 
