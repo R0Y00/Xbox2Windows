@@ -9407,6 +9407,14 @@ and unproven wave masks remain unsupported. Use
 Append `draw <dxc> <offscreen_check> <warp|hardware>` for CPU-reference readback
 of the SCC paths and lane-masked if/else.
 
+The `startup_mesh57_formatted_load_{warp,hardware}` tests use one
+`buffer_load_format_x` to set vertex red. The fixture supplies descriptor word 3
+in the constant slot published as `descword3` for SRV 0. It draws the same mesh
+and buffer with R32_FLOAT, RGBA8_UNORM red and RGBA8_UNORM blue. The CPU
+rasterizer checks all 1,024 pixels for each view and counts the changed pixels
+when the draw uses the wrong format or component. Overwriting the descriptor's
+format word in the guest program produces a translation refusal.
+
 Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
 slot 57 creation. The descriptor must name a registered root, have an empty
 VS slot and have a readable 16-byte to 64-KiB MS span. The PS span must be
