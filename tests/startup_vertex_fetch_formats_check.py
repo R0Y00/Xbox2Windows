@@ -408,9 +408,13 @@ def check(directory, compiler, consumer, adapter):
     for name, label, old, new in MUTATIONS:
         translated = pipeline_mubuf(FORMATS[name][2])
         source = mutate_case(translated.hlsl_vs(), FORMATS[name][0], old, new)
-        word3 = descriptor_word3(name)
-        bad = run(directory, compiler, consumer, adapter, name, source, mubuf_expected(name, 3), translated, word3)
-        if bad.returncode != 1 or 'Compute readback differs' not in bad.stderr:
+        # An xyz load never reads W, so a W-only mutation needs a word routing W into the third register.
+        for selects in ((4, 5, 6, 7), (4, 5, 7, 7)):
+            bad = run(directory, compiler, consumer, adapter, name, source, mubuf_expected(name, 3, selects), translated,
+                      descriptor_word3(name, selects))
+            if bad.returncode == 1 and 'Compute readback differs' in bad.stderr:
+                break
+        else:
             raise AssertionError('%s: descriptor-path mutation %r escaped detection\n%s' % (name, label, bad.stderr))
         print('%s: descriptor-path mutation %r fails' % (name, label))
     print('%s: %d buffer_load_format descriptor cases, wrong descriptor words and %d mutations fail'
