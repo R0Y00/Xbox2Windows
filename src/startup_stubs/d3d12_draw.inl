@@ -1260,7 +1260,7 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
     }
 }
 // List slot 49 (desktop 45 + 4), SOSetTargets(start, count, views). The bindings are kept on the pass;
-// draws do not write stream output yet, so the first calls with a bound buffer are logged.
+// draws do not write stream output yet (opt-in: X2W_D3D12_SO_TARGETS=1), so the first calls with a bound buffer are logged.
 void __stdcall list_stream_output_targets(Wrapper* self, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
 {
     static LONG logged;

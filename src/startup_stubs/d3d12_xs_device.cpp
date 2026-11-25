@@ -1885,6 +1885,17 @@ Pass& pass_of(Wrapper* self)
     if (!self->own().pass) self->own().pass = new Pass;
     return *static_cast<Pass*>(self->own().pass);
 }
+// Fixtures: the stream-output binding a list holds in a slot (BufferLocation, SizeInBytes, BufferFilledSizeLocation).
+// Returns 1 if the slot is bound, 0 if empty, -1 for a bad list or slot.
+extern "C" __declspec(dllexport) int x2w_d3d12_stream_output_slot(void* list, unsigned slot, unsigned long long* out)
+{
+    Wrapper* l = as_wrapper(list);
+    if (!l || l->own().kind != list_kind || slot >= x2w_startup::stream_output_slot_count) return -1;
+    const auto& v = pass_of(l).stream_output.views[slot];
+    if (out) { out[0] = v.location; out[1] = v.size; out[2] = v.filled_size_location; }
+    return v.location != 0;
+}
+
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
@@ -3774,7 +3785,8 @@ void build_tables()
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
-        list_typed[49] = reinterpret_cast<ListTyped>(&list_stream_output_targets);
+        // Slot 49 is inferred from the desktop order (45 + 4), with no independent evidence yet: opt in.
+        if (x2w_local::env_on("X2W_D3D12_SO_TARGETS")) list_typed[49] = reinterpret_cast<ListTyped>(&list_stream_output_targets);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
