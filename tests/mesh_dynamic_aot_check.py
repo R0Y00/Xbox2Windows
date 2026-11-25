@@ -27,6 +27,31 @@ def expect_refusal(decoded, geometry_word_count, text, limits=MESH_LIMITS):
         raise AssertionError(f"Expected refusal: {text}")
 
 
+def insert_scalar(decoded, after_pc, lines, skip_pc=None):
+    """Insert four-byte scalar lines after a pc; widen the skip branch that spans them."""
+    out = []
+    shift = 4 * len(lines)
+    for pc, text in decoded:
+        if pc == skip_pc:
+            text = f"s_cbranch_execz {int(text.split()[1]) + len(lines)}"
+        out.append((pc + (shift if pc > after_pc else 0), text))
+        if pc == after_pc:
+            out.extend((pc + 4 * (i + 1), line) for i, line in enumerate(lines))
+    return out
+
+
+def check_skipped_scalars(decoded):
+    # Wave 0 only: the write sits in the range wave 1 skips with its empty EXEC, so wave 1 never defines it.
+    skipped = insert_scalar(decoded, 160, ["s_mov_b32 s32, 1", "s_mov_b32 s33, 2"], skip_pc=156)
+    # A dead equality compare on a skipped-write scalar leaves SCC undefined instead of refusing the shader.
+    dead_compare = insert_scalar(skipped, 172, ["s_add_u32 s34, s32, 1", "s_cmp_eq_u32 s34, 0"])
+    lower(dead_compare, 2, MESH_LIMITS)
+    # A conditional mask that no live lane reads may be undefined.
+    last = skipped[-2][0]
+    masked_off = insert_scalar(skipped, last, ["s_mov_b64 exec, 0", "v_cndmask_b32_e64 v9, v9, v9, s[32:33]"])
+    lower(masked_off, 2, MESH_LIMITS)
+
+
 def check():
     decoded = decode(CODE)
     variants = enumerate_variants(decoded, 2, MESH_LIMITS)
@@ -64,6 +89,8 @@ def check():
     expect_refusal(decoded, 2, "Conflicting mesh counts", limits=(3, 1))
     with patch("mesh_dynamic_aot.MAX_VARIANTS", 1):
         expect_refusal(decoded, 2, "exceeds 1 input cases")
+
+    check_skipped_scalars(decoded)
 
     hlsl = lower(decoded, 2, MESH_LIMITS)
     assert hlsl.count("SetMeshOutputCounts(") == 1

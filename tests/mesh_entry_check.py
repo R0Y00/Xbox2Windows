@@ -850,6 +850,20 @@ def skipped_refusals():
         raise AssertionError(f"{name}: accepted")
 
 
+def skipped_unsupported_refusal():
+    # An opcode with implicit EXEC/SCC effects is refused even when an operand is undefined.
+    after_range = SKIPPED_PROGRAM.index("s_add_u32 s9, s7, 0x3e7feffd") + 1
+    program = SKIPPED_PROGRAM.copy()
+    program[after_range:after_range] = ["s_xor_saveexec_b64 s[34:35], s[8:9]"]
+    # Wave 1 reaches the instruction with an undefined operand; it must still see the unsupported opcode.
+    try:
+        Wave(1, [0x1003]).run(enumerate_pcs(program), {})
+    except ValueError as error:
+        assert "Unsupported scalar instruction s_xor_saveexec_b64" in str(error), error
+    else:
+        raise AssertionError("Unsupported scalar opcode accepted with an undefined operand")
+
+
 def skipped_cpu():
     text = skipped_draw()[0]
     # The first range in the program is skipped only by wave 1: the skipped write must not leak into wave 0.
@@ -863,6 +877,7 @@ def skipped_cpu():
     plain = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
     assert plain != text
     skipped_refusals()
+    skipped_unsupported_refusal()
 
 
 def skipped_negative_draws(dxc, renderer, adapter, tmp):

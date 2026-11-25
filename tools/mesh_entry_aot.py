@@ -65,6 +65,16 @@ UNDEF = _Undefined()
 UNDEFINED_SCALAR = "Scalar not written on this wave (skipped range) is used"
 
 
+SUPPORTED_SCALAR_OPS = frozenset(
+    (
+        "s_mov_b32", "s_mov_b64", "s_movk_i32", "s_cselect_b32", "s_cselect_b64",
+        "s_bfe_u32", "s_lshl_b32", "s_lshr_b32", "s_add_i32", "s_add_u32",
+        "s_sub_u32", "s_mul_i32", "s_and_b32", "s_and_b64", "s_or_b32",
+        "s_or_b64", "s_xor_b64", "s_andn2_b64",
+    )
+)
+
+
 class Wave:
     def __init__(self, wave, geometry, vertex_header=None):
         self.wave = wave
@@ -231,6 +241,9 @@ class Wave:
             self.put(d, old, True)
             self.scc = self.exec != 0
             return
+        if op not in SUPPORTED_SCALAR_OPS:
+            # Refuse before any undefined operand can hide an implicit EXEC/SCC/VCC effect.
+            raise ValueError(f"Unsupported scalar instruction {op}")
         vals = [self.scalar(t, True) for t in src]
         if op in ("s_cselect_b32", "s_cselect_b64") and self.scc is not None:
             # The arm that is not selected is never read.
