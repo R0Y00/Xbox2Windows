@@ -72,29 +72,25 @@ void require_copy_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_
 }
 
 // A resource the title maps at its own memory has a desktop resource that map and unmap never touch. Before
-// that resource is copied from, bring it up to date: a texture takes the draw path's upload, an upload buffer
-// takes the bytes through a desktop mapping, and a placed buffer aliasing the memory is already current.
-// False for a title-backed default-heap buffer, which has no desktop copy the list can refresh.
+// that resource is copied from, it must be current: a texture takes the draw path's upload, and a placed buffer
+// aliasing the memory already is. False when the desktop copy cannot be trusted: a texture the upload could not
+// stage, or a title-backed buffer in a default or upload heap. An upload buffer is refused because refreshing it
+// would rewrite one backing that an earlier submission may still be reading.
 bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
 {
     if (!source.wrapper || !source.wrapper->own().title_memory) return true;
     const D3D12_RESOURCE_DESC desc = source.resource->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-        upload_texture(self, source.wrapper, source.resource);
-        return true;
+        // A target or UAV holds what the GPU wrote; its title memory is never uploaded.
+        if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return true;
+        const auto written = texture_uploads().find(source.resource);
+        if (written != texture_uploads().end() && written->second.gpu_written) return true;
+        if (!upload_texture(self, source.wrapper, source.resource)) return false;
+        const auto found = texture_uploads().find(source.resource);
+        return found != texture_uploads().end() && found->second.staged;
     }
     const auto* info = resource_info(source.wrapper);
-    if (info && info->placement == Placement::aliased_buffer) return true;
-    D3D12_HEAP_TYPE type;
-    if (!fixed_heap(source.resource, type) || type != D3D12_HEAP_TYPE_UPLOAD) return false;
-    const u64 memory = reinterpret_cast<u64>(source.wrapper->own().title_memory);
-    if (readable_window(memory, static_cast<std::size_t>(desc.Width)) < desc.Width) return false;
-    void* mapped = nullptr;
-    const D3D12_RANGE none{0, 0};
-    if (FAILED(source.resource->Map(0, &none, &mapped)) || !mapped) return false;
-    std::memcpy(mapped, reinterpret_cast<const void*>(memory), static_cast<std::size_t>(desc.Width));
-    source.resource->Unmap(0, nullptr);
-    return true;
+    return info && info->placement == Placement::aliased_buffer;
 }
 
 // A copy or resolve destination now holds what the GPU wrote. A title-backed texture would otherwise be

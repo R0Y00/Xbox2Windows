@@ -14,7 +14,9 @@
 //   6. refused and counted, forwarded to nothing: a CopyResource between different sizes, a null source,
 //      a resolve from a one-sample source, a buffer range that runs past its end, a copy into an upload
 //      buffer and a copy out of a readback buffer
-//   7. after Close, the same calls change no counter
+//   7. a title-backed texture copied to a texture: the destination holds its texels; one whose memory cannot
+//      be read is refused and the destination stays empty
+//   8. after Close, the same calls change no counter
 //
 // The desktop device must not be removed and the debug layer must store no errors.
 //
@@ -256,6 +258,27 @@ int main(int argc, char** argv)
     invoke(device, 20, arg(msaa_m.Get()), arg(&multisampled), view_m.ptr);
     invoke(device, 20, arg(msaa_h.Get()), arg(&multisampled_half), view_h.ptr);
 
+    // Title-backed textures, placed at addresses of the title's own memory (device slot 133). One holds a known
+    // pattern; the other has its pages decommitted, so no upload can stage it.
+    constexpr std::uint32_t title_texel = 0x44332211;
+    constexpr std::size_t title_bytes = 0x10000;
+    auto* const readable_memory = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, title_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* const gone_memory = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, title_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!readable_memory || !gone_memory) return 30;
+    for (std::size_t i = 0; i < title_bytes / sizeof(std::uint32_t); ++i) readable_memory[i] = title_texel;
+    VirtualFree(gone_memory, title_bytes, MEM_DECOMMIT);
+    const D3D12_RESOURCE_DESC title_desc = texture(4, DXGI_FORMAT_R8G8B8A8_UNORM, 1, none);
+    void *title_readable = nullptr, *title_gone = nullptr;
+    ComPtr<ID3D12Resource> dest_readable, dest_gone;
+    if (!create(title_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, dest_readable) ||
+        !create(title_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, dest_gone))
+        return 31;
+    if (!ok(invoke(device, 133, arg(readable_memory), arg(&title_desc), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+                   arg(&title_readable))) || !title_readable ||
+        !ok(invoke(device, 133, arg(gone_memory), arg(&title_desc), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+                   arg(&title_gone))) || !title_gone)
+        return 32;
+
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
     void *allocator = nullptr, *list = nullptr;
@@ -297,12 +320,19 @@ int main(int argc, char** argv)
     invoke(list, 15, arg(buffer_y.Get()), 0, arg(probe.readback.Get()), 0, 16);
     if (!step("6f CopyBufferRegion out of a readback buffer", {0, 0, 0, 1}, seen)) return 29;
 
+    // A title-backed texture source is uploaded first, and the destination holds its texels. One whose memory
+    // cannot be staged is refused, and the destination keeps what it had.
+    invoke(list, 17, arg(dest_readable.Get()), arg(title_readable));
+    if (!step("8a CopyResource from a staged title-backed texture", {0, 1, 0, 0}, seen)) return 33;
+    invoke(list, 17, arg(dest_gone.Get()), arg(title_gone));
+    if (!step("8b CopyResource from an unreadable title-backed texture", {0, 0, 0, 1}, seen)) return 34;
+
     invoke(list, 9);
     if (!probe.submit(list)) return 19;
     invoke(list, 17, arg(copy_b.Get()), arg(empty_d.Get()));
     invoke(list, 19, arg(resolved_r.Get()), 0, arg(msaa_m.Get()), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
     invoke(list, 15, arg(buffer_y.Get()), 0, arg(buffer_x.Get()), 0, 16);
-    if (!step("7 calls on a closed list", {0, 0, 0, 0}, seen)) return 20;
+    if (!step("9 calls on a closed list", {0, 0, 0, 0}, seen)) return 20;
 
     const std::uint32_t copied = probe.texel(copy_b.Get());
     const std::uint32_t swapped_source = probe.texel(empty_d.Get());
@@ -317,6 +347,13 @@ int main(int argc, char** argv)
     if (swapped_source != 0 || swapped_target != 0) return 22;
     if (resolved != green_bits) return 23;
     if (resolved_half != half_one) return 24;
+
+    const std::uint32_t staged_copy = probe.texel(dest_readable.Get());
+    const std::uint32_t refused_copy = probe.texel(dest_gone.Get());
+    std::printf("title-backed source copied: %08x (expected %08x), refused source copy leaves destination: %08x (expected 00000000)\n",
+                staged_copy, title_texel, refused_copy);
+    if (staged_copy != title_texel) return 35;
+    if (refused_copy != 0) return 36;
 
     std::vector<std::uint8_t> whole, moved;
     if (!probe.bytes(buffer_x.Get(), 256, whole) || !probe.bytes(buffer_y.Get(), 80, moved)) return 25;

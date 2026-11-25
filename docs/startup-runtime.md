@@ -428,9 +428,9 @@ desktop would reject is counted, logged (first six) and not forwarded, with the 
 `bad_subresource`, `source_not_multisampled`, `destination_multisampled`, `bad_format`, `zero_size` or
 `range_overflow`, `heap_direction` (an upload buffer as a destination, a readback buffer as a source),
 `initial_state` (a placed buffer that does not start in COMMON) or `title_backed_source` (a title-backed default-heap
-buffer, which has no desktop copy to refresh). A source the title maps at its own memory is brought up to date first: a
-texture takes the draw path's upload, an upload buffer is copied through a desktop mapping, and an aliased placed buffer
-is already current. A copy or resolve destination with title memory is marked GPU-written, so a later draw does not
+buffer or an upload buffer, which have no desktop copy the list can refresh without rewriting bytes an earlier submission may
+still read). A source the title maps at its own memory must be current: a texture takes the draw path's upload and is refused
+when that upload cannot stage it (unreadable or unsupported memory), and an aliased placed buffer is already current. A copy or resolve destination with title memory is marked GPU-written, so a later draw does not
 upload the stale title memory over the result. CopyResource accepts formats of one DXGI family (colour, depth, 8/16/32-bit
 and block-compressed). A resolve format is exact against a fully typed endpoint and only family-compatible with a
 typeless one; a typeless resolve format (or an unknown one over typeless endpoints) resolves as the family's typed

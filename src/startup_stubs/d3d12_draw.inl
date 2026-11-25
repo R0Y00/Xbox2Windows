@@ -771,6 +771,7 @@ struct TextureUpload {
     bool done = false, tiled = false;
     ID3D12CommandList* pending_list = nullptr;
     u64 revision = 0;
+    bool staged = false;       // the last upload attempt put the title memory into the desktop texture
     bool gpu_written = false;  // a list copy or resolve wrote the texture; its title memory is stale and must not be uploaded
 };
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
@@ -1085,6 +1086,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         if (!state.done) InterlockedIncrement(&textures_unreadable);
         if (console) return false;
         state.done = true;
+        state.staged = false;
         state.generation = generation;
         return true;
     }
@@ -1110,6 +1112,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         }
         std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
     }
+    state.staged = false;
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
     if (console) {
         for (UINT slice = 0; slice < slices; ++slice) {
@@ -1180,6 +1183,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     state.checked_frame = frame_number;
     state.tiled = tiled;
     state.done = true;
+    state.staged = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
     static LONG shown;
