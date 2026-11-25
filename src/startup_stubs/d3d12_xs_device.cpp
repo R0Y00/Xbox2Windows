@@ -3230,8 +3230,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     // The allocation holding the address, and whether every byte from its base to the end of the
     // buffer is committed in it: one region-information call for a fully committed private
     // allocation, otherwise a region walk that stops at the end of the buffer. The GPU cannot fault in a lazily
-    // mapped physical page (X2W_XMEM_LAZY_COMMIT), so the buffer's pages are committed first.
+    // mapped physical page (X2W_XMEM_LAZY_COMMIT), so the buffer's pages are committed first; a lazy startup
+    // block (X2W_XMEM_LAZY_STARTUP) is committed whole, as the heap opened on it is reused for the block.
     x2w_local::commit_lazy(address, static_cast<std::size_t>(desc->Width));
+    x2w_local::commit_lazy_block(address);
     x2w_startup::PlacedBufferRange range;
     const bool committed = x2w_startup::measure_placed_buffer(address, desc->Width, range);
     InterlockedIncrement64(&placed_buffer_calls);
