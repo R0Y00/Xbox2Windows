@@ -1296,6 +1296,8 @@ uint class64(uint lo, uint hi) {
     # and the rounded value is clamped to [-2^31, 2^31 - 128] (2^31 - 1 is not a binary32), so every cast is in range.
     "cvt_flr_i32_f32": (
         "uint cvt_flr_i32_f32(uint bits) {\n"
+        # A host float floor can flush negative subnormals to zero before rounding.
+        "    if (bits > 0x80000000u && bits < 0x80800000u) return 0xffffffffu;\n"
         "    bool nan = (bits & 0x7fffffffu) > 0x7f800000u;\n"
         "    float x = asfloat(nan ? 0u : bits);\n"
         "    float r = clamp(floor(x), -2147483648.0f, 2147483520.0f);\n"
