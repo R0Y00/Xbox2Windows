@@ -79,8 +79,7 @@ _MESH_SRV_HANDLE = re.compile(
 _MESH_SRV_LOAD = re.compile(
     r'%\d+ = call %dx\.types\.ResRet\.i32 @dx\.op\.rawBufferLoad\.i32'
     r'\(i32 139, %dx\.types\.Handle (%\d+), i32 0, i32 undef, i8 1, i32 4\)')
-_MESH_GROUP_ID = re.compile(r'%\d+ = call i32 @dx\.op\.groupId\.i32\(i32 94, i32 [012]\)')
-_MESH_OUTPUT_OPS = frozenset(('setMeshOutputCounts', 'storeVertexOutput.f32',
+_MESH_OUTPUT_OPS = frozenset(('groupId.i32', 'setMeshOutputCounts', 'storeVertexOutput.f32',
                               'storeVertexOutput.i32', 'emitIndices'))
 _PIXEL_IO_OPS = frozenset(('loadInput.i32', 'loadInput.f32', 'storeOutput.i32', 'storeOutput.f32'))
 
@@ -110,8 +109,6 @@ def prove_mesh_root_srv(mesh_dump, pixel_dump):
             handles.append(match[1])
         elif op == 'rawBufferLoad.i32' and (match := _MESH_SRV_LOAD.fullmatch(instruction)):
             loads.append(match[1])
-        elif op == 'groupId.i32' and _MESH_GROUP_ID.fullmatch(instruction):
-            continue
         elif op not in _MESH_OUTPUT_OPS:
             raise ValueError(f'unsupported DXIL operation for the single-DWORD mesh SRV profile: {op}')
     if len(handles) != 1 or loads != handles:

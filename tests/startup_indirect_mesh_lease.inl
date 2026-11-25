@@ -14,6 +14,8 @@ struct MeshLeaseWriter {
     ID3D12Device* guest;
     HMODULE xmem;
     const UINT64 record_bytes;
+    const UINT64 record_offset;
+    const UINT expected_group_x;
     Allocate alloc;
     Map map;
     Free free_pages;
@@ -38,41 +40,44 @@ struct MeshLeaseWriter {
 
     MeshLeaseWriter(ID3D12Device* d, ID3D12Device* g, const wchar_t* dll,
                     ID3D12RootSignature* writer_root = nullptr, ID3D12PipelineState* writer = nullptr,
-                    const MeshLeaseWriter* shared = nullptr)
+                    MeshLeaseWriter* mirror_owner = nullptr, ID3D12PipelineState* append = nullptr)
         : device(d), guest(g), xmem(LoadLibraryW(dll)), record_bytes(writer ? sizeof(old_groups) : sizeof(red)),
+          record_offset(mirror_owner ? 0x80 : word_offset), expected_group_x(mirror_owner && !append ? 0 : new_groups[0]),
           alloc(function<Allocate>("XMemAllocatePhysicalPages")),
           map(function<Map>("XMemMapPhysicalPagesScatter")), free_pages(function<Free>("XMemFreePhysicalPages")),
           pin(function<Pin>("x2w_xmem_lease_section")), unpin(function<Unpin>("x2w_xmem_release_section"))
     {
-        check(SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", "1") &&
-              SetEnvironmentVariableA("X2W_XMEM_GPU_MIRROR", "1") ? S_OK : E_FAIL, "enable XMem mirror");
-        if (shared) {
-            cpu = shared->cpu + 3 * page;
-            mirror = shared->mirror + 3 * page;
+        if (mirror_owner) {
+            cpu = mirror_owner->cpu + page;
+            mirror = mirror_owner->mirror + page;
         } else {
+            check(SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", "1") &&
+                  SetEnvironmentVariableA("X2W_XMEM_GPU_MIRROR", "1") ? S_OK : E_FAIL, "enable XMem mirror");
             const auto reserve = function<Reserve>("XMemVirtualAlloc");
             constexpr UINT64 window = UINT64{16} << 30;
             cpu = static_cast<unsigned char*>(reserve(nullptr, window, 0x20402000, 0x21, 4));
             mirror = reinterpret_cast<UINT64>(reserve(nullptr, window, 0x20402000, 3, 0x801));
             check(cpu && mirror ? S_OK : E_FAIL, "reserve mirrored XMem");
+            ULONG_PTR count = 2;
+            void* const addresses[]{cpu, cpu + page};
+            check(alloc(0x280, &count, original) && count == 2 && map(addresses, 2, original) ? S_OK : E_FAIL,
+                  "map two XMem pages");
         }
-        ULONG_PTR count = 2;
-        void* const addresses[]{cpu, cpu + page};
-        check(alloc(0x280, &count, original) && count == 2 && map(addresses, 2, original) ? S_OK : E_FAIL,
-              "map two XMem pages");
         if (writer) {
-            std::memcpy(cpu + word_offset, old_groups.data(), sizeof(old_groups));
-            std::memcpy(cpu + page + word_offset, old_groups.data(), sizeof(old_groups));
-            std::memcpy(cpu + word_offset + 16, old_groups.data(), sizeof(old_groups));
-            std::memcpy(cpu + word_offset - 4, &leading_guard, sizeof(leading_guard));
-            std::memcpy(cpu + word_offset + record_bytes, &trailing_guard, sizeof(trailing_guard));
+            std::memcpy(cpu + record_offset, old_groups.data(), sizeof(old_groups));
+            if (!mirror_owner) {
+                std::memcpy(cpu + page + record_offset, old_groups.data(), sizeof(old_groups));
+                std::memcpy(cpu + record_offset + 16, old_groups.data(), sizeof(old_groups));
+            }
+            std::memcpy(cpu + record_offset - 4, &leading_guard, sizeof(leading_guard));
+            std::memcpy(cpu + record_offset + record_bytes, &trailing_guard, sizeof(trailing_guard));
         } else {
-            std::memcpy(cpu + word_offset, &green, sizeof(green));
-            std::memcpy(cpu + page + word_offset, &green, sizeof(green));
+            std::memcpy(cpu + record_offset, &green, sizeof(green));
+            std::memcpy(cpu + page + record_offset, &green, sizeof(green));
         }
         published_page = inspect(address());
 
-        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, writer ? 2 * page : page,
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, writer && !mirror_owner ? 2 * page : page,
             1, 1, 1, DXGI_FORMAT_UNKNOWN,
             {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
         using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
@@ -91,6 +96,14 @@ struct MeshLeaseWriter {
             list->SetComputeRootSignature(writer_root);
             list->SetComputeRootUnorderedAccessView(0, writer_source->GetGPUVirtualAddress());
             list->Dispatch(1, 1, 1);
+            if (append) {
+                D3D12_RESOURCE_BARRIER between_dispatches{};
+                between_dispatches.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                between_dispatches.UAV.pResource = writer_source.Get();
+                list->ResourceBarrier(1, &between_dispatches);
+                list->SetPipelineState(append);
+                list->Dispatch(1, 1, 1);
+            }
             transition(list.Get(), writer_source.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         } else {
             writer_source = make_buffer(device, sizeof(red), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -101,8 +114,9 @@ struct MeshLeaseWriter {
             writer_source->Unmap(0, nullptr);
         }
         using Copy = void (WINAPI*)(IUnknown*, IUnknown*, UINT64, IUnknown*, UINT64, UINT64);
-        slot<Copy>(recording.Get(), 15)(recording.Get(), placed.Get(), word_offset, writer_source.Get(),
-                                        writer ? argument_offset : 0, record_bytes);
+        const UINT64 source_offset = writer && !mirror_owner ? argument_offset : 0;
+        slot<Copy>(recording.Get(), 15)(recording.Get(), placed.Get(), record_offset, writer_source.Get(),
+                                        source_offset, record_bytes);
         check(slot<HRESULT (WINAPI*)(IUnknown*)>(recording.Get(), 9)(recording.Get()), "close slot 15 writer");
         queue = create_queue(type);
         gate = create_fence();
@@ -113,11 +127,11 @@ struct MeshLeaseWriter {
     {
         if (submitted) {
             gate->Signal(1);
-            completion->SetEventOnCompletion(1, nullptr);
+            mesh_fence_reached(completion.Get(), 5000);
         }
     }
 
-    UINT64 address() const { return mirror + word_offset; }
+    UINT64 address() const { return mirror + record_offset; }
 
     ComPtr<IUnknown> create_queue(D3D12_COMMAND_LIST_TYPE type)
     {
@@ -150,29 +164,32 @@ struct MeshLeaseWriter {
         auto native = native_object<ID3D12CommandQueue>(device, guest, queue.Get());
         check(native->Wait(gate.Get(), 1), "hold writer behind gate");
         submit_wrapped(queue.Get(), recording.Get());
-        check(native->Signal(completion.Get(), 1), "signal writer completion");
+        if (const HRESULT status = native->Signal(completion.Get(), 1); FAILED(status)) {
+            gate->Signal(1);
+            check(status, "signal writer completion");
+        }
         submitted = true;
     }
 
     void finish()
     {
         check(gate->Signal(1), "open writer gate");
-        check(completion->SetEventOnCompletion(1, nullptr), "wait for slot 15 writer");
+        check(mesh_fence_reached(completion.Get(), 5000) ? S_OK : E_FAIL, "wait for slot 15 writer");
         check(device->GetDeviceRemovedReason(), "slot 15 GPU completion");
         if (record_bytes == sizeof(new_groups)) {
             UINT observed[5]{};
-            const UINT expected[]{leading_guard, new_groups[0], new_groups[1], new_groups[2], trailing_guard};
-            std::memcpy(observed, cpu + word_offset - sizeof(UINT), sizeof(observed));
+            const UINT expected[]{leading_guard, expected_group_x, new_groups[1], new_groups[2], trailing_guard};
+            std::memcpy(observed, cpu + record_offset - sizeof(UINT), sizeof(observed));
             for (std::size_t i = 0; i < std::size(expected); ++i) {
                 if (observed[i] != expected[i])
                     std::fprintf(stderr, "XMem mesh argument/guard %zu: got %08x, expected %08x\n", i, observed[i], expected[i]);
                 check(observed[i] == expected[i] ? S_OK : E_FAIL, "check the compute-written XMem record and guards");
             }
-            std::puts("XMem DispatchMesh record and guards: {2,1,1} with both guards intact");
+            std::printf("XMem DispatchMesh record and guards: {%u,1,1} with both guards intact\n", expected_group_x);
             return;
         }
         UINT actual{};
-        std::memcpy(&actual, cpu + word_offset, sizeof(actual));
+        std::memcpy(&actual, cpu + record_offset, sizeof(actual));
         if (actual != red)
             std::fprintf(stderr, "leased slot 15 writer: 0x%08x != 0x%08x\n", actual, red);
         check(actual == red ? S_OK : E_FAIL, "leased XMem writer changed the CPU view");
@@ -247,122 +264,6 @@ void check_lease_debug(ID3D12InfoQueue* info)
     std::puts("D3D12 warnings/errors: 0");
 }
 
-bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar_t* xmem,
-                          ID3D12InfoQueue* info, const std::wstring& log_path,
-                          ID3D12RootSignature* writer_root, ID3D12PipelineState* group_writer,
-                          ID3D12RootSignature* root, IUnknown* pipeline, ID3D12CommandSignature* signature)
-{
-    MeshLeaseWriter srv(device, guest, xmem);
-    MeshLeaseWriter arguments(device, guest, xmem, writer_root, group_writer, &srv);
-    check(srv.published_page != arguments.published_page ? S_OK : E_FAIL, "writers use distinct XMem pages");
-    const auto queue = srv.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
-    MeshLeaseDraw read{srv.address(), queue.Get(), black};
-    read.argument = arguments.placed.Get();
-    read.argument_offset = MeshLeaseWriter::word_offset;
-    const auto verify = [&](const char* label) {
-        return run(device, guest, nullptr, nullptr, root, pipeline, signature, DrawKind::mesh,
-                   false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false, &read);
-    };
-
-    srv.start();
-    if (!verify("cached mesh refuses missing argument writer with SRV producer held")) return false;
-    arguments.start();
-    const bool skip_srv = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT", nullptr, 0) != 0;
-    const bool skip_arguments = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT", nullptr, 0) != 0;
-    read.expected = skip_srv ? green : red;
-    read.expected_right = skip_arguments ? black : read.expected;
-    if (skip_srv || skip_arguments) {
-        auto& fresh = skip_srv ? arguments : srv;
-        auto& held = skip_srv ? srv : arguments;
-        fresh.finish();
-        if (!verify(skip_srv ? "cached mesh reads stale SRV and two fresh groups"
-                             : "cached mesh reads fresh SRV and one stale group")) return false;
-        check(held.completion->GetCompletedValue() == 0 ? S_OK : E_FAIL, "omitted writer stayed behind its gate");
-        held.finish();
-        check_lease_debug(info);
-        DeleteFileW(log_path.c_str());
-        return true;
-    }
-
-    read.queued = [&](ID3D12Fence* done) {
-        srv.finish();
-        arguments.open_after_wait_probe(done);
-    };
-    if (!verify("cached mesh reads fresh SRV and two fresh groups")) return false;
-    arguments.finish();
-    read.queued = {};
-    read.expected = black;
-    read.expected_right.reset();
-    for (auto* writer : {&srv, &arguments}) {
-        ULONG_PTR replacement{}, count = 1;
-        check(writer->alloc(0x280, &count, &replacement) && count == 1 ? S_OK : E_FAIL, "allocate replacement page");
-        void* const address = writer->cpu;
-        read.before_submit = [&] {
-            check(writer->map(&address, 1, &replacement) ? S_OK : E_FAIL, "remap live address after recording");
-            check(writer->inspect(writer->address()) != writer->published_page ? S_OK : E_FAIL,
-                  "submission sees a different physical page at the same address");
-        };
-        const bool ok = verify(writer == &srv ? "cached mesh refuses remapped SRV at submission"
-                                             : "cached mesh refuses remapped arguments at submission");
-        check(writer->map(&address, 1, writer->original) && writer->free_pages(1, &replacement) ? S_OK : E_FAIL,
-              "restore the writer's original mapping");
-        if (!ok) return false;
-    }
-    read.before_submit = {};
-
-    const auto gate = srv.create_fence();
-    struct ReleaseGate {
-        ID3D12Fence* gate;
-        ~ReleaseGate() { gate->Signal(1); }
-    } release{gate.Get()};
-    const auto native = native_object<ID3D12CommandQueue>(device, guest, queue.Get());
-    check(native->Wait(gate.Get(), 1), "hold the consumer of both leases");
-    const auto reusable_pages = [&] {
-        std::array<ULONG_PTR, 4> tokens{}, empty{};
-        std::array<void*, 4> addresses{};
-        ULONG_PTR count = tokens.size();
-        for (std::size_t i = 0; i < addresses.size(); ++i)
-            addresses[i] = srv.cpu + (8 + i) * MeshLeaseWriter::page;
-        check(srv.alloc(0x280, &count, tokens.data()) && count == tokens.size() &&
-              srv.map(addresses.data(), count, tokens.data()) ? S_OK : E_FAIL, "allocate four probe pages");
-        std::array<bool, 2> reusable{};
-        for (std::size_t i = 0; i < addresses.size(); ++i) {
-            const auto page = srv.inspect(srv.address() + (8 + i) * MeshLeaseWriter::page);
-            reusable[0] |= page == srv.published_page;
-            reusable[1] |= page == arguments.published_page;
-        }
-        check(srv.map(addresses.data(), count, empty.data()) && srv.free_pages(count, tokens.data()) ? S_OK : E_FAIL,
-              "release probe pages");
-        return reusable;
-    };
-    read.expected = red;
-    read.drop_recording = true;
-    read.queued = [&](ID3D12Fence*) {
-        srv.free_original();
-        arguments.free_original();
-        check(reusable_pages() == std::array<bool, 2>{false, false} ? S_OK : E_FAIL,
-              "neither leased page can be reused while the consumer is queued");
-        check(gate->Signal(1), "release the consumer of both leases");
-    };
-    if (!verify("cached mesh reads both leases after the guest unmaps them")) return false;
-    const auto deadline = GetTickCount64() + 3000;
-    while (reusable_pages() != std::array<bool, 2>{true, true}) {
-        check(GetTickCount64() < deadline ? S_OK : E_FAIL, "both slots return after the consumer fence");
-        Sleep(1);
-    }
-    std::puts("both XMem slots returned after the DIRECT consumer fence");
-
-    std::ifstream log{std::filesystem::path(log_path)};
-    const std::string lines{std::istreambuf_iterator<char>(log), {}};
-    log.close();
-    DeleteFileW(log_path.c_str());
-    check(lines.find("writer or live page identity changed (4 bytes)") != std::string::npos &&
-          lines.find("writer or live page identity changed (12 bytes)") != std::string::npos ? S_OK : E_FAIL,
-          "submission refused each remapped range independently");
-    check_lease_debug(info);
-    return true;
-}
-
 bool check_mesh_indirect_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar_t* xmem,
                               ID3D12InfoQueue* info, const std::wstring& log_path,
                               ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
@@ -424,6 +325,182 @@ bool check_mesh_indirect_xmem(ID3D12Device* device, ID3D12Device* guest, const w
     check(lines.find(no_writer) != std::string::npos && wrong_page != std::string::npos &&
           lines.find(mismatch, wrong_page + sizeof(mismatch) - 1) != std::string::npos ? S_OK : E_FAIL,
           "check missing writer, wrong-page and wrong-range refusals");
+    check_lease_debug(info);
+    return true;
+}
+
+bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar_t* xmem,
+                          ID3D12InfoQueue* info, const std::wstring& log_path,
+                          ID3D12RootSignature* writer_root, ID3D12PipelineState* initialize, ID3D12PipelineState* append,
+                          ID3D12RootSignature* root, IUnknown* pipeline, ID3D12CommandSignature* signature)
+{
+    const bool init_only = !append;
+    MeshLeaseWriter colour(device, guest, xmem);
+    MeshLeaseWriter arguments(device, guest, xmem, writer_root, initialize, &colour, append);
+    check(colour.published_page.first != arguments.published_page.first ? S_OK : E_FAIL,
+          "combined mesh writers use different physical pages");
+    const auto queue = colour.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+    const auto draw = [&](UINT left, UINT right) {
+        MeshLeaseDraw result{colour.address(), queue.Get(), left};
+        result.argument = arguments.placed.Get();
+        result.argument_offset = arguments.record_offset;
+        result.expected_right = right;
+        return result;
+    };
+    const auto verify = [&](const MeshLeaseDraw& args, const char* label) {
+        return run(device, guest, nullptr, nullptr, root, pipeline, signature, DrawKind::mesh,
+                   false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false, &args);
+    };
+    const auto release_pages = [&] {
+        arguments.recording.Reset();
+        arguments.placed.Reset();
+        colour.free_original();
+    };
+    const auto refused = draw(black, black);
+    if (!verify(refused, "combined cached mesh without submitted writers refused")) return false;
+    if (GetEnvironmentVariableA("X2W_MESH86_FIXTURE_REJECT_MARKER", nullptr, 0)) {
+        colour.start();
+        arguments.start();
+        colour.finish();
+        arguments.finish();
+        const bool result = verify(refused, "combined cached mesh rejects invalid marker with both writers");
+        release_pages();
+        check_lease_debug(info);
+        return result;
+    }
+    if (!GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0)) {
+        release_pages();
+        check_lease_debug(info);
+        return true;
+    }
+
+    const bool skip_srv = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT", nullptr, 0) != 0;
+    const bool skip_arguments = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT", nullptr, 0) != 0;
+    check(static_cast<int>(skip_srv) + static_cast<int>(skip_arguments) + static_cast<int>(init_only) <= 1 ? S_OK : E_FAIL,
+          "select one combined mesh control");
+    const bool control = skip_srv || skip_arguments;
+    const bool ordered_case = !control && !init_only;
+    auto consume = init_only ? refused : draw(skip_srv ? green : red, skip_srv ? green : skip_arguments ? black : red);
+    const char* label = init_only ? "combined mesh initialized arguments: zero groups" :
+                        skip_srv ? "combined mesh stale SRV: two green halves" :
+                        skip_arguments ? "combined mesh stale arguments: left red, right clear" :
+                                         "combined mesh fresh inputs: two red halves";
+    colour.start();
+    if (ordered_case) {
+        if (!verify(refused, "combined mesh refuses recorded but unsubmitted argument writer")) return false;
+        check(colour.completion->GetCompletedValue() == 0 ? S_OK : E_FAIL,
+              "refusal completes with the published SRV writer still gated");
+    }
+    arguments.start();
+    bool ordered = false;
+    consume.queued = [&](ID3D12Fence* done) {
+        const bool blocked = !mesh_fence_reached(done, 50);
+        // With one wait omitted, release the producer which is still required.
+        // The other producer remains held until the entire draw completes.
+        auto& first = skip_srv ? arguments : colour;
+        auto& second = skip_srv ? colour : arguments;
+        const HRESULT opened_first = first.gate->Signal(1);
+        const bool first_finished = mesh_fence_reached(first.completion.Get(), 5000);
+        const bool finished_after_first = mesh_fence_reached(done, control ? 5000 : 50);
+        const HRESULT opened_second = second.gate->Signal(1);
+        ordered = blocked && SUCCEEDED(opened_first) && first_finished &&
+                  SUCCEEDED(opened_second) && finished_after_first == control;
+    };
+    if (!verify(consume, label)) return false;
+    check(ordered ? S_OK : E_FAIL, "combined mesh consumer followed the expected producer gates");
+    colour.finish();
+    arguments.finish();
+
+    if (ordered_case) {
+        for (std::size_t page = 0; page < std::size(colour.original); ++page) {
+            const bool root_page = page == 0;
+            auto& writer = root_page ? colour : arguments;
+            auto& other = root_page ? arguments : colour;
+            auto remapped = refused;
+            ULONG_PTR replacement{}, count = 1;
+            check(colour.alloc(0x280, &count, &replacement) && count == 1 ? S_OK : E_FAIL,
+                  "allocate replacement mesh page");
+            void* const replaced_address = writer.cpu;
+            remapped.before_submit = [&] {
+                check(colour.map(&replaced_address, 1, &replacement) ? S_OK : E_FAIL,
+                      "remap one mesh input before submission");
+                if (root_page)
+                    std::memcpy(writer.cpu + writer.record_offset, &green, sizeof(green));
+                else
+                    std::memcpy(writer.cpu + writer.record_offset, MeshLeaseWriter::old_groups.data(),
+                                sizeof(MeshLeaseWriter::old_groups));
+                check(writer.inspect(writer.address()) != writer.published_page &&
+                      other.inspect(other.address()) == other.published_page ? S_OK : E_FAIL,
+                      "only the selected mesh page identity changed");
+            };
+            const bool unchanged = verify(remapped, root_page
+                ? "combined mesh with remapped root SRV leaves target clear"
+                : "combined mesh with remapped arguments leaves target clear");
+            check(colour.map(&replaced_address, 1, &colour.original[page]) &&
+                  colour.free_pages(1, &replacement) ? S_OK : E_FAIL, "restore the original mesh page");
+            if (!unchanged || !verify(draw(red, red), "combined mesh reads both ranges after restoring mapping")) return false;
+        }
+
+        const auto gate = colour.create_fence();
+        struct ReleaseGate {
+            ID3D12Fence* gate;
+            ~ReleaseGate() { gate->Signal(1); }
+        } release{gate.Get()};
+        const auto native = native_object<ID3D12CommandQueue>(device, guest, queue.Get());
+        check(native->Wait(gate.Get(), 1), "hold the combined consumer");
+        const auto probe_reusable_pages = [&] {
+            // Hold both probe allocations at once to test for both original
+            // pages. Compare section offsets because the word offsets differ.
+            ULONG_PTR tokens[2]{}, count = std::size(tokens);
+            void* const probes[]{colour.cpu + 2 * MeshLeaseWriter::page, colour.cpu + 3 * MeshLeaseWriter::page};
+            check(colour.alloc(0x280, &count, tokens) && count == std::size(tokens) &&
+                  colour.map(probes, count, tokens) ? S_OK : E_FAIL, "map two physical probe pages");
+            std::array<bool, 2> reusable{};
+            for (std::size_t i = 0; i < std::size(probes); ++i) {
+                const auto page = colour.inspect(colour.address() + (2 + i) * MeshLeaseWriter::page).first;
+                reusable[0] |= page == colour.published_page.first;
+                reusable[1] |= page == arguments.published_page.first;
+            }
+            const ULONG_PTR empty[]{0, 0};
+            check(colour.map(probes, count, empty) && colour.free_pages(count, tokens) ? S_OK : E_FAIL,
+                  "release both physical probe pages");
+            return reusable;
+        };
+        auto pinned = draw(red, red);
+        pinned.drop_recording = true;
+        pinned.queued = [&](ID3D12Fence* done) {
+            release_pages();
+            const bool pending = done->GetCompletedValue() == 0;
+            const auto reusable = probe_reusable_pages();
+            check(gate->Signal(1), "release the combined consumer");
+            check(pending && reusable == std::array<bool, 2>{false, false} ? S_OK : E_FAIL,
+                  "neither original page is reusable before the DIRECT fence");
+        };
+        if (!verify(pinned, "combined mesh still reads both XMem pages after guest unmap")) return false;
+        const auto deadline = GetTickCount64() + 3000;
+        while (probe_reusable_pages() != std::array<bool, 2>{true, true}) {
+            check(GetTickCount64() < deadline ? S_OK : E_FAIL, "both original pages return after the DIRECT fence");
+            Sleep(1);
+        }
+        std::puts("both original XMem pages returned after the DIRECT fence");
+    } else {
+        release_pages();
+    }
+
+    std::ifstream log{std::filesystem::path(log_path)};
+    check(log ? S_OK : E_FAIL, "open combined mesh handoff log");
+    const std::string lines{std::istreambuf_iterator<char>(log), {}};
+    log.close();
+    DeleteFileW(log_path.c_str());
+    constexpr char missing_writer[] = "mesh XMem read has no submitted writer for the required size";
+    constexpr char remapped_page[] = "mesh XMem submit refused: writer or live page identity changed";
+    const auto first_missing = lines.find(missing_writer);
+    const auto first_remap = lines.find(remapped_page);
+    check(first_missing != std::string::npos &&
+          (!ordered_case || (lines.find(missing_writer, first_missing + sizeof(missing_writer) - 1) != std::string::npos &&
+             first_remap != std::string::npos &&
+             lines.find(remapped_page, first_remap + sizeof(remapped_page) - 1) != std::string::npos))
+          ? S_OK : E_FAIL, "check both missing-writer and both remapped-page refusals");
     check_lease_debug(info);
     return true;
 }

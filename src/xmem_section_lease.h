@@ -5,9 +5,8 @@
 
 inline constexpr std::uint32_t x2w_xmem_section_lease_version = 1;
 
-// The caller owns the section handle and closes it when no longer needed.
-// It retains the lease through its last submitted GPU access and releases it
-// after the completion fence.
+// The caller closes section after importing it. It retains the lease through
+// its last submitted GPU access and releases it after the completion fence.
 struct X2WXMemSectionLease {
     HANDLE section;
     std::uint64_t id;
