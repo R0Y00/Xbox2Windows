@@ -127,20 +127,34 @@ def trace(report, entry):
                       "Dynamic targets and actual execution order require independent evidence.")
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inventory", type=Path)
     parser.add_argument("entry", nargs="?", help="Relative PE path, or omit to assess every entry independently")
-    args = parser.parse_args()
-    data = args.inventory.read_bytes()
-    inventory = json.loads(data)
-    if args.entry and args.entry not in inventory["images"]:
-        parser.error("Entry does not appear in this inventory")
-    entries = [args.entry] if args.entry else sorted(inventory["images"])
-    document = dict(inventory_sha256=hashlib.sha256(data).hexdigest(),
-                    entries={name: trace(inventory, name) for name in entries})
+    args = parser.parse_args(argv)
+    try:
+        if args.inventory.is_dir():
+            raise ValueError(f"Inventory path is a directory: {args.inventory}")
+        data = args.inventory.read_bytes()
+        inventory = json.loads(data)
+        if not isinstance(inventory, dict):
+            raise ValueError("Inventory JSON root must be an object")
+        images = inventory.get("images")
+        if not isinstance(images, dict):
+            raise ValueError("Inventory JSON must contain an 'images' object")
+        imports = inventory.get("imports")
+        if not isinstance(imports, list):
+            raise ValueError("Inventory JSON must contain an 'imports' list")
+        if args.entry is not None and args.entry not in images:
+            parser.error("Entry does not appear in this inventory")
+        entries = [args.entry] if args.entry is not None else sorted(images)
+        document = dict(inventory_sha256=hashlib.sha256(data).hexdigest(),
+                        entries={name: trace(inventory, name) for name in entries})
+    except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+        parser.exit(1, f"{args.inventory}: {exc}\n")
     print(json.dumps(document, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,15 +1,18 @@
-"""Level-zero D16 image_load lowering in tools/startup/gfx2hlsl.py (Part of #2023, item D).
+"""D16 image_load and image_load_mip lowering in tools/startup/gfx2hlsl.py (Part of #2023, item D).
 
   (no arguments)                       emitted-HLSL rounding, decoder, SRV format and odd-dmask controls
   binary <llvm-mc>                     reassemble every fixture source and compare it with the recorded words
   decode <libLLVM>                     disassemble the MIMG words with LLVM's C API and compare with disasm_rdna2.py
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
-                                       translate, compile (DXC ps_6_0, and FXC ps_5_1 when given) and draw two
-                                       pixel fixtures against 8x2 R16_UNORM (including 0xffaf and 0xffef) and 8x2
-                                       R32G32B32A32_FLOAT textures into an R32G32B32A32_UINT target, checking all
-                                       64 output words per draw, high-half odd-dmask isolation and eight mutations
+                                       translate, compile (DXC ps_6_0, and FXC ps_5_1 when given) and draw four
+                                       pixel fixtures (level-zero 2D A/B, explicit-mip 2D C and explicit-mip
+                                       2D-array D) against two-mip (8x2 + 4x1) R16_UNORM (including 0xffaf and
+                                       0xffef) and R32G32B32A32_FLOAT 2D / two-slice 2D-array textures into an
+                                       R32G32B32A32_UINT target, checking all 64 output words per draw, high-half
+                                       odd-dmask isolation and fourteen mutations
 
-On RDNA 2 (gfx1013), image_load with d16 narrows the enabled dmask channels to IEEE binary16 (round to nearest even)
+On RDNA 2 (gfx1013), image_load and image_load_mip with d16 narrow the enabled dmask channels to IEEE binary16 (round to
+nearest even)
 and packs them pairwise into ceil(popcount(dmask) / 2) consecutive VGPRs (low half first, high half second; when
 popcount(dmask) is odd, bits 31:16 of the final destination VGPR are hardware-undefined). HLSL f32tof16 truncates
 toward zero on WARP (lowering 31,740 of the 65,536 R16_UNORM values by 1 ULP), while narrowing a binary32 intermediate
@@ -55,6 +58,11 @@ DEPTH_TEXELS = (
     0x8010, 0xa018, 0xc018, 0xe00c, 0xffaf, 0xffef, 0xfffe, 0xffff,
 )
 
+DEPTH_MIP1 = (
+    (0xffaf, 0xffef, 0x0003, 0x8010),
+    (0xffef, 0xffaf, 0x5555, 0xa018),
+)
+
 FLOAT_TEXELS = (
     (0x3f801000, 0x3f803000, 0x3f801001, 0x3f7fffff),
     (0x387fe000, 0x387fdfff, 0x33800000, 0x33000000),
@@ -72,6 +80,13 @@ FLOAT_TEXELS = (
     (0xb4000000, 0xb4800000, 0xb5000000, 0xb5800000),
     (0x3fc00000, 0xc0000000, 0x40200000, 0xc0400000),
     (0x477fe000, 0xc77fe000, 0x38800000, 0xb8800000),
+)
+
+FLOAT_MIP1 = (
+    (0x3f803000, 0x387fe000, 0xbf803000, 0x477fefff),
+    (0x33800000, 0x33000001, 0x80000000, 0x7fc00001),
+    (0x44006000, 0xc4006000, 0x39003000, 0xb9003000),
+    (0x477ff000, 0xc77ff000, 0x3e200000, 0xbe200000),
 )
 
 # DXGI_FORMAT enum values referenced in src/startup_stubs/d16_image_format.h.
@@ -190,20 +205,83 @@ MIMG_LLVM_MC = {
         'image_load v[4:5], v[0:2], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY d16',
         encode_mimg(IMG_LOAD, dmask=0xf, dim=DIM_2D_ARRAY, vaddr=0, vdata=4, d16=1),
     ),
-    'mip_d16_refused': (
+    'mip_d16_2d': (
         'image_load_mip v[4:5], v[0:2], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D d16',
         encode_mimg(IMG_LOAD_MIP, dmask=0xf, vaddr=0, vdata=4, d16=1),
+    ),
+    'mip_d16_x': (
+        'image_load_mip v4, v[8:10], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0x1, vaddr=8, vdata=4, d16=1),
+    ),
+    'mip_d16_xz': (
+        'image_load_mip v5, v[8:10], s[16:23] dmask:0x5 dim:SQ_RSRC_IMG_2D unorm d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0x5, vaddr=8, vdata=5, unorm=1, d16=1),
+    ),
+    'mip_d16_xyz_nsa': (
+        'image_load_mip v[6:7], [v2, v9, v10], s[16:23] dmask:0x7 dim:SQ_RSRC_IMG_2D glc slc dlc d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0x7, vaddr=2, vdata=6, nsa=1, extra_addrs=(9, 10), glc=1, slc=1, dlc=1, d16=1),
+    ),
+    'mip_d16_3d': (
+        'image_load_mip v[4:5], v[0:3], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_3D d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0xf, dim=DIM_3D, vaddr=0, vdata=4, d16=1),
+    ),
+    'mip_d16_2da_xyzw': (
+        'image_load_mip v[4:5], v[8:11], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0xf, dim=DIM_2D_ARRAY, vaddr=8, vdata=4, d16=1),
+    ),
+    'mip_d16_2da_x_nsa': (
+        'image_load_mip v6, [v12, v9, v10, v11], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0x1, dim=DIM_2D_ARRAY, vaddr=12, vdata=6, nsa=1, extra_addrs=(9, 10, 11), d16=1),
+    ),
+    'mip_d16_2da_zw_nsa': (
+        'image_load_mip v7, [v12, v9, v10, v11], s[16:23] dmask:0xc dim:SQ_RSRC_IMG_2D_ARRAY d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0xc, dim=DIM_2D_ARRAY, vaddr=12, vdata=7, nsa=1, extra_addrs=(9, 10, 11), d16=1),
     ),
     '1d_d16_refused': (
         'image_load v4, v0, s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_1D d16',
         encode_mimg(IMG_LOAD, dmask=0x1, dim=DIM_1D, vaddr=0, vdata=4, d16=1),
     ),
+    'mip_1d_d16_refused': (
+        'image_load_mip v4, v[0:1], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_1D d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0x1, dim=DIM_1D, vaddr=0, vdata=4, d16=1),
+    ),
     'cube_d16_refused': (
         'image_load v[4:5], v[0:2], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_CUBE d16',
         encode_mimg(IMG_LOAD, dmask=0xf, dim=DIM_CUBE, vaddr=0, vdata=4, d16=1),
     ),
+    'mip_cube_d16_refused': (
+        'image_load_mip v[4:5], v[0:3], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_CUBE d16',
+        encode_mimg(IMG_LOAD_MIP, dmask=0xf, dim=DIM_CUBE, vaddr=0, vdata=4, d16=1),
+    ),
 }
 DECODE_KEYS = tuple(MIMG_LLVM_MC)
+
+# Prefix for 2D image_load_mip (Fixture C): v10 = y (mip 0 or 1), v8 = v2 = x >> y, v9 = 0, v3 = 63 (NSA sentinel).
+PRE_C = """\
+s_load_dwordx8 s[16:23], s[8:9], 0x0
+v_and_b32_e32 v1, 7, v0
+v_lshrrev_b32_e32 v10, 16, v0
+v_lshrrev_b32_e32 v8, v10, v1
+v_mov_b32_e32 v9, 0
+v_lshrrev_b32_e32 v2, v10, v1
+v_mov_b32_e32 v3, 63
+s_waitcnt lgkmcnt(0)
+"""
+PRE_WORDS_C = bytes.fromhex('04040cf4000000fa' '87000236' '9000142c' '0a03102c' '8002127e' '0a03042c' 'bf02067e' '7fc08cbf')
+
+# Prefix for 2D-array image_load_mip (Fixture D): v8 = v12 = x >> 1, v9 = 0, v10 = x & 1 (slice), v11 = y (mip), v13 = 63.
+PRE_D = """\
+s_load_dwordx8 s[16:23], s[8:9], 0x0
+v_and_b32_e32 v1, 7, v0
+v_lshrrev_b32_e32 v11, 16, v0
+v_lshrrev_b32_e32 v8, 1, v1
+v_mov_b32_e32 v9, 0
+v_and_b32_e32 v10, 1, v1
+v_lshrrev_b32_e32 v12, 1, v1
+v_mov_b32_e32 v13, 63
+s_waitcnt lgkmcnt(0)
+"""
+PRE_WORDS_D = bytes.fromhex('04040cf4000000fa' '87000236' '9000162c' '8102102c' '8002127e' '81021436' '8102182c' 'bf021a7e' '7fc08cbf')
 
 # Fixture A exercises 1-channel depth d16 (dmask:0x1 -> v_cvt_f32_f16), 2-channel non-contiguous a16+d16 (dmask:0x5)
 # and 3-channel NSA d16 (dmask:0x7 -> SDWA WORD_0 low-half consumer on v7).
@@ -213,6 +291,16 @@ PS_WORDS_A = PRE_WORDS + b''.join(MIMG_LLVM_MC[k][1] for k in ('d16_x', 'd16_xz_
 # Fixture B exercises full 4-channel d16 (dmask:0xf), single y channel (dmask:0x2 -> v_and_b32 0xffff) and dmask:0xc.
 PS_SOURCE_B = PRE + '\n'.join(MIMG_LLVM_MC[k][0] for k in ('d16_xyzw', 'd16_y', 'd16_zw')) + '\n' + POST_B
 PS_WORDS_B = PRE_WORDS + b''.join(MIMG_LLVM_MC[k][1] for k in ('d16_xyzw', 'd16_y', 'd16_zw')) + POST_WORDS_B
+
+# Fixture C exercises 2D image_load_mip with d16 across mip 0 (y=0) and mip 1 (y=1): odd dmask:0x1 -> v_cvt_f32_f16,
+# 2-channel non-contiguous dmask:0x5 with unorm, and 3-channel NSA [v2, v9, v10] dmask:0x7 -> SDWA WORD_0 on v7.
+PS_SOURCE_C = PRE_C + '\n'.join(MIMG_LLVM_MC[k][0] for k in ('mip_d16_x', 'mip_d16_xz', 'mip_d16_xyz_nsa')) + '\n' + POST_A
+PS_WORDS_C = PRE_WORDS_C + b''.join(MIMG_LLVM_MC[k][1] for k in ('mip_d16_x', 'mip_d16_xz', 'mip_d16_xyz_nsa')) + POST_WORDS_A
+
+# Fixture D exercises 2D-array image_load_mip with d16 across slices (x & 1) and mips (y): full dmask:0xf on v[8:11],
+# NSA [v12, v9, v10, v11] odd dmask:0x1 -> v_and_b32 0xffff on v6, and NSA dmask:0xc on v7.
+PS_SOURCE_D = PRE_D + '\n'.join(MIMG_LLVM_MC[k][0] for k in ('mip_d16_2da_xyzw', 'mip_d16_2da_x_nsa', 'mip_d16_2da_zw_nsa')) + '\n' + POST_B
+PS_WORDS_D = PRE_WORDS_D + b''.join(MIMG_LLVM_MC[k][1] for k in ('mip_d16_2da_xyzw', 'mip_d16_2da_x_nsa', 'mip_d16_2da_zw_nsa')) + POST_WORDS_B
 
 
 PACK16_RNE_HLSL = """\
@@ -336,28 +424,49 @@ def pack16_rtz_ref(bits):
     return sign | (sig >> shift)
 
 
-def texel_f32_words(tex_mode, x, y):
-    if not (0 <= x < WIDTH and 0 <= y < HEIGHT):
-        return (0, 0, 0, 0)
-    idx = y * WIDTH + x
-    if tex_mode == 'r16_unorm':
-        return (f32_bits_from_unorm16(DEPTH_TEXELS[idx]), 0, 0, 0x3f800000)
-    return FLOAT_TEXELS[idx]
+def texel_f32_words(tex_mode, x, y, *, mip=0, slice_=0):
+    is_depth = tex_mode.startswith('r16_unorm')
+    oob = (0, 0, 0, 0x3f800000) if is_depth else (0, 0, 0, 0)
+    max_slices = 2 if tex_mode.endswith('_array') else 1
+    if not (0 <= mip < 2 and 0 <= slice_ < max_slices):
+        return oob
+    mw, mh = WIDTH >> mip, HEIGHT >> mip
+    if not (0 <= x < mw and 0 <= y < mh):
+        return oob
+    if mip == 0:
+        idx = (y * WIDTH + x) if slice_ == 0 else (WIDTH * HEIGHT - 1 - (y * WIDTH + x))
+        if is_depth:
+            return (f32_bits_from_unorm16(DEPTH_TEXELS[idx]), 0, 0, 0x3f800000)
+        return FLOAT_TEXELS[idx]
+    if is_depth:
+        return (f32_bits_from_unorm16(DEPTH_MIP1[slice_][x]), 0, 0, 0x3f800000)
+    idx = x if slice_ == 0 else ((WIDTH // 2 - 1) - x)
+    return FLOAT_MIP1[idx]
 
 
-def texel_halves(tex_mode, x, y, mutant=None):
-    if not (0 <= x < WIDTH and 0 <= y < HEIGHT):
-        return (0, 0, 0, 0)
-    idx = y * WIDTH + x
-    if tex_mode == 'r16_unorm':
-        rgba = texel_f32_words(tex_mode, x, y)
-        if mutant == 'rtz':
+def texel_halves(tex_mode, x, y, mutant=None, *, mip=0, slice_=0):
+    is_depth = tex_mode.startswith('r16_unorm')
+    oob = (0, 0, 0, 0x3c00) if is_depth else (0, 0, 0, 0)
+    max_slices = 2 if tex_mode.endswith('_array') else 1
+    if not (0 <= mip < 2 and 0 <= slice_ < max_slices):
+        return oob
+    mw, mh = WIDTH >> mip, HEIGHT >> mip
+    if not (0 <= x < mw and 0 <= y < mh):
+        return oob
+    rgba = texel_f32_words(tex_mode, x, y, mip=mip, slice_=slice_)
+    if is_depth:
+        if mutant in ('rtz', 'mip_rtz'):
             return tuple(pack16_rtz_ref(c) for c in rgba)
-        if mutant == 'double_round':
+        if mutant in ('double_round', 'mip_double_round'):
             return tuple(pack16_rne_ref(c) for c in rgba)
-        return (exact_unorm16_f16_ref(DEPTH_TEXELS[idx]), 0, 0, 0x3c00)
-    narrow = pack16_rtz_ref if mutant == 'rtz' else pack16_rne_ref
-    return tuple(narrow(c) for c in FLOAT_TEXELS[idx])
+        u16 = (
+            DEPTH_TEXELS[(y * WIDTH + x) if slice_ == 0 else (WIDTH * HEIGHT - 1 - (y * WIDTH + x))]
+            if mip == 0
+            else DEPTH_MIP1[slice_][x]
+        )
+        return (exact_unorm16_f16_ref(u16), 0, 0, 0x3c00)
+    narrow = pack16_rtz_ref if mutant in ('rtz', 'mip_rtz') else pack16_rne_ref
+    return tuple(narrow(c) for c in rgba)
 
 
 def pack_pair(lo, hi):
@@ -368,9 +477,9 @@ def expected_words(fixture, tex_mode, mutant=None):
     out = []
     for y in range(HEIGHT):
         for x in range(WIDTH):
-            rgba = texel_f32_words(tex_mode, x, y)
-            hx, hy, hz, hw = texel_halves(tex_mode, x, y, mutant)
             if fixture == 'A':
+                rgba = texel_f32_words(tex_mode, x, y)
+                hx, hy, hz, hw = texel_halves(tex_mode, x, y, mutant)
                 w0 = rgba[0] if mutant == 'unpacked_x' else f32_bits_from_f16_bits(hx)
                 ax, ay = (x | (y << 16), 63) if mutant == 'drop_a16' else (x, y)
                 hax, _, haz, _ = texel_halves(tex_mode, ax, ay, mutant)
@@ -385,8 +494,29 @@ def expected_words(fixture, tex_mode, mutant=None):
                 w2 = pack_pair(hnx, hny)
                 w3 = (0xdead0000 | hnz) if mutant == 'unmasked_odd_hi' else hnz
                 out.extend((w0, w1, w2, w3))
-            else:
+            elif fixture == 'B':
+                hx, hy, hz, hw = texel_halves(tex_mode, x, y, mutant)
                 out.extend((pack_pair(hx, hy), pack_pair(hz, hw), hy, pack_pair(hz, hw)))
+            elif fixture == 'C':
+                mip = 0 if mutant == 'mip_zero' else y
+                tx = x >> y
+                hx, _, hz, _ = texel_halves(tex_mode, tx, 0, mutant, mip=mip)
+                w0 = f32_bits_from_f16_bits(hx)
+                w1 = pack_pair(hx, hz)
+                nty = 63 if mutant == 'mip_drop_nsa' else 0
+                hnx, hny, hnz, _ = texel_halves(tex_mode, tx, nty, mutant, mip=mip)
+                w2 = pack_pair(hnx, hny)
+                w3 = (0xdead0000 | hnz) if mutant == 'mip_unmasked_odd_hi' else hnz
+                out.extend((w0, w1, w2, w3))
+            elif fixture == 'D':
+                tx = x >> 1
+                s, m = (y, x & 1) if mutant == 'swap_slice_mip' else (x & 1, y)
+                hx, hy, hz, hw = texel_halves(tex_mode, tx, 0, mutant, mip=m, slice_=s)
+                nty = 63 if mutant == 'array_drop_nsa' else 0
+                hnx, _, hnz, hnw = texel_halves(tex_mode, tx, nty, mutant, mip=m, slice_=s)
+                out.extend((pack_pair(hx, hy), pack_pair(hz, hw), hnx, pack_pair(hnz, hnw)))
+            else:
+                raise ValueError(fixture)
     return out
 
 
@@ -504,7 +634,8 @@ def check_rounding_formula():
 
 
 def check_decoder_and_masks():
-    for blob, expected_text in ((PRE_WORDS, PRE), (POST_WORDS_A, POST_A), (POST_WORDS_B, POST_B)):
+    for blob, expected_text in ((PRE_WORDS, PRE), (PRE_WORDS_C, PRE_C), (PRE_WORDS_D, PRE_D),
+                                (POST_WORDS_A, POST_A), (POST_WORDS_B, POST_B)):
         off = 0
         decoded = []
         while off < len(blob):
@@ -518,65 +649,78 @@ def check_decoder_and_masks():
         length, _, asm, _ = D.decode_instruction(raw, 0)
         assert length == len(raw) and asm == text, (key, length, asm, text)
 
-    # Check all 15 non-zero dmasks for destination register width, pairwise component order and odd-dmask gating.
-    for dmask in range(1, 16):
-        comps = [c for bit, c in enumerate('xyzw') if dmask & (1 << bit)]
-        expected_regs = (len(comps) + 1) // 2
-        raw = encode_mimg(IMG_LOAD, dmask=dmask, vaddr=8, vdata=4, d16=1)
-        _, _, asm, _ = D.decode_instruction(raw, 0)
-        expected_dst = 'v4' if expected_regs == 1 else 'v[4:5]'
-        assert asm.startswith(f'image_load {expected_dst}, '), (dmask, asm)
-        if len(comps) % 2 == 1:
-            odd_reg = 4 + (len(comps) - 1) // 2
-            expect_refused(
-                lambda r=raw: G.Pipeline(VS_WORDS, PRE_WORDS + r + POST_WORDS, root_blob(),
-                                         ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV),
-                f'whole-word read of v{odd_reg} after odd d16 image_load',
-                f'odd dmask 0x{dmask:x} direct export',
-            )
-            ps_blob = PRE_WORDS + raw + encode_v_and_low16(odd_reg) + POST_WORDS
-        else:
-            ps_blob = PRE_WORDS + raw + POST_WORDS
-        pipe = G.Pipeline(VS_WORDS, ps_blob, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
-        ps = pipe.hlsl_ps()
-        manifest = pipe.manifest()
-        assert PACK16_HELPERS_HLSL in ps
-        assert 'udsrc 4 d16unorm16 0' in manifest.splitlines(), manifest
-        assert 'd16srv 0 exact' in manifest.splitlines(), manifest
-        assert 'SamplerState' not in ps and 'smp ' not in manifest
-        for i in range(0, len(comps), 2):
-            reg = 4 + i // 2
-            if i + 1 == len(comps):
-                want = f'v{reg} = pack16_d16(t.{comps[i]}, ud4);'
+    # Check all 15 non-zero dmasks on both image_load and image_load_mip for destination width,
+    # pairwise component order, explicit mip Load coordinates and odd-dmask gating.
+    for op_name, op_code, pre_words, want_load in (
+        ('image_load', IMG_LOAD, PRE_WORDS, 'r0.Load(int3(v8, v9, 0))'),
+        ('image_load_mip', IMG_LOAD_MIP, PRE_WORDS_C, 'r0.Load(int3(v8, v9, v10))'),
+    ):
+        for dmask in range(1, 16):
+            comps = [c for bit, c in enumerate('xyzw') if dmask & (1 << bit)]
+            expected_regs = (len(comps) + 1) // 2
+            raw = encode_mimg(op_code, dmask=dmask, vaddr=8, vdata=4, d16=1)
+            _, _, asm, _ = D.decode_instruction(raw, 0)
+            expected_dst = 'v4' if expected_regs == 1 else 'v[4:5]'
+            assert asm.startswith(f'{op_name} {expected_dst}, '), (op_name, dmask, asm)
+            if len(comps) % 2 == 1:
+                odd_reg = 4 + (len(comps) - 1) // 2
+                expect_refused(
+                    lambda r=raw, pw=pre_words: G.Pipeline(
+                        VS_WORDS, pw + r + POST_WORDS, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV
+                    ),
+                    f'whole-word read of v{odd_reg} after odd d16 image_load',
+                    f'{op_name} odd dmask 0x{dmask:x} direct export',
+                )
+                ps_blob = pre_words + raw + encode_v_and_low16(odd_reg) + POST_WORDS
             else:
-                want = f'v{reg} = pack16_d16(t.{comps[i]}, ud4) | (pack16_d16(t.{comps[i + 1]}, ud4) << 16);'
-            assert want in ps, (dmask, want, ps)
+                ps_blob = pre_words + raw + POST_WORDS
+            pipe = G.Pipeline(VS_WORDS, ps_blob, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
+            ps = pipe.hlsl_ps()
+            manifest = pipe.manifest()
+            assert PACK16_HELPERS_HLSL in ps
+            assert want_load in ps, (op_name, dmask, ps)
+            assert 'udsrc 4 d16unorm16 0' in manifest.splitlines(), manifest
+            assert 'd16srv 0 exact' in manifest.splitlines(), manifest
+            assert 'SamplerState' not in ps and 'smp ' not in manifest
+            for i in range(0, len(comps), 2):
+                reg = 4 + i // 2
+                if i + 1 == len(comps):
+                    want = f'v{reg} = pack16_d16(t.{comps[i]}, ud4);'
+                else:
+                    want = f'v{reg} = pack16_d16(t.{comps[i]}, ud4) | (pack16_d16(t.{comps[i + 1]}, ud4) << 16);'
+                assert want in ps, (op_name, dmask, want, ps)
 
-    # Verify 3D and 2D-array level-zero D16 loads, plus vertex-stage emission.
-    for key, hlsl_type, srv_kind in (('d16_3d', 'Texture3D<float4>', 'tex3d'),
-                                     ('d16_2da', 'Texture2DArray<float4>', 'tex2da')):
-        ps_3 = PRE_WORDS + MIMG_LLVM_MC[key][1] + POST_WORDS
+    # Verify 3D and 2D-array level-zero and explicit-mip D16 loads, plus vertex-stage emission.
+    for key, hlsl_type, srv_kind, want_call, pre_words in (
+        ('d16_3d', 'Texture3D<float4>', 'tex3d', 'r0.Load(int4(v0, v1, v2, 0))', PRE_WORDS),
+        ('d16_2da', 'Texture2DArray<float4>', 'tex2da', 'r0.Load(int4(v0, v1, v2, 0))', PRE_WORDS),
+        ('mip_d16_3d', 'Texture3D<float4>', 'tex3d', 'r0.Load(int4(v0, v1, v2, v3))', PRE_WORDS),
+        ('mip_d16_2da_xyzw', 'Texture2DArray<float4>', 'tex2da', 'r0.Load(int4(v8, v9, v10, v11))', PRE_WORDS_D),
+    ):
+        ps_3 = pre_words + MIMG_LLVM_MC[key][1] + POST_WORDS
         pipe = G.Pipeline(VS_WORDS, ps_3, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
         hlsl = pipe.hlsl_ps()
         manifest = pipe.manifest().splitlines()
-        assert hlsl_type in hlsl and 'r0.Load(int4(v0, v1, v2, 0))' in hlsl, hlsl
+        assert hlsl_type in hlsl and want_call in hlsl, (key, hlsl)
         assert f'srv 0 {srv_kind} table 0 0' in manifest and 'd16srv 0 exact' in manifest
 
-    # Vertex stage using image_load ... d16 emits helpers and d16srv, while a pipeline without d16 omits both.
-    vs_d16 = (
-        bytes.fromhex('04040cf4000000fa' '8002027e' '7fc08cbf')
-        + encode_mimg(IMG_LOAD, dmask=0x3, vaddr=0, vdata=4, d16=1)
-        + bytes.fromhex('703f8cbf' 'cf0800f804040404' '000081bf')
-    )
+    # Vertex stage using image_load / image_load_mip ... d16 emits helpers and d16srv, while a pipeline without d16 omits both.
     ps_plain = bytes.fromhex('8002007e' '0f1800f800000000' '000081bf')
-    vs_pipe = G.Pipeline(vs_d16, ps_plain, root_blob())
-    assert PACK16_HELPERS_HLSL in vs_pipe.hlsl_vs()
-    assert 'v4 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in vs_pipe.hlsl_vs()
-    assert 'd16srv 0 exact' in vs_pipe.manifest().splitlines()
+    for op_code, want_call in ((IMG_LOAD, 'r0.Load(int3(v0, v1, 0))'), (IMG_LOAD_MIP, 'r0.Load(int3(v0, v1, v2))')):
+        vs_d16 = (
+            bytes.fromhex('04040cf4000000fa' '8002027e' '8002047e' '7fc08cbf')
+            + encode_mimg(op_code, dmask=0x3, vaddr=0, vdata=4, d16=1)
+            + bytes.fromhex('703f8cbf' 'cf0800f804040404' '000081bf')
+        )
+        vs_pipe = G.Pipeline(vs_d16, ps_plain, root_blob())
+        assert PACK16_HELPERS_HLSL in vs_pipe.hlsl_vs()
+        assert want_call in vs_pipe.hlsl_vs(), vs_pipe.hlsl_vs()
+        assert 'v4 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in vs_pipe.hlsl_vs()
+        assert 'd16srv 0 exact' in vs_pipe.manifest().splitlines()
     plain_pipe = G.Pipeline(VS_WORDS, ps_plain, root_blob())
     assert 'pack16_' not in plain_pipe.hlsl_vs() and 'pack16_' not in plain_pipe.hlsl_ps()
     assert 'd16srv' not in plain_pipe.manifest() and 'd16unorm16' not in plain_pipe.manifest()
-    print('decoder & masks: all 15 non-zero dmasks, 2D/a16/NSA/3D/2D_ARRAY, d16srv manifest and VS/PS paths verified')
+    print('decoder & masks: all 15 non-zero dmasks (load & load_mip), 2D/a16/NSA/3D/2D_ARRAY, d16srv and VS/PS paths verified')
 
 
 def check_srv_format_controls():
@@ -589,10 +733,12 @@ def check_srv_format_controls():
     assert {DXGI_FORMAT_VALUES[n] for n in unorm16_names} == G.D16_UNORM16_SRV_FORMATS
 
     ps_even = PRE_WORDS + MIMG_LLVM_MC['d16_xyzw'][1] + POST_WORDS
+    ps_mip_even = PRE_WORDS_C + MIMG_LLVM_MC['mip_d16_xz'][1] + POST_WORDS
     for fmt in sorted(G.D16_EXACT_SRV_FORMATS):
-        pipe = G.Pipeline(VS_WORDS, ps_even, root_blob(), ps_hw_inputs=PACKED_INPUT,
-                          rtv_formats=UINT_RTV, srv_formats=(fmt,))
-        assert 'd16srv 0 exact' in pipe.manifest().splitlines()
+        for blob in (ps_even, ps_mip_even):
+            pipe = G.Pipeline(VS_WORDS, blob, root_blob(), ps_hw_inputs=PACKED_INPUT,
+                              rtv_formats=UINT_RTV, srv_formats=(fmt,))
+            assert 'd16srv 0 exact' in pipe.manifest().splitlines()
 
     # Integer (UINT/SINT), typeless, depth-stencil-only, SNORM16, R24_UNORM, SRGB, BCn and console formats are refused.
     refused_srv_formats = (
@@ -630,13 +776,14 @@ def check_srv_format_controls():
         (119, 'console R16_UNORM_X8_TYPELESS'),
     )
     for fmt, label in refused_srv_formats:
-        expect_refused(
-            lambda f=fmt: G.Pipeline(VS_WORDS, ps_even, root_blob(), ps_hw_inputs=PACKED_INPUT,
-                                     rtv_formats=UINT_RTV, srv_formats={0: f}),
-            f'image_load d16 unsupported SRV format {fmt}',
-            f'srv_formats {label}',
-        )
-    print(f'srv formats: 14 exact formats match d16_image_format.h; {len(refused_srv_formats)} non-exact formats refused')
+        for op_name, blob in (('image_load', ps_even), ('image_load_mip', ps_mip_even)):
+            expect_refused(
+                lambda f=fmt, b=blob: G.Pipeline(VS_WORDS, b, root_blob(), ps_hw_inputs=PACKED_INPUT,
+                                                 rtv_formats=UINT_RTV, srv_formats={0: f}),
+                f'{op_name} d16 unsupported SRV format {fmt}',
+                f'{op_name} srv_formats {label}',
+            )
+    print(f'srv formats: 14 exact formats match d16_image_format.h; {len(refused_srv_formats)} non-exact formats refused on load & load_mip')
 
 
 def check_odd_dmask_consumers():
@@ -678,6 +825,8 @@ def check_odd_dmask_consumers():
 
     odd_1 = 'image_load v4, v[0:1], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D d16'
     odd_3 = 'image_load v[6:7], v[0:1], s[16:23] dmask:0x7 dim:SQ_RSRC_IMG_2D d16'
+    odd_mip_1 = 'image_load_mip v4, v[0:2], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D d16'
+    odd_mip_3 = 'image_load_mip v[6:7], v[0:2], s[16:23] dmask:0x7 dim:SQ_RSRC_IMG_2D d16'
 
     accepted_sequences = (
         (odd_1, 'v_cvt_f32_f16_e32 v4, v4', 'v_add_f32_e32 v4, 1.0, v4'),
@@ -694,6 +843,8 @@ def check_odd_dmask_consumers():
         (odd_1, 'v_fma_mixlo_f16 v8, v4, 1.0, 0 op_sel_hi:[1,0,0]', 'v_add_nc_u32_e32 v8, 1, v8'),
         (odd_1, 'v_fma_mixhi_f16 v4, 1.0, 1.0, 0', 'v_add_nc_u32_e32 v4, 1, v4'),
         (odd_3, 'v_add_nc_u32_e32 v6, 1, v6', 'v_cvt_f32_f16_e32 v7, v7', 'v_add_f32_e32 v7, 1.0, v7'),
+        (odd_mip_1, 'v_cvt_f32_f16_e32 v4, v4', 'v_add_f32_e32 v4, 1.0, v4'),
+        (odd_mip_3, 'v_add_nc_u32_e32 v6, 1, v6', 'v_and_b32_e32 v7, 0xffff, v7', 'v_add_nc_u32_e32 v7, 1, v7'),
     )
     for seq in accepted_sequences:
         stage_with(seq)
@@ -735,6 +886,15 @@ def check_odd_dmask_consumers():
         ('v7 dmask 0x7 tail',
          (odd_3, 'v_add_nc_u32_e32 v5, 1, v7'),
          'whole-word read of v7'),
+        ('mip v4 add',
+         (odd_mip_1, 'v_add_nc_u32_e32 v5, 1, v4'),
+         'whole-word read of v4'),
+        ('mip v7 dmask 0x7 tail',
+         (odd_mip_3, 'v_add_nc_u32_e32 v5, 1, v7'),
+         'whole-word read of v7'),
+        ('mip coord odd v4',
+         (odd_1, 'image_load_mip v[6:7], [v0, v1, v4], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D d16'),
+         'whole-word read of v4'),
     )
     for label, seq, msg in refused_sequences:
         expect_refused(lambda s=seq: stage_with(s), msg, label)
@@ -779,16 +939,21 @@ def check_refusals():
     def build_ps(mimg_bytes):
         return G.Pipeline(VS_WORDS, PRE_WORDS + mimg_bytes + POST_WORDS, root_blob(), ps_hw_inputs=PACKED_INPUT)
 
-    expect_refused(lambda: build_ps(MIMG_LLVM_MC['mip_d16_refused'][1]), 'image_load_mip', 'image_load_mip d16')
     expect_refused(lambda: build_ps(MIMG_LLVM_MC['1d_d16_refused'][1]), '1D', '1D image_load d16')
+    expect_refused(lambda: build_ps(MIMG_LLVM_MC['mip_1d_d16_refused'][1]), '1D', '1D image_load_mip d16')
     expect_refused(lambda: build_ps(MIMG_LLVM_MC['cube_d16_refused'][1]), 'SQ_RSRC_IMG_CUBE', 'cube image_load d16')
+    expect_refused(lambda: build_ps(MIMG_LLVM_MC['mip_cube_d16_refused'][1]), 'SQ_RSRC_IMG_CUBE', 'cube image_load_mip d16')
     expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, dim=DIM_3D, a16=1, d16=1)), 'image_load', '3D a16+d16')
     expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, dim=DIM_2D_ARRAY, a16=1, d16=1)), 'image_load', '2D_ARRAY a16+d16')
-    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, dmask=0, d16=1)), 'dmask:0x0', 'dmask 0 d16')
-    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, tfe=1, d16=1)), 'tfe', 'tfe d16')
-    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, lwe=1, d16=1)), 'lwe', 'lwe d16')
-    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, r128=1, d16=1)), 'r128', 'r128 d16')
-    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, w0_reserved=0x40, d16=1)), 'reserved', 'w0 reserved d16')
+    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD_MIP, dim=DIM_2D, a16=1, d16=1)), 'image_load_mip a16', 'mip 2D a16+d16')
+    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD_MIP, dim=DIM_3D, a16=1, d16=1)), 'image_load_mip a16', 'mip 3D a16+d16')
+    expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD_MIP, dim=DIM_2D_ARRAY, a16=1, d16=1)), 'image_load_mip a16', 'mip 2D_ARRAY a16+d16')
+    for op_name, op_code in (('image_load', IMG_LOAD), ('image_load_mip', IMG_LOAD_MIP)):
+        expect_refused(lambda o=op_code: build_ps(encode_mimg(o, dmask=0, d16=1)), 'dmask:0x0', f'{op_name} dmask 0 d16')
+        expect_refused(lambda o=op_code: build_ps(encode_mimg(o, tfe=1, d16=1)), 'tfe', f'{op_name} tfe d16')
+        expect_refused(lambda o=op_code: build_ps(encode_mimg(o, lwe=1, d16=1)), 'lwe', f'{op_name} lwe d16')
+        expect_refused(lambda o=op_code: build_ps(encode_mimg(o, r128=1, d16=1)), 'r128', f'{op_name} r128 d16')
+        expect_refused(lambda o=op_code: build_ps(encode_mimg(o, w0_reserved=0x40, d16=1)), 'reserved', f'{op_name} w0 reserved d16')
     expect_refused(lambda: build_ps(encode_mimg(IMG_LOAD, a16=1, d16=1, nsa=1, extra_addrs=(1,))), 'invalid_nsa', 'a16+d16 fake NSA')
 
     sample_pre = PRE_WORDS + bytes.fromhex('800398be800399be80039abe80039bbe')
@@ -816,7 +981,35 @@ def check_refusals():
         'image_load address or modifiers',
         '1-VGPR addr without a16',
     )
-    print('refusals: image_load_mip, sample/sample_lz, 1D/cube, 3D/array a16, tfe/lwe/r128/reserved and bad tuple widths refused')
+    expect_refused(
+        lambda: pipe.ps.image(['v[4:7]', 'v[8:10]', 's[16:23]'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0xf', 'd16'], 'load_mip'),
+        'image_load_mip d16 destination v[4:7] for dmask 0xf',
+        'mip 4-VGPR dst on dmask 0xf d16',
+    )
+    expect_refused(
+        lambda: pipe.ps.image(['v[4:5]', 'v[8:10]', 's[16:23]'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load_mip'),
+        'image_load_mip d16 destination v[4:5] for dmask 0x3',
+        'mip 2-VGPR dst on dmask 0x3 d16',
+    )
+    expect_refused(
+        lambda: pipe.ps.image(['v[4:5]', 'v[8:9]', 's[16:23]'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0xf', 'd16'], 'load_mip'),
+        'image_load_mip address or modifiers',
+        'mip 2-VGPR addr on 2D d16',
+    )
+    pipe_d = G.Pipeline(VS_WORDS, PS_WORDS_D, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV)
+    expect_refused(
+        lambda: pipe_d.ps.image(['v[4:5]', 'v[8:10]', 's[16:23]'], ['dim:SQ_RSRC_IMG_2D_ARRAY', 'dmask:0xf', 'd16'], 'load_mip'),
+        'image_load_mip address or modifiers',
+        'mip 3-VGPR addr on 2D_ARRAY d16',
+    )
+    cs_stage = G.Stage.__new__(G.Stage)
+    cs_stage.kind = 'cs'
+    expect_refused(
+        lambda: cs_stage.image(['v[4:5]', 'v[0:2]', 's[16:23]'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0xf', 'd16'], 'load_mip'),
+        'compute d16 image load',
+        'compute image_load_mip d16',
+    )
+    print('refusals: sample/sample_lz, 1D/cube, mip/3D/array a16, compute d16, tfe/lwe/r128/reserved and bad tuple widths refused')
 
 
 def controls():
@@ -830,11 +1023,13 @@ def controls():
 def check_binary(llvm_mc):
     assert assemble(llvm_mc, PS_SOURCE_A) == PS_WORDS_A, 'PS_SOURCE_A encoding mismatch'
     assert assemble(llvm_mc, PS_SOURCE_B) == PS_WORDS_B, 'PS_SOURCE_B encoding mismatch'
+    assert assemble(llvm_mc, PS_SOURCE_C) == PS_WORDS_C, 'PS_SOURCE_C encoding mismatch'
+    assert assemble(llvm_mc, PS_SOURCE_D) == PS_WORDS_D, 'PS_SOURCE_D encoding mismatch'
     for key, (inst, expected) in sorted(MIMG_LLVM_MC.items()):
         built = assemble(llvm_mc, inst + '\n')
         if built != expected:
             raise AssertionError(f'{key}: assembled {built.hex()}, recorded {expected.hex()}')
-    print(f'llvm-mc: {len(MIMG_LLVM_MC)} MIMG encodings and both pixel fixtures match recorded words')
+    print(f'llvm-mc: {len(MIMG_LLVM_MC)} MIMG encodings and all four pixel fixtures match recorded words')
 
 
 def check_decode(library):
@@ -895,6 +1090,59 @@ def mutate_hlsl_a(source, mutant):
     return mutated
 
 
+def mutate_hlsl_c(source, mutant):
+    if mutant == 'mip_zero':
+        t_contig = 't = r0.Load(int3(v8, v9, v10));'
+        t_nsa = 't = r0.Load(int3(v2, v9, v10));'
+        assert source.count(t_contig) == 2 and source.count(t_nsa) == 1, source
+        mutated = (source.replace(t_contig, 't = r0.Load(int3(v8, v9, 0));')
+                         .replace(t_nsa, 't = r0.Load(int3(v2, v9, 0));'))
+    elif mutant == 'mip_drop_nsa':
+        target = 't = r0.Load(int3(v2, v9, v10));'
+        assert source.count(target) == 1, source
+        mutated = source.replace(target, 't = r0.Load(int3(v2, v3, v10));', 1)
+    elif mutant == 'mip_rtz':
+        assert source.count(PACK16_RNE_HLSL) == 1 and source.count(PACK16_D16_HLSL) == 1, source
+        mutated = (source.replace(PACK16_RNE_HLSL, PACK16_RTZ_HLSL, 1)
+                         .replace('return unorm16 != 0u ? pack16_unorm16(value) : pack16_rne(value);',
+                                  'return pack16_rne(value);', 1))
+    elif mutant == 'mip_double_round':
+        target = 'return unorm16 != 0u ? pack16_unorm16(value) : pack16_rne(value);'
+        assert source.count(target) == 1, source
+        mutated = source.replace(target, 'return pack16_rne(value);', 1)
+    elif mutant == 'poison_odd_hi':
+        t4 = 'v4 = pack16_d16(t.x, ud4);'
+        t7 = 'v7 = pack16_d16(t.z, ud4);'
+        assert source.count(t4) == 1 and source.count(t7) == 1, source
+        mutated = (source.replace(t4, 'v4 = 0xdead0000u | pack16_d16(t.x, ud4);', 1)
+                         .replace(t7, 'v7 = 0xdead0000u | pack16_d16(t.z, ud4);', 1))
+    else:
+        raise ValueError(mutant)
+    assert mutated != source, mutant
+    return mutated
+
+
+def mutate_hlsl_d(source, mutant):
+    if mutant == 'swap_slice_mip':
+        t_contig = 't = r0.Load(int4(v8, v9, v10, v11));'
+        t_nsa = 't = r0.Load(int4(v12, v9, v10, v11));'
+        assert source.count(t_contig) == 1 and source.count(t_nsa) == 2, source
+        mutated = (source.replace(t_contig, 't = r0.Load(int4(v8, v9, v11, v10));')
+                         .replace(t_nsa, 't = r0.Load(int4(v12, v9, v11, v10));'))
+    elif mutant == 'array_drop_nsa':
+        t_nsa = 't = r0.Load(int4(v12, v9, v10, v11));'
+        assert source.count(t_nsa) == 2, source
+        mutated = source.replace(t_nsa, 't = r0.Load(int4(v12, v13, v10, v11));')
+    elif mutant == 'poison_odd_hi':
+        t6 = 'v6 = pack16_d16(t.x, ud4);'
+        assert source.count(t6) == 1, source
+        mutated = source.replace(t6, 'v6 = 0xdead0000u | pack16_d16(t.x, ud4);', 1)
+    else:
+        raise ValueError(mutant)
+    assert mutated != source, mutant
+    return mutated
+
+
 def run_d16_draw(renderer, adapter, tex_mode, vs, ps, words, directory, tag):
     expected_path = directory / f'{tag}.bin'
     expected_path.write_bytes(struct.pack('<64I', *words))
@@ -914,7 +1162,11 @@ def run_d16_draw(renderer, adapter, tex_mode, vs, ps, words, directory, tag):
 def check_draw(dxc, renderer, adapter, fxc=None):
     hlsl_a = G.Pipeline(VS_WORDS, PS_WORDS_A, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
     hlsl_b = G.Pipeline(VS_WORDS, PS_WORDS_B, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
-    mutants = ('rtz', 'double_round', 'unpacked_x', 'swap_halves', 'drop_shift', 'drop_a16', 'drop_nsa', 'unmasked_odd_hi')
+    hlsl_c = G.Pipeline(VS_WORDS, PS_WORDS_C, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
+    hlsl_d = G.Pipeline(VS_WORDS, PS_WORDS_D, root_blob(), ps_hw_inputs=PACKED_INPUT, rtv_formats=UINT_RTV).hlsl_ps()
+    mutants_a = ('rtz', 'double_round', 'unpacked_x', 'swap_halves', 'drop_shift', 'drop_a16', 'drop_nsa', 'unmasked_odd_hi')
+    mutants_c = ('mip_zero', 'mip_drop_nsa', 'mip_rtz', 'mip_double_round')
+    mutants_d = ('swap_slice_mip', 'array_drop_nsa')
 
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
     out_dir = HERE.parent / 'out'
@@ -925,40 +1177,63 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, f'vs_{kind}', vs_profile, directory)
             ps_a = compile_hlsl(compiler, kind, hlsl_a, f'ps_a_{kind}', ps_profile, directory)
             ps_b = compile_hlsl(compiler, kind, hlsl_b, f'ps_b_{kind}', ps_profile, directory)
-            ps_poison = compile_hlsl(compiler, kind, mutate_hlsl_a(hlsl_a, 'poison_odd_hi'),
-                                     f'ps_poison_{kind}', ps_profile, directory)
+            ps_c = compile_hlsl(compiler, kind, hlsl_c, f'ps_c_{kind}', ps_profile, directory)
+            ps_d = compile_hlsl(compiler, kind, hlsl_d, f'ps_d_{kind}', ps_profile, directory)
+            ps_poison_a = compile_hlsl(compiler, kind, mutate_hlsl_a(hlsl_a, 'poison_odd_hi'),
+                                       f'ps_poison_a_{kind}', ps_profile, directory)
+            ps_poison_c = compile_hlsl(compiler, kind, mutate_hlsl_c(hlsl_c, 'poison_odd_hi'),
+                                       f'ps_poison_c_{kind}', ps_profile, directory)
+            ps_poison_d = compile_hlsl(compiler, kind, mutate_hlsl_d(hlsl_d, 'poison_odd_hi'),
+                                       f'ps_poison_d_{kind}', ps_profile, directory)
 
             for tex_mode in ('r16_unorm', 'rgba32f'):
                 ref_a = expected_words('A', tex_mode)
                 ref_b = expected_words('B', tex_mode)
+                ref_c = expected_words('C', tex_mode)
                 run_a = run_d16_draw(renderer, adapter, tex_mode, vs, ps_a, ref_a, directory, f'ref_a_{tex_mode}_{kind}')
                 assert run_a.returncode == 0, f'{kind} A {tex_mode} failed:\n{run_a.stdout}{run_a.stderr}'
                 run_b = run_d16_draw(renderer, adapter, tex_mode, vs, ps_b, ref_b, directory, f'ref_b_{tex_mode}_{kind}')
                 assert run_b.returncode == 0, f'{kind} B {tex_mode} failed:\n{run_b.stdout}{run_b.stderr}'
-                run_p = run_d16_draw(renderer, adapter, tex_mode, vs, ps_poison, ref_a,
-                                     directory, f'poison_{tex_mode}_{kind}')
-                assert run_p.returncode == 0, f'{kind} poison_odd_hi {tex_mode} leaked:\n{run_p.stdout}{run_p.stderr}'
-                print(f'{kind} {tex_mode}: fixtures A/B and odd-dmask upper-half poison check matched all words', flush=True)
+                run_c = run_d16_draw(renderer, adapter, tex_mode, vs, ps_c, ref_c, directory, f'ref_c_{tex_mode}_{kind}')
+                assert run_c.returncode == 0, f'{kind} C {tex_mode} failed:\n{run_c.stdout}{run_c.stderr}'
+                run_pa = run_d16_draw(renderer, adapter, tex_mode, vs, ps_poison_a, ref_a,
+                                      directory, f'poison_a_{tex_mode}_{kind}')
+                assert run_pa.returncode == 0, f'{kind} poison_a {tex_mode} leaked:\n{run_pa.stdout}{run_pa.stderr}'
+                run_pc = run_d16_draw(renderer, adapter, tex_mode, vs, ps_poison_c, ref_c,
+                                      directory, f'poison_c_{tex_mode}_{kind}')
+                assert run_pc.returncode == 0, f'{kind} poison_c {tex_mode} leaked:\n{run_pc.stdout}{run_pc.stderr}'
+                arr_mode = f'{tex_mode}_array'
+                ref_d = expected_words('D', arr_mode)
+                run_d = run_d16_draw(renderer, adapter, arr_mode, vs, ps_d, ref_d, directory, f'ref_d_{arr_mode}_{kind}')
+                assert run_d.returncode == 0, f'{kind} D {arr_mode} failed:\n{run_d.stdout}{run_d.stderr}'
+                run_pd = run_d16_draw(renderer, adapter, arr_mode, vs, ps_poison_d, ref_d,
+                                      directory, f'poison_d_{arr_mode}_{kind}')
+                assert run_pd.returncode == 0, f'{kind} poison_d {arr_mode} leaked:\n{run_pd.stdout}{run_pd.stderr}'
+                print(f'{kind} {tex_mode}[/_array]: fixtures A/B/C/D and odd-dmask poison checks matched all words', flush=True)
 
             # Every mutation must fail against the reference and match its mutated model across every
             # applicable texture mode (drop_shift uses rgba32f because t.z is 0.0 on R16_UNORM; double_round
-            # uses r16_unorm to exercise 0xffaf -> 0x3bfe vs 0x3bfd and 0xffef -> 0x3c00 vs 0x3bff).
-            for mut in mutants:
-                ps_mut = compile_hlsl(compiler, kind, mutate_hlsl_a(hlsl_a, mut), f'mut_{mut}_{kind}', ps_profile, directory)
-                if mut == 'drop_shift':
-                    modes = ('rgba32f',)
-                elif mut == 'double_round':
-                    modes = ('r16_unorm',)
-                else:
-                    modes = ('r16_unorm', 'rgba32f')
+            # and mip_double_round use r16_unorm to exercise 0xffaf -> 0x3bfe vs 0x3bfd and 0xffef -> 0x3c00 vs 0x3bff).
+            mutant_cases = (
+                [('A', mut, mutate_hlsl_a(hlsl_a, mut),
+                  ('rgba32f',) if mut == 'drop_shift' else ('r16_unorm',) if mut == 'double_round' else ('r16_unorm', 'rgba32f'))
+                 for mut in mutants_a]
+                + [('C', mut, mutate_hlsl_c(hlsl_c, mut),
+                    ('r16_unorm',) if mut == 'mip_double_round' else ('r16_unorm', 'rgba32f'))
+                   for mut in mutants_c]
+                + [('D', mut, mutate_hlsl_d(hlsl_d, mut), ('r16_unorm_array', 'rgba32f_array'))
+                   for mut in mutants_d]
+            )
+            for fixture, mut, mutated_hlsl, modes in mutant_cases:
+                ps_mut = compile_hlsl(compiler, kind, mutated_hlsl, f'mut_{mut}_{kind}', ps_profile, directory)
                 for tex_mode in modes:
-                    ref_words = expected_words('A', tex_mode)
+                    ref_words = expected_words(fixture, tex_mode)
                     fail_run = run_d16_draw(renderer, adapter, tex_mode, vs, ps_mut, ref_words,
                                             directory, f'fail_{mut}_{tex_mode}_{kind}')
                     assert fail_run.returncode == 1, (
                         f'{kind} mutant {mut} ({tex_mode}) unexpectedly passed:\n{fail_run.stdout}{fail_run.stderr}'
                     )
-                    mut_words = expected_words('A', tex_mode, mutant=mut)
+                    mut_words = expected_words(fixture, tex_mode, mutant=mut)
                     match_run = run_d16_draw(renderer, adapter, tex_mode, vs, ps_mut, mut_words,
                                              directory, f'model_{mut}_{tex_mode}_{kind}')
                     assert match_run.returncode == 0, (

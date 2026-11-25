@@ -15,6 +15,8 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include "startup_stubs/d3d12_teardown.h"
+
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -92,6 +94,22 @@ public:
     static void finish(ID3D12GraphicsCommandList* list, ID3D12Resource* scratch)
     {
         transition(list, scratch, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+    }
+
+    // Lifetime boundary: this cache owns one root signature and one pipeline per device, for as long as
+    // the module that holds it is loaded, because a conversion may still be queued when the recording
+    // that called convert() returns (the entries are never dropped before that). The cache itself is a
+    // function-local static in rect_indirect_arguments(), so this destructor runs during the module's
+    // CRT teardown -- see startup_stubs/d3d12_teardown.h for the two detaches. On process exit the
+    // driver may already be stopped, so the objects are detached and nothing reaches it; FreeLibrary
+    // leaves the process and the driver alive and the entries below release their objects normally.
+    ~RectIndirectArguments()
+    {
+        if (!x2w_startup::d3d12_process_terminating) return;
+        for (auto& entry : entries_) {
+            entry->root.Detach();
+            entry->pipeline.Detach();
+        }
     }
 
 private:
