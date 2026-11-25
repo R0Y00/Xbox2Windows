@@ -35,8 +35,6 @@ int main(int argc, char** argv)
     ComPtr<IDXGIAdapter> warp;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
     check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)), "WARP adapter");
-    ComPtr<ID3D12Device> host;
-    check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&host)), "desktop device");
 
     const char source[] = R"(
         ByteAddressBuffer input : register(t0);
@@ -65,6 +63,9 @@ int main(int argc, char** argv)
     ComPtr<ID3D12Device> guest;
     const std::uint64_t create_params[8]{};
     check(D3D12XboxCreateDevice(warp.Get(), create_params, IID_PPV_ARGS(&guest)), "guest device");
+    ComPtr<ID3D12Device> host;
+    check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&host)), "desktop device");
+
     const auto root_blob = [](UINT space) {
         D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;

@@ -9,7 +9,8 @@ def check(executable, mode):
     args = [str(Path(executable).resolve())]
     if mode:
         args.append(mode)
-    result = subprocess.run(args, capture_output=True, text=True, check=True)
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, (mode, result.returncode, result.stdout, result.stderr)
     key = re.search(r"^key=([0-9a-f]{16})$", result.stdout, re.MULTILINE)[1]
     lines = [line for line in result.stderr.splitlines() if line.startswith("x2w-compute-bindings ")]
     if mode:
