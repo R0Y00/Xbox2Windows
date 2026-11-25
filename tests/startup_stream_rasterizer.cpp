@@ -44,6 +44,11 @@ struct RasterStream {
     BaseStream base;
     RasterizerSubobject raster;
 };
+struct MixedRasterStream {
+    BaseStream base;
+    RasterizerSubobject first;
+    RasterizerSubobject second;
+};
 static_assert(sizeof(BaseStream) % 8 == 0);
 static_assert(sizeof(RasterStream) % 8 == 0);
 
@@ -91,7 +96,8 @@ D3D12_RASTERIZER_DESC raster_desc(D3D12_CULL_MODE cull, BOOL depth_clip)
 // kind 0 drops the rasterizer subobject. kind 1 is RASTERIZER. kind 2 is RASTERIZER1 (type 27),
 // and bias replaces the int depth bias with the float bits.
 void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vector<char>& vs,
-                        const std::vector<char>& ps, int kind, const D3D12_RASTERIZER_DESC& raster, float bias)
+                        const std::vector<char>& ps, int kind, const D3D12_RASTERIZER_DESC& raster, float bias,
+                        bool mixed = false)
 {
     using CreateStream = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     auto create = reinterpret_cast<CreateStream>((*static_cast<void***>(device))[86]);
@@ -110,6 +116,14 @@ void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vect
                                        : static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(27),
                             raster};
     if (kind == 2) std::memcpy(&sub.desc.DepthBias, &bias, sizeof(bias));
+    if (mixed) {
+        const auto other_type = kind == 2 ? D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER
+                                          : static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(27);
+        MixedRasterStream stream{base, sub, {other_type, raster_desc(D3D12_CULL_MODE_NONE, TRUE)}};
+        const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+        if (FAILED(create(device, &desc, __uuidof(ID3D12PipelineState), &pso))) return nullptr;
+        return pso;
+    }
     RasterStream stream{base, sub};
     const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
     if (FAILED(create(device, &desc, __uuidof(ID3D12PipelineState), &pso))) return nullptr;
@@ -131,7 +145,7 @@ int execute_guest_list(void* queue, void* list, void* fence, UINT64 fence_value)
 
 int main(int argc, char** argv)
 {
-    if (argc != 5 && argc != 11) return 2;
+    if (argc != 5 && argc != 13) return 2;
     std::vector<char> vs, ps;
     if (!read_bytes(argv[1], vs) || !read_bytes(argv[2], ps)) return 3;
     const bool hardware = std::strcmp(argv[4], "hardware") == 0;
@@ -172,6 +186,10 @@ int main(int argc, char** argv)
     void* pso_bias = create_stream_pso(guest, root, vs, ps, 2, fractional, 0.5f);
     if (!pso_back || !pso_front || !pso_dropped || !pso_r1_back || !pso_r1_front || !pso_bias) return 9;
     if (argc == 5) return 0;
+    // Both mixed orders must be refused. Without the check, the final no-cull state draws pixels.
+    void* mixed_10_27 = create_stream_pso(guest, root, vs, ps, 1, back, 0, true);
+    void* mixed_27_10 = create_stream_pso(guest, root, vs, ps, 2, back, 0, true);
+    if (!mixed_10_27 || !mixed_27_10) return 10;
 
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
@@ -228,5 +246,7 @@ int main(int argc, char** argv)
     if (const int rc = run_case(4, argv[8], pso_r1_back)) return rc;
     if (const int rc = run_case(5, argv[9], pso_r1_front)) return rc;
     if (const int rc = run_case(6, argv[10], pso_bias)) return rc;
+    if (const int rc = run_case(7, argv[11], mixed_10_27)) return rc;
+    if (const int rc = run_case(8, argv[12], mixed_27_10)) return rc;
     return 0;
 }

@@ -14,7 +14,8 @@ def check(directory, consumer, backend, mode):
     cache = directory / "cache"
     cache.mkdir()
     vs, ps, root = (directory / name for name in ("vs", "ps", "root"))
-    outs = {name: directory / name for name in ("back", "front", "dropped", "r1_back", "r1_front", "bias")}
+    cases = ("back", "front", "dropped", "r1_back", "r1_front", "bias", "mixed_10_27", "mixed_27_10")
+    outs = {name: directory / name for name in cases}
     vs.write_bytes(vertex())
     ps.write_bytes(pixel(True))
 
@@ -30,7 +31,7 @@ def check(directory, consumer, backend, mode):
         raise RuntimeError(f"request run failed on {backend}: {req.returncode}\n{req.stderr}")
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
 
-    run = subprocess.run(base_args + [str(outs[name]) for name in ("back", "front", "dropped", "r1_back", "r1_front", "bias")],
+    run = subprocess.run(base_args + [str(outs[name]) for name in cases],
                          env=env, capture_output=True, text=True)
     print(run.stdout, end="")
     for line in run.stderr.splitlines():
@@ -68,7 +69,9 @@ def check(directory, consumer, backend, mode):
     assert images["r1_back"] == images["back"], f"rasterizer1 back: {images['r1_back'].hex()}"
     assert images["r1_front"] == images["front"], f"rasterizer1 front: {images['r1_front'].hex()}"
     assert images["bias"] == blank, f"fractional depth bias drew: {images['bias'].hex()}"
-    print(f"{backend}: cull changed 16 of 32 pixels versus the no-cull default; fractional RASTERIZER1 bias stayed clear")
+    mixed_draws = [name for name in ("mixed_10_27", "mixed_27_10") if images[name] != blank]
+    assert not mixed_draws, f"duplicate rasterizer state drew pixels: {mixed_draws}"
+    print(f"{backend}: cull changed the readback; fractional bias and both mixed rasterizer orders stayed clear")
     return 0
 
 

@@ -113,10 +113,13 @@ def check(work, consumer, backend, kind, dxc, fxc):
             for narrow in REFUSED_INTEGER_FORMATS:
                 line = f'rtv1 {gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())} {narrow} 28'
                 refused = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
-                (cache / f'req_{refused}.rtv').write_text(line)
+                marker = cache / f'req_{refused}.rtv'
+                marker.write_text(line)
                 result = gfx2hlsl.translate_request(cache, int(refused, 16))
-                assert result.startswith('unsupported: unverified '), result
+                assert re.fullmatch(rf'unsupported: unverified (UINT|SINT) RTV format {narrow}', result), result
                 assert not (cache / f'{refused}.txt').exists()
+                # Later --pending runs would retry this synthetic request on every valid format.
+                marker.unlink()
             print(f'{kind} {backend} narrow integer formats {REFUSED_INTEGER_FORMATS} refused at translation')
             # A pre-existing base translation may lack its original request files.
             base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}'

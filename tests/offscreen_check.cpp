@@ -1294,6 +1294,22 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest line> <first/count> prints one RGBA32F pixel.
+OperationResult run_startup_image_2d_view(const OperationContext& ctx)
+{
+    const std::string_view window = ctx.argv[6];
+    if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
+        window[2] < '1' || window[2] > '3')
+        return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
+    float color[4]{};
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
+                           UINT(window[0] - '0'), UINT(window[2] - '0'));
+    std::uint32_t bits[4];
+    std::memcpy(bits, color, sizeof(bits));
+    std::printf("view_rgba=%08x,%08x,%08x,%08x\n", bits[0], bits[1], bits[2], bits[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-image-load-d16 <r16_unorm|rgba32f> <vs.cso> <ps.cso> <expected.bin>: draws an 8x2 full-screen
 // pair to an R32G32B32A32_UINT target against an 8x2 R16_UNORM or R32G32B32A32_FLOAT source texture and
 // compares all 64 little-endian words with expected.bin.
@@ -1553,6 +1569,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},

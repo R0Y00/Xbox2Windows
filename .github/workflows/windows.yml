@@ -91,6 +91,7 @@ jobs:
               (["tests/startup_compute_image_store_d16_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_readfirstlane_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_gather_l_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_compute_buffer_atomics_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_c_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
@@ -106,6 +107,7 @@ jobs:
               (["tests/startup_gfx2hlsl_sgpr_spill_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_compute_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_compute_lds_b64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_calculated_target_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_join_symbols_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
@@ -203,6 +205,7 @@ jobs:
             tests/startup_compute_gather_lz_check.py \
             tests/startup_compute_image_store_d16_check.py \
             tests/startup_compute_gather_l_check.py \
+            tests/startup_compute_buffer_atomics_check.py \
             tests/startup_image_gather_c_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
@@ -246,6 +249,7 @@ jobs:
             tests/startup_gfx2hlsl_sgpr_spill_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
             tests/startup_gfx2hlsl_compute_check.py \
+            tests/startup_compute_lds_b64_check.py \
             tests/startup_compute_translate_check.py \
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
@@ -274,6 +278,7 @@ jobs:
             tests/compute_alu_lane_gaps_check.py \
             tests/startup_ngg_slice_check.py \
             tests/startup_gfx2hlsl_handler_arity_check.py \
+            tests/startup_gfx2hlsl_image_arity_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows

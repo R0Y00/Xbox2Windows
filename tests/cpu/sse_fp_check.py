@@ -660,7 +660,7 @@ def check_alt_encodings_and_rejections(original_path):
         ("rcpps", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.RCPPS_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
         ("haddpd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.HADDPD_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
         ("cvtps2pd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.CVTPS2PD_XMM_XMMM64, R.XMM0, R.XMM1), ret_ins)),
-        ("andpd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.ANDPD_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
+        ("cvtdq2pd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.CVTDQ2PD_XMM_XMMM64, R.XMM0, R.XMM1), ret_ins)),
         ("sqrtss", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.SQRTSS_XMM_XMMM32, R.XMM0, R.XMM1), ret_ins)),
         ("maxss", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.MAXSS_XMM_XMMM32, R.XMM0, R.XMM1), ret_ins)),
         ("addss", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.ADDSS_XMM_XMMM32, R.XMM0, R.XMM1), ret_ins)),
