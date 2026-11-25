@@ -378,6 +378,7 @@ def controls():
     ff1_exec_controls()
     ff1_scalar_controls()
     writelane_controls()
+    vcmp_select_controls()
 
 
 def grid_controls():
@@ -1071,6 +1072,33 @@ def read_controls():
     rejects("Store data is not a known word", read, "read_copy", *early,
             ("s_or_b32 exec_lo", "v_mov_b32_e32 v1, 5\ns_or_b32 exec_lo"),
             ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)
+
+    # A heap view provides a runtime stride only to formatted loads.
+    formatted = "buffer_load_format_x v10, v8, s[40:43], 0 idxen"
+    raw = "buffer_load_dword v10, v8, s[40:43], 0 idxen"
+    heap_lines = [
+        "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+        "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+        "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+        "s_load_dwordx4 s[40:43], s[12:13], 0x50",
+        "v_lshl_add_u32 v8, s11, 2, v0",
+        "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dwordx4 s[24:27], s[16:19], null",
+        "s_waitcnt lgkmcnt(0)",
+        formatted, "s_waitcnt vmcnt(0)",
+        "buffer_store_dword v10, v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+    heap_binding = dict(table_reg=7, descriptor_offset=0x30, constant_descriptor=0x40,
+                        source_descriptor=0x50, group_reg=11, stride=4, cpu="gfx1013",
+                        heap_view=(0, 64, 1, 128))
+    source = aot.lower(heap_lines, 4, **heap_binding)
+    assert "uint4 format_load_0 = load_heap_view_format(" in source and "Noneu" not in source
+    rejects("Unsupported read address", aot.lower,
+            variant(heap_lines, (formatted, formatted + "\ns_waitcnt vmcnt(0)\n" + raw)),
+            4, **heap_binding)
+    source = aot.lower(variant(heap_lines, (formatted, raw)), 4,
+                       **(heap_binding | dict(heap_view=None, source_stride=16)))
+    assert "inputData.Load(tid.x * 16u + 0u)" in source
 
 
 def alu_controls():
@@ -2557,6 +2585,387 @@ def bfe_draw(directory, compiler, renderer, backend):
         path.parent.mkdir(parents=True, exist_ok=True)
         opcodes = sorted({line.split()[0] for line in BFE if line.strip()})
         path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
+VCMP_SELECT_BINDING = dict(table_reg=8, descriptor_offset=0, source_descriptor=16, group_reg=10, stride=16)
+VCMP_SELECT_INT_GROUPS = (("f", "lt", "eq", "le"), ("gt", "ne", "ge", "t"))
+VCMP_SELECT_F32_GROUPS = (
+    ("f", "lt", "eq", "le"),
+    ("gt", "lg", "ge", "o"),
+    ("u", "nge", "nlg", "ngt"),
+    ("nle", "neq", "nlt", "tru"),
+)
+
+
+def vcmp_select_program(typ, preds, *, float_set="a"):
+    """Build a 64-thread gfx1013 program testing 4 predicates of `typ` with e32/e64 compares and selects."""
+    lines = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx8 s[12:19], s[8:9], null",
+        "v_lshl_add_u32 v3, s10, 6, v0",
+        "v_lshlrev_b32_e32 v1, 2, v3",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_load_dword v1, v1, s[16:19], 0 offen",
+        "s_mov_b32 s16, 0x10101010",
+        "s_mov_b32 s17, 0x40404040",
+        "v_add_nc_u32_e32 v17, 0x20202020, v3",
+        "v_add_nc_u32_e32 v18, 0x30303030, v3",
+        "s_waitcnt vmcnt(0)",
+    ]
+    if typ in ("u32", "i32"):
+        lines += [
+            "v_mov_b32_e32 v4, v1",
+            "v_xor_b32_e32 v5, 0x80000000, v3",
+            "v_mov_b32_e32 v6, 0x7fffffff",
+            "v_mov_b32_e32 v7, 0x80000000",
+            "v_mov_b32_e32 v8, 0xffffffff",
+            "v_mov_b32_e32 v9, 0x80000001",
+            "v_cmp_eq_u32_e32 vcc_lo, 3, v3",
+            "v_cndmask_b32_e32 v4, v4, v6, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v6, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 2, v3",
+            "v_mov_b32_e32 v14, 1",
+            "v_cndmask_b32_e32 v4, v4, v14, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v9, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 1, v3",
+            "v_mov_b32_e32 v14, 0",
+            "v_cndmask_b32_e32 v4, v4, v14, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v8, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v3",
+            "v_cndmask_b32_e32 v4, v4, v6, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v7, vcc_lo",
+        ]
+    elif float_set == "a":
+        lines += [
+            "v_and_b32_e32 v4, 0x3fffff, v1",
+            "v_or_b32_e32 v4, 0x3fc00000, v4",
+            "v_mov_b32_e32 v5, 0x3fe00000",
+            "v_mov_b32_e32 v6, 0x3fc00000",
+            "v_mov_b32_e32 v7, 0x7fc00000",
+            "v_mov_b32_e32 v8, 0x80000000",
+            "v_cmp_eq_u32_e32 vcc_lo, 2, v3",
+            "v_cndmask_b32_e32 v4, v4, v6, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v7, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 1, v3",
+            "v_cndmask_b32_e32 v4, v4, v7, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v6, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v3",
+            "v_mov_b32_e32 v14, 0",
+            "v_cndmask_b32_e32 v4, v4, v14, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v8, vcc_lo",
+        ]
+    else:
+        lines += [
+            "v_and_b32_e32 v4, 0x3fffff, v1",
+            "v_or_b32_e32 v4, 0x3fc00000, v4",
+            "v_mov_b32_e32 v5, 0x3fe00000",
+            "v_mov_b32_e32 v6, 0x3fc00000",
+            "v_mov_b32_e32 v7, 0x7fc00000",
+            "v_mov_b32_e32 v8, 0x7fc00001",
+            "v_mov_b32_e32 v9, 0x7f800000",
+            "v_mov_b32_e32 v14, 0xff800000",
+            "v_mov_b32_e32 v15, 0xbf400000",
+            "v_cmp_eq_u32_e32 vcc_lo, 3, v3",
+            "v_cndmask_b32_e32 v4, v4, v6, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v6, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 2, v3",
+            "v_cndmask_b32_e32 v4, v4, v14, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v15, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 1, v3",
+            "v_cndmask_b32_e32 v4, v4, v9, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v14, vcc_lo",
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v3",
+            "v_cndmask_b32_e32 v4, v4, v7, vcc_lo",
+            "v_cndmask_b32_e32 v5, v5, v8, vcc_lo",
+        ]
+    p0, p1, p2, p3 = preds
+    lines += [
+        f"v_cmp_{p0}_{typ}_e32 vcc_lo, v4, v5",
+        "v_cndmask_b32_e32 v10, s16, v17, vcc_lo",
+        f"v_cmp_{p1}_{typ}_e64 s4, v4, v5",
+        "v_cndmask_b32_e64 v11, v18, s17, s4",
+        f"v_cmp_{p2}_{typ}_e64 vcc_lo, v4, v5",
+        "v_cndmask_b32_e64 v12, s16, v17, vcc_lo",
+        f"v_cmp_{p3}_{typ}_e32 vcc_lo, v4, v5",
+        "v_cndmask_b32_e32 v13, v18, v17, vcc_lo",
+        "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    return lines
+
+
+VCMP_SELECT_CASES = (
+    [("u32", preds, "a") for preds in VCMP_SELECT_INT_GROUPS]
+    + [("i32", preds, "a") for preds in VCMP_SELECT_INT_GROUPS]
+    + [("f32", preds, fset) for fset in ("a", "b") for preds in VCMP_SELECT_F32_GROUPS]
+)
+VCMP_SELECT = vcmp_select_program("u32", ("f", "lt", "eq", "le"))
+
+
+def _py_vcmp_pred(typ, pred, a, b):
+    a &= 0xffffffff
+    b &= 0xffffffff
+    if typ == "u32":
+        return {
+            "f": False, "lt": a < b, "eq": a == b, "le": a <= b,
+            "gt": a > b, "ne": a != b, "ge": a >= b, "t": True,
+        }[pred]
+    if typ == "i32":
+        sa = a - 0x100000000 if a & 0x80000000 else a
+        sb = b - 0x100000000 if b & 0x80000000 else b
+        return {
+            "f": False, "lt": sa < sb, "eq": sa == sb, "le": sa <= sb,
+            "gt": sa > sb, "ne": sa != sb, "ge": sa >= sb, "t": True,
+        }[pred]
+    fa = struct.unpack("<f", struct.pack("<I", a))[0]
+    fb = struct.unpack("<f", struct.pack("<I", b))[0]
+    unord = math.isnan(fa) or math.isnan(fb)
+    return {
+        "f": False,
+        "lt": (not unord) and (fa < fb),
+        "eq": (not unord) and (fa == fb),
+        "le": (not unord) and (fa <= fb),
+        "gt": (not unord) and (fa > fb),
+        "lg": (not unord) and (fa != fb),
+        "ge": (not unord) and (fa >= fb),
+        "o": not unord,
+        "u": unord,
+        "nge": unord or (fa < fb),
+        "nlg": unord or (fa == fb),
+        "ngt": unord or (fa <= fb),
+        "nle": unord or (fa > fb),
+        "neq": unord or (fa != fb),
+        "nlt": unord or (fa >= fb),
+        "tru": True,
+    }[pred]
+
+
+def vcmp_select_words(typ, preds, *, float_set="a", pred_fn=_py_vcmp_pred, swap_select=False):
+    """Independent Python model for 64 threads of vcmp_select_program."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        inp = (0x8b02a7f1 + flat * 0x413b1) & 0xffffffff
+        if typ in ("u32", "i32"):
+            pairs = {
+                0: (0x7fffffff, 0x80000000),
+                1: (0x00000000, 0xffffffff),
+                2: (0x00000001, 0x80000001),
+                3: (0x7fffffff, 0x7fffffff),
+            }
+            a, b = pairs.get(flat, (inp, flat ^ 0x80000000))
+        elif float_set == "a":
+            pairs = {
+                0: (0x00000000, 0x80000000),
+                1: (0x7fc00000, 0x3fc00000),
+                2: (0x3fc00000, 0x7fc00000),
+            }
+            a, b = pairs.get(flat, ((inp & 0x3fffff) | 0x3fc00000, 0x3fe00000))
+        else:
+            pairs = {
+                0: (0x7fc00000, 0x7fc00001),
+                1: (0x7f800000, 0xff800000),
+                2: (0xff800000, 0xbf400000),
+                3: (0x3fc00000, 0x3fc00000),
+            }
+            a, b = pairs.get(flat, ((inp & 0x3fffff) | 0x3fc00000, 0x3fe00000))
+        s16 = 0x10101010
+        s17 = 0x40404040
+        v17 = (0x20202020 + flat) & 0xffffffff
+        v18 = (0x30303030 + flat) & 0xffffffff
+        slots = ((s16, v17), (v18, s17), (s16, v17), (v18, v17))
+        for idx, (pred, (src0, src1)) in enumerate(zip(preds, slots)):
+            cond = pred_fn(typ, pred, a, b)
+            if swap_select:
+                cond = not cond
+            words[flat * 4 + idx] = src1 if cond else src0
+    return words
+
+
+def vcmp_select_controls():
+    """Per-lane v_cmp_* and v_cndmask_b32_e32/e64: exact HLSL and one refusal per assumption."""
+    base_int = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx8 s[12:19], s[8:9], null",
+        "v_lshl_add_u32 v3, s10, 6, v0",
+        "v_lshlrev_b32_e32 v1, 2, v3",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_load_dword v1, v1, s[16:19], 0 offen",
+        "s_mov_b32 s16, 0x10101010",
+        "v_add_nc_u32_e32 v17, 0x20202020, v3",
+        "s_waitcnt vmcnt(0)",
+        "v_cmp_lt_u32_e32 vcc_lo, v1, v3",
+        "v_cndmask_b32_e32 v10, s16, v17, vcc_lo",
+        "buffer_store_dword v10, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    int_binding = dict(table_reg=8, descriptor_offset=0, source_descriptor=16, group_reg=10, stride=4)
+    lines = aot.lower(base_int, 64, **int_binding).splitlines()
+    assert lines[4] == (
+        "    outputData.Store(tid.x * 4u + 0u, ((inputData.Load((tid.x << 2u) + 0u) < tid.x) "
+        "? (0x20202020u + tid.x) : 0x10101010u));"
+    ), lines
+    i32_e64 = variant(
+        base_int,
+        ("v_cmp_lt_u32_e32 vcc_lo, v1, v3", "v_cmp_ge_i32_e64 s4, v1, v3"),
+        ("v_cndmask_b32_e32 v10, s16, v17, vcc_lo", "v_cndmask_b32_e64 v10, s16, v17, s4"),
+    )
+    assert "((asint(inputData.Load((tid.x << 2u) + 0u)) >= asint(tid.x)) ?" in "\n".join(
+        aot.lower(i32_e64, 64, **int_binding).splitlines()
+    )
+    f32_unord = variant(
+        base_int,
+        ("v_cmp_lt_u32_e32 vcc_lo, v1, v3", "v_cmp_nge_f32_e32 vcc_lo, v1, v3"),
+    )
+    assert ("((isnan(asfloat(inputData.Load((tid.x << 2u) + 0u))) || isnan(asfloat(tid.x)) "
+            "|| (asfloat(inputData.Load((tid.x << 2u) + 0u)) < asfloat(tid.x))) ?") in aot.lower(
+        f32_unord, 64, **int_binding
+    )
+    f32_ord_lg = variant(
+        base_int,
+        ("v_cmp_lt_u32_e32 vcc_lo, v1, v3", "v_cmp_lg_f32_e64 s4, 1.0, v1"),
+        ("v_cndmask_b32_e32 v10, s16, v17, vcc_lo", "v_cndmask_b32_e64 v10, s16, v17, s4"),
+    )
+    assert ("((!isnan(asfloat(0x3f800000u)) && !isnan(asfloat(inputData.Load((tid.x << 2u) + 0u))) "
+            "&& (asfloat(0x3f800000u) != asfloat(inputData.Load((tid.x << 2u) + 0u)))) ?") in aot.lower(
+        f32_ord_lg, 64, **int_binding
+    )
+    assert "(false ?" in aot.lower(
+        variant(base_int, ("v_cmp_lt_u32_e32 vcc_lo, v1, v3", "v_cmp_f_f32_e32 vcc_lo, v1, v3")),
+        64, **int_binding,
+    )
+    assert "(true ?" in aot.lower(
+        variant(base_int, ("v_cmp_lt_u32_e32 vcc_lo, v1, v3", "v_cmp_tru_f32_e64 s4, v1, v3"),
+                ("v_cndmask_b32_e32 v10, s16, v17, vcc_lo", "v_cndmask_b32_e64 v10, s16, v17, s4")),
+        64, **int_binding,
+    )
+    # 1. f32 source modifiers refused.
+    for mod in ("v_cmp_lt_f32_e64 s4, -v1, v3", "v_cmp_lt_f32_e64 s4, |v1|, v3"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(base_int, ("v_cmp_lt_u32_e32 vcc_lo, v1, v3", mod)), 64, **int_binding)
+    # 2. clamp, SDWA, and DPP spellings refused.
+    for bad in (
+        "v_cmp_lt_u32_e64 s4, v1, v3 clamp",
+        "v_cmp_lt_u32_sdwa vcc_lo, v1, v3 src0_sel:DWORD src1_sel:DWORD",
+        "v_cndmask_b32_sdwa v10, s16, v17, vcc_lo dst_sel:DWORD",
+        "v_cndmask_b32_dpp v10, v1, v17, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    ):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(base_int, ("v_cmp_lt_u32_e32 vcc_lo, v1, v3", bad)), 64, **int_binding)
+    # 3. Cond SGPR read by scalar ALU or used as a branch condition.
+    rejects("Unverified scalar ALU operand", aot.lower,
+            variant(i32_e64, ("v_cndmask_b32_e64 v10, s16, v17, s4",
+                              "s_add_u32 s5, s4, 1\nv_mov_b32_e32 v10, s5")),
+            64, **int_binding)
+    rejects("Unsupported compute instruction", aot.lower,
+            variant(i32_e64, ("v_cndmask_b32_e64 v10, s16, v17, s4", "s_cbranch_scc0 .L0")),
+            64, **int_binding)
+    # 4. s_and_saveexec on a cond built from loaded or ALU data.
+    rejects("Unverified lane guard compare", aot.lower,
+            variant(base_int, ("v_cndmask_b32_e32 v10, s16, v17, vcc_lo",
+                               "s_and_saveexec_b32 s2, vcc_lo\nv_mov_b32_e32 v10, v3\n"
+                               "s_or_b32 exec_lo, exec_lo, s2")),
+            64, **int_binding)
+    rejects("Unverified lane guard compare", aot.lower,
+            variant(base_int, ("v_cmp_lt_u32_e32 vcc_lo, v1, v3",
+                               "v_add_nc_u32_e32 v4, 1, v3\nv_cmp_lt_u32_e32 vcc_lo, v4, v3\n"
+                               "s_and_saveexec_b32 s2, vcc_lo\nv_mov_b32_e32 v10, v3\n"
+                               "s_or_b32 exec_lo, exec_lo, s2")),
+            64, **int_binding)
+    # 5. _ci carry-in from a cond (vcc_lo or SGPR).
+    rejects("Unverified carry-in operand", aot.lower,
+            variant(base_int, ("v_cndmask_b32_e32 v10, s16, v17, vcc_lo",
+                               "v_add_co_ci_u32_e32 v10, vcc_lo, 1, v3, vcc_lo")),
+            64, **(int_binding | dict(wave_size=32)))
+    rejects("Unverified carry-in operand", aot.lower,
+            variant(i32_e64, ("v_cndmask_b32_e64 v10, s16, v17, s4",
+                              "v_add_co_ci_u32_e64 v10, s5, 1, v3, s4")),
+            64, **(int_binding | dict(wave_size=32)))
+    # 6. Stale cond after another VCC write.
+    rejects("Unverified lane mask", aot.lower,
+            variant(base_int, ("v_cmp_lt_u32_e32 vcc_lo, v1, v3",
+                               "v_cmp_lt_u32_e32 vcc_lo, v1, v3\nv_add_co_u32 v11, vcc_lo, 1, v3")),
+            64, **(int_binding | dict(wave_size=32)))
+
+
+def vcmp_select_binary(directory, assembler, objcopy, library):
+    """All assembled VCMP_SELECT programs decode to their text and lower identically."""
+    for typ, preds, float_set in VCMP_SELECT_CASES:
+        lines = vcmp_select_program(typ, preds, float_set=float_set)
+        decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, lines), library, offsets=True))
+        assert [line for line in decoded if line.startswith(("v_cmp_", "v_cndmask_"))] == [
+            line for line in lines if line.startswith(("v_cmp_", "v_cndmask_"))], decoded
+        assert aot.lower(decoded, 64, **VCMP_SELECT_BINDING) == aot.lower(lines, 64, **VCMP_SELECT_BINDING)
+
+
+def vcmp_select_draw(directory, compiler, renderer, backend):
+    opcodes = set()
+    case_sources = {}
+    for idx, (typ, preds, float_set) in enumerate(VCMP_SELECT_CASES):
+        lines = vcmp_select_program(typ, preds, float_set=float_set)
+        opcodes.update(line.split()[0] for line in lines if line.strip())
+        src = directory / f"vcmp_{idx}.hlsl"
+        cso = directory / f"vcmp_{idx}.cso"
+        case = directory / f"vcmp_{idx}.case"
+        source = aot.lower(lines, 64, **VCMP_SELECT_BINDING)
+        case_sources[(typ, preds, float_set)] = (source, cso, case)
+        src.write_text(source, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        expected = vcmp_select_words(typ, preds, float_set=float_set)
+        case.write_bytes(struct.pack("<321I", 1, *expected))
+        result = subprocess.run([renderer, backend, "--compute-store-case", cso, case])
+        if result.returncode:
+            return result.returncode
+    # Reference controls, each failing at a stated word.
+    u32_key = ("u32", ("f", "lt", "eq", "le"), "a")
+    u32_expected = vcmp_select_words("u32", ("f", "lt", "eq", "le"))
+    u32_cso, u32_case = case_sources[u32_key][1:]
+    off = list(u32_expected)
+    off[256] ^= 1
+    f32_key = ("f32", ("u", "nge", "nlg", "ngt"), "a")
+    f32_expected = vcmp_select_words("f32", ("u", "nge", "nlg", "ngt"), float_set="a")
+    f32_cso, f32_case = case_sources[f32_key][1:]
+    swap_pred = lambda t, p, a, b: _py_vcmp_pred(t, {"lt": "gt", "gt": "lt"}.get(p, p), a, b)
+    signed_for_unsigned = lambda t, p, a, b: _py_vcmp_pred("i32" if t == "u32" else t, p, a, b)
+    ord_for_unord = lambda t, p, a, b: _py_vcmp_pred(t, {"nge": "lt"}.get(p, p), a, b)
+    for label, expected, cso, case, reference, word in (
+            ("lt and gt swapped", u32_expected, u32_cso, u32_case,
+             vcmp_select_words("u32", ("f", "lt", "eq", "le"), pred_fn=swap_pred), 1),
+            ("signed used for unsigned", u32_expected, u32_cso, u32_case,
+             vcmp_select_words("u32", ("f", "lt", "eq", "le"), pred_fn=signed_for_unsigned), 1),
+            ("ordered used for unordered", f32_expected, f32_cso, f32_case,
+             vcmp_select_words("f32", ("u", "nge", "nlg", "ngt"), float_set="a", pred_fn=ord_for_unord), 5),
+            ("select operands swapped", u32_expected, u32_cso, u32_case,
+             vcmp_select_words("u32", ("f", "lt", "eq", "le"), swap_select=True), 0),
+            ("sentinel past group", u32_expected, u32_cso, u32_case, off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run([renderer, backend, "--compute-store-case", cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"vcmp_select: reference '{label}' escaped detection\n{bad.stderr}")
+    u32_case.write_bytes(struct.pack("<321I", 1, *u32_expected))
+    f32_case.write_bytes(struct.pack("<321I", 1, *f32_expected))
+    # Recompiled-HLSL mutations that must mismatch on the device.
+    i32_key = ("i32", ("f", "lt", "eq", "le"), "a")
+    i32_source, _, i32_case = case_sources[i32_key]
+    i32_case.write_bytes(struct.pack("<321I", 1, *vcmp_select_words("i32", ("f", "lt", "eq", "le"))))
+    u32_source = case_sources[u32_key][0]
+    f32_source = case_sources[f32_key][0]
+    for label, mutated, case in (
+            ("< for <=", u32_source.replace(" <= ", " < "), u32_case),
+            ("asint dropped", i32_source.replace("asint(", "("), i32_case),
+            ("isnan dropped from unordered", f32_source.replace("isnan(", "isinf("), f32_case)):
+        assert mutated not in (u32_source, i32_source, f32_source), label
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([renderer, backend, "--compute-store-case", mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"vcmp_select: mutation '{label}' escaped detection\n{bad.stderr}")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(opcodes)), encoding="utf-8")
     return 0
 
 
@@ -5567,6 +5976,7 @@ def binary(directory, assembler, objcopy, library):
     ff1_exec_binary(directory, assembler, objcopy, library)
     ff1_scalar_binary(directory, assembler, objcopy, library)
     writelane_binary(directory, assembler, objcopy, library)
+    vcmp_select_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
     ds_controls()
@@ -8318,7 +8728,7 @@ DESCRIPTOR_STORES = (
     ("buffer_store_format_x", 56, 20, False, (("xor", UINT_PAYLOAD),)),
     ("buffer_store_format_d16_xy", 60, 23, False, (PACKED_25_75,)),
     ("buffer_store_format_d16_xyz", 68, 74, False, (PACKED_25_75, H25)),
-    ("buffer_store_format_xyzw", 80, 44, False, (F25, F75, 0, F75)),
+    ("buffer_store_format_xyzw", 80, 50, False, (F25, F75, 0, F75)),
     ("buffer_store_format_x", 96, 7, False, (F25,)),
     ("buffer_store_format_x", 100, 11, False, (UINT16_BITS,)),
     ("buffer_store_format_x", 104, 8, False, (F75,)),
@@ -8517,10 +8927,19 @@ def find_llvm15():
         for name in ("LLVM-C.dll", "libLLVM-15.so.1", "libLLVM.so"):
             if (parent / name).exists():
                 return ("mc", mc, objcopy, str(parent / name))
-    windows = Path(r"C:\Program Files\LLVM\bin")
-    clang, objcopy_path, library = windows / "clang.exe", windows / "llvm-objcopy.exe", windows / "LLVM-C.dll"
-    if clang.exists() and objcopy_path.exists() and library.exists():
-        return ("clang", str(clang), str(objcopy_path), str(library))
+    if os.name == "nt":
+        # The Windows LLVM 15 package ships clang's integrated assembler instead of llvm-mc.
+        for directory in [*os.get_exec_path(), r"C:\Program Files\LLVM\bin"]:
+            windows = Path(directory)
+            clang, objcopy_path, library = (windows / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            if not (windows.is_absolute() and clang.is_file() and objcopy_path.is_file() and library.is_file()):
+                continue
+            try:
+                version = subprocess.run([clang, "--version"], capture_output=True)
+            except OSError:
+                continue
+            if version.returncode == 0 and re.search(rb"\bclang version 15\.", version.stdout):
+                return ("clang", str(clang), str(objcopy_path), str(library))
     return None
 
 
@@ -8543,7 +8962,7 @@ def descriptor_store_round_trip(directory, lines, binding, kind, tool, objcopy, 
 PINNED_LEGACY_WORDS = {
     20: 0x00024FAC, 22: 0x00027FAC, 62: 0x0005CFAC, 64: 0x0005FFAC,
     72: 0x0006CFAC, 74: 0x0006FFAC, 75: 0x00074FAC, 77: 0x00077FAC,
-    56: 0x00050FAC, 23: 0x00028FAC, 44: 0x00040FAC, 29: 0x0002FFAC,
+    56: 0x00050FAC, 23: 0x00028FAC, 50: 0x00048FAC, 29: 0x0002FFAC,
     71: 0x00067FAC, 7: 0x00010FAC, 8: 0x00011FAC, 11: 0x00014FAC,
     12: 0x00015FAC, 13: 0x00017FAC,
 }
@@ -8717,6 +9136,16 @@ def descriptor_shader_bytes(source, thread_id):
 
 
 def descriptor_store_controls():
+    if os.name == "nt":
+        # A complete toolchain on PATH must enable the optional round trip outside Program Files too.
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = tuple(Path(tmp) / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            for tool in tools:
+                tool.touch()
+            version = subprocess.CompletedProcess([], 0, b"clang version 15.0.7\n")
+            with (patch.object(shutil, "which", return_value=None), patch.object(os, "get_exec_path", return_value=[tmp]),
+                  patch.object(subprocess, "run", return_value=version)):
+                assert find_llvm15() == ("clang", *map(str, tools))
     assert descriptor_unorm_bits(F25, 255) == 64
     assert descriptor_unorm_bits(F75, 255) == 191
     assert descriptor_unorm_bits(F25, 1023) == 256
@@ -8735,7 +9164,9 @@ def descriptor_store_controls():
         assert aot.descriptor_format_word(code, legacy=True) == word
         assert aot.decode_buffer_descriptor_format(word)[0] == code
     handled = 0x01038FAC
-    for word in (aot.DESCRIPTOR_GFX10_FIXED | (2 << 12), aot.DESCRIPTOR_GFX10_FIXED | (9 << 12),
+    # 10_10_10_2_UNORM (44, legacy DFMT 8) puts a 2-bit x in bits 1:0, not the 2_10_10_10 layout unorm10 packs.
+    for word in (aot.DESCRIPTOR_GFX10_FIXED | (44 << 12), 0x00040FAC,
+                 aot.DESCRIPTOR_GFX10_FIXED | (2 << 12), aot.DESCRIPTOR_GFX10_FIXED | (9 << 12),
                  handled | (1 << 23), handled | (1 << 21), handled | (1 << 28), handled | (1 << 30),
                  handled & ~0xFFF, 0):
         rejects("Unsupported buffer descriptor format", aot.decode_buffer_descriptor_format, word)
@@ -8825,6 +9256,14 @@ def descriptor_store_draw(directory, compiler, renderer, backend):
     result = subprocess.run(run)
     if result.returncode:
         return result.returncode
+    print("refused 10_10_10_2_UNORM", flush=True)
+    xyzw = next(index for index, store in enumerate(DESCRIPTOR_STORES) if store[1] == 80)
+    case.write_bytes(struct.pack("<321I", 1, *descriptor_words(1, refuse={xyzw}))
+                     + struct.pack("<16I", *descriptor_constants(
+                         {xyzw: aot.DESCRIPTOR_GFX10_FIXED | (44 << 12)})))
+    result = subprocess.run(run)
+    if result.returncode:
+        return result.returncode
     print("refused d16 16_UINT", flush=True)
     case.write_bytes(struct.pack("<321I", 1, *descriptor_words(1, refuse={2}))
                      + struct.pack("<16I", *descriptor_constants({2: aot.descriptor_format_word(11)})))
@@ -8911,6 +9350,7 @@ if __name__ == "__main__":
                  "draw-ff1-exec": ff1_exec_draw,
                  "draw-ff1-scalar": ff1_scalar_draw,
                  "draw-writelane": writelane_draw,
+                 "draw-vcmp-select": vcmp_select_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES),

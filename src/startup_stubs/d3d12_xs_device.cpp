@@ -13,6 +13,7 @@
 #define X2W_TRAP_MODULE "d3d12_xs.dll"
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
+#include "x2w_build_rev.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/overlay_window.h"
@@ -44,6 +45,7 @@
 #include "command_signature_filter.h"
 #include "console_plane_size.h"
 #include "descriptor_heap_type.h"
+#include "small_texture_4k.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
@@ -117,6 +119,7 @@ struct alignas(16) WrapperOwn {
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
+    x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
@@ -885,6 +888,17 @@ void note_console_size(const D3D12_RESOURCE_DESC& desc, const D3D12_RESOURCE_ALL
             info.SizeInBytes, desc.Width, desc.Height, desc.Format, desc.SampleDesc.Count);
 }
 
+// A single small 2D texture asked with a 4 KiB alignment gets the console's 4 KiB answer (small_texture_4k.h).
+bool small_texture_answer(UINT count, const D3D12_RESOURCE_DESC* descs, D3D12_RESOURCE_ALLOCATION_INFO& info)
+{
+    if (count != 1 || !descs || !x2w_startup::small_texture_4k(descs[0], info)) return false;
+    static LONG calls;
+    if (first_calls(calls, 8))
+        log("x2w-d3d12 allocation info: 4 KiB answer size 0x%llx for %llux%u mips %u format %d", info.SizeInBytes, descs[0].Width,
+            descs[0].Height, descs[0].MipLevels, descs[0].Format);
+    return true;
+}
+
 // Device slot 25, desktop GetResourceAllocationInfo(visibleMask, count, descs), returned by value.
 void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UINT count, const D3D12_RESOURCE_DESC* descs)
 {
@@ -895,6 +909,7 @@ void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UIN
     D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(mask, count, copies.data());
     // A single description of a family that is larger on desktop gets its console size (console_plane_size.h).
     if (count == 1 && x2w_startup::console_plane_size(descs[0], info)) note_console_size(descs[0], info);
+    small_texture_answer(count, descs, info);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
     if (first_calls(calls))
@@ -1021,6 +1036,7 @@ void* __stdcall device_resource_allocation_info1(void* a, void* b, UINT mask, UI
         if (info1) *info1 = {0, info.Alignment, info.SizeInBytes};
         note_console_size(descs[0], info);
     }
+    if (small_texture_answer(count, descs, info) && info1) *info1 = {0, info.Alignment, info.SizeInBytes};
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
     if (first_calls(calls))
@@ -1165,6 +1181,7 @@ struct DesktopAllocator {
     // until it is idle and Reset(); hardware drivers can fault if a second recording starts on
     // an allocator whose failed recording is still attached.
     bool close_failed;
+    std::vector<std::unique_ptr<x2w_upload::Arena>> uploads;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1197,6 +1214,48 @@ bool allocator_idle(const DesktopAllocator* allocator)
     return true;
 }
 
+// List slot 148 (Xbox order), allocate CPU-writable upload memory for this recording.
+void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignment)
+{
+    if (!bytes || !alignment || (alignment & (alignment - 1)) ||
+        bytes > UINT64_MAX - (std::max)(alignment, UINT64{16})) return nullptr;
+    x2w_upload::Allocation allocation{};
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (state.list_open && state.list_device && found != list_recordings.end() && found->second) {
+        try {
+            if (!state.list_uploads) {
+                auto arena = std::make_unique<x2w_upload::Arena>();
+                found->second->uploads.push_back(std::move(arena));
+                state.list_uploads = found->second->uploads.back().get();
+            }
+            allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment);
+        } catch (const std::bad_alloc&) {
+            // Refuse the allocation without invalidating any range already recorded.
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return reinterpret_cast<void*>(allocation.cpu);
+}
+
+UINT64 list_upload_gpu(Wrapper* self, UINT64 address, UINT64 bytes)
+{
+    AcquireSRWLockShared(&allocator_lock);
+    const auto& state = self->own();
+    const auto gpu = state.list_open && state.list_uploads ? state.list_uploads->translate(address, bytes) : 0;
+    ReleaseSRWLockShared(&allocator_lock);
+    return gpu;
+}
+
+// Fixture lookup. The full range must belong to this list's open recording.
+extern "C" __declspec(dllexport) UINT64 x2w_d3d12_upload_gpu_address(void* list, const void* cpu, UINT64 bytes)
+{
+    Wrapper* self = as_wrapper(list);
+    return self && self->own().kind == list_kind && cpu && bytes
+        ? list_upload_gpu(self, reinterpret_cast<UINT64>(cpu), bytes) : 0;
+}
+
 // Allocator slot 8, desktop Reset().
 HRESULT __stdcall allocator_reset(Wrapper* self)
 {
@@ -1223,6 +1282,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
     if (next) {
         hr = next->real->Reset();
         if (SUCCEEDED(hr)) {
+            next->uploads.clear();
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -1313,6 +1373,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             target = nullptr;
             for (DesktopAllocator* spare : title.pool) {
                 if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
+                    spare->uploads.clear();
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -1355,6 +1416,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
+            state.list_uploads = nullptr;
             state.list_ready = false;
             state.list_open = true;
         }
@@ -1892,6 +1954,7 @@ struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
     ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
+    const std::vector<RootParameter>* compute_params = nullptr;
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -2024,6 +2087,7 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Pass& pass = pass_of(self);
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
+    pass.compute_params = real ? root_info(w) : nullptr;
     if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
 }
 
@@ -2152,6 +2216,8 @@ enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline
        indirect_outcomes };
 volatile LONG64 indirect_calls[indirect_outcomes][5];
 
+const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset);
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -2183,14 +2249,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
+    const bool translated = command == IndirectCommand::draw && pass.pipeline && !pass.pipeline->own().real &&
+        pass.graphics_root && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer)) return refuse("indirect graphics requires one command and no count buffer");
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
-        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
-            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh) {
+        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || (!translated && (!pass.indirect_graphics.root ||
+            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh))) {
             // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
             // nothing is drawn.
             if (pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
@@ -2201,7 +2269,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                           indirect_graphics_pipeline);
         }
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
-            pass.target_formats[0] != pass.indirect_graphics.target_format ||
+            (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
             return refuse("indirect graphics requires one matching target, viewport and scissor");
         if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
@@ -2232,6 +2300,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
         return refuse("argument buffer does not use COMMON state tracking");
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
+    if (translated) {
+        const char* failure = draw_translated_indirect(self, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset);
+        if (failure) return refuse(failure, indirect_graphics_pipeline);
+        InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
+        return;
+    }
     auto argument_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     if (indexed) {
         auto view = pass.ib;
@@ -2536,6 +2610,17 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
         list->OMSetStencilRef(reference);
     }
 }
+// List slot 43 (desktop 39 + 4), set a compute root SRV backed by this recording's upload pages.
+void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 address)
+{
+    auto* list = recording(self);
+    const auto* params = pass_of(self).compute_params;
+    if (!list || !params || parameter >= params->size() ||
+        (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
+    const auto gpu = list_upload_gpu(self, address, 1);
+    if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) list->SetComputeRootShaderResourceView(parameter, gpu);
+}
+
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -2547,6 +2632,12 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     if (!list || !pass.root || pass.root_heap_flags || parameter >= pass.root->size() || parameter >= 32 ||
         (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
         return;
+    if (const auto gpu = list_upload_gpu(self, address, 1)) {
+        if (gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return;
+        list->SetGraphicsRootShaderResourceView(parameter, gpu);
+        pass.srv_bound |= 1u << parameter;
+        return;
+    }
     const std::size_t bytes = readable_window(address, 0x10000);
     const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(address, bytes) : 0;
     static LONG logged;
@@ -2656,8 +2747,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             } else {
                 queue->ExecuteCommandLists(ready_count, ready.data());
             }
-            retire_draw_sampler_heaps(queue, ready);
             retire_address_uploads(queue, ready);
+            retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
             InterlockedIncrement(&render_executes);
         }
@@ -3835,9 +3926,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (shown_in_window) {
         if (frame % 30 == 0) {
-            wchar_t text[200];
-            swprintf(text, 200, L"Xbox2Windows - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
-                     frame, frame * 1000.0 / (now - started ? now - started : 1), translated_draws);
+            // About 100 fixed characters, the revision (at most 46) and three numbers fit in 256.
+            wchar_t text[256];
+            swprintf(text, 256, L"Xbox2Windows %ls - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
+                     x2w_build_rev_w, frame, frame * 1000.0 / (now - started ? now - started : 1), translated_draws);
             SetWindowTextW(output_window(), text);
         }
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
@@ -4016,6 +4108,7 @@ void build_tables()
         list_typed[9] = reinterpret_cast<ListTyped>(&list_close);
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
+        list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
@@ -4026,6 +4119,7 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
+        list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_upload_srv);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
@@ -4168,8 +4262,8 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
         ? D3D12CreateDevice(adapter ? reinterpret_cast<IUnknown*>(unwrap(reinterpret_cast<u64>(adapter))) : nullptr,
                             D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device))
         : E_NOINTERFACE;
-    log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx", static_cast<void*>(adapter), block,
-        text, static_cast<unsigned long>(hr));
+    log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx build=%s", static_cast<void*>(adapter),
+        block, text, static_cast<unsigned long>(hr), x2w_build_rev);
     if (FAILED(hr)) return hr;
     if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     x2w_startup::attach_device(device, out);
