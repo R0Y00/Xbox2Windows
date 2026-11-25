@@ -5,8 +5,10 @@ others, X2W_DUMP_AT writes thread stacks at a time during the run, and X2W_VALLO
 virtual-memory allocations with their callers. X2W_LOG_AT captures registers and qwords at a
 function entry, then removes the breakpoint at the hit limit. A `stop` file created in the log directory
 ends the run as the timeout does; one left from an earlier run is removed at start. The launcher keeps the debug heap off unless
-the caller sets _NO_DEBUG_HEAP=0. tests/startup_debug_probe.cpp is the main input: it hits two
-breakpoints, reserves 256 MiB, prints its debug-heap flags, waits 3 s and exits 0.
+the caller sets _NO_DEBUG_HEAP=0. X2W_NOP_SOFT_ASSERTS=1 replaces a main-image INT3 with a NOP after
+the first continue, and the probe repeats one site when STARTUP_DEBUG_PROBE_ASSERTS is set.
+tests/startup_debug_probe.cpp is the main input: it hits two breakpoints, optionally repeats a
+third, reserves 256 MiB, prints its debug-heap flags, waits 3 s and exits 0.
 
 The gaming-runtime and movie-player call hooks are armed only with --trace-calls 1. For that case
 the probe and tests/startup_debug_calls.cpp are copied into one folder, the DLL under the
@@ -73,6 +75,12 @@ def run_with_stop(probe, work, name):
 
 def text(path):
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def breakpoint_sites(logdir, image):
+    """The main-image RVAs of the breakpoints the debugger logged, in order."""
+    return [int(m, 16) for m in re.findall(r"breakpoint at %s\+0x([0-9a-f]+) first-chance" % re.escape(image),
+                                          text(logdir / "events.txt"))]
 
 
 HOOKED_MODULE = "bink2scarlett.dll"  # the movie-player module name debug_launch.py hooks
@@ -187,6 +195,23 @@ def main(probe, calls_dll, group='all'):
             out, _ = run(probe, work, "stop-first", {"X2W_STOP_AT": f"{sites[1]:x}"}, options=())
             assert f"stopped at breakpoint (0x80000003) at {image}+{sites[0]:#x}" in out, out
 
+            # X2W_NOP_SOFT_ASSERTS=1: a site that traps once per iteration is patched after its first
+            # hit, so the loop finishes with one logged breakpoint. Without the switch every hit is logged.
+            repeats = 4
+            out, logdir = run(probe, work, "nop-repeat", {"STARTUP_DEBUG_PROBE_ASSERTS": str(repeats),
+                                                          "X2W_NOP_SOFT_ASSERTS": "1"})
+            assert "process exited with 0x00000000" in out, out
+            assert f"debug-probe repeated {repeats}\n" in text(logdir / "stdout.txt"), text(logdir / "stdout.txt")
+            hits = breakpoint_sites(logdir, image)
+            repeated = [site for site in hits if site not in sites]
+            assert len(hits) == len(sites) + 1 and len(repeated) == 1, text(logdir / "events.txt")
+            nop_line = next((line for line in out.splitlines() if "soft asserts NOP'd:" in line), "")
+            assert f"{image}+{repeated[0]:#x}" in nop_line, out
+            # Control: without the switch the same run logs every hit at the repeated site.
+            out, logdir = run(probe, work, "nop-repeat-control", {"STARTUP_DEBUG_PROBE_ASSERTS": str(repeats)})
+            assert "process exited with 0x00000000" in out, out
+            assert breakpoint_sites(logdir, image).count(repeated[0]) == repeats, text(logdir / "events.txt")
+
             # X2W_DUMP_AT: a dump one second in, while the probe is still alive.
             out, logdir = run(probe, work, "dump", {"X2W_DUMP_AT": "1"})
             assert "process exited with 0x00000000" in out, out
@@ -292,7 +317,7 @@ def main(probe, calls_dll, group='all'):
                 assert banners[name] in out, (name, out)
 
     print(f"startup_debug[{group}]: PASS (stop at a chosen assert, timed thread dump, large-allocation log, debug heap off, "
-          "call hooks opt-in, bounded register and qword logging)")
+          "soft asserts NOP'd after the first hit when the core group runs, call hooks opt-in, bounded register and qword logging)")
     return 0
 
 

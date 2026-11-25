@@ -3127,6 +3127,24 @@ SDWA_CO_CI_OPERANDS = re.compile(
     r" dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
     r" dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE)"
     r" src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD) src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
+# SDWA binary32-to-int32 conversions and frexp_exp (float src0 with src0_sel:DWORD -> int32 result).
+SDWA_CVT_F32_TO_INT = {
+    "cvt_i32_f32": "cvt_i32_f32",
+    "cvt_u32_f32": "cvt_u32_f32",
+    "cvt_flr_i32_f32": "cvt_flr_i32_f32",
+    "cvt_rpi_i32_f32": "cvt_rpi_i32_f32",
+    "frexp_exp_i32_f32": "dpp_frexp_exp_i32_f32",
+}
+# SDWA integer-to-binary32 conversions (integer src0 with optional sext() and any src0_sel, optional clamp).
+SDWA_CVT_INT_TO_F32 = {
+    "cvt_f32_i32": "float(asint({0}))",
+    "cvt_f32_u32": "float({0})",
+    "cvt_f32_ubyte0": "float(({0} >> 0u) & 0xffu)",
+    "cvt_f32_ubyte1": "float(({0} >> 8u) & 0xffu)",
+    "cvt_f32_ubyte2": "float(({0} >> 16u) & 0xffu)",
+    "cvt_f32_ubyte3": "float(({0} >> 24u) & 0xffu)",
+    "cvt_off_f32_i4": "(float(asint({0} << 28u) >> 28) * 0.0625f)",
+}
 SDWA_F16_SRC = re.compile(r"(-?)(?:abs\(([vs]\d+)\)|\|([vs]\d+)\||([vs]\d+))")
 SDWA_F16_UNARY_OPERANDS = re.compile(
     r"(v\d+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
@@ -3494,6 +3512,26 @@ def inline_calls(instructions):
                   *((call_offset + 4 + offset - target, text) for offset, text in instructions[start:end]),
                   *((offset + size, text) for offset, text in instructions[c + 1:start])])
 
+INTEGER_TEMPORARY = re.compile(r"\b(?:salu|alu)[0-9]+\b")
+
+
+def discard_dead_integer_temporaries(lines, candidates):
+    """Remove only emitter-marked, single-assignment locals after validation."""
+    live = set()
+    retained = []
+    first = next(iter(candidates))  # Emit sites mark candidates in line order.
+    # Locals are declared before their uses. Scan backwards from the roots
+    # (all unmarked lines), so skipped declarations do not root their inputs.
+    for index in range(len(lines) - 1, first - 1, -1):
+        name = candidates.get(index)
+        if name is not None and name not in live:
+            continue
+        line = lines[index]
+        retained.append(line)
+        live.update(INTEGER_TEMPORARY.findall(line))
+    retained.reverse()
+    return lines[:first] + retained
+
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
@@ -3569,6 +3607,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
     lines = [PREAMBLE] if sampler is None else [SAMPLED_RESOURCES, PREAMBLE]
+    dead_integer_candidates = {}
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
@@ -4644,6 +4683,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif op == "flbit_i32":
                 helpers.add("dpp_ffbh_i32")
             values = [scalar_u32(t, scalar, pending) for t in tokens]
+            if mask == "entry" and op in ("xor_b32", "lshl_b32"):
+                dead_integer_candidates[len(lines)] = f"salu{i}"
             lines.append(f"    uint salu{i} = {template.format(*values)};")
             if carry:
                 scc = f"({carry.format(*values, r=f'salu{i}')})"
@@ -5537,6 +5578,101 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = asfloat({placed});")
             scalar["vcc"] = ("condition", f"cmp{i}", 0, 1)
             vector[dst] = f"alu{i}"
+        elif m := match(rf"v_({'|'.join(SDWA_CVT_F32_TO_INT)})_sdwa (v\d+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # SDWA binary32-to-int32 conversions and frexp_exp: whole-dword float register source with
+            # optional bit-31 abs/neg modifiers, reusing the e64/DPP IEEE-754 bit helpers and SDWA dest placement.
+            op, dst, src0, dst_sel, unused, sel0 = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid conversion SDWA operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if unused == "UNUSED_SEXT":
+                raise ValueError("UNUSED_SEXT is not lowered")
+            if sel0 != "DWORD":
+                raise ValueError(f"v_{op}_sdwa requires src0_sel:DWORD, got {sel0}")
+            if src0.startswith("sext("):
+                raise ValueError(f"Unsupported float SDWA source modifier: {src0}")
+            sm = SDWA_F16_SRC.fullmatch(src0)
+            if not sm:
+                raise ValueError(f"Unsupported float SDWA operand: {src0}")
+            neg, abs_fn, abs_bars, plain = sm.groups()
+            reg = abs_fn or abs_bars or plain
+            if not 0 <= int(reg[1:]) <= (255 if reg[0] == "v" else 105):
+                raise ValueError(f"Register out of range: {reg}")
+            val = fp_operand(reg, scalar, vector, pending, sample_dest)
+            bits = f"asuint({val})"
+            if abs_fn or abs_bars:
+                bits = f"({bits} & 0x7fffffffu)"
+            if neg:
+                bits = f"({bits} ^ 0x80000000u)"
+            helper = SDWA_CVT_F32_TO_INT[op]
+            helpers.add(helper)
+            placed = sdwa_dest(f"{helper}({bits})", dst_sel, unused, vector.get(dst))
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({placed});")
+        elif m := match(rf"v_({'|'.join(SDWA_CVT_INT_TO_F32)})_sdwa (v\d+), ([^,\s]+)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # SDWA integer-to-binary32 conversions (i32, u32, ubyte0..3, off_i4): integer register source
+            # with optional sext() and any SDWA selection, optional clamp, and SDWA destination placement.
+            op, dst, src0, clamp, dst_sel, unused, sel0 = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid conversion SDWA operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if unused == "UNUSED_SEXT":
+                raise ValueError("UNUSED_SEXT is not lowered")
+            if src0.startswith(("-", "|", "abs(")):
+                raise ValueError(f"Source modifiers are not allowed on {src0}")
+            sm = re.fullmatch(SDWA_INT_SOURCE, src0)
+            if not sm or bool(sm.group(1)) != bool(sm.group(3)):
+                raise ValueError(f"Unsupported SDWA integer operand: {src0}")
+            is_sext, reg = bool(sm.group(1)), sm.group(2)
+            if not 0 <= int(reg[1:]) <= (255 if reg[0] == "v" else 105):
+                raise ValueError(f"Register out of range: {reg}")
+            selected = sdwa_source(int_operand(reg, scalar, vector, pending, sample_dest, signed=False), sel0, is_sext)
+            lines.append(f"    uint sc{i} = {selected};")
+            expr = SDWA_CVT_INT_TO_F32[op].format(f"sc{i}")
+            if clamp:
+                expr = f"saturate({expr})"
+            if dst_sel != "DWORD":
+                expr = f"asfloat({sdwa_dest(f'asuint({expr})', dst_sel, unused, vector.get(dst) if unused == 'UNUSED_PRESERVE' else None)})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
+        elif m := match(r"v_cvt_pkrtz_f16_f32_sdwa (v\d+), ([^,\s]+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD) src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # SDWA compressed-export pack: whole-dword binary32 float register sources with optional bit-31
+            # abs/neg modifiers and whole-dword destination, producing the same (lo, hi) compressed-export pair
+            # as v_cvt_pkrtz_f16_f32_e32 and v_cvt_pkrtz_f16_f32_dpp.
+            dst, src0, src1, dst_sel, unused, sel0, sel1 = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid pack SDWA operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if unused == "UNUSED_SEXT":
+                raise ValueError("UNUSED_SEXT is not lowered")
+            if dst_sel != "DWORD":
+                raise ValueError(f"v_cvt_pkrtz_f16_f32_sdwa requires dst_sel:DWORD, got {dst_sel}")
+            if sel0 != "DWORD" or sel1 != "DWORD":
+                raise ValueError("v_cvt_pkrtz_f16_f32_sdwa requires whole-dword sources")
+            pair_bits = []
+            for tok in (src0, src1):
+                if tok.startswith("sext("):
+                    raise ValueError(f"Unsupported float SDWA source modifier: {tok}")
+                sm = SDWA_F16_SRC.fullmatch(tok)
+                if not sm:
+                    raise ValueError(f"Unsupported float SDWA operand: {tok}")
+                neg, abs_fn, abs_bars, plain = sm.groups()
+                reg = abs_fn or abs_bars or plain
+                if not 0 <= int(reg[1:]) <= (255 if reg[0] == "v" else 105):
+                    raise ValueError(f"Register out of range: {reg}")
+                val = fp_operand(reg, scalar, vector, pending, sample_dest)
+                bits = f"asuint({val})"
+                if abs_fn or abs_bars:
+                    bits = f"({bits} & 0x7fffffffu)"
+                if neg:
+                    bits = f"({bits} ^ 0x80000000u)"
+                pair_bits.append(bits)
+            lines.append(f"    precise float alu{i}_lo = asfloat({pair_bits[0]});")
+            lines.append(f"    precise float alu{i}_hi = asfloat({pair_bits[1]});")
+            vector[dst] = (f"alu{i}_lo", f"alu{i}_hi")
         elif m := match(r"v_cvt_f16_f32_sdwa (.+)"):
             # SDWA binary32-to-binary16 conversion under the declared entry profile (half_denorm="preserve"
             # and HW_REG_MODE RNE). Takes a whole-dword register source (so f32 denormal mode never touches
@@ -5837,6 +5973,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             helpers.update(INTEGER_HELPERS.get(op, ()))
             helpers.update(SAD_HELPERS.get(op, ()))
             vector[dst] = f"alu{i}"
+            if op == "xor_b32":
+                dead_integer_candidates[len(lines)] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             enc, dst, value, classes = m.groups()
@@ -5876,6 +6014,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
             expression = {"add": f"{a} + {b}", "sub": f"{a} - {b}", "subrev": f"{b} - {a}"}[op]
             vector[dst] = f"alu{i}"
+            if line.startswith("v_add_nc_u32"):
+                dead_integer_candidates[len(lines)] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_(add|sub|subrev)_co_u32 (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+)"):
             # 32-bit add or subtract that also writes the unsigned carry or borrow of each lane to a lane
@@ -7728,6 +7868,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Expected one gather for the declared view")
     if not ended or sampled_textures != set(bindings.values()):
         raise ValueError("Unexpected sample count or missing color export")
+    if dead_integer_candidates:
+        lines = discard_dead_integer_temporaries(lines, dead_integer_candidates)
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
         if "div_fmas32" in helpers:
