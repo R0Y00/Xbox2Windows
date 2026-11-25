@@ -20,6 +20,8 @@ reads the read buffer at that index and stores to its own destination:
   three words at offset 16 under an exec mask set from a compare (lanes with tid.x < 6), and restores exec;
 - case D counts sparse mask bits below each lane with v_mbcnt_lo/hi, then obtains the full-mask count in lanes
   16-31 under partial EXEC. Two 4x2x4 groups write separate records to the raw buffer.
+- case E runs five SAVEEXEC forms with overlapping and distinct source registers. Four single-thread groups
+  cover both input bits for EXEC and S0; each stores the saved EXEC, resulting SCC and new EXEC.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -164,6 +166,49 @@ WORDS_D = bytes.fromhex(
 SOURCE_D_WRAP = SOURCE_D.replace('v_mov_b32 v6, 7', 's_mov_b32 s22, -1').replace('v8, s20, v6', 'v8, s20, s22')
 WORDS_D_WRAP = WORDS_D.replace(bytes.fromhex('87020c7e080065d7140c0200'), bytes.fromhex('c10396be080065d7142c0000'))
 
+def saveexec_fixture():
+    # RDNA 2 ISA, SOP1: D takes old EXEC, then EXEC takes the bitwise result and SCC reports nonzero.
+    # A single-thread group makes the lane bit the whole participating wave mask.
+    program = [
+        ('s_mov_b32 s10, s6', '06038abe'),
+        ('s_mov_b32 s11, 0', '80038bbe'),
+        ('s_load_dwordx8 s[12:19], s[10:11], 0x0', '05030cf4000000fa'),
+        ('s_waitcnt lgkmcnt(0)', '7fc08cbf'),
+        ('v_lshlrev_b32 v4, 2, s7', '04001ad5820e0000'),
+        ('s_and_b32 s22, s7, 1', '07811687'),
+        ('s_mov_b32 s23, 0', '800397be'),
+        ('s_mov_b32 s21, 0', '800395be'),
+        ('s_lshr_b32 s26, s7, 1', '07811a90'),
+    ]
+    snapshot = [
+        ('s_cselect_b32 s28, 1, 0', '81801c85'),
+        ('s_mov_b32 s29, exec_lo', '7e039dbe'),
+        ('s_mov_b32 exec_lo, 1', '8103febe'),  # every group writes its result, including EXEC == 0
+        ('v_lshlrev_b32 v5, 2, s20', '05001ad582280000'),
+        ('v_lshlrev_b32 v6, 1, s28', '06001ad581380000'),
+        ('v_or_b32 v5, v5, v6', '050d0a38'),
+        ('v_or_b32 v5, s29, v5', '1d0a0a38'),
+        ('buffer_store_dword v5, v4, s[16:19], 0 offen', '001070e004050480'),
+        ('v_add_nc_u32 v4, 16, v4', '9008084a'),
+    ]
+    for op, alias_word, distinct_word in (
+        ('s_and_saveexec_b64', '142494be', '162494be'),
+        ('s_and_saveexec_b32', '143c94be', '163c94be'),
+        ('s_or_saveexec_b64', '142594be', '162594be'),
+        ('s_or_saveexec_b32', '143d94be', '163d94be'),
+        ('s_andn2_saveexec_b64', '142794be', '162794be'),
+    ):
+        dst, src = ('s[20:21]', 's[22:23]') if op.endswith('b64') else ('s20', 's22')
+        for init, operand, word in (
+            (('s_mov_b32 s20, s22', '160394be'), dst, alias_word),
+            (('s_xor_b32 s20, s22, 1', '16811489'), src, distinct_word),
+        ):
+            program.extend((init, ('s_mov_b32 exec_lo, s26', '1a03febe'), (f'{op} {dst}, {operand}', word)))
+            program.extend(snapshot)
+    program.append(('s_endpgm', '000081bf'))
+    return '\n'.join(line for line, _ in program) + '\n', bytes.fromhex(''.join(word for _, word in program))
+
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -171,6 +216,7 @@ CASES = {
     'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
+    'E': (*saveexec_fixture(), USER7 | TGID_X | tidig(1), (1, 1, 1), (4, 1, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -240,6 +286,12 @@ def input_word(i):
 def expected(name):
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    if name == 'E':
+        # Group IDs 0..3 encode (old EXEC, S0) = (0,0), (0,1), (1,0), (1,1).
+        # Store old EXEC in bit 2, SCC in bit 1 and new EXEC in bit 0. Both operand layouts agree.
+        and_bits, or_bits, andn2_bits = [0, 0, 4, 7], [0, 3, 7, 7], [0, 3, 4, 4]
+        out[:40] = and_bits * 4 + or_bits * 4 + andn2_bits * 2
+        return out
     if name in ('D', 'D-wrap'):
         for group in range(groups[0]):
             count = 7 if name == 'D' else MASK

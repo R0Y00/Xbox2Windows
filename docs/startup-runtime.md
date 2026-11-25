@@ -189,8 +189,10 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-11`. Older translations can carry a stale scalar
-symbol across a join or read a stale SCC after an operation on a descriptor word.
+The shader cache revision is `x2w-startup-shader-12`. Older translations can overwrite the
+source mask when a save-EXEC instruction uses the same source and destination register.
+Earlier revisions can also carry a stale scalar symbol across a join or read a stale SCC after
+an operation on a descriptor word.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
