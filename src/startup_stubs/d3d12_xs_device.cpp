@@ -119,6 +119,9 @@ struct alignas(16) WrapperOwn {
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
+    ID3D12Resource* predication_buffer;  // CommandList: the guest predicate in force, or null
+    std::uint64_t predication_offset;
+    UINT predication_operation;
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
@@ -1405,6 +1408,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             state.list_uploads = nullptr;
             state.list_ready = false;
             state.list_open = true;
+            state.predication_buffer = nullptr;  // a desktop Reset clears predication
         }
     }
     ReleaseSRWLockExclusive(&allocator_lock);
@@ -2598,7 +2602,7 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
 }
 
 // List slot 59 (desktop 55 + 4), SetPredication(buffer, offset, operation). A null buffer turns predication off.
-// A buffer must be a COMMON-tracked desktop buffer; it is moved to the predication state before the call.
+// A buffer must be a default-heap desktop buffer; it is moved to the predication state before the call.
 void __stdcall list_set_predication(Wrapper* self, void* buffer_arg, u64 offset, UINT operation)
 {
     const auto refuse = [](const char* reason) {
@@ -2616,6 +2620,7 @@ void __stdcall list_set_predication(Wrapper* self, void* buffer_arg, u64 offset,
     if (has_buffer && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return refuse("predication needs a buffer");
     switch (x2w_predication::check(has_buffer, offset, operation, desc.Width)) {
     case x2w_predication::Verdict::clear:
+        self->own().predication_buffer = nullptr;
         list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         return;
     case x2w_predication::Verdict::set: break;
@@ -2623,10 +2628,15 @@ void __stdcall list_set_predication(Wrapper* self, void* buffer_arg, u64 offset,
     case x2w_predication::Verdict::bad_offset: return refuse("offset is not a multiple of 8");
     case x2w_predication::Verdict::outside_buffer: return refuse("value is outside the buffer");
     }
-    const auto* info = resource_info(buffer);
-    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
-        return refuse("buffer does not use COMMON state tracking");
+    // Only a DEFAULT heap buffer is tracked from COMMON; upload and readback heaps are fixed to
+    // GENERIC_READ / COPY_DEST and cannot enter the predication state.
+    D3D12_HEAP_PROPERTIES heap{};
+    if (FAILED(resource->GetHeapProperties(&heap, nullptr)) || heap.Type != D3D12_HEAP_TYPE_DEFAULT)
+        return refuse("buffer is not in a default heap");
     require_state(self, resource, D3D12_RESOURCE_STATE_PREDICATION);
+    self->own().predication_buffer = resource;
+    self->own().predication_offset = offset;
+    self->own().predication_operation = operation;
     list->SetPredication(resource, offset, static_cast<D3D12_PREDICATION_OP>(operation));
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
