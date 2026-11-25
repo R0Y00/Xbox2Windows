@@ -232,7 +232,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-8";
+    constexpr char revision[] = "x2w-startup-shader-11";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -352,7 +352,7 @@ void publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-8cs";  // tools/startup/gfx2hlsl.py compute_key
+    constexpr char compute_revision[] = "x2w-startup-shader-11cs";  // tools/startup/gfx2hlsl.py compute_key
     u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
@@ -1598,6 +1598,17 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
     constexpr auto shader_reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (!draw.indices.upload)
         require_state(self, indices, (index_previous & shader_reads) | D3D12_RESOURCE_STATE_INDEX_BUFFER);
+
+    // The clamp changes the native compute root and invalidates its arguments.
+    // In render mode slot 43 is the forwarded compute parameter setter.
+    const auto& pass = pass_of(self);
+    if (pass.desktop_compute_root) {
+        list->SetComputeRootSignature(pass.desktop_compute_root.Get());
+        for (UINT parameter = 0; parameter < pass.desktop_compute_upload_srvs.size(); ++parameter) {
+            const auto address = pass.desktop_compute_upload_srvs[parameter];
+            if (address) list->SetComputeRootShaderResourceView(parameter, address);
+        }
+    }
     return scratch.Get();
 }
 
@@ -1717,8 +1728,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
-        if (indexed && (pass.compute_root || pass.compute_pipeline)) {
-            indirect->refusal = "indexed validation cannot replace a live guest compute binding";
+        if (indexed && pass.compute_pipeline) {
+            indirect->refusal = "indexed validation cannot replace a live guest compute pipeline";
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }

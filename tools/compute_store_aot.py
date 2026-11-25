@@ -190,6 +190,7 @@ CVT_PK_U8 = {
     "v_cvt_pk_u8_f32": "(({2} & ~(0xffu << (({1} & 3u) << 3u))) | ((uint(asfloat({0})) & 0xffu) << (({1} & 3u) << 3u)))",
 }
 FLOAT_SOURCE = r"(s\d+|v\d+|-?\d+\.\d+|0x[0-9a-f]+|-?\d+)"
+VCC_HI = 107  # wave32 vcc_hi, tracked as a scalar word (see lower)
 SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 # Instruction prefixes that never write SCC, so a compare result survives them.
 SCC_PRESERVING = ("s_cselect_b32", "s_mov_b32", "s_movk_i32", "s_load", "s_buffer_load", "s_waitcnt",
@@ -325,7 +326,7 @@ def alu_word(token, scalar, vector, pending, sizes=None):
         value = vector.get(int(token[1:]))
     elif token[0] == "s":
         n = int(token[1:])
-        value = scalar.get(n) if n <= 105 and n not in pending else None
+        value = scalar.get(n) if (n <= 105 or n == VCC_HI) and n not in pending else None
         if sizes and isinstance(value, tuple) and value in sizes:
             value = ("alu", sizes[value])
     else:
@@ -953,6 +954,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Missing final program exit")
 
     for line in instructions[:-1]:
+        if "vcc_hi" in line and wave_size == 32:
+            # A wave32 VCC is vcc_lo alone and every lowered write of it (compares, carries, saveexec) touches only
+            # that half, so vcc_hi keeps what s_mov_b32 wrote. It is tracked as the otherwise unused SGPR 107,
+            # which only s_mov_b32 may write and only a known-word read may use. Without the wave32 statement the
+            # name stays unrecognised (wave64 VCC is the pair).
+            line = re.sub(r"\bvcc_hi\b", "s107", line)
+        elif re.search(r"\bs107\b", line):
+            raise ValueError("Invalid scalar destination or pending load")
         if ds_wait:
             if line != "s_waitcnt lgkmcnt(0)":
                 raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
@@ -1103,11 +1112,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             lds_m0_zero = True
         elif m := re.fullmatch(r"s_mov_b32 s(\d+), (s\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
-            if dst in pending or dst > 105:
+            if dst in pending or (dst > 105 and dst != VCC_HI):
                 raise ValueError("Invalid scalar destination or pending load")
             if src.startswith("s"):
                 n = int(src[1:])
-                if n > 105 or n in pending or n not in scalar:
+                if (n > 105 and n != VCC_HI) or n in pending or n not in scalar:
                     raise ValueError("Unknown or pending scalar source")
                 scalar[dst] = scalar[n]
             else:
@@ -1160,10 +1169,25 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             # subset). Outside a guarded region exec covers the whole wave: at most 32 threads is one wave of
             # either size, larger groups need wave_size=32 and a multiple of 32 threads.
             dst, src = int(m[1]), m[2]
-            if src != "exec_lo":
-                raise ValueError("Unsupported active lane count source: " + src)
             if dst in pending or dst > 105:
                 raise ValueError("Invalid scalar destination or pending load")
+            if src != "exec_lo":
+                # Any other source is a tracked scalar word (a loaded constant, a move or ALU result, a literal or
+                # wave32 vcc_hi): D = CountOneBits(S0) as for the 64-bit form, SCC unread. A source that is not
+                # a known word (descriptor word, untracked SGPR, exec or vcc halves) stays refused.
+                if not re.fullmatch(r"s\d+|-?\d+|0x[0-9a-f]+", src):
+                    raise ValueError("Unsupported active lane count source: " + src)
+                word = alu_word(src, scalar, vector, pending)
+                if word is None:
+                    raise ValueError("Unsupported active lane count source: " + src)
+                if isinstance(word, int):
+                    scalar[dst] = word.bit_count()
+                else:
+                    expression = f"countbits({hlsl_word(word)})"
+                    if len(expression) > ALU_EXPRESSION_LIMIT:
+                        raise ValueError("ALU expression too large")
+                    scalar[dst] = ("alu", expression)
+                continue
             if guard is not None:
                 raise ValueError("Active lane count inside guarded region")
             threads = dims[0] * dims[1] * dims[2]
@@ -1323,14 +1347,23 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  "    GroupMemoryBarrierWithGroupSync();\n"
                                  f"    uint {result} = {slot}[(gindex & ~31u) + {lane}u];"))
             scalar[dst] = ("alu", result)
-        elif m := re.fullmatch(rf"v_mbcnt_(lo|hi)_u32_b32 v(\d+), {SALU_SOURCE}, {ALU_SOURCE}", line):
+        elif m := re.fullmatch(rf"v_mbcnt_(lo|hi)_u32_b32 v(\d+), (exec_lo|s\d+|-?\d+|0x[0-9a-f]+), {ALU_SOURCE}", line):
             # D = popcount(S0 & lanes below this one, in the low or high half of the mask) + S1. A wave32 lane
             # has no bit in the high half, so v_mbcnt_hi adds nothing. gfx10 numbers lanes by the flat local
             # thread index (SV_GroupIndex) modulo the wave size, which is fixed only by the program, not by the
             # desktop wave width: a group of at most 32 threads is one wave of either size, a larger group needs
             # the wave32 statement. The mask must be uniform (a scalar word); exec is not read.
             half, dst = m[1], int(m[2])
-            mask, base = (alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:])
+            # exec_lo as the mask (the per-lane rank among active lanes) while the wave is full: every lane
+            # below the current one is active, so the mask is all ones. Inside an open guard exec is the
+            # lane compare and is refused; after the restore it is full again and accepted.
+            if m[3] == "exec_lo":
+                if guard is not None:
+                    raise ValueError("Active lane mask inside guarded region")
+                mask = 0xffffffff
+            else:
+                mask = alu_word(m[3], scalar, vector, pending, sizes)
+            base = alu_word(m[4], scalar, vector, pending, sizes)
             if (dst > 255 or mask is None or base is None
                     or (dims[0] * dims[1] * dims[2] > 32 and wave_size != 32)):
                 raise ValueError("Unverified lane count operand or wave size")

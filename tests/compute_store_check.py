@@ -1495,6 +1495,14 @@ def mbcnt_controls():
             variant(MBCNT, ("v4, -1, 0", "v4, s30, 0")), 64, **MBCNT_BINDING)
     rejects("Unverified lane count operand", aot.lower,
             variant(MBCNT, ("v5, 0x5a5a5a5a, 7", "v5, 0x5a5a5a5a, v40")), 64, **MBCNT_BINDING)
+    # exec_lo is the full mask once a guard has been restored, but not while the guard is open.
+    join_binding = GUARD_BINDING | dict(stride=8)
+    restored = variant(GUARD_JOIN, ("v_mov_b32_e32 v1, 0x600d", "v_mbcnt_lo_u32_b32 v1, exec_lo, 0"))
+    assert "countbits(0xffffffffu" in aot.lower(restored, 32, **join_binding)
+    rejects("Active lane mask inside guarded region", aot.lower,
+            variant(GUARD_JOIN, ("buffer_store_dword v0, v0, s[4:7], 0 idxen",
+                                 "v_mbcnt_lo_u32_b32 v1, exec_lo, 0\nbuffer_store_dword v0, v0, s[4:7], 0 idxen")),
+            32, **join_binding)
 
 
 def mbcnt_binary(directory, assembler, objcopy, library):

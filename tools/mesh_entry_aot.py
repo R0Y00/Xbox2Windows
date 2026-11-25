@@ -12,6 +12,7 @@ import re
 import struct
 from pathlib import Path
 
+from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
 from pixel_aot import MESH_WAVE64, container_code, disassemble
 from resource_inventory import parts
 
@@ -149,6 +150,8 @@ class Wave:
         self.indices = {}
         self.m0 = None
         self.written = set()
+        # Position exports per vertex in program order: (target, values, done).
+        self.position_exports = {}
 
     def scalar(self, t, allow_undef=False):
         if t.startswith("s["):
@@ -837,10 +840,11 @@ class Wave:
             elif op in ("ds_write_b32", "ds_read_b32"):
                 self.lds_op(op, tail)
             elif op == "exp":
-                m = re.fullmatch(r"(prim|pos0|param0),? (.+?)( done)?", tail)
+                m = re.fullmatch(r"(prim|pos[0-3]|param0),? (.+?)( done)?", tail)
                 if not m:
                     raise ValueError("Unsupported mesh export")
-                if not m[3] and m[1] != "param0":
+                # A position export may leave done to a later clip or cull distance export.
+                if not m[3] and m[1] == "prim":
                     raise ValueError("Expected completed primitive or position export")
                 operands = m[2].split(", ")
                 for lane in range(64):
@@ -858,6 +862,10 @@ class Wave:
                         if i in self.positions:
                             raise ValueError("Duplicate position")
                         self.positions[i] = [self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], None, bool(m[3])))
+                    elif m[1].startswith("pos") and len(operands) == 4:
+                        values = [None if t == "off" else self.lane_value(t, lane) for t in operands]
+                        self.position_exports.setdefault(i, []).append((m[1], values, bool(m[3])))
                     elif m[1] == "param0" and len(operands) == 4 and all(re.fullmatch(r"v\d+", t) for t in operands):
                         if i in self.attributes:
                             raise ValueError("Duplicate vertex attribute")
@@ -963,7 +971,8 @@ def emit_compute_draw(bindings, expressions, positions, indices, attributes):
     return "\n".join(lines) + "\n"
 
 
-def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False):
+def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
+    layout = None if vs_out_cntl is None else decode_vs_out_cntl(vs_out_cntl)
     if vertex_header is not None and (
         type(vertex_header) != int or not 0 <= vertex_header <= U32
     ):
@@ -1002,6 +1011,9 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         or any(max(tri) >= nv for tri in idx.values())
     ):
         raise ValueError("Conflicting mesh counts, vertices or primitive indices")
+    distances = vertex_distances(waves[0].position_exports | waves[1].position_exports, layout)
+    if compute_fallback and layout and layout.vectors:
+        raise ValueError("The compute fallback has no room for clip or cull distances")
     bindings = [
         "cbuffer Points : register(b0) { float4 pointData[32]; };",
         "cbuffer Matrices : register(b1) { float4 matrixData[32]; };",
@@ -1015,7 +1027,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         "#ifdef TRACE_EXPORTS",
         "RWByteAddressBuffer trace : register(u0);",
         "#endif",
-        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "") + "};",
+        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "")
+        + hlsl_fields(layout) + "};",
         '[outputtopology("triangle")]',
         f"[numthreads(128,1,1)] void main(uint id:SV_GroupIndex, out vertices Vertex v[{nv}], out indices uint3 p[{np}]) {{",
         f"  SetMeshOutputCounts({nv},{np});",
@@ -1034,6 +1047,8 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         )
         if attributes:
             lines.append(f"  if(id=={i}) v[{i}].attr={float4(attributes[i])};")
+        if i in distances:
+            lines.append(f"  if(id=={i}) {{ {hlsl_writes(f'v[{i}]', distances[i])} }}")
     for i, tri in idx.items():
         lines.extend(
             [
@@ -1106,9 +1121,10 @@ def decode_mesh(blob, library):
     return disassemble(code, library, offsets=True, features=MESH_WAVE64), limits
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
     decoded, limits = decode_mesh(blob, library)
-    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback,
+                 vs_out_cntl=vs_out_cntl)
 
 
 if __name__ == "__main__":
@@ -1126,6 +1142,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Emit SM 6.0 compute (main) and vertex (vertex_main) entry points",
     )
+    p.add_argument(
+        "--pa-cl-vs-out-cntl",
+        type=lambda s: int(s, 0),
+        help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2",
+    )
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
     if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
@@ -1139,6 +1160,7 @@ if __name__ == "__main__":
         a.llvm,
         a.vertex_header,
         compute_fallback=a.compute_fallback,
+        vs_out_cntl=a.pa_cl_vs_out_cntl,
     )
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_text(src, encoding="ascii")

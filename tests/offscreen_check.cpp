@@ -1228,6 +1228,18 @@ OperationResult run_startup_sampler_x(const OperationContext& ctx)
                          "skip: R32_FLOAT does not report filtered sampling with mips");
 }
 
+// --startup-sampler-lod[-dropped]: sampler heap entries that differ only in word 1 LOD limits, decoded by
+// the startup stand-in (tests/startup_sampler_lod.cpp). The dropped control must read the wrong mips.
+template<bool DropClamp>
+OperationResult run_startup_sampler_lod(const OperationContext& ctx)
+{
+    const int result = check_startup_sampler_lod(ctx.device, DropClamp);
+    if (result == 77) return {OutcomeKind::skip, "skip: R32_FLOAT does not report sampling, comparison, mips and render target"};
+    if (result) return {OutcomeKind::fail, DropClamp ? "dropped LOD clamp did not read the expected wrong mips"
+                                                     : "sampler LOD readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-sampler-heap <vs.cso> <ps.cso> <byte offset> <expected red bits>: draws one pixel with a
 // gfx2hlsl pixel shader that indexes its sampler table at run time (tests/startup_sampler_heap.cpp).
 OperationResult run_startup_sampler_heap(const OperationContext& ctx)
@@ -1646,6 +1658,8 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-sampler-lod", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<false>},
+    {"--startup-sampler-lod-dropped", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<true>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
     {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-range-provenance", 3, 3, nullptr, kNoGate, run_startup_range_provenance},

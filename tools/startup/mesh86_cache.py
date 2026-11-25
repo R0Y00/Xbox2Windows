@@ -2,7 +2,9 @@
 
 import argparse
 from pathlib import Path
+import re
 import struct
+import subprocess
 import sys
 import tempfile
 
@@ -71,7 +73,52 @@ def load_request(cache, key):
     return ms, ps, root, stream
 
 
-def publish(cache, key, ms_path, ps_path):
+_MESH_SRV_HANDLE = re.compile(
+    r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle'
+    r'\(i32 57, i8 0, i32 0, i32 0, i1 false\)')
+_MESH_SRV_LOAD = re.compile(
+    r'%\d+ = call %dx\.types\.ResRet\.i32 @dx\.op\.rawBufferLoad\.i32'
+    r'\(i32 139, %dx\.types\.Handle (%\d+), i32 0, i32 undef, i8 1, i32 4\)')
+_MESH_OUTPUT_OPS = frozenset(('setMeshOutputCounts', 'storeVertexOutput.f32',
+                              'storeVertexOutput.i32', 'emitIndices'))
+_PIXEL_IO_OPS = frozenset(('loadInput.i32', 'loadInput.f32', 'storeOutput.i32', 'storeOutput.f32'))
+
+
+def _dxil_calls(dump):
+    for line in dump.splitlines():
+        instruction = line.partition(';')[0].strip()
+        if re.search(r'\b(call|invoke|callbr)\b', instruction):
+            match = re.fullmatch(r'(?:(?:%\d+ = )?call \S+ @dx\.op\.([\w.]+)\(.*\))', instruction)
+            if not match:
+                raise ValueError('unexpected call in the single-DWORD mesh SRV profile')
+            yield match[1], instruction
+
+
+def prove_mesh_root_srv(mesh_dump, pixel_dump):
+    # Require a single raw SRV, range ID 0, register t0, space 0 and count 1.
+    # The byte width comes from the actual constant-offset DXIL load, not the
+    # root signature or a user-supplied span.
+    table = re.search(r'^; Resource Bindings:\n;\n; Name[^\n]*\n; [- ]+\n((?:; [^\n]+\n)*)',
+                      mesh_dump, re.MULTILINE)
+    rows = [line[1:].split()[1:] for line in table[1].splitlines() if line[1:].strip()] if table else []
+    if rows != [['texture', 'byte', 'r/o', 'T0', 't0', '1']]:
+        raise ValueError('expected exactly one non-array raw SRV at t0 space0')
+    handles, loads = [], []
+    for op, instruction in _dxil_calls(mesh_dump):
+        if op == 'createHandle' and (match := _MESH_SRV_HANDLE.fullmatch(instruction)):
+            handles.append(match[1])
+        elif op == 'rawBufferLoad.i32' and (match := _MESH_SRV_LOAD.fullmatch(instruction)):
+            loads.append(match[1])
+        elif op not in _MESH_OUTPUT_OPS:
+            raise ValueError(f'unsupported DXIL operation for the single-DWORD mesh SRV profile: {op}')
+    if len(handles) != 1 or loads != handles:
+        raise ValueError('expected one DWORD load from the verified SRV handle')
+    if any(op not in _PIXEL_IO_OPS for op, _ in _dxil_calls(pixel_dump)):
+        raise ValueError('pixel stage must not access resources in the mesh SRV profile')
+    return 4
+
+
+def publish(cache, key, ms_path, ps_path, *, srv_dxc=None):
     _, ps_source, _, _ = load_request(cache, key)
     if bool(ps_source) != bool(ps_path):
         raise ValueError('desktop pixel-stage presence must match the input stream')
@@ -84,12 +131,23 @@ def publish(cache, key, ms_path, ps_path):
         raise ValueError('desktop shader exceeds the runtime size bound')
     stem = cache / f'{key:016x}'
     ready = stem.with_suffix('.mesh86.txt')
-    manifest = f'x2w-mesh86 1 {key:016x} {fnv(ms):016x} {(fnv(ps) if ps else 0):016x}\n'
+    hashes = f'{key:016x} {fnv(ms):016x} {(fnv(ps) if ps else 0):016x}'
+    manifest = f'x2w-mesh86 1 {hashes}\n'
     with tempfile.TemporaryDirectory(prefix='.mesh86-', dir=cache) as temp:
         work = Path(temp)
         (work / 'ms').write_bytes(ms)
         if ps:
             (work / 'ps').write_bytes(ps)
+        if srv_dxc:
+            if not ps:
+                raise ValueError('the mesh SRV profile requires a pixel stage')
+            # Dump the very bytes that will be published, including when the
+            # original shader paths change concurrently.
+            dumps = [subprocess.run([srv_dxc, '-dumpbin', work / stage], check=True,
+                                    capture_output=True, text=True, encoding='utf-8').stdout
+                     for stage in ('ms', 'ps')]
+            extent = prove_mesh_root_srv(*dumps)
+            manifest = f'x2w-mesh86 2 {hashes} srv 0 0 {extent}\n'
         (work / 'marker').write_bytes(manifest.encode('ascii'))
         ready.unlink(missing_ok=True)
         (work / 'ms').replace(stem.with_suffix('.ms.cso'))
@@ -104,17 +162,19 @@ def main():
     parser.add_argument('key', type=lambda text: int(text, 16))
     parser.add_argument('--mesh', type=Path, help='desktop MS DXIL verified against the captured input')
     parser.add_argument('--pixel', type=Path, help='desktop PS DXIL when the captured input has a pixel stage')
+    parser.add_argument('--prove-root-srv', type=Path, metavar='DXC',
+                        help='use DXC to verify the bounded single-DWORD mesh root SRV profile')
     args = parser.parse_args()
     try:
         if args.mesh:
-            publish(args.cache, args.key, args.mesh, args.pixel)
+            publish(args.cache, args.key, args.mesh, args.pixel, srv_dxc=args.prove_root_srv)
             print(f'{args.key:016x}: published desktop stages')
         else:
-            if args.pixel:
-                raise ValueError('--pixel requires --mesh')
+            if args.pixel or args.prove_root_srv:
+                raise ValueError('--pixel and --prove-root-srv require --mesh')
             ms, ps, root, stream = load_request(args.cache, args.key)
             print(f'{args.key:016x}: MS {len(ms)}, PS {len(ps)}, root {len(root)}, stream {len(stream)} bytes')
-    except (ValueError, OSError, struct.error) as error:
+    except (ValueError, OSError, struct.error, subprocess.CalledProcessError) as error:
         parser.exit(1, f'{error}\n')
 
 
