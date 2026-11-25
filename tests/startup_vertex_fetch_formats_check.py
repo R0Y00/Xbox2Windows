@@ -311,12 +311,28 @@ def controls():
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
     from disasm_rdna2 import MTBUF_FORMATS
     assert gfx2hlsl.DESC_FORMAT_CODES.keys() == gfx2hlsl.FETCH_FORMATS.keys()
+    def table_matches(table):
+        for name, (code, *_rest) in FORMATS.items():
+            if code == 1:  # the omitted tbuffer format: LLVM prints nothing, the disassembler has no name for it
+                if code in table or name != 'BUF_FMT_8_UNORM':
+                    return False
+            elif table.get(code) != name:
+                return False
+        return True
     for name, (code, *_rest) in FORMATS.items():
         assert gfx2hlsl.DESC_FORMAT_CODES[name] == code, name
-        assert MTBUF_FORMATS.get(code, 'BUF_FMT_8_UNORM') == name, name
+    assert table_matches(MTBUF_FORMATS)
+    swapped = dict(MTBUF_FORMATS)  # a wrong format name for one code must be caught
+    victim = next(c for n, (c, *_r) in FORMATS.items() if c != 1)
+    swapped[victim] = 'BUF_FMT_INVALID'
+    assert not table_matches(swapped), 'format mutation not caught'
+    assert not table_matches({**MTBUF_FORMATS, 1: 'BUF_FMT_8_UNORM'}), 'code 1 must stay the omitted default'
     for op, count in ((0, 1), (1, 2), (2, 3)):
         source = pipeline_mubuf(4, op).hlsl_vs()
         assert source.count('case ') == len(FORMATS), op
+        # An unvalidated FORMAT yields the NaN sentinel in every component, never silent zeros.
+        assert 'default: c0 = c1 = c2 = c3 = %du;' % gfx2hlsl.DESC_FORMAT_UNKNOWN in source, op
+        assert 'default: break' not in source, op
         written = {int(n) for n in re.findall(r'^\s*v(\d+) = ', source, re.M) if int(n) >= 4}
         assert written == set(range(4, 4 + count)), (op, written)
     try:
