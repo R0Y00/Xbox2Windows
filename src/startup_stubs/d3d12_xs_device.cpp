@@ -181,7 +181,6 @@ std::vector<DescriptorRange> descriptor_ranges;
 // API documents 1,048,576, but a driver may accept fewer (1,000,000 on the GTX 1660 SUPER here), so
 // the accepted maximum is measured once and cached rather than assumed.
 constexpr std::uint64_t view_heap_probe_floor = 65536;
-
 void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
 void request_translation(Wrapper* pipeline);
@@ -305,6 +304,21 @@ struct Timed {
         QueryPerformanceCounter(&end);
         InterlockedAdd64(&time_ticks[category], end.QuadPart - start.QuadPart);
         InterlockedIncrement64(&time_calls[category]);
+    }
+};
+// Per-slot tick, call and census counters of a command-list slot, recorded when it goes out of scope (slot < 0: none).
+struct ListSlotTimed {
+    int slot;
+    LARGE_INTEGER start;
+    explicit ListSlotTimed(int n) : slot(n) { QueryPerformanceCounter(&start); }
+    ~ListSlotTimed()
+    {
+        if (slot < 0) return;
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        InterlockedAdd64(&list_slot_ticks[slot], end.QuadPart - start.QuadPart);
+        InterlockedIncrement64(&list_slot_calls[slot]);
+        InterlockedIncrement64(&list_slot_census[slot]);
     }
 };
 
@@ -521,20 +535,7 @@ template <int K, int N>
 __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
 {
     Timed timed(K == list_kind ? time_list : K == queue_kind ? time_queue : time_device_noop);
-    struct SlotTimed {
-        LARGE_INTEGER start;
-        SlotTimed() { QueryPerformanceCounter(&start); }
-        ~SlotTimed()
-        {
-            LARGE_INTEGER end;
-            QueryPerformanceCounter(&end);
-            if (K == list_kind) {
-                InterlockedAdd64(&list_slot_ticks[N & 255], end.QuadPart - start.QuadPart);
-                InterlockedIncrement64(&list_slot_calls[N & 255]);
-                InterlockedIncrement64(&list_slot_census[N & 255]);
-            }
-        }
-    } slot_timed;
+    ListSlotTimed slot_timed(K == list_kind ? N & 255 : -1);
     if (K == list_kind) InterlockedIncrement(&draw_calls_seen);
     if (K == list_kind && capture_active) {
         const u64 stack[4] = {s0, s1, s2, s3};
@@ -2582,8 +2583,9 @@ static_assert(x2w_clear_depth::clear_depth == D3D12_CLEAR_FLAG_DEPTH && x2w_clea
 void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float depth, UINT stencil, UINT rect_count,
                                 const D3D12_RECT* rects)
 {
-    InterlockedIncrement64(&list_slot_calls[51]);
-    InterlockedIncrement64(&list_slot_census[51]);
+    // The table calls this entry directly, so it keeps the timing noop_slot would have recorded for slot 51.
+    Timed timed(time_list);
+    ListSlotTimed slot_timed(51);
     InterlockedIncrement(&draw_calls_seen);
     auto* list = recording(self);
     if (!list) return;
@@ -2620,10 +2622,15 @@ void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float dep
             log("x2w-d3d12 ClearDepthStencilView refused: %s (flags 0x%x, depth %.3f)", x2w_clear_depth::reason(plan.verdict), flags, depth);
         return;
     }
+    // The clear needs DEPTH_WRITE; a texture still bound through a read-only view goes back to its read state after it.
+    D3D12_RESOURCE_STATES bound_read = D3D12_RESOURCE_STATE_COMMON;
+    for (const auto& known : pass_of(self).states)
+        if (known.first == target && (known.second & D3D12_RESOURCE_STATE_DEPTH_READ)) bound_read = known.second;
     require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)},
                                 static_cast<D3D12_CLEAR_FLAGS>(plan.flags), depth, static_cast<UINT8>(stencil), plan.rect_count,
                                 plan.rect_count ? rects : nullptr);
+    if (bound_read != D3D12_RESOURCE_STATE_COMMON) require_state(self, target, bound_read);
     InterlockedIncrement(&render_depth_clears);
     InterlockedIncrement(&render_clears);
 }
