@@ -271,6 +271,26 @@ presenter, its owned window and a dialog stay visible. Where the host lets the t
 it also checks that the foreground moves to the output window. A run under Wine did; the fixture prints
 which case applied.
 
+### Presented planes
+
+A console present (CommandQueue slot 32) carries a plane count and an array of plane records
+(`src/startup_stubs/present_planes.h`). Measured from the first presents: one record is 0x48 bytes,
+with +0x00 a frame token, +0x08 the resource count and +0x10 a pointer to the resource array. On the
+Series S profile a title presented two planes: plane 0 at 1920x1080 stayed black and plane 1 at
+3840x2160 held the picture, with alpha 255 wherever it drew. Showing plane 0 alone gave a black
+window. The output window now composites the planes bottom to top: the lowest shown plane opaque, each
+later one blended by its own alpha (`composite_steps`); planes the presenter cannot draw and repeats of
+a surface are left out. The plane whose surface is read back and reported is the topmost one. Why
+plane 0 stays black is not known. The first presents and every 300th log each plane:
+
+```text
+x2w-present frame <n> plane <i>/<count>: <width>x<height> format <f> flags=0x<flags>
+```
+
+`ctest --preset dev --no-tests=error -R '^startup_present_planes(_control)?$'` checks the record layout
+and the composite order; the control reads 0x40-byte records and composites plane 0 alone, and must
+print `FAIL:`.
+
 ## Null Texture2D descriptors
 
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
@@ -1352,6 +1372,8 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
+| `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
+| `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count) instead of compositing every plane. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
@@ -1383,6 +1405,36 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
+
+## Console profile
+
+`X2W_DEVICE_TYPE` answers the two registry reads a title makes of
+`HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM\ConsoleMode`
+(`src/startup_stubs/console_mode.h`, `registry_console_mode.inl`): with `X2W_RUNTIME_PROXY=1` the
+stand-in rewrites the registry imports of the EXE and package helpers. `6` answers 0x60 (Series S),
+`7` answers 0x64 (Series X) and `1` reports the value missing (PC); unset, every call goes to the real
+registry. Opening the key and reading the value are logged a few times either way. What the values
+mean on the console is taken from public notes, not measured here.
+`ctest --preset dev --no-tests=error -R '^startup_console_mode(_control)?$'` runs it against fake
+registry functions; the control leaves the switch unset for the answered cases and must print `FAIL:`.
+
+The Series S profile loads an upscaler package module that the other profiles do not. Three desktop
+refusals stopped it; the stand-in now avoids each:
+
+- `Device::slot76` (Xbox order) is desktop `CreateCommittedResource` with seven arguments (heap
+  properties, heap flags, desc, initial state, clear value, riid, ppv). It shares the committed-resource
+  path of slot 127.
+- A view description with `ViewDimension` 0 (UNKNOWN) makes desktop D3D12 remove the device. Measured:
+  the module makes such SRVs on 2D RGBA8 textures. Views of slots 18 to 21 with dimension 0 now get the
+  resource's default view (null description) where desktop allows one (not for buffers, typeless or
+  unknown formats, or depth formats in an SRV); otherwise the view is skipped and logged. A view whose
+  dimension does not fit the resource is skipped too (`src/startup_stubs/view_dimension.h`;
+  `ctest --preset dev --no-tests=error -R '^startup_view_dimension(_control)?$'`).
+- `R9G9B9E5_SHAREDEXP` textures with unordered access fail with `E_INVALIDARG`; the
+  [shared-exponent stand-in](#shared-exponent-render-and-unordered-access-targets) covers them.
+
+With these, a Series S profile run reaches the same scripted point as the Series X and PC profiles.
+That is a start-up milestone, not evidence that a title runs.
 
 ## D3D12 resource budget
 

@@ -46,6 +46,8 @@
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
+#include "startup_stubs/view_dimension.h"
+#include "startup_stubs/present_planes.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/rect_indirect_args.h"
 #include "startup_stubs/profile_zone.h"
@@ -866,8 +868,9 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     Kind kind = other_kind;
     if (SUCCEEDED(static_cast<HRESULT>(result)) && iid && out && *out) {
         kind = kind_for(*iid);
-        if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
+        if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN) {
             x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
+        }
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
         if constexpr (K == device_kind && N == 27) {
             if (kind == resource_kind && args[0])
@@ -1835,7 +1838,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     if (FAILED(readback->Map(0, &range, &mapped))) return;
     AcquireSRWLockExclusive(&shown_lock);
     shown_pixels.resize(shown_width * shown_height);
-    std::uint64_t sum = 0;
+    std::uint64_t sum = 0, alpha_sum = 0;
     for (int y = 0; y < shown_height; ++y) {
         const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                           static_cast<UINT64>(y) * desc.Height / shown_height * footprint.Footprint.RowPitch;
@@ -1844,6 +1847,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
             const unsigned r = rgba ? texel[0] : texel[2], g = texel[1], b = rgba ? texel[2] : texel[0];
             shown_pixels[y * shown_width + x] = (r << 16) | (g << 8) | b;
             sum += r + g + b;
+            alpha_sum += texel[3];
         }
     }
     ReleaseSRWLockExclusive(&shown_lock);
@@ -1876,8 +1880,9 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     const LONG count = InterlockedIncrement(&shown_frames);
-    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
-                  desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
+    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255, mean alpha %.2f/255",
+                  desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height),
+                  alpha_sum / (1.0 * shown_width * shown_height));
     if ((count > 0 && count <= 3) || count % 40 == 0) log("x2w-render presented %s", shown_note);
 }
 
@@ -4025,6 +4030,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                   described_bytes, title_dest, args[D], materialized);
     };
     const char* skip = nullptr;
+    bool default_view = false;
     if (N == 17) skip = "constant buffer view (title GPU address)";
     if (N >= 18 && N <= 21 && args[0]) {
         const UINT flags = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc().Flags;
@@ -4032,6 +4038,32 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) skip = "resource lacks unordered access";
         if (N == 20 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) skip = "resource lacks render target";
         if (N == 21 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) skip = "resource lacks depth stencil";
+        // Every view description of slots 18-21 starts with Format, then ViewDimension.
+        const u64 described = N == 19 ? args[2] : args[1];
+        UINT view_dimension = 0;
+        if (!skip && described && x2w_local::readable(reinterpret_cast<const void*>(described), 8)) {
+            std::memcpy(&view_dimension, reinterpret_cast<const unsigned char*>(described) + 4, sizeof(view_dimension));
+            const D3D12_RESOURCE_DESC resource_desc = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
+            const auto dimension = static_cast<unsigned>(resource_desc.Dimension);
+            if (view_dimension == 0) {
+                // UNKNOWN: desktop refuses it; make the resource's default view where that is allowed.
+                if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format)))
+                    default_view = true;
+                else
+                    skip = "unknown view dimension, and the resource has no default view";
+                static LONG unknown_dimension;
+                if (first_calls(unknown_dimension, 6))
+                    log("x2w-d3d12 Device::slot%d view dimension 0 (unknown), view format %u, resource dim=%u fmt=%d -> %s", N,
+                        *reinterpret_cast<const UINT*>(described), dimension, resource_desc.Format,
+                        default_view ? "default view" : "skipped");
+            } else if (!x2w_view_dimension::fits(N, view_dimension, dimension)) {
+                skip = "view dimension does not suit the resource";
+                static LONG mismatched;
+                if (first_calls(mismatched, 6))
+                    log("x2w-d3d12 Device::slot%d view dimension %u needs resource dimension %u, resource has %u", N, view_dimension,
+                        x2w_view_dimension::needed(N, view_dimension), dimension);
+            }
+        }
     }
     if (skip) {
         record_view(false);
@@ -4084,6 +4116,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                 *reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(b), null_rtv))
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
+    if (default_view) args[desc_index] = 0;
+    const LONG removed_before = removal_reported;
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
     // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
     // may keep the resource: on failure the slot is recorded unmaterialized, which releases the slot's previous view
@@ -4100,6 +4134,19 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     if ((N == 20 || N == 21) && args[0] && created)
         note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]), N);
     check_device("Device view", N);
+    if (!removed_before && removal_reported && N >= 18 && N <= 21) {
+        // The view that removed the device: its forwarded description and the resource's shape.
+        char bytes[3 * 40 + 1] = {};
+        const u64 described = args[desc_index];
+        if (described) hex_text(reinterpret_cast<const void*>(described), 40, bytes, sizeof(bytes));
+        log("x2w-d3d12 Device::slot%d removing view desc %s", N, described ? bytes : "(null)");
+        if (args[0]) {
+            const D3D12_RESOURCE_DESC rd = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
+            log("x2w-d3d12 Device::slot%d removing view resource: dim=%d %llux%u depth/array=%u mips=%u fmt=%d samples=%u flags=0x%x", N,
+                rd.Dimension, static_cast<unsigned long long>(rd.Width), rd.Height, rd.DepthOrArraySize, rd.MipLevels, rd.Format,
+                rd.SampleDesc.Count, static_cast<UINT>(rd.Flags));
+        }
+    }
     static LONG calls;
     if (first_calls(calls))
         log("x2w-d3d12 Device::slot%d view(0x%llx, 0x%llx, 0x%llx, 0x%llx) dest 0x%llx -> 0x%llx", N, a, b, c, d,
@@ -5517,10 +5564,10 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
 // COMMON, GENERIC_READ on an upload heap and COPY_DEST on a readback heap (the initial states D3D12
 // requires there; the Windows 10 runtime refuses COMMON with E_INVALIDARG). When desktop rejects the
 // clear value it is retried without one.
-HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
-                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
-                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
-                                            void** out)
+// Slot 76 shares the work with the slot number in the log line.
+HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                         const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear, void* session,
+                         UINT castable_count, const void* castable, const GUID* iid, void** out)
 {
     char text[48];
     guid_text(iid, text, sizeof(text));
@@ -5529,7 +5576,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     const D3D12_RESOURCE_DESC copy = sanitized(*desc);
     const auto flags = static_cast<D3D12_HEAP_FLAGS>(heap_flags);
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(0, 1, &copy);
-    check_device("Device before slot", 127);
+    check_device("Device before slot", slot);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
     ID3D12Resource* resource = nullptr;
     const D3D12_RESOURCE_STATES initial = props->Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
@@ -5547,8 +5594,9 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     }
     static LONG calls;
     if (first_calls(calls, 12))
-        log("x2w-d3d12 Device::slot127(CreateCommittedResource3?) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
-            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", props->Type, heap_flags, desc->Dimension,
+        log("x2w-d3d12 Device::slot%d(%s) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
+            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", slot,
+            slot == 76 ? "CreateCommittedResource" : "CreateCommittedResource3?", props->Type, heap_flags, desc->Dimension,
             desc->Width, desc->Height, desc->Format, desc->Flags, state, static_cast<const void*>(clear),
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
@@ -5560,6 +5608,25 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     note_resource(w, desc, info.SizeInBytes != ~0ull ? info.SizeInBytes : 0);
     *out = w;
     return S_OK;
+}
+
+HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
+                                            void** out)
+{
+    return create_committed(127, self, props, heap_flags, desc, state, clear, session, castable_count, castable, iid, out);
+}
+
+// Device slot 76 (Xbox order, +0x260): the seven arguments of desktop CreateCommittedResource
+// (heap properties, heap flags, desc, initial state, clear value, riid, ppv). Seen from an upscaler
+// package module that runs only on the lower-resolution console profile (X2W_DEVICE_TYPE=6).
+// Same desktop creation as slot 127.
+HRESULT __stdcall device_create_committed(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                          const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                          const GUID* iid, void** out)
+{
+    return create_committed(76, self, props, heap_flags, desc, state, clear, nullptr, 0, nullptr, iid, out);
 }
 
 // Device slot 80 (Xbox order): (type, timeout, 0, flags, &token) -> HRESULT, the frame-event wait
@@ -5754,6 +5821,63 @@ void report_budget(ID3D12CommandQueue* queue)
 
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
+// The planes of a present, resolved to real resources the window presenter can draw.
+// X2W_PRESENT_PLANE=<n> (diagnostic) keeps plane n alone (plane 0 when n is past the count);
+// otherwise every plane is kept and the window composites them (present_planes.h).
+struct PresentedPlanes {
+    Wrapper* surfaces[window_planes] = {};
+    x2w_startup::PlaneStep steps[window_planes];
+    unsigned count = 0;  // composite steps
+    // The topmost composited plane's surface (the one shown and read back for diagnostics).
+    Wrapper* top() const { return count ? surfaces[steps[count - 1].plane] : nullptr; }
+};
+PresentedPlanes presented_planes(UINT planes, const void* plane_parameters)
+{
+    static const long wanted = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_PRESENT_PLANE", value, sizeof(value)) ? std::atol(value) : -1L;
+    }();
+    const auto readable = [](const void* address, std::size_t bytes) { return x2w_local::readable(address, bytes); };
+    PresentedPlanes out;
+    std::uint64_t shown[window_planes] = {};
+    const unsigned total = planes < window_planes ? planes : window_planes;
+    const unsigned only = wanted >= 0 ? (static_cast<unsigned long>(wanted) < planes ? static_cast<unsigned>(wanted) : 0u) : ~0u;
+    for (unsigned i = 0; i < total; ++i) {
+        if (only != ~0u && i != only) continue;
+        const std::uint64_t resource = x2w_startup::present_plane_resource(plane_parameters, planes, i, readable);
+        Wrapper* const surface = resource ? as_wrapper(reinterpret_cast<void*>(resource)) : nullptr;
+        if (!surface || surface->own().kind != resource_kind || !surface->own().real) continue;
+        out.surfaces[i] = surface;
+        if (presentable_surface(static_cast<ID3D12Resource*>(surface->own().real))) shown[i] = resource;
+    }
+    out.count = x2w_startup::composite_steps(shown, total, out.steps, window_planes);
+    // A known surface the window cannot draw is still the one reported and read back.
+    if (!out.count)
+        for (unsigned i = 0; i < total && !out.count; ++i)
+            if (out.surfaces[i]) out.steps[out.count++] = x2w_startup::PlaneStep{i, false};
+    return out;
+}
+
+// The first presents and every 300th: each plane's first resource and its shape.
+void log_present_planes(LONG frame, UINT planes, const void* plane_parameters)
+{
+    if (frame > 2 && frame % 300 != 0) return;
+    static LONG lines;
+    if (!first_calls(lines, 24)) return;
+    const auto readable = [](const void* address, std::size_t bytes) { return x2w_local::readable(address, bytes); };
+    for (unsigned i = 0; i < planes && i < 4; ++i) {
+        const std::uint64_t resource = x2w_startup::present_plane_resource(plane_parameters, planes, i, readable);
+        Wrapper* const surface = resource ? as_wrapper(reinterpret_cast<void*>(resource)) : nullptr;
+        if (!surface || surface->own().kind != resource_kind || !surface->own().real) {
+            log("x2w-present frame %ld plane %u/%u: resource %p is not a known resource", frame, i, planes, reinterpret_cast<void*>(resource));
+            continue;
+        }
+        const D3D12_RESOURCE_DESC desc = static_cast<ID3D12Resource*>(surface->own().real)->GetDesc();
+        log("x2w-present frame %ld plane %u/%u: %llux%u format %d flags=0x%x", frame, i, planes,
+            static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, static_cast<UINT>(desc.Flags));
+    }
+}
+
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
 {
     // First, before anything reads or copies the surface: a presented resource keeps its old lifetime.
@@ -5787,17 +5911,27 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
     }
     bool shown_in_window = false;
+    log_present_planes(frame, planes, plane_parameters);
+    const PresentedPlanes presented = presented_planes(planes, plane_parameters);
     {
-        Wrapper* surface = nullptr;
-        const auto* words = static_cast<const u64*>(plane_parameters);
-        if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
-            surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
+        Wrapper* const surface = presented.top();
         capture::present(frame, surface);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
-        // Render mode: the presented surface goes to the title's window through a swap chain.
-        if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
-            shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        // Render mode: the presented planes go to the output window through a swap chain.
+        if (render_mode() && surface) {
+            ID3D12Resource* drawn[window_planes] = {};
+            bool blended[window_planes] = {};
+            UINT drawn_count = 0;
+            for (unsigned i = 0; i < presented.count; ++i) {
+                auto* const resource = static_cast<ID3D12Resource*>(presented.surfaces[presented.steps[i].plane]->own().real);
+                if (!presentable_surface(resource)) continue;
+                blended[drawn_count] = presented.steps[i].blended;
+                drawn[drawn_count++] = resource;
+            }
+            if (drawn_count)
+                shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), drawn, blended, drawn_count);
+        }
         InterlockedExchange(&last_frame_shown, shown_in_window ? 1 : 0);
         if (render_mode()) present_signature(self, surface, frame);
     }
@@ -5810,16 +5944,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
     }
     if (render_mode() && frame % (shown_in_window ? 60 : 6) == 0 && planes && plane_parameters) {
-        // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
-        const auto* words = static_cast<const u64*>(plane_parameters);
-        if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
-            Wrapper* surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
-            if (surface && surface->own().kind == resource_kind && surface->own().real)
-                read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
-            else
-                std::snprintf(shown_note, sizeof(shown_note), "presented object %p is not a known resource",
-                              *reinterpret_cast<void* const*>(words[2]));
-        }
+        // Plane records: present_planes.h.
+        Wrapper* const surface = presented.top();
+        if (surface)
+            read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        else
+            std::snprintf(shown_note, sizeof(shown_note), "presented plane has no known resource");
     }
     if (shown_in_window) {
         if (frame % 30 == 0) {
@@ -6012,6 +6142,7 @@ void build_tables()
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
     tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
+    tables[device_kind][76] = reinterpret_cast<void*>(&device_create_committed);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
     tables[device_kind][80] = reinterpret_cast<void*>(&device_wait_frame_event);

@@ -2,8 +2,8 @@
 // Included inside d3d12_xs_device.cpp's anonymous namespace, before queue_present.
 //
 // A flip-model swap chain on the title window, created on the queue the title presents with; each
-// present draws the presented surface into the back buffer with a full-window triangle (the surface
-// is usually larger than the window) and flips. Diagnostics go to the window title, because GDI
+// present draws the presented planes into the back buffer, bottom to top (present_planes.h), each
+// with a full-window triangle (a surface is usually larger than the window), and flips. Diagnostics go to the window title, because GDI
 // drawing does not mix with a flip-model swap chain.
 
 struct WindowPresenter {
@@ -14,13 +14,15 @@ struct WindowPresenter {
     ID3D12CommandAllocator* allocator = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12RootSignature* root = nullptr;
-    ID3D12PipelineState* pipeline = nullptr;
+    ID3D12PipelineState* pipeline = nullptr;        // the bottom plane, opaque
+    ID3D12PipelineState* blend_pipeline = nullptr;  // later planes, over it by their alpha
     ID3D12Fence* fence = nullptr;
     HANDLE reached = nullptr;
     UINT64 fence_value = 0;
     UINT width = 0, height = 0;
     bool failed = false;
 };
+constexpr UINT window_planes = 4;
 WindowPresenter window_presenter;
 LONG window_presents;
 
@@ -124,7 +126,7 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
     if (chain1) chain1->Release();
     if (factory) factory->Release();
     const D3D12_DESCRIPTOR_HEAP_DESC target_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-    const D3D12_DESCRIPTOR_HEAP_DESC texture_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC texture_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, window_planes, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&target_heap, IID_PPV_ARGS(&p.targets));
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&texture_heap, IID_PPV_ARGS(&p.textures));
     const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -142,12 +144,15 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
         "Texture2D<float4> surface : register(t0); SamplerState smooth : register(s0);\n"
         "struct V { float4 position : SV_Position; float2 uv : TEXCOORD0; };\n"
         "V vs(uint id : SV_VertexID) { V o; o.uv = float2((id << 1) & 2, id & 2); o.position = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
-        "float4 ps(V i) : SV_Target0 { return float4(surface.Sample(smooth, i.uv).rgb, 1); }\n";
+        "float4 ps(V i) : SV_Target0 { return float4(surface.Sample(smooth, i.uv).rgb, 1); }\n"
+        "float4 ps_over(V i) : SV_Target0 { return surface.Sample(smooth, i.uv); }\n";
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
+    ID3DBlob* ps_over = nullptr;
     ID3DBlob* blob = nullptr;
     if (SUCCEEDED(hr)) hr = D3DCompile(source, sizeof(source) - 1, "present", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, nullptr);
     if (SUCCEEDED(hr)) hr = D3DCompile(source, sizeof(source) - 1, "present", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, nullptr);
+    if (SUCCEEDED(hr)) hr = D3DCompile(source, sizeof(source) - 1, "present", nullptr, nullptr, "ps_over", "ps_5_0", 0, 0, &ps_over, nullptr);
     if (SUCCEEDED(hr)) {
         const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER parameter{};
@@ -177,29 +182,50 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
         desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
         hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&p.pipeline));
+        if (SUCCEEDED(hr)) {
+            desc.PS = {ps_over->GetBufferPointer(), ps_over->GetBufferSize()};
+            D3D12_RENDER_TARGET_BLEND_DESC& blend = desc.BlendState.RenderTarget[0];
+            blend.BlendEnable = TRUE;
+            blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOp = D3D12_BLEND_OP_ADD;
+            blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&p.blend_pipeline));
+        }
     }
     if (vs) vs->Release();
     if (ps) ps->Release();
+    if (ps_over) ps_over->Release();
     if (blob) blob->Release();
     log("x2w-present window swap chain %ux%u -> 0x%08lx", p.width, p.height, static_cast<unsigned long>(hr));
     check_device("window presenter", 0);
     return SUCCEEDED(hr);
 }
 
-// Draws `surface` (resting in COMMON) into the window and flips. Returns false if not shown.
-bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
+// Whether the window presenter can draw `surface` (present_view_format.h); logs the first refusals.
+bool presentable_surface(ID3D12Resource* surface)
+{
+    if (!surface) return false;
+    const D3D12_RESOURCE_DESC desc = surface->GetDesc();
+    if (x2w_startup::present_surface_supported(desc)) return true;
+    static LONG refused;
+    if (first_calls(refused, 4))
+        log("x2w-present surface dim=%d samples=%u flags=0x%x format=%d not supported (present_view_format.h)",
+            desc.Dimension, desc.SampleDesc.Count, desc.Flags, desc.Format);
+    return false;
+}
+
+// Draws `count` surfaces (each resting in COMMON and presentable) into the window, in order: the
+// first replaces the back buffer, each later one with blended[i] set is drawn over it by its alpha
+// (present_planes.h composite_steps), then flips. Returns false if not shown.
+bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* const* surfaces, const bool* blended, UINT count)
 {
     X2W_ZONE("window present (blit + fence wait)");
     WindowPresenter& p = window_presenter;
-    if (p.failed || !queue || !surface) return false;
-    const D3D12_RESOURCE_DESC desc = surface->GetDesc();
-    if (!x2w_startup::present_surface_supported(desc)) {
-        static LONG refused;
-        if (first_calls(refused, 4))
-            log("x2w-present surface dim=%d samples=%u flags=0x%x format=%d not supported (present_view_format.h)",
-                desc.Dimension, desc.SampleDesc.Count, desc.Flags, desc.Format);
-        return false;
-    }
+    if (p.failed || !queue || !surfaces || !count) return false;
+    if (count > window_planes) count = window_planes;
     HWND window = output_window();
     if (!window) return false;
     if (!p.chain && !create_window_presenter(queue, window)) {
@@ -207,31 +233,39 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
         return false;
     }
     ID3D12Device* device = device_of(the_device);
-    const DXGI_FORMAT view_format = x2w_startup::present_view_format(desc.Format);
-    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    view.Format = view_format;
-    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(surface, &view, p.textures->GetCPUDescriptorHandleForHeapStart());
+    const UINT texture_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (UINT i = 0; i < count; ++i) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = x2w_startup::present_view_format(surfaces[i]->GetDesc().Format);
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(surfaces[i], &view,
+                                         D3D12_CPU_DESCRIPTOR_HANDLE{p.textures->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{i} * texture_step});
+    }
     const UINT index = p.chain->GetCurrentBackBufferIndex();
     const D3D12_CPU_DESCRIPTOR_HANDLE target{p.targets->GetCPUDescriptorHandleForHeapStart().ptr +
                                              SIZE_T{index} * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
     if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator, p.pipeline))) return false;
-    transition(p.list, surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    for (UINT i = 0; i < count; ++i)
+        transition(p.list, surfaces[i], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(p.width), static_cast<float>(p.height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(p.width), static_cast<LONG>(p.height)};
     p.list->SetGraphicsRootSignature(p.root);
     p.list->SetDescriptorHeaps(1, &p.textures);
-    p.list->SetGraphicsRootDescriptorTable(0, p.textures->GetGPUDescriptorHandleForHeapStart());
     p.list->RSSetViewports(1, &viewport);
     p.list->RSSetScissorRects(1, &scissor);
     p.list->OMSetRenderTargets(1, &target, FALSE, nullptr);
     p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    p.list->DrawInstanced(3, 1, 0, 0);
+    for (UINT i = 0; i < count; ++i) {
+        p.list->SetPipelineState(i && blended[i] ? p.blend_pipeline : p.pipeline);
+        p.list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{p.textures->GetGPUDescriptorHandleForHeapStart().ptr + UINT64{i} * texture_step});
+        p.list->DrawInstanced(3, 1, 0, 0);
+    }
     transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    transition(p.list, surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    for (UINT i = 0; i < count; ++i)
+        transition(p.list, surfaces[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     if (FAILED(p.list->Close())) {
         p.failed = true;
         return false;
