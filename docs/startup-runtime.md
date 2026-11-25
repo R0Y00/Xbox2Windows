@@ -103,7 +103,11 @@ the registers the routine loaded. The routine's code is not in the shader contai
 
 The stand-in reads the `INPUT_LAYOUT` subobject and publishes it next to the request as `req_<key>.ia`, before
 `.a`. The file holds `ia1 <count>` and then one line per element: semantic, index, format, slot, offset, class
-and step rate. A stream with a non-empty layout includes that text in its cache key; other keys are unchanged.
+and step rate. A stream with a layout that is present, including one declared with zero elements, includes that text in its cache key;
+streams without a readable layout publish nothing and their keys are unchanged. A layout declared with zero elements is
+published as the single line `ia1 0`. That differs from an absent or unreadable layout, which is still refused and not drawn.
+For `ia1 0` the translation has no vertex buffer to read: every fetched register reads as zero. The zero default is an
+assumption, not a measurement; no fixture can show what the GPU does with it.
 One log line per stream gives the element count and, for each element, format, slot, offset and class:
 `x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/0/4294967295/0`.
 
@@ -153,7 +157,7 @@ rectangles instead: the records' registers exchanged, and both elements read fro
 out of the fetch index also fails it. A shader without its layout is refused and not drawn.
 
 The translator cases need no device: `python -B tests/startup_stream_fetch_check.py`, or
-`ctest --preset release --no-tests=error -R "^startup_stream_fetch_translate$"`. They check the generated loads and
+`ctest --preset release --no-tests=error -R "^startup_stream_fetch_translate$"`. It is the translator-only reproduction for the `ia1 0` case too. They check the generated loads and
 manifest entries for both slots, and that a fetch behind `s_wqm_b64 exec, exec` still translates. They also check
 these refusals:
 - no layout;
