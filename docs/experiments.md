@@ -6277,6 +6277,10 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_(store_aot_heap_view_load_|heap_view_controls$)' -V
 ```
 
+The 56 matching references and seven wrong references run in two shader batches, one for XY and one for
+XYZW. Each dispatch still checks all 320 words. Each wrong reference must report its first differing
+word, including the expected and actual values. The fourteen recompiled mutations run individually.
+
 ```sh
 python3 -B tests/compute_heap_view_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```

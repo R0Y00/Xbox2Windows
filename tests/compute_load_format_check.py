@@ -312,7 +312,7 @@ def binary(directory, assembler, objcopy, library):
     return 0
 
 
-def check_references(renderer, backend, shader, cases):
+def check_references(name, renderer, backend, shader, cases):
     paths = [path for path, _label, _diagnostic in cases]
     result = subprocess.run([renderer, backend, "--compute-store-batch", shader, *paths],
                             capture_output=True, text=True)
@@ -324,18 +324,18 @@ def check_references(renderer, backend, shader, cases):
         if (i >= len(statuses) or statuses[i] != f"case={i} status={status}"
                 or i >= len(messages) or not messages[i].startswith(f"case={i} path={path}\n")
                 or (diagnostic and diagnostic not in messages[i])):
-            raise AssertionError(f"{NAME}: {label} expected {status}\n{result.stdout}{result.stderr}")
+            raise AssertionError(f"{name}: {label} expected {status}\n{result.stdout}{result.stderr}")
         summary = summaries[i] if i < len(summaries) else ""
         counts = re.fullmatch(r"groups=\d+ compared_words=320 mismatches=(\d+)", summary)
         if not counts or (int(counts[1]) > 0) != bool(diagnostic):
-            raise AssertionError(f"{NAME}: {label} unexpected readback\n{result.stdout}{result.stderr}")
+            raise AssertionError(f"{name}: {label} unexpected readback\n{result.stdout}{result.stderr}")
     expected_exit = int(any(diagnostic for _, _, diagnostic in cases))
     if not (len(cases) == len(statuses) == len(messages) == len(summaries)) or result.returncode != expected_exit:
-        raise AssertionError(f"{NAME}: unexpected batch result ({result.returncode})\n{result.stdout}{result.stderr}")
+        raise AssertionError(f"{name}: unexpected batch result ({result.returncode})\n{result.stdout}{result.stderr}")
     labels = iter(label for _path, label, _diagnostic in cases)
     for line in result.stdout.splitlines():
         if line.startswith("groups="):
-            print(f"{NAME}: {next(labels)}")
+            print(f"{name}: {next(labels)}")
         print(line)
 
 
@@ -413,7 +413,7 @@ def draw(directory, compiler, renderer, backend):
         mutations.append((number, label, case, mutated))
 
     with ThreadPoolExecutor(max_workers=min(LAUNCH_THREADS, os.cpu_count() or 1)) as pool:
-        batch = pool.submit(check_references, renderer, backend, cso, references)
+        batch = pool.submit(check_references, NAME, renderer, backend, cso, references)
         mutants = [pool.submit(run_mutation, *mutation) for mutation in mutations]
         batch.result()
         for future in mutants:
