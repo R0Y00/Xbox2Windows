@@ -319,8 +319,18 @@ def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
 # with anisotropy refused and no partially resident texture, none of them changes the result.
 LEVEL_ZERO_IGNORED_W2 = 0x7
 
+# SQ_TEX_CLAMP modes accepted when the caller binds per-axis D3D12 addressing (2 = CLAMP_LAST_TEXEL, 6 = CLAMP_BORDER).
+COMPARISON_ADDRESS_MODES = {2: "clamp", 6: "border"}
+# SQ_IMG_SAMP_WORD3 bits 31:30 (BORDER_COLOR_TYPE): fixed border colors matching D3D12_STATIC_BORDER_COLOR 0..2.
+# Value 3 (SQ_TEX_BORDER_COLOR_REGISTER, indexed via BORDER_COLOR_PTR in bits 11:0) has no static-sampler representation.
+STATIC_BORDER_COLORS = {
+    0: ("transparent_black", 0),
+    1: ("opaque_black", 1),
+    2: ("opaque_white", 2),
+}
 
-def comparison_sampler_state(words, level_zero=False):
+
+def comparison_sampler_state(words, level_zero=False, allow_border=False):
     """Decode the sampler descriptor fields that change an image_sample_c_lz result on a 2D texture.
 
     level_zero=True is for a caller that samples explicitly at level zero (the startup translator's c_lz form):
@@ -328,11 +338,18 @@ def comparison_sampler_state(words, level_zero=False):
     only on anisotropic filtering (refused above) and BLEND_ZERO_PRT only on partially resident textures.
     Bit 31 stays refused. The default keeps the strict check the pixel AOT path is verified against.
 
+    allow_border=True is for a caller whose runtime binds per-axis addressing and D3D12_STATIC_BORDER_COLOR from the
+    sampler words (tools/startup/gfx2hlsl.py via smpc and src/startup_stubs/translated_sampler_bindings.h). CLAMP_X and
+    CLAMP_Y may then be CLAMP_LAST_TEXEL (2) or CLAMP_BORDER (6); half-border, mirror-once-border and wrap/mirror modes
+    stay refused. When either axis uses CLAMP_BORDER, word 3 bits 31:30 (BORDER_COLOR_TYPE) must be TRANS_BLACK (0),
+    OPAQUE_BLACK (1) or OPAQUE_WHITE (2); REGISTER (3) is refused.
+
     Field positions are those of SQ_IMG_SAMP_WORD0..3 (registers 0x8F30..0x8F3C in Mesa
     src/amd/registers/gfx10-rsrc.json; enum values in the Linux navi10_enum.h). Not read, because the accepted profile makes them irrelevant: CLAMP_Z,
     DISABLE_CUBE_WRAP and Z_FILTER (2D only), ANISO_THRESHOLD and ANISO_BIAS (ratio 1), word 0 bit 31
     (degamma control; no effect on a float depth texel), MAX_LOD, PERF_MIP and PERF_Z (LOD 0 only), and
-    BORDER_COLOR_PTR and BORDER_COLOR_TYPE (no border addressing). Any other non-zero field is refused,
+    BORDER_COLOR_PTR (only indexed when BORDER_COLOR_TYPE is REGISTER; BORDER_COLOR_TYPE itself is ignored when neither
+    axis uses CLAMP_BORDER). Any other non-zero field is refused,
     including word 2 bits 28-31 (MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT) and word 3 bits 12-29,
     which gfx10 leaves unnamed (bit 29 is UPGRADED_DEPTH on GFX8).
 
@@ -345,7 +362,11 @@ def comparison_sampler_state(words, level_zero=False):
     contract where the texel-space position is a multiple of 1/64, so the rounding is exact on both sides.
     """
     w0, w1, w2, w3 = words
-    if (w0 & 7, (w0 >> 3) & 7) != (2, 2):
+    ux, uy = w0 & 7, (w0 >> 3) & 7
+    if allow_border:
+        if ux not in COMPARISON_ADDRESS_MODES or uy not in COMPARISON_ADDRESS_MODES:
+            raise ValueError("Comparison sampling requires CLAMP_LAST_TEXEL or CLAMP_BORDER in X and Y")
+    elif (ux, uy) != (2, 2):
         raise ValueError("Comparison sampling requires CLAMP_LAST_TEXEL in X and Y")
     if (w0 >> 9) & 7:
         raise ValueError("Comparison sampling with anisotropy is not supported")
@@ -372,9 +393,16 @@ def comparison_sampler_state(words, level_zero=False):
     if trunc_coord != (filter_name == "point"):
         raise ValueError(f"Comparison sampling with {filter_name} filtering requires TRUNC_COORD "
                          f"{int(filter_name == 'point')}")
-    return {"compare": DEPTH_COMPARE[func], "d3d12_comparison_func": func + 1,
-            "filter": filter_name, "d3d12_filter": d3d_filter, "address": "clamp",
-            "trunc_coord": trunc_coord}
+    address = "clamp" if (ux, uy) == (2, 2) else (COMPARISON_ADDRESS_MODES[ux], COMPARISON_ADDRESS_MODES[uy])
+    state = {"compare": DEPTH_COMPARE[func], "d3d12_comparison_func": func + 1,
+             "filter": filter_name, "d3d12_filter": d3d_filter, "address": address,
+             "trunc_coord": trunc_coord}
+    if 6 in (ux, uy):
+        border_type = (w3 >> 30) & 3
+        if border_type not in STATIC_BORDER_COLORS:
+            raise ValueError("Comparison sampling with register border color is not supported")
+        state["border_color"], state["d3d12_static_border_color"] = STATIC_BORDER_COLORS[border_type]
+    return state
 
 
 def comparison_resources(state):
