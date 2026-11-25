@@ -29,16 +29,31 @@ public:
     // the first detail_entries distinct (key, reason) pairs so callers can budget detail logs.
     bool note(std::uint64_t key, const char* reason_name)
     {
-        char reason[max_reason_bytes];
+        char reason[max_reason_bytes] = {};
         copy_sanitized(reason, sizeof(reason), reason_name, "unknown");
 
         std::lock_guard<std::mutex> lock(mutex_);
         ++total_;
+        // Linear scan over max_entries under mutex_ is sized for refusal paths, not a per-draw hot path.
         for (unsigned i = 0; i < entry_count_; ++i) {
+#if defined(X2W_CENSUS_KEEP_LAST) || defined(X2W_CENSUS_KEEP_FIRST)
+            if (entries_[i].key == key) {
+                if (std::strcmp(entries_[i].reason, reason) == 0) {
+                    ++entries_[i].calls;
+#ifdef X2W_CENSUS_KEEP_LAST
+                } else {
+                    std::memcpy(entries_[i].reason, reason, sizeof(reason));
+                    entries_[i].calls = 1;
+#endif
+                }
+                return false;
+            }
+#else
             if (entries_[i].key == key && std::strcmp(entries_[i].reason, reason) == 0) {
                 ++entries_[i].calls;
                 return false;
             }
+#endif
         }
         if (entry_count_ >= max_entries) {
             ++overflow_calls_;

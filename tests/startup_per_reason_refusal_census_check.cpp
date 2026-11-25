@@ -1,24 +1,17 @@
 // Device-free checks for src/startup_stubs/per_reason_refusal_census.h: counts every refusal
 // reason per key rather than overwriting earlier reasons with the last one.
-// --mutate keep-last: simulate keeping only the last refusal reason per key (negative control).
-// --mutate keep-first: simulate keeping only the first refusal reason per key (negative control).
+// Compile with -DX2W_CENSUS_KEEP_LAST or -DX2W_CENSUS_KEEP_FIRST for the two negative controls
+// (testing the real PerReasonRefusalCensus class under single-reason-per-key regressions).
 #include "startup_stubs/per_reason_refusal_census.h"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace {
 
 int failures = 0;
-const char* mutation = "";
-
-bool mutated(const char* name)
-{
-    return std::strcmp(mutation, name) == 0;
-}
 
 void check(const char* what, bool ok)
 {
@@ -42,7 +35,6 @@ bool contains_line(const std::vector<std::string>& lines, const std::string& exp
     return false;
 }
 
-// Baseline reference with an optional single-reason regression toggle for the negative controls.
 void check_two_reasons_per_key()
 {
     using namespace x2w_startup;
@@ -63,48 +55,20 @@ void check_two_reasons_per_key()
     check("key2 missing_root is detailed", census.note(key2, reason_a));
     check("key2 second uav_missing is not detailed", !census.note(key2, "uav_missing"));
 
-    std::vector<std::string> observed = collect_report(census, true);
-    if (mutated("keep-last") || mutated("keep-first")) {
-        // Reconstruct what single-slot-per-key tracking would keep for key1 so the control fails
-        // while reporting both expected reasons and their counts.
-        struct SingleReason { std::string reason; std::uint64_t calls = 0; };
-        std::unordered_map<std::uint64_t, SingleReason> broken;
-        const std::pair<std::uint64_t, const char*> events[] = {
-            {key1, reason_a}, {key1, reason_a},
-            {key1, reason_b}, {key1, reason_b}, {key1, reason_b},
-            {key2, "uav_missing"}, {key2, reason_a}, {key2, "uav_missing"},
-        };
-        for (const auto& [k, r] : events) {
-            auto& slot = broken[k];
-            if (slot.reason.empty()) {
-                slot = {r, 1};
-            } else if (slot.reason == r) {
-                ++slot.calls;
-            } else if (mutated("keep-last")) {
-                slot = {r, 1};  // drops earlier reason_a (calls=2)
-            }
-            // keep-first drops later reason_b (calls=3)
-        }
-        observed.clear();
-        observed.push_back("x2w-d3d12 slot 67 refusals: total 8; distinct keys 2, distinct pairs 2 (overflow calls 0)");
-        unsigned idx = 1;
-        for (const std::uint64_t k : {key1, key2}) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf), "x2w-d3d12 slot 67 refusal %u: key=%016llx reason=%s calls=%llu",
-                          idx++, static_cast<unsigned long long>(k), broken[k].reason.c_str(),
-                          static_cast<unsigned long long>(broken[k].calls));
-            observed.emplace_back(buf);
-        }
-        std::printf("control (%s) expected key1: %s calls=2 and %s calls=3; observed: %s\n",
-                    mutation, reason_a, reason_b, observed[1].c_str());
-    }
-
+    const std::vector<std::string> observed = collect_report(census, true);
     const std::string exp_summary =
         "x2w-d3d12 slot 67 refusals: total 8; distinct keys 2, distinct pairs 4 (overflow calls 0)";
     const std::string exp_k1_a = "x2w-d3d12 slot 67 refusal 1: key=1000000000000001 reason=missing_root calls=2";
     const std::string exp_k1_b = "x2w-d3d12 slot 67 refusal 2: key=1000000000000001 reason=srv_unavailable calls=3";
     const std::string exp_k2_uav = "x2w-d3d12 slot 67 refusal 3: key=2000000000000002 reason=uav_missing calls=2";
     const std::string exp_k2_root = "x2w-d3d12 slot 67 refusal 4: key=2000000000000002 reason=missing_root calls=1";
+
+    if (!contains_line(observed, exp_k1_a) || !contains_line(observed, exp_k1_b)) {
+        std::printf("expected both key1 reasons: %s calls=2 and %s calls=3\n", reason_a, reason_b);
+        for (const auto& line : observed) {
+            std::printf("  observed: %s\n", line.c_str());
+        }
+    }
 
     check("summary includes both keys and all four pairs", contains_line(observed, exp_summary));
     check("key1 keeps first reason missing_root with calls=2", contains_line(observed, exp_k1_a));
@@ -161,18 +125,10 @@ void check_limits_and_periodic_deltas()
 
 }  // namespace
 
-int main(int argc, char** argv)
+int main(int argc, char**)
 {
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--mutate") == 0 && i + 1 < argc) {
-            mutation = argv[++i];
-        } else {
-            std::fprintf(stderr, "usage: %s [--mutate keep-last|keep-first]\n", argv[0]);
-            return 2;
-        }
-    }
-    if (mutation[0] != '\0' && !mutated("keep-last") && !mutated("keep-first")) {
-        std::fprintf(stderr, "unknown mutation: %s\n", mutation);
+    if (argc != 1) {
+        std::fprintf(stderr, "usage: startup_per_reason_refusal_census_check\n");
         return 2;
     }
 

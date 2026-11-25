@@ -399,9 +399,11 @@ token null with zero words, and the R8 texels. The control publishes the support
 
 ### Per-reason refusal census per pipeline key
 
-[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) tracks every distinct
-`(key, reason)` refusal pair separately instead of overwriting earlier reasons on the same key with the
-last refusal:
+[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) is a standalone,
+device-free header ready to be wired into runtime refusal callers (such as slot-67 compute dispatch
+and binding paths; it is not yet wired into `d3d12_xs_device.cpp` or the five-second report). It
+tracks every distinct `(key, reason)` refusal pair separately instead of overwriting earlier reasons on
+the same key with the last refusal:
 
 - Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
   call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
@@ -411,10 +413,11 @@ last refusal:
   prints the full table without hiding the next periodic delta.
 
 Check without a device via
-`ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep_(last|first)_control)?$' -V`:
+`ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
 the pass run verifies interleaved reasons across two keys, detail limits, overflow accounting and delta
-reports; the `keep-last` and `keep-first` negative controls each keep only one reason per key, report
-both expected reasons and counts in their mismatch output, and are marked `WILL_FAIL`.
+reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCensus` with
+`X2W_CENSUS_KEEP_LAST` and `X2W_CENSUS_KEEP_FIRST`, print both expected reasons with counts in their
+mismatch output, and are marked `WILL_FAIL`.
 
 ## Root constant buffer views
 
