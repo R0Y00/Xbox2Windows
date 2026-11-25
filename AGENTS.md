@@ -105,6 +105,8 @@ The full Linux CI list is in the `Run Python checks` step of the `python-linux`
 job in the [CI workflow](.github/workflows/windows.yml). To run it locally,
 copy the step's `tools/run_checks_parallel.py` command with all its arguments
 and replace the leading `python` with `./out/pe-env/bin/python`.
+See the [Linux quick start](docs/non-windows-hosts.md#quick-start-on-linux)
+for how skips affect the runner's exit status.
 
 ```bash
 python3 -m venv out/pe-env
@@ -148,6 +150,8 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/bidi_controls_check.py
 # With no arguments, this tests result classification without Vulkan or DXC.
 ./out/pe-env/bin/python -B tests/pixel_denorm_vulkan_check.py
+# With no arguments, this tests the Vulkan offscreen adapter without a device or DXC.
+./out/pe-env/bin/python -B tests/vk_offscreen.py
 ./out/pe-env/bin/python -B tests/gpu_report_format_check.py
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
 ./out/pe-env/bin/python -B tests/rectlist_topology_check.py
@@ -160,6 +164,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
+./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
@@ -176,6 +181,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
@@ -183,7 +189,10 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_get_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_saveexec_same_reg_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compare_dst_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_build_rev_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_root_check.py
@@ -217,11 +226,14 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sgpr_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cmp16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_signext_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_brev_fold_check.py
 ./out/pe-env/bin/python -B tests/run_checks_parallel_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_handler_arity_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_arity_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support

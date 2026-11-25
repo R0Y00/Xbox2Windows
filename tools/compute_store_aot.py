@@ -704,24 +704,44 @@ def heap_view_hlsl(table_offset, view_count, buffer_bytes):
     )
 
 
-def heap_store_view_hlsl(table_offset, view_count, output_bytes):
-    """Store raw UINT4 or four expanded half floats through the live side-table record."""
-    return f"""void store_heap_words4(uint slot, uint index, uint offset, bool d16, uint4 value) {{
-    if (slot >= {view_count}u) return;
-    uint record = {table_offset}u + slot * {HEAP_VIEW_RECORD_BYTES}u;
-    if (inputData.Load(record + 16u) != {HEAP_VIEW_LIVE}u) return;
-    uint4 view = inputData.Load4(record);
-    uint formatWord = d16 ? {descriptor_format_word(77):#x}u : {descriptor_format_word(75):#x}u;
-    if (view.w != formatWord || (view.y & 0xc000ffffu) != 0u) return;
-    uint stride = view.y >> 16u;
-    if (((view.x | stride) & 3u) != 0u || stride < offset + 16u || index >= view.z) return;
-    const uint bytes = {output_bytes}u;
-    if (view.x > bytes || offset + 16u > bytes - view.x) return;
-    if (index > (bytes - view.x - offset - 16u) / stride) return;
-    if (d16) value = asuint(f16tof32(uint4(value.x, value.x >> 16u, value.y, value.y >> 16u)));
-    outputData.Store4(view.x + index * stride + offset, value);
-}}
-"""
+def heap_store_view_hlsl(table_offset, view_count, output_bytes, *, components=4):
+    """Store UINT4 or expanded binary16 components through a live side-table record."""
+    width = 4 * components
+    if components in (1, 2):
+        sig = "void store_heap_word_d16(uint slot, uint index, uint offset, uint value)"
+        format_word = descriptor_format_word(22 if components == 1 else 64)  # BUF_FMT_32_FLOAT or BUF_FMT_32_32_FLOAT
+        fmt_check = f"    if (view.w != {format_word:#x}u || (view.y & 0xc000ffffu) != 0u) return;"
+        if components == 1:
+            write = "    outputData.Store(view.x + index * stride + offset, asuint(f16tof32(value & 0xffffu)));"
+        else:
+            write = ("    outputData.Store2(view.x + index * stride + offset, "
+                     "asuint(f16tof32(uint2(value & 0xffffu, value >> 16u))));")
+    elif components == 3:
+        sig = "void store_heap_xyz_d16(uint slot, uint index, uint offset, uint2 value)"
+        fmt_check = f"    if (view.w != {descriptor_format_word(74):#x}u || (view.y & 0xc000ffffu) != 0u) return;"
+        write = ("    uint3 halfWords = uint3(value.x & 0xffffu, value.x >> 16u, value.y & 0xffffu);\n"
+                 "    outputData.Store3(view.x + index * stride + offset, asuint(f16tof32(halfWords)));")
+    else:
+        sig = "void store_heap_words4(uint slot, uint index, uint offset, bool d16, uint4 value)"
+        fmt_check = (f"    uint formatWord = d16 ? {descriptor_format_word(77):#x}u : {descriptor_format_word(75):#x}u;\n"
+                     "    if (view.w != formatWord || (view.y & 0xc000ffffu) != 0u) return;")
+        write = ("    if (d16) value = asuint(f16tof32(uint4(value.x, value.x >> 16u, value.y, value.y >> 16u)));\n"
+                 "    outputData.Store4(view.x + index * stride + offset, value);")
+    return (
+        f"{sig} {{\n"
+        f"    if (slot >= {view_count}u) return;\n"
+        f"    uint record = {table_offset}u + slot * {HEAP_VIEW_RECORD_BYTES}u;\n"
+        f"    if (inputData.Load(record + 16u) != {HEAP_VIEW_LIVE}u) return;\n"
+        f"    uint4 view = inputData.Load4(record);\n"
+        f"{fmt_check}\n"
+        f"    uint stride = view.y >> 16u;\n"
+        f"    if (((view.x | stride) & 3u) != 0u || stride < offset + {width}u || index >= view.z) return;\n"
+        f"    const uint bytes = {output_bytes}u;\n"
+        f"    if (view.x > bytes || offset + {width}u > bytes - view.x) return;\n"
+        f"    if (index > (bytes - view.x - offset - {width}u) / stride) return;\n"
+        f"{write}\n"
+        f"}}\n"
+    )
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
@@ -749,7 +769,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     word index per formatted load, in program order, read by load_descriptor_format (see descriptor_load_hlsl).
     heap_view=(slot_word, table_offset, view_count, buffer_bytes) makes the same loads take the V# from a run-time view record
     instead of a constant format word (see heap_view_hlsl). It excludes load_format_constant.
-    heap_store_view uses the same t0 record layout for one indexed UINT4 or packed D16-to-FLOAT4 store to u0.
+    heap_store_view uses the same t0 record layout for one indexed UINT4, packed D16-to-FLOAT4, or
+    packed D16-to-FLOAT1 store to u0.
     Its fifth argument is the writable byte extent of u0. Root UAV descriptors carry no length.
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
@@ -924,6 +945,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    heap_store_components = 4
     format_store_index = 0
     atomic_update = False
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
@@ -2721,8 +2743,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
                 if heap_store_view is not None:
-                    if channels not in ("xyzw", "d16_xyzw"):
-                        raise ValueError("Heap store view requires buffer_store_format_xyzw or buffer_store_format_d16_xyzw")
+                    if channels != "xyzw" and not packed:
+                        raise ValueError("Heap store view requires buffer_store_format_xyzw or a D16 formatted store")
                     if not any(tag == ("constant_word", heap_slot_word) and reg not in pending
                                for reg, tag in scalar.items()):
                         raise ValueError("Heap store view slot constant is not ready")
@@ -2846,16 +2868,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 source_shift = 16 if m["store_hi"] else 0
                 words[0] = (f"((outputData.Load({address}) & {keep:#x}u) | "
                             f"((({words[0]} >> {source_shift}u) & {mask:#x}u) << {byte_shift}u))")
-            elif partial and not descriptor_store:
+            elif partial and not descriptor_store and heap_store_view is None:
                 # Reserve the entire final DWORD, including the untouched high half. The indexed
                 # layout, aligned stride and overlap checks give that word a single writer.
                 final_address = address if count == 1 else f"{address} + 4u"
                 words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
             if heap_store_view is not None:
                 slot = hlsl_word(("constant_word", heap_slot_word))
-                supplied = words + ["0u"] * (4 - len(words))
-                mode = "true" if packed else "false"
-                stores.append(f"    store_heap_words4({slot}, {address}, {offset}u, {mode}, uint4({', '.join(supplied)}));")
+                heap_store_components = components
+                if channels in ("d16_x", "d16_xy"):
+                    stores.append(f"    store_heap_word_d16({slot}, {address}, {offset}u, {words[0]});")
+                elif channels == "d16_xyz":
+                    stores.append(f"    store_heap_xyz_d16({slot}, {address}, {offset}u, uint2({', '.join(words)}));")
+                else:
+                    supplied = words + ["0u"] * (4 - len(words))
+                    mode = "true" if packed else "false"
+                    stores.append(f"    store_heap_words4({slot}, {address}, {offset}u, {mode}, uint4({', '.join(supplied)}));")
             elif descriptor_store:
                 supplied = words + ["0u"] * (4 - len(words))
                 stores.append("    store_descriptor_format("
@@ -2933,7 +2961,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if heap_view is not None:
         descriptor_hlsl += heap_view_hlsl(heap_table, heap_count, heap_bytes)
     if heap_store_view is not None:
-        descriptor_hlsl += heap_store_view_hlsl(heap_table, heap_count, output_bytes)
+        descriptor_hlsl += heap_store_view_hlsl(heap_table, heap_count, output_bytes, components=heap_store_components)
     # GetDimensions on a raw buffer returns its size in bytes, the value of descriptor word 2.
     for name, view in (("uav_bytes", "outputData"), ("srv_bytes", "inputData")):
         if f"{name}(" in body:
@@ -2982,7 +3010,8 @@ def main():
                              "SLOT_WORD; the record table is at byte TABLE_OFFSET of the BUFFER_BYTES-byte t0 and holds COUNT views")
     parser.add_argument("--heap-store-view", nargs=5, type=lambda n: int(n, 0),
                         metavar=("SLOT_WORD", "TABLE_OFFSET", "COUNT", "TABLE_BUFFER_BYTES", "OUTPUT_BYTES"),
-                        help="select a UINT4 or D16-to-FLOAT4 store view from t0 and bound writes by OUTPUT_BYTES of u0")
+                        help="select a UINT4 or expanded D16 FLOAT1/FLOAT2/FLOAT3/FLOAT4 store view from t0 "
+                             "and bound writes by OUTPUT_BYTES of u0")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
