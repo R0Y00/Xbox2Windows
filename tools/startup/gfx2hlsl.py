@@ -3831,9 +3831,11 @@ VEC_U.update({
     # of the 48-bit product. The 24-bit field is sign-extended with a left shift of 8 and an arithmetic right shift.
     'v_mul_i32_i24': (2, 'asuint((asint({0} << 8) >> 8) * (asint({1} << 8) >> 8))'),
     'v_mad_i32_i24': (3, 'asuint((asint({0} << 8) >> 8) * (asint({1} << 8) >> 8)) + {2}'),
-    # v_mul_hi_u32_u24 is deliberately not lowered: every unsigned form tried (an unsigned shift pair, the
-    # signed shift pair with a mask, a shift and a mask) is folded to a constant zero by FXC 10.0.26100 at
-    # ps_5_1, which the startup path uses, while DXC keeps it. A refusal is visible; zeros are not.
+    # v_mul_hi_u32_u24 is deliberately not lowered. Its result is at most 0xffff, so as a float output word it is
+    # always a binary32 denormal, and FXC 10.0.26100 at ps_5_1 (the startup path) folds a float output whose
+    # provable range lies below 0x00800000 to a constant zero (any form tried, even a plain shift without a
+    # product). The same words through a uint4 output survive, and DXC keeps them. v_mul_hi_i32_i24 can reach
+    # the whole 32-bit range, so FXC keeps it. A refusal is visible; zeros are not.
     'v_mul_hi_i32_i24': (2, _mul24_hi_i32()),
     'v_xnor_b32': (2, '~({0} ^ {1})'),
     # v_alignbit_b32 takes bits [S2[4:0] + 31 : S2[4:0]] of the 64-bit value {S0, S1}; a zero shift returns S1 and
