@@ -456,6 +456,7 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
+        getattr(self, 'byte_float_v', set()).discard(n)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
         self.used_v.add(n)
@@ -694,8 +695,13 @@ class Stage:
             # accepted here, because ignoring them would silently change the operand.
             if any(m not in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods):
                 raise Unsupported('%s with %s' % (base, mods))
-            return self.set_vf(reg_range(ops[0])[1],
-                               text_f.format(*[self.u(o) for o in ops[1:1 + arity]]), mods)
+            dst = reg_range(ops[0])[1]
+            self.set_vf(dst, text_f.format(*[self.u(o) for o in ops[1:1 + arity]]), mods)
+            if (base.startswith('v_cvt_f32_ubyte') and not mods and self.exec_known and
+                    not getattr(self, 'has_branches', True)):
+                # The whole register now holds float(0..255), exactly +0.0 or an integer in 1..255, until the next write.
+                self.__dict__.setdefault('byte_float_v', set()).add(dst)
+            return None
         if base in VEC_U:
             arity, text = VEC_U[base]
             if mods:
@@ -1446,8 +1452,11 @@ class Stage:
         #   D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])
         # The guides leave flt32_to_uint8 undefined (rounding, bounds, NaN and negative results are not
         # stated), so S0 must be +0.0 or an integer in [1, 255], where every reading gives the same byte.
-        # A constant S0 outside that set is refused; a register is not known statically, so the program
-        # must keep it inside the set. The clamp only keeps the HLSL conversion defined.
+        # A constant S0 outside that set is refused. A register is accepted only when proven: it was written
+        # by v_cvt_f32_ubyte0..3 (no modifier, straight-line code, full exec) with no write since. Any other
+        # register is refused unless the caller selects the pk_u8_s0_contract of the Pipeline, which states
+        # that every S0 register holds +0.0 or an integer in 1..255. The clamp only keeps the HLSL
+        # conversion defined.
         if mods:
             raise Unsupported('v_cvt_pk_u8_f32 with modifiers')
         if len(ops) != 4:
@@ -1461,6 +1470,16 @@ class Stage:
             value = struct.unpack('<f', struct.pack('<I', bits))[0]
             if bits != 0 and not (value.is_integer() and 1 <= value <= 255):
                 raise Unsupported('v_cvt_pk_u8_f32 with constant source %s outside +0.0 and 1..255' % ops[1])
+        else:
+            src = reg_range(ops[1])
+            if src[0] != 'v' or src[1] != src[2]:
+                raise Unsupported('v_cvt_pk_u8_f32 source %s' % ops[1])
+            if src[1] not in getattr(self, 'byte_float_v', ()):
+                if not getattr(getattr(self, 'pipe', None), 'pk_u8_s0_contract', False):
+                    raise Unsupported('v_cvt_pk_u8_f32 source %s is not proven to be +0.0 or an integer in 1..255'
+                                      % ops[1])
+                self.pipe.notes.add('v_cvt_pk_u8_f32 source registers assumed +0.0 or integers in 1..255 '
+                                    '(pk_u8_s0_contract)')
         value, select, rest = self.u(ops[1]), self.u(ops[2]), self.u(ops[3])
         shift = '((%s & 3u) << 3u)' % select
         self.set_v(dst[1], '((%s & ~(0xffu << %s)) | ((uint(clamp(F(%s), 0.0, 255.0)) & 0xffu) << %s))'
@@ -1985,7 +2004,10 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 class Pipeline:
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
-                 refusals=None, decoded=None):
+                 refusals=None, decoded=None, pk_u8_s0_contract=False):
+        # pk_u8_s0_contract: the caller guarantees that every v_cvt_pk_u8_f32 S0 register not proven in domain
+        # holds +0.0 or an integer in 1..255 (fixtures only; ordinary translation never selects it).
+        self.pk_u8_s0_contract = pk_u8_s0_contract
         self.root = parse_root(root_blob)
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
