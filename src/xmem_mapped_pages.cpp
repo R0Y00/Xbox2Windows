@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/profile_zone.h"
 
 #include <vector>
 
@@ -781,6 +782,7 @@ template <typename AddressAt>
 BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
                MapFailure* failure = nullptr) noexcept
 {
+    X2W_ZONE("xmem map_pages");
     const bool share_views = fault_retry.ready();
     const MappingThread marker;
     const std::lock_guard guard(memory.mutex);
@@ -1615,6 +1617,7 @@ const bool lazy_commit_installed = [] {
 // first page. DirectStorage requests can name such pages as their destination.
 extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PTR count, SIZE_T offset, const void* data, SIZE_T bytes)
 {
+    X2W_ZONE("x2w_xmem_write_physical");
     if (!tokens || !data || offset >= page_bytes) return FALSE;
     const auto* source = static_cast<const unsigned char*>(data);
     ULONG_PTR index = 0;
