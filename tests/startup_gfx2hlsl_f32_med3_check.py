@@ -135,6 +135,9 @@ def vop3_med3_f32(vdst, src0, src1, src2):
     return struct.pack('<II', w0, src0 | src1 << 9 | src2 << 18)
 
 
+# The fixture supplies eight words: ud0 for the rectangle list, the four inputs, three unused. The
+# translator declares three uds past the blob, so the pair reads eleven.
+FIXTURE_WORDS = 8
 PS_PREFIX_SOURCE = ''.join('s_mov_b32 s%d, s%d\n' % (44 + lane, 8 + lane) for lane in range(4))
 PS_PREFIX_WORDS = b''.join(sop1_mov_b32(44 + lane, 8 + lane) for lane in range(4))
 
@@ -182,9 +185,9 @@ def entry_counts(vs_hlsl, ps_hlsl):
 def pipeline():
     # The count depends only on the translated program, not on the values: translate once with a placeholder
     # root, then rebuild with the exact number of words the shaders declare.
-    probe = G.Pipeline(VS_WORDS, PS_WORDS, constant_root_blob(32))
+    probe = G.Pipeline(VS_WORDS, PS_WORDS, constant_root_blob(FIXTURE_WORDS))
     count = entry_counts(probe.hlsl_vs(), probe.hlsl_ps())
-    return G.Pipeline(VS_WORDS, PS_WORDS, constant_root_blob(count))
+    return G.Pipeline(VS_WORDS, PS_WORDS, constant_root_blob(FIXTURE_WORDS))
 
 
 def words_text(values):
