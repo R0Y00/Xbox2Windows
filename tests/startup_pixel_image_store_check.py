@@ -196,6 +196,11 @@ def check_binary(llvm_mc):
     print('fixture words match llvm-mc')
 
 
+def mismatch_line(stderr):
+    """The texel_mismatch report: on a machine with several adapters stderr starts with adapter notices."""
+    return next(line for line in stderr.splitlines() if 'texel_mismatch ' in line)
+
+
 def check_draw(dxc, renderer, adapter):
     source = translate(WORDS).hlsl_ps()
     expected = ','.join(BITS)
@@ -223,7 +228,7 @@ def check_draw(dxc, renderer, adapter):
             run = draw(text, label.replace(' ', '_'))
             if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
-            print('control %s: fails as expected (%s)' % (label, run.stderr.strip().splitlines()[0]))
+            print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
 
         # Exec after v_cmpx: an active lane writes the texel, an inactive one leaves it at its starting value.
         untouched_bits = ','.join(['bf800000'] * 4)
@@ -240,7 +245,7 @@ def check_draw(dxc, renderer, adapter):
         needle = 'texel_mismatch x=1 y=2 expected=%s actual=%s' % (untouched_bits, expected)
         if run.returncode == 0 or needle not in run.stderr:
             raise AssertionError('control exec guard removed was not detected\n%s\n%s' % (run.stdout, run.stderr))
-        print('control exec guard removed: fails as expected (%s)' % run.stderr.strip().splitlines()[0])
+        print('control exec guard removed: fails as expected (%s)' % mismatch_line(run.stderr))
 
 
 def main():
