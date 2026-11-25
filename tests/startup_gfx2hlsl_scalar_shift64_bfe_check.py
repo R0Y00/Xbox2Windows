@@ -42,7 +42,6 @@ def reference(op, x, amount):
     bits = format(x, '0%db' % size)[::-1]                 # index = bit number
     field = bits[offset:offset + width][:size]            # bits that exist, lowest first
     if op != 's_bfe_u64' and width and field:
-        field = field.ljust(min(width, size), '0')
         field = field + field[-1] * (size - len(field))   # replicate the top bit of the field
     return int((field + '0' * size)[:size][::-1], 2)
 
@@ -128,7 +127,7 @@ def load_helper(text, name):
                 var, rhs = part.split(' = ', 1)
                 lines.append('%s = %s' % (var.strip(), to_python(rhs)))
     source = 'def f(%s):\n    ' % ', '.join(params) + '\n    '.join(lines) + '\n'
-    env = {'U': U, 'T': lambda a, b: (a, b), 'asint': _asint, 'asuint': lambda v: U(int(v))}
+    env = {'min': min, 'U': U, 'T': lambda a, b: (a, b), 'asint': _asint, 'asuint': lambda v: U(int(v))}
     exec(source, env)  # noqa: S102 - our own generated helper text
     return env['f'], env
 
@@ -206,11 +205,12 @@ def const_folding():
         's_ashr_i64': ((0x8000000000000000, 63, M64), (0xf000000000000000, 60, M64),
                        (0x7fffffffffffffff, 62, 1), (0x8000000000000000, 32, 0xffffffff80000000)),
         's_bfe_i32': ((0x000000f0, 4 | 4 << 16, 0xffffffff), (0x00000030, 4 | 3 << 16, 0x00000003),
-                      (0x80000000, 31 | 1 << 16, 0xffffffff), (0x12345678, 0, 0), (0xdeadbeef, 32 << 16, 0xdeadbeef)),
+                      (0x80000000, 31 | 1 << 16, 0xffffffff), (0x80000000, 31 | 2 << 16, 0xffffffff), (0x12345678, 0, 0), (0xdeadbeef, 32 << 16, 0xdeadbeef)),
         's_bfe_u64': ((0x123456789abcdef0, 32 | 16 << 16, 0x5678), (M64, 63 | 8 << 16, 1),
                       (0x8000000000000000, 60 | 4 << 16, 8), (M64, 0 | 64 << 16, M64)),
         's_bfe_i64': ((0x00000000000000f0, 4 | 4 << 16, M64), (0x0000000000000030, 4 | 3 << 16, 3),
-                      (0x8000000000000000, 63 | 1 << 16, M64), (0x123456789abcdef0, 32 | 16 << 16, 0x5678),
+                      (0x8000000000000000, 63 | 1 << 16, M64), (0x8000000000000000, 63 | 2 << 16, M64),
+                      (0x123456789abcdef0, 32 | 16 << 16, 0x5678),
                       (0xff00000000000000, 56 | 8 << 16, M64)),
     }
     for op, rows in cases.items():
@@ -264,9 +264,28 @@ def uniformity():
         raise AssertionError('%s on a lane mask should be refused' % op)
 
 
-def refusals():
-    def refuse(op, dst, src, amt, label, sym=None):
+def overwritten_mask():
+    for op in OPCODES:
         stage = M.ProbeStage()
+        stage.masks = {DST} | ({DST + 1} if op in WIDE_RESULT else set())
+        stage.sym[SRC], stage.sym[SRC + 1] = ('const', 0x10), ('const', 0)
+        stage.sym[AMT] = ('const', 1)
+        code = M.encode_sop2(OPCODES[op], DST, SRC, AMT)
+        _, name, asm, _ = M.D.decode_instruction(code, 0)
+        stage.one(name, asm)
+        assert not stage.masks, (op, stage.masks)
+        stage = M.ProbeStage()
+        stage.masks = {DST} | ({DST + 1} if op in WIDE_RESULT else set())
+        code = M.encode_sop2(OPCODES[op], DST, SRC, AMT)
+        _, name, asm, _ = M.D.decode_instruction(code, 0)
+        stage.one(name, asm)
+        assert not stage.masks, (op, 'runtime', stage.masks)
+
+
+def refusals():
+    def refuse(op, dst, src, amt, label, sym=None, masks=()):
+        stage = M.ProbeStage()
+        stage.masks.update(masks)
         stage.sym.update(sym or {})
         code = M.encode_sop2(OPCODES[op], dst, src, amt)
         _, name, asm, _ = M.D.decode_instruction(code, 0)
@@ -282,6 +301,8 @@ def refusals():
     for op in WIDE_RESULT:
         refuse(op, DST + 1, SRC, AMT, 'odd destination pair')
         refuse(op, DST, SRC + 1, AMT, 'odd source pair')
+    for op in ('s_lshr_b64', 's_bfe_u64'):
+        refuse(op, DST, SRC, AMT, 'lane mask in the high source word', masks={SRC + 1})
     refuse('s_lshl_b64', DST, SRC, 106, 'vcc as the shift amount')
     refuse('s_lshl_b64', DST, SRC, 126, 'exec as the shift amount')
 
@@ -292,6 +313,7 @@ def main():
     runtime_blocks()
     uniformity()
     refusals()
+    overwritten_mask()
     print('startup scalar 64-bit shift and bitfield extract controls passed (%d helper cases)' % checked)
     return 0
 

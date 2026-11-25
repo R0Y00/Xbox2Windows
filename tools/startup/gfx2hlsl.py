@@ -1093,7 +1093,9 @@ class Stage:
                 or (wide_dst and dst[1] % 2)):
             raise Unsupported('%s destination %s' % (name, ops[0]))
         s1 = reg_range(ops[2])
-        if (any(self.is_lane_mask(t) for t in ops[1:]) or ops[2] in FLOATS or ops[1] in FLOATS
+        if (any(self.is_lane_mask(t) for t in ops[1:])
+                or any(r[0] == 's' and any(w in self.masks for w in range(r[1], r[2] + 1))
+                       for r in map(reg_range, ops[1:]) if r) or ops[2] in FLOATS or ops[1] in FLOATS
                 or (s1 and (s1[0] != 's' or s1[1] != s1[2] or s1[1] > 105))):
             raise Unsupported('%s source %s' % (name, ', '.join(ops[1:])))
         if wide_src:
@@ -1109,6 +1111,7 @@ class Stage:
         amount = self.u(ops[2])
         amount_known = self.scalar_const(ops[2])
         d = dst[1]
+        self.masks.difference_update(range(d, d + width))
         if None not in known and amount_known is not None:
             x = known[0] | (known[1] << 32 if wide_src else 0)
             value = scalar_wide_fold(helper, x, amount_known, signed)
@@ -2094,8 +2097,9 @@ def scalar_wide_fold(helper, x, amount, signed):
     if helper == 'shr64i':
         return ((x - (1 << 64) if x >> 63 else x) >> (amount & 63)) & m64
     bits = 32 if helper == 'bfe32' else 64
-    field = (x >> (amount & (bits - 1))) & ((1 << ((amount >> 16) & 127)) - 1) & ((1 << bits) - 1)
-    wd = (amount >> 16) & 127
+    off = amount & (bits - 1)
+    wd = min((amount >> 16) & 127, bits - off)  # bits past the source MSB do not exist
+    field = (x >> off) & ((1 << wd) - 1)
     if signed and 0 < wd < bits and field >> (wd - 1) & 1:
         field |= ((1 << bits) - 1) ^ ((1 << wd) - 1)
     return 0 if signed and wd == 0 else field
@@ -2260,12 +2264,12 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
-               'uint2 bfe64(uint lo, uint hi, uint s1, uint sg) { uint w = (s1 >> 16u) & 127u; uint2 e = shr64u(lo, hi, s1);'
+               'uint2 bfe64(uint lo, uint hi, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 64u - (s1 & 63u)); uint2 e = shr64u(lo, hi, s1);'
                ' e = uint2(e.x & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u)),'
                ' e.y & (w >= 64u ? 0xffffffffu : (w > 32u ? ((1u << ((w - 32u) & 31u)) - 1u) : 0u)));'
                ' if (sg == 0u || w >= 64u) return e; if (w == 0u) return uint2(0u, 0u);'
                ' uint sh = 64u - w; uint2 t = shl64(e.x, e.y, sh); return shr64i(t.x, t.y, sh); }',
-               'uint bfe32(uint x, uint s1, uint sg) { uint w = (s1 >> 16u) & 127u;'
+               'uint bfe32(uint x, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 32u - (s1 & 31u));'
                ' uint e = (x >> (s1 & 31u)) & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u));'
                ' if (sg == 0u || w >= 32u) return e; if (w == 0u) return 0u;'
                ' uint sh = 32u - w; return asuint(asint(e << sh) >> sh); }',
