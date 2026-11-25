@@ -27,10 +27,10 @@ s_endpgm
 mesh_outputs:"""
 
 
-def mesh_container(code):
+def mesh_container(code, *, stage=13):
     padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
     record = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)),
-                      compute_width=128, mesh_limits=MESH_LIMITS)
+                      compute_width=128, mesh_limits=MESH_LIMITS, shader_stage=stage)
     return _read_named_container(record, len(b"fixture") + 2)
 
 
@@ -83,7 +83,10 @@ def verify(directory, kind, tool, objcopy, library):
     rejects("missing mesh allocation", extract, replace(allocation, nop))
     rejects("Unverified multi-exit program", extract, code, llvm=None)
     rejects("Unverified multi-exit program", extract, code, features=b"+wavefrontsize32")
-    print(f"{len(code)} bytes: both CLIs and the profile audit match the single-exit mesh; five refusals checked")
+    compute = parts(mesh_container(code, stage=5))[b"DXIL"]
+    rejects("Unverified multi-exit control flow: s_sendmsg", container_code, compute,
+            stage=5, llvm=library, features=MESH_WAVE64)
+    print(f"{len(code)} bytes: both CLIs and the profile audit match the single-exit mesh; six refusals checked")
     return outputs
 
 
