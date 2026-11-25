@@ -2459,7 +2459,14 @@ check only:
 - Argument checks (`src/startup_stubs/list_copy_texture.h`): footprint on both sides, empty or inverted box,
   source and destination bounds, row pitch (multiple of 256), offset (multiple of 512), footprint end inside
   the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
-  sample-count mismatch, block alignment.
+  block alignment, every multiply and add in the footprint arithmetic checked for wrapping.
+- Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
+  `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
+  (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).
+- The two sides must name the same format (`format_mismatch`) and the same sample count
+  (`sample_mismatch`); a multisampled copy is whole subresource to whole subresource of equal size,
+  with origin 0 (`partial_multisample`). Buffer footprints are single-sample, so a multisampled texture
+  and a buffer are refused.
 - Upload and readback footprint buffers keep their fixed heap states and get no barrier; an upload buffer as
   destination or a readback buffer as source is refused (`bad_heap`).
 - A source or destination texture is brought up to date from its guest backing (`upload_texture`) before the
@@ -2467,6 +2474,9 @@ check only:
   refused (`stale_source`).
 - Two subresources of one resource are refused (`same_resource`): resource states are tracked per resource.
 
-Not verified: the Windows forwarding path (barriers, lazy-upload ordering) on a desktop device. Reproduce the
-portable check and its negative control with
+Wrapped-list readback (`tests/startup_list_copy_texture_warp.cpp`): two images round-trip through array
+slices 1 and 2 of a 2-mip, 3-slice texture (upload buffer, texture, readback buffer, byte-for-byte), and a
+list with an out-of-range subresource, an index of `0xffffffff` and a footprint format mismatch is refused
+before any desktop copy, leaving a sentinel-filled readback buffer unchanged. Reproduce the portable check
+with its negative controls and the WARP and hardware runs with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.

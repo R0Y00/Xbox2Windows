@@ -8,9 +8,20 @@ volatile LONG list_copy_texture_forwarded, list_copy_texture_refused;
 
 namespace {
 
+// Memory planes of a format on the resource's device (1 when the device cannot say).
+UINT copy_texture_planes(ID3D12Resource* resource, DXGI_FORMAT format)
+{
+    ID3D12Device* device = nullptr;
+    if (FAILED(resource->GetDevice(IID_PPV_ARGS(&device))) || !device) return 1;
+    D3D12_FEATURE_DATA_FORMAT_INFO info{format, 1};
+    const bool known = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof(info)));
+    device->Release();
+    return known && info.PlaneCount ? info.PlaneCount : 1;
+}
+
 // One side of the copy, read from the desktop resource it names. False when the location is unusable.
 bool copy_texture_side(const D3D12_TEXTURE_COPY_LOCATION* location, ID3D12Resource*& real, x2w_list_copy_texture::Side& side,
-                       DXGI_FORMAT& format)
+                       DXGI_FORMAT& format, bool& bad_subresource)
 {
     Wrapper* w = location && x2w_local::readable(location, sizeof(*location)) ? as_wrapper(location->pResource) : nullptr;
     if (!w || w->own().kind != resource_kind || !w->own().real) return false;
@@ -18,7 +29,8 @@ bool copy_texture_side(const D3D12_TEXTURE_COPY_LOCATION* location, ID3D12Resour
     const D3D12_RESOURCE_DESC desc = real->GetDesc();
     side = {};
     side.block_w = side.block_h = 1;
-    side.multisampled = desc.SampleDesc.Count > 1;
+    side.samples = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
+    side.mips = side.array_size = side.planes = 1;
     if (location->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return false;
         const auto& fp = location->PlacedFootprint;
@@ -29,12 +41,23 @@ bool copy_texture_side(const D3D12_TEXTURE_COPY_LOCATION* location, ID3D12Resour
         side.offset = fp.Offset;
         side.row_pitch = fp.Footprint.RowPitch;
         side.resource_bytes = desc.Width;
+        side.format = fp.Footprint.Format;
         format = fp.Footprint.Format;
         return true;
     }
     if (location->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX || desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return false;
-    const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
-    const UINT mip = location->SubresourceIndex % mips;
+    side.mips = desc.MipLevels ? desc.MipLevels : 1;
+    side.array_size = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+    side.planes = copy_texture_planes(real, desc.Format);
+    side.subresource = location->SubresourceIndex;
+    side.format = desc.Format;
+    // The index must lie inside mips * array slices * planes; the mip it names sizes this side.
+    x2w_list_copy_texture::Subresource parts{};
+    if (!x2w_list_copy_texture::decode_subresource(side.subresource, side.mips, side.array_size, side.planes, parts)) {
+        bad_subresource = true;
+        return false;
+    }
+    const UINT mip = parts.mip;
     side.kind = x2w_list_copy_texture::Kind::subresource;
     side.width = static_cast<UINT>((std::max<UINT64>)(1, desc.Width >> mip));
     side.height = (std::max<UINT>)(1, desc.Height >> mip);
@@ -86,8 +109,12 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
     ID3D12Resource *real_dst = nullptr, *real_src = nullptr;
     x2w_list_copy_texture::Side side_dst{}, side_src{};
     DXGI_FORMAT format_dst = DXGI_FORMAT_UNKNOWN, format_src = DXGI_FORMAT_UNKNOWN;
-    if (!copy_texture_side(dst, real_dst, side_dst, format_dst) || !copy_texture_side(src, real_src, side_src, format_src))
-        return refuse("unknown_resource");
+    bool bad_subresource = false;
+    if (!copy_texture_side(dst, real_dst, side_dst, format_dst, bad_subresource) ||
+        !copy_texture_side(src, real_src, side_src, format_src, bad_subresource))
+        return refuse(bad_subresource ? "bad_subresource" : "unknown_resource");
+    // Planar (depth-stencil, video) copies name a plane footprint format; only single-plane copies are forwarded.
+    if (side_dst.planes > 1 || side_src.planes > 1) return refuse("planar_unsupported");
     ID3D12Resource* texture = side_dst.kind == x2w_list_copy_texture::Kind::subresource ? real_dst : real_src;
     if (side_dst.kind == x2w_list_copy_texture::Kind::subresource || side_src.kind == x2w_list_copy_texture::Kind::subresource) {
         x2w_list_copy_texture::Side blocks{};

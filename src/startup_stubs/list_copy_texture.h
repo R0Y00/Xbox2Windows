@@ -21,9 +21,30 @@ struct Side {
     std::uint64_t offset;
     std::uint32_t row_pitch, bytes_per_block;
     std::uint64_t resource_bytes;
-    bool multisampled;
+    std::uint32_t samples;           // sample count; a footprint (buffer) side is always 1
     std::uint32_t block_w, block_h;  // texels per block (4 x 4 for block-compressed formats, else 1 x 1)
+    std::uint32_t format;            // DXGI_FORMAT value of the subresource, or of the footprint
+    // A subresource side: its index and the resource's counts, for D3D12's
+    // index = mip + slice * mips + plane * mips * array_size.
+    std::uint32_t subresource, mips, array_size, planes;
 };
+
+struct Subresource {
+    std::uint32_t mip, slice, plane;
+};
+
+// Splits a subresource index by the desktop's math. False when the index is outside
+// mips * array_size * planes (or a count is zero), so no mip, slice or plane aliases another.
+inline bool decode_subresource(std::uint32_t index, std::uint32_t mips, std::uint32_t array_size, std::uint32_t planes,
+                               Subresource& out) noexcept
+{
+    if (!mips || !array_size || !planes) return false;
+    const std::uint64_t per_plane = std::uint64_t{mips} * array_size;
+    if (index >= per_plane * planes) return false;
+    out = {static_cast<std::uint32_t>(index % mips), static_cast<std::uint32_t>((index / mips) % array_size),
+           static_cast<std::uint32_t>(index / per_plane)};
+    return true;
+}
 
 struct Box {
     std::uint32_t left, top, front, right, bottom, back;
@@ -38,8 +59,11 @@ enum class Verdict {
     bad_pitch,          // a footprint row pitch below one row, or not a multiple of 256
     bad_offset,         // a footprint offset that is not a multiple of 512
     footprint_overflow, // the footprint reaches past the end of its buffer
-    sample_mismatch,    // a multisampled side paired with a single-sample one
-    bad_alignment       // a block-compressed copy that does not start on a block
+    sample_mismatch,    // the two sides differ in sample count
+    bad_alignment,      // a block-compressed copy that does not start on a block
+    bad_subresource,    // an index outside the resource's mips * array slices * planes
+    format_mismatch,    // the two sides name different formats
+    partial_multisample // a multisampled copy that is not the whole subresource at the origin
 };
 
 inline const char* name(Verdict v) noexcept
@@ -55,33 +79,64 @@ inline const char* name(Verdict v) noexcept
     case Verdict::footprint_overflow: return "footprint_overflow";
     case Verdict::sample_mismatch: return "sample_mismatch";
     case Verdict::bad_alignment: return "bad_alignment";
+    case Verdict::bad_subresource: return "bad_subresource";
+    case Verdict::format_mismatch: return "format_mismatch";
+    case Verdict::partial_multisample: return "partial_multisample";
     }
     return "unknown";
 }
 
-// Bytes a footprint reaches for a w x h x d copy that starts at texel (ox, oy, oz) inside it, from its offset
-// (the last row is not padded; slices are as tall as the footprint, not the copy).
-inline bool footprint_end(const Side& s, std::uint32_t w, std::uint32_t h, std::uint32_t d, std::uint32_t ox, std::uint32_t oy,
-                          std::uint32_t oz, std::uint64_t& end) noexcept
+// a * b and a + b with the overflow reported, so no step of the footprint arithmetic wraps.
+inline bool checked_mul(std::uint64_t a, std::uint64_t b, std::uint64_t& out) noexcept
 {
-    if (!w || !h || !d) { end = s.offset; return true; }
-    const std::uint64_t row = std::uint64_t{(w + s.block_w - 1) / s.block_w} * s.bytes_per_block;
-    const std::uint64_t rows = (h + s.block_h - 1) / s.block_h;
-    const std::uint64_t start_x = std::uint64_t{ox / s.block_w} * s.bytes_per_block;
+    if (a && b > ~std::uint64_t{0} / a) return false;
+    out = a * b;
+    return true;
+}
+inline bool checked_add(std::uint64_t a, std::uint64_t b, std::uint64_t& out) noexcept
+{
+    if (b > ~std::uint64_t{0} - a) return false;
+    out = a + b;
+    return true;
+}
+
+enum class End { ok, over_pitch, overflow };
+
+// Bytes a footprint reaches for a w x h x d copy that starts at texel (ox, oy, oz) inside it, from its offset
+// (the last row is not padded; slices are as tall as the footprint, not the copy). Every multiply and add is checked.
+inline End footprint_end(const Side& s, std::uint32_t w, std::uint32_t h, std::uint32_t d, std::uint32_t ox, std::uint32_t oy,
+                         std::uint32_t oz, std::uint64_t& end) noexcept
+{
+    if (!w || !h || !d) { end = s.offset; return End::ok; }
+    const std::uint64_t blocks_w = (std::uint64_t{w} + s.block_w - 1) / s.block_w;
+    const std::uint64_t rows = (std::uint64_t{h} + s.block_h - 1) / s.block_h;
     const std::uint64_t start_row = oy / s.block_h;
     const std::uint64_t slice_rows = (std::uint64_t{s.height} + s.block_h - 1) / s.block_h;
-    if (start_x + row > s.row_pitch) return false;
-    const std::uint64_t slice = std::uint64_t{s.row_pitch} * (start_row + rows - 1) + start_x + row;
-    const std::uint64_t total = std::uint64_t{s.row_pitch} * slice_rows * (std::uint64_t{oz} + d - 1) + slice;
-    end = s.offset + total;
-    return end >= s.offset;
+    std::uint64_t row = 0, start_x = 0, row_end = 0;
+    if (!checked_mul(blocks_w, s.bytes_per_block, row) || !checked_mul(ox / s.block_w, s.bytes_per_block, start_x) ||
+        !checked_add(start_x, row, row_end))
+        return End::overflow;
+    if (row_end > s.row_pitch) return End::over_pitch;
+    std::uint64_t last_row = 0, row_bytes = 0, slice = 0, slice_bytes = 0, slices = 0, slices_bytes = 0, total = 0;
+    if (!checked_add(start_row, rows - 1, last_row) || !checked_mul(s.row_pitch, last_row, row_bytes) ||
+        !checked_add(row_bytes, row_end, slice) || !checked_mul(s.row_pitch, slice_rows, slice_bytes) ||
+        !checked_add(oz, d - 1, slices) || !checked_mul(slice_bytes, slices, slices_bytes) ||
+        !checked_add(slices_bytes, slice, total) || !checked_add(s.offset, total, end))
+        return End::overflow;
+    return End::ok;
 }
 
 // box == nullptr copies the whole source (for a footprint source, the whole footprint).
 inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uint32_t z, const Side& src, const Box* box) noexcept
 {
     if (dst.kind == Kind::placed_footprint && src.kind == Kind::placed_footprint) return Verdict::buffer_to_buffer;
-    if (dst.multisampled != src.multisampled) return Verdict::sample_mismatch;
+    for (const Side* s : {&dst, &src}) {
+        Subresource unused{};
+        if (s->kind == Kind::subresource && !decode_subresource(s->subresource, s->mips, s->array_size, s->planes, unused))
+            return Verdict::bad_subresource;
+    }
+    if (dst.samples != src.samples) return Verdict::sample_mismatch;
+    if (dst.format != src.format) return Verdict::format_mismatch;
     const Box whole{0, 0, 0, src.width, src.height, src.depth};
     const Box use = box ? *box : whole;
     if (use.left >= use.right || use.top >= use.bottom || use.front >= use.back) return Verdict::bad_box;
@@ -89,6 +144,10 @@ inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uin
     const Side& tex = dst.kind == Kind::subresource ? dst : src;  // the side that knows the block size
     if (x % tex.block_w || use.left % tex.block_w || y % tex.block_h || use.top % tex.block_h) return Verdict::bad_alignment;
     const std::uint32_t w = use.right - use.left, h = use.bottom - use.top, d = use.back - use.front;
+    // A multisampled copy is whole subresource to whole subresource of equal size.
+    if (src.samples > 1 && (x || y || z || w != src.width || h != src.height || d != src.depth || w != dst.width ||
+                            h != dst.height || d != dst.depth))
+        return Verdict::partial_multisample;
     if (std::uint64_t{x} + w > dst.width || std::uint64_t{y} + h > dst.height || std::uint64_t{z} + d > dst.depth)
         return Verdict::dest_overflow;
     for (const Side* s : {&dst, &src}) {
@@ -97,8 +156,9 @@ inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uin
         if (s->offset % 512) return Verdict::bad_offset;
         std::uint64_t end = 0;
         const bool is_dst = s == &dst;
-        if (!footprint_end(*s, w, h, d, is_dst ? x : use.left, is_dst ? y : use.top, is_dst ? z : use.front, end))
-            return Verdict::bad_pitch;
+        const End reach = footprint_end(*s, w, h, d, is_dst ? x : use.left, is_dst ? y : use.top, is_dst ? z : use.front, end);
+        if (reach == End::over_pitch) return Verdict::bad_pitch;
+        if (reach == End::overflow) return Verdict::footprint_overflow;
         if (end > s->resource_bytes) return Verdict::footprint_overflow;
     }
     return Verdict::ok;
