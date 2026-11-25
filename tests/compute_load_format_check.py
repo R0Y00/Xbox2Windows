@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -311,33 +312,51 @@ def binary(directory, assembler, objcopy, library):
     return 0
 
 
+def check_references(renderer, backend, shader, paths, jobs):
+    result = subprocess.run([renderer, backend, "--compute-store-batch", shader, *paths],
+                            capture_output=True, text=True)
+    expected = ["pass" if job[0] == "pass" else "mismatch" for job in jobs]
+    statuses = [line for line in result.stdout.splitlines() if line.startswith("case=")]
+    markers = [f"case={i} status={status}" for i, status in enumerate(expected)]
+    sections = re.split(r"^case=(\d+) path=(.*)\n", result.stderr, flags=re.MULTILINE)
+    summaries = re.findall(r"^groups=\d+ compared_words=320 mismatches=(\d+)$", result.stdout, re.MULTILINE)
+    if (result.returncode != int("mismatch" in expected) or statuses != markers
+            or len(sections) != 1 + 3 * len(jobs) or len(summaries) != len(jobs)):
+        raise AssertionError(f"Unexpected compute batch result\n{result.stdout}{result.stderr}")
+    for i, (check, label, diagnostic, _data, _source) in enumerate(jobs):
+        index, path, messages = sections[1 + 3*i:4 + 3*i]
+        if (index != str(i) or path != str(paths[i]) or (int(summaries[i]) == 0) != (check == "pass")
+                or (diagnostic and diagnostic not in messages)):
+            raise AssertionError(f"{NAME}: {label}\n{result.stdout}{result.stderr}")
+    print(result.stdout, end="")
+
+
 def draw(directory, compiler, renderer, backend):
     """Dispatch with chosen t0 words; wrong references and mutated sources must fail.
 
-    Every case owns its case and cso files, so the launches run on a small thread pool. Results are
-    checked afterwards in the original order with the original messages.
+    The reference cases share one device. Each independently compiled mutation keeps its own
+    renderer process so compilation and readback can overlap with the reference checks.
     """
     src, cso = directory / "load.hlsl", directory / "load.cso"
     source = lower()
     src.write_text(source, encoding="ascii")
     subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
     words = source_words()
-    jobs = []  # (check, label, extra, case bytes, shader, mutated source or None)
+    jobs = []  # (check, label, extra, case bytes, mutated source or None)
 
     def add(check, label, groups, reference, formats=None, extra=None, mutated=None):
         data = (struct.pack("<321I", groups, *reference) + struct.pack("<16I", *(formats or constants()))
                 + struct.pack("<320I", *words))
         jobs.append((check, label, extra, data, mutated))
 
-    def run(number, job):
+    def run_mutation(number, job):
         _check, _label, _extra, data, mutated = job
-        case, shader = directory / f"case{number}.bin", cso
+        case = directory / f"case{number}.bin"
         case.write_bytes(data)
-        if mutated is not None:
-            shader = directory / f"mutated{number}.cso"
-            bad_src = directory / f"mutated{number}.hlsl"
-            bad_src.write_text(mutated, encoding="ascii")
-            subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", shader, bad_src], check=True)
+        shader = directory / f"mutated{number}.cso"
+        bad_src = directory / f"mutated{number}.hlsl"
+        bad_src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", shader, bad_src], check=True)
         return subprocess.run([renderer, backend, "--compute-store-case", shader, case],
                               capture_output=True, text=True)
 
@@ -370,6 +389,7 @@ def draw(directory, compiler, renderer, backend):
         if word is None:
             raise AssertionError(f"{NAME}: reference '{label}' matches the expected words")
         add("wrong", label, 2, reference, extra=f"word={word} expected=")
+    reference_count = len(jobs)
     for label, old, new, run_index in MUTATIONS:
         mutated = source.replace(old, new, 1)
         if mutated == source:
@@ -380,21 +400,16 @@ def draw(directory, compiler, renderer, backend):
             add("mutation", label, 2, unwritten, invalid_formats(run_index), mutated=mutated)
 
     with ThreadPoolExecutor(max_workers=min(LAUNCH_THREADS, os.cpu_count() or 1)) as pool:
-        results = list(pool.map(lambda item: run(*item), enumerate(jobs)))
-    for (check, label, extra, _data, _mutated), result in zip(jobs, results):
-        if check == "pass":
-            print(f"{NAME}: {label}", flush=True)
-            sys.stdout.write(result.stdout)
-            if result.returncode:
-                sys.stderr.write(result.stderr)
-                return 1
-        elif check == "placeholder":
-            if result.returncode != 1 or extra not in result.stderr:
-                raise AssertionError(f"{NAME}: {label} escaped detection\n{result.stderr}")
-        elif check == "wrong":
-            if result.returncode != 1 or extra not in result.stderr:
-                raise AssertionError(f"{NAME}: reference '{label}' escaped detection\n{result.stderr}")
-        elif result.returncode != 1 or "Compute readback differs" not in result.stderr:
+        paths = [directory / f"case{i}.bin" for i in range(reference_count)]
+        for path, job in zip(paths, jobs):
+            path.write_bytes(job[3])
+        references = pool.submit(check_references, renderer, backend, cso, paths, jobs[:reference_count])
+        mutants = [(job[1], pool.submit(run_mutation, i, job))
+                   for i, job in enumerate(jobs[reference_count:], reference_count)]
+        references.result()
+    for label, future in mutants:
+        result = future.result()
+        if result.returncode != 1 or "Compute readback differs" not in result.stderr:
             raise AssertionError(f"{NAME}: mutation '{label}' escaped detection\n{result.stderr}")
     print(f"{NAME}: {2 + len(INVALID)} dispatches, {len(WRONG) + len(INVALID) + 1} wrong references and "
           f"{len(MUTATIONS)} mutated sources checked")
