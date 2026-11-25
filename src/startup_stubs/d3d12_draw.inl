@@ -1070,8 +1070,19 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             if (!plan.bytes(i) || plan.rows[i] != console_layout->rows(i) ||
                 plan.row_bytes[i] != u64{console_layout->columns(i)} * console_layout->bytes_per_element) return false;
     }
+    // A texture given the 4 KiB allocation answer is read in the compact plan XG describes and writes for it
+    // (small_texture_4k.h); its rows must be the footprint's rows, level by level. Address-only textures
+    // (single-element, or a console layout named in Layout) are tiled and keep their own paths.
+    x2w_startup::SmallTexturePlan compact;
+    const bool is_compact = original && !tiled && x2w_startup::small_texture_4k_plan(original->console, compact);
+    if (is_compact) {
+        bool rows_match = compact.levels == plan.count;
+        for (UINT i = 0; rows_match && i < plan.count; ++i)
+            rows_match = compact.level[i].rows == plan.rows[i] && compact.level[i].row_bytes == plan.row_bytes[i];
+        if (!rows_match) return true;
+    }
     const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->bytes()
-        : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
+        : tiled && !single ? surface.size() : is_compact ? compact.bytes : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
     // A single texel (at most 16 bytes) is rehashed on every bind, so a write between two draws is seen.
@@ -1166,7 +1177,17 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 const auto& fp = plan.placed[i];
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
-                if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+                if (is_compact) {
+                    auto* const rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+                    if (!rows) {
+                        state.done = false;
+                        return true;
+                    }
+                    const auto& level = compact.level[i];
+                    for (u64 y = 0; y < level.rows; ++y)
+                        std::memcpy(rows + y * fp.Footprint.RowPitch, memory + level.offset + y * level.row_bytes,
+                                    static_cast<std::size_t>(level.row_bytes));
+                } else if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
                     state.done = false;
                     return true;
                 }
@@ -1182,8 +1203,9 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
     static LONG shown;
     if (first_calls(shown, 12))
-        log("x2w-draw texture upload %p %llux%u x%u mips %u format %d from %p (%llu KiB)%s", static_cast<void*>(texture), desc.Width,
-            desc.Height, slices, mips, desc.Format, static_cast<const void*>(memory), total >> 10, announced ? " (announced write)" : "");
+        log("x2w-draw texture upload %p %llux%u x%u mips %u format %d from %p (%llu KiB)%s%s", static_cast<void*>(texture), desc.Width,
+            desc.Height, slices, mips, desc.Format, static_cast<const void*>(memory), total >> 10, announced ? " (announced write)" : "",
+            is_compact ? " (compact plan of the 4 KiB allocation answer)" : "");
     return true;
 }
 

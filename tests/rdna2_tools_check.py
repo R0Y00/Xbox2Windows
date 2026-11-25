@@ -5429,6 +5429,62 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual([d["raw"] for d in control["unsupported_details"]],
                          ["s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1"])
 
+    def test_masked_region_forms_are_supported(self):
+        """The structured masked region forms pixel_aot lowers count as supported, in both wave widths, and an
+        if/else region built from them is accepted end to end; neighbouring saveexec and exec forms stay refused."""
+        for line in ("s_and_saveexec_b64 s[60:61], vcc", "s_and_saveexec_b64 s[60:61], s[62:63]",
+                     "s_and_saveexec_b32 s60, vcc_lo", "s_and_saveexec_b32 s60, s62",
+                     "s_or_b64 exec, exec, s[60:61]", "s_or_b32 exec_lo, exec_lo, s60",
+                     "s_andn2_b64 exec, s[60:61], exec", "s_andn2_b32 exec_lo, s60, exec_lo",
+                     "s_cbranch_execz 2", "s_cbranch_execz -1", "s_cbranch_execz 0x10", "s_cbranch_execz 32767",
+                     "s_cbranch_execz -32768", "s_cbranch_execz 0x7fff", "s_cbranch_execz -0x8000",
+                     "s_and_saveexec_b32 s105, s104", "s_or_b64 exec, exec, s[104:105]"):
+            self.assertTrue(is_instruction_supported(line), line)
+        # The register check covers only the exec forms: ordinary scalar s_or/s_andn2 lines keep their verdict.
+        import scan_unsupported_shaders as scanner
+        for line in ("s_or_b32 s5, s6, s7", "s_or_b32 s106, s1, s2", "s_andn2_b64 s[61:62], s[60:61], s[62:63]"):
+            self.assertEqual(is_instruction_supported(line),
+                             any(pattern.match(line) for pattern in scanner.COMPILED_SUPPORTED_PATTERNS), line)
+        for line in ("s_or_saveexec_b64 s[60:61], s[62:63]", "s_andn2_saveexec_b64 s[60:61], vcc",
+                     "s_and_saveexec_b32 s60, vcc", "s_and_saveexec_b64 s60, vcc",
+                     "s_or_b64 exec, s[60:61], exec", "s_andn2_b64 exec, exec, s[60:61]",
+                     "s_andn2_b32 exec_lo, exec_lo, s60", "s_cbranch_execnz 2", "s_xor_b64 exec, exec, s[60:61]",
+                     # Registers and displacements pixel_aot refuses: an odd or out-of-range pair, an SGPR past s105,
+                     # a displacement outside 16 signed bits.
+                     "s_and_saveexec_b64 s[61:62], vcc", "s_and_saveexec_b64 s[106:107], vcc",
+                     "s_and_saveexec_b64 s[60:61], s[63:64]", "s_and_saveexec_b32 s106, vcc_lo",
+                     "s_and_saveexec_b32 s60, s106", "s_or_b64 exec, exec, s[61:62]", "s_or_b32 exec_lo, exec_lo, s106",
+                     "s_andn2_b64 exec, s[106:107], exec", "s_andn2_b32 exec_lo, s106, exec_lo",
+                     "s_cbranch_execz 40000", "s_cbranch_execz -32769", "s_cbranch_execz 0x8000",
+                     "s_cbranch_execz -0x8001", "s_cbranch_execz 010"):
+            self.assertFalse(is_instruction_supported(line), line)
+        prefix = ["s_mov_b64 s[50:51], exec", "s_wqm_b64 exec, exec", "s_mov_b32 m0, s24",
+                  "v_interp_p1_f32_e32 v8, v0, attr0.x", "v_interp_p1_f32_e32 v9, v0, attr0.y",
+                  "v_interp_p2_f32_e32 v9, v1, attr0.y", "v_interp_p2_f32_e32 v8, v1, attr0.x",
+                  "s_and_b64 exec, exec, s[50:51]", "s_mov_b32 s21, 0", "s_load_dwordx8 s[28:35], s[20:21], null",
+                  "s_mov_b32 s40, 1", "s_mov_b32 s41, 2", "s_mov_b32 s42, 3", "s_mov_b32 s43, 4",
+                  "s_waitcnt lgkmcnt(0)",
+                  "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                  "s_waitcnt vmcnt(0)"]
+        region = ["v_cmp_lt_f32_e64 vcc_lo, v12, v13", "s_and_saveexec_b64 s[60:61], vcc", "v_mov_b32_e32 v14, v12",
+                  "s_andn2_b64 exec, s[60:61], exec", "v_mov_b32_e32 v14, v13", "s_or_b64 exec, exec, s[60:61]"]
+        tail = ["v_cvt_pkrtz_f16_f32_e32 v16, v12, v13", "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+                "exp mrt0 v16, v16, v17, v17 done compr vm", "s_endpgm"]
+        wave32 = {"s_mov_b64 s[50:51], exec": "s_mov_b32 s50, exec_lo", "s_wqm_b64 exec, exec": "s_wqm_b32 exec_lo, exec_lo",
+                  "s_and_b64 exec, exec, s[50:51]": "s_and_b32 exec_lo, exec_lo, s50",
+                  "s_and_saveexec_b64 s[60:61], vcc": "s_and_saveexec_b32 s60, vcc_lo",
+                  "s_andn2_b64 exec, s[60:61], exec": "s_andn2_b32 exec_lo, s60, exec_lo",
+                  "s_or_b64 exec, exec, s[60:61]": "s_or_b32 exec_lo, exec_lo, s60"}
+        for label, program, wave_size in (
+                ("wave64", [*prefix, *region, *tail], None),
+                ("wave32", [wave32.get(line, line) for line in [*prefix, *region, *tail]], 32)):
+            with self.subTest(wave=label):
+                result = analyze_shader_instructions(f"ps_masked_region_{label}", program, wave_size=wave_size)
+                self.assertTrue(result["translator_accepted"], result.get("lower_error"))
+                self.assertEqual(result["unsupported_details"], [])
+                self.assertTrue(result["is_fully_supported"])
+                self.assertEqual(result["compatibility_category"], "accepted")
+
     def test_binary_scan_hwreg_recognition_stays_separate_from_translation_support(self):
         """Issue #938 follow-up: hwreg SOPK opcodes are recognized ISA opcodes while s_getreg/s_setreg stay unlowered."""
         for op in ("s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32"):

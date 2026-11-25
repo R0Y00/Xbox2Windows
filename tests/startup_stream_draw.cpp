@@ -190,6 +190,8 @@ int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input
     return binding.table ? 0 : 41;
 }
 
+bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding);
+
 bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
 {
     std::ifstream file(input.blocks, std::ios::binary);
@@ -217,7 +219,45 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
     void* texture = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
         D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+    return bind_table(desktop, guest, texture, binding);
+}
 
+bool bind_small4k(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
+{
+    std::ifstream file(input.blocks, std::ios::binary);
+    const std::vector<unsigned char> texels{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{}};
+    if (texels.size() != 32 * 32 * 4 + 16 * 16 * 4) return false;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0x1000, 32, 32, 1, 2,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    void** computer = nullptr;
+    if (FAILED(XGCreateTextureComputer(&desc, &computer, 0, 0)) || !computer) return false;
+    const auto table = static_cast<void**>(computer[0]);
+    using Query = HRESULT(*)(void*, unsigned char*);
+    using Write = HRESULT(*)(void*, unsigned char*, UINT, UINT, const unsigned char*, UINT, UINT);
+    std::array<unsigned char, 0x18 + 4 * 0x6c8 + 8> layout{};
+    UINT64 total = 0, alignment = 0;
+    HRESULT hr = reinterpret_cast<Query>(table[2])(computer, layout.data());
+    std::memcpy(&total, layout.data(), sizeof total);
+    std::memcpy(&alignment, layout.data() + 8, sizeof alignment);
+    std::printf("small4k: slot 2 total 0x%llx alignment 0x%llx\n", static_cast<unsigned long long>(total),
+                static_cast<unsigned long long>(alignment));
+    if (SUCCEEDED(hr) && (total != 0x2000 || alignment != 0x1000)) hr = E_FAIL;
+    auto* memory = SUCCEEDED(hr) ? static_cast<unsigned char*>(VirtualAlloc(nullptr, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) : nullptr;
+    DWORD old = 0;
+    if (!memory || !VirtualProtect(memory + 0x2000, 0x1000, PAGE_NOACCESS, &old)) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = reinterpret_cast<Write>(table[8])(computer, memory, 0, 0, texels.data(), 128, 0);
+    if (SUCCEEDED(hr)) hr = reinterpret_cast<Write>(table[8])(computer, memory, 0, 1, texels.data() + 32 * 32 * 4, 64, 0);
+    reinterpret_cast<UINT64(*)(void*)>(table[1])(computer);
+    if (FAILED(hr)) return false;
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(memory), arg(&desc),
+        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+    return bind_table(desktop, guest, texture, binding);
+}
+
+// A shader-visible heap whose first entry is a view of every mip of texture; binding.table is its GPU handle.
+bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding)
+{
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT entries = (32 + increment - 1) / increment;
     binding.views.resize(static_cast<std::size_t>(entries) * increment);
@@ -248,13 +288,15 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
     const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
     const bool legacy = !single;
-    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
     if (bc7 && bc7->packed) {
         if (const int rc = bind_packed(desktop.Get(), guest, *bc7, binding)) return rc;
+    } else if (bc7 && bc7->small4k) {
+        if (!bind_small4k(desktop.Get(), guest, *bc7, binding)) return 35;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first

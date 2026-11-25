@@ -140,6 +140,8 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/xgameruntime_table_check.py
 ./out/pe-env/bin/python -B tests/docs_links_check.py
 ./out/pe-env/bin/python -B tests/bidi_controls_check.py
+# With no arguments, this tests result classification without Vulkan or DXC.
+./out/pe-env/bin/python -B tests/pixel_denorm_vulkan_check.py
 ./out/pe-env/bin/python -B tests/gpu_report_format_check.py
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
 ./out/pe-env/bin/python -B tests/rectlist_topology_check.py
@@ -150,6 +152,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
+./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_a16_check.py
@@ -171,7 +174,9 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
+./out/pe-env/bin/python -B tests/startup_build_rev_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_root_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
 ./out/pe-env/bin/python -B tests/startup_buffer_address_check.py
@@ -182,6 +187,8 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ./out/pe-env/bin/python -B tests/compute_alu_bcnt64_check.py
 ./out/pe-env/bin/python -B tests/compute_load_format_check.py
+./out/pe-env/bin/python -B tests/compute_heap_view_check.py
+./out/pe-env/bin/python -B tests/compute_heap_store_check.py
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py

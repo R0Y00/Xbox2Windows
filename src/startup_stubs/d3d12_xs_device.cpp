@@ -13,6 +13,7 @@
 #define X2W_TRAP_MODULE "d3d12_xs.dll"
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
+#include "x2w_build_rev.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/overlay_window.h"
@@ -44,6 +45,7 @@
 #include "command_signature_filter.h"
 #include "console_plane_size.h"
 #include "descriptor_heap_type.h"
+#include "small_texture_4k.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
@@ -886,6 +888,17 @@ void note_console_size(const D3D12_RESOURCE_DESC& desc, const D3D12_RESOURCE_ALL
             info.SizeInBytes, desc.Width, desc.Height, desc.Format, desc.SampleDesc.Count);
 }
 
+// A single small 2D texture asked with a 4 KiB alignment gets the console's 4 KiB answer (small_texture_4k.h).
+bool small_texture_answer(UINT count, const D3D12_RESOURCE_DESC* descs, D3D12_RESOURCE_ALLOCATION_INFO& info)
+{
+    if (count != 1 || !descs || !x2w_startup::small_texture_4k(descs[0], info)) return false;
+    static LONG calls;
+    if (first_calls(calls, 8))
+        log("x2w-d3d12 allocation info: 4 KiB answer size 0x%llx for %llux%u mips %u format %d", info.SizeInBytes, descs[0].Width,
+            descs[0].Height, descs[0].MipLevels, descs[0].Format);
+    return true;
+}
+
 // Device slot 25, desktop GetResourceAllocationInfo(visibleMask, count, descs), returned by value.
 void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UINT count, const D3D12_RESOURCE_DESC* descs)
 {
@@ -896,6 +909,7 @@ void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UIN
     D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(mask, count, copies.data());
     // A single description of a family that is larger on desktop gets its console size (console_plane_size.h).
     if (count == 1 && x2w_startup::console_plane_size(descs[0], info)) note_console_size(descs[0], info);
+    small_texture_answer(count, descs, info);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
     if (first_calls(calls))
@@ -1022,6 +1036,7 @@ void* __stdcall device_resource_allocation_info1(void* a, void* b, UINT mask, UI
         if (info1) *info1 = {0, info.Alignment, info.SizeInBytes};
         note_console_size(descs[0], info);
     }
+    if (small_texture_answer(count, descs, info) && info1) *info1 = {0, info.Alignment, info.SizeInBytes};
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
     if (first_calls(calls))
@@ -3901,9 +3916,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (shown_in_window) {
         if (frame % 30 == 0) {
-            wchar_t text[200];
-            swprintf(text, 200, L"Xbox2Windows - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
-                     frame, frame * 1000.0 / (now - started ? now - started : 1), translated_draws);
+            // About 100 fixed characters, the revision (at most 46) and three numbers fit in 256.
+            wchar_t text[256];
+            swprintf(text, 256, L"Xbox2Windows %ls - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
+                     x2w_build_rev_w, frame, frame * 1000.0 / (now - started ? now - started : 1), translated_draws);
             SetWindowTextW(output_window(), text);
         }
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
@@ -4236,8 +4252,8 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
         ? D3D12CreateDevice(adapter ? reinterpret_cast<IUnknown*>(unwrap(reinterpret_cast<u64>(adapter))) : nullptr,
                             D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device))
         : E_NOINTERFACE;
-    log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx", static_cast<void*>(adapter), block,
-        text, static_cast<unsigned long>(hr));
+    log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx build=%s", static_cast<void*>(adapter),
+        block, text, static_cast<unsigned long>(hr), x2w_build_rev);
     if (FAILED(hr)) return hr;
     if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     x2w_startup::attach_device(device, out);
