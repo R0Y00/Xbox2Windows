@@ -1086,7 +1086,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `bank_mask` and `bound_ctrl:1` or none, lowers on `v_mov_b32` and the VOP1/VOP2 float, integer and
   integer-to-float tables as one read of lane k of the quad, `QuadReadLaneAt`. The four lanes of a pixel
   quad are one 2 x 2 pixel block (lane = x & 1 | (y & 1) << 1). The lowering applies to straight-line pixel
-  stages with a known entry mask only, where no lane of the quad can be off. `QuadReadLaneAt` is shader model
+  stages that ran `s_wqm exec, exec` with EXEC unchanged since, so no lane of the quad is off; without that proof the broadcast is refused. `QuadReadLaneAt` is shader model
   6.0, so such a pixel stage compiles as `ps_6_0` with DXC (set `X2W_DXC`, or put `dxc.exe` in the Windows
   Kits `bin` folder or on `PATH`), and its vertex stage as `vs_6_0` too, because D3D12 rejects a pipeline
   state that mixes DXBC and DXIL; every other pixel stage stays `ps_5_1` with FXC. Swaps, pair broadcasts,

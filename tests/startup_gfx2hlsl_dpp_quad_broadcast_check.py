@@ -74,8 +74,10 @@ def vop1(op, vdst, src0):
     return struct.pack('<I', 0x7e000000 | vdst << 17 | op << 9 | 0x100 | src0)
 
 
+WQM = struct.pack('<I', 0xBE800000 | 126 << 16 | 0x0a << 8 | 126)  # s_wqm_b64 exec, exec
 DPP = ' row_mask:0xf bank_mask:0xf'
 INT_SOURCE = """\
+s_wqm_b64 exec, exec
 v_mov_b32_dpp v1, v0 quad_perm:[0,0,0,0]%(m)s bound_ctrl:1
 v_mov_b32_dpp v2, v0 quad_perm:[1,1,1,1]%(m)s
 v_mov_b32_dpp v3, v0 quad_perm:[2,2,2,2]%(m)s bound_ctrl:1
@@ -83,18 +85,21 @@ v_add_nc_u32_dpp v4, v0, v1 quad_perm:[3,3,3,3]%(m)s bound_ctrl:1
 exp mrt0 v1, v2, v3, v4 done vm
 s_endpgm
 """ % {'m': DPP}
-INT_WORDS = (dpp16(False, 1, 1, 0, 0, (0, 0, 0, 0), True) + dpp16(False, 1, 2, 0, 0, (1, 1, 1, 1), False)
+INT_WORDS = (WQM + dpp16(False, 1, 1, 0, 0, (0, 0, 0, 0), True) + dpp16(False, 1, 2, 0, 0, (1, 1, 1, 1), False)
              + dpp16(False, 1, 3, 0, 0, (2, 2, 2, 2), True) + dpp16(True, 0x25, 4, 0, 1, (3, 3, 3, 3), True)
              + export((1, 2, 3, 4)))
 FLOAT_SOURCE = """\
+s_wqm_b64 exec, exec
 v_cvt_f32_u32_e32 v5, v0
 v_sub_f32_dpp v6, v5, v5 quad_perm:[1,1,1,1]%(m)s bound_ctrl:1
 v_mul_f32_dpp v7, -v5, v5 quad_perm:[0,0,0,0]%(m)s bound_ctrl:1
 exp mrt0 v6, v7, v5, v5 done vm
 s_endpgm
 """ % {'m': DPP}
-FLOAT_WORDS = (vop1(6, 5, 0) + dpp16(True, 0x4, 6, 5, 5, (1, 1, 1, 1), True)
+FLOAT_WORDS = (WQM + vop1(6, 5, 0) + dpp16(True, 0x4, 6, 5, 5, (1, 1, 1, 1), True)
                + dpp16(True, 0x8, 7, 5, 5, (0, 0, 0, 0), True, neg0=True) + export((6, 7, 5, 5)))
+NO_WQM_WORDS = INT_WORDS[len(WQM):]  # the entry EXEC may leave out lanes of a partly covered quad
+OTHER_WQM_WORDS = struct.pack('<I', 0xBE800000 | 2 << 16 | 0x0a << 8) + NO_WQM_WORDS  # s_wqm_b64 s[2:3], s[0:1]
 FIXTURES = {'integer': (INT_SOURCE, INT_WORDS), 'float': (FLOAT_SOURCE, FLOAT_WORDS)}
 MUTATIONS = ('wrong lane', 'own lane')
 
@@ -156,16 +161,25 @@ def pixel_hlsl(kind, how='reference'):
 class Probe(G.Stage):
     """A pixel Stage with no pipeline: enough state for single instructions to be translated."""
 
-    def __init__(self, kind='ps', exec_known=True, branches=False):
+    def __init__(self, kind='ps', exec_known=True, branches=False, quad_exec=True):
         self.kind = kind
         self.lines, self.sym = [], {}
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
         self.exec_known, self.has_branches, self.blocks, self.quad_ops = exec_known, branches, [], False
+        self.quad_exec = quad_exec
 
 
 def refused(assembly, **kwargs):
     try:
         Probe(**kwargs).one(assembly.split(' ', 1)[0], assembly)
+    except G.Unsupported:
+        return True
+    return False
+
+
+def refused_in_stage(words):
+    try:
+        pixel_stage(words).hlsl_ps()
     except G.Unsupported:
         return True
     return False
@@ -221,6 +235,9 @@ def controls():
         check('refused: %s' % label, refused(line), line)
     check('refused: vertex stage', refused(sane, kind='vs'))
     check('refused: EXEC no longer the entry mask', refused(sane, exec_known=False))
+    check('refused: no s_wqm exec, exec before the broadcast', refused(sane, quad_exec=False))
+    check('refused: the stage translator without s_wqm', refused_in_stage(NO_WQM_WORDS))
+    check('refused: s_wqm into another register', refused_in_stage(OTHER_WQM_WORDS))
     check('refused: pixel stage with branches', refused(sane, branches=True))
     check('control: the sane line itself translates', not refused(sane))
 

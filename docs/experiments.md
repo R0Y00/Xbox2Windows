@@ -12148,6 +12148,12 @@ The [MASM fixture](../tests/cpu/vex_parity.asm) and [differential check](../test
 ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 ```
 
+### gfx1013 pixel DPP16 quad broadcast
+
+The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted only in a straight-line pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. Without that proof the instruction is refused, as are swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
+
+Reproduce: `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast" -V`. The controls cover the translation, every refusal and the missing `s_wqm`; the WARP and hardware draws compare all 256 pixels of two fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls. This does not establish full-game startup.
+
 ## Startup root signature changes
 
 `tests/startup_root_reset.cpp` and `tests/startup_root_reset_check.py` bind a 1D texture through a descriptor table

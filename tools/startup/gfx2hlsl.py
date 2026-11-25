@@ -362,6 +362,7 @@ class Stage:
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
+        self.quad_exec = False    # s_wqm exec, exec ran while exec was the entry mask: whole quads are active
         self.quad_ops = False     # pixel: a DPP quad broadcast was lowered to QuadReadLaneAt (needs ps_6_0)
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
@@ -684,6 +685,8 @@ class Stage:
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
         if base in ('s_wqm_b32', 's_wqm_b64'):
+            if ops and ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1]:
+                self.quad_exec = True  # every lane of each quad that has a live lane is now active (helpers too)
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -751,9 +754,9 @@ class Stage:
     # lane k of its own quad (RDNA 2 ISA, "DPP": a lane reads lane (lane & ~3) | perm[lane & 3] of the row; LLVM 15
     # AMDGPU DPP quad_perm). A pixel stage's four consecutive lanes are a 2x2 pixel quad (lane = x & 1 | (y & 1) << 1),
     # which is what SM 6.0 QuadReadLaneAt(value, k) reads, so the stage is compiled as ps_6_0 (Stage.quad_ops).
-    # Accepted only where the whole quad is active: a straight-line pixel stage whose EXEC is still the entry mask,
-    # which covers helper lanes. bound_ctrl then has nothing to decide (the source lane is never disabled), so it is
-    # accepted and ignored. Everything else a DPP word can say stays refused: other controls (swaps, pair
+    # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
+    # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
+    # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (swaps, pair
     # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, fi, and a vertex stage.
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
@@ -779,6 +782,10 @@ class Stage:
         if (self.kind != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', [])
                 or not getattr(self, 'exec_known', False)):
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        if not getattr(self, 'quad_exec', False):
+            # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
+            # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
+            raise Unsupported('%s_dpp without s_wqm exec, exec proving whole-quad activity' % base)
         if base != 'v_mov_b32' and base not in VEC_F and base not in VEC_U and base not in VEC_U_TO_F:
             raise Unsupported('DPP form of %s' % base)
         if len(ops) < 2:
