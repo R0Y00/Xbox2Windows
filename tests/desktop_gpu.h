@@ -24,6 +24,8 @@ float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, 
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
                             bool one_dimensional = false, bool two_dimensional = false);
+void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                  bool depth16, std::uint32_t words[64]);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
                               const std::uint32_t expected[4]);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,

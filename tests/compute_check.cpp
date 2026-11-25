@@ -54,14 +54,15 @@ UINT texture_words_per_texel(DXGI_FORMAT format)
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
 
-static void fill_upload(ID3D12Resource* upload)
+// source replaces the generated t0 words when a store case supplies its own.
+static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>* source = nullptr)
 {
     void* mapped = nullptr;
     const D3D12_RANGE no_reads{};
     check(upload->Map(0, &no_reads, &mapped), "Map compute upload");
     auto* words = static_cast<UINT*>(mapped);
     for (UINT i = 0; i < capacity; ++i) {
-        words[i] = input_word(i);
+        words[i] = source ? (*source)[i] : input_word(i);
         words[capacity + i] = sentinel;
     }
     auto* cb = static_cast<unsigned char*>(mapped) + constants_offset;
@@ -181,6 +182,9 @@ struct StoreCase {
     UINT groups;
     std::array<UINT, capacity> expected;
     std::array<UINT, constants.size()> root_constants = constants;
+    // Optional t0 words after the constants; otherwise t0 holds input_word(i).
+    std::array<UINT, capacity> source{};
+    bool has_source = false;
     UINT axis(UINT index) const
     {
         const UINT n = (groups >> (8 * index)) & 0xff;
@@ -208,7 +212,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     auto output = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    fill_upload(input.Get());
+    fill_upload(input.Get(), store && store->has_source ? &store->source : nullptr);
     ComputeCommands commands(device, pipeline.Get());
     auto& list = commands.list;
     ComPtr<ID3D12Resource> texture_upload, texture;
@@ -311,8 +315,14 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
             throw std::runtime_error("Invalid compute DPP reference dispatch");
         if (file.peek() != std::char_traits<char>::eof()) {
             file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));
-            if (!file || file.peek() != std::char_traits<char>::eof())
+            if (!file)
                 throw std::runtime_error("Invalid compute store constants");
+            if (file.peek() != std::char_traits<char>::eof()) {
+                file.read(reinterpret_cast<char*>(store.source.data()), sizeof(store.source));
+                if (!file || file.peek() != std::char_traits<char>::eof())
+                    throw std::runtime_error("Invalid compute store source words");
+                store.has_source = true;
+            }
         }
         run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
                     DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);

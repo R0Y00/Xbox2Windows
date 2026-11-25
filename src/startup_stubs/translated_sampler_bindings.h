@@ -36,7 +36,7 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
     s.AddressW = modes[(words[0] >> 6) & 7];
     s.MaxAnisotropy = 1u << ((words[0] >> 9) & 7);
     if (s.MaxAnisotropy > 16) s.MaxAnisotropy = 16;
-    s.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     if (comparison) {
         s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
         s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);

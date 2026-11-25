@@ -56,6 +56,16 @@ STOP = "taskkill.exe /T /F /PID $translator.Id"
 CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
+# Without -FakeUser, user APIs hit the host runtime; run.ps1 must warn (docs/startup-runtime.md).
+FAKE_USER_WARN = re.compile(
+    r"if\s*\(\s*-not\s+\$FakeUser\s+-and\s+\$env:X2W_FAKE_USER\s+-ne\s+\"1\"\s*\)\s*\{\s*"
+    r'Write-Warning\s+"Without -FakeUser, user API calls go to the host gaming runtime',
+    re.I | re.S,
+)
+FAKE_USER_WARNING = (
+    "Without -FakeUser, user API calls go to the host gaming runtime (docs/startup-runtime.md)."
+)
+FAKE_USER_WARN_LINE = f'Write-Warning "{FAKE_USER_WARNING}"'
 
 
 def decode(raw):
@@ -70,13 +80,13 @@ def alive(pid):
     return f'"{pid}"' in out.stdout
 
 
-def run_case(shell, script, code, work, translate=False, switches=(), passed=()):
+def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
     `translate` exercises -Render -Translate and requires the watcher to stop with its child.
     """
-    root = Path(tempfile.mkdtemp(dir=work))
+    root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"
     startup.mkdir(parents=True)
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
@@ -90,6 +100,11 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=())
     exe.write_bytes(b"")
     data.mkdir()
     env = dict(os.environ)
+    # Compare PowerShell's warning text consistently on hosts that enable ANSI colors.
+    env["NO_COLOR"] = "1"
+    env.pop("X2W_FAKE_USER", None)
+    if fake_user_env:
+        env["X2W_FAKE_USER"] = "1"
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
     # goes first so the stub runs under the Python that runs this check.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
@@ -99,18 +114,27 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=())
     if translate:
         command += ["-Render", "-Translate", "-ShaderCache", "cache"]
         (startup / "translate.flag").write_bytes(b"")
-    try:
-        out = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
-                             errors="replace", timeout=120)
-    except subprocess.TimeoutExpired:
-        return [f"stub exit {code}: run.ps1 did not finish in 120 s"]
+    # A surviving watcher can keep a capture pipe open after PowerShell exits.
+    # Capture to files so we can check the watcher's PID as soon as the shell exits.
+    with (tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stdout,
+          tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stderr):
+        try:
+            out = subprocess.run(command, cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=120)
+        except subprocess.TimeoutExpired:
+            return [f"stub exit {code}: run.ps1 did not finish in 120 s"]
+        stdout.seek(0)
+        stderr.seek(0)
+        printed = [line.strip() for line in stdout if line.strip()]
+        error_text = stderr.read().strip()
     found = []
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
-    printed = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    if printed != STUB_LINES[:HEAD_LINES]:
-        found.append(f"stub exit {code}: printed {printed} instead of the first {HEAD_LINES} "
-                     f"debugger lines (stderr: {out.stderr.strip()!r})")
+    want_output = STUB_LINES[:HEAD_LINES]
+    if not fake_user_env and "-FakeUser" not in switches:
+        want_output = [f"WARNING: {FAKE_USER_WARNING}", *want_output]
+    if printed != want_output:
+        found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
+                     f"(stderr: {error_text!r})")
     summary = Path(str(log) + ".out")
     if not summary.is_file():
         found.append(f"stub exit {code}: {summary.name} was not written")
@@ -138,11 +162,17 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=())
 
 
 def run_problems(shell, script, work, first_only):
+    if shell is None:
+        return text_problems(script)
     found = []
     for code in (2, 0, 7):  # 2 is the debugger's "CreateProcess failed"; 7 rules out a fixed code
         found += run_case(shell, script, code, work)
         if found and first_only:
             return found
+    found += run_case(shell, script, 0, work, switches=["-FakeUser"])
+    found += run_case(shell, script, 0, work, fake_user_env=True)
+    if found and first_only:
+        return found
     # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
     if found and first_only:
@@ -175,6 +205,8 @@ def text_problems(script):
         found.append(f"the script does not end with 'exit ${capture.group(1)}'")
     if HEAD not in after[1:-1]:
         found.append("the log head is not printed between the capture and the exit")
+    if not FAKE_USER_WARN.search(code):
+        found.append("missing Write-Warning when -FakeUser is not passed")
     return found
 
 
@@ -188,10 +220,12 @@ def mutants_of(script):
             early += [other for other in lines if is_exit(other)]
         if not is_exit(line):
             early.append(line)
+    no_fake_warn = [line for line in lines if FAKE_USER_WARN_LINE not in line]
     mutants = {
         "no capture and no exit": [line for line in lines if not is_exit(line) and not is_capture(line)],
         "fixed exit 2": ["exit 2" if is_exit(line) else line for line in lines],
         "exit before the log head": early,
+        "no FakeUser warning": no_fake_warn,
     }
     return {name: None if mutant == lines else "\n".join(mutant) + "\n" for name, mutant in mutants.items()}
 
@@ -212,25 +246,22 @@ def main():
             mode = "text only: no PowerShell found"
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
-        checks = {Path(shell).stem.lower(): (lambda text, first_only, shell=shell:
-                                             run_problems(shell, text, tmp, first_only))
-                  for shell in shells}
-        if not shells:
-            checks = {"text": lambda text, first_only: text_problems(text)}
-        for name, check in checks.items():
-            bad = check(script, False)
+        for shell in shells or [None]:
+            name = Path(shell).stem.lower() if shell else "text"
+            bad = run_problems(shell, script, tmp, False)
             failures += [f"{name}: {item}" for item in bad]
             if bad:
                 continue
-            mutants = mutants_of(script)
-            if shells:  # only an executed run can see the translator outlive the script
-                stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
-                mutants["translator left running"] = None if stopless == script else stopless
-                parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
-                mutants["translator's workers left running"] = None if parent_only == script else parent_only
-            for label, mutant in mutants.items():
-                if mutant is None or not check(mutant, True):
+            for label, mutant in mutants_of(script).items():
+                if mutant is None or not run_problems(shell, mutant, tmp, True):
                     failures.append(f"{name}: mutant '{label}' was not detected")
+            if shell:
+                stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
+                parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
+                for mutant, who in ((stopless, "translator"), (parent_only, "translator's child process")):
+                    problems = run_case(shell, mutant, 7, tmp, translate=True)
+                    if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
+                        failures.append(f"{name}: expected a surviving {who}, got {problems}")
     for item in failures:
         print("FAIL", item)
     print(f"startup run.ps1 exit code: {len(failures)} failed ({mode})")
