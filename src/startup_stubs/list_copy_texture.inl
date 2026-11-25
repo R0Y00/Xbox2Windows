@@ -147,14 +147,19 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
     }
     // Bring a texture's desktop copy up to date with its guest backing before the copy reads or partly overwrites it,
     // and record that upload so a later sample does not replace the copied texels.
-    if (side_src.kind == x2w_list_copy_texture::Kind::subresource) upload_texture(self, src_wrapper, real_src);
-    if (side_dst.kind == x2w_list_copy_texture::Kind::subresource) upload_texture(self, dst_wrapper, real_dst);
+    // A resource of the retire class has no title memory, so there is nothing to upload and no cache entry to leave behind.
+    if (side_src.kind == x2w_list_copy_texture::Kind::subresource && !src_wrapper->own().retire_when_idle)
+        upload_texture(self, src_wrapper, real_src);
+    if (side_dst.kind == x2w_list_copy_texture::Kind::subresource && !dst_wrapper->own().retire_when_idle)
+        upload_texture(self, dst_wrapper, real_dst);
     if (!src_fixed) require_state(self, real_src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (!dst_fixed) require_state(self, real_dst, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION to = *dst, from = *src;
     to.pResource = real_dst;
     from.pResource = real_src;
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyTextureRegion(&to, x, y, z, &from, box ? box : nullptr);
+    retire_hold(self, dst_wrapper);
+    retire_hold(self, src_wrapper);
     InterlockedIncrement(&list_copy_texture_forwarded);
 }
 

@@ -379,12 +379,18 @@ bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar
     check(static_cast<int>(skip_srv) + static_cast<int>(skip_arguments) + static_cast<int>(init_only) <= 1 ? S_OK : E_FAIL,
           "select one combined mesh control");
     const bool control = skip_srv || skip_arguments;
+    const bool ordered_case = !control && !init_only;
     auto consume = init_only ? refused : draw(skip_srv ? green : red, skip_srv ? green : skip_arguments ? black : red);
     const char* label = init_only ? "combined mesh initialized arguments: zero groups" :
                         skip_srv ? "combined mesh stale SRV: two green halves" :
                         skip_arguments ? "combined mesh stale arguments: left red, right clear" :
                                          "combined mesh fresh inputs: two red halves";
     colour.start();
+    if (ordered_case) {
+        if (!verify(refused, "combined mesh refuses recorded but unsubmitted argument writer")) return false;
+        check(colour.completion->GetCompletedValue() == 0 ? S_OK : E_FAIL,
+              "refusal completes with the published SRV writer still gated");
+    }
     arguments.start();
     bool ordered = false;
     consume.queued = [&](ID3D12Fence* done) {
@@ -405,36 +411,96 @@ bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar
     colour.finish();
     arguments.finish();
 
-    if (!control && !init_only) {
-        auto remapped = refused;
-        ULONG_PTR replacement{}, count = 1;
-        check(colour.alloc(0x280, &count, &replacement) && count == 1 ? S_OK : E_FAIL,
-              "allocate replacement argument page");
-        void* const replaced_address = arguments.cpu;
-        remapped.before_submit = [&] {
-            check(colour.map(&replaced_address, 1, &replacement) ? S_OK : E_FAIL,
-                  "remap only the argument page before submission");
-            std::memcpy(arguments.cpu + arguments.record_offset, MeshLeaseWriter::old_groups.data(),
-                        sizeof(MeshLeaseWriter::old_groups));
-            check(arguments.inspect(arguments.address()) != arguments.published_page &&
-                  colour.inspect(colour.address()) == colour.published_page ? S_OK : E_FAIL,
-                  "argument page identity changed while SRV page stayed mapped");
+    if (ordered_case) {
+        for (std::size_t page = 0; page < std::size(colour.original); ++page) {
+            const bool root_page = page == 0;
+            auto& writer = root_page ? colour : arguments;
+            auto& other = root_page ? arguments : colour;
+            auto remapped = refused;
+            ULONG_PTR replacement{}, count = 1;
+            check(colour.alloc(0x280, &count, &replacement) && count == 1 ? S_OK : E_FAIL,
+                  "allocate replacement mesh page");
+            void* const replaced_address = writer.cpu;
+            remapped.before_submit = [&] {
+                check(colour.map(&replaced_address, 1, &replacement) ? S_OK : E_FAIL,
+                      "remap one mesh input before submission");
+                if (root_page)
+                    std::memcpy(writer.cpu + writer.record_offset, &green, sizeof(green));
+                else
+                    std::memcpy(writer.cpu + writer.record_offset, MeshLeaseWriter::old_groups.data(),
+                                sizeof(MeshLeaseWriter::old_groups));
+                check(writer.inspect(writer.address()) != writer.published_page &&
+                      other.inspect(other.address()) == other.published_page ? S_OK : E_FAIL,
+                      "only the selected mesh page identity changed");
+            };
+            const bool unchanged = verify(remapped, root_page
+                ? "combined mesh with remapped root SRV leaves target clear"
+                : "combined mesh with remapped arguments leaves target clear");
+            check(colour.map(&replaced_address, 1, &colour.original[page]) &&
+                  colour.free_pages(1, &replacement) ? S_OK : E_FAIL, "restore the original mesh page");
+            if (!unchanged || !verify(draw(red, red), "combined mesh reads both ranges after restoring mapping")) return false;
+        }
+
+        const auto gate = colour.create_fence();
+        struct ReleaseGate {
+            ID3D12Fence* gate;
+            ~ReleaseGate() { gate->Signal(1); }
+        } release{gate.Get()};
+        const auto native = native_object<ID3D12CommandQueue>(device, guest, queue.Get());
+        check(native->Wait(gate.Get(), 1), "hold the combined consumer");
+        const auto probe_reusable_pages = [&] {
+            // Hold both probe allocations at once to test for both original
+            // pages. Compare section offsets because the word offsets differ.
+            ULONG_PTR tokens[2]{}, count = std::size(tokens);
+            void* const probes[]{colour.cpu + 2 * MeshLeaseWriter::page, colour.cpu + 3 * MeshLeaseWriter::page};
+            check(colour.alloc(0x280, &count, tokens) && count == std::size(tokens) &&
+                  colour.map(probes, count, tokens) ? S_OK : E_FAIL, "map two physical probe pages");
+            std::array<bool, 2> reusable{};
+            for (std::size_t i = 0; i < std::size(probes); ++i) {
+                const auto page = colour.inspect(colour.address() + (2 + i) * MeshLeaseWriter::page).first;
+                reusable[0] |= page == colour.published_page.first;
+                reusable[1] |= page == arguments.published_page.first;
+            }
+            const ULONG_PTR empty[]{0, 0};
+            check(colour.map(probes, count, empty) && colour.free_pages(count, tokens) ? S_OK : E_FAIL,
+                  "release both physical probe pages");
+            return reusable;
         };
-        const bool unchanged = verify(remapped, "combined mesh submit with remapped argument page leaves target clear");
-        check(colour.map(&replaced_address, 1, &colour.original[1]) && colour.free_pages(1, &replacement) ? S_OK : E_FAIL,
-              "restore the original argument page");
-        if (!unchanged || !verify(draw(red, red), "combined mesh reads both original ranges after restoring mapping")) return false;
+        auto pinned = draw(red, red);
+        pinned.drop_recording = true;
+        pinned.queued = [&](ID3D12Fence* done) {
+            release_pages();
+            const bool pending = done->GetCompletedValue() == 0;
+            const auto reusable = probe_reusable_pages();
+            check(gate->Signal(1), "release the combined consumer");
+            check(pending && reusable == std::array<bool, 2>{false, false} ? S_OK : E_FAIL,
+                  "neither original page is reusable before the DIRECT fence");
+        };
+        if (!verify(pinned, "combined mesh still reads both XMem pages after guest unmap")) return false;
+        const auto deadline = GetTickCount64() + 3000;
+        while (probe_reusable_pages() != std::array<bool, 2>{true, true}) {
+            check(GetTickCount64() < deadline ? S_OK : E_FAIL, "both original pages return after the DIRECT fence");
+            Sleep(1);
+        }
+        std::puts("both original XMem pages returned after the DIRECT fence");
+    } else {
+        release_pages();
     }
 
-    release_pages();
     std::ifstream log{std::filesystem::path(log_path)};
     check(log ? S_OK : E_FAIL, "open combined mesh handoff log");
     const std::string lines{std::istreambuf_iterator<char>(log), {}};
     log.close();
     DeleteFileW(log_path.c_str());
-    check(lines.find("mesh XMem read has no submitted writer for the required size") != std::string::npos &&
-          (control || init_only || lines.find("mesh XMem submit refused: writer or live page identity changed") != std::string::npos)
-          ? S_OK : E_FAIL, "check combined mesh missing-writer and remapped-argument refusals");
+    constexpr char missing_writer[] = "mesh XMem read has no submitted writer for the required size";
+    constexpr char remapped_page[] = "mesh XMem submit refused: writer or live page identity changed";
+    const auto first_missing = lines.find(missing_writer);
+    const auto first_remap = lines.find(remapped_page);
+    check(first_missing != std::string::npos &&
+          (!ordered_case || (lines.find(missing_writer, first_missing + sizeof(missing_writer) - 1) != std::string::npos &&
+             first_remap != std::string::npos &&
+             lines.find(remapped_page, first_remap + sizeof(remapped_page) - 1) != std::string::npos))
+          ? S_OK : E_FAIL, "check both missing-writer and both remapped-page refusals");
     check_lease_debug(info);
     return true;
 }

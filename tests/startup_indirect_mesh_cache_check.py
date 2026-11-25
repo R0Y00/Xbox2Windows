@@ -29,9 +29,8 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, dep
     for suffix, stage in (('ms', 13), ('ps', 0)):
         (work / f'source.{suffix}.dxbc').write_bytes(source_envelope(stage))
     environment = dict(os.environ, X2W_MESH86_FIXTURE_DIR=str(work), X2W_SHADER_CACHE=str(work))
-    environment.pop('X2W_MESH86_FIXTURE_READY', None)
-    environment.pop('X2W_MESH86_FIXTURE_DEPTH', None)
-    environment.pop('X2W_MESH86_FIXTURE_DEPTH_PIXEL', None)
+    for flag in ('READY', 'DEPTH', 'DEPTH_PIXEL', 'PADDING', 'SAMPLE_MASK'):
+        environment.pop(f'X2W_MESH86_FIXTURE_{flag}', None)
     if depth_only:
         environment['X2W_MESH86_FIXTURE_DEPTH'] = '1'
     if depth_pixel:
@@ -85,7 +84,31 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, dep
     # WARP keeps the existing MS-only depth refusal.
     if has_pixel or backend == 'hardware':
         environment['X2W_MESH86_FIXTURE_READY'] = '1'
-    return subprocess.run(cmd, env=environment).returncode
+    if lease_xmem or depth_only:
+        return subprocess.run(cmd, env=environment).returncode
+
+    # Change only the blend and depth-stencil object padding between capture
+    # and replay. A cache miss leaves the fixture's color attachments clear.
+    padded = dict(environment, X2W_MESH86_FIXTURE_PADDING='1')
+    replay = subprocess.run(cmd, env=padded)
+    if replay.returncode:
+        return replay.returncode
+    assert list(work.glob('req_*.m86')) == [marker]
+
+    # A real sample-mask change must instead publish a different request and
+    # refuse the previously cached PSO, leaving all attachments clear.
+    padded.pop('X2W_MESH86_FIXTURE_READY')
+    changed = subprocess.run(cmd, env=dict(padded, X2W_MESH86_FIXTURE_SAMPLE_MASK='1'))
+    if changed.returncode:
+        return changed.returncode
+    changed_marker, = set(work.glob('req_*.m86')) - {marker}
+    changed_key = int(changed_marker.stem.removeprefix('req_'), 16)
+    changed_ms, changed_ps, changed_root, changed_stream = mesh86_cache.load_request(work, changed_key)
+    assert (changed_ms, changed_ps, changed_root) == (source_ms, source_ps, root)
+    assert stream[-8:] == struct.pack('<II', 9, 0xffffffff)
+    assert changed_stream == stream[:-4] + struct.pack('<I', 0xfffffffe)
+    print('mesh cache padding replay reused the PSO; sample-mask change generated a new key')
+    return 0
 
 
 if __name__ == '__main__':
