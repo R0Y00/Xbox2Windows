@@ -96,6 +96,12 @@ try:
 except G.Unsupported:
     other_refused = True
 check('another unmodelled target stays refused', other_refused)
+try:
+    translate(struct.pack('<II', 0xf8001c91, 0), exec_known=False)  # compr null export, en:0x1 (not a whole pair)
+    partial_en_refused = False
+except G.Unsupported:
+    partial_en_refused = True
+check('a null export with a partial compressed enable mask stays refused (vm is not dropped)', partial_en_refused)
 
 if failures:
     print('FAILED: ' + ', '.join(failures))
