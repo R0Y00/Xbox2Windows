@@ -311,6 +311,7 @@ requires direct short-output decoding to fail, and checks refusal and unchanged 
 bad offsets, wrong sizes and codecs, invalid data, excessive counts and ambiguous matches.
 A second fixture uses 4 MiB of CPython-zlib output, verifies its checksum before publishing
 first, interior and final windows, and rejects an extent beyond the 16 MiB budget.
+The zlib queue probe also checks 8 KiB outputs at the first and continuation offsets.
 Both run through the DirectStorage stand-in and check exact output and guard bytes; disabling
 the option makes the same bounded requests fail with unchanged destinations. The heartbeat's
 `metadata-windows` count records successful writes by this path.

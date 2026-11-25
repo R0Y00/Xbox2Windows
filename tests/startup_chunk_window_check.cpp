@@ -20,7 +20,8 @@ template<class R, class... A> R call(Object* object, unsigned slot, A... args) {
     return reinterpret_cast<R(__stdcall*)(Object*, A...)>(object->table[slot])(object, args...);
 }
 bool runtime(const char* dll, const std::filesystem::path& path, const std::vector<unsigned char>& archive,
-             unsigned packed, unsigned format, const std::vector<unsigned char>& expected, bool enabled) {
+             unsigned packed, unsigned format, const std::vector<unsigned char>& expected, bool enabled,
+             unsigned size = 65536) {
     { std::ofstream file(path, std::ios::binary); file.write(reinterpret_cast<const char*>(archive.data()), archive.size()); }
     HMODULE library = LoadLibraryW(std::filesystem::path(dll).c_str());
     if (!library) return false;
@@ -35,12 +36,12 @@ bool runtime(const char* dll, const std::filesystem::path& path, const std::vect
     for (unsigned skip : {0u, 65536u}) {
         Object* status = nullptr;
         if (call<long>(factory, 5, 1u, "window", static_cast<const GUID*>(nullptr), reinterpret_cast<void**>(&status))) return false;
-        std::vector<unsigned char> out(65536 + 16, 0xcc);
+        std::vector<unsigned char> out(size + 16, 0xcc);
         alignas(8) unsigned char request[0x48] = {};
         const std::uint64_t options = format == 8 ? 1 : format * 2;
         std::memcpy(request, &options, 8);
         auto* pointer = out.data(); std::memcpy(request + 8, &pointer, 8);
-        const unsigned size = 65536; std::memcpy(request + 0x18, &size, 4);
+        std::memcpy(request + 0x18, &size, 4);
         std::memcpy(request + 0x20, &file, 8);
         const std::uint64_t offset = 8192 + skip; std::memcpy(request + 0x28, &offset, 8);
         std::memcpy(request + 0x30, &packed, 4);
@@ -50,9 +51,9 @@ bool runtime(const char* dll, const std::filesystem::path& path, const std::vect
         if (tries == 500) return false;
         const long hr = call<long>(status, 4, 0u);
         if (enabled) {
-            if (hr || !std::equal(out.begin(), out.begin() + 65536, expected.begin() + skip)) return false;
+            if (hr || !std::equal(out.begin(), out.begin() + size, expected.begin() + skip)) return false;
         } else if (hr >= 0 || !std::all_of(out.begin(), out.end(), [](unsigned char b) { return b == 0xcc; })) return false;
-        if (!std::all_of(out.begin() + 65536, out.end(), [](unsigned char b) { return b == 0xcc; })) return false;
+        if (!std::all_of(out.begin() + size, out.end(), [](unsigned char b) { return b == 0xcc; })) return false;
     }
     call<void>(file, 3);
     std::filesystem::remove(path);
@@ -127,6 +128,8 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> zfull(zdecoded_size);
     for (unsigned i = 0; i < zdecoded_size; ++i) zfull[i] = static_cast<unsigned char>(i * 17 + i / 31);
     if (!runtime(argv[3], std::filesystem::path(argv[2]).replace_extension(".rds5"), archive, zpacked.size(), 8, zfull, enabled)) return 14;
+    if (!runtime(argv[3], std::filesystem::path(argv[2]).replace_extension(".short.rds5"),
+                 archive, zpacked.size(), 8, zfull, enabled, 8192)) return 16;
     for (unsigned skip : {0u, destination, zdecoded_size - destination}) {
         std::vector<unsigned char> out{0xcc};
         if (!x2w_startup::decode_chunk_window(read, archive.size(), start + skip, zpacked.size(), destination, 8, out)) return 10;
