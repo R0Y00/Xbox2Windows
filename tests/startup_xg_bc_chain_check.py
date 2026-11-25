@@ -97,10 +97,13 @@ def prepare(create, fmt, path):
             result = ctypes.create_string_buffer(b"\xe7" * len(linear), len(linear))
             assert copy_from(computer, result, 0, level, 0, guest, row_pitch, 0) == 0
             assert result.raw == bytes(linear), f"mip {level} copy-out or row padding mismatch"
-        sentinel = b"\xad" * len(linear)
-        result.raw = sentinel
-        assert copy_from(computer, result, 0, level, 1, guest, row_pitch, 0) & 0xffffffff == 0x80004001
-        assert result.raw == sentinel, "unsupported copy-out option changed destination"
+        refused_mip = 5
+        blocks = 256 >> refused_mip
+        pitch = blocks * 16
+        sentinel = b"\xad" * (pitch * blocks)
+        refused = ctypes.create_string_buffer(sentinel, len(sentinel))
+        assert copy_from(computer, refused, 0, refused_mip, 1, guest, pitch, 0) & 0xffffffff == 0x80004001
+        assert refused.raw == sentinel, "unsupported copy-out option changed destination"
         assert guest.raw == bytes(expected_guest), "tiled blocks or padding differ"
         error = COPY_INTO(slots[8])(computer, guest, 0, 6, source, row_pitch, len(linear))
         assert error & 0xffffffff == 0x80070057 and guest.raw == bytes(expected_guest)
