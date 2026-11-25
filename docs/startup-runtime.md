@@ -677,7 +677,7 @@ from process creation. The ordinary-heap run also recorded process audio levels.
 There was one run per setting. Measure the window and the first visible content
 separately when repeating this comparison. Time from the first recorded button
 release to language selection was about 17 seconds in both runs. For the public
-heap-flag regression, run `ctest --preset dev --no-tests=error -R '^startup_debug$'`.
+heap-flag regression, run `ctest --preset dev --no-tests=error -R '^startup_debug'`.
 
 It writes:
 

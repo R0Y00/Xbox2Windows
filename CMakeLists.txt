@@ -3448,7 +3448,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
     # One script, three groups of cases that ctest can run in parallel. startup_debug keeps the old
-    # name (docs select it with -R '^startup_debug$'); the other two carry the log and hook cases.
+    # name; select all three with -R '^startup_debug' (the anchored -R '^startup_debug$' runs only the core group).
     foreach(group IN ITEMS core log hooks)
         if(group STREQUAL "core")
             set(startup_debug_test startup_debug)
