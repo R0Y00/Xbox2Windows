@@ -1,5 +1,5 @@
 """24-bit multiplies, v_xnor_b32 and the funnel shifts in tools/startup/gfx2hlsl.py: v_mul_i32_i24,
-v_mul_hi_i32_i24, v_mul_hi_u32_u24, v_mad_i32_i24, v_xnor_b32, v_alignbit_b32 and v_alignbyte_b32.
+v_mul_hi_i32_i24, v_mad_i32_i24, v_xnor_b32, v_alignbit_b32 and v_alignbyte_b32.
 
 Each instruction is translated by the real translator, the emitted 32-bit HLSL text is evaluated on the CPU with the
 integer evaluator of startup_gfx2hlsl_bit_alu_check.py, and the result is compared with a reference written from the
@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
-from startup_gfx2hlsl_bit_alu_check import Expr, Probe  # noqa: E402
+from startup_gfx2hlsl_bit_alu_check import Expr, Probe, refused  # noqa: E402
 
 MASK = 0xffffffff
 
@@ -24,15 +24,10 @@ def s24(x):
     return x - (1 << 24) if x >> 23 else x
 
 
-def u24(x):
-    return x & 0xffffff
-
-
 REFERENCE = {
     'v_mul_i32_i24': (2, lambda a, b, c: (s24(a) * s24(b)) & MASK),
     'v_mad_i32_i24': (3, lambda a, b, c: (s24(a) * s24(b) + c) & MASK),
     'v_mul_hi_i32_i24': (2, lambda a, b, c: ((s24(a) * s24(b)) >> 32) & MASK),
-    'v_mul_hi_u32_u24': (2, lambda a, b, c: (u24(a) * u24(b)) >> 32),
     'v_xnor_b32': (2, lambda a, b, c: ~(a ^ b) & MASK),
     'v_alignbit_b32': (3, lambda a, b, c: (((a << 32) | b) >> (c & 31)) & MASK),
     'v_alignbyte_b32': (3, lambda a, b, c: (((a << 32) | b) >> (8 * (c & 3))) & MASK),
@@ -75,6 +70,11 @@ def main():
         same = a[0].tokens == b[0].tokens
         print('%s: e64 spelling lowers the same %s' % (op, 'ok' if same else 'MISMATCH'))
         failures += not same
+    # v_mul_hi_u32_u24 is refused in both spellings (FXC folds every unsigned lowering to zero; see gfx2hlsl.py)
+    for assembly in ('v_mul_hi_u32_u24 v1, v2, v3', 'v_mul_hi_u32_u24_e64 v1, v2, v3'):
+        ok = refused(assembly)
+        print('%s: refused %s' % (assembly.split(' ', 1)[0], 'ok' if ok else 'MISMATCH'))
+        failures += not ok
     return 1 if failures else 0
 
 
