@@ -65,6 +65,7 @@ def main(xmem_path, xcrdapi_path):
     log = Path(tempfile.gettempdir()) / f"x2w-heartbeat-{os.getpid()}.txt"
     log.write_bytes(b"")
     os.environ["X2W_TRAP_LOG"] = str(log)
+    os.environ["X2W_HEARTBEAT_INTERVAL_MS"] = "1000"  # three samples in about 3 s, not 30 s
     xcrdapi = C.WinDLL(str(Path(xcrdapi_path).resolve()), use_last_error=True, winmode=0x900)
     kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
     pointer, number = C.c_void_p, C.c_size_t
