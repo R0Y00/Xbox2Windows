@@ -50,7 +50,7 @@ def to_int(x):
 FUNCS = {
     'U': bits, 'F': value, 'uint': lambda x: int(x) & MASK, 'int': to_int, 'float': float,
     'floor': lambda x: x if math.isinf(x) else float(math.floor(x)), 'max': max, 'exp2': lambda x: f32(2.0 ** x),
-    'clamp': lambda x, lo, hi: min(max(x, lo), hi), 'saturate': lambda x: min(max(x, 0.0), 1.0),
+    'isnan': lambda x: x != x, 'clamp': lambda x, lo, hi: min(max(x, lo), hi), 'saturate': lambda x: min(max(x, 0.0), 1.0),
 }
 
 

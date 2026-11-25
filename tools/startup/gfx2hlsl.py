@@ -2757,8 +2757,8 @@ class Stage:
             raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
         x = self.f(ops[1])
         r = 'floor(%s)' % (rounded % x)
-        self.set_v(reg_range(ops[0])[1], '(%s != %s) ? 0u : (%s >= 2147483648.0) ? 0x7fffffffu : uint(int(max(%s, -2147483648.0)))' % (
-            x, x, r, r))
+        self.set_v(reg_range(ops[0])[1], 'isnan(%s) ? 0u : (%s >= 2147483648.0) ? 0x7fffffffu : uint(int(max(%s, -2147483648.0)))' % (
+            x, r, r))
 
     def op_v_cvt_flr_i32_f32(self, ops, mods):
         self.float_to_int('v_cvt_flr_i32_f32', ops, mods, '%s')
