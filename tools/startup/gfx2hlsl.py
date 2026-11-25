@@ -795,6 +795,64 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+def check_lds_exchange(ins, group, words):
+    """Prove one race-free fill of a contiguous LDS span, one uniform barrier, then reads of initialized words."""
+    if not 0 < words <= 8192 or group[1:] != (1, 1):
+        raise Unsupported('LDS exchange needs a 1D group and a nonzero allocation of at most 32 KiB')
+    first = None
+    published = False
+    read = False
+    prev = (None, [], [])
+    for i, (_, _, _, asm) in enumerate(ins):
+        name, ops, mods = parse(asm)
+        base = name.removesuffix('_e32').removesuffix('_e64')
+        if (base.startswith(('s_branch', 's_cbranch', 's_setpc', 's_swappc')) or writes_exec(base, ops)
+                or base == 's_endpgm' and i + 1 < len(ins)):
+            raise Unsupported('LDS exchange needs straight-line code and entry EXEC')
+        if base == 's_barrier':
+            if first is None or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], []) or asm != 's_barrier 0x0':
+                raise Unsupported('LDS exchange needs one barrier after a completed fill')
+            published = True
+        elif base in ('ds_write_b32', 'ds_read_b32'):
+            if (len(ops) != 2 or not all(re.fullmatch(r'v[0-9]+', op) for op in ops)
+                    or mods and (len(mods) != 1 or not re.fullmatch(r'offset:\d+', mods[0]))):
+                raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
+            offset = int(mods[0][7:]) if mods else 0
+            producer, args, modifiers = prev
+            if base == 'ds_write_b32':
+                # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct dword.
+                if (first is not None or producer != 'v_lshlrev_b32' or args != [ops[0], '2', 'v0']
+                        or modifiers or offset % 4 or offset + group[0] * 4 > words * 4):
+                    raise Unsupported('LDS exchange needs one bounded dword per local X ID')
+                first = offset
+            else:
+                if not published or modifiers or not args or args[0] != ops[1]:
+                    raise Unsupported('LDS read needs a bounded address after the fill barrier')
+                if producer == 'v_mov_b32' and len(args) == 2 and re.fullmatch(r'0x[0-9a-f]+|\d+', args[1]):
+                    low = high = int(args[1], 0)
+                elif (producer == 'v_and_b32' and len(args) == 3 and re.fullmatch(r'0x[0-9a-f]+|\d+', args[1])
+                      and re.fullmatch(r'v[0-9]+', args[2])):
+                    low, high = 0, int(args[1], 0)
+                else:
+                    raise Unsupported('LDS read needs a literal or literal-masked byte address')
+                if offset % 4 or high % 4 or low + offset < first or high + offset >= first + group[0] * 4:
+                    raise Unsupported('LDS read outside the aligned, initialized span')
+                if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
+                    raise Unsupported('LDS read needs a completed LGKM wait')
+                read = True
+        elif base.startswith('ds_') or 'lds' in mods:
+            raise Unsupported('LDS exchange does not cover ' + asm)
+        elif first is None and not base.startswith('s_'):
+            # Simple VALU instructions only write their single destination. Other forms, e.g. v_swap_b32,
+            # can also change a source. An unknown write could destroy the local-ID proof.
+            if (base not in VEC_U and base not in VEC_F and base != 'v_mov_b32'
+                    or not ops or not re.fullmatch(r'v[0-9]+', ops[0]) or ops[0] == 'v0'):
+                raise Unsupported('LDS fill needs the unchanged entry local X ID')
+        prev = base, ops, mods
+    if not read:
+        raise Unsupported('LDS exchange needs a fill, a barrier and a completed read')
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -1760,6 +1818,24 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        if base in ('ds_write_b32', 'ds_read_b32', 's_barrier'):
+            if self.kind != 'cs':
+                raise Unsupported(base)
+            if not getattr(self, 'lds_checked', False):
+                check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
+                self.lds_checked = True
+            if base == 's_barrier':
+                self.emit('GroupMemoryBarrierWithGroupSync();')
+            else:
+                write = base == 'ds_write_b32'
+                address = self.u(ops[0 if write else 1])
+                offset = int(mods[0][7:]) if mods else 0
+                cell = 'lds[(%s + %du) >> 2]' % (address, offset)
+                if write:
+                    self.emit('%s = %s;' % (cell, self.u(ops[1])))
+                else:
+                    self.set_v(reg_range(ops[0])[1], cell)
+            return None
         if base.endswith('_dpp'):
             return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
@@ -4452,6 +4528,8 @@ class ComputePipeline(Pipeline):
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified = set(), set()
         self.lod_unvalidated = set()
+        # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
+        self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
     def resource(self, key, kind):
@@ -4479,7 +4557,8 @@ class ComputePipeline(Pipeline):
         if s.exports:
             raise Unsupported('export in a compute program')
         body = s.body()
-        return '\n'.join(self.common() + ['[numthreads(%d, %d, %d)]' % self.group,
+        shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'lds_checked', False) else []
+        return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'
 
