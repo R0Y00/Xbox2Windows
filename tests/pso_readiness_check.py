@@ -146,7 +146,8 @@ def check_mesh():
                 # An empty allocation (0, 0) is refused by the count check.
                 (enumerate_pcs(invalid_alloc), "mesh_lowering_rejected", "blocked",
                  "Conflicting mesh counts, vertices or primitive indices"),
-                ([(0, "s_mov_b32 m0, s99")], "mesh_lowering_rejected", "blocked", "99"),
+                ([(0, "s_mov_b32 m0, s99")], "mesh_lowering_rejected", "blocked",
+                 "Scalar register s99 used before it is written"),
                 ([], "disassembly_failed", "blocked", "empty instruction stream"),
                 (ValueError("Unknown instruction at byte 4"), "disassembly_failed", "blocked",
                  "Unknown instruction at byte 4")):
