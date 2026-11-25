@@ -93,7 +93,7 @@ def masked_vertex_red():
 
 # The first six threads select the shift for their entire guest wave. The second wave keeps 64/255.
 SHIFT_ASM = """s_mov_b32 s40, 0x3e808081
-v_cmp_gt_u32_e32 vcc_lo, 6, v0
+v_cmp_gt_u32_e32 vcc, 6, v0
 s_and_saveexec_b64 s[20:21], vcc
 s_cbranch_execz 2
 s_lshl_b32 s40, 0x1fc00000, 1
