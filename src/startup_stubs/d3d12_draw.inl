@@ -2034,7 +2034,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 return false;
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
-            if (texture) require_state(self, texture, sampled_state(self, texture));
+            if (texture) {
+                require_state(self, texture, sampled_state(self, texture));
+                if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
+            }
             const bool had_texture = texture != nullptr;
             bool mismatched = false;
             static LONG shown;

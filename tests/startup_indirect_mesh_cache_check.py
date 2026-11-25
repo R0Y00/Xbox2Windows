@@ -70,6 +70,24 @@ def trace_paired_submission(cmd, environment):
     return 0
 
 
+def check_trace_disabled(cmd, environment):
+    # Both invalid values would select call 3 if the parser accepted a prefix or truncated to UINT.
+    for selector in (None, '3x', '4294967299'):
+        traced = dict(environment)
+        if selector is None:
+            traced.pop('X2W_MESH86_WRITER_TRACE', None)
+        else:
+            traced['X2W_MESH86_WRITER_TRACE'] = selector
+        result = subprocess.run(cmd, env=traced, stderr=subprocess.PIPE, encoding='utf-8', errors='replace')
+        sys.stderr.write(result.stderr)
+        if result.returncode:
+            return result.returncode
+        trace = [line for line in result.stderr.splitlines() if line.startswith('x2w-mesh86-trace ')]
+        assert not trace, f'trace selector {selector!r} emitted unexpected rows: {trace!r}'
+        print(f'trace selector {selector!r}: paired readback passed without trace rows')
+    return 0
+
+
 def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, depth_pixel=None):
     for suffix, stage in (('ms', 13), ('ps', 0)):
         (work / f'source.{suffix}.dxbc').write_bytes(source_envelope(stage))
@@ -92,7 +110,7 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, dep
             environment['X2W_MESH86_FIXTURE_LOOSE_ROOT'] = '1'
         elif mode == 'skip-wait':
             environment['X2W_TEST_MESH_XMEM_SKIP_WAIT'] = '1'
-        elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument', 'dual-init-only', 'dual-trace'):
+        elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument', 'dual-init-only', 'dual-trace', 'dual-trace-disabled'):
             environment.update(X2W_MESH86_FIXTURE_DUAL='1', X2W_MESH_INDIRECT_XMEM='1')
             if mode == 'dual-skip-srv':
                 environment['X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT'] = '1'
@@ -134,6 +152,8 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, dep
         environment['X2W_MESH86_FIXTURE_READY'] = '1'
     if mode == 'dual-trace':
         return trace_paired_submission(cmd, environment)
+    if mode == 'dual-trace-disabled':
+        return check_trace_disabled(cmd, environment)
     if lease_xmem or depth_only:
         return subprocess.run(cmd, env=environment).returncode
 

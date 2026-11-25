@@ -1092,6 +1092,20 @@ Archive each run's logs together with a copy of `shader_cache/`, and leave the c
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
 
+**Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies the graphics, RTV variant and slot 67 compute requests of the old cache under the keys of the current revision, computed with `pipeline_key` and `compute_key` of the `gfx2hlsl.py` next to it. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools\startup\shader_cache_rekey.py out\startup\shader_cache out\startup\shader_cache_rekeyed
+.\out\pe-env\Scripts\python.exe -B tools\startup\gfx2hlsl.py --pending out\startup\shader_cache_rekeyed
+robocopy out\startup\shader_cache_rekeyed out\startup\shader_cache /XC /XN /XO
+```
+
+1. The re-key step only reads the old cache and writes request files (`req_*`) only, never results or `.fail`. A file already in the new directory is left as it is, so a second run writes nothing. It reads every request before it writes: if a part is missing or unreadable, or an RTV variant is malformed or names a base that is not in the cache, it prints how many, writes nothing and exits with 1. Slot 57 and slot 86 mesh requests have their own key strings and are not re-keyed. `X2W_TRANSLATE_JOBS` sets the number of hashing processes.
+2. `--pending` translates the re-keyed requests offline, as it does for a running title's cache.
+3. The `robocopy` switches skip every file that already exists in the cache, so results the runtime or a later pass wrote are kept. A `robocopy` exit code below 8 means success: 1 is set when files were copied, and 2 is set because the cache holds files that the new directory does not. A code of 8 or more is a failure. On Linux, run the same steps with `./out/pe-env/bin/python` and merge with `cp -rn out/startup/shader_cache_rekeyed/. out/startup/shader_cache/`, which also keeps existing files.
+
+`tests/startup_shader_cache_rekey_check.py` checks the tool on synthetic requests only: the names match the current keys, a newer revision gives other names, a second run and a current cache change nothing, and an incomplete request or an RTV variant without its base writes nothing. Re-keying recovers the requests, not the translations: some re-keyed pipelines can still fail to translate, which is separate from the cache key. Nothing here shows that a title runs.
+
 When `fxc` is available, a request that later translates loses its `.fail`. In manifest-only mode (`X2W_FXC` empty) the old `.fail` stays, so on a kept cache the `.fail` categories in `triage.md` can include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
 
 ### 3. Measure a run against the previous one
@@ -1381,33 +1395,54 @@ those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
 
-`X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for one class: a
-texture created by device slot 27 or 127 that is two-dimensional, has one
-sample, no render-target, depth-stencil or unordered-access flag, lives in a
-default heap without heap flags and has no title memory. If the title exports
-`__XMemAllocationHooks__`, every slot 127 resource gets title memory and none is in the class; the fixture runs
-without that export. Every other resource
-keeps the lifetime described above. A resource leaves the class for good when a
-view is created for it (slots 18 to 21, also a refused one), when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. Only
-wrappers can be in the class; a raw desktop pointer never is. Sampler feedback
-is not checked: no device slot of the stand-in reaches it.
+`X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for committed
+2D textures that have one sample, no render-target, depth-stencil or
+unordered-access flag, and live in a default heap without heap flags:
+- **Slice 1**: slot 27 and slot 127 textures without title memory (if the title
+  exports `__XMemAllocationHooks__`, every slot 127 resource gets title memory
+  and stays out of the class).
+- **Slice 2**: slot 133 (`CreatePlacedResourceX`) committed 2D textures with
+  title memory. Before their desktop `ID3D12Resource` is destroyed, they are
+  erased from `resource_address_index` and `texture_uploads`, and stale
+  `written_textures` entries whose generation has not changed are cleared so
+  reusing the same title address or desktop pointer does not skip uploads or
+  resolve a retired wrapper.
+
+Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
+targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
+described above. A resource leaves the class for good when a UAV/RTV/DSV view is
+created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
+an untracked descriptor slot or is copied out of tracked heaps, when it is passed
+to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
+SRV keeps the resource only when the desktop created the view: desktop view
+creation returns `void`, so a removed device is the only failure it reports, and
+a slot whose creation failed is recorded without a reference. Tracked
+slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+while any descriptor slot in `HeapInfo::shadow` names it (updated across
+`note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
+bound textures via `retire_hold`. Only wrappers can be in the class; a raw
+desktop pointer never is. Sampler feedback is not checked: no device slot of the
+stand-in reaches it.
 
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
-passed and nothing else names it. A copy (list slot 17), texture copy (16) or
-resolve destination (19) that the stand-in forwards makes the list hold a
-desktop reference to each resource of the class it names, source and
-destination, until the list is Reset, fails to Close or is destroyed. A list
+passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
+recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+resolve destination (19), or translated draw SRV bind that the stand-in forwards
+makes the list hold a desktop reference to each resource of the class it names,
+source and destination, until the list is Reset, fails to Close or is destroyed. A list
 that is closed and never submitted is thus discarded without any submission.
 Each submission holds the same references until its queue passes a fence
 signalled behind it. A release with no registered queue, and a hold, marker or
-submission fence that cannot be recorded, keep the resource retained. Nothing
-waits: `ExecuteCommandLists` and `Present` check and release without blocking.
+submission fence that cannot be recorded, keep the resource retained. A use that
+`retire_hold` cannot record (no desktop object left, or no room for the entry)
+leaves the class and marks the resource so the drain keeps its desktop object for
+the process, as an unfenced submission is kept, instead of dropping an object a
+list still names. Nothing waits: `ExecuteCommandLists` and `Present` check and
+release without blocking.
 The wrapper stays allocated, and a guest that uses a resource after its final
-release is not supported with the switch. Buffers, placed and reserved
-resources, slot 133 and all resources with title memory are not in the class.
-Slot 18 (`CopyTiles`) is not forwarded at all and is outside this change.
+release is not supported with the switch. Slot 18 (`CopyTiles`) is not
+forwarded at all and is outside this change.
 
 The source-built fixture reads the process-wide counters through
 `x2w_d3d12_budget_snapshot` and checks allocation sizes, final guest release,
@@ -1423,10 +1458,21 @@ its own fence, a destination released after recording (slots 17, 16 and 19), a
 list destroyed while its submission is held, a copy queue, an open list that
 D3D12 refuses to Reset and one that is destroyed, a release that no list
 refers to behind a held queue, and, in one run with the class, a buffer,
-render target, title-memory texture, viewed texture, resident texture and
-presented texture that must stay retained. The fixture-only export
-`x2w_d3d12_retire_probe` returns FALSE without the switch, like
-`x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
+render target, viewed texture (while its slot-18 SRV stays live), resident texture and
+presented texture that must stay retained, alongside slot 133 title-memory textures.
+`startup_resource_retire_title_{warp,hardware}_debug{0,1}` additionally test slot 133
+`CopyTextureRegion`/`CopyResource` upload holds, same-address slot 70 (`existing_memory_texture`)
+reuse with `X2W_RESOURCE_INDEX_CHECK=1`, stale `written_textures` `bc7_width` cleanup,
+slot-18 SRV `CopyDescriptorsSimple` / overwrite / heap-release lifetime, and, with the
+switch on, a newer `written_textures` generation kept when the older generation retires
+and a translated draw that samples such a texture through a descriptor table (the view
+token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
+a clear sentinel corner, and the texture leaves the budget only after the closed draw
+recording is dropped); the `_off_` case checks that an ordinary committed texture (no
+title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
+`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+`x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
+FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
 physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
 

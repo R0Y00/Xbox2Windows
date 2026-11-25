@@ -219,6 +219,7 @@ jobs:
             tests/startup_image_load_mip_check.py \
             tests/startup_gfx2hlsl_operand_count_check.py \
             tests/startup_gfx2hlsl_scalar_arity_check.py \
+          tests/startup_gfx2hlsl_scalar_table_arity_check.py \
             tests/startup_image_2d_array_check.py \
             tests/startup_image_sample_a16_check.py \
             tests/startup_image_load_d16_check.py \
@@ -242,6 +243,7 @@ jobs:
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_compute_request_offline_check.py \
             tests/compute_container_index_check.py \
+            tests/startup_shader_cache_rekey_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_waitcnt_depctr_check.py \
             tests/startup_mesh57_skeleton_check.py \
@@ -256,6 +258,7 @@ jobs:
             tests/startup_run_ps1_check.py \
             tests/startup_run_sh_check.py \
             tests/startup_flat_param_check.py \
+            tests/startup_ps_input_scan_check.py \
             tests/startup_build_rev_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_gfx2hlsl_interp_f16_check.py \

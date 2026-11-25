@@ -177,6 +177,67 @@ a different input register, and a disabled position input each produce a detecta
 The fixture rejects differing enable/address masks. Production startup requests still omit these
 arguments. Identifying both masks for the affected pipeline remains open. [Refs #1629](https://github.com/R0Y00/Xbox2Windows/issues/1629)
 
+### Locating the pixel input masks from shader register use
+
+Run `python -B tools/startup/ps_input_scan.py [<request_dir>] [--capture <capture.bin>] [--pixel-dir <dir>] [--json <file>] [--list] [--top N]`.
+At least one input is required and they can be combined. A request directory holds
+`req_<key>.a/.b/.root` files. In a `--pixel-dir` every regular file is one pixel shader, either a
+DXBC container or a raw blob; pipelines are numbered `p000001` upward in sorted file-name order and
+file names are never printed. The check is
+`ctest --preset dev --no-tests=error -R '^startup_ps_input_scan$' -V`.
+
+For each pixel shader the tool reads only the disassembly and records a contract: the vector
+registers read before any write (live-in), the I/J register pairs that feed attribute
+interpolation, and the live-in registers split into low and high 16-bit halves. Compare forms give
+no half evidence. A first read is a live-in register unless a backward branch spans it and the
+register is written later in program order: that value can be loop-carried, so the register is
+reported as ambiguous and takes no part in any rule, and evidence taken from such a read is
+dropped. Aliases made by `v_mov_b32` do not cross a branch or a branch target. A branch whose
+target the text does not give, and an indirect branch, make every first read of a register that is
+written somewhere ambiguous. A contract that no address mask satisfies at all (for example a
+definite live-in register above v23) is excluded from every tally and reported on its own line. A
+candidate address mask is consistent when every live-in register is covered by
+its register layout (C1) and every pair starts at a two-register input (C2); a value above 0xffff
+fails C0. Inputs that are enabled but never read are expected, so a layout may be larger than
+the highest live-in register needs. A consistent pipeline is tight when the layout has exactly as many registers as the
+highest live-in register needs. A mask with every bit set is consistent with every shader but never
+tight, so tight separates it from a real mask.
+
+The candidate locations are the byte regions of each pipeline: the bytes before the prefetch marker
+of a raw pixel blob; for a container the FSSM image head and tail, the other XDAT entries and every
+part other than the DXIL part (`ps.part.<TAG>`, for example `ps.part.PSV0`); with `--capture` the
+pipeline description and its two state blocks. The capture stores only the 96-byte description in
+its PSO record, so the state blocks are scanned only when the capture also holds that memory. In a
+request directory every other regular file `req_<key>.<ext>` (not `a`, `b`, `root` or `rtv`, at
+most 1 MiB) is a region `req.<ext>`; this is the way to scan a recorded description or state block
+without changing the tool. In each region the tool tries every aligned pair or
+single value, plus words that follow the register byte addresses 0x286CC/0x286D0 or the context
+indices 0x1B3/0x1B4 (0xA1B3/0xA1B4 as "mm" indices). Candidates that read the same address
+everywhere are listed once with a count of equivalents. Only the first `--region-limit` bytes
+(0x1000) of each region are searched.
+
+Read the verdict line. `unique full match` means one location is consistent in every pipeline with
+a live-in register and has more tight pipelines than any other full match. `N full matches
+(ambiguous)` means several distinct locations fit equally and tie on the number of tight pipelines. `no location is consistent with all
+pipelines` means none fits. `uninformative corpus` means no shader reads a live-in register, so
+nothing can be told apart. Two separate lines follow for the top candidate. `mask agreement` counts
+pipelines that satisfy the coverage and pair rules, those that are tight and the failures per rule.
+`packed-position agreement` counts the pipelines that split a live-in register into 16-bit halves
+and have it at the register the address mask predicts for bit 15. The second line never votes: it
+tests the assumed register widths, not a location, and does not prove the hardware register order.
+When any shader splits a register, `full matches that also agree on every packed split` names the
+full matches whose predicted bit-15 register matches every such split, or `none`; it does not
+change the ranking or the verdict.
+The scan takes the layout from the address mask and reports, in the relation counts, where the
+enable value differs from it.
+
+The header counts the pipelines with ambiguous live-in reads and the excluded unsatisfiable contracts.
+By default stdout holds aggregates only: counts, reasons and ranked candidates, no pipeline ids.
+`--list` adds the per-pipeline table (id, enable, address, predicted packed register, live-in, split and
+ambiguous registers); `--json` always keeps the ids. The tool and its check have run on synthetic blobs
+only; no result for real pipelines is claimed.
+[Refs #1629](https://github.com/R0Y00/Xbox2Windows/issues/1629)
+
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
 ## Resuming startup shader compilation
@@ -9071,6 +9132,11 @@ the writer. `order` records a cross-queue wait, a shared wait, same-queue
 ordering or an omitted wait in a control. A `recorded` call reaches a
 desktop command list. A `forwarded` submission reaches the desktop queue.
 
+The paired trace fixture runs on WARP and hardware. An additional WARP
+control leaves the selector unset, supplies a nondecimal suffix, and supplies
+a value that would truncate to the ordered call's ordinal. Each control must
+pass the paired pixel readback without emitting any trace rows.
+
 The recent-copy rows search the last 1,024 submitted copy destinations
 recorded by the XMem lease tracker. These cover forwarded slot 15 and slot 17
 copies into eligible copied placements. A placement overlap is a candidate
@@ -9119,6 +9185,11 @@ shader pair through the guest request publisher. The offline reader checks
 the published bytes and key, compiles the recorded pair with its serialized
 root, and compares all 1,024 desktop readback pixels with the CPU reference.
 The one-pixel negative control uses that same published pair.
+
+The pending scan checks the DXContainer header and file length for both
+slot 57 bytecode artifacts. A missing or truncated artifact leaves the
+request pending even if its manifest exists. In manifest-only mode the
+manifest still completes the request.
 
 Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
 slot 57 creation. The descriptor must name a registered root, have an empty
@@ -14053,7 +14124,7 @@ lane masks and the discard destination. Run
 
 `tools/startup/gfx2hlsl.py` lowers the gfx1013 binary16 interpolation pair `v_interp_p1ll_f16` / `v_interp_p2_f16` (#1996, item C). The attribute channel holds two binary16 values that the vertex stage exports with `compr`; half `h` of channel `c` is float channel `2 * c + h` of the parameter, and the pair becomes `(vD & 0xffff0000u) | f32tof16(i.paramN.<channel>)`, with the upper half of the destination kept. Only the plain form and `high` are lowered: `clamp`, an output modifier, a source modifier, a `p2` whose third source is not the matching `p1ll` result, and an attribute that the vertex stage does not export are refused. A vertex stage that packs the halves into a plain 32-bit export (no `compr`, e.g. with `v_cvt_pkrtz_f16_f32`) is lowered too, for all four channels: half `h` of channel `c` is `f16tof32(word_c >> 16 * h)`, carried by the extra interpolated outputs `hparamN_lo` and `hparamN_hi` that exist only when the pixel stage reads the attribute this way. An attribute exported both with `compr` and plain, and a read of a channel the plain export leaves `off`, are refused; the compr export still fills only `x` and `y`. `tests/startup_gfx2hlsl_interp_f16_check.py` evaluates the translated text on the CPU against a reference from the ISA layout and fails when the lowering is removed or the `high` bit is inverted; `binary <llvm-mc>` reassembles the fixtures and `draw` is the desktop readback (tests `startup_gfx2hlsl_interp_f16_controls`, `_warp` and `_hardware`). The `op_sel` bits (word 0 bits 11 to 14, each refused on its own) and any read of the upper 16 bits of a `p2` destination stay refused because no source states them for gfx10. Either of two kinds of evidence would lift the refusals: a source that states the gfx10 behaviour of the high 16 bits of the `v_interp_p2_f16` destination and of `op_sel` (kept, cleared or written), or a hardware draw on RDNA that reads back both halves of a `p2` result for each `op_sel` value and compares them with the lowering.
 
-The startup pixel stage lowers DPP16 quad swaps (#2125 item B): `v_mov_b32_dpp` and the VOP2 forms in the integer and binary32 operation tables with `quad_perm:[1,0,3,2]`, `[2,3,0,1]` or `[3,2,1,0]` and full `row_mask`/`bank_mask` read the source from the neighbouring pixel of the 2x2 quad (X, Y or diagonal), written as `QuadReadAcrossX`, `QuadReadAcrossY` and `QuadReadAcrossDiagonal` (SM 6.0, helper lanes included). The second source of a VOP2 keeps the lane's own register. The form needs a straight-line pixel stage at entry EXEC, proven whole-quad by an earlier `s_wqm_b64 exec, exec` (a partly covered quad has inactive source lanes that the hardware masks and `QuadReadAcross*` does not; a later write to EXEC or a restored older copy drops the proof), and plain VGPR operands; vertex stages, broadcast and pair selections (items A and C), row shifts, mirrors, DPP8, partial masks, `fi:1`, source modifiers and operations without a table entry are refused. FXC ps_5_1 has no quad intrinsic, so `translate_to` compiles a pair that uses one with DXC as vs_6_0/ps_6_0 (`X2W_DXC`, then PATH) and refuses it when no DXC exists. `tests/startup_gfx2hlsl_dpp_quad_swap_check.py` builds three pixel programs from the lane rule (OR and move forms, plus `v_min_u32_dpp` of the exchanged and own positions, #2023 item H, whose reference is the integer unsigned minimum and which also rejects a maximum) (the packed position in v0, the neighbour at x^1, y^1 or both, an own-lane control), draws 16 x 16 pixels and compares every word with an integer reference; three wrong exchanges, a missing exchange and (for the minimum) a maximum must read a different image, and a reference with one swap dropped must be rejected. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_dpp_quad_swap_' -V`. The Python controls run on Linux; the draws need DXC and `offscreen_check` on Windows.
+The startup pixel stage lowers DPP16 quad swaps (#2125 item B): `v_mov_b32_dpp` and the VOP2 forms in the integer and binary32 operation tables with `quad_perm:[1,0,3,2]`, `[2,3,0,1]` or `[3,2,1,0]` and full `row_mask`/`bank_mask` read the source from the neighbouring pixel of the 2x2 quad (X, Y or diagonal), written as `QuadReadAcrossX`, `QuadReadAcrossY` and `QuadReadAcrossDiagonal` (SM 6.0, helper lanes included). The second source of a VOP2 keeps the lane's own register. The form needs a straight-line pixel stage at entry EXEC, proven whole-quad by an earlier `s_wqm_b64 exec, exec` (a partly covered quad has inactive source lanes that the hardware masks and `QuadReadAcross*` does not; a later write to EXEC or a restored older copy drops the proof), and plain VGPR operands; vertex stages, broadcast and pair selections (items A and C), row shifts, mirrors, DPP8, partial masks, source modifiers and operations without a table entry are refused. `fi:1` (fetch inactive) is accepted under the same whole-quad proof, where no source lane is disabled, and gives the same translation. FXC ps_5_1 has no quad intrinsic, so `translate_to` compiles a pair that uses one with DXC as vs_6_0/ps_6_0 (`X2W_DXC`, then PATH) and refuses it when no DXC exists. `tests/startup_gfx2hlsl_dpp_quad_swap_check.py` builds three pixel programs from the lane rule (OR and move forms, plus `v_min_u32_dpp` of the exchanged and own positions, #2023 item H, whose reference is the integer unsigned minimum and which also rejects a maximum) (the packed position in v0, the neighbour at x^1, y^1 or both, an own-lane control), draws 16 x 16 pixels and compares every word with an integer reference; three wrong exchanges, a missing exchange and (for the minimum) a maximum must read a different image, and a reference with one swap dropped must be rejected. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_dpp_quad_swap_' -V`. The Python controls run on Linux; the draws need DXC and `offscreen_check` on Windows.
 
 The startup pixel stage lowers constant-lane SGPR spills (#2125 item E): `v_writelane_b32 vN, sM, k` followed by `v_readlane_b32 sD, vN, k` with an inline constant lane `k` (0..31) becomes one scalar slot per (VGPR, lane), written and read back as plain assignments. Both instructions ignore EXEC and touch only lane `k`, so with a constant `k` and a VGPR that no other instruction names, no cross-lane read exists to model. Refused, each with a reason: a lane chosen by an SGPR, lanes outside 0..31, a VGPR that any other instruction also names (vector use or register range), a read of a slot nothing wrote, branches (write-before-read needs straight-line order), a lane mask, `m0` or modifier on the value, a destination that is not a plain SGPR, and vertex stages. A constant value reloads as a constant. `tests/startup_gfx2hlsl_sgpr_spill_check.py` builds a pixel program with four slots in three VGPRs, clobbers the source SGPRs, reloads them (one slot after a second write) and ORs each word into the packed screen position; it draws 16 x 16 pixels and compares every word with an integer reference computed from the slot rule. Four wrong lowerings (overwrite ignored, lane 31 read as lane 0, a second VGPR read as the first, no reload) must read a different image. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sgpr_spill_' -V`. The Python controls and the `binary` assembler check run on Linux; the draws need DXC and `offscreen_check` on Windows.
 
@@ -14135,15 +14206,24 @@ join. When no lane is active, the wave skips the block too. The block is therefo
 when every SGPR, `vcc`, `m0` and SCC it may define is dead where it joins. A backward liveness pass over
 the program's instructions checks this. `m0` is always treated as live.
 
-Exec writes inside the block are accepted when the block is straight-line (no branch in it and none into
-it) and the write cannot set the exec bit of a lane whose bit is clear, because that lane's bit is clear on
-entry. Accepted forms:
-- `s_and_saveexec` and `v_cmpx`;
-- `s_and` or `s_andn2` that keeps exec;
-- `s_or`, `s_xor` or a move whose other source only ever holds a copy of exec made earlier in the same block.
+Exec writes inside the block are accepted when they cannot set the exec bit of a lane whose bit was clear at
+the branch. A forward pass over the block proves it. For each instruction the wave can reach from the branch,
+the pass keeps the set of scalar words in which such a lane's bit is known clear, on every path through the
+block, branches and loops inside it included (the largest sets that every path keeps, found by iteration). Each
+fact names the half of the wave it holds for, so a copy of `exec_hi` proves nothing about `exec_lo`. The set
+starts as exec alone. Only bitwise forms carry a fact:
+- a copy of exec (`s_mov` from exec, or the mask a saveexec form saves) and a zero literal are clear;
+- `s_and` is clear where either source is, `s_or` and `s_xor` where both are, `s_andn2` and `s_mov` where the
+  first source is;
+- `s_and_saveexec`, `s_or_saveexec`, `s_xor_saveexec`, `s_andn2_saveexec` and `s_andn2_wrexec` are their
+  operation on exec and the source, and `v_cmpx` ANDs into exec;
+- any other write, a compare result included, drops the facts of what it writes.
 
-That covers a nested `if` without its own branch. The copies are tracked in program order, which is every path
-only in a straight-line block.
+An exec write must leave exec in the set. The lane's bit is then clear at every instruction the wave runs in
+the block, so the wave changes nothing of that lane there, and its exec at the join is the model's. That
+covers a nested `if`, an `if`/`else` whose arms have their own `s_cbranch_execz`, and a loop, when every
+restore reads a mask saved inside the block. The proof starts at the branch, so it is not run for a block that
+a branch from outside enters.
 
 Each instruction's reads and writes come from its printed operands, checked against the repository
 decoder's spelling:
@@ -14166,9 +14246,10 @@ The block is still refused in these cases:
 - a definition that is live at the join, other than the lane mask above (or one of its conditions fails: zeroing
   with a value other than 0 or missing, a branch or a branch target between the zeroing and the branch, a write
   of M that is not from exec, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
-- any other exec write: exec set from a compare alone, restored from a mask saved before the block, or written
-  in a block with a branch or entered by one (a proven calculated `s_setpc_b64` jump counts), or restored through a 64-bit move, `s_or` or `s_xor` (the tracked copies name
-  registers, not which exec half they hold);
+- any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
+  some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
+  the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven
+  calculated `s_setpc_b64` jump counts), or restored from a copy of the other exec half;
 - an effect outside scalar registers, such as a scalar store or atomic, a barrier, `s_endpgm` or `v_writelane`;
 - a branch out of the block;
 - a backward `s_cbranch_execz`.
@@ -14215,6 +14296,9 @@ The runtime has no slot-67 path yet, so no translated compute program runs in th
   of the block's scalar statements must mismatch.
 - Case H nests an `s_and_saveexec`/`s_or` if inside such a block. Three lanes store two words, three more lanes
   store one word, and the rest store nothing. A control that drops the inner exec predicate must mismatch.
+- Case M is case H with an `if`/`else` in the block. Each arm has its own `s_cbranch_execz`, `s_andn2_b32` of
+  the saved mask switches to the else arm and `s_mov_b32` restores it. Three lanes store the first word, three
+  more the second, and the rest store nothing. A control that drops the switch to the else arm must mismatch.
 - Case K enters such a block only in group 1; in the other three groups the whole wave skips it. A control that
   runs the block for the skipped waves must mismatch.
 
@@ -14223,12 +14307,15 @@ for `cs_6_0`, and a plain D3D12 device dispatches it. The root signature is the 
 a root UAV and the root constants), so the manifest's table lines and the descriptor fetch are not exercised
 on the GPU. All 320 words are compared, including the sentinels. Four controls must each mismatch: swapping
 the X and Y group IDs, dropping the store, dropping case B's immediate offset, and dropping case C's exec
-predicate. Three more cover the execz cases: dropping a scalar statement in case J's block, dropping case H's
-inner exec predicate, and running case K's block for the skipped waves.
+predicate. Four more cover the execz cases: dropping a scalar statement in case J's block, dropping case H's
+inner exec predicate, running case K's block for the skipped waves, and dropping case M's switch to the else arm.
 
 The pure-Python controls cover:
 - accepted and refused execz blocks: a dead definition is accepted; a live scalar definition, SCC consumed
-  after the join, a nested block and a backward branch are refused;
+  after the join and a backward branch are refused;
+- exec writes in such a block: an `if`/`else` in both switch forms, a loop and a mask built from a zero literal
+  are accepted; a mask the loop body overwrites, a nonzero literal, an `s_or_saveexec` or `s_andn2_wrexec` source
+  from before the block, `s_orn2` and a copy of `exec_hi` are refused;
 - a modified descriptor word, an implicit-LOD sample and a misaligned immediate offset, all refused;
 - a store past the descriptor's range, which today translates with no range check.
 
@@ -14823,7 +14910,7 @@ ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 
 ### gfx1013 pixel DPP16 quad broadcast
 
-The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted only in a straight-line pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. Without that proof the instruction is refused, as are swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
+The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted only in a straight-line pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. Without that proof the instruction is refused, as are swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `bound_ctrl:0`, non-VGPR sources and vertex stages. `fi:1` is accepted with the proof and changes nothing, since no source lane is disabled. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
 
 Reproduce: `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast" -V`. The controls cover the translation, every refusal and the missing `s_wqm`; the WARP and hardware draws compare all 256 pixels of two fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls. This does not establish full-game startup.
 
@@ -14991,6 +15078,7 @@ check and requires the old exception to come back:
 The checks are `tests/startup_gfx2hlsl_handler_arity_check.py`, `…_image_arity_check.py`,
 `…_operand_count_check.py` and `…_scalar_arity_check.py`. They run on Linux and Windows without D3D12 or game
 data, because a refusal is observable at the `Stage` entry point.
+
 ## Startup translator: v_sad_u8, v_sad_u16 and v_sad_u32
 
 [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) now lowers the gfx1013 VOP3A unsigned sum-of-absolute-differences instructions `v_sad_u8` (`0x15a`), `v_sad_u16` (`0x15c`) and `v_sad_u32` (`0x15d`) in `VEC_U` to three on-demand preamble helpers emitted in `Pipeline.common()` only when referenced by a stage (`sad_u8`, `sad_u16`, `sad_u32`):
@@ -15004,4 +15092,19 @@ data, because a refusal is observable at the `Stage` entry point.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sad_(controls|warp|hardware)$' -V
+```
+
+## Opt-in release of retired slot-133 title-memory textures (Slice 2)
+
+Building on #2443 (Slice 1), `X2W_D3D12_RELEASE_RETIRED=1` extends desktop object retirement to device slot 133 (`CreatePlacedResourceX`) committed 2D textures with `title_memory` (non-RT/DS/UAV, 1-sample, `DEFAULT` heap), while keeping slot 127 `__XMemAllocationHooks__` resources out of the class:
+
+- `drain_retired_resources()` erases the retired wrapper from `resource_address_index()` (under `note_lock`), erases its desktop pointer from `texture_uploads()` (under `draw_lock`), and cleans stale `written_textures()` entries whose generation was not bumped by a newer allocation/write at the same title address (also cleared immediately on final `Release` when no view or live sibling shares the address).
+- `list_copy_texture.inl` calls `upload_texture()` for a subresource copy only when the resource is not in the retire class or has title memory (`!retire_when_idle || title_memory`), so with the switch off every resource uploads exactly as before; `texture_uploads()` accesses in `list_copy.inl` / `list_copy_texture.inl` are guarded with `draw_lock`.
+- `view_slot` records a view only when the desktop created it: desktop view creation returns `void`, so a removed device is the only failure it reports, and a failed slot is recorded unmaterialized (releasing its previous view reference and adding none). `retire_hold` reads the wrapper's desktop pointer under the retire lock and marks a use it cannot record, which makes the drain keep that desktop object for the process instead of dropping one a list still names.
+- `view_slot<18>` (SRV) tracks descriptor slots via `HeapInfo::shadow` across `note_view`, `note_copy`, and heap destruction (falling back to `retire_leave_class` for untracked slots or slots 19–21), and `draw_translated` holds bound textures with `retire_hold`.
+
+[`tests/startup_resource_retire_title.cpp`](../tests/startup_resource_retire_title.cpp) (`startup_resource_retire_title_{warp,hardware}_debug0` and `_off_`) verifies slot 133 copy/upload holds and readbacks, same-address slot 70 (`existing_memory_texture`) reuse under `X2W_RESOURCE_INDEX_CHECK=1`, stale `bc7_width` `written_textures` cleanup on RGBA8 reuse, `CopyDescriptorsSimple` / overwrite / heap-release SRV retirement, the switch-off control that an ordinary committed texture (no title memory) copy still records its upload, and that a newer `written_textures` generation survives the older generation's retirement across WARP (`Microsoft Basic Render Driver`) and `NVIDIA GeForce GTX 1660 SUPER`. Case 7 closes the fixture's draw-path gap (review finding B1): a host-built translated pixel shader samples a slot 133 title-memory texture through a descriptor table, its view token must resolve to that texture (a skipped resolve binds a null view and the readback reports `pixel (0,0) got 00000000`), and `retire_hold` in the draw keeps the released texture retained while the closed recording names it (removed, the budget reports `retained=0/0 expected=65536/1` before the recording is dropped); the readback holds the exact sampled words plus a clear sentinel row and column throughout, including after the texture leaves the budget.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
 ```

@@ -515,40 +515,54 @@ def is_exec(regs):
     return regs in ({'exec'}, EXEC_KEYS)
 
 
-def exec_stays_clear(name, asm, saved):
-    """True when an exec write cannot set the bit of a lane whose bit is clear: exec & x (s_and_saveexec, v_cmpx,
-    s_and or s_andn2 with exec as the kept operand), or exec | x, exec ^ x or a move of x where x is only ever a copy
-    of exec made inside the same skipped block (so x's bit is clear for that lane too)."""
-    base = re.sub(r'_e(32|64)$', '', name)
-    _, ops, _ = parse(asm)
-    if base.startswith(('s_and_saveexec', 'v_cmpx')):
-        return True
-    if not ops or not is_exec(scalar_tokens(ops[0])):
-        return False
-    srcs = [scalar_tokens(op) for op in ops[1:]]
-    # saved tracks register names, not which exec half was copied, so only a 32-bit restore is trusted
-    copies = lambda regs: bool(regs) and regs <= saved and base.endswith('32')
-    if base in ('s_and_b32', 's_and_b64'):
-        return any(is_exec(regs) for regs in srcs)
-    if base in ('s_andn2_b32', 's_andn2_b64'):
-        return bool(srcs) and is_exec(srcs[0])
-    if base in ('s_or_b32', 's_or_b64', 's_xor_b32', 's_xor_b64') and len(srcs) == 2:
-        return all(is_exec(regs) or copies(regs) for regs in srcs)
-    if base in ('s_mov_b32', 's_mov_b64') and len(srcs) == 1:
-        return copies(srcs[0])
-    return False
+def mask_words(tok, count):
+    """The scalar state keys holding a mask operand's words, low word first ('0' for a zero literal), or None when
+    the operand is not `count` whole words of scalar state."""
+    if tok == '0':
+        return ['0'] * count
+    m = re.fullmatch(r's\[(\d+):(\d+)\]|s(\d+)|(vcc|exec)(_lo|_hi)?', tok)
+    if not m:
+        return None
+    if m.group(4):
+        words = {'_lo': [m.group(4)], '_hi': [m.group(4) + '_hi']}.get(m.group(5), [m.group(4), m.group(4) + '_hi'])
+    else:
+        words = ['s%d' % n for n in range(int(m.group(1) or m.group(3)), int(m.group(2) or m.group(3)) + 1)]
+    return words if len(words) == count else None
 
 
-def exec_copies_after(name, asm, saved, may):
-    """The registers that hold only copies of exec made in the block, after this instruction."""
+def clear_after(name, asm, may, clear):
+    """Forward step of the proof Stage.execz_refusals runs over a block that s_cbranch_execz skips. A fact (key, h)
+    says: for every lane of wave half h (0: lanes 0 to 31, 1: lanes 32 to 63) whose exec bit was clear at the branch,
+    that lane's bit of the scalar state word `key` is clear. Returns the facts after the instruction, given the
+    facts before it.
+
+    Only bitwise forms carry a fact, per word: a zero literal holds it for both halves; D = A & B holds what either
+    source holds; A | B and A ^ B what both hold; A & ~B and a move what A holds. A saveexec or wrexec form is its
+    operation on exec plus the copy it saves, and v_cmpx ANDs its result into exec. Any other write, a compare
+    result included, drops the facts of what it may write."""
     base = re.sub(r'_e(32|64)$', '', name)
     _, ops, _ = parse(asm)
-    dests = scalar_tokens(ops[0]) - EXEC_KEYS - {'scc'} if ops else set()
-    saved = saved - (may - EXEC_KEYS - {'scc'})
-    if base.startswith('s_and_saveexec') or (base in ('s_mov_b32', 's_mov_b64') and len(ops) == 2
-                                             and is_exec(scalar_tokens(ops[1]))):
-        saved |= dests
-    return saved
+    out = {fact for fact in clear if fact[0] not in may - EXEC_KEYS}
+    if base.startswith('v_cmpx'):
+        return out
+    halves = lambda word: {0, 1} if word == '0' else {h for key, h in clear if key == word}
+    m = re.fullmatch(r's_(mov|and|or|xor|andn2)(_saveexec|_wrexec)?_b(32|64)', base)
+    saving = m and m.group(2)
+    count = 2 if m and m.group(3) == '64' else 1
+    words = [mask_words(op, count) for op in ops] if m and not (saving and m.group(1) == 'mov') else [None]
+    if None in words or len(words) != (2 if saving or m.group(1) == 'mov' else 3):
+        return {fact for fact in out if fact[0] not in may}
+    dest, srcs = words[0], words[1:]
+    if saving:  # RDNA 2 ISA SOP1: the operation is S0 op EXEC, so andn2 is S0 & ~EXEC
+        srcs.append(['exec', 'exec_hi'][:count])
+    combine = {'and': set.union, 'or': set.intersection, 'xor': set.intersection}.get(m.group(1), lambda a, *b: a)
+    value = [combine(*(halves(src[j]) for src in srcs)) for j in range(count)]
+    writes = list(zip(dest, value))
+    if saving:  # saveexec keeps the old exec in D; wrexec writes the result to both
+        writes = list(zip(('exec', 'exec_hi'), value)) + (writes if saving == '_wrexec' else
+                                                          [(word, halves(old)) for word, old in zip(dest, srcs[-1])])
+    out = {fact for fact in out if fact[0] not in dict(writes)}
+    return out | {(word, h) for word, held in writes for h in held}
 
 
 def scalar_effects(name, asm):
@@ -1679,17 +1693,18 @@ class Stage:
         model skips the block for an inactive lane. That lane can differ from the wave only by reading, after the
         join, scalar state the block defines (no lane active means the wave skipped the block too). The block is
         therefore accepted unchanged when every scalar register, mask and SCC it may define is dead where it joins,
-        and it has no effect outside scalar registers and no branch out of it. An exec write is accepted in a
-        straight-line block (no branch in it, none into it) when it cannot set the bit of a lane whose bit is clear
-        (exec_stays_clear): such a lane's bit is clear on entry, so the wave leaves it clear and its exec at the
-        join is the model's. A live definition, another exec write, a refused effect, a branch leaving the block
-        or a backward s_cbranch_execz is refused.
-
+        and it has no effect outside scalar registers and no branch out of it. An exec write is accepted when it
+        cannot set the bit of a lane whose bit was clear at the branch: clear_after carries, over every path through
+        the block (its branches and loops included), which masks have that lane's bit clear, and the write must
+        leave exec among them. Such a lane's bit then stays clear at every instruction the wave runs in the block,
+        so the wave changes nothing of that lane there and its exec at the join is the model's. The proof starts at
+        the branch, so a block that a branch from outside enters keeps its exec writes refused. A live definition,
+        an unproven exec write, a refused effect, a branch leaving the block or a backward s_cbranch_execz is
+        refused.
         One live definition is accepted: the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
         or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
         exec_lo`, `s_and_b32 M, X, exec_lo` in either operand order). Every write of M in the block yields a value
-        whose bit is 0 for any lane whose exec bit is clear there: exec can only be narrowed in the block
-        (exec_stays_clear has accepted each exec write), and a copy of exec, or X & exec, has that bit clear. M is 0
+        whose bit is 0 for any lane whose exec bit is clear there: the clear-mask proof keeps exec clear for that lane, and a copy of exec, or X & exec, has that bit clear. M is 0
         at the branch on every path (nothing branches or lands between the zeroing and the branch). So for a lane
         the model skips, the wave's M has that lane's bit 0 whether the wave ran the block or not, which is the
         model's M (0); a lane that runs the block runs it in the model too. This holds only while M is read per
@@ -1701,14 +1716,14 @@ class Stage:
         index = {off: i for i, off in enumerate(offsets)}
         effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
         succ = []
-        targets = []  # every branch target, the proven calculated s_setpc_b64 ones included
+        jumps = []  # (instruction, target) of every branch, the proven calculated s_setpc_b64 ones included
         for i, (off, n, name, asm) in enumerate(self.ins):
             to = int(parse(asm)[1][0].split('_')[1], 16) if name.startswith(('s_cbranch', 's_branch')) else None
             if name == 's_setpc_b64':  # a proven calculated jump reaches its target
                 to = getattr(self, 'calculated_pc', {}).get(off)
             nxt = [i + 1] if i + 1 < len(self.ins) and name not in ('s_branch', 's_endpgm') else []
             if to is not None:
-                targets.append(to)
+                jumps.append((i, to))
             succ.append(nxt + ([index[to]] if to in index else []))
         live_in = [set() for _ in self.ins]
         changed = True
@@ -1729,9 +1744,20 @@ class Stage:
                 refused.setdefault(off, 's_cbranch_execz to a block before it')
                 continue
             live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
-            saved = set()  # registers whose every write in the block so far is a copy of exec
-            # The copies are tracked in program order, which is every path only in a straight-line block: no branch
-            # in it and no branch into it. Elsewhere an exec write is refused.
+            # Facts before each instruction the wave can reach from the branch: the largest sets every path keeps.
+            entry = frozenset({('exec', 0), ('exec_hi', 1)})
+            before = {b + 1: entry} if b + 1 < t else {}
+            entered = any(index.get(target) in range(b + 1, t) for k, target in jumps if not b < k < t)
+            changed = not entered
+            while changed:
+                changed = False
+                for i in range(b + 1, t):
+                    if i in before:
+                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | entry
+                        for s in succ[i]:
+                            if b < s < t and before.get(s, after) & after != before.get(s):
+                                before[s], changed = before.get(s, after) & after, True
+            targets = [target for _, target in jumps]
             straight = not any(self.ins[k][2].startswith(('s_cbranch', 's_branch')) for k in range(b + 1, t)) and \
                 not any(index.get(target) in range(b + 1, t) for target in targets)
             cand = {k for i in range(b + 1, t) for k in (effects[i][2] - EXEC_KEYS) & live if re.fullmatch(r'vcc|s\d+', k)}
@@ -1745,12 +1771,12 @@ class Stage:
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
                         b < index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1) <= t):
                     reason = 'branch out of the block'
-                elif may & EXEC_KEYS and not (straight and exec_stays_clear(inner, inner_asm, saved)):
+                elif may & EXEC_KEYS and (entered or i in before and
+                                          not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
                 elif (may - EXEC_KEYS - ok_masks) & live:
                     reason = 'definition of %s, live where the block joins' % ', '.join(
                         sorted((may - EXEC_KEYS - ok_masks) & live))
-                saved = exec_copies_after(inner, inner_asm, saved, may)
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
@@ -2344,7 +2370,7 @@ class Stage:
         lane keeps the one quad_perm names for its own position in the quad. That needs all four lanes of the quad to
         run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and a
         whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every
-        other control (other permutations, row_*, wave_*, a partial row or bank mask, fi, a vertex stage) is refused by
+        other control (other permutations, row_*, wave_*, a partial row or bank mask, a vertex stage) is refused by
         name, since the single lane cannot read a neighbour."""
         perms = [m for m in mods if m.startswith('quad_perm:')]
         rest = [m for m in mods if not m.startswith('quad_perm:')]
@@ -2573,7 +2599,7 @@ class Stage:
     # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
     # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
     # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (pair
-    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, fi, and a vertex stage.
+    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
@@ -2632,8 +2658,12 @@ class Stage:
     # map onto the SM 6.0 quad intrinsics, which read the other lane of the 2x2 pixel quad and keep
     # helper lanes active. Only a pixel stage at entry EXEC qualifies, and only after `s_wqm exec, exec`
     # proved whole-quad EXEC: the hardware can return 0 or the old value for a source lane whose EXEC bit
-    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Other permutations, DPP8, row shifts and partial masks stay refused.
+    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Other permutations, fi:1 without that proof, DPP8, row shifts and partial masks stay refused.
     def dpp(self, base, ops, mods):
+        # fi:1 (fetch inactive, DPP16 dword bit 18; LLVM AMDGPU `fi`, Mesa ACO fetch_inactive) only decides what a
+        # disabled source lane returns. Every lowering below is taken only with the whole quad proven active, so no
+        # source lane is disabled and it decides nothing.
+        mods = [m for m in mods if m != 'fi:1']
         if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
             return self.dpp_broadcast(base, ops, mods)
         perm = None
@@ -2844,6 +2874,14 @@ class Stage:
             else:
                 self.sym[d] = ('descnum',)
             return None
+        # The table templates name their sources as {0}, {1}, ...; a short operand list would make
+        # str.format raise IndexError, which the single-shader path records as a translator crash
+        # rather than a refusal. The arity guards above cover the table entries that spell a count, so
+        # this one covers the templates themselves: every placeholder the template uses must have a
+        # source, and a template may not read a source the instruction does not carry.
+        needed = max((int(i) for i in re.findall(r'\{(\d+)\}', text)), default=-1) + 1
+        if len(srcs) < needed:
+            raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), needed + 1))
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
         if shift_add:
@@ -6200,6 +6238,19 @@ def has_bytecode(path):
         return False
 
 
+def has_complete_mesh57_bytecode(path):
+    """Check the DXContainer header and length without reading the shader body."""
+    try:
+        with open(path, 'rb') as shader:
+            header = shader.read(32)
+            if len(header) != 32 or header[:4] != b'DXBC':
+                return False
+            size, parts = struct.unpack_from('<II', header, 24)
+            return size == os.fstat(shader.fileno()).st_size and 0 < parts <= (size - 32) // 4
+    except OSError:
+        return False
+
+
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
                  ps_attr_map=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
@@ -6392,10 +6443,10 @@ def translate_mesh57(out_dir, key):
                 bytecode = os.path.join(staging, stage + '.cso')
                 r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
                                    capture_output=True, text=True)
-                if r.returncode or not has_bytecode(bytecode):
+                if r.returncode or not has_complete_mesh57_bytecode(bytecode):
                     # DXC names the source path; keep only the diagnostic after it.
                     lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
-                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'no bytecode produced')[:500]))
+                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'missing or incomplete bytecode')[:500]))
             for stage, _, _ in sources:
                 os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
     temporary = '%s.ms57.txt.%d.tmp' % (name, os.getpid())
@@ -6746,8 +6797,10 @@ def pending_keys(out_dir, skip_failed):
         result = os.path.join(out_dir, '%016x' % key)
         mesh = m.group(2) == 'm57'
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
+        ready_bytecode = has_complete_mesh57_bytecode if mesh else has_bytecode
+        manifest = result + ('.ms57.txt' if mesh else '.txt')
         # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if os.path.isfile(result + ('.ms57.txt' if mesh else '.txt')) and (manifest_only or all(has_bytecode(result + s) for s in stages)):
+        if os.path.isfile(manifest) and (manifest_only or all(ready_bytecode(result + s) for s in stages)):
             continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
         # A repeated pass retries a failure only once its request is rewritten.
