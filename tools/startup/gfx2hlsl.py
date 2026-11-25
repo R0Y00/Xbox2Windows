@@ -2787,7 +2787,22 @@ class Stage:
             (arity, text), kind = VEC_F[base], 'f'
         else:
             raise Unsupported('%s_dpp' % base)
-        if len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
+        src_neg_abs = []
+        if kind == 'f':
+            # Float quad swaps accept the source neg/abs of the plain operation (RDNA 2 ISA 12.19;
+            # LLVM 15 AMDGPU DPP prints them on the _dpp spelling). The permuted word is read first,
+            # then neg/abs apply, so -vN negates the neighbour lane value. VGPR-only is kept: an SGPR
+            # source stays refused below, as does a non-VGPR base.
+            if len(ops) != arity + 1:
+                raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
+            for token in ops[1:1 + arity]:
+                neg, rest = self.split_neg(token)
+                absolute = rest.startswith('|') and rest.endswith('|')
+                base_tok = rest[1:-1] if absolute else rest
+                if not re.fullmatch(r'v\d+', base_tok):
+                    raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
+                src_neg_abs.append((neg, absolute, base_tok))
+        elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
                 or not getattr(self, 'exec_known', False)):
@@ -2797,9 +2812,18 @@ class Stage:
                               'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
         self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
-        swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
-        args = [('F(%s)' % swapped) if kind == 'f' else swapped] + \
-               [self.f(o) if kind == 'f' else self.u(o) for o in ops[2:1 + arity]]
+        if kind == 'f':
+            neg0, abs0, base0 = src_neg_abs[0]
+            swapped = '%s(%s)' % (intrinsic, self.u(base0))
+            first = 'F(%s)' % swapped
+            if abs0:
+                first = 'abs(%s)' % first
+            if neg0:
+                first = '(-%s)' % first
+            args = [first] + [self.f(o) for o in ops[2:1 + arity]]
+        else:
+            swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
+            args = [swapped] + [self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
 

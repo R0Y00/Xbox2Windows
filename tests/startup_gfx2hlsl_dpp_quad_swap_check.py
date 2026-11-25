@@ -197,6 +197,14 @@ def controls():
     check('bound_ctrl:1 is accepted (a quad_perm source is always in range)', refused(base + ' bound_ctrl:1') is None)
     check('quad broadcast also translates', refused(base.replace('[1,0,3,2]', '[0,0,0,0]')) is None)
     check('pair broadcast also translates', refused(base.replace('[1,0,3,2]', '[1,1,3,3]')) is None)
+    # Float quad swaps accept the source neg/abs of the plain operation (RDNA 2 ISA 12.19).
+    # The permuted word is read first, then neg/abs apply, so -v0 negates the neighbour lane.
+    neg = Probe()
+    neg.one('v_add_f32_dpp', 'v_add_f32_dpp v5, -v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf')
+    check('float swap with -v0 negates the neighbour word', '(-F(QuadReadAcrossX(v0)))' in ' '.join(neg.lines))
+    absolute = Probe()
+    absolute.one('v_add_f32_dpp', 'v_add_f32_dpp v5, |v0|, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf')
+    check('float swap with |v0| takes abs of the neighbour word', 'abs(F(QuadReadAcrossX(v0)))' in ' '.join(absolute.lines))
     cases = [
         ('identity [0,1,2,3]', base.replace('[1,0,3,2]', '[0,1,2,3]'), {}),
         ('partial row_mask', base.replace('row_mask:0xf', 'row_mask:0x3'), {}),
@@ -206,7 +214,7 @@ def controls():
         ('fi:0 spelling', base + ' fi:0', {}),
         ('fi:1 with EXEC no longer the entry mask', base + ' fi:1', {'exec_known': False}),
         ('fi:1 with entry EXEC not proven whole-quad', base + ' fi:1', {'wqm_exec': False}),
-        ('negated source', 'v_add_f32_dpp v5, -v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
+        ('integer negated source', 'v_or_b32_dpp v5, -v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('SGPR source', 'v_mov_b32_dpp v5, s0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('operation without a table entry', 'v_cvt_f64_f32_dpp v[5:6], v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('vertex stage', base, {'kind': 'vs'}),
