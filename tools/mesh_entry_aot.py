@@ -301,7 +301,8 @@ class Wave:
             self.s, self.pending = dict(base[0]), set(base[1])
             self.pending_v = set(base[2])
             self.scc = None
-            self.exec_range(decoded, expressions, jumps, start, stop, arm=True)
+            for _ in self.exec_range(decoded, expressions, jumps, start, stop, arm=True):
+                raise ValueError("Barrier inside a descriptor join arm")
             # Each arm is checked on its own so two changes cannot cancel.
             if (self.exec, self.vcc, self.m0) != before:
                 raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
@@ -676,7 +677,7 @@ class Wave:
                 self.written.add(int(dest[1:]))
             elif dest.startswith("s["):
                 self.written.update(span(dest))
-        if self.exec_range(decoded, expressions, jumps, 0, len(decoded)):
+        if (yield from self.exec_range(decoded, expressions, jumps, 0, len(decoded))):
             return
         raise ValueError("No program exit")
 
