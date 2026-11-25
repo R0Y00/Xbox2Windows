@@ -2172,6 +2172,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
         return refuse("signature root constants require the bound compute root");
+    } else if (sig->own().signature_root && (count != 1 || count_buffer)) {
+        // Batched and count-buffer Dispatch is supported for rootless signatures only in this slice.
+        return refuse("a Dispatch signature with root constants requires one command and no count buffer");
     }
     Wrapper* buffer = as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)

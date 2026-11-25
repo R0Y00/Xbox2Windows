@@ -7710,6 +7710,7 @@ buffer; otherwise the call is refused with a named reason and records nothing.
 Without a count buffer all `count` records run. A zero maximum count, a count
 offset without a buffer, and any count or count buffer on a graphics signature
 are still refused.
+A Dispatch signature with root constants stays single-command: a maximum count above one or a count buffer is refused, even when its root matches the bound root.
 
 The `count` mode of
 [`startup_indirect_dispatch.cpp`](../tests/startup_indirect_dispatch.cpp) places

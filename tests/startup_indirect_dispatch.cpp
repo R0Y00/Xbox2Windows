@@ -141,9 +141,11 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
 // The count mode adds no_count_buffer (accepted: every record up to the max count runs), count_outside and
 // count_unaligned (count word outside the buffer or off a word boundary) and records_short (max count records overflow).
 enum class Rejection { none, unmapped, short_range, placeholder, other_root, partial_record, padded_stride,
-                       no_count_buffer, count_outside, count_unaligned, records_short };
+                       no_count_buffer, count_outside, count_unaligned, records_short, rooted_multi, rooted_count_buffer };
 
 // `record` is what the writer stores after the padding word: (scale, bias) in the constants mode, then the groups.
+// The constants mode also refuses a rooted signature with two records (rooted_multi) or a count buffer
+// (rooted_count_buffer): batching is rootless-only in this slice.
 // The other-root control binds `other_guest_root`, which lacks the signature's constants.
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, ID3D12RootSignature* guest_root,
          ID3D12RootSignature* other_guest_root, ID3D12PipelineState* writer, IUnknown* consumer,
@@ -222,7 +224,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
                                             rejection == Rejection::no_count_buffer ? nullptr : argument,
                                             rejection == Rejection::no_count_buffer ? 0 : count_offset);
     else
-        slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, 1, argument, offset, nullptr, 0);
+        slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, rejection == Rejection::rooted_multi ? 2 : 1,
+                                            argument, offset,
+                                            rejection == Rejection::rooted_count_buffer ? argument : nullptr,
+                                            rejection == Rejection::rooted_count_buffer ? sizeof(std::uint32_t) : 0);
     transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), argument_bytes, result.Get(), 0, result_bytes);
     using Close = HRESULT (WINAPI*)(IUnknown*);
@@ -423,6 +428,8 @@ int main(int argc, char** argv) try
         !verify(writer.Get(), record, Rejection::short_range, signature.Get()) ||
         !verify(writer.Get(), record, Rejection::placeholder, placeholder.Get()) ||
         (constants && (!verify(writer.Get(), record, Rejection::other_root, signature.Get()) ||
+                       !verify(writer.Get(), record, Rejection::rooted_multi, signature.Get()) ||
+                       !verify(writer.Get(), record, Rejection::rooted_count_buffer, signature.Get()) ||
                        !verify(writer.Get(), record, Rejection::partial_record, signature.Get()) ||
                        !verify(writer.Get(), record, Rejection::padded_stride, padded.Get()))))) return 1;
     if (info) {
