@@ -5477,6 +5477,16 @@ The `DOT_U` fixture in `tests/compute_store_check.py` (`draw-dot-u`, `compute_st
 ctest --preset dev --no-tests=error -R '^compute_store_aot_dot_u_(warp|hardware)$' -V
 ```
 
+#### Per-lane compare and select
+
+`v_cmp_{f,lt,eq,le,gt,ne,ge,t}_{u32,i32}` (`_e32` into `vcc_lo` and `_e64` into `vcc_lo` or `s0..s105`), `v_cmp_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,ngt,nle,neq,nlt,tru}_f32` (`_e32` into `vcc_lo` and `_e64` into `vcc_lo` or `s0..s105`), `v_cndmask_b32_e32 vD, S0, vS1, vcc_lo`, and `v_cndmask_b32_e64 vD, S0, S1, (vcc_lo|sN)` track per-lane compare results as `("cond", hlsl_bool_expression)` in `vcc_cond` or `scalar[n]` and lower selects to `(cond ? S1 : S0)`. Because only the same lane reads its condition bit, the lowering is independent of wave size. Integer `u32` compares compare `uint` words, `i32` compares cast via `asint(...)`, and `f32` compares cast via `asfloat(...)` with explicit `isnan(...)` checks for all ordered and unordered IEEE NaN predicates. Existing lane guards (`s_and_saveexec_b32` on uniform `v_cmp`), constant-mask `v_cndmask_b32_e64`, and `vcc_carry`/`vcc_borrow` keep their behavior, and any write to `vcc_lo` invalidates the other VCC-derived states. `f32` source modifiers, `clamp`, SDWA/DPP spellings, scalar ALU or branch readers of a condition SGPR, `s_and_saveexec_b32` on a condition built from loaded or ALU data, `_ci` carry-in from a condition, and stale conditions after another VCC write are refused.
+
+The `VCMP_SELECT` suite in `tests/compute_store_check.py` (`draw-vcmp-select`, `compute_store_aot_vcmp_select_${adapter}`) runs 12 64-thread `gfx1013` dispatches (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words each) covering all 32 predicates across equal values, `0x7fffffff` vs `0x80000000`, `0` vs `0xffffffff`, denormal raw words (`0x00000001` vs `0x80000001`), `±0`, `NaN` on either or both sides, `±inf`, and memory-loaded/`tid` inputs, comparing all 3,840 words against an independent Python model. Reference controls (`lt`/`gt` swapped at word 1, signed for unsigned at word 1, ordered for unordered at word 5, select operands swapped at word 0, sentinel modified at word 256) and recompiled-HLSL mutations (`<` for `<=`, `asint` dropped, `isnan` replaced by `isinf` on an unordered predicate) must all fail.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_vcmp_select_(warp|hardware)$' -V
+```
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
