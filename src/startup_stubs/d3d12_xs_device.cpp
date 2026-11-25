@@ -24,6 +24,7 @@
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/heap_indexed_root.h"
+#include "startup_stubs/indexed_indirect_guard.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
@@ -1186,6 +1187,7 @@ struct DesktopAllocator {
     // an allocator whose failed recording is still attached.
     bool close_failed;
     std::vector<std::unique_ptr<x2w_upload::Arena>> uploads;
+    std::vector<x2w_startup::ComPtr<ID3D12Resource>> indexed_validation;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1288,6 +1290,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
         hr = next->real->Reset();
         if (SUCCEEDED(hr)) {
             next->uploads.clear();
+            next->indexed_validation.clear();
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -1379,6 +1382,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             for (DesktopAllocator* spare : title.pool) {
                 if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
                     spare->uploads.clear();
+                    spare->indexed_validation.clear();
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -2265,7 +2269,13 @@ enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline
        indirect_outcomes };
 volatile LONG64 indirect_calls[indirect_outcomes][5];
 
-const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset);
+struct IndirectIndexView {
+    D3D12_INDEX_BUFFER_VIEW view{};
+    ID3D12Resource* resource = nullptr;
+    u64 offset = 0;
+};
+const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument,
+                                     u64 offset, const IndirectIndexView& indices);
 
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
@@ -2298,7 +2308,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
-    const bool translated = command == IndirectCommand::draw && pass.pipeline && !pass.pipeline->own().real &&
+    const bool translated = (command == IndirectCommand::draw || indexed) && pass.pipeline && !pass.pipeline->own().real &&
         (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer)) return refuse("indirect graphics requires one command and no count buffer");
@@ -2349,13 +2359,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
         return refuse("argument buffer does not use COMMON state tracking");
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
-    if (translated) {
-        const char* failure = draw_translated_indirect(self, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset);
-        if (failure) return refuse(failure, indirect_graphics_pipeline);
-        InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
-        return;
-    }
-    auto argument_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    IndirectIndexView index_view;
     if (indexed) {
         auto view = pass.ib;
         const UINT alignment = view.Format == DXGI_FORMAT_R16_UINT ? 2 : view.Format == DXGI_FORMAT_R32_UINT ? 4 : 0;
@@ -2375,9 +2379,20 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (!native_base || index_offset > ~u64{} - native_base || (native_base + index_offset) % alignment)
             return refuse("index view has no aligned desktop address");
         view.BufferLocation = native_base + index_offset;
-        if (index == resource) argument_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
-        else require_state(self, index, D3D12_RESOURCE_STATE_INDEX_BUFFER);
-        list->IASetIndexBuffer(&view);
+        index_view = {view, index, index_offset};
+    }
+    if (translated) {
+        const char* failure = draw_translated_indirect(self, static_cast<ID3D12CommandSignature*>(sig->own().real), resource,
+                                                       offset, index_view);
+        if (failure) return refuse(failure, indirect_graphics_pipeline);
+        InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
+        return;
+    }
+    auto argument_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    if (index_view.resource) {
+        if (index_view.resource == resource) argument_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        else require_state(self, index_view.resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        list->IASetIndexBuffer(&index_view.view);
     }
     if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));

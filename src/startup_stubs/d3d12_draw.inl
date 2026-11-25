@@ -24,6 +24,9 @@ struct Translation {
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
     std::optional<bool> independent_indirect_entry;
+    std::optional<bool> indexed_indirect_entry;
+    int indirect_base_word = -1;
+    x2w_startup::ComPtr<ID3D12CommandSignature> indexed_signature;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
     LONG logged_draws = 0, logged_bindings = 0, logged_large = 0;  // diagnostics budget per translation
@@ -1365,7 +1368,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
 
 // FXC keeps unused entry declarations in reflection. Check actual uses so a
 // generated shader which reads the draw's start vertex or instance is refused.
-bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation)
+bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation, bool indexed = false)
 {
     x2w_startup::ComPtr<ID3D12ShaderReflection> shader;
     if (!blob || FAILED(D3DReflect(blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(shader.GetAddressOf())))) return false;
@@ -1389,8 +1392,10 @@ bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation)
             if (var.StartOffset % sizeof(UINT) || var.Size != sizeof(UINT) || word >= translation.uds.size() ||
                 !var.Name || std::strcmp(var.Name, name)) return false;
             const auto& ud = translation.uds[word];
+            if (indexed && ud.kind == Translation::base_vertex) continue;
             if (ud.kind == Translation::stride && ud.a >= 0 && static_cast<std::size_t>(ud.a) < translation.srvs.size() &&
-                translation.srvs[ud.a].source == 0 && translation.srvs[ud.a].kind == 0) continue;
+                (translation.srvs[ud.a].source == 0 || (indexed && translation.srvs[ud.a].source == 1)) &&
+                translation.srvs[ud.a].kind == 0) continue;
             if (ud.kind != Translation::root_constant && ud.kind != Translation::rect && ud.kind != Translation::d16_unorm16)
                 return false;
         }
@@ -1402,9 +1407,124 @@ struct TranslatedIndirectDraw {
     ID3D12CommandSignature* signature;
     ID3D12Resource* argument;
     u64 offset;
+    IndirectIndexView indices;
     u64 shader_key = 0;
     const char* refusal = "translated pipeline or target unavailable";
 };
+
+struct IndexedValidationPipeline {
+    x2w_startup::ComPtr<ID3D12Device> device;
+    x2w_startup::ComPtr<ID3D12RootSignature> root;
+    x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+};
+
+IndexedValidationPipeline& indexed_validation_pipeline(ID3D12Device* device)
+{
+    // Hold the compute pipeline for the life of the shim and keep incompatible devices out of the route.
+    static IndexedValidationPipeline validation = [device] {
+        IndexedValidationPipeline result;
+        result.device = device;
+        D3D12_ROOT_PARAMETER params[4]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.Num32BitValues = 8;
+        params[1].ParameterType = params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[2].Descriptor.ShaderRegister = 1;
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        const D3D12_ROOT_SIGNATURE_DESC desc{4, params};
+        x2w_startup::ComPtr<ID3DBlob> signature, code;
+        HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, nullptr);
+        if (SUCCEEDED(hr)) hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                                                            IID_PPV_ARGS(&result.root));
+        if (SUCCEEDED(hr)) hr = D3DCompile(x2w_startup::indexed_indirect_guard, sizeof(x2w_startup::indexed_indirect_guard) - 1,
+                                           "indexed indirect validation", nullptr, nullptr, "guard", "cs_5_0", 0, 0, &code, nullptr);
+        if (SUCCEEDED(hr)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+            pipeline.pRootSignature = result.root.Get();
+            pipeline.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+            hr = device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&result.pipeline));
+        }
+        if (FAILED(hr)) log("x2w-render translated indexed argument validation setup failed 0x%08lx", static_cast<unsigned long>(hr));
+        return result;
+    }();
+    return validation;
+}
+
+ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandList* list, Translation& translation,
+                                         const TranslatedIndirectDraw& draw, UINT vertices)
+{
+    auto* device = device_of(self->own().list_device);
+    auto& compute = indexed_validation_pipeline(device);
+    if (compute.device.Get() != device || !compute.pipeline) return nullptr;
+    if (!translation.indexed_signature) {
+        D3D12_INDIRECT_ARGUMENT_DESC fields[2]{};
+        fields[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        fields[0].Constant = {0, static_cast<UINT>(translation.indirect_base_word), 1};
+        fields[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+        const D3D12_COMMAND_SIGNATURE_DESC signature{24, 2, fields, 0};
+        if (FAILED(device->CreateCommandSignature(&signature, translation.root, IID_PPV_ARGS(&translation.indexed_signature))))
+            return nullptr;
+    }
+    const auto argument_desc = draw.argument->GetDesc();
+    const auto index_desc = draw.indices.resource->GetDesc();
+    if (argument_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || index_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        (index_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || (argument_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        argument_desc.Width > UINT_MAX || index_desc.Width > UINT_MAX || draw.offset > UINT_MAX || draw.indices.offset > UINT_MAX)
+        return nullptr;
+
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 28;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    x2w_startup::ComPtr<ID3D12Resource> scratch;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(&scratch)))) return nullptr;
+    const auto keep = [&] {
+        AcquireSRWLockExclusive(&allocator_lock);
+        const auto found = list_recordings.find(self);
+        bool retained = false;
+        if (found != list_recordings.end() && found->second) {
+            try {
+                found->second->indexed_validation.push_back(scratch);
+                retained = true;
+            } catch (const std::bad_alloc&) {
+            }
+        }
+        ReleaseSRWLockExclusive(&allocator_lock);
+        return retained;
+    };
+    if (!keep()) return nullptr;
+
+    auto* indices = draw.indices.resource;
+    const auto before = [&](ID3D12Resource* resource) {
+        for (const auto& state : pass_of(self).states)
+            if (state.first == resource) return state.second;
+        return D3D12_RESOURCE_STATE_COMMON;
+    };
+    const auto argument_previous = before(draw.argument);
+    const auto index_previous = before(indices);
+    require_state(self, draw.argument, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (indices != draw.argument) require_state(self, indices, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    require_state(self, scratch.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const UINT bounds[]{static_cast<UINT>(draw.offset), static_cast<UINT>(argument_desc.Width), static_cast<UINT>(draw.indices.offset),
+        draw.indices.view.SizeInBytes, static_cast<UINT>(index_desc.Width), draw.indices.view.Format == DXGI_FORMAT_R16_UINT ? 2u : 4u,
+        vertices, 0};
+    list->SetPipelineState(compute.pipeline.Get());
+    list->SetComputeRootSignature(compute.root.Get());
+    list->SetComputeRoot32BitConstants(0, 8, bounds, 0);
+    list->SetComputeRootShaderResourceView(1, draw.argument->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(2, indices->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(3, scratch->GetGPUVirtualAddress());
+    list->Dispatch(1, 1, 1);
+    require_state(self, scratch.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    if (draw.argument != indices && argument_previous != D3D12_RESOURCE_STATE_COMMON)
+        require_state(self, draw.argument, argument_previous);
+    constexpr auto shader_reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    require_state(self, indices, (index_previous & shader_reads) | D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    return scratch.Get();
+}
 
 struct IndirectBufferView {
     ID3D12Resource* resource = nullptr;
@@ -1515,13 +1635,28 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
-        if (!tr->independent_indirect_entry.has_value()) {
-            tr->independent_indirect_entry = indirect_shader_entry(tr->vs, *tr) && indirect_shader_entry(tr->ps, *tr) &&
-                std::all_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) {
-                    return srv.source == 0;
+        if (indexed && (pass.compute_root || pass.compute_pipeline)) {
+            indirect->refusal = "indexed validation cannot replace a live guest compute binding";
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
+        auto& entry = indexed ? tr->indexed_indirect_entry : tr->independent_indirect_entry;
+        if (!entry.has_value()) {
+            bool found_base = !indexed;
+            if (indexed) {
+                for (std::size_t i = 0; i < tr->uds.size(); ++i) {
+                    if (tr->uds[i].kind != Translation::base_vertex) continue;
+                    if (found_base) { found_base = false; break; }
+                    found_base = true;
+                    tr->indirect_base_word = static_cast<int>(i);
+                }
+            }
+            entry = found_base && indirect_shader_entry(tr->vs, *tr, indexed) && indirect_shader_entry(tr->ps, *tr, indexed) &&
+                std::all_of(tr->srvs.begin(), tr->srvs.end(), [indexed](const Translation::Srv& srv) {
+                    return srv.source == 0 || (indexed && srv.kind == 0 && srv.source == 1 && srv.a == 0);
                 });
         }
-        if (!*tr->independent_indirect_entry || tr->samplers.heap) {
+        if (!*entry || tr->samplers.heap) {
             indirect->refusal = "translated draw uses an unsupported resource or draw-dependent entry value";
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
@@ -1545,7 +1680,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const UINT index_bytes = pass.ib.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
     const u64 index_address = pass.ib.BufferLocation + u64{start} * index_bytes;
     const std::size_t index_total = std::size_t{count} * index_bytes;
-    const bool indices_ok = indexed && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
+    const bool indices_ok = indexed && !indirect && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
     INT vertex_first = indexed ? 0 : static_cast<INT>(start);
     UINT vertex_count = indexed ? 0 : count;
     if (indices_ok) {
@@ -1562,6 +1697,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     if (vertex_first < 0) vertex_first = 0;
+    UINT indexed_vertices = UINT_MAX;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -1676,9 +1812,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         if (indirect) {
-            const auto view = entry_ok ? indirect_table_buffer(self, words) : IndirectBufferView{};
+            IndirectBufferView view{};
+            if (srv.source == 1 && indexed) {
+                const auto& vb = pass.vb[0];
+                if (vb.StrideInBytes && vb.StrideInBytes <= 0x3fff && vb.SizeInBytes % vb.StrideInBytes == 0 &&
+                    vb.BufferLocation <= 0xffffffffffffull) {
+                    const std::uint32_t stream[]{static_cast<UINT>(vb.BufferLocation),
+                        static_cast<UINT>(vb.BufferLocation >> 32) | vb.StrideInBytes << 16, vb.SizeInBytes / vb.StrideInBytes, 0};
+                    view = indirect_table_buffer(self, stream);
+                    indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
+                }
+            } else if (entry_ok) {
+                view = indirect_table_buffer(self, words);
+            }
             if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
-                indirect->refusal = "translated draw requires a complete GPU-backed table buffer range";
+                indirect->refusal = srv.source == 1 ? "translated indexed draw requires a complete GPU-backed vertex stream"
+                                                    : "translated draw requires a complete GPU-backed table buffer range";
                 ReleaseSRWLockExclusive(&draw_lock);
                 return false;
             }
@@ -1806,6 +1955,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             pass.default_scissor_h = target.Height;
         }
     }
+    ID3D12Resource* validated = nullptr;
+    if (indirect && indexed) {
+        validated = validate_indexed_arguments(self, list, *tr, *indirect, indexed_vertices);
+        if (!validated) {
+            indirect->refusal = "translated indexed argument validation could not be recorded";
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
+    }
     list->SetPipelineState(pipeline);
     // X2W_DEPTH_STATE: the reference of the decoded stencil test is list state in D3D12. It replaces the one a
     // preceding OMSetStencilRef set, for draws of this pipeline only when a depth view is bound.
@@ -1826,8 +1984,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
     if (indirect) {
-        require_state(self, indirect->argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-        list->ExecuteIndirect(indirect->signature, 1, indirect->argument, indirect->offset, nullptr, 0);
+        if (validated) {
+            list->IASetIndexBuffer(&indirect->indices.view);
+            list->ExecuteIndirect(tr->indexed_signature.Get(), 1, validated, 4, validated, 0);
+        } else {
+            require_state(self, indirect->argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list->ExecuteIndirect(indirect->signature, 1, indirect->argument, indirect->offset, nullptr, 0);
+        }
         // The translated root invalidated the desktop arguments of the tracked guest root.
         if (pass.graphics_root) list->SetGraphicsRootSignature(pass.graphics_root);
         pass.srv_bound = 0;
@@ -1872,10 +2035,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     return draw_translated(self, indexed, count, instances, start, base_vertex, start_instance, nullptr);
 }
 
-const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset)
+const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset,
+                                     const IndirectIndexView& indices)
 {
-    TranslatedIndirectDraw draw{signature, argument, offset};
-    if (!draw_translated(self, false, 0, 0, 0, 0, 0, &draw)) {
+    TranslatedIndirectDraw draw{signature, argument, offset, indices};
+    if (!draw_translated(self, indices.resource != nullptr, 0, 0, 0, 0, 0, &draw)) {
         static LONG refused;
         if (draw.shader_key && first_calls(refused, 32))
             log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);
@@ -1884,7 +2048,8 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
     InterlockedIncrement(&translated_draws);
     static LONG reported;
     if (first_calls(reported, 16))
-        log("x2w-render translated ExecuteIndirect Draw recorded, shader %016llx, offset 0x%llx", draw.shader_key, offset);
+        log("x2w-render translated ExecuteIndirect %s recorded, shader %016llx, offset 0x%llx",
+            indices.resource ? "DrawIndexed" : "Draw", draw.shader_key, offset);
     return nullptr;
 }
 

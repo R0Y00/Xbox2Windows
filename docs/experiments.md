@@ -8336,6 +8336,34 @@ left half. Physical adapter coverage for this Draw path is pending.
 [Candidate run](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45484934665)
 [Negative control](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45484385924)
 
+#### Translated indexed indirect draw
+
+With `X2W_TRANSLATED_INDIRECT_DRAW=1`, a translated triangle-list pipeline can execute
+one rootless indexed record using a matched guest root, one single-sample color
+target, and a GPU-backed index view. The supported translated sources are the
+existing bounded tables and a complete GPU-backed vertex stream at slot zero.
+The translated shader can use one base-vertex entry constant. Start-instance
+inputs and an active guest compute binding are refused.
+
+A compute pass checks the actual desktop argument and index buffers in command
+order. It accepts a single instance starting at zero and up to 4,096 indices in
+whole triangles. Every adjusted index must fit the vertex extent. The pass
+publishes a checked DrawIndexed record, the base-vertex root constant, and a draw
+count. A rejected GPU record publishes a zero count. Scratch resources belong
+to the current desktop allocator, which holds them through reset and GPU completion.
+
+The source-built test compares every pixel and the original argument guards. A
+16-bit index view with base zero paints the left half. A 32-bit index view with a
+different view offset, a different argument offset and GPU-written base three
+paints the right half. Failed index and vertex-view ranges, an adjusted index
+past the bound stream, a short argument record and an omitted writer leave the
+target clear.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed
+ctest --preset release --no-tests=error -R '^startup_indirect_(translated_indexed|translated_draw|draw_indexed)_(warp|hardware)$' -V
+```
+
 #### GPU-written indirect mesh dispatch arguments
 
 The same slot 61 accepts one rootless `DISPATCH_MESH` record with three group
