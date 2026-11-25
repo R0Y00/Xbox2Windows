@@ -21,22 +21,23 @@
 
 namespace x2w_startup {
 
+// The scratch buffer holds the copied title words at byte 16 and receives the converted words at byte 0. The pass
+// never reads the title's buffer: that buffer is a small placed resource read at an arbitrary 4-byte offset, and a
+// root SRV there drew nothing on an Intel Gen9 (cause not isolated; a copy has no alignment rule and the UAV is on a buffer this
+// pass owns, so both avoid the title buffer binding).
 inline constexpr char rect_indirect_args_hlsl[] = R"(
-ByteAddressBuffer source : register(t0);
-RWByteAddressBuffer converted : register(u0);
+RWByteAddressBuffer scratch : register(u0);
 
 [numthreads(1, 1, 1)]
 void convert() {
-    // Four scalar loads: the title's draw record may sit at any 4-byte offset, and a 16-byte vector load from such an
-    // address is not valid on every GPU (an Intel Gen9 draws nothing from it).
-    uint4 args = uint4(source.Load(0), source.Load(4), source.Load(8), source.Load(12));
+    uint4 args = uint4(scratch.Load(16), scratch.Load(20), scratch.Load(24), scratch.Load(28));
     uint rectangles = args.x / 3;
     // 0x2AAAAAAA * 6 is the largest product below 2^32.
     uint vertices = rectangles > 0x2AAAAAAAu ? 0 : rectangles * 6;
-    converted.Store(0, vertices);
-    converted.Store(4, args.y);
-    converted.Store(8, args.z);
-    converted.Store(12, args.w);
+    scratch.Store(0, vertices);
+    scratch.Store(4, args.y);
+    scratch.Store(8, args.z);
+    scratch.Store(12, args.w);
 }
 )";
 
@@ -60,21 +61,23 @@ public:
             scratch.Reset();
         return scratch;
     }
-    // Records the conversion of the four draw words at `source_address` into `scratch` (from make_scratch, in
-    // COMMON) and leaves it in INDIRECT_ARGUMENT state. Returns false if the pass could not be set up (nothing
-    // was recorded then). The compute root signature and pipeline of the list are replaced: the caller refuses
-    // first when the title has live compute root arguments. `finish` puts the scratch back in COMMON.
-    bool convert(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS source_address, ID3D12Resource* scratch)
+    // Records the conversion of the four draw words at `source_offset` of `source` into `scratch` (from make_scratch,
+    // in COMMON) and leaves it in INDIRECT_ARGUMENT state. `source` must already be in a state that includes
+    // COPY_SOURCE. Returns false if the pass could not be set up (nothing was recorded then). The compute root
+    // signature and pipeline of the list are replaced: the caller refuses first when the title has live compute
+    // root arguments. `finish` puts the scratch back in COMMON.
+    bool convert(ID3D12GraphicsCommandList* list, ID3D12Resource* source, UINT64 source_offset, ID3D12Resource* scratch)
     {
         Microsoft::WRL::ComPtr<ID3D12Device> device;
-        if (!list || !scratch || !source_address || FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return false;
+        if (!list || !scratch || !source || FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return false;
         Entry* entry = entry_for(device.Get());
         if (!entry) return false;
-        transition(list, scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(list, scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(scratch, 16, source, source_offset, 16);
+        transition(list, scratch, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->SetComputeRootSignature(entry->root.Get());
         list->SetPipelineState(entry->pipeline.Get());
-        list->SetComputeRootShaderResourceView(0, source_address);
-        list->SetComputeRootUnorderedAccessView(1, scratch->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(0, scratch->GetGPUVirtualAddress());
         list->Dispatch(1, 1, 1);
         transition(list, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         return true;
@@ -119,12 +122,11 @@ private:
         if (FAILED(D3DCompile(rect_indirect_args_hlsl, sizeof(rect_indirect_args_hlsl) - 1, "rect_indirect_args", nullptr,
                               nullptr, "convert", "cs_5_0", 0, 0, &code, &error)))
             return;
-        D3D12_ROOT_PARAMETER parameters[2]{};
-        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        parameters[1].Descriptor.ShaderRegister = 0;
-        for (auto& parameter : parameters) parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        const D3D12_ROOT_SIGNATURE_DESC desc{2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameter.Descriptor.ShaderRegister = 0;
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        const D3D12_ROOT_SIGNATURE_DESC desc{1, &parameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         Microsoft::WRL::ComPtr<ID3DBlob> serialized;
         if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &serialized, &error)) ||
             FAILED(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),

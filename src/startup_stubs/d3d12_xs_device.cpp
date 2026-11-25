@@ -2690,14 +2690,14 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (rect_list) {
         // The producer's count names three vertices per rectangle; the desktop draw needs six. Convert on the GPU
         // into a scratch record and draw from that. The compute root signature and bindings of the list are replaced.
-        const auto source = resource->GetGPUVirtualAddress();
-        if (!source || offset > ~u64{} - source) return refuse("argument buffer has no desktop address");
-        require_state(self, resource, argument_state | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        // The four words are copied into the scratch first (the pass never reads the title's buffer), so the source only
+        // needs COPY_SOURCE next to its argument state.
+        require_state(self, resource, argument_state | D3D12_RESOURCE_STATE_COPY_SOURCE);
         // The conversion replaces the compute root signature, which drops the title's compute root arguments; they
         // cannot be restored, so a live set is refused before anything is recorded.
         if (pass.compute_args_live) return refuse("rectangle-list conversion would drop live compute root arguments");
         scratch = recording_rect_scratch(self);
-        if (!scratch || !x2w_startup::rect_indirect_arguments().convert(list, source + offset, scratch))
+        if (!scratch || !x2w_startup::rect_indirect_arguments().convert(list, resource, offset, scratch))
             return refuse("rectangle-list argument conversion is unavailable");
         if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
