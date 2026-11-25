@@ -2464,18 +2464,20 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         import subprocess
         # An existing manifest can already point at these paths. Publish only bytecode from a successful pair.
         with tempfile.TemporaryDirectory(prefix='.fxc-', dir=out_dir) as staging:
-            for stage, profile in (('vs', 'vs_5_1'), ('ps', pipe.ps_profile())):
+            ps_profile = pipe.ps_profile()
+            for stage, profile in (('vs', 'vs_5_1' if ps_profile == 'ps_5_1' else 'vs_6_0'), ('ps', ps_profile)):
                 bytecode = os.path.join(staging, stage + '.cso')
-                if profile == 'ps_5_1':
+                if profile.endswith('_5_1'):
                     command = [fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage]
                 else:
-                    # A quad read has no shader model 5.1 spelling: DXC compiles the pixel stage, the vertex
-                    # stage stays DXBC (a graphics pipeline state may mix the two).
+                    # A quad read has no shader model 5.1 spelling: DXC compiles the pixel stage. D3D12 rejects a
+                    # graphics pipeline state that mixes DXBC and DXIL (CreateGraphicsPipelineState E_INVALIDARG),
+                    # so the vertex stage goes through DXC as well.
                     dxc = find_dxc()
                     if dxc is None:
-                        open(name + '.fail', 'w').write('dxc.exe not found (X2W_DXC=%s): the pixel stage needs %s\n'
+                        open(name + '.fail', 'w').write('dxc.exe not found (X2W_DXC=%s): the stages need %s\n'
                                                         % (os.environ.get('X2W_DXC', '<unset>'), profile))
-                        return 'dxc.exe not found for a %s pixel stage' % profile
+                        return 'dxc.exe not found for a %s pixel stage' % ps_profile
                     command = [dxc, '-nologo', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.%s.hlsl' % stage]
                 r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):

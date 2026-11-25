@@ -4,8 +4,8 @@
   binary <llvm-mc>                     assemble the pixel fixtures with llvm-mc (gfx1013) and compare the words
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        compile the pixel fixtures with DXC ps_6_0, draw 16 x 16 pixels and compare
-                                       every pixel with a CPU reference (with fxc: also the mixed DXBC vertex stage
-                                       plus DXIL pixel stage pair the pipeline compiler emits, and the FXC refusal)
+                                       every pixel with a CPU reference (with fxc: also the FXC refusal). The vertex
+                                       stage is DXIL too: D3D12 rejects a DXBC + DXIL pipeline state pair
 
 Semantics (RDNA 2 ISA, "DPP": a lane reads SRC0 of lane (lane & ~3) | quad_perm[lane & 3] of its row; LLVM 15
 AMDGPU DPP quad_perm): quad_perm:[k,k,k,k] gives every lane of a quad the word of lane k of that quad. The four
@@ -249,7 +249,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     controls()
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        stages = [('dxc', dxc, 'vs_6_0')] + ([('fxc', fxc, 'vs_5_1')] if fxc else [])
+        stages = [('dxc', dxc, 'vs_6_0')]
         for kind in FIXTURES:
             reference = words_file(directory, 'reference_' + kind, image(kind))
             for vs_kind, vs_compiler, vs_profile in stages:
