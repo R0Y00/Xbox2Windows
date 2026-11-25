@@ -19,8 +19,8 @@ check does not depend on how many ulps the division is off by; every other compo
 The same table also serves buffer_load_format_x/xy/xyz, whose format and component selection are not in the
 instruction but in word 3 of the buffer descriptor (FORMAT bits 12..18, DST_SEL bits 0..11): the runtime passes
 that word as an entry constant and the translation switches on it. Each format is run through a MUBUF
-xyz load with its own descriptor word, then descriptor words with a swizzle (a swapped pair, the constants 0
-and 1) and an invalid or unknown FORMAT are run through the same translated body.
+xyz load with its own descriptor word, then descriptor words with swizzles and constants 0 and 1 run through
+the same translated body.
 Wrong references (channels swapped, a shift off by one field, a missing W read as 0, UNORM over 2^bits)
 and mutated translations must fail the readback.
 """
@@ -188,15 +188,15 @@ IDENTITY = 4 | 5 << 3 | 6 << 6 | 7 << 9  # DST_SEL X, Y, Z, W: the four componen
 
 
 def pipeline_mubuf(offset, op=2):
-    """A source-built vertex stage: buffer_load_format_xyz (op 2; 0 is _x, 1 is _xy) from vertex buffer 1."""
-    # s_load_dwordx4 s[16:19], s[0:1], 16
+    """A source-built vertex stage: buffer_load_format_xyz (op 2; 0 is _x, 1 is _xy) from a hardware table descriptor."""
+    # s_load_dwordx4 s[16:19], s[8:9], 0
     # buffer_load_format_xyz v[4:6], v0, s[16:19], 0 idxen offset:<offset>
     # exp pos0 v4, v5, v6, v7 done
-    words = (0xf4080400, 0xfa000010, 0xe0002000 | op << 18 | offset, 0x80040400,
+    words = (0xf4080404, 0xfa000000, 0xe0002000 | op << 18 | offset, 0x80040400,
              0xf80008cf, 0x07060504, 0xbf810000)
     ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
     result = gfx2hlsl.Pipeline(struct.pack('<7I', *words), ps, root_blob(flags=0))
-    assert 'srv 0 buf vb 1' in result.manifest().splitlines()
+    assert 'srv 0 buf table 0 0' in result.manifest().splitlines()
     assert 'udsrc 5 descword3 0' in result.manifest().splitlines()
     return result
 
@@ -236,7 +236,6 @@ DESC_MUTATIONS = (
     ('DST_SEL constant 1 as 0', 'one = U(1.0)', 'one = 0u'),
 )
 # Integer 1 for the constant of an integer format, and the switch cases themselves, are mutated per format below.
-UNKNOWN_FORMATS = (0, 2, 99, 127)  # invalid, a format the table lacks, and the largest 7-bit value
 
 
 def mubuf_cases():
@@ -249,8 +248,6 @@ def mubuf_cases():
     cases.append(('xyzw read as w, 0, z', wide, descriptor_word3(wide, (7, 0, 6, 7)), mubuf_expected(wide, 3, (7, 0, 6))))
     cases.append(('uint constant 1 stays integer', small, descriptor_word3(small, (4, 1, 0, 7)),
                   mubuf_expected(small, 3, (4, 1, 0), integer_one=True)))
-    for code in UNKNOWN_FORMATS:
-        cases.append(('format %d reads zeros' % code, wide, code << 12 | IDENTITY, [0 if i < 64 else SENTINEL for i in range(320)]))
     return cases
 
 
@@ -262,6 +259,8 @@ def controls():
     for name, label, old, new in MUTATIONS:
         source = pipeline(name).hlsl_vs()
         assert old in source, (name, label)
+    runtime = (Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'formatted_buffer.h').read_text()
+    assert set(map(int, re.findall(r'case (\d+):', runtime))) == set(gfx2hlsl.DESC_FORMAT_CODES.values())
     # SNORM: the emitted expressions hit the boundaries, and each wrong form is caught by the same check.
     components = gfx2hlsl.FETCH_FORMATS['BUF_FMT_16_16_SNORM'][1][:2]
     snorm_boundaries(components)
@@ -317,7 +316,7 @@ def controls():
         written = {int(n) for n in re.findall(r'^\s*v(\d+) = ', source, re.M) if int(n) >= 4}
         assert written == set(range(4, 4 + count)), (op, written)
     try:
-        gfx2hlsl.Pipeline(struct.pack('<7I', 0xf4080400, 0xfa000010, 0xe00c2000, 0x80040400, 0xf80008cf, 0x07060504, 0xbf810000),
+        gfx2hlsl.Pipeline(struct.pack('<7I', 0xf4080404, 0xfa000000, 0xe00c2000, 0x80040400, 0xf80008cf, 0x07060504, 0xbf810000),
                           struct.pack('<3I', 0xf800180f, 0, 0xbf810000), root_blob(flags=0))
     except gfx2hlsl.Unsupported:
         pass
@@ -326,13 +325,40 @@ def controls():
     # A shader that rewrites descriptor word 3 (s_mov_b32 s19, 0x50fac) after the load must not be translated
     # with the table word: the formatted load is refused.
     try:
-        gfx2hlsl.Pipeline(struct.pack('<8I', 0xf4080400, 0xfa000010, 0xbe9303ff, 0x50fac, 0xe0002000 | 2 << 18, 0x80040400,
+        gfx2hlsl.Pipeline(struct.pack('<8I', 0xf4080404, 0xfa000000, 0xbe9303ff, 0x50fac, 0xe0002000 | 2 << 18, 0x80040400,
                                       0xf80008cf, 0x07060504) + struct.pack('<I', 0xbf810000),
                           struct.pack('<3I', 0xf800180f, 0, 0xbf810000), root_blob(flags=0))
     except gfx2hlsl.Unsupported as error:
         assert 'rewritten' in str(error), error
     else:
         raise AssertionError('formatted load through a rewritten descriptor word 3 must be refused')
+    # A branch can bypass the descriptor load, even though the decoder sees the load before the use.
+    branch = (0xbf840002, 0xf4080404, 0xfa000000, 0xe0002000, 0x80040400,
+              0xf80008cf, 0x07060504, 0xbf810000)
+    ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
+    try:
+        gfx2hlsl.Pipeline(struct.pack('<8I', *branch), ps, root_blob(flags=0))
+    except gfx2hlsl.Unsupported as error:
+        assert 'proven in the entry block' in str(error), error
+    else:
+        raise AssertionError('formatted load accepted when a branch could skip the descriptor load')
+    def stage(words):
+        return gfx2hlsl.Pipeline(struct.pack('<%dI' % len(words), *words), ps, root_blob(flags=0))
+
+    load = (0xf4080404, 0xfa000000)
+    formatted_tail = (0xe0002000, 0x80040400, 0xf80008cf, 0x07060504, 0xbf810000)
+    # Both edges reach a block that reloads all four words from the unmodified table pointer.
+    local_reload = stage((0xbf840001, 0xbf800000, *load, *formatted_tail))
+    assert 'srv 0 buf table 0 0' in local_reload.manifest().splitlines()
+    # One edge clobbers the entry pointer before the reload. The last lexical path restores it,
+    # but the branch can skip that restore, so a proof based only on translation order is wrong.
+    changed_pointer = (0xbe920308, 0xbe880380, 0xbf840001, 0xbe880312, *load, *formatted_tail)
+    try:
+        stage(changed_pointer)
+    except gfx2hlsl.Unsupported as error:
+        assert 'local table load' in str(error), error
+    else:
+        raise AssertionError('formatted load accepted after a possibly clobbered root pointer')
     source = pipeline_mubuf(0).hlsl_vs()
     for label, old, new in DESC_MUTATIONS:
         assert old in source, label
@@ -347,42 +373,38 @@ RUNTIME = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12
 
 
 def runtime_gate(source):
-    """The draw refuses (returns false) before any list command unless every descword3 binding is usable.
-
-    Returns the FORMAT numbers the runtime accepts and the gate text, or raises AssertionError.
-    """
-    known = re.search(r'known\[\] = \{([0-9, ]+)\}', source)
-    gate = re.search(r'if \(ud\.kind != Translation::desc_word3\) continue;(.*?)return false;', source, re.S)
-    assert known and gate, 'descriptor word 3 gate missing'
-    assert source.index(gate.group(0)) < source.index('list->SetPipelineState(pipeline)'), 'gate must precede list commands'
-    for condition in ('desc_hardware[ud.a]', 'desc_backed[ud.a]', 'supported_descriptor_format('):
-        assert condition in gate.group(1), condition
-    return {int(n) for n in known.group(1).split(',')}, gate.group(0)
+    """Check that both FORMAT metadata and usable backing are required before submission."""
+    assert 'formatted_buffers_ready(*tr, pass, formatted_buffers)' in source
+    preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
+    for condition in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
+        assert condition in preflight, condition
+    start = source.index('bool draw_translated(')
+    gate = source.index('if (!have && formatted.entry)', start)
+    assert source.index('formatted_buffers_ready(*tr, pass, formatted_buffers)', start) < gate
+    assert gate < source.index('if (!have && identity_for_null)', gate)
+    assert gate < source.index('list->SetPipelineState(pipeline)', gate)
 
 
 def runtime_gate_controls():
-    """Unresolved metadata, an unsupported FORMAT and missing backing are each refused; a real zero payload is not a refusal."""
-    source = RUNTIME.read_text()
-    accepted, gate = runtime_gate(source)
-    assert accepted == set(gfx2hlsl.DESC_FORMAT_CODES.values()), 'runtime FORMAT list differs from the translation switch'
-    assert 2 not in accepted and 0 not in accepted  # the unsupported FORMAT 2 and the invalid FORMAT 0 are refused
-    # word 3 and the hardware flag are only set together, in the hardware descriptor branch
-    assert source.count('desc_hardware[i] = true;') == 1 and source.count('desc_word3[i] = words[3];') == 1
-    # each of the three conditions is necessary: dropping any one must be noticed
-    for dropped in ('desc_hardware[ud.a]', 'desc_backed[ud.a]', 'supported_descriptor_format('):
+    source = RUNTIME.read_text(encoding='utf-8')
+    runtime_gate(source)
+    preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
+    for dropped in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
         try:
-            runtime_gate(source.replace(gate, gate.replace(dropped, 'true')))
+            runtime_gate(source.replace(preflight, preflight.replace(dropped, 'omitted')))
         except AssertionError:
             continue
         raise AssertionError('gate without %s must fail the control' % dropped)
-    # a gate placed after the first list command is refused too
-    late = source.replace(gate, '').replace('list->SetPipelineState(pipeline);', 'list->SetPipelineState(pipeline);\n' + gate, 1)
+    start = source.index('bool draw_translated(')
+    gate = 'if (!have && formatted.entry)'
+    start_cmd = 'list->SetPipelineState(pipeline);'
+    late = source[:start] + source[start:].replace(gate, '', 1).replace(start_cmd, start_cmd + '\n' + gate, 1)
     try:
         runtime_gate(late)
-    except AssertionError:
+    except (AssertionError, ValueError):
         pass
     else:
-        raise AssertionError('a gate after list commands must fail the control')
+        raise AssertionError('gate after binding fallback or list commands must fail the control')
 
 
 def run(directory, compiler, consumer, adapter, name, source, words, translated=None, word3=None):

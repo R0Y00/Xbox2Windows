@@ -862,16 +862,23 @@ class Stage:
         self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
         self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
         self.has_branches = bool(targets)
+        self.entry_table_pointers = {
+            reg: sym[1] for reg, sym in self.sym.items()
+            if isinstance(reg, int) and sym[0] == 'ptr' and sym[1][0] == 'table'
+        }
+        self.descriptor_block_first = 0
         self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
         self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
         start = 0
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
-        for off, n, name, asm in self.ins:
+        for instruction_index, (off, n, name, asm) in enumerate(self.ins):
             if off in targets and off != start:
                 self.pinned_low16_v.update(self.low16_only_v)
                 self.blocks.append((start, self.lines, None))
                 self.lines, start = [], off
+                self.descriptor_block_first = instruction_index
             self.pc = off
+            self.descriptor_instruction_index = instruction_index
             # Before the first branch target or terminator every path has run exactly the instructions above, so
             # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
             # branch-free program is past it too (dead code).
@@ -902,6 +909,7 @@ class Stage:
                 self.pinned_low16_v.update(self.low16_only_v)
                 self.blocks.append((start, self.lines, term))
                 self.lines, start = [], off + n
+                self.descriptor_block_first = instruction_index + 1
         if self.lines:
             self.blocks.append((start, self.lines, None))
         self.pinned_low16_v.update(self.low16_only_v)
@@ -1919,23 +1927,101 @@ class Stage:
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
 
+    @staticmethod
+    def descriptor_scalar_writes(name, ops):
+        regs = set()
+        for token in destinations(name, ops):
+            if token in ('vcc', 'vcc_lo', 'vcc_hi'):
+                regs.update((106, 107))
+            parsed = reg_range(token)
+            if parsed and parsed[0] == 's':
+                regs.update(range(parsed[1], parsed[2] + 1))
+        if name.startswith('v_cmp') and len(ops) == 2:
+            regs.update((106, 107))
+        return regs
+
+    def formatted_pointer_reaches(self, pointer, before):
+        """Refuse a write to the original root pointer on any predecessor path of this read."""
+        if not hasattr(self, 'descriptor_predecessors'):
+            by_offset = {off: i for i, (off, *_rest) in enumerate(self.ins)}
+            self.descriptor_predecessors = [[] for _ in self.ins]
+            self.descriptor_writes_by_instruction = []
+            for index, (_, _, name, asm) in enumerate(self.ins):
+                _, args, _ = parse(asm)
+                self.descriptor_writes_by_instruction.append(self.descriptor_scalar_writes(name, args))
+                if index + 1 < len(self.ins) and name not in ('s_branch', 's_endpgm'):
+                    self.descriptor_predecessors[index + 1].append(index)
+                if name == 's_branch' or name.startswith('s_cbranch_'):
+                    target = by_offset.get(int(args[0].split('_')[1], 16))
+                    if target is not None:
+                        self.descriptor_predecessors[target].append(index)
+        seen = set()
+        pending = list(self.descriptor_predecessors[before])
+        while pending:
+            earlier = pending.pop()
+            if earlier in seen:
+                continue
+            seen.add(earlier)
+            if pointer in self.descriptor_writes_by_instruction[earlier]:
+                return False
+            pending.extend(self.descriptor_predecessors[earlier])
+        return True
+
+    def formatted_descriptor_from_block(self, reg, first):
+        """Require one untouched local load and a table pointer that no incoming path can rewrite."""
+        start, end = self.descriptor_block_first, self.descriptor_instruction_index
+        block = self.ins[start:end]
+        words = set(range(reg[1], reg[2] + 1))
+        for index in range(len(block) - 1, -1, -1):
+            _, _, name, asm = block[index]
+            _, args, _ = parse(asm)
+            if not (self.descriptor_scalar_writes(name, args) & words):
+                continue
+            m = re.fullmatch(r's_load_dwordx(4|8|16)', name)
+            load = reg_range(args[0])
+            if not m or not load or load[1] + first[3] != reg[1] or int(m.group(1)) < first[3] + 4:
+                return False
+            base = reg_range(args[1])
+            if not base or base[0] != 's':
+                return False
+            pointer = base[1]
+            read = start + index
+            for previous in range(index - 1, -1, -1):
+                _, _, earlier, prior = block[previous]
+                _, src, _ = parse(prior)
+                if pointer not in self.descriptor_scalar_writes(earlier, src):
+                    continue
+                copied_from = reg_range(src[1]) if earlier == 's_mov_b32' and len(src) == 2 else None
+                if not copied_from or copied_from[0] != 's' or copied_from[1] != copied_from[2]:
+                    return False
+                pointer = copied_from[1]
+                read = start + previous
+                break
+            return self.entry_table_pointers.get(pointer) == first[1] and self.formatted_pointer_reaches(pointer, read)
+        return False
+
     def mubuf_format(self, ops, mods, count):
         """buffer_load_format_x/xy/xyz: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
 
         The runtime passes that word as an entry constant. Each supported format becomes one case of a switch
         on the FORMAT field that decodes the four components as the tbuffer path does; DST_SEL then picks, for
-        each destination register, a component or the constant 0 or 1. The draw refuses before submission when
-        word 3 is not a hardware descriptor with a FORMAT from the table and a bound buffer, so the default arm
-        is not reached at run time and a word 3 of 0 never stands in for missing metadata.
+        each destination register, a component or the constant 0 or 1. The draw validates FORMAT and descriptor
+        availability before submission, so the generated switch only sees the supported cases.
         """
+        if self.kind not in ('vs', 'ps'):
+            raise Unsupported('formatted buffer load requires a graphics draw')
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
         # FORMAT and DST_SEL are read from the table word, so word 3 must still be the loaded one.
         r = reg_range(ops[2])
-        first = self.sym.get(r[1])
+        first = self.sym.get(r[1]) if r else None
         if not r or r[2] - r[1] != 3 or not first or first[0] != 'desc' or any(
                 self.sym.get(r[1] + i) != ('desc', first[1], first[2], first[3] + i) for i in range(4)):
             raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
+        if first[1][0] != 'table':
+            raise Unsupported('formatted buffer load requires a hardware table descriptor')
+        if self.past_entry and not self.formatted_descriptor_from_block(r, first):
+            raise Unsupported('formatted buffer load requires descriptor words proven in the entry block or a local table load')
         word3 = 'ud%d' % self.pipe.ud(('descword3', self.pipe.resources[self.descriptor(ops[2])]['index']))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')

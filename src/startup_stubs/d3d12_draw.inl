@@ -1353,12 +1353,40 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
     return true;
 }
 
-// The buffer-descriptor FORMAT numbers the translated formatted loads decode (DESC_FORMAT_CODES in tools/startup/gfx2hlsl.py).
-static bool supported_descriptor_format(std::uint32_t format)
+struct FormattedBufferDescriptor {
+    u64 entry = 0;
+    std::uint32_t words[8] = {};
+};
+
+bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
-    static const std::uint32_t known[] = {1, 5, 14, 22, 23, 24, 29, 56, 64, 71, 74, 77};
-    for (const std::uint32_t code : known) if (code == format) return true;
-    return false;
+    const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-draw %016llx srv %d: formatted buffer refused (%s %u)", tr.key, slot, reason, detail);
+        return false;
+    };
+    for (const auto& ud : tr.uds) {
+        if (ud.kind != Translation::desc_word3) continue;
+        if (ud.a < 0 || ud.a >= 32 || static_cast<std::size_t>(ud.a) >= tr.srvs.size())
+            return refuse(ud.a, "invalid SRV index");
+        auto& descriptor = descriptors[ud.a];
+        if (descriptor.entry) continue;
+        const auto& srv = tr.srvs[ud.a];
+        if (srv.kind != 0 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
+            return refuse(ud.a, "missing hardware descriptor");
+        const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), sizeof(descriptor.words));
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
+            return refuse(ud.a, "missing hardware descriptor");
+        std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
+        if (descriptor.words[0] == view_token_magic)
+            return refuse(ud.a, "missing hardware descriptor");
+        const auto format = x2w_startup::formatted_buffer_code(descriptor.words[3]);
+        if (!x2w_startup::formatted_buffer_supported(format))
+            return refuse(ud.a, "unsupported FORMAT", format);
+        descriptor.entry = entry;
+    }
+    return true;
 }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
@@ -1371,7 +1399,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     std::uint32_t d16_unorm16[32] = {};
-    if (!tr || tr->state != 1 || !d16_srvs_ready(*tr, pass, d16_unorm16)) {
+    FormattedBufferDescriptor formatted_buffers[32] = {};
+    if (!tr || tr->state != 1 || !d16_srvs_ready(*tr, pass, d16_unorm16) ||
+        !formatted_buffers_ready(*tr, pass, formatted_buffers)) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -1387,9 +1417,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
     std::uint32_t strides[32] = {};
-    std::uint32_t desc_word3[32] = {};  // word 3 (FORMAT and DST_SEL) of a hardware buffer descriptor
-    bool desc_hardware[32] = {};        // the binding is a hardware descriptor read from the table (word 3 is real, even when 0)
-    bool desc_backed[32] = {};          // ... and its buffer range was bound
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
     // -vertex_first and each stream's view starts at vertex_first.
@@ -1434,11 +1461,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             address = pass.root_address[srv.a];
             bytes = readable_window(address, 0x10000);
         }
-        const u64 entry = srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
-            pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0;
+        const auto& formatted = formatted_buffers[i];
+        const u64 entry = formatted.entry ? formatted.entry :
+            (srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
+                pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0);
         std::uint32_t words[8] = {};
-        const bool entry_ok = entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32);
-        if (entry_ok) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+        const bool entry_ok = formatted.entry ||
+            (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
+        if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
         if (srv.kind >= 1 && srv.kind <= 4) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
@@ -1547,8 +1577,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // A hardware buffer descriptor the title wrote itself: base address, stride and record count.
             address = words[0] | (static_cast<u64>(words[1] & 0xffff) << 32);
             strides[i] = (words[1] >> 16) & 0x3fff;
-            desc_word3[i] = words[3];
-            desc_hardware[i] = true;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         if (bytes > (16u << 20)) bytes = 16u << 20;
@@ -1578,13 +1606,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             buffer_view(dest, target ? upload_ring : nullptr, offset, padded);
             count_buffer(target != nullptr);
-            desc_backed[i] = target != nullptr;
             continue;
         }
         if (placed.alias && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && bytes) {
             require_state(self, placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
-            desc_backed[i] = true;
             continue;
         }
         bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
@@ -1592,6 +1618,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
+        if (!have && formatted.entry) {
+            static LONG refused;
+            if (first_calls(refused, 6))
+                log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
         if (!have && identity_for_null) {
             static float identity[64];
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
@@ -1601,7 +1634,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         buffer_view(dest, have ? upload_ring : nullptr, offset, bytes);
         count_buffer(have);
-        desc_backed[i] = have;
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
             if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
@@ -1612,22 +1644,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     static LONG checks;
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
-    // A formatted buffer load reads FORMAT and DST_SEL from word 3, so every binding that supplies it must be a
-    // hardware descriptor with a supported FORMAT and a bound buffer. Anything else is refused before the list
-    // is touched: a word 3 of 0 from a missing binding must not look like a real descriptor.
-    for (const Translation::Ud& ud : tr->uds) {
-        if (ud.kind != Translation::desc_word3) continue;
-        const bool valid = ud.a >= 0 && ud.a < 32 && desc_hardware[ud.a] && desc_backed[ud.a] &&
-                           supported_descriptor_format((desc_word3[ud.a] >> 12) & 127u);
-        if (valid) continue;
-        static LONG refused;
-        if (first_calls(refused, 6))
-            log("x2w-draw   %016llx refused: buffer descriptor %d has no usable word 3 (hardware %d, bound %d, FORMAT %u)", tr->key, ud.a,
-                ud.a >= 0 && ud.a < 32 && desc_hardware[ud.a], ud.a >= 0 && ud.a < 32 && desc_backed[ud.a],
-                ud.a >= 0 && ud.a < 32 ? (desc_word3[ud.a] >> 12) & 127u : 0u);
-        ReleaseSRWLockExclusive(&draw_lock);
-        return false;
-    }
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
@@ -1637,7 +1653,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
             : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a]
-            : ud.kind == Translation::desc_word3 && ud.a >= 0 && ud.a < 32 ? desc_word3[ud.a] : 0;
+            : ud.kind == Translation::desc_word3 ? formatted_buffers[ud.a].words[3] : 0;
     }
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
