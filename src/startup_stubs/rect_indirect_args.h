@@ -79,6 +79,13 @@ public:
         list->SetPipelineState(entry->pipeline.Get());
         list->SetComputeRootUnorderedAccessView(0, scratch->GetGPUVirtualAddress());
         list->Dispatch(1, 1, 1);
+        // Make the shader's stores visible before the same buffer is read as indirect arguments. The transition below
+        // implies this on a conforming driver; the explicit barrier removes the dependence on that for the command
+        // processor's argument fetch.
+        D3D12_RESOURCE_BARRIER written{};
+        written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        written.UAV.pResource = scratch;
+        list->ResourceBarrier(1, &written);
         transition(list, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         return true;
     }

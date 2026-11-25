@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 
 #include "desktop_gpu.h"
+#include "startup_stubs/rect_indirect_args.h"
 #include "startup_indirect_mesh_mesh.h"
 #include "startup_indirect_mesh_amplify.h"
 #include "startup_indirect_mesh_amplified_mesh.h"
@@ -572,6 +573,45 @@ bool supports_mesh(ID3D12Device* device)
         options.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
 }
 
+// Failure-path diagnostic for the rectangle-list indirect conversion. Runs the same GPU conversion pass on a copy of
+// the four draw words that the title's buffer held and prints the words it wrote, so a log shows the exact
+// DrawInstanced arguments (vertex count, instance count, start vertex, start instance) the adapter produced.
+void report_rect_conversion(ID3D12Device* device, const Words& observed, UINT word)
+{
+    const std::uint32_t source_words[4]{observed[word], observed[word + 1], observed[word + 2], observed[word + 3]};
+    const std::uint32_t cpu_vertices = source_words[0] / 3 > 0x2AAAAAAAu ? 0 : source_words[0] / 3 * 6;
+    std::fprintf(stderr, "rect conversion diagnostic: title words %u %u %u %u, CPU reference vertices %u\n",
+                 source_words[0], source_words[1], source_words[2], source_words[3], cpu_vertices);
+    const auto source = make_buffer(device, 16, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const auto readback = make_buffer(device, 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
+    void* mapped = nullptr;
+    const D3D12_RANGE none{0, 0};
+    if (!scratch || FAILED(source->Map(0, &none, &mapped))) {
+        std::fprintf(stderr, "rect conversion diagnostic: scratch or source unavailable\n");
+        return;
+    }
+    std::memcpy(mapped, source_words, sizeof(source_words));
+    source->Unmap(0, nullptr);
+    ComputeCommands commands(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    if (!x2w_startup::rect_indirect_arguments().convert(commands.list.Get(), source.Get(), 0, scratch.Get())) {
+        std::fprintf(stderr, "rect conversion diagnostic: conversion pass unavailable\n");
+        return;
+    }
+    transition(commands.list.Get(), scratch.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commands.list->CopyBufferRegion(readback.Get(), 0, scratch.Get(), 0, 16);
+    commands.submit_and_wait(device);
+    const D3D12_RANGE read{0, 16};
+    std::uint32_t converted[4]{};
+    if (FAILED(readback->Map(0, &read, &mapped))) return;
+    std::memcpy(converted, mapped, sizeof(converted));
+    readback->Unmap(0, &none);
+    std::fprintf(stderr, "rect conversion diagnostic: GPU scratch DrawInstanced words %u %u %u %u (%s)\n", converted[0],
+                 converted[1], converted[2], converted[3],
+                 converted[0] == cpu_vertices && converted[1] == source_words[1] && converted[2] == source_words[2] &&
+                 converted[3] == source_words[3] ? "matches the CPU reference" : "differs from the CPU reference");
+}
+
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
@@ -1006,7 +1046,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
             }
         pixel_readback->Unmap(0, &untouched);
         std::printf("%s: %u/%u non-clear pixels, argument guards intact\n", label, painted, width * height);
-        if (!pixels_match) return false;
+        if (!pixels_match) {
+            if (kind == DrawKind::rect) report_rect_conversion(device, observed, indexed_argument_offset / sizeof(std::uint32_t));
+            return false;
+        }
     }
     return true;
 }
@@ -1552,7 +1595,7 @@ int main(int argc, char** argv) try
             try {
                 for (int round = 0; round < 24 && concurrent_ok; ++round)
                     if (!run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
-                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr, false, false, 0, false, &gate)) concurrent_ok = false;
+                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr, false, false, 0, false, false, &gate)) concurrent_ok = false;
             } catch (...) {
                 concurrent_ok = false;
             }
