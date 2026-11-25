@@ -24,6 +24,18 @@ def check(directory, consumer, backend, mode):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_D3D12_DEBUG="1", X2W_SHADER_CACHE=str(cache))
     base_args = [consumer, str(vs), str(ps), str(root), backend]
+    if mode == "filter":
+        missing = "x2w-no-such-hardware-adapter"
+        for selector, message in (("x" * 128, "XBOX2WINDOWS_ADAPTER is longer than 127 characters"),
+                                  (missing, f"No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER={missing}")):
+            req = subprocess.run(base_args, env=dict(env, XBOX2WINDOWS_ADAPTER=selector),
+                                 capture_output=True, text=True)
+            if selector == missing and req.returncode == 77:
+                return 77
+            if req.returncode != 4 or message not in req.stderr:
+                raise RuntimeError(f"expected {message!r}, got exit {req.returncode}\n{req.stdout}{req.stderr}")
+        print("overlong and unmatched hardware adapter filters rejected")
+        return 0
     req = subprocess.run(base_args, env=env, capture_output=True, text=True)
     if backend == "hardware" and req.returncode == 77:
         print("No D3D12 feature-level 12 hardware adapter")

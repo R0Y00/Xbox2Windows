@@ -169,6 +169,17 @@ viam0['m0'] = ('ptr', ('root', 1))
 s = run(viam0, [('s_add_u32', 's20, m0, 0x40'), ('s_addc_u32', 's21, s9, 0')] + LOAD)
 check('a low word held in m0 completes the pair', not isinstance(s, str), str(s))
 
+# A program with branches does not track the added offset: the load through the advanced pointer is a refusal
+# (never a crash), and the same straight-line shape keeps folding.
+IN_PLACE = [('s_add_u32', 's8, s8, 0x40'), ('s_load_dwordx4', 's[4:7], s[8:9], 0x10')]
+s = run(TABLE, IN_PLACE, branches=True)
+check('in-place pointer advance then load in a program with branches is refused, not a crash',
+      isinstance(s, str) and 'untracked offset' in s, str(s))
+
+s = run(TABLE, IN_PLACE)
+check('the same in-place advance without branches still folds to +0x50',
+      not isinstance(s, str) and s.sym.get(4) == ('desc', ('table', 0), 0x50, 0), str(s if isinstance(s, str) else s.sym))
+
 if failures:
     print('FAILED: %s' % ', '.join(failures))
     sys.exit(1)
