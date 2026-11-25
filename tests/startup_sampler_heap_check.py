@@ -200,6 +200,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                                       str(mutant if dropped_index else shader), str(offset), '%08x' % expected, str(manifest)],
                                      capture_output=True, text=True)
                 sys.stdout.write(run.stdout)
+                # offscreen_check prefixes each info-queue message with its numeric D3D12 ID.
                 if 'D3D12 1361:' in run.stderr:
                     raise AssertionError('ordinary sampler heap emitted D3D12 warning 1361')
                 label = 'dropped index' if dropped_index else 'run-time offset'
