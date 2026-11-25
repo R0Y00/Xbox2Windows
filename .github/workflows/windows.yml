@@ -47,6 +47,7 @@ jobs:
               (["tests/compute_load_format_check.py", *COMMON_LLVM], {}),
               (["tests/compute_heap_view_check.py", *COMMON_LLVM], {}),
               (["tests/compute_heap_store_check.py", *COMMON_LLVM], {}),
+              (["tests/compute_desc_numeric_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_aot_check.py", *COMMON_LLVM], {}),
               (["tests/sampled_coverage_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_gather_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
@@ -82,6 +83,7 @@ jobs:
               (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_pk_u8_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_sample_b_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
@@ -94,6 +96,7 @@ jobs:
               (["tests/startup_flat_param_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_bit_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_interp_f16_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_sgpr_spill_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_compute_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
@@ -206,6 +209,7 @@ jobs:
             tests/rectlist_topology_check.py \
             tests/startup_sampler_heap_check.py \
             tests/startup_image_sample_l_check.py \
+            tests/startup_image_sample_b_check.py \
             tests/startup_image_gather_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
@@ -237,6 +241,7 @@ jobs:
             tests/startup_build_rev_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_gfx2hlsl_interp_f16_check.py \
+            tests/startup_gfx2hlsl_sgpr_spill_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
             tests/startup_gfx2hlsl_compute_check.py \
             tests/startup_compute_translate_check.py \
@@ -262,6 +267,7 @@ jobs:
             tests/compute_load_format_check.py \
             tests/compute_heap_view_check.py \
             tests/compute_heap_store_check.py \
+            tests/compute_desc_numeric_check.py \
             tests/startup_ngg_slice_check.py \
             tests/startup_gfx2hlsl_handler_arity_check.py \
             tests/run_checks_parallel_check.py

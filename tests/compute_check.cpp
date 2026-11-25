@@ -128,7 +128,8 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
 
 static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                          ID3D12Resource* input, ID3D12Resource* output,
-                                         ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1, UINT output_mip = 0)
+                                         ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1, UINT output_mip = 0,
+                                         UINT input_register = srvs - 1)
 {
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     desc.NumDescriptors = uavs + srvs;
@@ -166,7 +167,7 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
         if (texture && i == 0)
             device->CreateShaderResourceView(texture, nullptr, cpu);
         else
-            device->CreateShaderResourceView(!texture && i == srvs - 1 ? input : nullptr, &srv, cpu);
+            device->CreateShaderResourceView(!texture && i == input_register ? input : nullptr, &srv, cpu);
     }
     ID3D12DescriptorHeap* heaps[]{heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
@@ -198,7 +199,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
                         const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
                         DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr,
-                        bool dpp_case = false)
+                        bool dpp_case = false, bool sized_views = false)
 {
     if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
@@ -228,7 +229,9 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         // An image-load case binds its output at u0 and the source texture at t0; the table
         // signature's UAV range starts at u0, while the root-descriptor path keeps u12.
         auto* image = rendered_texture ? rendered_texture : texture.Get();
-        heap = bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1);
+        // A sized-view case binds both raw buffers at u0 and t0, so GetDimensions reports the view's byte size.
+        heap = sized_views ? bind_tables(device, list.Get(), input.Get(), output.Get(), nullptr, 0, 0, 0)
+                           : bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1);
     } else {
         list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
@@ -294,7 +297,7 @@ void check_compute(ID3D12Device* device, bool tables)
 }
 
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference,
-                        bool dpp_case)
+                        bool dpp_case, bool sized_views)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
@@ -326,8 +329,12 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
                 store.has_source = true;
             }
         }
-        run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
-                    DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
+        if (sized_views)
+            run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, nullptr,
+                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case, true);
+        else
+            run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
+                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
     } else {
         run_compute(device, false, shader, shader, conversion_pair);
     }

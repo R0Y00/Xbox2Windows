@@ -42,14 +42,18 @@ struct Arena {
     // The caller must retire all recordings and GPU submissions before releasing their pages.
     void reset() { allocations.clear(); pages.clear(); }
 
-    UINT64 translate(UINT64 cpu, UINT64 bytes) const {
-        if (!bytes) return 0;
+    Allocation range(UINT64 cpu, UINT64 bytes) const {
+        if (!bytes) return {};
         for (auto it = allocations.rbegin(); it != allocations.rend(); ++it) {
             if (cpu < it->cpu) continue;
             UINT64 offset = cpu - it->cpu;
-            if (offset < it->bytes && bytes <= it->bytes - offset) return it->gpu + offset;
+            if (offset < it->bytes && bytes <= it->bytes - offset)
+                return {static_cast<uintptr_t>(cpu), it->gpu + offset, bytes, it->resource, it->offset + offset};
         }
-        return 0;
+        return {};
+    }
+    UINT64 translate(UINT64 cpu, UINT64 bytes) const {
+        return range(cpu, bytes).gpu;
     }
     Allocation allocate(ID3D12Device* device, UINT64 bytes, UINT64 alignment) {
         if (!device || !bytes || !alignment || (alignment & (alignment - 1))) return {};
