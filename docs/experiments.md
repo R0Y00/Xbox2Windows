@@ -9510,9 +9510,22 @@ the empty `targets` line, a control without the EXEC narrowing (no discard)
 and a null export followed by a position export (still refused). A slot 57
 pixel stage that has the null export next to an `mrt0`, `mrtz` or `param0`
 export, in either order, is refused before any source or manifest is written;
-the general pixel path keeps those mixed forms. Nothing is
-drawn. The runtime does not load slot 57 results yet, so these draws are not
-submitted.
+the general pixel path keeps those mixed forms. The
+`startup_mesh57_skeleton_depth_{warp,hardware}` CTest checks draw a
+source-built depth-only pair (`v_interp_mov_f32`, `v_cmpx_lt_f32 0.5, v0`,
+`exp null off, off, off, off done vm`, `s_endpgm`) twice with
+`offscreen_check --mesh-depth-pair` into a D32 target cleared to the sentinel
+1.0, depth test LESS. Colour must stay cleared and depth must match the CPU
+rasteriser: of 259 covered pixels, 181 keep a written depth and 78 keep the
+sentinel only because of the discard. A reference without the depth writes
+(181 mismatches) and the same mesh with a null export that does not discard
+(134 mismatches) must each fail. The offline check also refuses the drawn
+stage with a colour export before its null export, a pair whose pixel stage
+does not match its key, and the mesh shapes the paired path refuses next to
+the depth-only pixel stage; it checks that `pending_keys` keeps
+the pair pending until both `.ms57.cso` and `.ps57.cso` are complete. The
+runtime does not load slot 57 results yet, so these draws are not submitted
+through the guest path.
 
 The pending scan checks the DXContainer header and file length for every
 required slot 57 bytecode artifact. A `ps none` result needs the mesh artifact
