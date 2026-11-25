@@ -9491,7 +9491,9 @@ endif()
 
 # Start the slowest tests first so the ctest worker pool has no long tail at the end.
 # COST only changes scheduling order under `ctest --parallel`; no test, argument or assertion changes.
-# Measured seconds (Windows CI, approx.) are in the trailing comments. Names absent in a configuration are skipped.
+# Costs are measured seconds (approx.) from the Windows CI ctest log taken when this list was added
+# (2026-11-25, main at a6c8d80dc); re-measure when the order looks wrong. Keep the list in descending cost order:
+# the loop below stops the configure if it is not. Names absent in a configuration are skipped.
 set(X2W_SLOW_TEST_COSTS
     startup_debug 56
     compute_store_aot_heap_view_store_warp 51
@@ -9520,10 +9522,22 @@ set(X2W_SLOW_TEST_COSTS
     pixel_aot_comparisons_warp 26)
 list(LENGTH X2W_SLOW_TEST_COSTS X2W_SLOW_TEST_COSTS_LEN)
 math(EXPR X2W_SLOW_TEST_COSTS_LAST "${X2W_SLOW_TEST_COSTS_LEN} - 1")
+math(EXPR X2W_SLOW_TEST_COSTS_ODD "${X2W_SLOW_TEST_COSTS_LEN} % 2")
+if(X2W_SLOW_TEST_COSTS_ODD)
+    message(FATAL_ERROR "X2W_SLOW_TEST_COSTS must hold name/cost pairs")
+endif()
+set(X2W_SLOW_TEST_PREV_COST "")
 foreach(i RANGE 0 ${X2W_SLOW_TEST_COSTS_LAST} 2)
     math(EXPR j "${i} + 1")
     list(GET X2W_SLOW_TEST_COSTS ${i} slow_name)
     list(GET X2W_SLOW_TEST_COSTS ${j} slow_cost)
+    if(NOT slow_cost MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "X2W_SLOW_TEST_COSTS: cost of ${slow_name} is not an integer: ${slow_cost}")
+    endif()
+    if(NOT X2W_SLOW_TEST_PREV_COST STREQUAL "" AND slow_cost GREATER X2W_SLOW_TEST_PREV_COST)
+        message(FATAL_ERROR "X2W_SLOW_TEST_COSTS must be in descending cost order: ${slow_name} (${slow_cost}) follows ${X2W_SLOW_TEST_PREV_COST}")
+    endif()
+    set(X2W_SLOW_TEST_PREV_COST ${slow_cost})
     if(TEST ${slow_name})
         set_tests_properties(${slow_name} PROPERTIES COST ${slow_cost})
     endif()
