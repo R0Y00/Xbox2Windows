@@ -812,6 +812,9 @@ class Stage:
     # The whole-program proof of interp_f16_scan depends only on the decoded program, so it runs once per Stage
     # (a class default keeps probes built without __init__ working).
     interp_scanned = False
+    defined_uniform_s = None
+    bad_sgprs = None
+    _uniform_written = None
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -840,6 +843,9 @@ class Stage:
             self.uses_pos = False
             self.masks = set()        # scalar registers currently holding lane masks
             self.fetched = False      # vertex: the entry call into the fetch routine was translated as loads
+            self.defined_uniform_s = set()
+            self.bad_sgprs = set()
+            self._uniform_written = set()
             self.setup_entry()
             self.translate()
             grown = False
@@ -1097,17 +1103,17 @@ class Stage:
                 uniform = self.scalar_expr_uniform(expr)
             if uniform:
                 self.varying_s.discard(n)
-                if hasattr(self, 'defined_uniform_s'):
+                if self.defined_uniform_s is not None:
                     self.defined_uniform_s.add(n)
-                if hasattr(self, '_uniform_written'):
+                if self._uniform_written is not None:
                     self._uniform_written.add(n)
             else:
                 self.varying_s.add(n)
-                if hasattr(self, 'defined_uniform_s'):
+                if self.defined_uniform_s is not None:
                     self.defined_uniform_s.discard(n)
-                if hasattr(self, '_uniform_written'):
+                if self._uniform_written is not None:
                     self._uniform_written.discard(n)
-                if hasattr(self, 'bad_sgprs'):
+                if self.bad_sgprs is not None:
                     self.bad_sgprs.add(n)
             # Invariant: since_join gains an SGPR only here, when set_s proves it uniform; forget_writes drops any SGPR
             # an instruction writes first, so a write through an unmodelled path never keeps a stale mark.
@@ -1324,7 +1330,7 @@ class Stage:
             )
         }
         entry_ud = {reg: sym for reg, sym in init_sym.items() if sym[0] == 'ud'}
-        local_forced = {t: dict(regs) for t, regs in getattr(self, 'force_joined', {}).items()}
+        forced = getattr(self, 'force_joined', {})
         force_unproven = set()
         force_at = {}
         first_refusal = len(refusals) if refusals is not None else 0
@@ -1394,7 +1400,7 @@ class Stage:
                     written = (written - here) | set().union(*(w for _, w in arriving))
                     for reg in here:
                         paths = [s[reg] for s, w in arriving if reg in w]
-                        force = local_forced.get(off, {}).get(reg)
+                        force = forced.get(off, {}).get(reg)
                         if any(reg not in w for _, w in arriving) and any(p and not run_time_symbol(p) for p in paths):
                             self.sym[reg] = ('joined at a branch target',)
                             continue
@@ -1487,15 +1493,9 @@ class Stage:
                     self.blocks.append((start, self.lines, term))
                     self.lines, start = [], off + n
 
-            grown_forced = False
-            for t, regs in self.back_force.items():
-                have = local_forced.setdefault(t, {})
-                for reg, kind in regs.items():
-                    if have.get(reg) not in (kind, 'refuse'):
-                        have[reg], grown_forced = kind, True
             new_bad = self.bad_sgprs - force_unproven
             new_at = {k: v - force_at.get(k, set()) for k, v in bad_at_target.items() if v - force_at.get(k, set())}
-            if grown_forced or ((new_bad or new_at) and tentative_kept):
+            if (new_bad or new_at) and tentative_kept:
                 force_unproven.update(new_bad)
                 for k, v in new_at.items():
                     force_at.setdefault(k, set()).update(v)
@@ -1624,13 +1624,13 @@ class Stage:
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
             self.since_join -= (wrote_s - uniform_written)
-        if wrote_s and hasattr(self, 'bad_sgprs'):
+        if wrote_s and self.bad_sgprs is not None:
             for r in wrote_s - uniform_written:
                 sym = self.sym.get(r)
                 if (r in self.varying_s or r in getattr(self, 'masks', ()) or
                         (sym is not None and sym[0] not in ('const', 'ud', 'fixed_buffer_word')) or
-                        (hasattr(self, 'defined_uniform_s') and r not in self.defined_uniform_s)):
-                    if hasattr(self, 'defined_uniform_s'):
+                        (self.defined_uniform_s is not None and r not in self.defined_uniform_s)):
+                    if self.defined_uniform_s is not None:
                         self.defined_uniform_s.discard(r)
                     self.bad_sgprs.add(r)
         if dst is not None:
