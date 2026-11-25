@@ -2799,6 +2799,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_sgpr_spill_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl 24-bit multiplies, v_xnor_b32 and the funnel shifts: CPU evaluation of the translated text
+    # against an independent reference built from unbounded integers.
+    add_test(NAME startup_gfx2hlsl_mul24_align COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul24_align_check.py")
+    set_tests_properties(startup_gfx2hlsl_mul24_align PROPERTIES TIMEOUT 120)
     # gfx2hlsl v_cmpx_le_i32_sdwa on a sign-extended byte decides which of 16 x 16 pixels survive, checked
     # pixel by pixel (#1906); translations without the select or without sext() must fail the same draw.
     foreach(adapter IN ITEMS warp hardware)
