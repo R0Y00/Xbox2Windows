@@ -1395,11 +1395,13 @@ def readlane_binary(directory, assembler, objcopy, library):
 
 
 def readlane_draw(directory, compiler, renderer, backend):
+    accepted = set()
     for threads in (32, 64):
         lines = READLANE if threads == 64 else variant(
             READLANE, ("v_lshl_add_u32 v0, s2, 6, v0", "v_lshl_add_u32 v0, s2, 5, v0"))
         binding = READLANE_BINDING if threads == 64 else READ_BINDING
         source = aot.lower(lines, threads, **binding)
+        accepted.update(line.split()[0] for line in lines if line.strip() and not line.strip().endswith(":"))
         src, cso, case = [directory / f"readlane-{threads}.{suffix}" for suffix in ("hlsl", "cso", "case")]
         src.write_text(source, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
@@ -1424,6 +1426,10 @@ def readlane_draw(directory, compiler, renderer, backend):
                 bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
                 if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
                     raise AssertionError(f"readlane: mutation '{label}' escaped detection\n{bad.stderr}")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
     return 0
 
 
@@ -2064,6 +2070,11 @@ def ff1_scalar_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"ff1_scalar: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in FF1_SCALAR if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -6382,6 +6393,7 @@ def mubuf_format_store_draw(directory, compiler, renderer, backend, *, xyz=False
     compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
     run = [renderer, backend, "--compute-store-case", cso, case]
     accepted = []
+    opcodes = set()
     cases = (mubuf_format_store_cases(xyz=True) if xyz else
              (*mubuf_format_store_cases(), *mubuf_format_store_cases(packed=True)))
     for name, lines, binding in cases:
@@ -6435,11 +6447,13 @@ def mubuf_format_store_draw(directory, compiler, renderer, backend, *, xyz=False
             raise AssertionError(f"{name}: incorrect store escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
         accepted.append(name)
+        opcodes.update(line.split()[0] for line in lines if line.strip() and not line.strip().endswith(":"))
     # Register the candidate after its native reference has been verified.
-    if not xyz and (record := os.environ.get("FORM_COVERAGE_RECORD")):
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
+        lines_to_write = sorted(opcodes) if xyz else accepted
+        path.write_text("\n".join(lines_to_write) + "\n", encoding="utf-8")
     return 0
 
 
@@ -7954,6 +7968,11 @@ def draw_dpp(directory, compiler, renderer, backend):
     if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
         raise AssertionError(f"DPP no-shuffle negative control escaped detection\n{bad.stderr}")
     print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in DPP_QUAD_PERM if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -8200,9 +8219,11 @@ def draw_scratch_base_write(directory, compiler, renderer, backend):
     return draw(directory, compiler, renderer, backend, cases=SCRATCH_BASE_WRITE_CASES)
 
 def draw(directory, compiler, renderer, backend, cases=None):
+    accepted = set()
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
+        accepted.update(line.split()[0] for line in lines if line.strip() and not line.strip().endswith(":"))
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
         if name == "read_mul_lo":
@@ -8265,6 +8286,10 @@ def draw(directory, compiler, renderer, backend, cases=None):
         bad = subprocess.run(cmd, capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError("A wrong stored word escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
     return 0
 
 
@@ -8293,7 +8318,7 @@ DESCRIPTOR_STORES = (
     ("buffer_store_format_x", 56, 20, False, (("xor", UINT_PAYLOAD),)),
     ("buffer_store_format_d16_xy", 60, 23, False, (PACKED_25_75,)),
     ("buffer_store_format_d16_xyz", 68, 74, False, (PACKED_25_75, H25)),
-    ("buffer_store_format_xyzw", 80, 44, False, (F25, F75, 0, F75)),
+    ("buffer_store_format_xyzw", 80, 50, False, (F25, F75, 0, F75)),
     ("buffer_store_format_x", 96, 7, False, (F25,)),
     ("buffer_store_format_x", 100, 11, False, (UINT16_BITS,)),
     ("buffer_store_format_x", 104, 8, False, (F75,)),
@@ -8492,10 +8517,19 @@ def find_llvm15():
         for name in ("LLVM-C.dll", "libLLVM-15.so.1", "libLLVM.so"):
             if (parent / name).exists():
                 return ("mc", mc, objcopy, str(parent / name))
-    windows = Path(r"C:\Program Files\LLVM\bin")
-    clang, objcopy_path, library = windows / "clang.exe", windows / "llvm-objcopy.exe", windows / "LLVM-C.dll"
-    if clang.exists() and objcopy_path.exists() and library.exists():
-        return ("clang", str(clang), str(objcopy_path), str(library))
+    if os.name == "nt":
+        # The Windows LLVM 15 package ships clang's integrated assembler instead of llvm-mc.
+        for directory in [*os.get_exec_path(), r"C:\Program Files\LLVM\bin"]:
+            windows = Path(directory)
+            clang, objcopy_path, library = (windows / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            if not (windows.is_absolute() and clang.is_file() and objcopy_path.is_file() and library.is_file()):
+                continue
+            try:
+                version = subprocess.run([clang, "--version"], capture_output=True)
+            except OSError:
+                continue
+            if version.returncode == 0 and re.search(rb"\bclang version 15\.", version.stdout):
+                return ("clang", str(clang), str(objcopy_path), str(library))
     return None
 
 
@@ -8518,7 +8552,7 @@ def descriptor_store_round_trip(directory, lines, binding, kind, tool, objcopy, 
 PINNED_LEGACY_WORDS = {
     20: 0x00024FAC, 22: 0x00027FAC, 62: 0x0005CFAC, 64: 0x0005FFAC,
     72: 0x0006CFAC, 74: 0x0006FFAC, 75: 0x00074FAC, 77: 0x00077FAC,
-    56: 0x00050FAC, 23: 0x00028FAC, 44: 0x00040FAC, 29: 0x0002FFAC,
+    56: 0x00050FAC, 23: 0x00028FAC, 50: 0x00048FAC, 29: 0x0002FFAC,
     71: 0x00067FAC, 7: 0x00010FAC, 8: 0x00011FAC, 11: 0x00014FAC,
     12: 0x00015FAC, 13: 0x00017FAC,
 }
@@ -8692,6 +8726,16 @@ def descriptor_shader_bytes(source, thread_id):
 
 
 def descriptor_store_controls():
+    if os.name == "nt":
+        # A complete toolchain on PATH must enable the optional round trip outside Program Files too.
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = tuple(Path(tmp) / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            for tool in tools:
+                tool.touch()
+            version = subprocess.CompletedProcess([], 0, b"clang version 15.0.7\n")
+            with (patch.object(shutil, "which", return_value=None), patch.object(os, "get_exec_path", return_value=[tmp]),
+                  patch.object(subprocess, "run", return_value=version)):
+                assert find_llvm15() == ("clang", *map(str, tools))
     assert descriptor_unorm_bits(F25, 255) == 64
     assert descriptor_unorm_bits(F75, 255) == 191
     assert descriptor_unorm_bits(F25, 1023) == 256
@@ -8710,7 +8754,9 @@ def descriptor_store_controls():
         assert aot.descriptor_format_word(code, legacy=True) == word
         assert aot.decode_buffer_descriptor_format(word)[0] == code
     handled = 0x01038FAC
-    for word in (aot.DESCRIPTOR_GFX10_FIXED | (2 << 12), aot.DESCRIPTOR_GFX10_FIXED | (9 << 12),
+    # 10_10_10_2_UNORM (44, legacy DFMT 8) puts a 2-bit x in bits 1:0, not the 2_10_10_10 layout unorm10 packs.
+    for word in (aot.DESCRIPTOR_GFX10_FIXED | (44 << 12), 0x00040FAC,
+                 aot.DESCRIPTOR_GFX10_FIXED | (2 << 12), aot.DESCRIPTOR_GFX10_FIXED | (9 << 12),
                  handled | (1 << 23), handled | (1 << 21), handled | (1 << 28), handled | (1 << 30),
                  handled & ~0xFFF, 0):
         rejects("Unsupported buffer descriptor format", aot.decode_buffer_descriptor_format, word)
@@ -8800,6 +8846,14 @@ def descriptor_store_draw(directory, compiler, renderer, backend):
     result = subprocess.run(run)
     if result.returncode:
         return result.returncode
+    print("refused 10_10_10_2_UNORM", flush=True)
+    xyzw = next(index for index, store in enumerate(DESCRIPTOR_STORES) if store[1] == 80)
+    case.write_bytes(struct.pack("<321I", 1, *descriptor_words(1, refuse={xyzw}))
+                     + struct.pack("<16I", *descriptor_constants(
+                         {xyzw: aot.DESCRIPTOR_GFX10_FIXED | (44 << 12)})))
+    result = subprocess.run(run)
+    if result.returncode:
+        return result.returncode
     print("refused d16 16_UINT", flush=True)
     case.write_bytes(struct.pack("<321I", 1, *descriptor_words(1, refuse={2}))
                      + struct.pack("<16I", *descriptor_constants({2: aot.descriptor_format_word(11)})))
@@ -8815,6 +8869,11 @@ def descriptor_store_draw(directory, compiler, renderer, backend):
     if bad.returncode != 1 or "word=14 expected=89abcdef actual=89abcdee" not in bad.stderr:
         raise AssertionError(f"incorrect 32_UINT store escaped detection\n{bad.stderr}")
     print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in lines if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
