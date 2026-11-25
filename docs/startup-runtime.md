@@ -437,7 +437,9 @@ with the last refusal:
   each of the first 8 distinct `(key, reason)` pairs even after the 32-call refusal log limit is spent,
   emits deltas in the five-second report, and appends the full `x2w-d3d12 indirect-draw refusals:` lines
   to `x2w_d3d12_census_report` whenever at least one refusal occurred (leaving zero-refusal runs at the
-  existing four memory-SRV lines).
+  existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
+  are not counted in this census (matching the per-call log gate), so `total` counts only refusals
+  attributed to a resolved translated shader key rather than all `ExecuteIndirect` refusals.
 
 Check without a device via
 `ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
