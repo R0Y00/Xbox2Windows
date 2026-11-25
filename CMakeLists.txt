@@ -365,8 +365,8 @@ add_test(NAME d3d12x_device_slots_device1_control COMMAND d3d12x_device_slots_ch
 set_tests_properties(d3d12x_device_slots_device1_control PROPERTIES WILL_FAIL TRUE)
 
 # Fixture-only desktop xgameruntime.dll. The single X-macro table in
-# xgameruntime_shim.cpp distinguishes implemented synchronous contracts from
-# logged E_NOTIMPL stubs. Keep it out of the normal shim directory so a package
+# xgameruntime_shim.cpp distinguishes implemented contracts and the manual-queue async
+# operations. Keep it out of the normal shim directory so a package
 # cannot treat the production-named DLL as a provider.
 add_library(xgameruntime_shim SHARED src/xgameruntime_shim.cpp src/xgameruntime_shim.def)
 set(xgameruntime_fixture_dir "${CMAKE_BINARY_DIR}/fixture-shims")
@@ -418,6 +418,14 @@ add_test(NAME xgameruntime_user_async COMMAND xgameruntime_user_async_check
     "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
     "$<TARGET_FILE_DIR:xmem_shim>")
 set_tests_properties(xgameruntime_user_async PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
+
+add_executable(xgameruntime_package_async_check tests/xgameruntime_package_async_check.cpp)
+add_dependencies(xgameruntime_package_async_check xgameruntime_shim)
+target_compile_features(xgameruntime_package_async_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_package_async COMMAND xgameruntime_package_async_check
+    "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+    "$<TARGET_FILE_DIR:xmem_shim>")
+set_tests_properties(xgameruntime_package_async PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
 
 add_executable(xgameruntime_pls_xpackage_check tests/xgameruntime_pls_xpackage_check.cpp)
 add_dependencies(xgameruntime_pls_xpackage_check xgameruntime_shim)

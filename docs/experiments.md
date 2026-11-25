@@ -12108,8 +12108,8 @@ than the reported size and
 handle. `XPackageGetMountPathSize` and `XPackageGetMountPath` report that path,
 and `XPackageCloseMountHandle` invalidates the handle; later path queries return
 `E_HANDLE`. The mapping is shim-only and does not read or verify a real package
-manifest. `XPackageMountWithUiAsync` remains an explicit stub because its
-completion contract is not modeled.
+manifest. `XPackageMountWithUiAsync` and `XPackageMountWithUiResult` are
+implemented on the manual task queue, described below.
 
 The same fixture adds the synchronous XSystem and XGame identity subset.
 `XSystemGetConsoleId` reports the fixed 38-character console ID
@@ -12138,16 +12138,17 @@ device type.
 checks repeated path and space values, writes and removes a PLS marker, verifies
 the package mount directory, checks the unmounted `E_HANDLE` status, and asserts
 that no implemented call logged `E_NOTIMPL`. Its negative control is
-`XPackageMountWithUiAsync`, which must log `E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
-checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls the
-`XPackageMountWithUiAsync` stub as a negative control. `xgameruntime_identity`
+`XPackageMountWithUiAsync` with a null block, which must log `E_INVALIDARG`.
+`xgameruntime_contracts` exercises the XUser/XGameSave subset and
+checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls
+`XPackageMountWithUiAsync` with null arguments as a negative control (`E_INVALIDARG`). `xgameruntime_identity`
 calls `XSystemGetConsoleId`, `XSystemGetDeviceType`, and `XGameGetXboxTitleId`,
 repeats each call for stability, checks the short-buffer and null-pointer errors,
 and asserts that `XUserAddAsync(None)` (the unsupported picker option) still logs `E_NOTIMPL`. The DLL remains under
 `out/build/dev/fixture-shims/` and is loaded by explicit path. The exact CTest
 names are `xgameruntime_thunks`, `xgameruntime_contracts`,
 `xgameruntime_pls_xpackage`, `xgameruntime_identity`,
-`xgameruntime_gamesave_async`, and `xgameruntime_user_async`.
+`xgameruntime_gamesave_async`, `xgameruntime_user_async`, and `xgameruntime_package_async`.
 
 `XGameSaveInitializeProviderAsync` and `XGameSaveInitializeProviderResult` are
 implemented on top of the synchronous provider path. Argument errors (null
@@ -12170,7 +12171,7 @@ queue open for the caller to close after delivery.
 completion, expiration or successful queue closure. The work port has no work
 items in this profile. The
 shim keeps its state in a side table keyed by the block address and reads only
-the leading queue, context and callback fields. `XPackageMountWithUiAsync` remains an `E_NOTIMPL` stub.
+the leading queue, context and callback fields. No explicit stub export remains in the table.
 `XUserAddAsync` and `XUserAddResult` (part of #870, #1334; on #2170 and #2179)
 use the same manual-queue contract for the one synthetic user. Only
 `AddDefaultUserSilently` or `AddDefaultUserAllowingUI` alone are accepted. Any
@@ -12181,6 +12182,24 @@ returns `E_PENDING` until then without consuming anything, then `S_OK` with one
 handle for `XUserCloseHandle`, once. An untracked block, a second claim or a
 game-save block gets `E_INVALIDARG`. A start that finds no free user handle
 fails with `E_OUTOFMEMORY` and frees its block.
+`XPackageMountWithUiAsync` and `XPackageMountWithUiResult` (part of #870) use the
+same manual-queue contract. The package identifier is validated like
+`XPackageMount` (`E_INVALIDARG`, nothing consumed); a null queue or a queue the
+shim did not make is refused with `E_NOTIMPL`; no UI is ever shown. The mount is
+made before the call returns and the callback fires once on `XTaskQueueDispatch`.
+`XPackageMountWithUiResult` returns `E_PENDING` until then without consuming
+anything, then `S_OK` with one mount handle for `XPackageCloseMountHandle`, once.
+An untracked block, a second claim or a block of another operation gets
+`E_INVALIDARG`; a start with no free mount fails with `E_OUTOFMEMORY` and frees
+its block. `XAsyncGetResultSize` reports one mount handle.
+`xgameruntime_package_async` covers the lifecycle, the in-callback claim, the
+refusals (negative control), the wrong-kind and close guards and mount-table
+exhaustion:
+
+```sh
+ctest --preset dev --no-tests=error -R '^xgameruntime_package_async$' -V
+```
+
 `XAsyncGetStatus` and `XAsyncGetResultSize` answer for tracked blocks only.
 Operation completion and callback dispatch stay separate: once the provider work
 has finished, both queries report the stored status (and a result size of one
