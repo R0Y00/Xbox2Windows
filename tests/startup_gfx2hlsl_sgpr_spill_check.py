@@ -187,6 +187,17 @@ def controls():
         stage.one(name, asm)
     check('a constant slot reloads as a constant: %s' % (stage.sym.get(1),), stage.sym.get(1) == ('const', 7))
 
+    # 6. A word loaded from a constant buffer at an immediate offset is a plain number: it may be spilled.
+    stage = Probe(['v_writelane_b32 v10, s0, 3', 'v_readlane_b32 s1, v10, 3'])
+    stage.sym[0] = ('fixed_buffer_word',)  # what s_buffer_load_dword s0, ..., <immediate> records
+    reason = None
+    try:
+        for _, _, name, asm in stage.ins:
+            stage.one(name, asm)
+    except G.Unsupported as err:
+        reason = str(err)
+    check('a buffer word loaded at an immediate offset is accepted as a spill source (%s)' % reason, reason is None)
+
 
 def check_binary(llvm_mc):
     check('llvm-mc assembles the fixture to the same words', assemble(llvm_mc, FIXTURE_TEXT) == FIXTURE_WORDS)

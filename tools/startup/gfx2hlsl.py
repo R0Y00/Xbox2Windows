@@ -2251,7 +2251,7 @@ class Stage:
             if re.fullmatch(r'0x[0-9a-f]{8}u', value):
                 sym = ('const', int(value[2:-1], 16))
         else:
-            if self.is_lane_mask(ops[1]) or (self.sym.get(src[1]) or ('',))[0] not in ('', 'const', 'ud'):
+            if self.is_lane_mask(ops[1]) or (self.sym.get(src[1]) or ('',))[0] not in ('', 'const', 'ud', 'fixed_buffer_word'):
                 raise Unsupported('v_writelane_b32 source s%d holds a lane mask or descriptor' % src[1])
             value = self.S(src[1])
             sym = self.sym.get(src[1]) if (self.sym.get(src[1]) or ('',))[0] == 'const' else None
