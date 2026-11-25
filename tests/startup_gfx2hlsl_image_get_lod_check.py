@@ -9,7 +9,7 @@ and bias, so the sampler must be a constant descriptor under the validation of i
 Fixture (synthetic): the recorded c_lz stage of startup_image_sample_c_check with the MIMG opcode set to 0x60
 (image_get_lod; the decoder reads it back with a 2-register address), sampler word 2 loaded from a literal (mip
 filter point), and for the second form dmask 0x3.
-Checks: dmask 0x1 and 0x3 lower to the two calls on the sampler, which carries its LOD limits. Controls (refused):
+Checks: dmask 0x1, 0x2 and 0x3 lower to the two calls on the sampler, which carries its LOD limits. Controls (refused):
 dmask 0x4, a 2D array, a branch before the read, a sampler LOD bias, a sampler with mipmapping disabled, and the
 stage without op_image_get_lod (negative control: refused as on main).
   draw <dxc> [fxc]: also compile the dmask 0x3 stage with dxc ps_6_0 (and fxc ps_5_1).
@@ -72,6 +72,8 @@ def controls():
     assert call in text and 'v4 = U(t.x);' in text, text
     _, text = ps(stage(dmask=3))
     assert call in text and 'v4 = U(t.x);' in text and 'v5 = U(t.y);' in text, text
+    _, text = ps(stage(dmask=2))  # the unclamped LOD alone lands in the first destination register
+    assert call in text and 'v4 = U(t.y);' in text and 'U(t.x)' not in text, text
     refused(stage(dmask=4), 'image_get_lod form')
     refused(stage(dim=5), 'image_get_lod form')  # SQ_RSRC_IMG_2D_ARRAY
     refused(stage(branch=True), 'image_get_lod needs implicit derivatives')
@@ -83,7 +85,7 @@ def controls():
         refused(stage(), 'image_get_lod')
     finally:
         G.Stage.op_image_get_lod = saved
-    print('image_get_lod: CalculateLevelOfDetail / Unclamped for dmask 0x1 and 0x3; dmask 0x4, a 2D array, a branch, '
+    print('image_get_lod: CalculateLevelOfDetail / Unclamped for dmask 0x1, 0x2 and 0x3; dmask 0x4, a 2D array, a branch, '
           'a sampler bias and a sampler without mipmapping refused; refused without the handler')
     return pipe
 
