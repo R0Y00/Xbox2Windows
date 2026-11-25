@@ -455,6 +455,16 @@ with the last refusal:
   existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
   are not counted in this census (matching the per-call log gate), so `total` counts only refusals
   attributed to a resolved translated shader key rather than all `ExecuteIndirect` refusals.
+- [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) also wires an `indirect-other`
+  census instance into `list_execute_indirect`: every `ExecuteIndirect` pre-check refusal counted under
+  `other` records `(key, reason_code)` (using the bound pipeline's known shader key when available, or
+  `0000000000000000` when no console pipeline key is resolved), distinguishes render-target and state
+  checks (`no_render_target`, `multiple_render_targets`, `depth_target_bound`,
+  `missing_viewport_or_scissor`, `target_format_mismatch`, `graphics_multi_command`,
+  `argument_outside_placed_buffer`, etc.), keeps logging the first occurrence of each of the first 8
+  distinct `(key, reason)` pairs even after the 16-call global refusal log limit is spent, emits deltas
+  in the five-second report, and appends the full `x2w-d3d12 indirect-other refusals:` lines to
+  `x2w_d3d12_census_report` whenever at least one `other` refusal occurred.
 
 Check without a device via
 `ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
@@ -464,12 +474,18 @@ reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCens
 mismatch output, and are marked `WILL_FAIL`.
 
 Check the runtime wiring on WARP and hardware via
-`ctest --preset dev --no-tests=error -R '^startup_indirect_translated_refusal_census_(warp|hardware|control_warp)$' -V`:
-the pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
+`ctest --preset dev --no-tests=error -R '^startup_indirect_(translated|other)_refusal_census_(warp|hardware|control_warp)$' -V`:
+the `translated` pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
 key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
 succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
-and both per-call log lines for the shared key; the control replaces the second refusal on key 1 with a
+and both per-call log lines for the shared key; its control replaces the second refusal on key 1 with a
 valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.
+The `other` pass runs warm up one translated pipeline key, interleave `missing_viewport_or_scissor` and
+`argument_outside_placed_buffer` on that key alongside `graphics_multi_command` on key `0` (plus
+non-`other` placeholder, graphics-pipeline and compute-pipeline refusals that must not be counted), and
+verify `x2w_d3d12_census_report` (4 refusals, 2 keys, 3 pairs, 0 overflow, no `indirect-draw` lines)
+and the three per-call log lines; its control replaces the second refusal on key 1 with a valid draw and
+must report `total 3; distinct keys 2, distinct pairs 2` as a mismatch.
 
 ## Root constant buffer views
 

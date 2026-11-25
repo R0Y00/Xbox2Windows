@@ -97,12 +97,13 @@ namespace {
 
 using u64 = std::uint64_t;
 constexpr int slot_count = 512;
-// Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and translated indirect draw
-// refusals per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
+// Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and indirect refusal censuses
+// per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
 x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
 x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
+x2w_startup::PerReasonRefusalCensus indirect_other_refusal_census{"indirect-other"};
 
 enum Kind : int {
     device_kind, queue_kind, fence_kind, allocator_kind, list_kind, descriptor_heap_kind, root_signature_kind,
@@ -2581,6 +2582,47 @@ struct IndirectIndexView {
 };
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument,
                                      u64 offset, const IndirectIndexView& indices);
+u64 known_pipeline_key(Wrapper* pipeline);
+
+namespace indirect_other_refusal_code {
+constexpr const char* list_closed = "list_closed";
+constexpr const char* invalid_list_type = "invalid_list_type";
+constexpr const char* invalid_command_count = "invalid_command_count";
+constexpr const char* count_offset_without_buffer = "count_offset_without_buffer";
+constexpr const char* signature_device_mismatch = "signature_device_mismatch";
+constexpr const char* graphics_multi_command = "graphics_multi_command";
+constexpr const char* cached_mesh_attachments = "cached_mesh_attachments";
+constexpr const char* no_render_target = "no_render_target";
+constexpr const char* multiple_render_targets = "multiple_render_targets";
+constexpr const char* depth_target_bound = "depth_target_bound";
+constexpr const char* missing_viewport_or_scissor = "missing_viewport_or_scissor";
+constexpr const char* target_format_mismatch = "target_format_mismatch";
+constexpr const char* rect_list_indexed = "rect_list_indexed";
+constexpr const char* unsupported_topology = "unsupported_topology";
+constexpr const char* multisample_target = "multisample_target";
+constexpr const char* compute_root_mismatch = "compute_root_mismatch";
+constexpr const char* dispatch_root_multi_command = "dispatch_root_multi_command";
+constexpr const char* missing_argument_resource = "missing_argument_resource";
+constexpr const char* invalid_argument_offset = "invalid_argument_offset";
+constexpr const char* argument_address_overflow = "argument_address_overflow";
+constexpr const char* argument_outside_placed_buffer = "argument_outside_placed_buffer";
+constexpr const char* argument_not_common_state = "argument_not_common_state";
+constexpr const char* invalid_index_view = "invalid_index_view";
+constexpr const char* index_view_overlap = "index_view_overlap";
+constexpr const char* index_not_common_state = "index_not_common_state";
+constexpr const char* index_unaligned_address = "index_unaligned_address";
+constexpr const char* upload_index_unaligned = "upload_index_unaligned";
+constexpr const char* index_no_desktop_range = "index_no_desktop_range";
+constexpr const char* aliased_index_unaligned = "aliased_index_unaligned";
+constexpr const char* mesh_xmem_read = "mesh_xmem_read";
+constexpr const char* rect_live_compute_root = "rect_live_compute_root";
+constexpr const char* rect_conversion_unavailable = "rect_conversion_unavailable";
+constexpr const char* count_missing_resource = "count_missing_resource";
+constexpr const char* count_invalid_offset = "count_invalid_offset";
+constexpr const char* count_outside_placed_buffer = "count_outside_placed_buffer";
+constexpr const char* count_not_common_state = "count_not_common_state";
+constexpr const char* unknown = "unknown";
+}  // namespace indirect_other_refusal_code
 
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
@@ -2589,34 +2631,48 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     // Every refusal is counted under the signature's kind, including those before the signature is checked.
     Wrapper* sig = as_wrapper(signature);
     IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
-    const auto refuse = [&kind](const char* reason, int outcome = indirect_other) {
+    Wrapper* refusal_pipeline = nullptr;
+    const auto refuse = [&kind, &refusal_pipeline](const char* reason, int outcome = indirect_other,
+                                                   const char* code = nullptr) {
         InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
         static LONG refusals;
+        if (outcome == indirect_other) {
+            const u64 key = known_pipeline_key(refusal_pipeline);
+            const char* reason_code = code ? code : indirect_other_refusal_code::unknown;
+            const bool first_pair = indirect_other_refusal_census.note(key, reason_code);
+            if (first_pair || first_calls(refusals, 16))
+                log("x2w-render ExecuteIndirect refused, key %016llx [%s]: %s", key, reason_code, reason);
+            return;
+        }
         if (first_calls(refusals, 16)) log("x2w-render ExecuteIndirect refused: %s", reason);
     };
     auto* list = recording(self);
-    if (!list) return refuse("list is closed");
+    if (!list) return refuse("list is closed", indirect_other, indirect_other_refusal_code::list_closed);
     const auto type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
-        return refuse("requires a direct or compute command list");
+        return refuse("requires a direct or compute command list", indirect_other, indirect_other_refusal_code::invalid_list_type);
     // Only a desktop Dispatch signature runs more than one command or reads a count buffer here.
     constexpr UINT max_dispatch_commands = 1u << 16;
-    if (!count || count > max_dispatch_commands) return refuse("command count is zero or above the supported maximum");
-    if (!count_buffer && count_offset) return refuse("count offset without a count buffer");
+    if (!count || count > max_dispatch_commands)
+        return refuse("command count is zero or above the supported maximum", indirect_other, indirect_other_refusal_code::invalid_command_count);
+    if (!count_buffer && count_offset)
+        return refuse("count offset without a count buffer", indirect_other, indirect_other_refusal_code::count_offset_without_buffer);
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
         return refuse("missing or placeholder signature", indirect_placeholder);
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
-        return refuse("requires a supported signature from this device");
+        return refuse("requires a supported signature from this device", indirect_other, indirect_other_refusal_code::signature_device_mismatch);
     const auto command = sig->own().indirect_command;
     const bool indexed = command == IndirectCommand::draw_indexed;
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
+    refusal_pipeline = pass.pipeline;
     const bool translated = (command == IndirectCommand::draw || indexed) && pass.pipeline && !pass.pipeline->own().real &&
         (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     u64 bytes = sig->own().indirect_bytes;
-    if (graphics && (count != 1 || count_buffer)) return refuse("indirect graphics requires one command and no count buffer");
+    if (graphics && (count != 1 || count_buffer))
+        return refuse("indirect graphics requires one command and no count buffer", indirect_other, indirect_other_refusal_code::graphics_multi_command);
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
@@ -2649,7 +2705,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 pass.target_count != pso.cached_target_count || pass.dsv_format != pso.cached_depth ||
                 (pso.cached_depth_writes && !pass.depth_view_writable) ||
                 !std::equal(pso.cached_targets, pso.cached_targets + pso.cached_target_count, pass.target_formats))
-                return refuse("cached mesh requires matching color and depth attachments, viewport and scissor");
+                return refuse("cached mesh requires matching color and depth attachments, viewport and scissor",
+                              indirect_other, indirect_other_refusal_code::cached_mesh_attachments);
             if (!pass.root || pass.root != pso.guest_root_params || pass.root_heap_flags)
                 return refuse("cached mesh requires a recorded root without heap indexing", indirect_graphics_pipeline);
             for (std::size_t i = 0; i < pass.root->size(); ++i) {
@@ -2660,40 +2717,50 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             }
         } else if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
-            pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
-            return refuse("indirect graphics requires one matching target, viewport and scissor");
+            pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set) {
+            const char* code =
+                pass.target_count > 1                                 ? indirect_other_refusal_code::multiple_render_targets
+                : (!pass.targets_bound || !pass.target_count || !pass.target0) ? indirect_other_refusal_code::no_render_target
+                : pass.dsv_format != DXGI_FORMAT_UNKNOWN              ? indirect_other_refusal_code::depth_target_bound
+                : (!pass.viewport_set || !pass.scissor_set)           ? indirect_other_refusal_code::missing_viewport_or_scissor
+                                                                      : indirect_other_refusal_code::target_format_mismatch;
+            return refuse("indirect graphics requires one matching target, viewport and scissor", indirect_other, code);
+        }
         const bool rect_list = !mesh && pass.topology == 0x11;
         if (rect_list && indexed && !translated)
-            return refuse("indirect rectangle list requires a non-indexed draw");
+            return refuse("indirect rectangle list requires a non-indexed draw", indirect_other, indirect_other_refusal_code::rect_list_indexed);
         if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-            return refuse("indirect draw requires triangle-list or rectangle-list topology");
+            return refuse("indirect draw requires triangle-list or rectangle-list topology", indirect_other, indirect_other_refusal_code::unsupported_topology);
         if (!pass.indirect_graphics.cached_mesh) {
             const auto samples = pass.target0->GetDesc().SampleDesc;
             if (samples.Count != 1 || samples.Quality)
-                return refuse("draw requires a single-sample render target");
+                return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);
         }
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
-        return refuse("signature root constants require the bound compute root");
+        return refuse("signature root constants require the bound compute root", indirect_other, indirect_other_refusal_code::compute_root_mismatch);
     } else if (sig->own().signature_root && (count != 1 || count_buffer)) {
         // Batched and count-buffer Dispatch is supported for rootless signatures only in this slice.
-        return refuse("a Dispatch signature with root constants requires one command and no count buffer");
+        return refuse("a Dispatch signature with root constants requires one command and no count buffer",
+                      indirect_other, indirect_other_refusal_code::dispatch_root_multi_command);
     }
     Wrapper* buffer = as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
-        return refuse("argument has no desktop resource");
+        return refuse("argument has no desktop resource", indirect_other, indirect_other_refusal_code::missing_argument_resource);
     const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
     if (!base || (offset & 3) || offset > ~u64{} - base)
-        return refuse("invalid argument offset or unmapped buffer");
+        return refuse("invalid argument offset or unmapped buffer", indirect_other, indirect_other_refusal_code::invalid_argument_offset);
     // Every record up to the maximum must lie in the buffer: the count word can only lower the number executed.
     const u64 span = u64{count - 1} * sig->own().indirect_bytes + bytes;
-    if (span < bytes || base + offset > ~u64{} - span) return refuse("argument records overflow the address space");
+    if (span < bytes || base + offset > ~u64{} - span)
+        return refuse("argument records overflow the address space", indirect_other, indirect_other_refusal_code::argument_address_overflow);
     const auto found = placed_buffer_range(device, base + offset, span);
-    if (found.reject || found.owner != buffer) return refuse("argument record is outside a unique placed buffer");
+    if (found.reject || found.owner != buffer)
+        return refuse("argument record is outside a unique placed buffer", indirect_other, indirect_other_refusal_code::argument_outside_placed_buffer);
     const auto* info = resource_info(buffer);
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
-        return refuse("argument buffer does not use COMMON state tracking");
+        return refuse("argument buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::argument_not_common_state);
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
     IndirectIndexView index_view;
     if (indexed) {
@@ -2701,19 +2768,20 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         const UINT alignment = view.Format == DXGI_FORMAT_R16_UINT ? 2 : view.Format == DXGI_FORMAT_R32_UINT ? 4 : 0;
         if (!alignment || !view.BufferLocation || !view.SizeInBytes ||
             view.BufferLocation % alignment || view.SizeInBytes % alignment)
-            return refuse("invalid index view");
+            return refuse("invalid index view", indirect_other, indirect_other_refusal_code::invalid_index_view);
         const auto indices = placed_buffer_range(device, view.BufferLocation, view.SizeInBytes);
-        if (indices.reject) return refuse("index view crosses or overlaps placed buffers");
+        if (indices.reject)
+            return refuse("index view crosses or overlaps placed buffers", indirect_other, indirect_other_refusal_code::index_view_overlap);
         if (indices.owner && indices.owner->own().real) {
             const auto* index_info = resource_info(indices.owner);
             if (!index_info || index_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
-                return refuse("index buffer does not use COMMON state tracking");
+                return refuse("index buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::index_not_common_state);
             auto* index = static_cast<ID3D12Resource*>(indices.owner->own().real);
             const auto index_base = reinterpret_cast<u64>(indices.owner->own().title_memory);
             const auto index_offset = view.BufferLocation - index_base;
             const auto native_base = index->GetGPUVirtualAddress();
             if (!native_base || index_offset > ~u64{} - native_base || (native_base + index_offset) % alignment)
-                return refuse("index view has no aligned desktop address");
+                return refuse("index view has no aligned desktop address", indirect_other, indirect_other_refusal_code::index_unaligned_address);
             view.BufferLocation = native_base + index_offset;
             index_view = {view, index, index_offset};
         } else {
@@ -2723,16 +2791,19 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             // load an adjacent recording upload allocation when extracting a half-word.
             if (upload.resource) {
                 if ((upload.offset | view.SizeInBytes) & 3)
-                    return refuse("upload index view is not dword-aligned and dword-sized");
+                    return refuse("upload index view is not dword-aligned and dword-sized",
+                                  indirect_other, indirect_other_refusal_code::upload_index_unaligned);
                 view.BufferLocation = upload.gpu;
                 index_view = {view, upload.resource, upload.offset, true};
             } else {
                 const auto alias = translated && !indices.owner && !list_upload_range(self, view.BufferLocation, 1).resource
                     ? indirect_address_alias(self->own().list_device, view.BufferLocation, view.SizeInBytes) : IndirectAddressAlias{};
-                if (!alias.resource) return refuse("index view has no proven desktop buffer range");
+                if (!alias.resource)
+                    return refuse("index view has no proven desktop buffer range", indirect_other, indirect_other_refusal_code::index_no_desktop_range);
                 const auto gpu = alias.resource->GetGPUVirtualAddress();
                 if (!gpu || ((alias.offset | view.SizeInBytes) & 3))
-                    return refuse("aliased index view is not dword-aligned and dword-sized");
+                    return refuse("aliased index view is not dword-aligned and dword-sized",
+                                  indirect_other, indirect_other_refusal_code::aliased_index_unaligned);
                 view.BufferLocation = gpu + alias.offset;
                 index_view = {view, alias.resource, alias.offset};
             }
@@ -2766,7 +2837,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         inputs[input_count++] = {base + offset, bytes, argument_state};
     if (input_count) {
         if (const char* failure = record_mesh_xmem_reads(self, inputs, input_count))
-            return refuse(failure, mesh_srv != UINT_MAX ? indirect_graphics_pipeline : indirect_other);
+            return refuse(failure, mesh_srv != UINT_MAX ? indirect_graphics_pipeline : indirect_other,
+                          indirect_other_refusal_code::mesh_xmem_read);
         if (leased_arguments) {
             draw_arguments = inputs[input_count - 1].resource;
             draw_offset = inputs[input_count - 1].offset;
@@ -2775,7 +2847,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (rect_list) {
         if (std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(),
                         [](u64 address) { return address != 0; }))
-            return refuse("rectangle-list conversion would drop live compute root arguments");
+            return refuse("rectangle-list conversion would drop live compute root arguments",
+                          indirect_other, indirect_other_refusal_code::rect_live_compute_root);
         // The producer's count names three vertices per rectangle; the desktop draw needs six. Convert on the GPU
         // into a scratch record and draw from that. The compute root signature and bindings of the list are replaced.
         // The four words are copied into the scratch first (the pass never reads the title's buffer), so the source only
@@ -2783,7 +2856,8 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         require_state(self, resource, argument_state | D3D12_RESOURCE_STATE_COPY_SOURCE);
         scratch = recording_rect_scratch(self);
         if (!scratch || !x2w_startup::rect_indirect_arguments().convert(list, resource, offset, scratch))
-            return refuse("rectangle-list argument conversion is unavailable");
+            return refuse("rectangle-list argument conversion is unavailable",
+                          indirect_other, indirect_other_refusal_code::rect_conversion_unavailable);
         if (pass.desktop_compute_root) list->SetComputeRootSignature(pass.desktop_compute_root.Get());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         draw_arguments = scratch;
@@ -2807,16 +2881,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         // The count word is four bytes in a unique placed buffer that also tracks state from COMMON.
         Wrapper* count_wrapper = as_wrapper(count_buffer);
         if (!count_wrapper || count_wrapper->own().kind != resource_kind || !count_wrapper->own().real)
-            return refuse("count buffer has no desktop resource");
+            return refuse("count buffer has no desktop resource", indirect_other, indirect_other_refusal_code::count_missing_resource);
         const auto count_base = reinterpret_cast<u64>(count_wrapper->own().title_memory);
         if (!count_base || (count_offset & 3) || count_offset > ~u64{} - count_base - sizeof(UINT))
-            return refuse("invalid count offset or unmapped count buffer");
+            return refuse("invalid count offset or unmapped count buffer", indirect_other, indirect_other_refusal_code::count_invalid_offset);
         const auto count_found = placed_buffer_range(device, count_base + count_offset, sizeof(UINT));
         if (count_found.reject || count_found.owner != count_wrapper)
-            return refuse("count word is outside a unique placed buffer");
+            return refuse("count word is outside a unique placed buffer", indirect_other, indirect_other_refusal_code::count_outside_placed_buffer);
         const auto* count_info = resource_info(count_wrapper);
         if (!count_info || count_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
-            return refuse("count buffer does not use COMMON state tracking");
+            return refuse("count buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::count_not_common_state);
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
@@ -4816,6 +4890,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         token_null_census.report([](const char* line) { log("%s", line); }, true);
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
         indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
+        indirect_other_refusal_census.report([](const char* line) { log("%s", line); }, true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
@@ -4838,6 +4913,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     token_null_census.report(emit, false);
     memory_srv_writes.report(emit, false);
     if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
+    if (indirect_other_refusal_census.total()) indirect_other_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
     return length;
 }
