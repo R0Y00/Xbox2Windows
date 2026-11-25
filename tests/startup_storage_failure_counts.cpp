@@ -243,7 +243,7 @@ int main(int argc, char** argv)
     constexpr unsigned request_count = sizeof(plan) / sizeof(plan[0]);
 
     void *status_ptr = nullptr, *queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, request_count, "Counts", nullptr, &status_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0) {

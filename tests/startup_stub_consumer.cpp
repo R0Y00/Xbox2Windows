@@ -1836,7 +1836,7 @@ bool dstorage_directory_batches()
     const wchar_t* names[]{L"small.ttpf", L"large.ttpf"};
     for (unsigned i = 0; i < 2; ++i)
         if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, names[i], nullptr, &files[i])) return false;
-    const unsigned char queue_description[0x20] = {};
+    const unsigned char queue_description[0x28] = {};
     if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, queue_description, nullptr, &object)) return false;
     auto* queue = static_cast<Object*>(object);
     const unsigned count = static_cast<unsigned>(requests.size());

@@ -79,7 +79,7 @@ bool begin_batch()
     auto factory = static_cast<Ptr>(result);
     const GUID* iid = nullptr;
     const HRESULT file_result = invoke<4, HRESULT>(factory, archive_name, iid, &file);
-    const unsigned char queue_description[0x20] = {};
+    const unsigned char queue_description[0x28] = {};
     const HRESULT queue_result = invoke<10, HRESULT>(factory, static_cast<const void*>(queue_description), iid, &queue);
     const HRESULT status_result = invoke<5, HRESULT>(factory, 2u, "BC pages", iid, &status);
     invoke<2, unsigned>(factory);

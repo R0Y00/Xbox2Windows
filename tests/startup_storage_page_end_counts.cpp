@@ -279,7 +279,7 @@ int main(int argc, char** argv)
     auto valid = [&](unsigned i) { return plan[i].outcome == completed || (plan[i].outcome == not_counted && i + 1 < request_count); };
 
     void *status_ptr = nullptr, *queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     // Room for every entry, so the queue does not submit itself before the page array is made unreadable.
     *reinterpret_cast<std::uint16_t*>(description + 8) = 4 * request_count;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, request_count, "PageEnds", nullptr, &status_ptr) != 0 ||

@@ -165,7 +165,7 @@ struct Fixture {
     {
         void* status = nullptr;
         void* queue = nullptr;
-        unsigned char description[0x20] = {};
+        unsigned char description[0x28] = {};
         *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
         if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 4, "Status", nullptr, &status) != 0 ||
             reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue) != 0)

@@ -118,7 +118,7 @@ int main(int argc, char** argv)
     auto* factory = static_cast<Object*>(factory_pointer);
     void* status_pointer = nullptr;
     void* queue_pointer = nullptr;
-    unsigned char description[0x20] = {};
+    unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, cases, "Status", nullptr, &status_pointer) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_pointer) != 0)
