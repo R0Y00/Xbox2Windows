@@ -293,7 +293,7 @@ struct alignas(void*) Subobject {
 template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage>
 ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
                                D3D12_SHADER_BYTECODE source, D3D12_SHADER_BYTECODE pixel,
-                               D3D12_SHADER_BYTECODE amplification = {})
+                               D3D12_SHADER_BYTECODE amplification = {}, UINT targets = 1, bool depth_only = false)
 {
     struct {
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
@@ -304,9 +304,10 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
     } stream;
-    static_assert(sizeof(stream) == 16 + 24 + 24 + 48 + 56 + 8 + 40 + 16 + 24);
+    static_assert(sizeof(stream) == 16 + 24 + 24 + 48 + 56 + 8 + 40 + 16 + 8 + 24);
     stream.root.value = root;
     stream.source.value = source;
     stream.ps.value = pixel;
@@ -315,9 +316,15 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
     stream.raster.value.DepthClipEnable = TRUE;
     stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    if (depth_only) {
+        stream.depth.value.DepthEnable = TRUE;
+        stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        stream.dsv.value = DXGI_FORMAT_D16_UNORM;
+    }
     stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    stream.targets.value.RTFormats[0] = format;
-    stream.targets.value.NumRenderTargets = 1;
+    std::fill_n(stream.targets.value.RTFormats, targets, format);
+    stream.targets.value.NumRenderTargets = targets;
     stream.samples.value.Count = 1;
     stream.as.value = amplification;
     const D3D12_PIPELINE_STATE_STREAM_DESC desc{
@@ -388,7 +395,8 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
 enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
-                     rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape };
+                     rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending };
 enum class DrawKind { indexed, vertices, mesh, indexed_rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
@@ -497,7 +505,9 @@ bool supports_mesh(ID3D12Device* device)
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
-         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr, bool upload_index = false)
+         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
+         bool upload_index = false,
+         UINT cached_mesh_targets = 0, bool cached_depth_only = false)
 {
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool translated_indexed = translated && indexed;
@@ -533,17 +543,42 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     if (indexed) std::memcpy(static_cast<char*>(memory) + sizeof(initial_words), index_data, index_bytes);
     upload->Unmap(0, nullptr);
 
-    const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, format, {1, 0},
-                                          D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    const auto target_format = cached_depth_only ? DXGI_FORMAT_D16_UNORM : format;
+    const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, target_format, {1, 0},
+        D3D12_TEXTURE_LAYOUT_UNKNOWN, cached_depth_only ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL :
+                                                          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
     constexpr float clear[]{0, 0, 0, 1};
-    const D3D12_CLEAR_VALUE clear_value{format, {0, 0, 0, 1}};
-    const auto target = resource(device, target_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &clear_value);
-    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+    D3D12_CLEAR_VALUE clear_value{target_format, {0, 0, 0, 1}};
+    if (cached_depth_only) clear_value.DepthStencil = {1, 0};
+    const UINT target_count = cached_mesh_targets ? cached_mesh_targets : 1;
+    std::vector<ComPtr<ID3D12Resource>> targets;
+    const auto heap_kind = cached_depth_only ? D3D12_DESCRIPTOR_HEAP_TYPE_DSV : D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{heap_kind, target_count,
                                               D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ComPtr<ID3D12DescriptorHeap> heap;
-    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create RTV heap");
-    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
-    guest->CreateRenderTargetView(target.Get(), nullptr, rtv);
+    check((cached_depth_only ? guest : device)->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)),
+        "create attachment heap");
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
+    D3D12_CPU_DESCRIPTOR_HANDLE native_dsv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+    if (cached_depth_only) {
+        using GetCpu = UINT64(WINAPI*)(IUnknown*, void*);
+        rtv.ptr = slot<GetCpu>(heap.Get(), 9)(heap.Get(), nullptr);
+        native_dsv = native_object<ID3D12DescriptorHeap>(device, guest, heap.Get())->GetCPUDescriptorHandleForHeapStart();
+    } else {
+        rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    }
+    for (UINT i = 0; i < target_count; ++i) {
+        targets.push_back(resource(device, target_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &clear_value));
+        if (cached_depth_only) {
+            D3D12_DEPTH_STENCIL_VIEW_DESC depth_view{};
+            depth_view.Format = target_format;
+            depth_view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            guest->CreateDepthStencilView(targets.back().Get(), &depth_view, rtv);
+        } else guest->CreateRenderTargetView(targets.back().Get(), nullptr, rtv);
+        rtvs.push_back(rtv);
+        rtv.ptr += device->GetDescriptorHandleIncrementSize(heap_kind);
+    }
 
     ComPtr<ID3D12CommandAllocator> allocator;
     check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create guest allocator");
@@ -616,10 +651,25 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
     const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
     const D3D12_RECT scissor{rect ? 1 : 0, 0, width, height};
-    slot<Clear>(wrapped, 52)(wrapped, rtv.ptr, clear, 0, nullptr);
-    slot<Targets>(wrapped, 50)(wrapped, 1, &rtv, FALSE, nullptr);
+    if (cached_depth_only) {
+        slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, rtvs.data());
+        list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        if (refusal == Refusal::mesh_attachment_count)
+            slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, nullptr);
+    } else {
+        for (const auto target_view : rtvs) slot<Clear>(wrapped, 52)(wrapped, target_view.ptr, clear, 0, nullptr);
+        const UINT bound_targets = target_count - (refusal == Refusal::mesh_attachment_count ? 1 : 0);
+        slot<Targets>(wrapped, 50)(wrapped, bound_targets, rtvs.data(), FALSE, nullptr);
+    }
     slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Bind>(wrapped, 34)(wrapped, refusal == Refusal::wrong_root ? translated->wrong_root.Get() : graphics_root);
+    if (cached_mesh_targets || cached_depth_only) {
+        using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
+        const UINT values[]{17, 29};
+        slot<Constants>(wrapped, 40)(wrapped, 0, 1, values, 0);
+        if (refusal != Refusal::incomplete_mesh_constants)
+            slot<Constants>(wrapped, 40)(wrapped, 0, 1, values + 1, 1);
+    }
     if (translated && refusal != Refusal::missing_texture) {
         ID3D12DescriptorHeap* heaps[]{translated->heap.Get()};
         using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
@@ -756,43 +806,49 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT64 bytes = 0;
     device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-    const auto pixel_readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
-    transition(copy.list.Get(), target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION source{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    D3D12_TEXTURE_COPY_LOCATION destination{pixel_readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
-    destination.PlacedFootprint = footprint;
-    copy.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-    copy.submit_and_wait(device);
+    for (const auto& target : targets) {
+        const auto pixel_readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        transition(copy.list.Get(), target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION source{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        D3D12_TEXTURE_COPY_LOCATION destination{pixel_readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        destination.PlacedFootprint = footprint;
+        copy.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        copy.submit_and_wait(device);
 
-    const D3D12_RANGE pixel_range{0, static_cast<SIZE_T>(bytes)};
-    check(pixel_readback->Map(0, &pixel_range, &memory), "map pixel readback");
-    UINT painted = 0;
-    bool pixels_match = true;
-    for (UINT y = 0; y < height; ++y)
-        for (UINT x = 0; x < width; ++x) {
-            std::uint32_t actual = 0;
-            std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * sizeof(actual),
-                        sizeof(actual));
-            const bool right_half = x >= width / 2;
-            const bool covered = indexed ? right_half == draw_right : translated || !right_half || draw_right;
-            const bool drawn = writer && refusal == Refusal::none && covered;
-            auto wanted = drawn ? (translated ? (draw_right ? green : red) : (right_half ? green : red)) : black;
-            if (rect) {
-                // NDC pixel centers are x=(-.75,-.25,.25,.75), y=(.5,-.5).
-                // UV follows the clipped original rectangle, not the viewport/scissor.
-                constexpr UINT u[]{80, 112, 143, 175}, v[]{96, 159};
-                wanted = writer && refusal == Refusal::none && (x == 1 || x == 2)
-                    ? (0xff350000 | (v[y] << 8) | u[x]) : black;
+        const D3D12_RANGE pixel_range{0, static_cast<SIZE_T>(bytes)};
+        check(pixel_readback->Map(0, &pixel_range, &memory), "map pixel readback");
+        UINT painted = 0;
+        bool pixels_match = true;
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x) {
+                std::uint32_t actual = 0;
+                const auto pixel_bytes = cached_depth_only ? 2u : sizeof(actual);
+                std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * pixel_bytes,
+                            pixel_bytes);
+                const bool right_half = x >= width / 2;
+                const bool covered = cached_depth_only || (indexed ? right_half == draw_right : translated || !right_half || draw_right);
+                const bool drawn = writer && refusal == Refusal::none && covered;
+                const std::uint32_t background = cached_depth_only ? 0xffff : black;
+                auto wanted = drawn ? (cached_depth_only ? 0u :
+                    translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
+                if (rect) {
+                    // NDC pixel centers are x=(-.75,-.25,.25,.75), y=(.5,-.5).
+                    // UV follows the clipped original rectangle, not the viewport/scissor.
+                    constexpr UINT u[]{80, 112, 143, 175}, v[]{96, 159};
+                    wanted = writer && refusal == Refusal::none && (x == 1 || x == 2)
+                        ? (0xff350000 | (v[y] << 8) | u[x]) : black;
+                }
+                if (actual != background) ++painted;
+                if (actual == wanted) continue;
+                std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
+                pixels_match = false;
             }
-            if (actual != black) ++painted;
-            if (actual == wanted) continue;
-            std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
-            pixels_match = false;
-        }
-    pixel_readback->Unmap(0, &untouched);
-    std::printf("%s: %u/%u non-clear pixels, argument guards intact\n", label, painted, width * height);
-    return pixels_match;
+        pixel_readback->Unmap(0, &untouched);
+        std::printf("%s: %u/%u non-clear pixels, argument guards intact\n", label, painted, width * height);
+        if (!pixels_match) return false;
+    }
+    return true;
 }
 // Calls refused before any argument is read: one per counted reason, and one with two commands, which is
 // counted as other under its signature's kind. The list is closed and dropped.
@@ -916,6 +972,40 @@ int main(int argc, char** argv) try
     const auto root_flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, root_flags};
     const auto writer = create_root(device.Get(), writer_desc);
+    wchar_t mesh86_dir[MAX_PATH]{};
+    if (mesh && GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_DIR", mesh86_dir, MAX_PATH)) {
+        const bool depth_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH", nullptr, 0) != 0;
+        const auto input = std::filesystem::path(mesh86_dir);
+        const auto read_stage = [&](const char* name) {
+            std::ifstream file(input / name, std::ios::binary);
+            check(file ? S_OK : E_FAIL, name);
+            return std::vector<char>(std::istreambuf_iterator<char>(file), {});
+        };
+        const auto ms = read_stage("source.ms.dxbc");
+        const auto ps = depth_only ? std::vector<char>{} : read_stage("source.ps.dxbc");
+        D3D12_ROOT_PARAMETER parameter{D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, {}, D3D12_SHADER_VISIBILITY_ALL};
+        parameter.Constants = {0, 0, 2};
+        const D3D12_ROOT_SIGNATURE_DESC root_desc{1, &parameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const auto root = create_root(guest.Get(), root_desc);
+        D3D12_INDIRECT_ARGUMENT_DESC argument{};
+        argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+        const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument, 0};
+        ComPtr<ID3D12CommandSignature> signature;
+        check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create cached mesh signature");
+        const auto pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(
+            guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
+            {}, depth_only ? 0 : 3, depth_only);
+        const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
+        const auto verify = [&](Refusal control, const char* label) {
+            return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
+                       DrawKind::mesh, false, control, label, nullptr, false, nullptr, false, depth_only ? 0 : 3, depth_only);
+        };
+        if (!GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0))
+            return verify(Refusal::mesh_pending, "unavailable cached mesh") ? 0 : 1;
+        return verify(Refusal::none, depth_only ? "cached mesh depth-only" : "cached translated mesh with three attachments") &&
+            verify(Refusal::incomplete_mesh_constants, "cached mesh incomplete root constants") &&
+            verify(Refusal::mesh_attachment_count, "cached mesh missing attachment") ? 0 : 1;
+    }
     if (mesh && GetEnvironmentVariableA("X2W_MESH_REQUEST_FIXTURE", nullptr, 0)) {
         const auto cache = std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directory(cache);

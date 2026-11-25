@@ -251,19 +251,21 @@ ctest --preset dev --no-tests=error -R '^startup_r8_uint_(warp|hardware)$' -V
 
 ### Every vertex-fetch buffer format
 
-The `gfx2hlsl` table for `tbuffer_load_format_*` has ten formats (plus `16_16_SNORM`, added afterwards and described at the end of this section): `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` runs all ten the way the check above does. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for `8_UINT`). It shares no code with the translator's table.
+The original `tbuffer_load_format_*` fixture covered ten formats: `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. The fixture also covers `16_16_SNORM`, `16_16_16_16_FLOAT` and `8_8_8_8_UINT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` exercises each format with the same vertex-fetch fixture. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for integer formats). It shares no code with the translator's table. The `16_16_SNORM` check below also exercises the signed endpoints and detects an unsigned decode.
 
 - **Element alignment.** Formats with fields narrower than a dword use strides and offsets that put elements at more than one byte alignment (stride 3 offset 2, stride 5 offset 3, stride 6 offset 2, stride 10 offset 10), so fields that cross a dword go through `ldu()`. The 32-bit formats keep 4-byte aligned elements, which their aligned `Load()` needs.
 - **How components are compared.** UNORM components are compared as `round(v * (2^bits - 1))`, so the result does not depend on how many ulps the division is off. All other components are compared bit for bit. The chosen binary16 and binary32 values are all normal.
-- **Negative controls.** 25 wrong references must fail at their first differing word: swapped channels, fields read one field higher, a missing W read as 0, and UNORM over `2^bits`, for each format where they change a word. Seven mutated translations must also fail: the second byte of `8_8_8_8_UNORM` taken from the third, its fourth byte read as 1.0, an aligned load instead of `ldu()` for `8_8_UNORM`, the high half of `16_16_UNORM` over 65536, the low binary16 half read from the high half, the missing W of `32_32_32_FLOAT` read as 0, and the W of `32_32_32_32_FLOAT` read from the third word.
+- **Negative controls for the original ten formats.** 25 wrong references must fail at their first differing word: swapped channels, fields read one field higher, a missing W read as 0, and UNORM over `2^bits`, for each format where they change a word. Seven mutated translations must also fail: the second byte of `8_8_8_8_UNORM` taken from the third, its fourth byte read as 1.0, an aligned load instead of `ldu()` for `8_8_UNORM`, the high half of `16_16_UNORM` over 65536, the low binary16 half read from the high half, the missing W of `32_32_32_FLOAT` read as 0, and the W of `32_32_32_32_FLOAT` read from the third word.
 
-All ten formats matched on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). The translation-side controls run without a device as `startup_vertex_fetch_formats_controls`.
+The original ten formats matched on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). The translation-side controls run without a device as `startup_vertex_fetch_formats_controls`.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|warp|hardware)$' -V
 ```
 
 `BUF_FMT_16_16_SNORM` (format 24, DXGI `R16G16_SNORM` 37) sign-extends each half, divides by 32767 and clamps to -1.0, so -32768 and -32767 both give -1.0 (the Direct3D and Vulkan SNORM rule, as in LLVM 15 and Mesa `ac_formats`). The device run compares `round(v * 32767)` against the same byte decode, with a wrong reference that reads the halves unsigned and a mutated translation that does the same. The pattern the harness writes to t0 holds no 0x8000, so `startup_vertex_fetch_formats_controls` also evaluates the emitted expressions on 0x8000, 0x8001, 0x7fff, 0x0000, 0xffff and 0x4000 in each half, and four wrong forms (unsigned read, no clamp, divisor 32768, one half for both) must fail that check. The D3D12 draw has not been run on Linux.
+
+`BUF_FMT_8_8_8_8_UINT` (gfx10 format 60, DXGI `R8G8B8A8_UINT` 30) reads four unsigned bytes into X, Y, Z and W in increasing address order. With stride 5 and byte offset 3, the 16-vertex fixture visits all four dword alignments. On WARP, all 64 component words matched the byte reference. Swapping channels in the reference or normalizing the green byte in the generated shader each triggered a mismatch.
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks
 
@@ -8567,6 +8569,29 @@ of console shader programs and support for other console mesh paths are tracked 
 [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 
+Slot 86 publishes complete Xbox mesh containers under a separate cache key. The
+key frames the original MS, the optional PS, the creation root signature and the
+pipeline-state stream with its pointers cleared. The shim writes `.m86` last,
+after `.ps86`, `.root` and `.stream86`. An empty `.ps86` records a stream
+without a pixel shader. Use the cache tool with a desktop pair independently
+validated for that exact source and root. The ready marker records both output
+shader hashes so an incomplete or mixed update cannot reach PSO creation.
+
+```powershell
+python -B tools/startup/mesh86_cache.py <cache> <key> --mesh <desktop-ms.cso> --pixel <desktop-ps.cso>
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_cache_' -V
+```
+
+The executable subset uses the original root and PSO state. It accepts root
+constants captured on the list, single-sample color attachments in exact format
+order and a matching depth view when the stream declares one. A mesh stream
+without a pixel stage requires zero color attachments, a writable matching
+depth view and a physical adapter. The depth-only fixture removed the device
+on WARP when dispatched, so the shim refuses it there. Untracked descriptor
+tables, heap indexing, root descriptors,
+stencil state and depth bounds are refused. A shader accepted individually can still
+fail PSO creation or lack a consumable root binding.
+
 The fixture writes its group counts at byte offset four on the GPU and checks
 all eight pixels and the surrounding argument words. One group paints the
 left half. Two groups paint both halves. An omitted writer, a short argument
@@ -8803,6 +8828,14 @@ The run also probes the boundaries the fallback relies on, and reports three fin
 The negative controls each remove one guarantee and must fail every case that it protects. On both adapters, `--mutate skip-refresh` uses the `bind` copy point and makes copy and fallback case a read A, failing 4 of 4 cases. `--mutate skip-copy-back` leaves P in the alias for copy and fallback cases b and d2, failing 8 of 8. `--mutate reuse-early` drops the fence checks on slots and the ring. Sharing case c then gives Y X's slots and the held read returns C, and the copy paths take X's ring slot and read E, failing 6 of 6.
 
 Run `cmake --build --preset dev --target unified_buffer_paths_check` and `ctest --preset dev --no-tests=error -R '^unified_buffer_paths_' -V`. Set `XBOX2WINDOWS_ADAPTER` to select a hardware adapter and `X2W_TEST_DEBUG_LAYER=1` to enable the debug layer. The hardware case skips (77) without an `ID3D12Device3` adapter or without sharing support. The controls run on WARP as `WILL_FAIL` tests and skip if a targeted case could not run. Unsynchronized concurrent CPU and GPU writes are outside the contract and not exercised. Textures, render targets and acceleration structures are outside this slice.
+
+#### A lease for committed XMem section pages (#1914)
+
+The in-process lease API requires version 1 and the exact output structure size. It clears a correctly sized output before checking the request. It checks the mirrored and CPU mappings under the XMem lock, accepts only committed pages backed by consecutive slots of one section, and duplicates the section handle within the caller's process. The caller maps the selected span with `MapViewOfFile` and opens that view with `OpenExistingHeapFromAddress`. The returned byte offset identifies the requested start inside the placed buffer. The lease holds the slots until the caller releases it after its last GPU fence. Freeing the original title grant is allowed after unmapping. Its slots stay out of the reuse pool until the lease retires.
+
+The fixture maps two pages from the shim's `SEC_RESERVE` pool and copies a 4 KiB span across their boundary. A GPU write appears in both title views. A second copy sees the original pages' late CPU updates after the title frees and remaps the same virtual addresses. Readback compares all 4,096 bytes and checks the replacement pages retain their own data. A later allocation gets the retired slot and sees zeroes. The checks also refuse holes, reversed section order, a CPU address passed to the mirrored address API, an invalid output size and a repeated release.
+
+Run `cmake --build --preset release --target xmem_section_lease_check` and `ctest --preset release --no-tests=error -R '^xmem_section_lease_' -V`. The tests report a capability skip (77) when the D3D12 device lacks existing heap support.
 
 #### Xbox frame events and token wait semantics (#874)
 

@@ -214,6 +214,7 @@ jobs:
             tests/startup_compute_request_offline_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
+            tests/startup_gfx2hlsl_loop_constants_check.py \
             tests/startup_gfx2hlsl_readfirstlane_recompute_check.py \
             tests/startup_gfx2hlsl_calculated_target_check.py \
             tests/startup_triage_run_check.py \

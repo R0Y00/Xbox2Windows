@@ -2191,7 +2191,12 @@ void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, co
         log("x2w-render root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)",
             parameter >= 16 || offset >= 8 ? "dropped" : "truncated", parameter, offset, count);
     if (parameter >= 16 || offset >= 8 || !count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
-    for (UINT i = 0; i < count && offset + i < 8; ++i) pass_of(self).constants[parameter][offset + i] = data[i];
+    Pass& pass = pass_of(self);
+    for (UINT i = 0; i < count && offset + i < 8; ++i) pass.constants[parameter][offset + i] = data[i];
+    if (pass.root && parameter < pass.root->size() &&
+        (*pass.root)[parameter].type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+        count <= 8 - offset && offset + count <= (*pass.root)[parameter].constants_count)
+        pass.constant_words_bound[parameter] |= static_cast<unsigned char>(((1u << count) - 1) << offset);
 }
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)

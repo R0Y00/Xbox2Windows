@@ -112,11 +112,18 @@ const char* const kind_names[kind_count] = {
 // state lives in front of the object, out of the title's reach, and the zero-filled area behind the
 // vtable pointer is sized per kind (64 KiB for command lists).
 struct Wrapper;
+struct RootParameter;
 enum class IndirectCommand { none, dispatch, draw, draw_indexed, dispatch_mesh };
 struct IndirectGraphicsPipeline {
     ID3D12RootSignature* root{};
     DXGI_FORMAT target_format{};
     bool mesh{};
+    bool cached_mesh{};
+    UINT cached_target_count{};
+    DXGI_FORMAT cached_targets[8]{};
+    DXGI_FORMAT cached_depth{};
+    bool cached_depth_writes{};
+    const std::vector<RootParameter>* guest_root_params{};
 };
 
 struct alignas(16) WrapperOwn {
@@ -148,6 +155,7 @@ struct alignas(16) WrapperOwn {
     ID3D12RootSignature* signature_root; // CommandSignature: desktop root of a Dispatch with root constants, or null
     UINT indirect_bytes; // CommandSignature: bytes one command reads (root constants plus the Dispatch record)
     IndirectGraphicsPipeline indirect_graphics;
+    u64 mesh86_key{};
     UINT list_node_mask;
     D3D12_QUERY_HEAP_DESC query_heap; // QueryHeap: the desc it was created with (device slot 39)
 };
@@ -1828,7 +1836,7 @@ bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_S
 
 constexpr std::size_t stream_sizes[23] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8, 48, 56, 24, 8, 8, 40, 8, 16, 8, 24, 8, 64, 24};
 
-enum class DxilMeshStage : unsigned { unknown = 0, mesh = 13, amplification = 14 };
+enum class DxilMeshStage : unsigned { pixel = 0, mesh = 13, amplification = 14, unknown = 0xffff };
 
 DxilMeshStage desktop_dxil_mesh_stage(const D3D12_SHADER_BYTECODE& code)
 {
@@ -1862,6 +1870,7 @@ DxilMeshStage desktop_dxil_mesh_stage(const D3D12_SHADER_BYTECODE& code)
             std::memcmp(data + program + 8 + bitcode, "BC\xc0\xde", 4)) return DxilMeshStage::unknown;
         const UINT version = word(program);
         if (((version >> 4) & 0xf) != 6) return DxilMeshStage::unknown;
+        if (version >> 16 == static_cast<UINT>(DxilMeshStage::pixel)) stage = DxilMeshStage::pixel;
         if (version >> 16 == static_cast<UINT>(DxilMeshStage::mesh)) stage = DxilMeshStage::mesh;
         if (version >> 16 == static_cast<UINT>(DxilMeshStage::amplification)) stage = DxilMeshStage::amplification;
     }
@@ -1876,8 +1885,10 @@ std::size_t desktop_stream_size(UINT type)
 
 // Converts the supported stream layout to desktop form and creates the pipeline.
 ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size,
-                                          bool& compute, IndirectGraphicsPipeline& graphics)
+                                          bool& compute, IndirectGraphicsPipeline& graphics,
+                                          ID3D12RootSignature* cached_root = nullptr)
 {
+    const bool cached_mesh = cached_root != nullptr;
     const std::size_t bytes = desc->SizeInBytes;
     if (bytes < 16 || bytes > 0x2000 || (bytes & 7) || !x2w_local::readable(desc->pPipelineStateSubobjectStream, bytes)) {
         std::snprintf(why, why_size, "stream not readable");
@@ -1893,6 +1904,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     D3D12_RT_FORMAT_ARRAY targets{};
     DXGI_FORMAT depth = DXGI_FORMAT_UNKNOWN;
     DXGI_SAMPLE_DESC samples{1, 0};
+    bool depth_enabled = false, depth_writes = false, untracked_depth_state = false;
     bool ok = true;
     // First pass: validate the layout and find the wrapped root signature.
     for (std::size_t offset = 0; offset < bytes;) {
@@ -1932,17 +1944,18 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         offset += size;
     }
     const bool empty_root = root && root->own().kind == root_signature_kind && root->own().root_without_bindings;
+    const bool native_mesh_root = empty_root || cached_mesh;
     for (std::size_t offset = 0; ok && offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
         if (type == 0) {
             u64& pointer = *reinterpret_cast<u64*>(stream + offset + 8);
-            pointer = unwrap(pointer);
+            pointer = cached_mesh ? reinterpret_cast<u64>(cached_root) : unwrap(pointer);
         } else if (type >= 1 && type <= 5) {
             const auto* code = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + offset + 8);
             if (code->pShaderBytecode) {
                 const bool is_vertex = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
                 bool supported = false;
-                if (empty_root && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+                if ((mesh ? native_mesh_root : empty_root) && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
                     // The native PSO validates the DXIL stages against the empty root.
                     supported = mesh ? !is_vertex && readable_shader_container(*code)
                         : desktop_indirect_graphics_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER);
@@ -1957,7 +1970,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
             }
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
             const auto* code = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + offset + 8);
-            if (!empty_root || !readable_shader_container(*code)) {
+            if (!native_mesh_root || !readable_shader_container(*code)) {
                 std::snprintf(why, why_size, "mesh stage needs desktop bytecode and an empty root signature");
                 ok = false;
                 break;
@@ -1984,15 +1997,33 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
             auto* format = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
             *format = desktop_format(*format);
             depth = *format;
+        } else if (cached_mesh && (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
+                                  type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)) {
+            D3D12_DEPTH_STENCIL_DESC1 state{};
+            const auto size = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ?
+                sizeof(D3D12_DEPTH_STENCIL_DESC) : sizeof(state);
+            std::memcpy(&state, stream + offset + sizeof(UINT), size);
+            depth_enabled = state.DepthEnable;
+            depth_writes = depth_enabled && state.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO;
+            untracked_depth_state = state.StencilEnable || state.DepthBoundsTestEnable;
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
             samples = *reinterpret_cast<const DXGI_SAMPLE_DESC*>(stream + offset + 4);
         }
         offset += desktop_stream_size(type);
     }
+    if (ok && cached_mesh && (untracked_depth_state || targets.NumRenderTargets > 8 ||
+        (pixel ? !targets.NumRenderTargets : targets.NumRenderTargets || !depth_enabled || !depth_writes) ||
+        (depth_enabled && depth == DXGI_FORMAT_UNKNOWN) ||
+        std::any_of(targets.RTFormats, targets.RTFormats + std::min<UINT>(targets.NumRenderTargets, 8),
+            [](DXGI_FORMAT value) { return value == DXGI_FORMAT_UNKNOWN; }))) {
+        std::snprintf(why, why_size, "cached mesh needs tracked color attachments or writable depth-only state");
+        ok = false;
+    }
     if (ok && (vertex || pixel || mesh || amplification) &&
-        ((!vertex && !mesh) || (amplification && !mesh) || !pixel || compute || input_layout ||
+        ((!vertex && !mesh) || (amplification && !mesh) || (!pixel && !cached_mesh) || compute || input_layout ||
          topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
-         targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN || depth != DXGI_FORMAT_UNKNOWN ||
+         (!cached_mesh && (targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN ||
+                           depth != DXGI_FORMAT_UNKNOWN)) ||
          samples.Count != 1 || samples.Quality)) {
         std::snprintf(why, why_size, "desktop indirect graphics stream needs VS/PS or MS/PS, triangles, one single-sample target and no vertex layout or depth");
         ok = false;
@@ -2016,8 +2047,17 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         }
         check_device("Device CreatePipelineState", 86);
     }
-    if (pipeline && (vertex || mesh) && pixel)
-        graphics = {static_cast<ID3D12RootSignature*>(root->own().real), targets.RTFormats[0], mesh};
+    if (pipeline && (vertex || mesh) && (pixel || cached_mesh)) {
+        graphics = {cached_mesh ? cached_root : static_cast<ID3D12RootSignature*>(root->own().real),
+            targets.RTFormats[0], mesh, cached_mesh};
+        if (cached_mesh) {
+            graphics.cached_target_count = targets.NumRenderTargets;
+            std::copy_n(targets.RTFormats, targets.NumRenderTargets, graphics.cached_targets);
+            graphics.cached_depth = depth;
+            graphics.cached_depth_writes = depth_writes;
+            graphics.guest_root_params = root_info(root);
+        }
+    }
     return pipeline;
 }
 
@@ -2128,11 +2168,14 @@ struct Pass {
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
+    unsigned char constant_words_bound[16] = {};
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    bool targets_single_sample = false;
+    bool depth_view_writable = false;
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
@@ -2473,19 +2516,41 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 pass.requested_pipeline = pass.pipeline;
                 request_translation(pass.pipeline);
             }
+            if (mesh && pass.pipeline && pass.pipeline->own().mesh86_key) {
+                static LONG mesh_cache_refusals;
+                if (first_calls(mesh_cache_refusals, 16))
+                    log("x2w-render slot86 mesh %016llx: no matching desktop pipeline/root for indirect execution",
+                        pass.pipeline->own().mesh86_key);
+            }
             return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root",
                           indirect_graphics_pipeline);
         }
-        if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
+        if (pass.indirect_graphics.cached_mesh) {
+            const auto& pso = pass.indirect_graphics;
+            if (!pass.targets_bound || !pass.viewport_set || !pass.scissor_set || !pass.targets_single_sample ||
+                pass.target_count != pso.cached_target_count || pass.dsv_format != pso.cached_depth ||
+                (pso.cached_depth_writes && !pass.depth_view_writable) ||
+                !std::equal(pso.cached_targets, pso.cached_targets + pso.cached_target_count, pass.target_formats))
+                return refuse("cached mesh requires matching color and depth attachments, viewport and scissor");
+            if (!pass.root || pass.root != pso.guest_root_params || pass.root_heap_flags)
+                return refuse("cached mesh requires a recorded root without heap indexing", indirect_graphics_pipeline);
+            for (std::size_t i = 0; i < pass.root->size(); ++i) {
+                const auto mask = (1u << (*pass.root)[i].constants_count) - 1;
+                if ((pass.constant_words_bound[i] & mask) != mask)
+                    return refuse("cached mesh root constants are incomplete", indirect_graphics_pipeline);
+            }
+        } else if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
             return refuse("indirect graphics requires one matching target, viewport and scissor");
         if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
             !(translated && indexed && pass.topology == 0x11))
             return refuse("indirect draw requires triangle-list topology or a translated indexed rectangle");
-        const auto samples = pass.target0->GetDesc().SampleDesc;
-        if (samples.Count != 1 || samples.Quality)
-            return refuse("draw requires a single-sample render target");
+        if (!pass.indirect_graphics.cached_mesh) {
+            const auto samples = pass.target0->GetDesc().SampleDesc;
+            if (samples.Count != 1 || samples.Quality)
+                return refuse("draw requires a single-sample render target");
+        }
     } else if (!pass.compute_pipeline || !pass.compute_root) {
         return refuse("requires a desktop compute pipeline and root", indirect_compute_pipeline);
     } else if (sig->own().signature_root && sig->own().signature_root != pass.compute_root) {
@@ -2558,6 +2623,9 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
+        if (pass.indirect_graphics.cached_mesh)
+            for (UINT i = 0; i < pass.root->size(); ++i)
+                list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants[i], 0);
     }
     ID3D12Resource* counts = nullptr;
     if (count_buffer) {
@@ -2597,6 +2665,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
         for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
         std::memset(pass.constants, 0, sizeof(pass.constants));
+        std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
     pass.root = params;
     pass.srv_bound = 0;
@@ -2715,6 +2784,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     pass.targets_bound = false;
+    pass.targets_single_sample = false;
+    pass.depth_view_writable = false;
     pass.target_count = 0;
     pass.target0 = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
@@ -2811,6 +2882,13 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     if (dsv_target) require_state(self, dsv_target, dsv_state);
     pass.target_count = count;
     pass.dsv_format = dsv_format;
+    const auto single_sample = [](ID3D12Resource* resource) {
+        const auto samples = resource->GetDesc().SampleDesc;
+        return samples.Count == 1 && !samples.Quality;
+    };
+    pass.targets_single_sample = std::all_of(targets, targets + count, single_sample) &&
+        (!dsv_target || single_sample(dsv_target));
+    pass.depth_view_writable = dsv_target && dsv_state == D3D12_RESOURCE_STATE_DEPTH_WRITE;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
     InterlockedIncrement(&render_target_binds);
@@ -2954,6 +3032,7 @@ std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_draw.inl"
+#include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
@@ -3874,12 +3953,16 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool compute = false;
     IndirectGraphicsPipeline graphics;
+    u64 mesh86_key = 0;
     if (render_mode()) {
         char why[256] = "";
         // Recognized desktop stages must reach the native path before the
         // guest cache creates a pending translation for any DXBC container.
         real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics);
-        if (!real_pipeline || graphics.root)
+        bool mesh_cache_request = false;
+        if (!real_pipeline)
+            real_pipeline = try_cached_mesh86(*desc, why, sizeof(why), graphics, mesh_cache_request, mesh86_key);
+        if (!mesh_cache_request && (!real_pipeline || graphics.root))
             translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
         static LONG built;
         if ((real_pipeline || !translation) && first_calls(built, 24))
@@ -3888,6 +3971,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     *out = wrap(real_pipeline, pipeline_kind);
     static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
     static_cast<Wrapper*>(*out)->own().indirect_graphics = graphics;
+    static_cast<Wrapper*>(*out)->own().mesh86_key = mesh86_key;
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
                   translation, translation && has_blend ? &blend : nullptr,
                   translation && has_depth_stencil ? &depth_stencil : nullptr,

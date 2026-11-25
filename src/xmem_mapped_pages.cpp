@@ -4,6 +4,7 @@
 
 #include "era_physical.h"
 #include "xmem_slab_slots.h"
+#include "xmem_section_lease.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,9 @@ struct Backing {
     bool committed = true;  // false while a lazily mapped slot is untouched (X2W_XMEM_LAZY_COMMIT)
 };
 
+using Slot = std::pair<std::size_t, ULONG64>;
+struct SlotPin { unsigned references{}; bool retired{}; };
+
 // Keep grant transitions and section views serialized. A grant can outlive all its
 // views so its bytes survive unmapping. Its backing is released before reuse.
 struct PhysicalMemory {
@@ -45,6 +49,11 @@ struct PhysicalMemory {
     // The slabs and their 64 KiB slots; released slots are reused lowest first, so that pages reused together
     // are adjacent slots again.
     x2w_xmem::SlabSlots<HANDLE> slots{era_physical::page_bytes};
+    // A grant may be freed after unmapping while a submitted GPU operation
+    // still uses the section. Keep those slots out of the reusable pool.
+    std::map<Slot, SlotPin> pins;
+    std::map<ULONG64, std::vector<Slot>> leases;
+    ULONG64 next_lease = 1;
 
     ~PhysicalMemory()
     {
@@ -57,6 +66,15 @@ struct PhysicalMemory {
 
 PhysicalMemory memory;
 constexpr SIZE_T page_bytes = era_physical::page_bytes;
+
+// Caller holds memory.mutex.
+void unpin_slot(const Slot& slot)
+{
+    const auto found = memory.pins.find(slot);
+    if (--found->second.references) return;
+    if (found->second.retired) memory.slots.release(slot.first, slot.second);
+    memory.pins.erase(found);
+}
 
 BOOL physical_result(era_physical::Status status) noexcept
 {
@@ -980,7 +998,11 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
             if (backing != memory.backings.end()) {
-                memory.slots.release(backing->second.slab, backing->second.offset);
+                const Slot slot{backing->second.slab, backing->second.offset};
+                if (const auto pin = memory.pins.find(slot); pin != memory.pins.end())
+                    pin->second.retired = true;
+                else
+                    memory.slots.release(slot.first, slot.second);
                 memory.backings.erase(backing);
             }
         }
@@ -988,6 +1010,75 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
     return physical_result(status);
 }
 }  // namespace
+
+// The view is a dense range of committed slots in one section. A caller can
+// map it as a separate view at section_offset and open that address as a heap.
+extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, SIZE_T length,
+                                              X2WXMemSectionLease* out, SIZE_T bytes)
+{
+    if (!out || bytes != sizeof(*out)) return FALSE;
+    *out = {};
+    if (version != x2w_xmem_section_lease_version) return FALSE;
+    constexpr SIZE_T max_pages = 64;
+    if (!length || length > max_pages * page_bytes || address > UINT64_MAX - length) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    if (!memory.mirror_gpu || address < memory.mirror_gpu || !memory.next_lease) return FALSE;
+    const auto offset = address - memory.mirror_gpu;
+    if (offset >= memory.mirror_bytes || length > memory.mirror_bytes - offset) return FALSE;
+    const auto first = address & ~(page_bytes - 1);
+    const auto first_byte = address - first;
+    const auto count = (first_byte + length + page_bytes - 1) / page_bytes;
+    if (count > max_pages) return FALSE;
+    std::vector<Slot> selected;
+    std::size_t pinned = 0;
+    HANDLE section = nullptr, duplicate = nullptr;
+    try {
+        selected.reserve(count);
+        for (SIZE_T i = 0; i < count; ++i) {
+            const auto page = first + i * page_bytes;
+            const auto mirror = memory.views.find(page);
+            const auto cpu = memory.views.find(memory.mirror_cpu + (page - memory.mirror_gpu));
+            if (mirror == memory.views.end() || cpu == memory.views.end() || cpu->second != mirror->second)
+                return FALSE;
+            const auto backing = memory.backings.find(mirror->second);
+            if (backing == memory.backings.end() || !backing->second.committed) return FALSE;
+            const auto& slot = backing->second;
+            if (selected.empty())
+                section = slot.section;
+            else if (slot.section != section || slot.slab != selected.front().first ||
+                     slot.offset != selected.front().second + i * page_bytes)
+                return FALSE;
+            selected.emplace_back(slot.slab, slot.offset);
+        }
+        if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE,
+                             DUPLICATE_SAME_ACCESS))
+            return FALSE;
+        for (const auto& slot : selected) {
+            ++memory.pins[slot].references;
+            ++pinned;
+        }
+        const auto lease = memory.next_lease;
+        memory.leases.emplace(lease, selected);
+        ++memory.next_lease;
+        *out = {duplicate, lease, selected.front().second, count * page_bytes, first_byte};
+        return TRUE;
+    } catch (const std::bad_alloc&) {
+        if (duplicate) CloseHandle(duplicate);
+        for (std::size_t i = 0; i < pinned; ++i) unpin_slot(selected[i]);
+        return FALSE;
+    }
+}
+
+extern "C" BOOL WINAPI x2w_xmem_release_section(UINT version, ULONG64 lease)
+{
+    if (version != x2w_xmem_section_lease_version) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    const auto found = memory.leases.find(lease);
+    if (found == memory.leases.end()) return FALSE;
+    for (const auto& slot : found->second) unpin_slot(slot);
+    memory.leases.erase(found);
+    return TRUE;
+}
 
 // Experimental export: one snapshot of the physical-page accounting for the startup heartbeat
 // (#1199). A page gets a 64 KiB slot of a shared slab on first use, by a mapping or by a page-token write, and
