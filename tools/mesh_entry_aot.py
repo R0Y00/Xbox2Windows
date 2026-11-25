@@ -635,7 +635,7 @@ class Wave:
                     and self.vcc is None
                 ):
                     raise ValueError("Undefined branch predicate")
-                if op not in ("s_branch", "s_cbranch_scc0", "s_cbranch_execz", "s_cbranch_vccnz"):
+                if op not in ("s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_execz", "s_cbranch_vccnz"):
                     raise ValueError(f"Unsupported mesh branch {op}")
                 take = {
                     "s_branch": True,
