@@ -273,7 +273,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
         return true;
     }
     const std::size_t groups = constants ? 3 : 1;
-    const std::size_t sum = groups + 3;
+    const std::size_t sum = expected.size() - 2;
     const std::uint32_t scale = constants ? expected[1] : 1;
     const std::uint32_t bias = constants ? expected[2] : 0;
     if (rejection == Rejection::none) {
@@ -303,7 +303,7 @@ int main(int argc, char** argv) try
     constants = argc == 3 && std::strcmp(argv[2], "constants") == 0;
     counted = argc == 3 && std::strcmp(argv[2], "count") == 0;
     if (argc > 3 || (argc == 3 && !constants && !counted)) return 2;
-    initial = counted ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x31415926, 0x5a5a5a5a} : constants ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 0x31415926, 0x5a5a5a5a}
+    initial = counted ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x31415926, 0x5a5a5a5a} : constants ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 3, 5, 1, 1, 1, 0x31415926, 0x5a5a5a5a}
                         : Words{0xa5a5a5a5, 0, 0, 0, 0x31415926, 0x5a5a5a5a};
     argument_bytes = static_cast<UINT>((initial.size() - 2) * sizeof(std::uint32_t));
     ComPtr<ID3D12Debug> debug;
