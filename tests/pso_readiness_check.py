@@ -170,7 +170,8 @@ def check_mesh():
         assert row["shaders"]["mesh"]["detail"] == "Unsupported scalar instruction s_getpc_b64", row
         assert row["status"] == "blocked" and unknown["status"] == "blocked", (row, unknown)
         # An error the lowering did not anticipate must not abort the whole report.
-        with patch("mesh_entry_aot.lower", side_effect=IndexError("operand")):
+        with patch("pixel_aot.disassemble", return_value=[(0, "s_getpc_b64 s[0:1]")]), \
+                patch("mesh_entry_aot.lower", side_effect=IndexError("operand")):
             row, unknown = report(manifest, pipelines, root, "test-llvm")["pipelines"]
         assert row["shaders"]["mesh"]["detail"] == "lowering failed unexpectedly: IndexError", row
         assert row["status"] == "blocked" and unknown["status"] == "blocked", (row, unknown)
