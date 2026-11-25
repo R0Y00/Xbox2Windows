@@ -5103,24 +5103,26 @@ A load is **refused**, and the whole dispatch leaves u0 unwritten as for an inva
 - the slot is not below `COUNT`;
 - the record state is not 1 (never written, or released);
 - the stride is zero;
+- the base, the stride or the instruction offset is not a multiple of four (the DWORD load of the decoder needs an aligned address);
 - the format is unknown, or its channel count differs from the opcode.
 
 A load on a live view whose element does not exist **reads zero** and stays valid (zero data from a valid read is distinguishable from a refusal). That is the case when:
 - the index is not below `num_records`;
 - the opcode needs more bytes than one stride;
-- the element would leave the `BUFFER_BYTES` of t0.
+- the element would leave the `BUFFER_BYTES` of t0. The bound is derived from the buffer length and the stride (`index <= (BUFFER_BYTES - base) / stride`), so it holds for any index a dispatch can reach and the product `index * stride` cannot wrap.
 
 Refused: `d16_` forms, `offen`, gfx1030, `--source-stride` and `--source-format` with this flag.
 
 What is not done here: the records live in the t0 buffer, as a side table; binding them as their own resource and reaching the desktop view through `ResourceDescriptorHeap[index]` (SM 6.6) needs a heap-indexed root signature and is still open. This is not application coverage until a real dispatch uses it.
 
-The fixtures use a group of four, two groups and 8 threads. Each opcode width (`xy`, `xyzw`) has a table of eleven records, ten declared:
+The fixtures use a group of four, two groups and 8 threads. Each opcode width (`xy`, `xyzw`) has a table of thirteen records, twelve declared:
 - a whole-range view, one with an index past `num_records`, one with a legacy format word and a smaller stride;
 - a stride too small for the opcode, a view whose end leaves the buffer;
 - a view that is not live, a zero stride, an unknown format, a format of the other channel count and a released view;
+- a base that is not DWORD aligned and a stride that is not DWORD aligned;
 - a valid record past the declared count.
 
-Every slot and one slot past the records are dispatched on WARP and the hardware adapter for one and two groups, and compared word for word with a Python model that reads the views from the case words. Zero words against a refused slot must fail. Three references must fail too: no `num_records` bound, a fixed 16-byte stride and out-of-range threads left unwritten. So must eleven mutated sources: `num_records`, the stride, the opcode-versus-stride check, the liveness check, the released state, the zero stride, the buffer end, the table count, the view base, the zero result and the refusal.
+Every slot and one slot past the records are dispatched on WARP and the hardware adapter for one and two groups, and compared word for word with a Python model that reads the views from the case words. Zero words against a refused slot must fail. Three references must fail too: no `num_records` bound, a fixed 16-byte stride and out-of-range threads left unwritten. So must thirteen mutated sources: `num_records`, the stride, the opcode-versus-stride check, the liveness check, the released state, the zero stride, the buffer end, the table count, the base and stride alignment checks, the view base, the zero result and the refusal. The fixture buffer is 1280 bytes, so no dispatch reaches an index of 2^18; the overflow-safe bound is checked in the controls on the generated source only.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check

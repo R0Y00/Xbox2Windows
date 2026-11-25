@@ -614,7 +614,7 @@ def heap_view_hlsl(table_offset, view_count, buffer_bytes):
     then three reserved words. Words 1 to 3 follow the GFX10 V# layout of the public LLVM AMDGPU
     documentation and Mesa's ac_build_buffer_descriptor; the record around them is this project's own.
 
-    load_heap_view_format sets valid to false, and returns zeros, for a slot beyond the table, a record that is not live, a zero stride or an unhandled format. lower() makes an
+    load_heap_view_format sets valid to false, and returns zeros, for a slot beyond the table, a record that is not live, a zero stride, a base, stride or instruction offset that is not DWORD aligned, or an unhandled format. lower() makes an
     invalid load suppress every store, as for the constant format word. A live view whose index is not below
     num_records, whose opcode needs more than one stride, or whose bytes leave the buffer_bytes of t0, reads as zero
     and stays valid: the buffer-format unit's out-of-range result is zero (RDNA 2 ISA, buffer addressing).
@@ -630,12 +630,14 @@ def heap_view_hlsl(table_offset, view_count, buffer_bytes):
         "    uint4 v = inputData.Load4(record);\n"
         "    uint stride = (v.y >> 16u) & 0x3fffu;\n"
         "    if (stride == 0u) return zero;\n"
-        "    bool inRange = index < v.z && index < 0x40000u && instOffset + 4u * channels <= stride && v.x <= length;\n"
+        "    if (((v.x | stride | instOffset) & 3u) != 0u) return zero;\n"
+        "    bool inRange = index < v.z && instOffset + 4u * channels <= stride && v.x <= length;\n"
         "    uint addr = 0u;\n"
         "    if (inRange) {\n"
         "        uint left = length - v.x;\n"
-        "        uint start = index * stride;\n"
-        "        inRange = start <= left && instOffset + 4u * channels <= left - start;\n"
+        "        inRange = index <= left / stride;\n"
+        "        uint start = inRange ? index * stride : 0u;\n"
+        "        inRange = inRange && instOffset + 4u * channels <= left - start;\n"
         "        addr = v.x + start + instOffset;\n"
         "    }\n"
         "    uint4 r = load_descriptor_format(v.w, inRange ? addr : 0u, channels, valid);\n"

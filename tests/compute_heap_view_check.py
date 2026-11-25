@@ -20,13 +20,13 @@ GROUP = (4, 1, 1)
 THREADS = 8
 OUTPUT_STRIDE = 16
 WORDS = 320
-TABLE = 896                 # byte offset of the view records inside t0
+TABLE = 576                 # byte offset of the view records inside t0
 RECORD = aot.HEAP_VIEW_RECORD_BYTES
 LIVE = aot.HEAP_VIEW_LIVE
 MASK = 0xffffffff
 IDENTITY_UNKNOWN = aot.DESCRIPTOR_GFX10_FIXED | (2 << 12)   # 8_SNORM: not handled
 # One view: label, format word, base byte, stride, num_records, state. The format code is 0 for a raw word.
-# The xy and xyzw fixtures each have a table of ten views; SLOTS lists the slot each dispatch reads.
+# The xy and xyzw fixtures each have a table of twelve views; SLOTS lists the slot each dispatch reads.
 
 
 
@@ -49,6 +49,8 @@ XY_VIEWS = (
     view("four-channel format under an xy opcode", 56, 0, 16, 8),
     view("view end leaves the buffer", 23, 1260, 16, 8),
     view("view released (stale state)", 23, 0, 16, 8, state=2),
+    view("base not DWORD aligned", 23, 2, 16, 8),
+    view("stride not DWORD aligned", 23, 0, 18, 8),
     view("good view past the declared table count", 23, 0, 16, 8),
 )
 XYZW_VIEWS = (
@@ -62,13 +64,15 @@ XYZW_VIEWS = (
     view("stride 12 holds less than the opcode reads", 56, 0, 12, 8),
     view("view end leaves the buffer", 56, 1260, 16, 8),
     view("view released (stale state)", 56, 0, 16, 8, state=2),
+    view("base not DWORD aligned", 56, 2, 16, 8),
+    view("stride not DWORD aligned", 56, 0, 18, 8),
     view("good view past the declared table count", 56, 0, 16, 8),
 )
 SUFFIXES = {"xy": XY_VIEWS, "xyzw": XYZW_VIEWS}
 CHANNELS = {"xy": 2, "xyzw": 4}
 # slot -> "ok": results published (zeros where out of range), "refused": u0 untouched.
-REFUSED = {"xy": {4, 5, 6, 7, 9, 10}, "xyzw": {3, 4, 5, 6, 9, 10}}
-DECLARED = 10               # views the heap_view binding declares; the last record in the table is past it
+REFUSED = {"xy": {4, 5, 6, 7, 9, 10, 11, 12}, "xyzw": {3, 4, 5, 6, 9, 10, 11, 12}}
+DECLARED = 12               # views the heap_view binding declares; the last record in the table is past it
 
 
 def source_words(views):
@@ -169,8 +173,9 @@ def controls():
         store = next(i for i, line in enumerate(lines) if "outputData.Store" in line)
         assert lines.index(call) < lines.index("    if (!(format_valid_0)) return;") < store
         assert "uint4 load_descriptor_format(" in source and "load_descriptor_format(v.w," in source
-        assert f"uint record = {TABLE}u + slot * 32u;" in source and "if (slot >= 10u) return zero;" in source and "const uint length = 1280u;" in source
+        assert f"uint record = {TABLE}u + slot * 32u;" in source and "if (slot >= 12u) return zero;" in source and "const uint length = 1280u;" in source
         assert "inputData.Load(record + 16u) != 1u" in source
+        assert "0x40000u" not in source and "index <= left / stride" in source
     xy_lines, _ = PROGRAMS["xy"]
     load = "buffer_load_format_xy v[10:11], v8, s[40:43], 0 idxen"
     assert load in xy_lines
@@ -185,19 +190,19 @@ def controls():
         ("Unsupported formatted buffer read target or address mode",
          base.variant(xy_lines, (load, load.replace(" idxen", ""))), {}),
         ("Heap view slot constant is not ready", xy_lines[:wait] + xy_lines[wait + 1:], {}),
-        ("Heap view slot constant is not ready", None, dict(heap_view=(15, TABLE, 10, 1280))),
+        ("Heap view slot constant is not ready", None, dict(heap_view=(15, TABLE, 12, 1280))),
         ("Unused heap view binding", base.variant(xy_lines, (load, "v_mov_b32_e32 v10, 0"),
                                                   ("buffer_store_dwordx2 v[10:11]", "buffer_store_dword v10")), {}),
         ("Invalid heap view binding", None, dict(cpu="gfx1030")),
         ("Invalid heap view binding", None, dict(source_stride=16)),
         ("Invalid heap view binding", None, dict(constant_descriptor=None)),
         ("Invalid buffer load format constant", None, dict(load_format_constant=(0,))),
-        ("Invalid heap view binding", None, dict(heap_view=(16, TABLE, 10, 1280))),
+        ("Invalid heap view binding", None, dict(heap_view=(16, TABLE, 12, 1280))),
         ("Invalid heap view binding", None, dict(heap_view=(0, TABLE + 2, 10, 1280))),
         ("Invalid heap view binding", None, dict(heap_view=(0, TABLE, 0, 1280))),
         ("Invalid heap view binding", None, dict(heap_view=(0, TABLE, aot.HEAP_VIEW_MAX + 1, 1280))),
-        ("Invalid heap view binding", None, dict(heap_view=(0, TABLE, 10, 1279))),
-        ("Invalid heap view binding", None, dict(heap_view=(0, TABLE, 13, 1280))),
+        ("Invalid heap view binding", None, dict(heap_view=(0, TABLE, 12, 1279))),
+        ("Invalid heap view binding", None, dict(heap_view=(0, TABLE, 23, 1280))),
         ("Invalid heap view binding", None, dict(heap_view=(0, TABLE))),
         ("Unsupported store address", base.variant(xy_lines, (", v8, s[20:23], 0 idxen", ", v10, s[20:23], 0 idxen")), {}),
     ):
@@ -232,7 +237,9 @@ MUTATIONS = (
     ("zero stride accepted", "    if (stride == 0u) return zero;\n", "", ("xy", 5)),
     ("buffer end ignored", "inRange = start <= left && instOffset + 4u * channels <= left - start;",
      "inRange = true;", ("xy", 8)),
-    ("slot past the table accepted", "    if (slot >= 10u) return zero;\n", "", ("xy", 10)),
+    ("slot past the table accepted", "    if (slot >= 12u) return zero;\n", "", ("xy", 12)),
+    ("misaligned base or stride accepted", "    if (((v.x | stride | instOffset) & 3u) != 0u) return zero;\n", "", ("xy", 10)),
+    ("stride alignment not checked", "(v.x | stride | instOffset)", "(v.x | instOffset)", ("xy", 11)),
     ("base ignored", "addr = v.x + start + instOffset;", "addr = start + instOffset;", ("xy", 1)),
     ("out of range leaves the stale word", "return inRange ? r : zero;", "return r;", ("xy", 1)),
     ("invalid loads still store", "    if (!(format_valid_0)) return;\n", "", ("xy", 6)),
@@ -272,7 +279,7 @@ def draw(directory, compiler, renderer, backend):
             print(f"{NAME}: {suffix} slot {slot} {'refused' if slot in REFUSED[suffix] or slot >= len(views) else 'read'}"
                   f" ({label})", flush=True)
     # A refusal must stay distinguishable from a published zero read: zeros against a refused slot must fail.
-    for suffix, slot in (("xy", 4), ("xy", 10), ("xyzw", 3)):
+    for suffix, slot in (("xy", 4), ("xy", 10), ("xy", 11), ("xyzw", 3)):
         words = source_words(SUFFIXES[suffix])
         zeros = [0] * WORDS
         write(suffix, slot, 2, zeros)
