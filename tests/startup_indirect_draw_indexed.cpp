@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -252,7 +253,7 @@ Method slot(IUnknown* object, unsigned index)
 }
 
 template <typename T>
-ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* object)
+ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* object, bool allow_missing = false)
 {
     // The guest forwards SetPrivateDataInterface with the underlying desktop argument.
     constexpr GUID key{0x18097577, 0x0a4a, 0x427c, {0xac, 0xd5, 0xac, 0x1d, 0x98, 0x90, 0x65, 0x85}};
@@ -261,6 +262,7 @@ ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* obj
     UINT bytes = sizeof(IUnknown*);
     const HRESULT read = device->GetPrivateData(key, &bytes, stored.GetAddressOf());
     check(guest->SetPrivateDataInterface(key, nullptr), "clear underlying object");
+    if (allow_missing && (read == DXGI_ERROR_NOT_FOUND || (SUCCEEDED(read) && !stored))) return {};
     check(read, "retrieve underlying object");
     ComPtr<T> result;
     check(stored.As(&result), "query underlying object");
@@ -356,24 +358,31 @@ struct alignas(void*) Subobject {
     T value{};
 };
 
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage>
+enum class StreamDepth { none, writable, read_only };
+
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage, bool CacheControl = false>
 ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
                                D3D12_SHADER_BYTECODE source, D3D12_SHADER_BYTECODE pixel,
-                               D3D12_SHADER_BYTECODE amplification = {}, UINT targets = 1, bool depth_only = false)
+                               D3D12_SHADER_BYTECODE amplification = {}, UINT targets = 1, StreamDepth depth = StreamDepth::none)
 {
+    using Depth = std::conditional_t<CacheControl, D3D12_DEPTH_STENCIL_DESC1, D3D12_DEPTH_STENCIL_DESC>;
+    constexpr auto depth_type = CacheControl ? D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
+                                             : D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
     struct {
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
         Subobject<Stage, D3D12_SHADER_BYTECODE> source;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
-        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+        Subobject<depth_type, Depth> depth;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
     } stream;
-    static_assert(sizeof(stream) == 16 + 24 + 24 + 48 + 56 + 8 + 40 + 16 + 8 + 24);
+    static_assert(offsetof(decltype(stream), as) == 16 + 24 + 24 + 48 + (CacheControl ? 64 : 56) + 8 + 40 + 16 + 8);
     stream.root.value = root;
     stream.source.value = source;
     stream.ps.value = pixel;
@@ -382,9 +391,10 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
     stream.raster.value.DepthClipEnable = TRUE;
     stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    if (depth_only) {
+    if (depth != StreamDepth::none) {
         stream.depth.value.DepthEnable = TRUE;
-        stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        if (depth == StreamDepth::writable)
+            stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         stream.dsv.value = DXGI_FORMAT_D16_UNORM;
     }
@@ -393,12 +403,40 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
     stream.targets.value.NumRenderTargets = targets;
     stream.samples.value.Count = 1;
     stream.as.value = amplification;
-    const D3D12_PIPELINE_STATE_STREAM_DESC desc{
-        amplification.pShaderBytecode ? sizeof(stream) : sizeof(stream) - sizeof(stream.as), &stream};
     using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     ComPtr<IUnknown> result;
-    check(slot<Create>(guest, 86)(guest, &desc, __uuidof(ID3D12PipelineState),
-                                 reinterpret_cast<void**>(result.GetAddressOf())), "create guest graphics pipeline");
+    const auto create = [&](void* bytes, std::size_t size) {
+        const D3D12_PIPELINE_STATE_STREAM_DESC desc{size, bytes};
+        check(slot<Create>(guest, 86)(guest, &desc, __uuidof(ID3D12PipelineState),
+                                     reinterpret_cast<void**>(result.GetAddressOf())), "create guest graphics pipeline");
+    };
+    if constexpr (CacheControl) {
+        constexpr auto masks = offsetof(Depth, StencilWriteMask) + 1;
+        constexpr auto faces = offsetof(Depth, FrontFace);
+        constexpr auto write_mask = offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1;
+        const int padding = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_PADDING", nullptr, 0) ? 0xa5 : 0;
+        std::memset(reinterpret_cast<unsigned char*>(&stream.depth.value) + masks, padding, faces - masks);
+        for (auto& blend : stream.blend.value.RenderTarget) {
+            blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+            blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+            blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            std::memset(reinterpret_cast<unsigned char*>(&blend) + write_mask, padding, sizeof(blend) - write_mask);
+        }
+        stream.sample_mask.value = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_SAMPLE_MASK", nullptr, 0)
+            ? UINT_MAX ^ 1u : UINT_MAX;
+
+        // Omit the amplification record from this cache profile.
+        constexpr auto prefix = offsetof(decltype(stream), as);
+        constexpr auto suffix = offsetof(decltype(stream), blend);
+        alignas(void*) std::array<unsigned char, sizeof(stream) - sizeof(stream.as)> bytes;
+        std::memcpy(bytes.data(), &stream, prefix);
+        std::memcpy(bytes.data() + prefix, &stream.blend, sizeof(stream) - suffix);
+        create(bytes.data(), bytes.size());
+    } else {
+        create(&stream, amplification.pShaderBytecode ? offsetof(decltype(stream), blend) : offsetof(decltype(stream), as));
+    }
     return result;
 }
 
@@ -680,7 +718,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false)
 {
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
@@ -1128,10 +1166,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * pixel_bytes,
                             pixel_bytes);
                 const bool right_half = x >= width / 2;
-                const bool covered = cached_depth_only || (indexed ? right_half == draw_right : translated || !right_half || draw_right);
+                const bool covered = (cached_depth_only && !cached_depth_pixel) ||
+                    (indexed ? right_half == draw_right : translated || !right_half || draw_right);
                 const bool drawn = writer && refusal == Refusal::none && covered;  // overflowing_count draws nothing
                 const std::uint32_t background = cached_depth_only ? 0xffff : black;
-                auto wanted = drawn ? (cached_depth_only ? 0u :
+                const auto depth_word = cached_depth_pixel ? 0x4000u : 0u; // D16_UNORM encodes SV_Depth 0.25.
+                auto wanted = drawn ? (cached_depth_only ? depth_word :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
                 if (leased) wanted = right_half ? leased->expected_right.value_or(leased->expected) : leased->expected;
                 if (rect) {
@@ -1278,6 +1318,98 @@ bool check_translated_refusal_census(const std::wstring& log_path)
     for (const auto& line : entries) std::printf("%s\n", line.c_str());
     return true;
 }
+
+bool check_indirect_other_refusal_census(const std::wstring& log_path)
+{
+    const std::size_t needed = x2w_d3d12_census_report(nullptr, 0);
+    std::string report(needed + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    report.resize(std::strlen(report.c_str()));
+    std::string summary;
+    std::vector<std::string> entries;
+    bool saw_indirect_draw = false;
+    std::size_t pos = 0;
+    while (pos < report.size()) {
+        std::size_t end = report.find('\n', pos);
+        if (end == std::string::npos) end = report.size();
+        std::string line = report.substr(pos, end - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("x2w-d3d12 indirect-other refusals:", 0) == 0) summary = line;
+        else if (line.rfind("x2w-d3d12 indirect-other refusal ", 0) == 0) entries.push_back(line);
+        else if (line.rfind("x2w-d3d12 indirect-draw refusal", 0) == 0) saw_indirect_draw = true;
+        pos = end + 1;
+    }
+    if (saw_indirect_draw) {
+        std::fprintf(stderr, "indirect-other refusal census saw unexpected indirect-draw refusal lines\n");
+        return false;
+    }
+    const std::string expected =
+        "x2w-d3d12 indirect-other refusals: total 4; distinct keys 2, distinct pairs 3 (overflow calls 0)";
+    if (summary != expected) {
+        std::fprintf(stderr, "indirect-other refusal census mismatch:\n  got      '%s'\n  expected '%s'\n",
+                     summary.c_str(), expected.c_str());
+        return false;
+    }
+    if (entries.size() != 3) {
+        std::fprintf(stderr, "indirect-other refusal census expected 3 detail lines, got %zu\n", entries.size());
+        return false;
+    }
+    struct ParsedEntry {
+        unsigned index = 0;
+        std::string key;
+        std::string reason;
+        unsigned long long calls = 0;
+    };
+    std::vector<ParsedEntry> parsed;
+    for (const auto& line : entries) {
+        unsigned index = 0;
+        char key[32]{};
+        char reason[64]{};
+        unsigned long long calls = 0;
+        if (std::sscanf(line.c_str(), "x2w-d3d12 indirect-other refusal %u: key=%16[0-9a-f] reason=%63s calls=%llu",
+                        &index, key, reason, &calls) != 4 || std::strlen(key) != 16) {
+            std::fprintf(stderr, "malformed indirect-other refusal detail line: '%s'\n", line.c_str());
+            return false;
+        }
+        parsed.push_back({index, key, reason, calls});
+    }
+    const std::string zero_key = "0000000000000000";
+    const bool entries_ok =
+        parsed[0].index == 1 && parsed[0].key != zero_key &&
+        parsed[0].reason == "missing_viewport_or_scissor" && parsed[0].calls == 2 &&
+        parsed[1].index == 2 && parsed[1].key == parsed[0].key &&
+        parsed[1].reason == "argument_outside_placed_buffer" && parsed[1].calls == 1 &&
+        parsed[2].index == 3 && parsed[2].key == zero_key &&
+        parsed[2].reason == "graphics_multi_command" && parsed[2].calls == 1;
+    if (!entries_ok) {
+        std::fprintf(stderr, "indirect-other refusal census entries did not match expected per-(key, reason) rows:\n");
+        for (const auto& line : entries) std::fprintf(stderr, "  %s\n", line.c_str());
+        return false;
+    }
+    std::ifstream file(log_path, std::ios::binary);
+    std::string log_line;
+    bool saw_vp_log = false, saw_arg_log = false, saw_multi_log = false;
+    const std::string want_vp = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
+        " [missing_viewport_or_scissor]: indirect graphics requires one matching target, viewport and scissor";
+    const std::string want_arg = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
+        " [argument_outside_placed_buffer]: argument record is outside a unique placed buffer";
+    const std::string want_multi = "x2w-render ExecuteIndirect refused, key " + zero_key +
+        " [graphics_multi_command]: indirect graphics requires one command and no count buffer";
+    while (std::getline(file, log_line)) {
+        if (!log_line.empty() && log_line.back() == '\r') log_line.pop_back();
+        if (log_line == want_vp) saw_vp_log = true;
+        if (log_line == want_arg) saw_arg_log = true;
+        if (log_line == want_multi) saw_multi_log = true;
+    }
+    if (!saw_vp_log || !saw_arg_log || !saw_multi_log) {
+        std::fprintf(stderr, "indirect-other refusal log lines missing (vp=%d, arg=%d, multi=%d)\n",
+                     saw_vp_log ? 1 : 0, saw_arg_log ? 1 : 0, saw_multi_log ? 1 : 0);
+        return false;
+    }
+    std::printf("%s\n", summary.c_str());
+    for (const auto& line : entries) std::printf("%s\n", line.c_str());
+    return true;
+}
 bool fixed_mesh_create_contract(ID3D12Device* guest)
 {
     const D3D12_ROOT_SIGNATURE_DESC root_desc{};
@@ -1364,7 +1496,11 @@ int main(int argc, char** argv) try
     const bool lease_fixture = GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_XMEM", lease_xmem, MAX_PATH) != 0;
     const bool dual_lease = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DUAL", nullptr, 0) != 0;
     if (dual_lease) check(lease_fixture && !lease_arguments ? S_OK : E_FAIL, "configure combined mesh XMem fixture");
-    if (lease_fixture && !lease_arguments)
+    const bool loose_root = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_LOOSE_ROOT", nullptr, 0) != 0;
+    if (loose_root)
+        check(lease_fixture && SetEnvironmentVariableA("X2W_MESH86_LOOSE_XMEM_SRV", "1") &&
+            SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", nullptr) ? S_OK : E_FAIL, "enable loose XMem root SRV");
+    else if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
@@ -1372,12 +1508,14 @@ int main(int argc, char** argv) try
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
     const bool refusal_census_control = argc == 3 && std::strcmp(argv[2], "translated-refusal-census-control") == 0;
     const bool refusal_census = refusal_census_control || (argc == 3 && std::strcmp(argv[2], "translated-refusal-census") == 0);
+    const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
+    const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
     const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = copy_on || copy_off || refusal_census || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = copy_on || copy_off || refusal_census || other_refusal_census || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -1420,7 +1558,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || refusal_census) {
+    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1469,6 +1607,11 @@ int main(int argc, char** argv) try
     wchar_t mesh86_dir[MAX_PATH]{};
     if (mesh && GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_DIR", mesh86_dir, MAX_PATH)) {
         const bool depth_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH", nullptr, 0) != 0;
+        char depth_mode[16]{};
+        const bool depth_pixel = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH_PIXEL", depth_mode, sizeof(depth_mode)) != 0;
+        auto depth = depth_only ? StreamDepth::writable : StreamDepth::none;
+        if (std::strcmp(depth_mode, "no-dsv") == 0) depth = StreamDepth::none;
+        if (std::strcmp(depth_mode, "read-only") == 0) depth = StreamDepth::read_only;
         const auto input = std::filesystem::path(mesh86_dir);
         const auto read_stage = [&](const char* name) {
             std::ifstream file(input / name, std::ios::binary);
@@ -1476,7 +1619,7 @@ int main(int argc, char** argv) try
             return std::vector<char>(std::istreambuf_iterator<char>(file), {});
         };
         const auto ms = read_stage("source.ms.dxbc");
-        const auto ps = depth_only ? std::vector<char>{} : read_stage("source.ps.dxbc");
+        const auto ps = depth_only && !depth_pixel ? std::vector<char>{} : read_stage("source.ps.dxbc");
         D3D12_ROOT_PARAMETER parameter{};
         parameter.ParameterType = lease_fixture ? D3D12_ROOT_PARAMETER_TYPE_SRV : D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         parameter.ShaderVisibility = lease_fixture ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_ALL;
@@ -1488,9 +1631,12 @@ int main(int argc, char** argv) try
         const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument, 0};
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create cached mesh signature");
-        const auto pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(
-            guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
-            {}, depth_only ? 0 : lease_fixture ? 1 : 3, depth_only);
+        const D3D12_SHADER_BYTECODE ms_code{ms.data(), ms.size()};
+        const D3D12_SHADER_BYTECODE ps_code{ps.empty() ? nullptr : ps.data(), ps.size()};
+        const auto pso = lease_fixture
+            ? guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(guest.Get(), root.Get(), ms_code, ps_code, {}, 1, depth)
+            : guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, true>(guest.Get(), root.Get(), ms_code, ps_code, {},
+                                                                         depth_only ? 0 : 3, depth);
         if (dual_lease) {
             const bool init_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_INIT_ONLY", nullptr, 0) != 0;
             const auto initialize = writer_pipeline(device.Get(), writer.Get(), "initialize_mesh_record");
@@ -1500,6 +1646,72 @@ int main(int argc, char** argv) try
                                         writer.Get(), initialize.Get(), append.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
         }
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
+        if (loose_root) {
+            const bool ready = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0) != 0;
+            MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem, nullptr, nullptr, nullptr, nullptr, true);
+            const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            const auto verify = [&](const MeshLeaseDraw& draw, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
+                    DrawKind::mesh, false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false,
+                    &draw);
+            };
+            if (!ready) {
+                const bool ok = verify({source.address(), queue.Get(), black}, "loose mesh requires shader proof");
+                source.free_original();
+                return ok ? 0 : 1;
+            }
+            if (!verify({source.address(), queue.Get(), green}, "loose mesh reads ordinary XMem root SRV") ||
+                !verify({source.address() + 4, queue.Get(), black}, "loose mesh refuses misaligned root") ||
+                !verify({source.address() + 2 * MeshLeaseWriter::page, queue.Get(), black}, "loose mesh refuses unmapped page"))
+                return 1;
+            const std::unique_ptr<void, FreeMemory> unrelated(
+                VirtualAlloc(nullptr, MeshLeaseWriter::page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!unrelated || !verify({reinterpret_cast<UINT64>(unrelated.get()), queue.Get(), black},
+                "loose mesh refuses readable untracked memory")) return 1;
+            const auto registered_desc = D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, MeshLeaseWriter::page,
+                1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+            ComPtr<IUnknown> placed;
+            check(slot<Place>(guest.Get(), 133)(guest.Get(), source.cpu, &registered_desc, D3D12_RESOURCE_STATE_COMMON,
+                nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(placed.GetAddressOf())), "register overlapping buffer");
+            if (!verify({source.address(), queue.Get(), black}, "loose mesh refuses registered resource without a publisher")) return 1;
+            placed.Reset();
+
+            MeshLeaseDraw late{source.address(), queue.Get(), red};
+            late.before_submit = [&] { std::memcpy(source.cpu + source.record_offset, &red, sizeof(red)); };
+            if (!verify(late, "loose mesh sees a CPU write after Close")) return 1;
+            // The queue rejects the entire stale recording, so use already
+            // initialized external DispatchMesh arguments for this control.
+            PlacedBuffer args(device.Get(), guest.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_RESOURCE_FLAG_NONE);
+            const auto upload = make_buffer(device.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ);
+            const D3D12_RANGE empty{};
+            void* memory{};
+            check(upload->Map(0, &empty, &memory), "map loose-root dispatch arguments");
+            std::memcpy(memory, MeshLeaseWriter::old_groups.data(), sizeof(MeshLeaseWriter::old_groups));
+            upload->Unmap(0, nullptr);
+            ComputeCommands seed(device.Get(), nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            seed.list->CopyBufferRegion(args.native.Get(), 0, upload.Get(), 0, sizeof(MeshLeaseWriter::old_groups));
+            seed.submit_and_wait(device.Get());
+            MeshLeaseDraw remap{source.address(), queue.Get(), black};
+            remap.argument = args.wrapped.Get();
+            remap.before_submit = [&] { source.replace_loose_page(); };
+            if (!verify(remap, "loose mesh refuses a remapped page on submit") ||
+                !verify({source.address(), queue.Get(), green}, "new loose mesh recording reads replacement page")) return 1;
+            source.free_original();
+            check_lease_debug(info.Get());
+
+            std::ifstream log{std::filesystem::path(log_path)};
+            const std::string lines{std::istreambuf_iterator<char>(log), {}};
+            log.close();
+            DeleteFileW(log_path.c_str());
+            check(lines.find("mesh XMem loose root bind") != std::string::npos &&
+                  lines.find("mesh XMem submit refused: writer or live page identity changed") != std::string::npos &&
+                  lines.find("mesh XMem loose root SRV has no usable single-page lease") != std::string::npos &&
+                  lines.find("mesh XMem read address is missing or misaligned") != std::string::npos ? S_OK : E_FAIL,
+                  "observe loose binding, stale submission and invalid range refusals");
+            return 0;
+        }
         if (lease_fixture) {
             MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);
             const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -1551,13 +1763,26 @@ int main(int argc, char** argv) try
         }
         const auto verify = [&](Refusal control, const char* label) {
             return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
-                       DrawKind::mesh, false, control, label, nullptr, false, nullptr, false, false, depth_only ? 0 : 3, depth_only);
+                       DrawKind::mesh, false, control, label, nullptr, false, nullptr, false, false,
+                       depth_only ? 0 : 3, depth_only, false, nullptr, nullptr, depth_pixel);
         };
-        if (!GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0))
-            return verify(Refusal::mesh_pending, "unavailable cached mesh") ? 0 : 1;
-        return verify(Refusal::none, depth_only ? "cached mesh depth-only" : "cached translated mesh with three attachments") &&
-            verify(Refusal::incomplete_mesh_constants, "cached mesh incomplete root constants") &&
-            verify(Refusal::mesh_attachment_count, "cached mesh missing attachment") ? 0 : 1;
+        const bool ready = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0) != 0;
+        const bool invalid_depth_pixel = depth_pixel && depth != StreamDepth::writable;
+        if (depth_pixel) {
+            const bool native = bool(native_object<ID3D12PipelineState>(device.Get(), guest.Get(), pso.Get(), true));
+            if (native != (ready && !invalid_depth_pixel)) {
+                std::fprintf(stderr, "depth-only pixel mode %s: unexpected native PSO presence %d\n", depth_mode, native);
+                return 1;
+            }
+        }
+        const bool ok = !ready || invalid_depth_pixel
+            ? verify(Refusal::mesh_pending, invalid_depth_pixel ? depth_mode : "unavailable cached mesh")
+            : verify(Refusal::none, depth_pixel ? "cached mesh depth-only pixel stage" :
+                depth_only ? "cached mesh depth-only" : "cached translated mesh with three attachments") &&
+              verify(Refusal::incomplete_mesh_constants, "cached mesh incomplete root constants") &&
+              verify(Refusal::mesh_attachment_count, "cached mesh missing attachment");
+        if (depth_pixel) check_lease_debug(info.Get());
+        return ok ? 0 : 1;
     }
     if (mesh && GetEnvironmentVariableA("X2W_MESH_REQUEST_FIXTURE", nullptr, 0)) {
         const auto cache = std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
@@ -1738,6 +1963,21 @@ int main(int argc, char** argv) try
                     DrawKind::vertices, false, Refusal::copied_table_buffer, "census key3 incomplete_table_buffer #2", &copied_buffer) &&
                 verify(producer.Get(), false, Refusal::none, "census valid draw does not increment refusals");
             if (ok) ok = check_translated_refusal_census(log_path);
+            std::filesystem::remove_all(cache);
+            DeleteFileW(log_path.c_str());
+            return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
+        if (other_refusal_census) {
+            bool ok = verify(producer.Get(), false, Refusal::none, "other census warm up translated pipeline key") &&
+                verify(producer.Get(), false, Refusal::missing_viewport, "other census key1 missing_viewport_or_scissor #1") &&
+                verify(producer.Get(), false, other_refusal_census_control ? Refusal::none : Refusal::short_argument,
+                       other_refusal_census_control ? "other census control valid draw replaces second reason"
+                                                    : "other census key1 argument_outside_placed_buffer") &&
+                verify(producer.Get(), false, Refusal::missing_viewport, "other census key1 missing_viewport_or_scissor #2");
+            if (ok) {
+                refuse_each_reason(guest.Get(), signature.Get());
+                ok = check_indirect_other_refusal_census(log_path);
+            }
             std::filesystem::remove_all(cache);
             DeleteFileW(log_path.c_str());
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;

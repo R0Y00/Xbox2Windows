@@ -103,9 +103,15 @@ endpgm = 0xbf810000
 mesh = struct.pack('<6I', 0xbf900009, *position, *primitive, endpgm)
 pixel = struct.pack('<3I', 0xf800080f, 0x03020100, endpgm)
 vertex = struct.pack('<3I', *position, endpgm)
-mesh57_fixture(mesh, pixel, 'slot 57 mesh code emission is unavailable')
-mesh57_fixture(mesh, b'', 'slot 57 mesh code emission is unavailable')
+mesh57_fixture(mesh, pixel, 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
+mesh57_fixture(mesh, b'', 'slot 57 mesh without a pixel stage is not covered')
 mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
+# A pixel stage whose only export is the null target (done, vm, no channels) is a depth-only stage and passes the role check.
+null_export = struct.pack('<3I', 0xf8001890, 0, endpgm)
+mesh57_fixture(mesh, null_export, 'slot 57 mesh with a depth-only pixel stage is not covered')
+# Controls: a position export, or a null export mixed with one, stays refused.
+mesh57_fixture(mesh, struct.pack('<3I', *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
+mesh57_fixture(mesh, struct.pack('<5I', 0xf8001890, 0, *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, vertex, 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, pixel, 'slot 57 mesh request key mismatch', tamper=True)
 
