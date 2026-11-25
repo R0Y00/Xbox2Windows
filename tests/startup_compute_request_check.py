@@ -15,7 +15,7 @@ stand-in copies them without interpreting them. Checked:
   their limits publish; valid -> refused -> valid publishes exactly the two valid keys;
 - parts left by an interrupted earlier write (no .c67) are kept and the next creation completes the request;
 - a data qword that names committed memory is counted and still published;
-- gfx2hlsl.py --pending records "compute stage not supported" in <key>.fail, and --refusals reports compute
+- gfx2hlsl.py --pending records the compute stage's refusal of the 24-byte state block A in <key>.fail, and --refusals reports compute
   requests in their own section.
 "disabled" is the negative control: without X2W_D3D12_RENDER=1 nothing is published, and the check must print
 "FAIL: no compute request".
@@ -168,19 +168,19 @@ def check(directory, consumer, disabled):
 
     out = subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], check=True,
                          capture_output=True, text=True).stdout
-    assert f"{key:016x}: unsupported: compute stage not supported" in out, out
-    assert (cache / ("%016x.fail" % key)).read_text() == "compute stage not supported\n"
+    assert f"{key:016x}: unsupported: compute state block A is 24 bytes, not 28" in out, out
+    assert (cache / ("%016x.fail" % key)).read_text() == "compute state block A is 24 bytes, not 28\n"
     assert not (cache / ("%016x.txt" % key)).exists()
     assert all((cache / file).read_bytes() == data for file, data in files.items()), "the offline pass changed the request"
     report = gfx2hlsl.refusals_report(cache)
     assert report["per_request"]["examined"] == 0, report["per_request"]
     assert report["compute"] == dict(examined=3, no_refusal=0, reasons=[
-        dict(reason="compute stage not supported", containing=3, first=3)]), report["compute"]
+        dict(reason="compute state block A is 24 bytes, not 28", containing=3, first=3)]), report["compute"]
 
     check_boundaries(directory, consumer)
     print(f"startup_compute_request: PASS on WARP (request {key:016x}: exact files, length-framed runtime key, "
           "published once across two creations and two processes, refusals and limits, interrupted write completed, "
-          "offline 'compute stage not supported' recorded)")
+          "offline refusal recorded)")
     return 0
 
 

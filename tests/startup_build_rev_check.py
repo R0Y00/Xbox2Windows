@@ -63,12 +63,15 @@ class Repo:
         self.git, self.cmake = git, cmake
         empty = base / "empty.gitconfig"
         empty.write_text("")
+        # An empty hooks folder rather than "core.hooksPath=": some git builds reject an empty path.
+        self.hooks = base / "no-hooks"
+        self.hooks.mkdir(exist_ok=True)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         self.env.update(GIT_CONFIG_GLOBAL=str(empty), GIT_CONFIG_NOSYSTEM="1")
 
     def run(self, cwd, *args):
         result = subprocess.run([self.git, "-c", "user.name=x2w-test", "-c", "user.email=test@example.invalid",
-                                 "-c", "commit.gpgsign=false", "-c", "core.hooksPath=", *args],
+                                 "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={self.hooks.as_posix()}", *args],
                                 cwd=cwd, env=self.env, capture_output=True, text=True)
         if result.returncode != 0:
             fail(f"git {' '.join(args)} in {cwd}: {result.stderr.strip()}")
