@@ -54,11 +54,12 @@ struct RefusedShape {
     std::uint64_t width;
     std::uint32_t height, depth, mips, layout, flags;
     std::uint64_t calls;
+    std::uint64_t reported_calls;  // calls at the last periodic report
 };
 
 class MemorySrvCensus {
 public:
-    static constexpr unsigned max_shapes = 32;  // later distinct shapes are counted as "more"
+    static constexpr unsigned max_shapes = 128;  // later distinct shapes are counted as "more"
     static constexpr unsigned detail_shapes = 8;
 
     // Counts one refusal. True when the call is the first of one of the first detail_shapes distinct
@@ -73,7 +74,7 @@ public:
         if (resource && memory_srv_reason_has_shape(reason)) {
             const RefusedShape key{reason, static_cast<std::uint32_t>(resource->Dimension), static_cast<std::uint32_t>(resource->Format),
                                    resource->Width, resource->Height, resource->DepthOrArraySize, resource->MipLevels,
-                                   static_cast<std::uint32_t>(resource->Layout), static_cast<std::uint32_t>(resource->Flags), 0};
+                                   static_cast<std::uint32_t>(resource->Layout), static_cast<std::uint32_t>(resource->Flags), 0, 0};
             unsigned i = 0;
             while (i < shape_count_ && !same(shapes_[i], key)) ++i;
             if (i < shape_count_) {
@@ -112,8 +113,11 @@ public:
             std::snprintf(line + n, sizeof(line) - n, "; distinct shapes %u (calls past the shape table %llu)", shape_count_,
                           static_cast<unsigned long long>(more_shape_calls_));
         emit(static_cast<const char*>(line));
+        // The periodic report lists only the shapes counted since it last ran; a forced report lists all.
         for (unsigned i = 0; i < shape_count_; ++i) {
-            const RefusedShape& s = shapes_[i];
+            RefusedShape& s = shapes_[i];
+            if (only_if_changed && s.calls == s.reported_calls) continue;
+            if (only_if_changed) s.reported_calls = s.calls;
             std::snprintf(line, sizeof(line),
                           "x2w-d3d12 memory SRV refused shape %u: reason=%s dim=%u fmt=%u size=%llux%ux%u mips=%u layout=0x%x flags=0x%x calls=%llu",
                           i + 1, s.reason < memory_srv_reason_count ? memory_srv_reasons[s.reason] : "other", s.dimension, s.format,

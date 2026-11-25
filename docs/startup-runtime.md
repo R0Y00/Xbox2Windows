@@ -276,7 +276,8 @@ Three census lines follow the five-second report whenever their counts changed
   refused slot 70 call by reason. It then prints one `x2w-d3d12 memory SRV refused shape i:` line per
   distinct `reason`, dimension, format, size, mips, layout and flags, for the reasons a different
   description could avoid (`unsupported_description`, `buffer_unavailable`, `texture_unavailable`).
-  Up to 32 shapes are kept; later shapes are only counted.
+  Up to 128 shapes are kept; later shapes are only counted. The periodic report lists the shapes counted
+  since it last ran.
 - `x2w-d3d12 memory SRV writes (slot 70): calls N, distinct entries D` counts successful slot 70
   calls and the distinct destination descriptors they wrote.
 - `x2w-draw token texture nulls: total N in P pipelines; <pipeline key>=n ...` counts the texture SRVs

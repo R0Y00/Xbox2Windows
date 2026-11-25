@@ -56,16 +56,20 @@ int main()
     auto report = lines(srv, true);
     check("report has a summary and a line per kept shape", report.size() == 1 + MemorySrvCensus::max_shapes);
     check("summary", !report.empty() && report[0] ==
-          "x2w-d3d12 memory SRV refusals (slot 70): total 42; null_destination 1, unreadable_resource 0, unreadable_view 0, "
-          "null_address 1, unsupported_description 37, destination_outside_view_heaps 0, buffer_unavailable 1, "
-          "texture_unavailable 1, other 1; distinct shapes 32 (calls past the shape table 5)");
+          "x2w-d3d12 memory SRV refusals (slot 70): total 138; null_destination 1, unreadable_resource 0, unreadable_view 0, "
+          "null_address 1, unsupported_description 133, destination_outside_view_heaps 0, buffer_unavailable 1, "
+          "texture_unavailable 1, other 1; distinct shapes 128 (calls past the shape table 5)");
     check("first shape line", report.size() > 1 && report[1] ==
           "x2w-d3d12 memory SRV refused shape 1: reason=unsupported_description dim=3 fmt=71 size=64x64x1 mips=7 layout=0x0 "
           "flags=0x0 calls=2");
     check("unchanged periodic report is skipped", lines(srv, true).empty());
+    srv.note("unsupported_description", &a);
+    const auto changed = lines(srv, true);
+    check("periodic report lists only the shapes counted since", changed.size() == 2 && changed[1].find("shape 1:") != std::string::npos);
+    check("a forced report lists every shape", lines(srv, false).size() == report.size());
     check("forced report still prints", lines(srv, false).size() == report.size());
     srv.note("null_address", nullptr);
-    check("forced report does not hide the next change", lines(srv, false).size() == report.size() && !lines(srv, true).empty());
+    check("forced report does not hide the next change", lines(srv, false).size() == report.size() && lines(srv, true).size() == 1);
 
     TokenNullCensus tokens;
     check("first pipeline is detailed", tokens.note(0x0e614191cdfbaf54ull));
