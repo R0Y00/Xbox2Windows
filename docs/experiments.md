@@ -13271,6 +13271,26 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^startup_image_sample_lod' -V
 ```
 
+## Startup 2D LOD queries through a mip view
+
+`startup_image_get_lod_view_warp` and `startup_image_get_lod_view_hardware` draw a synthetic
+gfx1013 `image_get_lod` pixel stage with its emitted `smpl` static sampler. Each draw also runs
+an independent HLSL shader against the same SRV and sampler. Both RGBA32F readbacks must agree
+bit for bit. The expected clamped and raw LODs allow one fractional LOD step (1/256).
+
+The texture has three mips starting at 4×4. With a UV step of one per pixel, a view of all
+three mips gives `(2, 2)`. Starting at mip 1 gives `(1, 1)` for a two-mip view and `(0, 1)`
+for a one-mip view. On the full view with MaxLOD 0.75, point mip filtering gives `(1, 2)`
+and linear mip filtering gives `(0.75, 2)`. Switching only the latter manifest tag to
+`smp` gives `(2, 2)`. A UV step of 1/8 and linear MinLOD 0.5 gives `(0.5, -1)`.
+The two adapters and WARP [measured on the desktop](https://github.com/R0Y00/Xbox2Windows/pull/2311#issuecomment-7162845528)
+differed at exact half-mip boundaries with point mip filtering. The regression uses linear
+filtering for the fractional lower clamp. Native console readback remains open.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_image_get_lod_view_' -V
+```
+
 ## Startup translator: packed 2D image-load coordinates
 
 For plain 2D `image_load`, the startup translator reads `a16` coordinates from the low and high unsigned

@@ -1262,22 +1262,11 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
 // third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
 // mip levels whose cells all differ (tests/startup_image_3d.cpp).
-// --startup-image-2d-view takes the sampler line and a final first/count mip window on a 4x4 2D texture.
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
     const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
     const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
-    const bool view = std::strcmp(ctx.argv[2], "--startup-image-2d-view") == 0;
-    const bool two_dimensional = view || std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
-    UINT first_mip = 0, view_levels = 0;
-    if (view) {
-        const std::string_view window = ctx.argv[8];
-        if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
-            window[2] < '1' || window[2] > '3')
-            return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
-        first_mip = UINT(window[0] - '0');
-        view_levels = UINT(window[2] - '0');
-    }
+    const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
     float z = 0.0f;
     if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
         char* end = nullptr;
@@ -1292,9 +1281,9 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
-    const char* sampler = ctx.argc >= 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, (mips || view) ? 3 : 1,
-                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0, two_dimensional, first_mip, view_levels);
+    const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1,
+                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0, two_dimensional);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1302,6 +1291,22 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
                      ctx.argv[5], expected[0], expected[1], expected[2], expected[3], bits[0], bits[1], bits[2], bits[3]);
         return {OutcomeKind::fail, "image 3D readback differs"};
     }
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest line> <first/count> prints one RGBA32F pixel.
+OperationResult run_startup_image_2d_view(const OperationContext& ctx)
+{
+    const std::string_view window = ctx.argv[6];
+    if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
+        window[2] < '1' || window[2] > '3')
+        return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
+    float color[4]{};
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
+                           UINT(window[0] - '0'), UINT(window[2] - '0'));
+    std::uint32_t bits[4];
+    std::memcpy(bits, color, sizeof(bits));
+    std::printf("view_rgba=%08x,%08x,%08x,%08x\n", bits[0], bits[1], bits[2], bits[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1564,7 +1569,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-2d-view", 9, 9, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
