@@ -125,6 +125,18 @@ FETCH_FORMATS = {
     'BUF_FMT_32_FLOAT': (None, ['{0}.Load(a)', '0u', '0u', 'U(1.0)'])}
 
 
+# gfx10 buffer-descriptor FORMAT field (word 3, bits 12..18) for each FETCH_FORMATS entry: the same unified
+# numbers as the tbuffer `format:` operand (tools/disasm_rdna2.py MTBUF_FORMATS; 1 is the omitted default).
+# A MUBUF buffer_load_format_* has no format operand, so its translation switches on this field at run time.
+DESC_FORMAT_CODES = {
+    'BUF_FMT_8_UNORM': 1, 'BUF_FMT_8_UINT': 5, 'BUF_FMT_8_8_UNORM': 14, 'BUF_FMT_32_FLOAT': 22,
+    'BUF_FMT_16_16_UNORM': 23, 'BUF_FMT_16_16_SNORM': 24, 'BUF_FMT_16_16_FLOAT': 29, 'BUF_FMT_8_8_8_8_UNORM': 56,
+    'BUF_FMT_32_32_FLOAT': 64, 'BUF_FMT_16_16_16_16_FLOAT': 71, 'BUF_FMT_32_32_32_FLOAT': 74,
+    'BUF_FMT_32_32_32_32_FLOAT': 77}
+DESC_FORMAT_SHIFT, DESC_FORMAT_MASK = 12, 127
+# Integer formats read a DST_SEL constant 1 as the integer 1, every other format as 1.0.
+DESC_ONE_INTEGER = ('BUF_FMT_8_UINT',)
+
 def starts_with_fetch_call(code):
     return len(code) >= 4 and struct.unpack_from('<I', code)[0] == FETCH_CALL
 
@@ -952,10 +964,8 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
             return self.scalar(base, ops)
-        if base in ('buffer_load_format_x', 'buffer_load_format_xy',
-                    'buffer_load_format_xyz', 'buffer_load_format_xyzw'):
-            # MUBUF formatted loads take both fields from V# word 3. The startup request carries
-            # the root signature layout, while the descriptor table is supplied at draw time.
+        if base == 'buffer_load_format_xyzw':
+            # Not translated: the four-component form has no startup request that needs it yet.
             raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
 
@@ -1682,6 +1692,43 @@ class Stage:
             self.emit('a = (vid + ud%d) * ud%d + %d;' % (base, stride, e['offset']))
             self.load_format(FETCH_DXGI[e['format']][0], buf, e['vgpr'], e['count'])
         self.fetched = True
+
+    def mubuf_format(self, ops, mods, count):
+        """buffer_load_format_x/xy/xyz: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
+
+        The runtime passes that word as an entry constant. Each supported format becomes one case of a switch
+        on the FORMAT field that decodes the four components as the tbuffer path does; DST_SEL then picks, for
+        each destination register, a component or the constant 0 or 1. A format outside the table decodes as
+        zeros (assumption: the invalid format 0 loads zero) and a descriptor the draw cannot read passes word 3 as 0.
+        """
+        dst = reg_range(ops[0])
+        buf, address = self.buffer_address(ops, mods)
+        word3 = 'ud%d' % self.pipe.ud(('descword3', self.pipe.resources[self.descriptor(ops[2])]['index']))
+        self.emit('a = %s;' % address)
+        self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')
+        self.emit('switch ((%s >> %d) & %du) {' % (word3, DESC_FORMAT_SHIFT, DESC_FORMAT_MASK))
+        for fmt, code in sorted(DESC_FORMAT_CODES.items(), key=lambda kv: kv[1]):
+            load, comps = FETCH_FORMATS[fmt]
+            body = ['w = %s;' % load.format(buf)] if load else []
+            body += ['c%d = %s;' % (i, comps[i].format(buf)) for i in range(4)]
+            if fmt in DESC_ONE_INTEGER:
+                body.append('one = 1u;')
+            self.emit('case %du: %s break;' % (code, ' '.join(body)))
+        self.emit('default: break; }')
+        pick = ('((%s >> %d) & 7u)' % (word3, 3 * i) for i in range(count))
+        for i, sel in enumerate(pick):
+            self.set_v(dst[1] + i, '%s == 4u ? c0 : %s == 5u ? c1 : %s == 6u ? c2 : %s == 7u ? c3 : %s == 1u ? one : 0u'
+                       % (sel, sel, sel, sel, sel))
+        self.emit('}')
+
+    def op_buffer_load_format_x(self, ops, mods):
+        self.mubuf_format(ops, mods, 1)
+
+    def op_buffer_load_format_xy(self, ops, mods):
+        self.mubuf_format(ops, mods, 2)
+
+    def op_buffer_load_format_xyz(self, ops, mods):
+        self.mubuf_format(ops, mods, 3)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
