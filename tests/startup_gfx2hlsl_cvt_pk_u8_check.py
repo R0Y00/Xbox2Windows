@@ -8,8 +8,11 @@
 The RDNA 1.0 and RDNA 2 ISA guides give (VOP3A opcode 350)
   D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])
 and leave flt32_to_uint8 undefined. MEASURED holds rows of the probe run on an RX 6900 XT (gfx1030, Windows, ROCm 7.2,
-Adrenalin 26.11.2, MODE at the launch default; tools/rdna_cvt_pk_u8 of the research repository): round to nearest
-even, saturate to [0, 255], NaN and negatives give 0. The reference model below must reproduce every measured word,
+Adrenalin 26.11.2, MODE at the launch default; tools/rdna_cvt_pk_u8.py): round to nearest
+even, saturate to [0, 255], NaN and negatives give 0. The whole probe output, 5432 rows identical on that card and
+on an integrated gfx1036, is stored in tests/data/rdna_cvt_pk_u8_measured.tsv and checked against the model without
+a GPU (stored_data_controls); the default word follows round-to-nearest-even and the rtz word (s_round_mode 0xf)
+truncation, both saturated, NaN and negatives 0. The reference model below must reproduce every measured word,
 and the translated text is evaluated on the same inputs. S1 keeps its bits above [1:0] in every draw set, and every S2
 holds four distinct bytes (the measured rows use the sentinel 0xa5c3e17b), so a wrong byte or an overwritten S2
 changes the word.
@@ -51,7 +54,7 @@ def dropped_src2(s0, s1, s2):
     return cvt_pk_u8(s0, s1, 0)
 
 
-# Measured words, S1 = 0 and S2 = SENTINEL, one row per input of the probe run (gfx1030, default MODE):
+# Hand-copied subset of that file. Measured words, S1 = 0 and S2 = SENTINEL, one row per input of the probe run (gfx1030, default MODE):
 # (S0 bits, D word), then the label of the row.
 MEASURED = [
     (0x00000000, 0xa5c3e100),  # +0
@@ -275,7 +278,7 @@ def half_away(x):
 
 
 def measured_controls():
-    # The reference model reproduces every measured word; the table is not read from the research repository.
+    # The reference model reproduces every measured word; the table is copied here.
     for bits, word in MEASURED:
         check('model reads measured %08x' % bits, cvt_pk_u8(bits, 0, SENTINEL) == word)
     for bits, select, word in MEASURED_SELECT:
@@ -318,6 +321,57 @@ def measured_controls():
           'cannot parse' in (lambda: [str(e) for e in [catch(lambda: evaluate(line.replace('255.0', '255.0) ?'), {'v0': 0}))]][0])())
 
 
+STORED = Path(__file__).resolve().parent / 'data' / 'rdna_cvt_pk_u8_measured.tsv'
+
+
+def trunc_byte(bits):
+    """Model of the round-toward-zero variant: truncate, saturate, NaN and negatives give 0."""
+    x = as_float(bits)
+    if math.isnan(x) or x <= 0.0:
+        return 0
+    return 255 if x >= 255.0 else math.trunc(x)
+
+
+def merge_byte(byte, select, s2=SENTINEL):
+    shift = 8 * (select & 3)
+    return (s2 & ~(0xff << shift) & MASK) | (byte << shift)
+
+
+def stored_data_controls():
+    # Every row of the stored hardware output (no GPU needed): default = nearest even, rtz = truncation, flush = default.
+    text = STORED.read_text().splitlines()
+    check('stored file names both devices and the sentinel',
+          '# sentinel (S2) a5c3e17b' in text and sum(l.startswith('# device gfx1030') for l in text) == 1
+          and sum(l.startswith('# device gfx1036') for l in text) == 1)
+    rows = [l.split('\t') for l in text if not l.startswith('#')]
+    check('stored file has 5432 rows of 6 fields', len(rows) == 5432 and all(len(r) == 6 for r in rows))
+    check('stored rows are distinct', len({tuple(r[1:3]) for r in rows}) == len(rows))
+    parsed = [(int(r[1], 16), int(r[2], 16), int(r[3], 16), int(r[4], 16), int(r[5], 16)) for r in rows]
+    check('all four byte selects are stored', {sel & 3 for _, sel, _, _, _ in parsed} == {0, 1, 2, 3})
+    bad = [(i, rows[i][0]) for i, (bits, sel, d, _, _) in enumerate(parsed) if d != cvt_pk_u8(bits, sel, SENTINEL)]
+    check('stored default words equal the nearest-even model: %s' % bad[:3], not bad)
+    bad = [(i, rows[i][0]) for i, (bits, sel, _, z, _) in enumerate(parsed) if z != merge_byte(trunc_byte(bits), sel)]
+    check('stored rtz words equal the truncation model: %s' % bad[:3], not bad)
+    bad = [i for i, (_, _, d, _, f) in enumerate(parsed) if d != f]
+    check('stored flush words equal the default words', not bad)
+    # Negative controls: other conversions must disagree with stored rows, and each variant with the other model.
+    miss = lambda column, byte: sum(r[column] != merge_byte(byte(r[0]), r[1]) for r in parsed)
+    check('truncation disagrees with stored default words', miss(2, trunc_byte) > 1000)
+    check('nearest even disagrees with stored rtz words', miss(3, to_byte) > 1000)
+    check('round half away disagrees with stored default words',
+          miss(2, lambda b: 0 if math.isnan(as_float(b)) or as_float(b) <= 0.0 else half_away(min(as_float(b), 255.0))) > 0)
+    check('a wrap to 8 bits without saturation disagrees with stored default words',
+          miss(2, lambda b: 0 if math.isnan(as_float(b)) or as_float(b) <= 0.0 else
+               (round(min(as_float(b), 1e9)) & 0xff)) > 0)
+    # The stored select words reach the model unchanged: a model that drops select bit 0 must fail.
+    check('a model without select bit 0 disagrees', any(
+        d != merge_byte(to_byte(bits), sel & 2) for bits, sel, d, _, _ in parsed))
+    # Through the translated text, every stored default word.
+    line = emitted('v_cvt_pk_u8_f32 v12, v0, v4, v8')
+    check('translated text reproduces every stored default word',
+          all(evaluate(line, {'v0': bits, 'v4': sel, 'v8': SENTINEL}) == d for bits, sel, d, _, _ in parsed))
+
+
 def selector_controls():
     # All four byte selectors, high S1 bits, and an S2 of four distinct bytes, through the translated text.
     line = emitted('v_cvt_pk_u8_f32 v12, v0, v4, v8')
@@ -341,6 +395,7 @@ def selector_controls():
 def run_controls():
     selector_controls()
     measured_controls()
+    stored_data_controls()
     check('constant is lowered', 'F(0x3f800000u)' in emitted('v_cvt_pk_u8_f32 v1, 1.0, v3, v4'))
     check('S1 and S2 constants are lowered', not refused('v_cvt_pk_u8_f32 v1, 1.0, 7, 0xffffffff'))
     check('a register S0 needs no proof', refuses(['v_mul_f32 v2, v5, v6', 'v_cvt_pk_u8_f32 v1, v2, v3, v4']) is None)
