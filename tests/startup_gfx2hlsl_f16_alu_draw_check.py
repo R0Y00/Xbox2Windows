@@ -15,6 +15,7 @@ The expected words come from an exact rational model of binary16 arithmetic (Fra
 not from the lowering's expressions.
 """
 import math
+import re
 import struct
 import sys
 import tempfile
@@ -183,6 +184,22 @@ def translate(op):
     return G.Pipeline(vs_words([(0, 0, 0)] * 4), ps_words(op), root_blob()).hlsl_ps()
 
 
+# The target is R32G32B32A32_FLOAT, so a small integer result is a binary32 denormal and FXC drops it when it comes
+# from a float to integer conversion. The integer-result operations therefore set bit 30 on the way out of the pixel
+# stage and in the expected word; the translated statements themselves are unchanged.
+INTEGER_RESULT = ('v_cvt_i16_f16', 'v_cvt_u16_f16')
+TAG = 0x40000000
+
+
+def draw_text(op):
+    text = translate(op)
+    return re.sub(r'F\(v(1[2-5])\)', r'F(v\1 | 0x%xu)' % TAG, text) if op in INTEGER_RESULT else text
+
+
+def draw_word(op, x):
+    return reference(op, x) | (TAG if op in INTEGER_RESULT else 0)
+
+
 def controls():
     failures = []
 
@@ -235,12 +252,12 @@ def check_draw(dxc, renderer, adapter, fxc=None):
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:
             for op, lanes in DRAW.items():
-                ps = compile_hlsl(compiler, kind, translate(op), 'ps_%s_%s' % (op, kind), ps_profile, directory)
+                ps = compile_hlsl(compiler, kind, draw_text(op), 'ps_%s_%s' % (op, kind), ps_profile, directory)
                 for index in range(0, len(lanes), 4):
                     chunk = lanes[index:index + 4]
                     vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), ps_words(op), root_blob()).hlsl_vs(),
                                       'vs_%s_%d_%s' % (op, index, kind), vs_profile, directory)
-                    expected = words_text(reference(op, x) for x in chunk)
+                    expected = words_text(draw_word(op, x) for x in chunk)
                     run = draw(renderer, adapter, vs, ps, expected)
                     if run.returncode:
                         failures.append('%s %s set %d' % (kind, op, index // 4))
