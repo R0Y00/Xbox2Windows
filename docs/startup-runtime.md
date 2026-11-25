@@ -2393,4 +2393,4 @@ only the resolve path with valid addresses on a device, so it does not cover the
   removed. The draw path binds the title's `TEXTURECUBE` or `TEXTURECUBEARRAY` view as the equivalent
   `TEXTURE2DARRAY` view (six slices per cube). Limitation: filtering is not seamless across face edges, because
   a 2D array clamps within one face. Reproduce: `python -B tests/startup_gfx2hlsl_cube_check.py` and
-  `python -B tests/startup_gfx2hlsl_cube_alu_check.py` (add `draw <dxc> <offscreen_check> warp` on Windows).
+  `python -B tests/startup_gfx2hlsl_cube_alu_check.py` (add `draw <dxc> <offscreen_check> warp` on Windows). The cube-array slice mapping is drawn with `python -B tests/startup_image_cube_array_check.py draw <dxc> <offscreen_check> warp`.
