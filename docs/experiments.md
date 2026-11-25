@@ -11994,6 +11994,15 @@ is that first visible mip. The translator validates a constant sampler
 with normalized clamp addressing, bilinear XY, point mip filtering, and
 zero minimum LOD and bias. Implicit, explicit-LOD, comparison, offset,
 and non-2D forms remain outside this slice.
+
+The sampler's Z address mode (`CLAMP_Z`, SQ_IMG_SAMP_WORD0 bits 8:6) is not
+checked: a 2D view has no third coordinate, and the Direct3D 11.3
+functional spec (22.4.2, gather4) says only the sampler's addressing modes
+are used. The X and Y modes still have to clamp to the last texel. The
+bound static sampler keeps the title's own words, `CLAMP_Z` included. The
+check accepts `CLAMP_Z` 1 to 7 and keeps refusing wrap or mirror in X or
+Y and an anisotropy ratio. Its negative control removes the 2D profile and
+expects the refusal again, and one draw runs with `CLAMP_Z` set.
 [RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) ·
 [Direct3D gather semantics](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#Gather4)
 

@@ -88,7 +88,39 @@ def controls(llvm_mc):
     refused(shader(prefix=bad_wrap), 'requires normalized clamp')
     refused(shader(prefix=bad_min_lod), 'requires normalized clamp')
     refused(shader(prefix=missing_sampler), 'constant sampler')
+    check_clamp_z()
     print('Four fixed-mip gather channels and unsupported encodings checked')
+
+
+# CLAMP_Z (SQ_IMG_SAMP_WORD0 bits 8:6) addresses a third coordinate a 2D view does not have. Word 0 is moved
+# with a literal (s_mov_b32 s24, <word>), so the words below are the 0x12 profile with CLAMP_Z set.
+CLAMP_WORD0 = bytes.fromhex('920398be')
+
+
+def with_word0(word):
+    return PREFIX.replace(CLAMP_WORD0, bytes.fromhex('ff0398be') + struct.pack('<I', word))
+
+
+def check_clamp_z():
+    for clamp_z in range(1, 8):
+        word = 0x12 | clamp_z << 6
+        pipe = pipeline(shader(prefix=with_word0(word)))
+        assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
+        # The title's own words are bound, CLAMP_Z included.
+        assert f'smp 0 {word:#x} 0x0 0x4500000 0x0\n' in pipe.manifest(), pipe.manifest()
+    # The X and Y address modes are still checked: mirror in Y, wrap in X, each with CLAMP_Z set as well.
+    refused(shader(prefix=with_word0(0x0a)), 'requires normalized clamp')
+    refused(shader(prefix=with_word0(0x10 | 2 << 6)), 'requires normalized clamp')
+    refused(shader(prefix=with_word0(0x13 | 2 << 6)), 'requires normalized clamp')
+    # Other word 0 fields beside CLAMP_Z still refuse: anisotropy ratio (bits 11:9).
+    refused(shader(prefix=with_word0(0x92 | 1 << 9)), 'requires normalized clamp')
+    # Negative control: without the 2D profile the CLAMP_Z word is refused, as before this change.
+    profile = G.gather_2d_profile_words
+    G.gather_2d_profile_words = lambda words: tuple(words)
+    try:
+        refused(shader(prefix=with_word0(0x92)), 'requires normalized clamp')
+    finally:
+        G.gather_2d_profile_words = profile
 
 
 def expected_taps(mip, component, uv):
@@ -134,6 +166,8 @@ def draw(dxc, renderer, adapter):
         clamped = PREFIX.replace(bytes.fromhex('f002007e'), bytes.fromhex('f102007e'))
         clamped = clamped.replace(bytes.fromhex('0000803e'), bytes.fromhex('0000a03f'))
         run(3, 0, 1, (-0.5, 1.25), shader(2, prefix=clamped))
+        # The same draw with the title's CLAMP_Z set: a 2D gather cannot observe it.
+        run(3, 1, 0, uv, shader(1, prefix=with_word0(0x92)))
         run(3, 1, 2, uv, shader(4), mutant=True)
 
 
