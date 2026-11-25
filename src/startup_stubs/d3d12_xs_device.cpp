@@ -42,6 +42,7 @@
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/list_copy.h"
+#include "startup_stubs/rect_indirect_args.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -142,6 +143,7 @@ struct alignas(16) WrapperOwn {
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
+    ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
@@ -1255,6 +1257,9 @@ struct DesktopAllocator {
     bool close_failed;
     std::vector<std::unique_ptr<x2w_upload::Arena>> uploads;
     std::vector<x2w_startup::ComPtr<ID3D12Resource>> indexed_validation;
+    // Rectangle-list argument scratch of the recordings on this allocator. Retained with the recording, so until every
+    // queue that ran it has passed its fence (the allocator is reused only when idle).
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratches;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1312,6 +1317,47 @@ void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignme
     return reinterpret_cast<void*>(allocation.cpu);
 }
 
+// The rectangle-list argument scratch of this recording: created on first use, owned by the recording's desktop
+// allocator (so it outlives every queue fence of the recording) and never shared with another recording.
+ID3D12Resource* recording_rect_scratch(Wrapper* self)
+{
+    ID3D12Resource* scratch = nullptr;
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (state.list_open && state.list_device && found != list_recordings.end() && found->second) {
+        if (!state.list_scratch) {
+            try {
+                auto created = x2w_startup::RectIndirectArguments::make_scratch(device_of(state.list_device));
+                if (created) {
+                    found->second->scratches.push_back(std::move(created));
+                    state.list_scratch = found->second->scratches.back().Get();
+                }
+            } catch (const std::bad_alloc&) {
+                // No scratch: the caller refuses the draw.
+            }
+        }
+        scratch = state.list_scratch;
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return scratch;
+}
+
+// Fixture query for two closed recordings before either is submitted.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_distinct_rect_scratch(void* first, void* second)
+{
+    const Wrapper* a = as_wrapper(first);
+    const Wrapper* b = as_wrapper(second);
+    if (!a || !b || a == b || a->own().kind != list_kind || b->own().kind != list_kind) return FALSE;
+    AcquireSRWLockShared(&allocator_lock);
+    const auto& x = a->own();
+    const auto& y = b->own();
+    const bool distinct = x.list_ready && y.list_ready && x.list_scratch && y.list_scratch &&
+                          x.list_scratch != y.list_scratch;
+    ReleaseSRWLockShared(&allocator_lock);
+    return distinct;
+}
+
 x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 bytes)
 {
     AcquireSRWLockShared(&allocator_lock);
@@ -1358,6 +1404,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
         if (SUCCEEDED(hr)) {
             next->uploads.clear();
             next->indexed_validation.clear();
+            next->scratches.clear();
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -1450,6 +1497,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
                 if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
                     spare->uploads.clear();
                     spare->indexed_validation.clear();
+                    spare->scratches.clear();
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -1493,6 +1541,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             on = title.current;
             ++on->lists;
             state.list_uploads = nullptr;
+            state.list_scratch = nullptr;
             state.list_ready = false;
             state.list_open = true;
         }
@@ -2306,7 +2355,8 @@ void reset_list_dynamic_state(Wrapper* self)
     pass_of(self).default_viewport_h = pass_of(self).default_scissor_h = 0;
 }
 
-// List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).
+// List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list: translated draws and indirect
+// non-indexed draws expand it to triangles; the topology is not forwarded as such.
 void __stdcall list_topology(Wrapper* self, UINT topology)
 {
     pass_of(self).topology_ok = topology >= 1 && topology <= 5;
@@ -2571,9 +2621,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
             return refuse("indirect graphics requires one matching target, viewport and scissor");
-        if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
-            !(translated && indexed && pass.topology == 0x11))
-            return refuse("indirect draw requires triangle-list topology or a translated indexed rectangle");
+        const bool rect_list = !mesh && pass.topology == 0x11;
+        if (rect_list && indexed && !translated)
+            return refuse("indirect rectangle list requires a non-indexed draw");
+        if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+            return refuse("indirect draw requires triangle-list or rectangle-list topology");
         if (!pass.indirect_graphics.cached_mesh) {
             const auto samples = pass.target0->GetDesc().SampleDesc;
             if (samples.Count != 1 || samples.Quality)
@@ -2658,6 +2710,27 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         else require_state(self, index_view.resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         list->IASetIndexBuffer(&index_view.view);
     }
+    const bool rect_list = graphics && !mesh && pass.topology == 0x11;
+    ID3D12Resource* scratch = nullptr;
+    ID3D12Resource* draw_arguments = resource;
+    u64 draw_offset = offset;
+    if (rect_list) {
+        if (std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(),
+                        [](u64 address) { return address != 0; }))
+            return refuse("rectangle-list conversion would drop live compute root arguments");
+        // The producer's count names three vertices per rectangle; the desktop draw needs six. Convert on the GPU
+        // into a scratch record and draw from that. The compute root signature and bindings of the list are replaced.
+        // The four words are copied into the scratch first (the pass never reads the title's buffer), so the source only
+        // needs COPY_SOURCE next to its argument state.
+        require_state(self, resource, argument_state | D3D12_RESOURCE_STATE_COPY_SOURCE);
+        scratch = recording_rect_scratch(self);
+        if (!scratch || !x2w_startup::rect_indirect_arguments().convert(list, resource, offset, scratch))
+            return refuse("rectangle-list argument conversion is unavailable");
+        if (pass.desktop_compute_root) list->SetComputeRootSignature(pass.desktop_compute_root.Get());
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        draw_arguments = scratch;
+        draw_offset = 0;
+    }
     if (graphics) {
         list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
         list->SetGraphicsRootSignature(pass.graphics_root);
@@ -2691,11 +2764,18 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
         if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     }
-    require_state(self, resource, argument_state);
+    if (mesh && !pass.indirect_graphics.cached_mesh && mesh_xmem_indirect() &&
+        info->placement == Placement::copied_buffer) {
+        if (const char* failure = record_mesh_xmem_read(self, base + offset, bytes, argument_state, draw_arguments, draw_offset))
+            return refuse(failure);
+    } else if (!rect_list) {
+        require_state(self, resource, argument_state);
+    }
     const auto red_samples = graphics ? red_producer_draw_before(self, list, "indirect-draw", 0) : RedDrawSamples{};
-    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, counts,
+    list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, draw_arguments, draw_offset, counts,
                           counts ? count_offset : 0);
     red_producer_draw_after(self, red_samples);
+    if (scratch) x2w_startup::RectIndirectArguments::finish(list, scratch);
     InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
@@ -3123,7 +3203,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             InterlockedIncrement(&render_executes);
         };
         bool split = false;
-        if (mesh_xmem_handoff()) {
+        if (mesh_xmem_tracking()) {
             const std::lock_guard lock(mesh_xmem_mutex);
             reap_mesh_xmem_flights();
             split = std::any_of(ready.begin(), ready.end(), mesh_xmem_needs_submission);

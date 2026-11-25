@@ -11,10 +11,13 @@ import compute_store_check as base
 GROUP = (4, 1, 1)
 WORDS = 320
 TABLE_BYTE = 256
-UINT4 = 0x0104BFAC  # gfx10 format 75, identity XYZW selectors and RESOURCE_LEVEL set
+FLOAT1 = 0x01016FAC  # gfx10 format 22 (BUF_FMT_32_FLOAT), identity selectors and RESOURCE_LEVEL set
+UINT1 = 0x01014FAC   # gfx10 format 20 (BUF_FMT_32_UINT)
+UINT4 = 0x0104BFAC   # gfx10 format 75, identity XYZW selectors and RESOURCE_LEVEL set
 FLOAT4 = 0x0104DFAC
 STORE = "buffer_store_format_xyzw v[10:13], v8, s[20:23], 0 idxen offset:4"
 D16_STORE = "buffer_store_format_d16_xyzw v[10:11], v8, s[20:23], 0 idxen offset:4"
+D16_X_STORE = "buffer_store_format_d16_x v10, v8, s[20:23], 0 idxen offset:4"
 SETUP = [
     "s_mov_b32 s12, s7", "s_mov_b32 s13, 0", "s_load_dwordx4 s[20:23], s[12:13], 0x30",
     "s_load_dwordx4 s[16:19], s[12:13], 0x40", "v_lshl_add_u32 v8, s11, 2, v0",
@@ -27,8 +30,18 @@ PROGRAM = SETUP + [
 D16_PROGRAM = SETUP + [
     "v_xor_b32_e32 v10, 0xc0003c00, v8", "v_mov_b32_e32 v11, 0x80000001", D16_STORE, "s_endpgm",
 ]
+D16_X_PROGRAM = SETUP + [
+    "v_xor_b32_e32 v10, s25, v8", D16_X_STORE, "s_endpgm",
+]
 # 0x3c00..0x3c03 are consecutive binary16 values starting at 1.0.
 D16_X = (0x3f800000, 0x3f802000, 0x3f804000, 0x3f806000)
+# High half 0x4200 poisons each word so leaking high bits or missing & 0xffffu shifts fails readback.
+D16_X_PAYLOADS = (
+    ("positive 1.0..", 0x42003c00, D16_X),
+    ("negative -2.0..", 0x4200c000, (0xc0000000, 0xc0002000, 0xc0004000, 0xc0006000)),
+    ("min positive subnormal and +0", 0x42000001, (0x33800000, 0x00000000, 0x34400000, 0x34000000)),
+    ("-0 and negative subnormals", 0x42008000, (0x80000000, 0xb3800000, 0xb4000000, 0xb4400000)),
+)
 # V# words 0..3 and live state, then the expected *word addresses* of the four component stores.
 # The addresses are literal to keep the reference independent of the generated address calculation.
 CASES = (
@@ -45,6 +58,21 @@ CASES = (
     ("base past the declared u0 extent", (640, 24 << 16, 4, UINT4, 1), ()),
     ("live slot beyond declared count", (12, 24 << 16, 4, UINT4, 1), ()),
 )
+# 4-byte FLOAT1 records leaving adjacent dwords at SENTINEL so wider writes fail readback.
+D16_X_CASES = (
+    ("four float1 records", (12, 8 << 16, 4, FLOAT1, 1), (4, 6, 8, 10)),
+    ("second base and short record count", (116, 12 << 16, 2, FLOAT1, 1), (30, 33)),
+    ("released view", (12, 8 << 16, 4, FLOAT1, 2), ()),
+    ("last complete float1 texel in u0", (504, 8 << 16, 4, FLOAT1, 1), (127,)),
+    ("partial float1 texel at end of u0", (508, 8 << 16, 4, FLOAT1, 1), ()),
+    ("wrong single-channel UINT1 format", (12, 8 << 16, 4, UINT1, 1), ()),
+    ("offset plus 4-byte float1 wider than stride", (12, 4 << 16, 4, FLOAT1, 1), ()),
+    ("misaligned base", (14, 8 << 16, 4, FLOAT1, 1), ()),
+    ("misaligned stride", (12, 6 << 16, 4, FLOAT1, 1), ()),
+    ("unsupported high address", (12, (8 << 16) | 1, 4, FLOAT1, 1), ()),
+    ("base past the declared u0 extent", (640, 8 << 16, 4, FLOAT1, 1), ()),
+    ("live slot beyond declared count", (12, 8 << 16, 4, FLOAT1, 1), ()),
+)
 VIEW = (0, TABLE_BYTE, len(CASES) - 1, WORDS * 4, 512)
 BINDING = dict(table_reg=7, descriptor_offset=0x30, constant_descriptor=0x40, source_descriptor=0x50, group_reg=11)
 
@@ -55,30 +83,54 @@ def lower(program=PROGRAM, **options):
 
 def controls():
     assert base.aot.descriptor_format_word(75) == UINT4
+    assert base.aot.descriptor_format_word(22) == FLOAT1
+    assert base.aot.descriptor_format_word(20) == UINT1
     # Pin the translator call here. draw() exercises the generated guards against actual UAV contents.
     assert "store_heap_words4(params[0].x, tid.x, 4u, false, uint4(tid.x," in lower()
     assert "store_heap_words4(params[0].x, tid.x, 4u, true," in lower(D16_PROGRAM)
+    d16x_hlsl = lower(D16_X_PROGRAM)
+    assert "store_heap_word_d16(params[0].x, tid.x, 4u, (params[0].y ^ tid.x));" in d16x_hlsl
+    assert f"{FLOAT1:#x}u" in d16x_hlsl
+    assert "store_heap_words4(" not in d16x_hlsl and "outputData.Load(" not in d16x_hlsl
     refuses = base.rejects
     refuses("Unsupported formatted buffer store target or address mode", lower, heap_store_view=None)
-    refuses("Invalid heap store view binding", lower, stride=24)
-    refuses("Invalid heap store view binding", lower, heap_view=VIEW)
+    refuses("Unsupported formatted buffer store target or address mode", lower, D16_X_PROGRAM, heap_store_view=None)
+    refuses("Invalid heap store view binding", lower, D16_X_PROGRAM, stride=8)
+    refuses("Invalid heap store view binding", lower, heap_store_view=VIEW, stride=24)
+    refuses("Invalid heap store view binding", lower, heap_store_view=VIEW, heap_view=VIEW)
     refuses("Invalid heap view binding", lower, source_descriptor=None)
     refuses("Invalid heap view binding", lower, heap_store_view=(0, TABLE_BYTE, 11, TABLE_BYTE + 32, 512))
     refuses("Invalid heap store view output size", lower, heap_store_view=(*VIEW[:4], 511))
     refuses("Heap store view requires exactly one formatted UAV store", lower,
             PROGRAM[:-1] + [STORE.replace("offset:4", "offset:24"), "s_endpgm"])
     refuses("Heap store view slot constant is not ready", lower, PROGRAM[:7] + PROGRAM[8:])
+    refuses("Heap store view slot constant is not ready", lower,
+            base.variant(D16_X_PROGRAM, ("s_buffer_load_dwordx4 s[24:27], s[16:19], null",
+                                         "s_buffer_load_dword s25, s[16:19], 0x4")))
+    refuses("Unverified ALU operand", lower, D16_X_PROGRAM[:7] + D16_X_PROGRAM[8:])
     refuses("Heap store view requires buffer_store_format_xyzw", lower,
             base.variant(PROGRAM, (STORE, STORE.replace("xyzw v[10:13]", "xy v[10:11]"))))
     refuses("Heap store view requires buffer_store_format_xyzw", lower,
             base.variant(D16_PROGRAM, (D16_STORE, D16_STORE.replace("d16_xyzw", "d16_xyz"))))
+    refuses("Heap store view requires buffer_store_format_xyzw", lower,
+            base.variant(D16_X_PROGRAM, (D16_X_STORE, D16_X_STORE.replace("d16_x", "d16_xy"))))
+    refuses("Heap store view requires buffer_store_format_xyzw", lower,
+            base.variant(D16_X_PROGRAM, (D16_X_STORE, D16_X_STORE.replace("d16_x", "x"))))
     refuses("Unverified raw UAV store", lower,
             base.variant(D16_PROGRAM, (D16_STORE, D16_STORE.replace("v[10:11]", "v[10:13]"))))
+    refuses("Unverified raw UAV store", lower,
+            base.variant(D16_X_PROGRAM, (D16_X_STORE, D16_X_STORE.replace("v10", "v[10:11]"))))
+    refuses("Unverified raw UAV store", lower,
+            base.variant(D16_X_PROGRAM, (D16_X_STORE, D16_X_STORE.replace("offset:4", "offset:2"))))
     refuses("Unsupported formatted buffer store target or address mode", lower,
             base.variant(PROGRAM, (STORE, STORE.replace(" idxen", " offen"))))
+    refuses("Unsupported formatted buffer store target or address mode", lower,
+            base.variant(D16_X_PROGRAM, (D16_X_STORE, D16_X_STORE.replace(" idxen", " offen"))))
     refuses("Unverified raw UAV store", lower, base.variant(PROGRAM, (STORE, STORE.replace("s[20:23]", "s[16:19]"))))
     refuses("Heap store view needs a formatted store indexed by dispatch thread ID", lower,
             base.variant(PROGRAM, (STORE, STORE.replace(", v8,", ", v12,"))))
+    refuses("Heap store view needs a formatted store indexed by dispatch thread ID", lower,
+            base.variant(D16_X_PROGRAM, (D16_X_STORE, D16_X_STORE.replace(", v8,", ", v12,"))))
 
 
 def verify_binary(directory, code, library, program=PROGRAM):
@@ -92,13 +144,15 @@ def verify_binary(directory, code, library, program=PROGRAM):
     assert output.read_text(encoding="ascii") == expected
 
 
-def draw(directory, compiler, renderer, backend, d16):
-    source = lower(D16_PROGRAM if d16 else PROGRAM)
+def draw(directory, compiler, renderer, backend, mode):
+    program = {"uint4": PROGRAM, "d16_xyzw": D16_PROGRAM, "d16_x": D16_X_PROGRAM}[mode]
+    cases = D16_X_CASES if mode == "d16_x" else CASES
+    source = lower(program)
     table = [0] * WORDS
-    for slot, (_, record, _) in enumerate(CASES):
+    for slot, (_, record, _) in enumerate(cases):
         start = TABLE_BYTE // 4 + slot * 8
         table[start:start + 5] = record
-        if d16:
+        if mode == "d16_xyzw":
             table[start + 3] = FLOAT4 if record[3] == UINT4 else UINT4
     hlsl, cso = directory / "store.hlsl", directory / "store.cso"
 
@@ -106,46 +160,72 @@ def draw(directory, compiler, renderer, backend, d16):
         hlsl.write_text(text, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, hlsl], check=True)
 
-    def run(slot):
+    def run(slot, payload=D16_X_PAYLOADS[0][1], expected_x=D16_X, table_words=table):
         result = [base.SENTINEL] * WORDS
-        for thread, start in enumerate(CASES[slot][2]):
-            # D16 y, z, w are -2, the smallest positive binary16 subnormal, and negative zero.
-            result[start:start + 4] = ([D16_X[thread], 0xc0000000, 0x33800000, 0x80000000] if d16 else
-                                       [thread, 0x12345678, 0x80000001, 0x3F800001])
+        for thread, start in enumerate(cases[slot][2]):
+            if mode == "d16_x":
+                result[start] = expected_x[thread]
+            elif mode == "d16_xyzw":
+                # D16 y, z, w are -2, the smallest positive binary16 subnormal, and negative zero.
+                result[start:start + 4] = [D16_X[thread], 0xc0000000, 0x33800000, 0x80000000]
+            else:
+                result[start:start + 4] = [thread, 0x12345678, 0x80000001, 0x3F800001]
         case = directory / "store.case"
-        case.write_bytes(struct.pack("<321I", 1, *result) + struct.pack("<16I", slot, *([0] * 15))
-                         + struct.pack("<320I", *table))
+        case.write_bytes(struct.pack("<321I", 1, *result) + struct.pack("<16I", slot, payload, *([0] * 14))
+                         + struct.pack("<320I", *table_words))
         return subprocess.run([renderer, backend, "--compute-store-case", cso, case], capture_output=True, text=True)
 
     compile_shader(source)
-    for slot, (label, _, _) in enumerate(CASES):
+    for slot, (label, _, _) in enumerate(cases):
         result = run(slot)
         if result.returncode == 77 and backend == "hardware":
             return 77
-        assert result.returncode == 0, (label, result.stderr)
+        assert result.returncode == 0, (mode, label, result.stderr)
+    extra = 0
+    if mode == "d16_x":
+        for label, payload, want in D16_X_PAYLOADS[1:]:
+            result = run(0, payload=payload, expected_x=want)
+            assert result.returncode == 0, (label, result.stderr)
+            extra += 1
+        # A FLOAT4 format word must be refused just like UINT1 by store_heap_word_d16.
+        wrong_float4 = list(table)
+        wrong_float4[TABLE_BYTE // 4 + 3] = FLOAT4
+        case = directory / "store.case"
+        case.write_bytes(struct.pack("<321I", 1, *([base.SENTINEL] * WORDS)) + struct.pack("<16I", 0, D16_X_PAYLOADS[0][1], *([0] * 14))
+                         + struct.pack("<320I", *wrong_float4))
+        result = subprocess.run([renderer, backend, "--compute-store-case", cso, case], capture_output=True, text=True)
+        assert result.returncode == 0, ("wrong FLOAT4 format", result.stderr)
+        extra += 1
+    width_str = "4u" if mode == "d16_x" else "16u"
     mutations = (
         ("view.x + index * stride + offset", "index * stride + offset", 0),
         (" || index >= view.z", "", 1),
-        ("uint stride = view.y >> 16u;", "uint stride = 24u;", 1),
+        ("uint stride = view.y >> 16u;", "uint stride = 8u;" if mode == "d16_x" else "uint stride = 24u;", 1),
         ("const uint bytes = 512u;", "const uint bytes = 1280u;", 4),
-        ("if (index > (bytes - view.x - offset - 16u) / stride) return;", "", 3),
-        ("view.w != formatWord || ", "", 5),
+        (f"if (index > (bytes - view.x - offset - {width_str}) / stride) return;", "", 3),
+        (f"view.w != {FLOAT1:#x}u || " if mode == "d16_x" else "view.w != formatWord || ", "", 5),
         ("!= 1u) return;", "== 0u) return;", 2),
         (f"slot >= {VIEW[2]}u", f"slot > {VIEW[2]}u", VIEW[2]),
     )
-    if d16:
+    if mode == "d16_xyzw":
         mutations += (
             ("value.x >> 16u", "value.x", 0),
             ("value.y >> 16u", "value.x >> 16u", 0),
             ("if (d16) value =", "if (false) value =", 0),
+        )
+    elif mode == "d16_x":
+        mutations += (
+            ("value & 0xffffu", "value >> 16u", 0),
+            ("asuint(f16tof32(value & 0xffffu))", "value", 0),
+            (f"{FLOAT1:#x}u", f"{FLOAT4:#x}u", 0),
         )
     for old, new, slot in mutations:
         assert source.count(old) == 1, old
         compile_shader(source.replace(old, new))
         result = run(slot)
         assert result.returncode == 1 and "Compute readback differs" in result.stderr, (old, result.stderr)
-    kind = "D16-to-FLOAT4" if d16 else "UINT4"
-    print(f"{backend} {kind}: {len(CASES)} heap-store cases and {len(mutations)} shader mutations checked")
+    kind = {"uint4": "UINT4", "d16_xyzw": "D16-to-FLOAT4", "d16_x": "D16_X-to-FLOAT1"}[mode]
+    print(f"{backend} {kind}: {len(cases) + extra} heap-store cases and {len(mutations)} shader mutations checked")
     return 0
 
 
@@ -158,13 +238,13 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             if mode == "draw":
-                for d16 in (False, True):
-                    result = draw(directory, *args, d16)
+                for kind in ("uint4", "d16_xyzw", "d16_x"):
+                    result = draw(directory, *args, kind)
                     if result:
                         sys.exit(result)
                 sys.exit(0)
             assembler, objcopy, library = args
-            for program in (PROGRAM, D16_PROGRAM):
+            for program in (PROGRAM, D16_PROGRAM, D16_X_PROGRAM):
                 code = base.assemble(directory, assembler, objcopy, program, cpu="gfx1013")
                 verify_binary(directory, code, library, program)
     else:

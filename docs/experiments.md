@@ -5790,11 +5790,11 @@ The view must be live and describe format 75 (`BUF_FMT_32_32_32_32_UINT`) with i
 
 Run `ctest --preset dev -R '^compute_(heap_store_controls|store_aot_heap_view_store_(warp|hardware))$' --output-on-failure`. The fixture checks all 320 readback words across twelve cases. These include distinct live ranges, one texel ending exactly at the u0 limit, and a partial texel that must leave the sentinel intact. Eight mutations exercise the base, stride, record count, format, lifetime, output extent and slot limit. Removing the per-index extent check lets the next thread write past the last complete texel.
 
-### Packed D16 heap-view stores to FLOAT4
+### Packed D16 heap-view stores to FLOAT4 and FLOAT1
 
-With the same `--heap-store-view` binding, gfx1013 `buffer_store_format_d16_xyzw` reads X/Y from the low/high halves of the first VGPR and Z/W from the second. A live identity `BUF_FMT_32_32_32_32_FLOAT` view (format 77) receives four binary32 words. Two source VGPRs still require 16 writable bytes in the destination. An ordinary UINT4 record selected by this opcode leaves the sentinel region untouched. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [HLSL half-to-float conversion](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/f16tof32)
+With the same `--heap-store-view` binding, gfx1013 `buffer_store_format_d16_xyzw` reads X/Y from the low/high halves of the first VGPR and Z/W from the second. A live identity `BUF_FMT_32_32_32_32_FLOAT` view (format 77) receives four binary32 words. Two source VGPRs still require 16 writable bytes in the destination. `buffer_store_format_d16_x` takes one source VGPR, converts its low 16 bits (`& 0xffffu`) via `f16tof32`, and writes one 4-byte binary32 word into a live identity `BUF_FMT_32_FLOAT` view (format 22, `0x01016fac`), enforcing 4-byte offset/stride/base alignment and `(bytes - view.x - offset - 4u) / stride` bounds without a raw UAV read-modify-write. Ordinary UINT views or mismatched four-channel/single-channel FLOAT views leave the sentinel region untouched, and `d16_xy` / `d16_xyz` remain refused under `--heap-store-view`. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [HLSL half-to-float conversion](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/f16tof32)
 
-The heap-store CTest selection above runs both programs. The D16 fixture checks twelve cases with 320 words each. Its reference includes consecutive half values starting at 1, a negative value, the smallest positive half subnormal and negative zero. Eleven compiled shader mutations check addressing, view selection and conversion, including using the low X half for Y, taking W from the wrong VGPR and writing packed values directly.
+The heap-store CTest selection above runs all three programs (`UINT4`, `D16-to-FLOAT4`, and `D16_X-to-FLOAT1`). Each D16 fixture checks 320 words across its heap-view cases (with `D16_X` additionally checking four binary16 payload patterns with poisoned high halves: `1.0`..`1.00293`, `-2.0`.., minimum positive subnormal + `+0.0`, and `-0.0` + negative subnormals, plus `UINT1` and `FLOAT4` mismatch rejections and untouched adjacent sentinel dwords). Eleven compiled shader mutations check addressing, view selection, and half-float extraction, including swapping high for low bits, checking the wrong format word, and writing packed values directly.
 
 ### Heap-view buffer loads
 
@@ -8792,6 +8792,38 @@ fixture repeats the readback with a mesh program under tag 24 and checks that
 a pixel program under the same tag leaves the target clear. The amplified
 fixture passes a group index through an amplification payload and checks the
 same pixels. Adapters without mesh shader support report a capability skip.
+
+With `X2W_MESH_INDIRECT_XMEM=1`, the desktop mesh path can consume one
+12-byte indirect record from a mirrored XMem placement. A COMPUTE list uses
+slot 15 to copy the record from a default-heap UAV buffer into the XMem lease.
+Submission publishes the exact range with a completion fence. The runtime
+checks the live physical page and byte range at slot 61 and again at submission.
+A different queue waits on the writer's fence before executing and retains
+the lease through its own completion fence. This uses the page lease from
+[#2280](https://github.com/R0Y00/Xbox2Windows/pull/2280) and the queue handoff
+from [#2303](https://github.com/R0Y00/Xbox2Windows/pull/2303).
+
+The source-built check reuses the desktop mesh pipeline and compute shader
+from [#1916](https://github.com/R0Y00/Xbox2Windows/pull/1916). The shader writes
+two groups into a scratch UAV. The mirrored XMem record starts with one group.
+With the wait, the DIRECT consumer paints eight pixels. Omitting the wait
+while the COMPUTE queue is held back paints four. Without a submitted writer,
+from a different page in the same placement, or at a different byte offset,
+the runtime refuses the record and all eight pixels stay clear. The CPU view
+shows the three group counts and unchanged guard words after the writer fence.
+A second gated consumer paints eight pixels after the guest mappings are
+removed. XMem can reuse the original slot once that consumer completes.
+
+Release on Windows 10 build 19045.6456 with app-local WARP 1.0.22 and Agility
+SDK 1.620.2 passed both cases with zero D3D12 debug warnings or errors. The
+physical GPU cases returned 77 because the available GTX 1080 Ti lacks mesh
+shader support. The producer behind the application calls in
+[#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412) remains open.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed xmem_shim
+ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_xmem_arguments' -V
+```
 
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
@@ -13032,6 +13064,36 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 - Raw desktop topology rejection: passing raw `0x11` to desktop `CreateGraphicsPipelineState`
   is rejected with `0x80070057` (`E_INVALIDARG`).
 
+### Indirect Draw with a rectangle list
+
+An indirect `Draw` whose recorded topology is `0x11` is forwarded as a triangle-list `ExecuteIndirect`
+([#1999](https://github.com/R0Y00/Xbox2Windows/issues/1999), item E). The producer's GPU-written
+`VertexCountPerInstance` names three vertices per rectangle, so the runtime records a one-thread compute pass
+([`rect_indirect_args.h`](../src/startup_stubs/rect_indirect_args.h)) that writes `count / 3 * 6` (other words
+unchanged) into a scratch record, and the desktop draw reads that record. The title's own argument buffer is not
+modified. A count that would not fit 32 bits becomes 0 vertices. The model is
+`convert_indirect_draw_arguments` in [`rectlist_topology.py`](../tools/rectlist_topology.py).
+
+The scratch record belongs to the recording, not the device: it is created on the recording's first conversion and
+retained by the recording's desktop allocator, which is reused only after every queue that ran the recording has
+passed its fence. Two recordings on two queues therefore never read each other's converted count. The compute pass
+replaces the list's compute root signature and pipeline. The draw is refused while a forwarded desktop compute
+root SRV is still bound. Rebinding the same root or receiving a guest root that is not forwarded does not clear that
+binding. The fixture checks both cases with an untouched rectangle target and a subsequent compute readback.
+An indexed draw with `0x11` is still refused, as in the direct draw. Other console-only topologies are not handled.
+
+```powershell
+cmake --build --preset dev --target startup_indirect_draw_indexed
+ctest --preset dev --no-tests=error -R '^startup_indirect_rectlist_(warp|hardware)$' -V
+```
+
+[The fixture](../tests/startup_indirect_draw_indexed.cpp) (`rect` mode) has a compute producer write one or two
+rectangles into a 4x2 target through a vertex shader that builds `(v0, v1, v2)` and `(v0, v2, v0 + v2 - v1)`. It
+reads the pixels back (left half red, right half green) and the argument words (unchanged). An omitted producer, a
+short argument range, a missing viewport and an overflowing count must leave the target clear. Two threads then
+record and submit one- and two-rectangle draws on separate queues 24 times each; every target must match its own count. Without the
+conversion the runtime refuses the draw and the first case stays clear.
+
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
 
@@ -13270,7 +13332,7 @@ ctest --preset dev --no-tests=error -R '^startup_image_sample_b' -V
 
 The guest sampler's MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) clamp the LOD of every sample form. `tools/startup/gfx2hlsl.py` now carries them for `image_sample`, `image_sample_l` and `image_sample_lz` when the sampler is a constant, through the `smpl` manifest line and `decode_sampler` that `image_sample_b` introduced (#2051); the slice is #2177, split from the run-time heap case (#2221). The three forms share one validation with `image_sample_b`: a descriptor LOD bias (word 2 bits 19:0) and MIN_LOD above MAX_LOD are refused, with the form's own name in the message. Behavior change: a constant sampler with either of those fields set used to translate for these forms (limits ignored) and is now refused. A mip filter of 0 (mipmapping disabled) is not refused for these forms, unlike `image_sample_b` where the bias would count: such a sampler keeps its ordinary `smp` line and its previous behavior. Refusing it would drop every pipeline with an all-zero inline sampler (seven existing check scripts build one); `image_sample_lz` and `_l` with level 0 would be harmless anyway. The one-argument switch is `mip_filter_none_ok` in `Stage.lod_sampler_words`. Also changed: a constant sampler with a non-zero MAX_LOD now clamps the level (it was unbounded before), which is the intended fix.
 
-Not changed: a sampler read through the sampler heap (table or default-sampler shortcut) keeps the ordinary static or heap sampler and is not validated; `translate_to` and `translate_compute` write one line per module to stderr (`<key>: image_sample, image_sample_l through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)`). A sampler that is neither heap nor constant is refused as before. `image_sample_c` keeps its MAX_LOD rule.
+Not changed: a sampler read through the sampler heap (table or default-sampler shortcut) keeps the ordinary static or heap sampler and is not validated; `translate_to` and `translate_compute` write one line per module to stderr (`<key>: image_sample, image_sample_l through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)`). Since then the run-time heap table applies each entry's MIN_LOD and MAX_LOD (`dynamic_sampler()` in `src/startup_stubs/translated_sampler_bindings.h`, checked by `startup_sampler_lod_*`); the entry's LOD bias is not carried, a MIN_LOD above MAX_LOD is passed through unchanged, and the default-sampler shortcut keeps a static sampler with an unbounded LOD range. A sampler that is neither heap nor constant is refused as before. `image_sample_c` keeps its MAX_LOD rule.
 
 `tests/startup_image_sample_lod_check.py` draws each form on its own (`startup_image_sample_lod_warp`, `startup_image_sample_lod_hardware`) against the 4x4, two-slice, three-mip array, point sampler with mip filter point, where all six cells differ. Each form's control is the same program through the ordinary `smp` line, which must read a different mip: `image_sample_l` with explicit level 2 and MAX_LOD 1 reads mip 1 (`smp`: mip 2); `image_sample` with MIN_LOD 2 above the implicit level 1 reads mip 2 (`smp`: mip 1); `image_sample_lz` with MIN_LOD 1 reads mip 1 (`smp`: mip 0). The implicit level 1 comes from the technique of the bias check: only the `u` initialiser of the translated HLSL is replaced by `0.75 + 0.5 * (SV_Position.x - 0.5)`, the `Sample` call is untouched. Refusal controls per form: bias, secondary bias and MIN_LOD 3 above MAX_LOD 2; accepted controls per form: mip filter 0 (`smp` line) and a heap sampler (table and default-sampler shortcut, logged once). The three `image_sample_b` discriminators are unchanged. Not covered: a fractional MIN_LOD or MAX_LOD, a linear mip filter, 1D, 3D and packed `a16` draws, the run-time heap sampler's LOD fields (#2221), and compute stages.
 
@@ -13468,6 +13530,27 @@ predicted failure counts under negative mutations.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_hardware)?$' -V
+```
+
+### Startup compute raw buffer atomics
+
+The startup compute translator lowers 32-bit gfx1013 raw `offen` MUBUF buffer
+atomics (`buffer_atomic_add`, `sub`, `smin`, `umin`, `smax`, `umax`, `and`,
+`or`, `xor`, `swap`, and `cmpswap`) through fixed-table unmodified `RWByteAddressBuffer`
+descriptors (`u0`). Addresses combine the `vaddr` byte offset, optional `soffset`
+register or aligned immediate, and aligned 12-bit `offset` rounded down by
+`& 0xfffffffcu`, guarded under `(exec & 1)` when `EXEC` is narrowed.
+
+`glc` writes the pre-atomic word back to `vdata[0]` (preserving `vdata[1]` on
+`cmpswap`, which reverses the ISA `(replacement, compare)` register pair to HLSL's
+`(compare, replacement)` order). `buffer_atomic_sub` emits `InterlockedAdd(a, (0u - val))`,
+and `smin`/`smax` use signed `asint` overloads. `idxen`, missing `offen`, `slc`/`dlc`,
+unaligned immediate offsets, modified or aliased descriptors, non-compute stages,
+and `inc`/`dec`/float/64-bit forms stay refused.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_buffer_atomics(_warp|_hardware)?$' -V
 ```
 
 ## Startup translator: fixed-mip 2D comparison gathers

@@ -1256,6 +1256,7 @@ endforeach()
 
 add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_draw_indexed PRIVATE cxx_std_17)
+target_include_directories(startup_indirect_draw_indexed PRIVATE src)
 target_link_libraries(startup_indirect_draw_indexed PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_draw_indexed_${backend} COMMAND startup_indirect_draw_indexed ${backend})
@@ -1271,7 +1272,15 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_mesh_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
     add_test(NAME startup_indirect_mesh_console_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh-console)
     add_test(NAME startup_indirect_mesh_amplified_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh-amplified)
-    set_tests_properties(startup_indirect_draw_indexed_${backend} startup_indirect_draw_${backend} PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_indirect_mesh_xmem_arguments_${backend}
+        COMMAND startup_indirect_draw_indexed ${backend} mesh-xmem-arguments)
+    add_test(NAME startup_indirect_mesh_xmem_arguments_skip_wait_${backend}
+        COMMAND startup_indirect_draw_indexed ${backend} mesh-xmem-arguments-skip-wait)
+    set_tests_properties(startup_indirect_mesh_xmem_arguments_${backend} startup_indirect_mesh_xmem_arguments_skip_wait_${backend}
+        PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "X2W_MESH86_FIXTURE_XMEM=$<TARGET_FILE:xmem_shim>")
+    add_test(NAME startup_indirect_rectlist_${backend} COMMAND startup_indirect_draw_indexed ${backend} rect)
+    set_tests_properties(startup_indirect_draw_indexed_${backend} startup_indirect_draw_${backend}
+        startup_indirect_rectlist_${backend} PROPERTIES TIMEOUT 30)
     set_tests_properties(startup_indirect_mesh_${backend} startup_indirect_mesh_console_${backend}
         startup_indirect_mesh_amplified_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_draw_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
@@ -1283,7 +1292,8 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_translated_indexed_alias_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_indexed_alias_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
-set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware
+    startup_indirect_rectlist_hardware PROPERTIES SKIP_RETURN_CODE 77)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_mesh_request_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
     add_test(NAME startup_indirect_mesh_create_result_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
@@ -2747,6 +2757,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py")
     add_test(NAME startup_compute_gather_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_gather_l_check.py")
+    add_test(NAME startup_compute_buffer_atomics COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_buffer_atomics_check.py")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
     add_test(NAME startup_image_gather_c_lz COMMAND "${INTAKE_PYTHON}" -B
@@ -4801,6 +4813,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_fp_move_original_lifted>"
         "$<TARGET_FILE:cpu_avx_fp_move_altered_lifted>")
     set_tests_properties(cpu_aot_avx_fp_move PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_avx_test_exports
+        "op_vptest_xmm_reg,op_vptest_xmm_mem,op_vptest_ymm_reg,op_vptest_ymm_mem,"
+        "op_vtestps_xmm_reg,op_vtestps_xmm_mem,op_vtestps_ymm_reg,op_vtestps_ymm_mem,"
+        "op_vtestpd_xmm_reg,op_vtestpd_xmm_mem,op_vtestpd_ymm_reg,op_vtestpd_ymm_mem,"
+        "op_vptest_ymm_after_xmm_zero,op_vtestps_ymm_after_xmm_zero,op_vtest_self,op_vtest_r8_store_reload")
+    string(CONCAT cpu_avx_test_exports ${cpu_avx_test_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_test_${variant} avx_test)
+        cpu_translation(cpu_avx_test_${variant} cpu_avx_test_aot "${cpu_avx_test_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_test_altered PRIVATE ALTER_TEST)
+    add_test(NAME cpu_aot_avx_test COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_test_check.py"
+        "$<TARGET_FILE:cpu_avx_test_original>"
+        "$<TARGET_FILE:cpu_avx_test_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_test_altered>"
+        "$<TARGET_FILE:cpu_avx_test_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_test PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_test.txt")
     set(cpu_sse_mmx_int_exports
         "op_pavgb_mm_reg,op_pavgb_mm_mem,op_pavgb_mm_mem_plus1,op_pavgb_mm_self,"
         "op_pavgw_mm_reg,op_pavgw_mm_mem,op_pavgw_mm_mem_plus1,op_pavgw_mm_self,"
@@ -5140,6 +5172,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_vex_words_ext PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_vex_words_ext.txt")
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_vex_bytes_${variant} vex_bytes)
+        set(vex_bytes_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_bytes_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${vex_bytes_lifted}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_vex_aot.py"
+                "$<TARGET_FILE:cpu_vex_bytes_${variant}>" "${vex_bytes_lifted}"
+                pandn_reg pandn_mem pavgb_reg pavgb_mem pmaddubsw_reg pmaddubsw_mem
+                pshufb_reg pshufb_mem bytes_mem_r8_chain bytes_aligned
+            DEPENDS cpu_vex_bytes_${variant} tools/cpu_vex_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_library(cpu_vex_bytes_${variant}_lifted SHARED "${vex_bytes_lifted}")
+    endforeach()
+    target_compile_definitions(cpu_vex_bytes_altered PRIVATE ALTER_BYTES)
+    add_test(NAME cpu_aot_vex_bytes COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/vex_bytes_check.py"
+        "$<TARGET_FILE:cpu_vex_bytes_original>" "$<TARGET_FILE:cpu_vex_bytes_original_lifted>"
+        "$<TARGET_FILE:cpu_vex_bytes_altered>" "$<TARGET_FILE:cpu_vex_bytes_altered_lifted>")
+    set_tests_properties(cpu_aot_vex_bytes PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_vex_bytes.txt")
     set(cpu_seg_inspect_exports
         "lar_reg16,lar_reg32,lar_reg64,lar_mem16,lar_mem32_disp,lar_mem64_disp,"
         "lsl_reg16,lsl_reg32,lsl_reg64,lsl_mem16,lsl_mem32_disp,lsl_mem64_disp,"
@@ -7725,6 +7777,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/gfx10_texture_roundtrip_check.py" controls)
     add_test(NAME texture_bc_volume COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/texture_bc_volume_check.py")
+    add_test(NAME texture_descriptors_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/texture_descriptors_check.py")
     add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
     add_test(NAME ttpf_batch_export COMMAND "${INTAKE_PYTHON}" -B
@@ -7735,12 +7789,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/sgd5_effects_check.py")
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
+    add_test(NAME rdna2_cli_checks COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/disasm_rdna2_cli_check.py")
     add_test(NAME pso_readiness_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pso_readiness_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
     add_test(NAME depth_mask_aot_cli COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/depth_mask_aot_cli_check.py")
+    add_test(NAME extract_shaders_cli COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/extract_shaders_cli_check.py")
     # #369: the built cs_6_0 array-atomics probe keeps nonUniformIndex on its atomic's handle.
     add_test(NAME array_atomics_dxil COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/array_atomics_dxil_check.py" "${DXC_EXECUTABLE}"
@@ -8767,6 +8825,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_gather_l_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_compute_gather_l_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_buffer_atomics_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_buffer_atomics_check.py" --dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_buffer_atomics_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_image_gather_c_lz_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_image_gather_c_lz_check.py" --draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)

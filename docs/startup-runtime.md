@@ -1944,8 +1944,10 @@ These are measured on one executable; treat them as hypotheses for others.
 - `image_sample`, `image_sample_l` and `image_sample_lz` through a constant sampler carry the descriptor's MIN_LOD and MAX_LOD
   through the same `smpl` line (#2177). A constant sampler with a LOD bias or MIN_LOD above MAX_LOD is now refused for these forms;
   a mip filter of 0 is not (the sampler stays an ordinary `smp` line). A sampler from the heap, including the default-sampler
-  shortcut, still translates as before with an unbounded LOD range: its MIN_LOD, MAX_LOD and bias are not validated, and
-  `gfx2hlsl.py` logs that once per translated module (#2221). `image_sample_c` is unchanged.
+  shortcut, still translates as before: its MIN_LOD, MAX_LOD and bias are not validated, and `gfx2hlsl.py` logs that once per
+  translated module (#2221). With the sampler-heap opt-in, a table entry applies its MIN_LOD and MAX_LOD at run time (see the
+  sampler-heap item above); its LOD bias is not carried, and a MIN_LOD above MAX_LOD is passed through unchanged. The
+  default-sampler shortcut keeps a static sampler with an unbounded LOD range. `image_sample_c` is unchanged.
   `ctest --preset dev --no-tests=error -R '^startup_image_sample_lod'` draws each form on its own against a plain-`smp` control
   (`docs/experiments.md`, "constant-sampler LOD limits").
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
