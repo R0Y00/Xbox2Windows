@@ -1,5 +1,24 @@
 # Experiment notes and reproduction commands
 
+## Desktop culling and front-face winding
+
+`raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles
+into an 8×4 float target. Each triangle covers six pixel centers. The pixel shader
+writes green for a front face and red for a back face. Uncovered and culled pixels
+retain the clear value. The test compares all four channels at all 32 positions
+for each combination of none/front/back culling and clockwise/counterclockwise
+front faces. Four wrong-state comparisons check the number of differing pixels
+when culling is ignored, front/back culling is exchanged, or winding is reversed.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -V -R '^raster_winding_(warp|hardware)$'
+```
+
+The log includes the adapter, driver, and debug-layer availability for each
+backend. When enabled, the debug layer must report zero warnings and errors for
+every draw. The fixture sets desktop PSO fields directly.
+
 ## Present color producer trace
 
 Set `X2W_RED_PRODUCER_AUTO=3700,12` and `X2W_PRESENT_SIGNATURE_EVERY=1` to sample the
