@@ -1495,6 +1495,45 @@ def check_dpp_f16_cvt_fmac_ldexp_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_sdwa_f16_forms():
+    """The 14 contracted binary16 SDWA forms count as covered once the translator accepts their
+    fixtures; unlowered binary16 SDWA neighbours stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in (*pixel.SDWA_F16_PROGRAMS.values(), pixel.SDWA_F16_CVT_F32_BODY):
+            pixel.translate_f16(pixel.uncompressed_export(body))
+        ops = (
+            "v_add_f16_sdwa", "v_sub_f16_sdwa", "v_subrev_f16_sdwa", "v_mul_f16_sdwa",
+            "v_ldexp_f16_sdwa", "v_floor_f16_sdwa", "v_ceil_f16_sdwa", "v_trunc_f16_sdwa",
+            "v_rndne_f16_sdwa", "v_cvt_f16_f32_sdwa", "v_cvt_f16_i16_sdwa", "v_cvt_f16_u16_sdwa",
+            "v_cvt_i16_f16_sdwa", "v_cvt_u16_f16_sdwa",
+        )
+        forms = {("SDWA", op) for op in ops}
+        assert len(forms) == 14
+        neighbours = {
+            ("SDWA", "v_min_f16_sdwa"), ("SDWA", "v_max_f16_sdwa"),
+            ("SDWA", "v_fract_f16_sdwa"), ("SDWA", "v_rcp_f16_sdwa"),
+            ("SDWA", "v_cvt_norm_i16_f16_sdwa"), ("SDWA", "v_cvt_norm_u16_f16_sdwa"),
+            ("SDWA", "v_cvt_pkrtz_f16_f32_sdwa"), ("SDWA", "v_frexp_mant_f16_sdwa"),
+            ("SDWA", "v_frexp_exp_i16_f16_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        # Control: removing one opcode removes its SDWA form from the count.
+        stripped = pixel.ACCEPTED - {"v_ldexp_f16_sdwa"}
+        assert ("SDWA", "v_ldexp_f16_sdwa") not in fc.gfx_forms(stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1517,6 +1556,7 @@ if __name__ == "__main__":
     check_f16_to_int16_forms()
     check_dpp_f16_arith_round_forms()
     check_dpp_f16_cvt_fmac_ldexp_forms()
+    check_sdwa_f16_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sdwa_cmp_coverage()

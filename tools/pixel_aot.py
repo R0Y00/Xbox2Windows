@@ -2988,6 +2988,152 @@ SDWA_INT_OPERANDS = re.compile(
     rf"(v\d+), {SDWA_INT_SOURCE}(?:, {SDWA_INT_SOURCE})? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
     r" dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
     r"(?: src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD))?")
+SDWA_F16_SRC = re.compile(r"(-?)(?:abs\(([vs]\d+)\)|\|([vs]\d+)\||([vs]\d+))")
+SDWA_F16_UNARY_OPERANDS = re.compile(
+    r"(v\d+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
+    r" dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
+SDWA_F16_BINARY_OPERANDS = re.compile(
+    r"(v\d+), ([^,\s]+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
+    r" dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
+    r" src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
+
+
+def half16_sdwa_source(token, sel, scalar, vector, pending, sample_dest, known_ssa_bits, known_half):
+    """Parse one float register source of a binary16 SDWA op under the static finite-proof contract.
+
+    Accepts a VGPR or SGPR with optional bit-15 abs/neg modifiers and WORD_0, WORD_1 or DWORD selection
+    (refusing BYTE_* and sext()). A ("half16", name) source only permits WORD_0 so the undefined high
+    half is never read. Returns (hlsl_u16_expr, proven_u16_bits).
+    """
+    if sel not in ("WORD_0", "WORD_1", "DWORD"):
+        raise ValueError(f"Unsupported binary16 SDWA source selection: {sel}")
+    if token.startswith("sext("):
+        raise ValueError(f"Unsupported binary16 SDWA source modifier: {token}")
+    m = SDWA_F16_SRC.fullmatch(token)
+    if not m:
+        raise ValueError(f"Unsupported binary16 SDWA operand: {token}")
+    neg, abs_fn, abs_bars, plain = m.groups()
+    reg = abs_fn or abs_bars or plain
+    use_abs = bool(abs_fn or abs_bars)
+    idx = int(reg[1:])
+    if not 0 <= idx <= (255 if reg[0] == "v" else 105):
+        raise ValueError(f"Register out of range: {reg}")
+    if reg in pending:
+        raise ValueError("Constant read before load completion")
+    if reg in sample_dest:
+        raise ValueError("Sample used before vmcnt wait")
+    if reg[0] == "s":
+        value = scalar.get(reg)
+        if not isinstance(value, int):
+            raise ValueError(f"binary16 operand lacks a finite proof: {reg}")
+        full_bits, word = value & 0xffffffff, f"{value & 0xffffffff}u"
+    else:
+        value = vector.get(reg)
+        if isinstance(value, str) and value in known_ssa_bits:
+            full_bits, word = known_ssa_bits[value] & 0xffffffff, f"asuint({value})"
+        elif (name := half16_name(reg, vector)) is not None:
+            if sel != "WORD_0":
+                raise ValueError("Reads the undefined high half of a 16-bit result")
+            if name not in known_half:
+                raise ValueError(f"binary16 operand lacks a finite proof: {reg}")
+            full_bits, word = known_half[name] & 0xffff, f"asuint({name})"
+        else:
+            raise ValueError(f"binary16 operand lacks a finite proof: {reg}")
+    bits = (full_bits >> 16) & 0xffff if sel == "WORD_1" else full_bits & 0xffff
+    if (bits >> 10) & 0x1f == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {reg}")
+    hlsl_bits = f"((({word}) >> 16u) & 0xffffu)" if sel == "WORD_1" else f"(({word}) & 0xffffu)"
+    if use_abs:
+        bits &= 0x7fff
+        hlsl_bits = f"({hlsl_bits} & 0x7fffu)"
+    if neg:
+        bits ^= 0x8000
+        hlsl_bits = f"({hlsl_bits} ^ 0x8000u)"
+    return hlsl_bits, bits
+
+
+def int16_sdwa_source(token, sel, scalar, vector, pending, sample_dest, known_ssa_bits):
+    """Parse one integer register source of a binary16 SDWA op (optional sext(), no float modifiers).
+
+    Accepts a VGPR or SGPR with BYTE_0..3, WORD_0..1 or DWORD selection. A ("low16", name) source is
+    restricted to WORD_0, BYTE_0 or BYTE_1; a ("half16", name) source is rejected. Returns
+    (hlsl_selected_u32_expr, known_low16_or_None).
+    """
+    if token.startswith(("-", "|", "abs(")):
+        raise ValueError(f"Source modifiers are not allowed on {token}")
+    m = re.fullmatch(SDWA_INT_SOURCE, token)
+    if not m or bool(m.group(1)) != bool(m.group(3)):
+        raise ValueError(f"Unsupported SDWA integer operand: {token}")
+    is_sext, reg = bool(m.group(1)), m.group(2)
+    idx = int(reg[1:])
+    if not 0 <= idx <= (255 if reg[0] == "v" else 105):
+        raise ValueError(f"Register out of range: {reg}")
+    if reg in pending:
+        raise ValueError("Constant read before load completion")
+    if reg in sample_dest:
+        raise ValueError("Sample used before vmcnt wait")
+    if reg[0] == "s":
+        value = scalar.get(reg)
+        if isinstance(value, int):
+            full_bits, word = value & 0xffffffff, f"{value & 0xffffffff}u"
+        else:
+            word = int_operand(reg, scalar, vector, pending, sample_dest, signed=False)
+            full_bits = None
+    elif (low_name := low16_name(reg, vector)) is not None:
+        if sel not in ("WORD_0", "BYTE_0", "BYTE_1"):
+            raise ValueError("Reads the undefined high half of a 16-bit result")
+        word, full_bits = f"asuint({low_name})", None
+    elif half16_name(reg, vector) is not None:
+        raise ValueError("Expected a numeric register")
+    else:
+        if reg not in vector:
+            raise ValueError(f"Untracked 16-bit source: {reg}")
+        word = int_operand(reg, scalar, vector, pending, sample_dest, signed=False)
+        value = vector[reg]
+        full_bits = known_ssa_bits[value] & 0xffffffff if isinstance(value, str) and value in known_ssa_bits else None
+    hlsl_word = sdwa_source(word, sel, is_sext)
+    if full_bits is None:
+        return hlsl_word, None
+    offset, width = SDWA_SEL[sel]
+    raw_field = (full_bits >> offset) & ((1 << width) - 1)
+    if is_sext and width < 32 and (raw_field >> (width - 1)) & 1:
+        selected = (raw_field | (~((1 << width) - 1) & 0xffffffff)) & 0xffffffff
+    else:
+        selected = raw_field
+    return hlsl_word, selected & 0xffff
+
+
+def emit_sdwa_f16_dest(lines, i, dst, result_u16_expr, dst_sel, unused, vector, known_ssa_bits, known_half,
+                       *, tag, known_result=None):
+    """Emit the SDWA destination placement for a 16-bit binary16 or int16 result.
+
+    dst_sel:DWORD keeps the low-16-only contract (("half16", alu) or ("low16", alu)) because bits 31:16
+    are unspecified. dst_sel:WORD_0 and WORD_1 with UNUSED_PAD or UNUSED_PRESERVE define all 32 bits,
+    updating known_ssa_bits whenever the full 32-bit result is statically known.
+    """
+    if dst_sel not in ("DWORD", "WORD_0", "WORD_1"):
+        raise ValueError(f"Unsupported 16-bit SDWA destination selection: {dst_sel}")
+    if unused == "UNUSED_SEXT":
+        raise ValueError("UNUSED_SEXT is not lowered")
+    if dst_sel == "DWORD":
+        lines.append(f"    precise float alu{i} = asfloat({result_u16_expr});")
+        vector[dst] = (tag, f"alu{i}")
+        if tag == "half16" and known_result is not None:
+            known_half[f"alu{i}"] = known_result & 0xffff
+        return
+    old = vector.get(dst) if unused == "UNUSED_PRESERVE" else None
+    if isinstance(old, tuple) and old[0] in ("low16", "half16"):
+        raise ValueError("Reads the undefined high half of a 16-bit result")
+    dest_expr = sdwa_dest(result_u16_expr, dst_sel, unused, old)
+    lines.append(f"    precise float alu{i} = asfloat({dest_expr});")
+    vector[dst] = f"alu{i}"
+    if known_result is not None:
+        shift = 16 if dst_sel == "WORD_1" else 0
+        if unused == "UNUSED_PAD":
+            known_ssa_bits[f"alu{i}"] = (known_result & 0xffff) << shift
+        elif old in known_ssa_bits:
+            keep = 0x0000ffff if dst_sel == "WORD_1" else 0xffff0000
+            known_ssa_bits[f"alu{i}"] = (known_ssa_bits[old] & keep) | ((known_result & 0xffff) << shift)
 
 
 class VectorRegisters(dict):
@@ -5184,6 +5330,171 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             result = sdwa_dest(f"({template.format(*args)})", dst_sel, unused, vector.get(dst))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
+        elif m := match(r"v_cvt_f16_f32_sdwa (.+)"):
+            # SDWA binary32-to-binary16 conversion under the declared entry profile (half_denorm="preserve"
+            # and HW_REG_MODE RNE). Takes a whole-dword register source (so f32 denormal mode never touches
+            # a zero-extended sub-dword) with optional bit-31 abs/neg modifiers.
+            rest = m.group(1)
+            parsed = SDWA_F16_UNARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_cvt_f16_f32_sdwa {rest}")
+            dst, src0, dst_sel, unused, sel0 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if sel0 != "DWORD":
+                raise ValueError(f"v_cvt_f16_f32_sdwa requires src0_sel:DWORD, got {sel0}")
+            if src0.startswith("sext("):
+                raise ValueError(f"Unsupported binary16 SDWA source modifier: {src0}")
+            sm = SDWA_F16_SRC.fullmatch(src0)
+            if not sm:
+                raise ValueError(f"Unsupported binary16 SDWA operand: {src0}")
+            neg, abs_fn, abs_bars, plain = sm.groups()
+            reg = abs_fn or abs_bars or plain
+            if not 0 <= int(reg[1:]) <= (255 if reg[0] == "v" else 105):
+                raise ValueError(f"Register out of range: {reg}")
+            val = fp_operand(reg, scalar, vector, pending, sample_dest)
+            bits = f"asuint({val})"
+            if abs_fn or abs_bars:
+                bits = f"({bits} & 0x7fffffffu)"
+            if neg:
+                bits = f"({bits} ^ 0x80000000u)"
+            emit_sdwa_f16_dest(lines, i, dst, f"narrow16(asfloat({bits}))", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16")
+        elif m := match(rf"v_({'|'.join(VOP2_F16)})_f16_sdwa (.+)"):
+            # SDWA binary16 VOP2 arithmetic under the static finite-proof contract (#839). Both sources
+            # select WORD_0, WORD_1 or DWORD with optional bit-15 abs/neg modifiers.
+            name, rest = m.groups()
+            parsed = SDWA_F16_BINARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_{name}_f16_sdwa {rest}")
+            dst, src0, src1, dst_sel, unused, sel0, sel1 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            s1_bits, b1 = half16_sdwa_source(
+                src1, sel1, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_vop2_result(name, b0, b1)
+            if result is None:
+                raise ValueError(f"binary16 result overflows: v_{name}_f16_sdwa")
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    uint hf{i}_1 = {s1_bits};")
+            expression = VOP2_F16[name].format(f"widen16(hf{i}_0)", f"widen16(hf{i}_1)")
+            lines.append(f"    precise float hs{i} = {expression};")
+            emit_sdwa_f16_dest(lines, i, dst, f"narrow16(hs{i})", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16", known_result=result)
+        elif m := match(r"v_ldexp_f16_sdwa (.+)"):
+            # SDWA binary16 exponent scaling (D = S0 * 2^S1): float src0 with optional abs/neg and
+            # WORD_0/WORD_1/DWORD selection; integer src1 with optional sext() and any SDWA selection,
+            # statically proven within [-LDEXP_F16_EXPONENT_LIMIT, LDEXP_F16_EXPONENT_LIMIT].
+            rest = m.group(1)
+            parsed = SDWA_F16_BINARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_ldexp_f16_sdwa {rest}")
+            dst, src0, src1, dst_sel, unused, sel0, sel1 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            _, known = int16_sdwa_source(src1, sel1, scalar, vector, pending, sample_dest, known_ssa_bits)
+            if known is None:
+                raise ValueError(f"binary16 ldexp exponent lacks a proof: {src1}")
+            exponent = known - 0x10000 if known & 0x8000 else known
+            if abs(exponent) > LDEXP_F16_EXPONENT_LIMIT:
+                raise ValueError(f"binary16 ldexp exponent out of range: {exponent}")
+            result = f16_ldexp_result(b0, exponent)
+            if result is None:
+                raise ValueError("binary16 result overflows: v_ldexp_f16_sdwa")
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0) * asfloat({(127 + exponent) << 23}u);")
+            emit_sdwa_f16_dest(lines, i, dst, f"narrow16(hs{i})", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16", known_result=result)
+        elif m := match(rf"v_({'|'.join(VOP1_F16_ROUND)})_f16_sdwa (.+)"):
+            # SDWA binary16 VOP1 rounding under the static finite-proof contract (#839).
+            name, rest = m.groups()
+            parsed = SDWA_F16_UNARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_{name}_f16_sdwa {rest}")
+            dst, src0, dst_sel, unused, sel0 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_round_result(name, b0)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float hs{i} = {VOP1_F16_ROUND[name].format(f'widen16(hf{i}_0)')};")
+            emit_sdwa_f16_dest(lines, i, dst, f"narrow16(hs{i})", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16", known_result=result)
+        elif m := match(r"v_cvt_f16_(i16|u16)_sdwa (.+)"):
+            # SDWA 16-bit integer to binary16 conversion (round to nearest even): integer src0 with
+            # optional sext() and any SDWA selection. Runtime i16 is always finite; u16 requires a
+            # static proof < 65520 after selection/sign-extension.
+            kind, rest = m.groups()
+            parsed = SDWA_F16_UNARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_cvt_f16_{kind}_sdwa {rest}")
+            dst, src0, dst_sel, unused, sel0 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            signed = kind == "i16"
+            selected_word, known = int16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits)
+            result = None
+            if known is not None:
+                result = f16_cvt_int_result(signed, known)
+                if result is None:
+                    raise ValueError(f"binary16 result overflows: v_cvt_f16_{kind}_sdwa")
+            elif not signed:
+                raise ValueError(f"binary16 conversion source lacks a range proof: {src0}")
+            word = f"(asint(({selected_word}) << 16) >> 16)" if signed else f"(({selected_word}) & 0xffffu)"
+            lines.append(f"    {'int' if signed else 'uint'} cv{i}_0 = {word};")
+            lines.append(f"    precise float hs{i} = float(cv{i}_0);")
+            emit_sdwa_f16_dest(lines, i, dst, f"narrow16(hs{i})", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16", known_result=result)
+        elif m := match(r"v_cvt_(i16|u16)_f16_sdwa (.+)"):
+            # SDWA binary16 to 16-bit integer conversion (truncation toward zero): statically proven
+            # finite float src0 whose truncated integer lies in range.
+            kind, rest = m.groups()
+            parsed = SDWA_F16_UNARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_cvt_{kind}_f16_sdwa {rest}")
+            dst, src0, dst_sel, unused, sel0 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_to_int_result(kind == "i16", b0)
+            if result is None:
+                raise ValueError(f"binary16 value out of range: v_cvt_{kind}_f16_sdwa")
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0);")
+            lines.append(f"    int cv{i}_0 = int(trunc(hs{i}));")
+            emit_sdwa_f16_dest(lines, i, dst, f"(asuint(cv{i}_0) & 0xffffu)", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="low16", known_result=result)
         elif m := match(r"v_(lshlrev_b64|lshrrev_b64|ashrrev_i64)(?:_e64)? (v\[\d+:\d+\]), ([^,\s]+), ([^,\s]+)"):
             # VOP3 64-bit shifts (issue #928): D = S1 << S0[5:0], S1 >> S0[5:0], or signext(S1) >> S0[5:0]
             # (AMD RDNA 2 ISA §12.12, opcodes 767-769). The 64-bit value is two 32-bit words. Both source words

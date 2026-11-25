@@ -59,6 +59,9 @@ Contract = namedtuple('Contract', 'live_in ij_pairs split16 ambiguous', defaults
 # Forms whose operands are all sources even though the first one may be a vector register.
 ALL_SOURCE_PREFIXES = ('v_cmp', 'ds_write', 'v_nop')
 READ_WRITE = ('v_swap_b32', 'v_swaprel_b32')
+# Forms that also read their destination: the multiply-accumulate and dot-accumulate forms add to it, and
+# v_writelane_b32 keeps every other lane of it.
+DESTINATION_READ_PREFIXES = ('v_mac_', 'v_fmac_', 'v_pk_fmac_', 'v_dot2c_', 'v_dot4c_', 'v_dot8c_', 'v_writelane_b32')
 UNKNOWN_FLOW = ('s_setpc_b64', 's_swappc_b64', 's_rfe_b64', 's_call_b64')
 
 
@@ -108,7 +111,7 @@ def parse_instruction(asm):
         ops[0] = ops[0].partition(' ')[2]
     destination = operand_vregs(ops[0]) if ops else None
     has_destination = destination is not None and not all_source(base) and base not in READ_WRITE
-    sources = ops[1:] if has_destination else ops
+    sources = ops[1:] if has_destination and not base.startswith(DESTINATION_READ_PREFIXES) else ops
     if base in READ_WRITE:   # both operands are read, then both are rewritten
         writes = [span for span in map(operand_vregs, ops) if span]
     else:
