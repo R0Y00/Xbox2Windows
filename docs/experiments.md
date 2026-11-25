@@ -6211,6 +6211,12 @@ On the invalid runs, these mutated sources must fail:
 
 Dropping only the -1 clamp is not observable: long division of 32768 by 32767 also gives 1.0. With the lowering removed, or with its channel count changed, the translation controls fail. LLVM 15 assembles the fixture, and `lower` of the disassembly and the CLI output both match `lower` of the source.
 
+The seven matching and fourteen intentionally wrong references use the same shader. The fixture passes
+them to `offscreen_check <adapter> --compute-store-batch <shader.cso> <case.bin>...` in order. They share
+one D3D12 device, root signature and pipeline. Each case gets fresh buffers, submits its own dispatch and
+compares all 320 words after the fence. The renderer reports `pass`, `mismatch` or `error` for each case
+and exits with status 1 if any case fails. The eleven shader mutations still compile and dispatch separately.
+
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_(store_aot_descriptor_load_format_|load_format_controls$)' -V
@@ -14165,11 +14171,20 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cselect_mask_controls$
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mask_overwrite_controls$' -V
 ```
 
+## Startup translator: lane masks used as vector data
+
+The one-lane model stores a mask as the current lane's bit. RDNA 2 reads the whole mask word when the register is
+a data source. For example, after `v_cmp_eq_u32_e64 s[30:31], 0, v0`, reading s30 as data gives
+`0xffffffff` if all 32 lanes pass. The translator refuses lane masks in either data operand of
+`v_cndmask_b32` and in the source of `v_mov_b32`, including SDWA DWORD. Source modifiers still identify the
+underlying mask register. Lane masks remain valid as selectors, and ordinary scalar words remain valid as data.
+The synthetic controls run under `startup_gfx2hlsl_mask_data_controls`.
+
 ## Startup translator: 32-bit add and subtract with a carry out
 
 `tools/startup/gfx2hlsl.py` refused the VOP3b forms `v_add_co_u32`, `v_sub_co_u32` and `v_subrev_co_u32` as unknown instructions. It now lowers them from the AMD RDNA 2 ISA description: `D = S0 + S1` with the carry out of bit 31, `D = S0 - S1` with a borrow when `S1 > S0`, and `SUBREV` with the sources swapped. These forms take no carry-in. The carry goes to the lane's bit of VCC or of the SGPR destination, which becomes a lane mask and is never a uniform source. The result and the carry are computed into the scratch registers `a` and `w` before either destination is written, so a destination may overlap a source. When `exec` is not known, an inactive lane keeps D and writes a 0 carry, as the compare lowering does. `clamp`, other modifiers, an EXEC carry-out and a wrong operand count are refused.
 
-`tests/startup_gfx2hlsl_add_sub_co_check.py` decodes synthetic VOP3b words for the three forms with an SGPR and a VCC carry-out, evaluates the emitted lines with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py` on a grid of edge values, and compares them with Python references written from the ISA description. It also checks that the carry-out SGPR is a lane mask, that a readfirstlane of a copy of it is refused, the exec-masked form, an overlapping destination and the refusals. Negative control: a borrow with the comparison reversed disagrees with the reference on the grid. On the translator before this change every form is refused. Test: `startup_gfx2hlsl_add_sub_co_controls`. Not covered: DXC compilation and a draw through a translated pipeline; the check evaluates the emitted HLSL text only.
+`tests/startup_gfx2hlsl_add_sub_co_check.py` decodes synthetic VOP3b words for the three forms with an SGPR and a VCC carry-out, evaluates the emitted lines with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py` on a grid of edge values, and compares them with Python references written from the ISA description. It also checks that the carry-out SGPR is a lane mask, that moving it as vector data is refused, the exec-masked form, an overlapping destination and the refusals. Negative control: a borrow with the comparison reversed disagrees with the reference on the grid. On the translator before this change every form is refused. Test: `startup_gfx2hlsl_add_sub_co_controls`. Not covered: DXC compilation and a draw through a translated pipeline; the check evaluates the emitted HLSL text only.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_add_sub_co_controls$' -V
@@ -14301,6 +14316,17 @@ The same executable checks `OMSetStencilRef` (command-list slot 24, the desktop 
 ```powershell
 cmake --build --preset release --target startup_stream_depth
 ctest --preset release --no-tests=error -R '^startup_stream_depth_(warp|hardware)$' -V
+```
+
+## Startup translator: null-target export after a colour export
+
+`exp null, off, off, off, off done vm` writes no channel. The `vm` flag still emits the existing discard outside the entry execution mask, so a pixel shader that only discards keeps its kill; the null target itself adds no `SV_Target` and no write mask. A null export after `mrt0` leaves the colour target intact. `tests/startup_gfx2hlsl_export_null_check.py` covers the translation, classification and refusals. `tests/startup_gfx2hlsl_export_null_draw_check.py draw <dxc> <offscreen_check> <warp|hardware>` compiles a null-after-`mrt0` stage with DXC `ps_6_0`, draws 4x4 pixels, and compares all 64 words with the four constants the fixture writes; a control that writes `mrt0` from the null site must produce a pixel mismatch. Limits: this is translation and a mixed null-plus-colour draw, not a runtime PSO test with zero render-target views.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+python -B tests/startup_gfx2hlsl_export_null_check.py
+python -B tests/startup_gfx2hlsl_export_null_draw_check.py draw "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe" out/build/release/offscreen_check.exe warp
+ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_export_null' -V
 ```
 
 ## Startup translator: depth-comparison image sampling
