@@ -301,7 +301,11 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
                 found.append(f"--translate: the {what} was still running after run.sh exited")
     else:
         if "--translate" in switches:
-            time.sleep(1)  # the stub debugger does not wait for a watcher here
+            # The stub debugger does not wait for a watcher here. A started watcher needs a
+            # Python start-up to write watch.json, which can take over a second on a loaded runner.
+            deadline = time.time() + 5
+            while not watch.is_file() and time.time() < deadline:
+                time.sleep(0.05)
         if watch.is_file():
             found.append(f"{label}: the translator started without --render --translate")
     return found
