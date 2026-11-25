@@ -4399,7 +4399,7 @@ class Stage:
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
             axes = 3 if three else 2
             packed_2d = how == 'load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
-            packed_d16 = how == 'load' and 'd16' in mods
+            packed_d16 = how in ('load', 'load_mip') and 'd16' in mods
             allowed = ('unorm', 'glc', 'slc', 'dlc')
             if packed_2d:
                 allowed += ('a16',)
@@ -4411,14 +4411,15 @@ class Stage:
             if unsupported or wrong_address or not dmask:
                 raise Unsupported('image_%s address or modifiers: %s' % (how, ' '.join(mods)))
             if packed_d16:
+                op_name = 'image_' + how
                 expected_dst = (bin(dmask).count('1') + 1) // 2
                 if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != expected_dst or dst[2] > 255:
-                    raise Unsupported('image_load d16 destination %s for dmask %#x' % (ops[0], dmask))
+                    raise Unsupported('%s d16 destination %s for dmask %#x' % (op_name, ops[0], dmask))
                 res = self.pipe.resources[desc_key]
                 if res['index'] in self.pipe.srv_formats:
                     fmt = self.pipe.srv_formats[res['index']]
                     if fmt not in D16_EXACT_SRV_FORMATS:
-                        raise Unsupported('image_load d16 unsupported SRV format %d' % fmt)
+                        raise Unsupported('%s d16 unsupported SRV format %d' % (op_name, fmt))
             if packed_2d:
                 packed = self.u(cs[0])
                 address = ['%s & 0xffffu' % packed, '%s >> 16' % packed]
@@ -4497,7 +4498,7 @@ class Stage:
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)
-        if how == 'load' and 'd16' in mods:
+        if how in ('load', 'load_mip') and 'd16' in mods:
             res = self.pipe.resources[desc_key]
             res['d16_exact'] = True
             mode_arg = 'ud%d' % self.pipe.ud(('d16unorm16', res['index']))
@@ -6179,8 +6180,8 @@ SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 UINT_RTVS = frozenset((3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62))
 SINT_RTVS = frozenset((4, 8, 14, 18, 32, 38, 43, 52, 59, 64))
 FLOAT32_RTVS = frozenset((2, 6, 16, 41))
-# DXGI_FORMAT values independently verified exact for D16 image_load, matching d16_srv_mode()
-# in src/startup_stubs/d16_image_format.h (#2023): 32-bit float and 8-bit UNORM views (exact via
+# DXGI_FORMAT values independently verified exact for D16 image_load and image_load_mip, matching
+# d16_srv_mode() in src/startup_stubs/d16_image_format.h (#2023): 32-bit float and 8-bit UNORM views (exact via
 # pack16_rne) plus 16-bit UNORM views (exact via pack16_unorm16).
 D16_FLOAT_EXACT_SRV_FORMATS = frozenset((2, 6, 16, 21, 28, 41, 49, 61, 65, 87, 88))
 D16_UNORM16_SRV_FORMATS = frozenset((11, 35, 56))
