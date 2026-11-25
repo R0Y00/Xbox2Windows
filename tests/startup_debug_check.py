@@ -3,7 +3,8 @@
 X2W_STOP_AT stops at a chosen main-image breakpoint while --continue-asserts steps over the
 others, X2W_DUMP_AT writes thread stacks at a time during the run, and X2W_VALLOC_MIN logs large
 virtual-memory allocations with their callers. X2W_LOG_AT captures registers and qwords at a
-function entry, then removes the breakpoint at the hit limit. The launcher keeps the debug heap off unless
+function entry, then removes the breakpoint at the hit limit. A `stop` file created in the log directory
+ends the run as the timeout does; one left from an earlier run is removed at start. The launcher keeps the debug heap off unless
 the caller sets _NO_DEBUG_HEAP=0. tests/startup_debug_probe.cpp is the main input: it hits two
 breakpoints, reserves 256 MiB, prints its debug-heap flags, waits 3 s and exits 0.
 
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = Path(__file__).resolve().parents[1]
 DEBUG = REPO / "tools/startup/debug_launch.py"
@@ -45,6 +47,28 @@ def run(probe, work, name, variables, options=("--continue-asserts", "10")):
     command = [sys.executable, "-B", str(DEBUG), str(probe), str(work), str(logdir), "--timeout", "30", "--console", "0", *options]
     result = subprocess.run(command, capture_output=True, text=True, timeout=120, env=env)
     return result.stdout + result.stderr, logdir
+
+
+def run_with_stop(probe, work, name):
+    """Create <logdir>/stop once the launcher records the running probe."""
+    logdir = work / name
+    env = {k: v for k, v in os.environ.items() if not k.startswith("X2W_") and k.upper() != "_NO_DEBUG_HEAP"}
+    command = [sys.executable, "-B", str(DEBUG), str(probe), str(work), str(logdir), "--timeout", "0", "--console", "0",
+               "--continue-asserts", "10"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    try:
+        deadline = time.monotonic() + 10
+        while f"process {probe.name} at " not in text(logdir / "events.txt"):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("stop-file probe did not start")
+            time.sleep(0.025)
+        (logdir / "stop").write_text("", encoding="utf-8")
+        out, _ = process.communicate(timeout=120)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    return out, logdir
 
 
 def text(path):
@@ -157,6 +181,20 @@ def main(probe, calls_dll):
         assert "process exited with 0x00000000" in out, out
         assert "rip=" in text(logdir / "threads_1.txt"), text(logdir / "threads_1.txt")
         assert not (work / "baseline" / "threads_1.txt").exists()
+
+        # <logdir>/stop ends the run with thread stacks even when the timer is disabled, while the probe
+        # (which waits 3 s) is still alive. Control: a stop file left in the directory before the run is removed at
+        # start, so that run exits normally.
+        out, logdir = run_with_stop(probe, work, "stop-file")
+        assert "stopped by request after" in out and "process exited" not in out, out
+        assert "stop file found" in text(logdir / "events.txt"), text(logdir / "events.txt")
+        assert "rip=" in text(logdir / "threads.txt"), text(logdir / "threads.txt")
+        stale = work / "stop-stale"
+        stale.mkdir(exist_ok=True)
+        (stale / "stop").write_text("", encoding="utf-8")
+        out, logdir = run(probe, work, "stop-stale", {})
+        assert "process exited with 0x00000000" in out and "stopped by request" not in out, out
+        assert not (logdir / "stop").exists(), "stale stop file kept"
 
         # X2W_VALLOC_MIN: the 256 MiB reservation is logged with a caller in the probe; a higher
         # threshold logs nothing.
