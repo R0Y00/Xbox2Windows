@@ -1934,6 +1934,19 @@ foreach(mutation IN ITEMS no-limit no-state no-root-args no-pairing no-bound)
     add_test(NAME startup_list_dispatch_${mutation}_control COMMAND startup_list_dispatch_check --mutate ${mutation})
     set_tests_properties(startup_list_dispatch_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# The same slot driven through the stand-in on a desktop device: one refusal line per refused case, and the
+# forwarded calls counted by a pipeline-statistics query on the desktop list.
+add_executable(startup_list_dispatch_native tests/startup_list_dispatch_native.cpp)
+target_compile_features(startup_list_dispatch_native PRIVATE cxx_std_17)
+target_link_libraries(startup_list_dispatch_native PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_list_dispatch_native_${backend} COMMAND startup_list_dispatch_native ${backend})
+    set_tests_properties(startup_list_dispatch_native_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
+# Negative control: without slot 43 the first forwarded case is refused, and the fixture must report it.
+add_test(NAME startup_list_dispatch_native_skip_srv_warp_control COMMAND startup_list_dispatch_native warp skip-srv)
+set_tests_properties(startup_list_dispatch_native_skip_srv_warp_control PROPERTIES TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "bound: expected no Dispatch line, got 1 Dispatch line\\(s\\)[\r\n]+  x2w-render Dispatch\\(2, 3, 1\\) refused: a compute root SRV is not bound")
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_store.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
