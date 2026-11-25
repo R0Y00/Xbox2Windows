@@ -1,10 +1,10 @@
 // Source-built control for runtime_gpa_patch.h: which PE imports the gaming-runtime proxy notices.
 //
-// The stand-in must catch GetProcAddress and a direct xgameruntime.dll!QueryApiImpl on the regular
-// import table, report delay-import hits with delay_import set (without treating the delay IAT as a
-// real export), and ignore ordinal thunks. A synthetic PE32+ image is walked; the mutated control
-// classifies by import name alone (accepting QueryApiImpl from other.dll) and must fail. No Windows
-// loader and no game files.
+// Which PE imports the stand-in notices on the EXE / package-helper import tables: GetProcAddress and
+// a direct xgameruntime.dll!QueryApiImpl on the regular import table, delay-import hits with
+// delay_import set (without treating the delay IAT as a real export), and ordinal thunks ignored.
+// A synthetic PE32+ image is walked; the mutated control classifies by import name alone (accepting
+// QueryApiImpl from other.dll) and must fail. No Windows loader and no game files.
 #include "startup_stubs/runtime_gpa_patch.h"
 
 #include <cstdint>

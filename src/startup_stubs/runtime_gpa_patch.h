@@ -1,12 +1,13 @@
 // Experimental (docs/startup-runtime.md): which PE imports the gaming-runtime proxy considers.
 //
 // The GameInput-hosted proxy used to patch only the main EXE's GetProcAddress IAT. A title that
-// resolves QueryApiImpl through another module's GetProcAddress (or that imports QueryApiImpl from
+// resolves QueryApiImpl through a package helper's GetProcAddress (or that imports QueryApiImpl from
 // xgameruntime.dll by name) never hits that hook, so FakeUser / X2W_TRACE_API see no providers.
 // This header lists the import shapes to notice — regular and delay-import tables. The stand-in
-// rewrites only regular IAT slots: a delay IAT holds a delay-load thunk until first use, so treating
-// it as GetProcAddress or QueryApiImpl is wrong. Ordinal imports are ignored. Pure walk helpers —
-// no Windows calls — so a source-built control can check them.
+// rewrites only regular IAT slots on the EXE and package-directory helpers: a delay IAT holds a
+// delay-load thunk until first use, so treating it as GetProcAddress or QueryApiImpl is wrong.
+// Ordinal imports are ignored. Pure walk helpers — no Windows calls — so a source-built control can
+// check them.
 #pragma once
 
 #include <cstddef>
