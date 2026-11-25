@@ -1530,6 +1530,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh86_srv_proof_check.py"
         "${DXC_EXECUTABLE}" "${CMAKE_CURRENT_BINARY_DIR}")
     set_tests_properties(startup_mesh86_srv_proof PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_indirect_mesh_lease_warp_dual-trace COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
+        "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" warp
+        "$<TARGET_FILE:xmem_shim>" dual-trace)
+    set_tests_properties(startup_indirect_mesh_lease_warp_dual-trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_indirect_mesh_cache_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
@@ -2969,6 +2974,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl refuses a binary32 or integer vector operation with a source too few or too many.
     add_test(NAME startup_gfx2hlsl_operand_count COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_operand_count_check.py")
+    # gfx2hlsl refuses a scalar ALU operation whose operand list is too short.
+    add_test(NAME startup_gfx2hlsl_scalar_arity COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_arity_check.py")
     # gfx2hlsl lowers v_swap_b32 (VOP1): CPU evaluation of the translated text, refusals of every form llvm-mc rejects.
     add_test(NAME startup_gfx2hlsl_swap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_swap_check.py")
@@ -2981,6 +2989,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_gfx2hlsl_watch PROPERTIES TIMEOUT 120)
     add_test(NAME startup_gfx2hlsl_handler_arity COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_handler_arity_check.py")
+    # gfx2hlsl names why s_getpc_b64 is refused instead of reporting the mnemonic alone.
+    add_test(NAME startup_gfx2hlsl_getpc_refusal COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_getpc_refusal_check.py")
     # Image instructions with fewer than three operands (#2360 follow-up): the handler refused
     # them as an index error before it checked the count.
     add_test(NAME startup_gfx2hlsl_image_arity COMMAND "${INTAKE_PYTHON}" -B
@@ -4280,6 +4291,47 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_loops>" "$<TARGET_FILE:cpu_fuzz_loops_lifted>" "${cpu_fuzz_loops_o2}"
         --area loops --mutant "$<TARGET_FILE:cpu_fuzz_loops_mutant>")
     set_tests_properties(cpu_aot_fuzz_loops PROPERTIES TIMEOUT 60)
+
+    # Straight-line x87 code through the shared lowering's x87 profile, with FSUBR lowered as FSUB planted.
+    set(CPU_FUZZ_X87_SEED "0x8087" CACHE STRING "Seed for the CPU differential fuzz x87 test")
+    set(CPU_FUZZ_X87_FUNCTIONS "40" CACHE STRING "Number of exported functions in the CPU differential fuzz x87 test")
+    set(cpu_fuzz_x87_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87.asm")
+    set(cpu_fuzz_x87_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_x87_asm}" "${cpu_fuzz_x87_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_X87_SEED}" "${CPU_FUZZ_X87_FUNCTIONS}" "${cpu_fuzz_x87_asm}"
+            "${cpu_fuzz_x87_def}" --area x87
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_x87 SHARED "${cpu_fuzz_x87_asm}" "${cpu_fuzz_x87_def}")
+    set_target_properties(cpu_fuzz_x87 PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_x87 PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_x87_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_lifted.cpp")
+    set(cpu_fuzz_x87_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_x87_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_X87_SEED}" "${CPU_FUZZ_X87_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_x87>"
+                "${cpu_fuzz_x87_${variant}}" --area x87 ${mutant_flag}
+            DEPENDS cpu_fuzz_x87 tools/fuzz_cpu.py tools/ffx_version_query.py tools/x87_lower.py tools/x87_soft.h
+                tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_x87_${variant} SHARED "${cpu_fuzz_x87_${variant}}")
+        target_compile_features(cpu_fuzz_x87_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_x87_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_x87_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_x87_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_x87_lifted_o2.obj" "/Fe${cpu_fuzz_x87_o2}"
+        DEPENDS "${cpu_fuzz_x87_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_x87_lifted_o2 ALL DEPENDS "${cpu_fuzz_x87_o2}")
+    add_test(NAME cpu_aot_fuzz_x87 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_X87_SEED}" "${CPU_FUZZ_X87_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_x87>" "$<TARGET_FILE:cpu_fuzz_x87_lifted>" "${cpu_fuzz_x87_o2}"
+        --area x87 --mutant "$<TARGET_FILE:cpu_fuzz_x87_mutant>")
+    set_tests_properties(cpu_aot_fuzz_x87 PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
@@ -5919,6 +5971,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_bmi2_shift.txt")
 
+    # cpu_aot_bmi1_bit
+    set(cpu_bmi1_aot_exports
+        "op_blsi32,op_blsi64,op_blsmsk32,op_blsmsk64,op_blsr32,op_blsr64,"
+        "op_blsi32_mem,op_blsi64_mem,op_blsmsk32_mem,op_blsmsk64_mem,op_blsr32_mem,op_blsr64_mem,"
+        "op_blsi32_flags,op_blsi64_flags,op_blsmsk32_flags,op_blsmsk64_flags,"
+        "op_blsr32_flags,op_blsr64_flags,op_blsr64_mem_flags,"
+        "op_r8_source_then_store,op_bmi1_discarded_read")
+    string(CONCAT cpu_bmi1_aot_exports ${cpu_bmi1_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_bmi1_aot_${variant} bmi1_aot)
+        cpu_translation(cpu_bmi1_aot_${variant} cpu_bmi1_aot "${cpu_bmi1_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_bmi1_aot_altered PRIVATE ALTER_BMI1)
+    add_test(NAME cpu_aot_bmi1_bit COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bmi1_aot_check.py"
+        "$<TARGET_FILE:cpu_bmi1_aot_original>"
+        "$<TARGET_FILE:cpu_bmi1_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_bmi1_aot_altered>"
+        "$<TARGET_FILE:cpu_bmi1_aot_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_bmi1_bit PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_bmi1_bit.txt")
+
     cpu_asm_fixture(cpu_sse2_packed_cvt sse2_packed_cvt)
     target_sources(cpu_sse2_packed_cvt PRIVATE tests/cpu/sse2_mxcsr_test.asm)
     set(sse2_packed_cvt_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse2_packed_cvt_lifted.cpp")
@@ -6093,6 +6169,30 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_crypto_aes_pclmul COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/crypto_aes_pclmul.py"
         check "$<TARGET_FILE:cpu_crypto_aes_pclmul>" "$<TARGET_FILE:cpu_crypto_aes_pclmul_lifted>")
     set_tests_properties(cpu_aot_crypto_aes_pclmul PROPERTIES SKIP_RETURN_CODE 77)
+
+    # cpu_aot_sha256
+    set(cpu_sha256_aot_exports
+        "op_sha256rnds2_reg,op_sha256rnds2_mem,op_sha256rnds2_mem_r8,"
+        "op_sha256rnds2_self_src,op_sha256rnds2_dst_xmm0,op_sha256rnds2_src_xmm0,op_sha256rnds2_all_xmm0,"
+        "op_sha256msg1_reg,op_sha256msg1_mem,op_sha256msg1_self,"
+        "op_sha256msg2_reg,op_sha256msg2_mem,op_sha256msg2_self,"
+        "op_sha256_pipeline,op_sha256_discarded_read")
+    string(CONCAT cpu_sha256_aot_exports ${cpu_sha256_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sha256_aot_${variant} sha256_aot)
+        cpu_translation(cpu_sha256_aot_${variant} cpu_sha256_aot "${cpu_sha256_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sha256_aot_altered PRIVATE ALTER_SHA256)
+    add_test(NAME cpu_aot_sha256 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sha256_aot_check.py"
+        "$<TARGET_FILE:cpu_sha256_aot_original>"
+        "$<TARGET_FILE:cpu_sha256_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_sha256_aot_altered>"
+        "$<TARGET_FILE:cpu_sha256_aot_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_sha256 PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_sha256.txt")
 
     cpu_asm_fixture(cpu_fma_scalar fma_scalar)
     set(fma_scalar_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_fma_scalar_lifted.cpp")
@@ -8245,6 +8345,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/ttpf_batch_export_check.py")
     add_test(NAME audio_awc_metadata COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/awc_metadata_check.py")
+    add_test(NAME audio_awc_metadata_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/awc_metadata_cli_check.py")
     add_test(NAME sgd5_effect_candidates COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/sgd5_effects_check.py")
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
@@ -8272,6 +8374,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/mesh_clip_cull_check.py")
     add_test(NAME mesh_dynamic_aot_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_aot_check.py")
+    add_test(NAME mesh_dynamic_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_aot_cli_check.py")
     add_test(NAME mesh_lane_spill_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_lane_spill_check.py")
     add_test(NAME mesh_entry_skipped_scalar_cpu COMMAND "${INTAKE_PYTHON}" -B
@@ -8285,6 +8389,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME mesh_amplification_refusal COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_amplification_refusal_check.py")
     set_tests_properties(mesh_amplification_refusal PROPERTIES TIMEOUT 30)
+    add_test(NAME mesh_entry_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_entry_aot_cli_check.py")
     foreach(adapter IN ITEMS hardware warp)
         add_test(NAME mesh_dynamic_aot_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_aot_draw_check.py" "${DXC_EXECUTABLE}"
