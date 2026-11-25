@@ -229,7 +229,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             # Negative controls: each wrong lowering must read a different image than the reference.
             wrong = {
                 'the overwritten slot keeps its first value': mutate(text, r'sp10_0 = s5;', 'sp10_0 = sp10_0;'),
-                'lane 31 reads lane 0 of the same VGPR': mutate(text, r'= sp10_31;', '= sp10_0;'),
+                # A constant slot folds into the export, so the wrong lane shows up as lane 0's word there.
+                'lane 31 reads lane 0 of the same VGPR': mutate(text, r'v2 = 0x40400000u', 'v2 = 0x40200000u'),
                 'another VGPR at lane 0 reads v10': mutate(text, r'= sp11_0;', '= sp10_0;'),
                 'no reload (the clobbered SGPR stays)': mutate(text, r'(s9) = sp12_7;', r'\1 = 0;'),
             }
