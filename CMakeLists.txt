@@ -2265,6 +2265,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # reference; floating-point SDWA forms and unsupported modifiers are refused. The draws are registered below.
     add_test(NAME startup_gfx2hlsl_vopc_sdwa COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vopc_sdwa_check.py")
+    # DPP16 quad broadcasts quad_perm:[k,k,k,k] (#2125): lowered to QuadReadLaneAt, so the pixel stage compiles as
+    # ps_6_0; the controls and refusals run here, the draws below compare every pixel with a CPU reference.
+    add_test(NAME startup_gfx2hlsl_dpp_quad_broadcast COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_broadcast_check.py")
     # f32 lg/nlg ordered for NaN (#1920): every f32 condition, e32 and e64 under every neg/abs, evaluated over
     # +-0, denormals, +-1, +-max, +-inf and NaNs against the ISA reference; the old != lowering must fail.
     add_test(NAME startup_gfx2hlsl_f32_lg COMMAND "${INTAKE_PYTHON}" -B
@@ -2408,6 +2412,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_vopc_sdwa_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_vopc_sdwa_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_gfx2hlsl_dpp_quad_broadcast_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_broadcast_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_dpp_quad_broadcast_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_gfx2hlsl_sdwa_cvt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)

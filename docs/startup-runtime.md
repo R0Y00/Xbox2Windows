@@ -1082,6 +1082,18 @@ These are measured on one executable; treat them as hypotheses for others.
   integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
   that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
   the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
+- **DPP quad broadcasts.** `quad_perm:[k,k,k,k]` for k = 0, 1 or 2 (and 3), with full `row_mask` and
+  `bank_mask` and `bound_ctrl:1` or none, lowers on `v_mov_b32` and the VOP1/VOP2 float, integer and
+  integer-to-float tables as one read of lane k of the quad, `QuadReadLaneAt`. The four lanes of a pixel
+  quad are one 2 x 2 pixel block (lane = x & 1 | (y & 1) << 1). The lowering applies to straight-line pixel
+  stages with a known entry mask only, where no lane of the quad can be off. `QuadReadLaneAt` is shader model
+  6.0, so such a pixel stage compiles as `ps_6_0` with DXC (set `X2W_DXC`, or put `dxc.exe` in the Windows
+  Kits `bin` folder or on `PATH`); every other pixel stage stays `ps_5_1` with FXC. Swaps, pair broadcasts,
+  row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages stay
+  refused. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast"`: the controls
+  check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
+  fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.
+  [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path

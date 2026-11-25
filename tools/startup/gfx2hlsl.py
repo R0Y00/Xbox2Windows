@@ -362,6 +362,7 @@ class Stage:
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
+        self.quad_ops = False     # pixel: a DPP quad broadcast was lowered to QuadReadLaneAt (needs ps_6_0)
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
@@ -704,6 +705,8 @@ class Stage:
         handler = getattr(self, 'op_' + base, None)
         if handler:
             return handler(ops, mods)
+        if base.endswith('_dpp'):
+            return self.dpp(base[:-len('_dpp')], ops, mods)
         if base.startswith('v_cmp'):
             # Before the VOP1/VOP2 SDWA route below: VOPC SDWA names also end in _sdwa.
             return self.compare(base, ops, mods)
@@ -743,6 +746,63 @@ class Stage:
             # the root signature layout, while the descriptor table is supplied at draw time.
             raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
+
+    # VOP1/VOP2 with DPP16 quad broadcast (#2125 item A): quad_perm:[k,k,k,k] makes every lane read SRC0 from
+    # lane k of its own quad (RDNA 2 ISA, "DPP": a lane reads lane (lane & ~3) | perm[lane & 3] of the row; LLVM 15
+    # AMDGPU DPP quad_perm). A pixel stage's four consecutive lanes are a 2x2 pixel quad (lane = x & 1 | (y & 1) << 1),
+    # which is what SM 6.0 QuadReadLaneAt(value, k) reads, so the stage is compiled as ps_6_0 (Stage.quad_ops).
+    # Accepted only where the whole quad is active: a straight-line pixel stage whose EXEC is still the entry mask,
+    # which covers helper lanes. bound_ctrl then has nothing to decide (the source lane is never disabled), so it is
+    # accepted and ignored. Everything else a DPP word can say stays refused: other controls (swaps, pair
+    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, fi, and a vertex stage.
+    DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
+    DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
+
+    def dpp(self, base, ops, mods):
+        fields, rest = {}, []
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key in ('quad_perm', 'row_mask', 'bank_mask', 'bound_ctrl') and value and key not in fields:
+                fields[key] = value
+            elif m in self.DPP_OUTPUT_MODS:
+                rest.append(m)
+            else:
+                raise Unsupported('%s_dpp with modifier %s' % (base, m))
+        lanes = re.fullmatch(r'\[([0-3]),([0-3]),([0-3]),([0-3])\]', fields.get('quad_perm', ''))
+        if not lanes or len(set(lanes.groups())) != 1:
+            raise Unsupported('%s_dpp %s: only quad_perm:[k,k,k,k] broadcasts are lowered'
+                              % (base, fields.get('quad_perm', 'without quad_perm')))
+        if fields.get('row_mask') != '0xf' or fields.get('bank_mask') != '0xf':
+            raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
+        if fields.get('bound_ctrl', '1') != '1':
+            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
+        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', [])
+                or not getattr(self, 'exec_known', False)):
+            raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        if base != 'v_mov_b32' and base not in VEC_F and base not in VEC_U and base not in VEC_U_TO_F:
+            raise Unsupported('DPP form of %s' % base)
+        if len(ops) < 2:
+            raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
+        token = ops[1]
+        neg = token.startswith('-') and base in VEC_F
+        token = token[1:] if neg else token
+        absolute = token.startswith('|') and token.endswith('|') and base in VEC_F
+        token = token[1:-1] if absolute else token
+        source = reg_range(token)
+        if not source or source[0] != 'v' or source[1] != source[2]:
+            raise Unsupported('%s_dpp source %s is not a VGPR' % (base, ops[1]))
+        # Modifiers apply to the value the lane read, so they stay on the rewritten operand.
+        rewritten = 'v%d' % self.DPP_TEMP
+        rewritten = '|%s|' % rewritten if absolute else rewritten
+        rewritten = '-' + rewritten if neg else rewritten
+        self.quad_ops = True
+        self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
+        operands = [ops[0], rewritten] + ops[2:]
+        if base == 'v_mov_b32':
+            if rest or len(operands) != 2:
+                raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
+            return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
+        return self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
@@ -2259,6 +2319,10 @@ class Pipeline:
         out += ['    o.pos = p.pos + r.pos - q.pos;', '    return o;', '}']
         return '\n'.join(out) + '\n'
 
+    def ps_profile(self):
+        """The shader profile the pixel stage compiles with: ps_6_0 once it holds a quad read, else ps_5_1."""
+        return 'ps_6_0' if self.ps.quad_ops else 'ps_5_1'
+
     def hlsl_ps(self):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
@@ -2345,6 +2409,27 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
+def find_dxc():
+    """The dxc.exe for a pixel stage that needs shader model 6.0, or None. Order: X2W_DXC, the newest
+    KITS_BIN/<version>/x64, then PATH."""
+    configured = os.environ.get('X2W_DXC')
+    if configured and os.path.isfile(configured):
+        return configured
+    versions = []
+    try:
+        for entry in os.listdir(KITS_BIN):
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', entry):
+                versions.append((tuple(map(int, entry.split('.'))), entry))
+    except OSError:
+        pass
+    for _, entry in sorted(versions, reverse=True):
+        candidate = os.path.join(KITS_BIN, entry, 'x64', 'dxc.exe')
+        if os.path.isfile(candidate):
+            return candidate
+    import shutil
+    return shutil.which('dxc.exe') or shutil.which('dxc')
+
+
 def has_bytecode(path):
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
@@ -2379,10 +2464,20 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         import subprocess
         # An existing manifest can already point at these paths. Publish only bytecode from a successful pair.
         with tempfile.TemporaryDirectory(prefix='.fxc-', dir=out_dir) as staging:
-            for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
+            for stage, profile in (('vs', 'vs_5_1'), ('ps', pipe.ps_profile())):
                 bytecode = os.path.join(staging, stage + '.cso')
-                r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage],
-                                   capture_output=True, text=True)
+                if profile == 'ps_5_1':
+                    command = [fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage]
+                else:
+                    # A quad read has no shader model 5.1 spelling: DXC compiles the pixel stage, the vertex
+                    # stage stays DXBC (a graphics pipeline state may mix the two).
+                    dxc = find_dxc()
+                    if dxc is None:
+                        open(name + '.fail', 'w').write('dxc.exe not found (X2W_DXC=%s): the pixel stage needs %s\n'
+                                                        % (os.environ.get('X2W_DXC', '<unset>'), profile))
+                        return 'dxc.exe not found for a %s pixel stage' % profile
+                    command = [dxc, '-nologo', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.%s.hlsl' % stage]
+                r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
                     open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))
