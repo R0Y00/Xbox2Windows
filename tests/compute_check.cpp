@@ -346,7 +346,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
                     store->axis(2), capacity, mismatches);
     else std::printf("layout=%s output_words=%u guard_words=%u mismatches=%u\n",
                 tables ? "tables" : "root", active, capacity - active, mismatches);
-    if (mismatches) throw std::runtime_error("Compute readback differs from CPU reference");
+    if (mismatches) throw ReadbackMismatch("Compute readback differs from CPU reference");
 }
 
 void check_compute(ID3D12Device* device, bool tables)
