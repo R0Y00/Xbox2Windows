@@ -21,7 +21,8 @@ The decoder takes the exception code, the parameters and a `read_mem(address, si
 so it has no Win32 dependency and runs the same on Linux and Windows. It never returns an address, a path
 or a name from the title: the record has the decorated name of a built-in scalar or of a public standard
 library or COM type, `other` for any other class, and for a thrown 32-bit scalar the HRESULT as a public
-name (E_INVALIDARG, DXGI_ERROR_DEVICE_REMOVED, ...) or HRESULT(0x...) and its facility category.
+name (E_INVALIDARG, DXGI_ERROR_DEVICE_REMOVED, ...) and its facility category. A failure-looking value that
+is not a recognized public HRESULT is only classified as `unrecognized_failure`, never printed.
 Uses only the Python 3 standard library.
 """
 
@@ -81,7 +82,8 @@ HRESULT_NAMES = {
     0x887E0003: "D3D12_ERROR_INVALID_REDIST",
 }
 FACILITY_CATEGORIES = {0x007: "win32", 0x87A: "dxgi", 0x87E: "d3d12"}
-SMALL_VALUE_LIMIT = 0xFFFF  # a non-HRESULT scalar above this could be anything, so no number is reported
+UNRECOGNIZED_HRESULT = "unrecognized_failure"
+SMALL_VALUE_LIMIT = 0xFFFF # a non-HRESULT scalar above this could be anything, so no number is reported
 
 
 def hresult_name(value: int) -> str:
@@ -224,9 +226,12 @@ def decode_throw(exception_code: int, params: Sequence[int], read_mem: ReadMem, 
 
 def _describe_value(c_type: str, bits: int) -> dict:
     """What a thrown 32-bit scalar says: a failure HRESULT by name and facility, a small number, or just 'large'."""
-    if bits in HRESULT_NAMES or bits & 0x80000000:
-        return {"c_type": c_type, "hresult": hresult_name(bits), "category": hresult_category(bits),
+    if bits in HRESULT_NAMES:
+        return {"c_type": c_type, "hresult": HRESULT_NAMES[bits], "category": hresult_category(bits),
                 "code": "0x%08X" % bits}
+    if bits & 0x80000000:
+        # Not a recognized public HRESULT: it can be private application data, so no bits, code or facility.
+        return {"c_type": c_type, "hresult": UNRECOGNIZED_HRESULT, "category": UNRECOGNIZED_HRESULT}
     if bits <= SMALL_VALUE_LIMIT:
         return {"c_type": c_type, "number": bits, "category": "success" if bits == 0 else "number"}
     return {"c_type": c_type, "category": "number", "number": None}

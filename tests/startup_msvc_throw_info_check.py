@@ -83,8 +83,6 @@ for hresult, name, category in (
     (0x887A0006, "DXGI_ERROR_DEVICE_HUNG", "dxgi"),
     (0x887E0002, "D3D12_ERROR_DRIVER_VERSION_MISMATCH", "d3d12"),
     (0x800705AF, "HRESULT_FROM_WIN32(ERROR_COMMITMENT_LIMIT)", "win32"),
-    (0x80041234, "HRESULT(0x80041234)", "other"),
-    (0x887A9999, "HRESULT(0x887A9999)", "dxgi"),
 ):
     params, mem = build([".J"], long_value(hresult))
     record = decode(params, mem)
@@ -106,6 +104,18 @@ check("a large positive number is not reported", decode(params, mem)["value"]["n
       and "12345678" not in json.dumps(decode(params, mem)))
 params, mem = build([".J"], long_value(0))
 check("zero is S_OK", decode(params, mem)["value"]["hresult"] == "S_OK")
+
+# 2b. A high-bit scalar that is not a recognized public HRESULT can be private data: no bits in any output.
+for sentinel in (0xDEADBEEF, 0x80041234, 0x887A9999, 0xCAFE0001):
+    params, mem = build([".J"], long_value(sentinel))
+    record = decode(params, mem)
+    text = json.dumps(record) + m.describe(record)
+    hex_digits = "%08X" % sentinel
+    check(f"unrecognized {sentinel:#010x} is classified without its bits",
+          record["value"] == {"c_type": "long", "hresult": "unrecognized_failure", "category": "unrecognized_failure"}
+          and hex_digits not in text.upper() and str(sentinel) not in text and str(sentinel - (1 << 32)) not in text, text)
+    check(f"unrecognized {sentinel:#010x}: describe line",
+          m.describe(record) == "msvc-throw ok types=.J count=1 long=unrecognized_failure category=unrecognized_failure")
 
 # 3. Records that are not decoded.
 params, mem = build([".J"])
@@ -201,7 +211,7 @@ check("a name that ends before unreadable memory", decode(params, mem)["status"]
 
 # 8. Nothing that identifies the run leaves the decoder: no address, no path, no number over 32 bits.
 records = []
-for hresult in (0x80070057, 0x887A0005, 0x80041234, 0x12345678):
+for hresult in (0x80070057, 0x887A0005, 0x80041234, 0xDEADBEEF, 0x12345678):
     params, mem = build([".J", ".?AVSecret@@"], long_value(hresult), sizes=[4, 4])
     records.append(decode(params, mem))
 records.append(decode(*build([".?AVruntime_error@std@@"], sizes=[24])))
