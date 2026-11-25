@@ -12,12 +12,14 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -430,6 +432,34 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
+// Two runs on two threads share one guest device, whose recording state is not meant to be driven from two threads
+// at once. The gate serializes everything except the GPU phase and releases both submits together, so the two
+// queues run their conversions at the same time.
+struct Gate {
+    std::mutex state;
+    std::mutex wait_lock;
+    std::condition_variable changed;
+    int arrived = 0;
+    unsigned generation = 0;
+    bool aborted = false;
+    void meet() {
+        std::unique_lock<std::mutex> guard(wait_lock);
+        const unsigned mine = generation;
+        if (++arrived == 2) {
+            arrived = 0;
+            ++generation;
+            changed.notify_all();
+            return;
+        }
+        changed.wait(guard, [&] { return aborted || generation != mine; });
+    }
+    void abort() {
+        std::lock_guard<std::mutex> guard(wait_lock);
+        aborted = true;
+        changed.notify_all();
+    }
+};
+
 enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered,
                      alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
@@ -547,8 +577,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
-         UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false)
+         UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false, Gate* gate = nullptr)
 {
+    std::unique_lock<std::mutex> recording;
+    if (gate) recording = std::unique_lock<std::mutex>(gate->state);
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool translated_indexed = translated && indexed;
     const UINT indexed_argument_offset = translated_indexed && draw_right ? 8 : argument_offset;
@@ -875,7 +907,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         }
     }
     check(closed, "close guest command list");
+    if (gate) {
+        recording.unlock();
+        gate->meet();
+    }
     submit(device, list);
+    if (gate) recording.lock();
 
     if (restore_compute) {
         const D3D12_RANGE read{0, 4}, none{0, 0};
@@ -1510,14 +1547,16 @@ int main(int argc, char** argv) try
         // Two recordings on two queues convert different argument counts at the same time. Each must draw its own
         // count: the conversion scratch belongs to the recording, never to the device.
         std::atomic<bool> concurrent_ok{true};
+        Gate gate;
         const auto worker = [&](ID3D12PipelineState* producer, bool draw_right, const char* label) {
             try {
                 for (int round = 0; round < 24 && concurrent_ok; ++round)
                     if (!run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
-                             kind, draw_right, Refusal::none, label)) concurrent_ok = false;
+                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr, false, &gate)) concurrent_ok = false;
             } catch (...) {
                 concurrent_ok = false;
             }
+            if (!concurrent_ok) gate.abort();
         };
         std::thread one(worker, left.Get(), false, "concurrent one rectangle");
         std::thread two(worker, right.Get(), true, "concurrent two rectangles");
