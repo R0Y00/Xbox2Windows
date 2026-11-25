@@ -166,6 +166,9 @@ struct XGameSaveBlob {
     std::uint8_t* data;
 };
 
+// Public XGameSave.h callback: return false to stop the enumeration.
+using XGameSaveBlobInfoCallback = bool CALLBACK(const XGameSaveBlobInfo*, void*);
+
 // Shim-only observability interface. It is not a GDK API.
 struct XGameRuntimeShimLogEntry {
     std::uint32_t sequence;
@@ -200,6 +203,8 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XGameSaveSubmitBlobWrite, XGameSave, HRESULT, (XGameSaveUpdateHandle updateContext, const char* blobName, const std::uint8_t* data, std::size_t byteCount), implemented_hr, (updateContext, blobName, data, byteCount), game_save_submit_blob_write) \
     X(XGameSaveSubmitUpdate, XGameSave, HRESULT, (XGameSaveUpdateHandle updateContext), implemented_hr, (updateContext), game_save_submit_update) \
     X(XGameSaveReadBlobData, XGameSave, HRESULT, (XGameSaveContainerHandle container, const char** blobNames, std::uint32_t* countOfBlobs, std::size_t blobsSize, XGameSaveBlob* blobData), implemented_hr, (container, blobNames, countOfBlobs, blobsSize, blobData), game_save_read_blob_data) \
+    X(XGameSaveEnumerateBlobInfo, XGameSave, HRESULT, (XGameSaveContainerHandle container, void* context, XGameSaveBlobInfoCallback* callback), implemented_hr, (container, context, callback), game_save_enumerate_blob_info) \
+    X(XGameSaveEnumerateBlobInfoByName, XGameSave, HRESULT, (XGameSaveContainerHandle container, const char* blobNamePrefix, void* context, XGameSaveBlobInfoCallback* callback), implemented_hr, (container, blobNamePrefix, context, callback), game_save_enumerate_blob_info_by_name) \
     X(XGameSaveCloseProvider, XGameSave, void, (XGameSaveProviderHandle provider), implemented_void, (provider), game_save_close_provider) \
     X(XGameSaveCloseContainer, XGameSave, void, (XGameSaveContainerHandle context), implemented_void, (context), game_save_close_container) \
     X(XGameSaveCloseUpdate, XGameSave, void, (XGameSaveUpdateHandle context), implemented_void, (context), game_save_close_update) \
@@ -1375,6 +1380,62 @@ HRESULT game_save_read_blob_data(XGameSaveContainerHandle container, const char*
     *count_of_blobs = requested;
     ReleaseSRWLockShared(&runtime_state.lock);
     return S_OK;
+}
+
+// Blob enumeration copies the matching names and sizes under the shared lock,
+// releases it, and only then calls the title. The callback may therefore call
+// back into this shim (including closing the container) without deadlocking,
+// and sees the name pointer valid for the duration of that one call.
+// A null prefix is an argument error; an empty prefix matches every blob.
+HRESULT enumerate_blobs(XGameSaveContainerHandle container, const char* prefix, void* context,
+                        XGameSaveBlobInfoCallback* callback) noexcept
+{
+    if (!container || !prefix || !callback) return E_INVALIDARG;
+    struct Entry {
+        char name[blob_name_capacity];
+        std::uint32_t size;
+    };
+    std::array<Entry, blob_capacity> entries{};
+    std::size_t count = 0;
+    const std::size_t prefix_length = std::strlen(prefix);
+    AcquireSRWLockShared(&runtime_state.lock);
+    const auto found_container = find_live(runtime_state.containers, container);
+    if (!found_container) {
+        ReleaseSRWLockShared(&runtime_state.lock);
+        return E_HANDLE;
+    }
+    const auto provider = find_live(runtime_state.providers, found_container->provider);
+    const auto store = find_store_by_id(found_container->store_id);
+    if (!provider || provider->scope != found_container->provider_scope || !store ||
+        store->provider_scope != found_container->provider_scope) {
+        ReleaseSRWLockShared(&runtime_state.lock);
+        return e_gs_handle_expired;
+    }
+    for (const auto& blob : store->blobs) {
+        if (!blob.live || std::strncmp(blob.name, prefix, prefix_length) != 0) continue;
+        std::memcpy(entries[count].name, blob.name, sizeof(blob.name));
+        entries[count].size = blob.size;
+        ++count;
+    }
+    ReleaseSRWLockShared(&runtime_state.lock);
+    for (std::size_t i = 0; i < count; ++i) {
+        const XGameSaveBlobInfo info{entries[i].name, entries[i].size};
+        if (!callback(&info, context)) break;
+    }
+    return S_OK;
+}
+
+HRESULT game_save_enumerate_blob_info(XGameSaveContainerHandle container, void* context,
+                                      XGameSaveBlobInfoCallback* callback) noexcept
+{
+    return enumerate_blobs(container, "", context, callback);
+}
+
+HRESULT game_save_enumerate_blob_info_by_name(XGameSaveContainerHandle container,
+                                              const char* blob_name_prefix, void* context,
+                                              XGameSaveBlobInfoCallback* callback) noexcept
+{
+    return enumerate_blobs(container, blob_name_prefix, context, callback);
 }
 
 HRESULT game_save_close_provider(XGameSaveProviderHandle provider) noexcept

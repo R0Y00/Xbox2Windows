@@ -12199,8 +12199,20 @@ user-table exhaustion, and that `XAsyncGetStatus` and `XAsyncGetResultSize` repo
 in-callback claim, the error paths, reuse, provider exhaustion, early result
 retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
+`XGameSaveEnumerateBlobInfo` and `XGameSaveEnumerateBlobInfoByName` walk the
+committed blobs of an open container in slot order and call the public
+`bool(const XGameSaveBlobInfo*, void*)` callback for each; returning `false`
+stops the walk with `S_OK`. The by-name form matches a case-sensitive prefix
+(an empty prefix matches every blob). The names and sizes are copied under the
+shared lock and the callback runs after it is released, so a callback may call
+back into the shim. A null container, prefix or callback returns `E_INVALIDARG`;
+a closed handle returns `E_HANDLE`; a handle whose provider closed returns
+`E_HANDLE` or `E_GS_HANDLE_EXPIRED`. Container enumeration and asynchronous
+reads are not implemented. `xgameruntime_gamesave_enumerate` covers these
+cases, including sibling-container isolation.
+
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check xgameruntime_user_async_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_gamesave_enumerate_check xgameruntime_async_status_check xgameruntime_user_async_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
