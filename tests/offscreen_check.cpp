@@ -1316,6 +1316,20 @@ OperationResult run_startup_image_load_d16(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits>: the translated pixel stage stores to
+// u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and every other texel -1.0.
+OperationResult run_startup_image_store(const OperationContext& ctx)
+{
+    unsigned x = 0, y = 0;
+    std::uint32_t expected[4]{};
+    if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
+    if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+        return {OutcomeKind::fail, "image store readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_startup_packed_position(const OperationContext& ctx)
 {
     constexpr UINT width = 13, height = 7;
@@ -1349,6 +1363,13 @@ bool validate_pixel_words_args(int, char** argv)
     return pixel_extent(argv[5]) != 0 && pixel_extent(argv[6]) != 0;
 }
 
+bool validate_raster_args(int argc, char** argv)
+{
+    const std::string_view cull = argv[8], winding = argv[9];
+    return validate_pixel_words_args(argc, argv) && (cull == "none" || cull == "front" || cull == "back") &&
+           (winding == "cw" || winding == "ccw");
+}
+
 // --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
 // width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
 // value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
@@ -1362,7 +1383,15 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
     if (!file || file.peek() != std::char_traits<char>::eof())
         return {OutcomeKind::fail, "expected file does not hold width * height * 4 words"};
     std::vector<std::uint32_t> pixels(expected.size());
-    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    if (std::string_view(ctx.argv[2]) == "--raster-reference") {
+        const std::string_view mode = ctx.argv[8], winding = ctx.argv[9];
+        const auto cull = mode == "none" ? D3D12_CULL_MODE_NONE :
+                          mode == "front" ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
+                                cull, winding == "ccw", 6);
+    } else {
+        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    }
     unsigned long differing = 0;
     for (unsigned long y = 0; y < height; ++y) {
         for (unsigned long x = 0; x < width; ++x) {
@@ -1513,12 +1542,14 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
@@ -1802,6 +1833,14 @@ int run_self_test()
     for (const char* bad : {"", "8x4", "4junk", "4.5", "0", "65", "-1", "999999999999999999999"}) {
         if (!check_extent(bad, "4", CliAction::usage_error) || !check_extent("8", bad, CliAction::usage_error)) return 1;
     }
+    const auto check_raster = [&](const char* width, const char* cull, const char* winding, CliAction action) {
+        return check_cli({"offscreen_check", "warp", "--raster-reference", "vs", "ps", width, "4", "ref",
+                          cull, winding}, action);
+    };
+    if (!check_raster("8", "back", "ccw", CliAction::operation) ||
+        !check_raster("8x4", "none", "cw", CliAction::usage_error) ||
+        !check_raster("8", "both", "cw", CliAction::usage_error) ||
+        !check_raster("8", "front", "left", CliAction::usage_error)) return 1;
 
     for (const char* op : {"--dxr-opacity", "--dxr-opacity-pipeline"}) {
         if (!check_cli({"offscreen_check", "warp", op}, CliAction::operation, {}, 0.25f) ||
