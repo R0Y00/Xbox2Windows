@@ -294,6 +294,8 @@ add_dependencies(xmem_section_lease_check xmem_shim)
 foreach(adapter warp hardware)
   add_test(NAME xmem_section_lease_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>")
   set_tests_properties(xmem_section_lease_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  add_test(NAME xmem_page_batch_inflight_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>" page-batch)
+  set_tests_properties(xmem_page_batch_inflight_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   add_test(NAME xmem_section_lease_mesh_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>" mesh)
   add_test(NAME xmem_section_lease_vertex_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>" vertex)
   set_tests_properties(xmem_section_lease_vertex_${adapter} xmem_section_lease_mesh_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
@@ -1118,6 +1120,19 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_queue_wait_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
 endforeach()
+
+# Console COPY queue page mappings through the installed XMem provider.
+add_executable(startup_queue_page_batch tests/startup_queue_page_batch.cpp)
+target_compile_features(startup_queue_page_batch PRIVATE cxx_std_17)
+target_include_directories(startup_queue_page_batch PRIVATE src)
+target_link_libraries(startup_queue_page_batch PRIVATE d3d12_xs_shim dxgi OneCore)
+add_dependencies(startup_queue_page_batch xmem_shim)
+add_test(NAME startup_queue_page_batch_warp COMMAND startup_queue_page_batch "$<TARGET_FILE:xmem_shim>")
+add_test(NAME startup_queue_page_batch_runs_warp COMMAND startup_queue_page_batch "$<TARGET_FILE:xmem_shim>" runs)
+set_tests_properties(startup_queue_page_batch_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
+set_tests_properties(startup_queue_page_batch_runs_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=1")
 
 # Closed lists stay submittable, also after their allocator's Reset (#1352).
 add_executable(startup_list_resubmit tests/startup_list_resubmit.cpp)
@@ -2865,6 +2880,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: v_add/sub/subrev_co_u32 against ISA references.
     add_test(NAME startup_gfx2hlsl_add_sub_co_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_check.py")
+    # Startup shader translator: s_*_saveexec with D == S0 reads S0 before writing D.
+    add_test(NAME startup_gfx2hlsl_saveexec_same_reg_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_saveexec_same_reg_check.py")
+    # Startup shader translator: a VOPC compare into vcc_hi, exec_hi or m0 is refused, not a crash.
+    add_test(NAME startup_gfx2hlsl_compare_dst_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compare_dst_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_cvt_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py" draw "${DXC_EXECUTABLE}"
@@ -3384,6 +3405,20 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: scalar constants are dropped at a branch join that another path writes (loop counters).
     add_test(NAME startup_gfx2hlsl_loop_constants COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loop_constants_check.py")
+    # Startup shader translator: symbols that are not constants (descriptors, pointers, pairs) at a branch join.
+    add_test(NAME startup_gfx2hlsl_join_symbols_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_join_symbols_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_join_symbols_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_join_symbols_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        add_test(NAME startup_gfx2hlsl_join_symbols_folded_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_join_symbols_check.py" control "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_join_symbols_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_gfx2hlsl_join_symbols_folded_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "control OUTSIDE: 3 in all four channels")
+    endforeach()
     # Startup shader translator: uniform sources of v_readfirstlane_b32 in straight-line code and entry blocks (#1723).
     add_test(NAME startup_gfx2hlsl_readfirstlane_uniform COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_uniform_check.py")
@@ -6375,6 +6410,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_status COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_status.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_status>"
         "$<TARGET_FILE:cpu_x87_status_lifted>" ${x87_status_control_files})
+    # FNSTENV and FNSAVE after FNINIT, and the FSTENV and FSAVE forms the translation refuses: pure Python.
+    add_test(NAME cpu_x87_environment_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/x87_environment_check.py")
     cpu_asm_fixture(cpu_x87_parity x87_parity)
     # The lifted DLL and five mutated controls that the check requires to mismatch.
     set(x87_parity_control_files "")

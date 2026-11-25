@@ -4,6 +4,7 @@
 #include <dxgi1_6.h>
 
 #include "desktop_gpu.h"
+#include "xmem_page_batch.h"
 #include "xmem_section_lease.h"
 
 #include <array>
@@ -29,9 +30,11 @@ void require(bool ok, const char* what)
 #include "xmem_mesh_root_srv.h"
 
 int wmain(int argc, wchar_t** argv) try {
+    const bool page_batch = argc == 4 && std::wcscmp(argv[3], L"page-batch") == 0;
     const bool mesh = argc == 4 && std::wcscmp(argv[3], L"mesh") == 0;
     const bool vertex = argc == 4 && std::wcscmp(argv[3], L"vertex") == 0;
-    if ((!mesh && !vertex && argc != 3) || (std::wcscmp(argv[1], L"warp") && std::wcscmp(argv[1], L"hardware"))) return 2;
+    if ((argc != 3 && !mesh && !vertex && !page_batch) ||
+        (std::wcscmp(argv[1], L"warp") && std::wcscmp(argv[1], L"hardware"))) return 2;
     const bool warp = std::wcscmp(argv[1], L"warp") == 0;
     SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", "1");
     SetEnvironmentVariableA("X2W_XMEM_GPU_MIRROR", "1");
@@ -168,6 +171,71 @@ int wmain(int argc, wchar_t** argv) try {
     for (UINT64 i = 0; i < bytes; ++i)
         require(cpu[first_byte + i] == 0x29 && reinterpret_cast<unsigned char*>(mirror)[first_byte+i] == 0x29,
                 "both title views see the GPU write");
+
+    if (page_batch) {
+        const auto batch_map = load<decltype(&X2WMapPageBatch)>(xmem, "X2WMapPageBatch");
+        const auto pool = cpu + 2 * page;
+        void* const pool_pages[]{pool, pool + page};
+        count = 2;
+        require(alloc(0x280, &count, fresh) && count == 2 && map(pool_pages, 2, fresh), "map replacement pool");
+        ComputeCommands before(device.Get(), nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        before.list->CopyBufferRegion(readback.Get(), 0, alias.Get(), first_byte, bytes);
+        check(before.list->Close(), "close old backing read");
+        ComPtr<ID3D12Fence> gate, done;
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "create submission gate");
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)), "create completion fence");
+        check(before.queue->Wait(gate.Get(), 1), "hold GPU before reading original pages");
+        ID3D12CommandList* lists[]{before.list.Get()};
+        before.queue->ExecuteCommandLists(1, lists);
+        check(before.queue->Signal(done.Get(), 1), "signal after the held read");
+        X2WPageRange span{0, 0, 2};
+        X2WPageBatch batch{mirror, 1, &span};
+        const HRESULT remapped = batch_map(1, &batch, reinterpret_cast<UINT64>(pool), 2, 0, nullptr);
+        const bool in_flight = done->GetCompletedValue() == 0;
+        check(gate->Signal(1), "allow the older read to finish");
+        check(done->SetEventOnCompletion(1, nullptr), "wait for the older read");
+        check(remapped, "replace both mapped pages while the first GPU read is held");
+        require(in_flight, "page remap returned before the GPU gate opened");
+        const D3D12_RANGE range{0, bytes};
+        check(readback->Map(0, &range, &data), "read original pages");
+        for (UINT64 i = 0; i < bytes; ++i)
+            require(static_cast<unsigned char*>(data)[i] == 0x29, "older GPU work kept the original backing");
+        readback->Unmap(0, &empty);
+        X2WXMemSectionLease next{};
+        require(acquire(mirror + first_byte, bytes, &next, sizeof(next)), "lease the replacement mapping");
+        require(next.section_offset != lease.section_offset, "replacement uses another section offset");
+        require(!match_section(x2w_xmem_section_lease_version, lease.id, lease.first_byte, mirror + first_byte, bytes),
+                "old lease no longer matches the remapped destination");
+        require(match_section(x2w_xmem_section_lease_version, next.id, next.first_byte, mirror + first_byte, bytes),
+                "new lease matches the explicit mapping");
+        void* view = MapViewOfFile(next.section, FILE_MAP_WRITE, DWORD(next.section_offset >> 32),
+                                   DWORD(next.section_offset), SIZE_T(next.window_bytes));
+        CloseHandle(next.section);
+        require(view != nullptr, "open replacement view");
+        ComPtr<ID3D12Heap> next_heap;
+        ComPtr<ID3D12Resource> next_buffer;
+        check(device->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&next_heap)), "import replacement view");
+        check(device->CreatePlacedResource(next_heap.Get(), 0, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, IID_PPV_ARGS(&next_buffer)), "bind replacement pages");
+        ComputeCommands after(device.Get(), nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        after.list->CopyBufferRegion(readback.Get(), 0, next_buffer.Get(), next.first_byte, bytes);
+        for (UINT64 i = 0; i < bytes; ++i) pool[first_byte + i] = static_cast<unsigned char>(i ^ 0x53);
+        after.submit_and_wait(device.Get());
+        check(readback->Map(0, &range, &data), "read replacement pages");
+        for (UINT64 i = 0; i < bytes; ++i)
+            require(static_cast<unsigned char*>(data)[i] == static_cast<unsigned char>(i ^ 0x53),
+                    "later GPU work saw late writes to replacement pool pages");
+        readback->Unmap(0, &empty);
+        next_buffer.Reset();
+        next_heap.Reset();
+        require(UnmapViewOfFile(view) && release(next.id), "release replacement lease after completion");
+        alias.Reset();
+        heap.Reset();
+        require(UnmapViewOfFile(small_view) && release(lease.id), "release original lease after completion");
+        std::printf("%s: held GPU read and subsequent late-write read matched %llu bytes each; debug layer %s\n",
+                    warp ? "WARP" : "physical", bytes, debug ? "on" : "off");
+        return 0;
+    }
 
     {
         ComputeCommands copy(device.Get(), nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
