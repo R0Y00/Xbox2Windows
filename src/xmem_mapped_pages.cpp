@@ -943,8 +943,24 @@ BOOL local_apply_locked(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG
     BOOL ok = TRUE;
     DWORD error = 0;
     MapFailure failure;
-    if (!unmap.empty() && !map_pages_locked(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; },
-                                            share_views, &failure)) {
+    // Validate the final address/page pairs before removing any live view. The mapping lock
+    // also keeps grants live between this check and the subsequent unmap and map operations.
+    if (!unmap.empty()) {
+        for (const auto& [address, page] : want) {
+            const char* invalid = nullptr;
+            if (!address || address % page_bytes) invalid = "invalid-address";
+            else if (page && !era_physical::owns(page)) invalid = "unowned-page";
+            if (invalid) {
+                ok = FALSE;
+                error = ERROR_INVALID_PARAMETER;
+                failure.record(invalid, address, page, error);
+                break;
+            }
+        }
+    }
+    if (ok && !unmap.empty() &&
+        !map_pages_locked(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; },
+                          share_views, &failure)) {
         ok = FALSE;
         error = GetLastError();
     }

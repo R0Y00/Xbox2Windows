@@ -89,9 +89,62 @@ def check_scatter_diagnostic(path):
     print("Permissive scatter diagnostics identify the caller index and page after address sorting and rollback")
 
 
+def scatter_replacement(path):
+    """A rejected replacement leaves both aliases live, and a corrected retry succeeds."""
+    library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
+    kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
+    pointer, number, dword = C.c_void_p, C.c_size_t, C.c_ulong
+    process = pointer(-1)
+    allocate = bind(library, "XMemAllocatePhysicalPages", [number, C.POINTER(number), C.POINTER(number)], C.c_int)
+    release = bind(library, "XMemFreePhysicalPages", [number, C.POINTER(number)], C.c_int)
+    scatter = bind(library, "XMemMapPhysicalPagesScatter", [C.POINTER(pointer), number, C.POINTER(number)], C.c_int)
+    reserve = bind(kernel, "VirtualAlloc2", [pointer, pointer, number, dword, dword, pointer, dword], pointer)
+    free = bind(kernel, "VirtualFree", [pointer, number, dword], C.c_int)
+    read = bind(kernel, "ReadProcessMemory", [pointer, pointer, pointer, number, pointer], C.c_int)
+
+    def read_word(address, label):
+        data = dword()
+        assert read(process, address, C.byref(data), C.sizeof(data), None), label
+        return data.value
+
+    first, alias, second = (reserve(process, None, PAGE_BYTES, WIN_RESERVE | RESERVE_PLACEHOLDER,
+                                    NOACCESS, None, 0) for _ in range(3))
+    assert first and alias and second, C.get_last_error()
+    count, tokens = number(2), (number * 2)()
+    assert allocate(PHYSICAL_64K, C.byref(count), tokens) and count.value == 2
+    count, released = number(1), number()
+    assert allocate(PHYSICAL_64K, C.byref(count), C.byref(released)) and count.value == 1
+    assert release(1, C.byref(released))
+    unowned = released.value
+    assert scatter((pointer * 2)(first, alias), 2, (number * 2)(tokens[0], tokens[0]))
+    C.c_uint32.from_address(alias).value = 0x1974
+    for destination, replacement, label in ((second, unowned, "unowned token"),
+                                             (second + 1, tokens[1], "unaligned destination")):
+        assert not scatter((pointer * 2)(first, destination), 2, (number * 2)(tokens[1], replacement))
+        assert C.get_last_error() == 87, label
+        assert read_word(first, f"{label} removed the original mapping") == 0x1974
+        C.c_uint32.from_address(first).value = 0x2365
+        assert read_word(alias, label) == 0x2365
+        C.c_uint32.from_address(alias).value = 0x1974
+
+    # The final occurrence of first wins even when an earlier token is unowned.
+    assert scatter((pointer * 3)(first, second, first), 3, (number * 3)(unowned, tokens[1], tokens[1]))
+    C.c_uint32.from_address(second).value = 0x8265
+    assert read_word(first, "retry did not install the replacement") == 0x8265
+    assert read_word(alias, "retry modified the old page") == 0x1974
+    assert scatter((pointer * 3)(first, alias, second), 3, None) and release(2, tokens)
+    for address in (first, alias, second):
+        assert free(address, 0, WIN_RELEASE), C.get_last_error()
+
+
 def main(path):
     check_permissive_count(path)
     check_scatter_diagnostic(path)
+    environment = dict(os.environ, X2W_XMEM_PERMISSIVE="1")
+    replacement = subprocess.run([sys.executable, "-B", __file__, path, "--scatter-replacement"],
+                                 env=environment, capture_output=True, text=True, timeout=120)
+    assert replacement.returncode == 0, replacement.stderr
+    print("Rejected scatter replacements preserve live aliases and allow a corrected retry")
     library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
     kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
     pointer, number = C.c_void_p, C.c_size_t
@@ -178,5 +231,7 @@ if __name__ == "__main__":
         permissive_count(sys.argv[1], int(sys.argv[3]))
     elif len(sys.argv) == 3 and sys.argv[2] == "--scatter-failure":
         scatter_failure(sys.argv[1])
+    elif len(sys.argv) == 3 and sys.argv[2] == "--scatter-replacement":
+        scatter_replacement(sys.argv[1])
     else:
         main(sys.argv[1])
