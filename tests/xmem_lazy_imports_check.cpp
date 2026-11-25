@@ -96,9 +96,12 @@ int main(int argc, char** argv)
         CloseHandle(file);
         file = CreateFileA(name, GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
         DWORD read = 0;
-        const BOOL ok = ReadFile(file, target, sizeof(data), &read, nullptr);
+        const BOOL ok = file != INVALID_HANDLE_VALUE && ReadFile(file, target, sizeof(data), &read, nullptr);
         const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-        CloseHandle(file);
+        if (file != INVALID_HANDLE_VALUE)
+            CloseHandle(file);  // FILE_FLAG_DELETE_ON_CLOSE removes the file
+        else
+            DeleteFileA(name);
         if (!ok) std::printf("  ReadFile failed with error %lu\n", error);
         check(ok && read == sizeof(data) && std::memcmp(target, data, sizeof(data)) == 0, "readfile_into_lazy_page");
         map(reservation, pages, nullptr);

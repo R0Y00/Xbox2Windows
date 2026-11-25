@@ -977,6 +977,8 @@ BOOL WINAPI virtual_free_lazy(LPVOID address, SIZE_T bytes, DWORD type)
         AcquireSRWLockExclusive(&lazy_blocks.lock);
         const bool listed = lazy_blocks.blocks.erase(reinterpret_cast<ULONG_PTR>(address)) != 0;
         ReleaseSRWLockExclusive(&lazy_blocks.lock);
+        // Counted before the block is released: a thread that faults in between sees the new count while the old
+        // block is still reserved, which costs it at most one extra retry.
         if (listed) InterlockedIncrement(&lazy_block_releases);
     }
     return real_virtual_free(address, bytes, type);
