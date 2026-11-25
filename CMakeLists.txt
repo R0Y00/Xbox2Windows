@@ -7214,6 +7214,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_dynamic_aot_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(NAME mesh_two_exits_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_two_exits_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_two_exits_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME mesh_pixel_pipeline_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_pixel_pipeline_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

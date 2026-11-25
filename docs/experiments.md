@@ -4700,9 +4700,30 @@ compares all 320 output words each time. The stale reference fails on exactly
 eight stored words. The binding is limited to unsigned 32-bit words and fixed
 byte offsets.
 
+### Mesh containers with two reachable exits
+
+The static and runtime-geometry mesh CLIs pass the gfx1013 wave64 profile to
+the bounded FSSM extractor. For two decoded `s_endpgm` instructions it follows
+direct branches from the entry and checks that both exits are reachable. A
+mesh allocation message and `s_barrier` fall through in this control-flow
+check. The wave model subsequently verifies allocation, synchronization and
+exports. The allocation message is required for this two-exit mesh profile.
+
+In the source-built fixture both waves reach the allocation barrier. Wave 1
+then ends, and wave 0 skips that exit and emits a quad. Both CLIs must emit
+the same HLSL as the single-exit version. Run the binary and draw checks with:
+
+```sh
+python -B tests/mesh_two_exits_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R '^mesh_two_exits_(warp|hardware)$' -V
+```
+
+The draws require LLVM 15, DXC and a mesh-capable adapter. Each lowering
+matches 1,024 pixels and rejects the triangle reference at exactly 528 pixels.
+
 ### Compute programs with two exits
 
-Compute programs (stage 5) now use the [pixel two-exit check](#pixel-programs-with-two-exits) from #477 when LLVM is supplied. Only exactly two aligned `s_endpgm` markers qualify. One marker is unchanged, three or more are rejected, and mesh programs (stage 13) with more than one marker are still rejected. `compute_store_aot.py` now passes `--llvm` to the extractor, and `shader_profile_audit.py` already did. This step extracts the code span only. The store profile does not lower branches, so a two-exit program now stops at its first unsupported instruction instead of at extraction.
+Compute programs (stage 5) use the [pixel two-exit check](#pixel-programs-with-two-exits) from #477 when LLVM is supplied. Only exactly two aligned `s_endpgm` markers qualify for this check. `compute_store_aot.py` passes `--llvm` to the extractor, as does `shader_profile_audit.py`. This step extracts the code span only. At the time of this experiment the store profile stopped at its first unsupported branch.
 
 The fixtures are original kernels compiled with LLVM 15 and reassembled with `llvm-mc-15`:
 
