@@ -1259,13 +1259,18 @@ void push(Object* self, Entry&& entry)
     start_worker(self, work);  // a failure shows at Submit
     bool recorded = false;
     bool full = false;
-    try {
+    {
         const std::lock_guard guard(work->mutex);
-        entry.id = ++work->next_entry_id;
-        work->waiting.push_back(std::move(entry));
-        recorded = true;
-        full = self->capacity && work->waiting.size() >= self->capacity;
-    } catch (const std::bad_alloc&) {
+        // The handler sits inside the lock's scope, like every other growth of these lists: a
+        // std::bad_alloc must not unwind through the guard (the MSVC build under test then leaves
+        // the mutex locked, and the next Submit throws std::system_error on its own lock).
+        try {
+            entry.id = ++work->next_entry_id;
+            work->waiting.push_back(std::move(entry));
+            recorded = true;
+            full = self->capacity && work->waiting.size() >= self->capacity;
+        } catch (const std::bad_alloc&) {
+        }
     }
     if (!recorded) {
         defer_unrecorded(self, entry);
