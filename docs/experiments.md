@@ -272,7 +272,7 @@ ctest --preset dev --no-tests=error -R '^startup_r8_uint_(warp|hardware)$' -V
 
 ### Every vertex-fetch buffer format
 
-The original `tbuffer_load_format_*` fixture covered ten formats: `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. The fixture also covers `16_16_SNORM`, `16_16_16_16_FLOAT` and `8_8_8_8_UINT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` exercises each format with the same vertex-fetch fixture. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for integer formats). It shares no code with the translator's table. The `16_16_SNORM` check below also exercises the signed endpoints and detects an unsigned decode.
+The original `tbuffer_load_format_*` fixture covered ten formats: `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. The fixture also covers `16_16_SNORM`, `16_16_16_16_FLOAT`, `8_8_8_8_UINT` and `16_16_UINT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` exercises each format with the same vertex-fetch fixture. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for integer formats). It shares no code with the translator's table. The `16_16_SNORM` check below also exercises the signed endpoints and detects an unsigned decode.
 
 - **Element alignment.** Formats with fields narrower than a dword use strides and offsets that put elements at more than one byte alignment (stride 3 offset 2, stride 5 offset 3, stride 6 offset 2, stride 10 offset 10), so fields that cross a dword go through `ldu()`. The 32-bit formats keep 4-byte aligned elements, which their aligned `Load()` needs.
 - **How components are compared.** UNORM components are compared as `round(v * (2^bits - 1))`, so the result does not depend on how many ulps the division is off. All other components are compared bit for bit. The chosen binary16 and binary32 values are all normal.
@@ -287,6 +287,8 @@ ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|
 `BUF_FMT_16_16_SNORM` (format 24, DXGI `R16G16_SNORM` 37) sign-extends each half, divides by 32767 and clamps to -1.0, so -32768 and -32767 both give -1.0 (the Direct3D and Vulkan SNORM rule, as in LLVM 15 and Mesa `ac_formats`). The device run compares `round(v * 32767)` against the same byte decode, with a wrong reference that reads the halves unsigned and a mutated translation that does the same. The pattern the harness writes to t0 holds no 0x8000, so `startup_vertex_fetch_formats_controls` also evaluates the emitted expressions on 0x8000, 0x8001, 0x7fff, 0x0000, 0xffff and 0x4000 in each half, and four wrong forms (unsigned read, no clamp, divisor 32768, one half for both) must fail that check. The D3D12 draw has not been run on Linux.
 
 `BUF_FMT_8_8_8_8_UINT` (gfx10 format 60, DXGI `R8G8B8A8_UINT` 30) reads four unsigned bytes into X, Y, Z and W in increasing address order. With stride 5 and byte offset 3, the 16-vertex fixture visits all four dword alignments. On WARP, all 64 component words matched the byte reference. Swapping channels in the reference or normalizing the green byte in the generated shader each triggered a mismatch.
+
+`BUF_FMT_16_16_UINT` (gfx10 format 27; LLVM 15 `BUF_DATA_FORMAT_16_16` with `BUF_NUM_FORMAT_UINT`) reads two unsigned 16-bit fields into X and Y, the low half first, with Z = 0 and W = 1. With stride 6 and byte offset 2, the fixture's elements sit at two dword alignments, so half of them cross a dword. On WARP and on an AMD Radeon RX 9070 XT (driver 32.0.32015.7029, Windows 10.0.26300.9974, debug layer enabled), all 64 component words matched the byte reference. The wrong references and three mutated translations each triggered a mismatch: a normalized low half, the high half read from the low half, and a missing W read as 1.0.
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks
 
@@ -6707,6 +6709,31 @@ ctest --preset dev --no-tests=error -R '^sampled_coverage_warp$' -V
 32.0.16.2124); WARP 10.0.26100.9818. The D3D12 debug layer was enabled on
 all three backends.
 
+#### Desktop Intel UHD 770 adjacent-query comparison
+
+On the UHD 770, the unmodified fixture failed on the first slot-0 draw with
+`Full draw coverage mismatch`. A diagnostic build from `209938b0` ran each of
+the 13 no-output shader cases separately. The first full draw used query 0.
+In the baseline, query 65 was empty after the 64 one-pixel draws. In the
+adjacent run, query 65 enclosed a second full draw immediately after the
+first, before any one-pixel draws. Intel ran each case twice per mode.
+
+| Adapter and driver | First full count | First matches per mode | Second adjacent matches | One-pixel sums matching per mode |
+|---|---|---|---|---|
+| Intel UHD 770 (`8086:a780`), 32.0.101.5973 | Always 64 | 8/26 | 26/26 | 26/26 |
+| RTX 4060 (`10de:2882`), 32.0.15.9579 | 0–64, by case | 13/13 | 13/13 | 13/13 |
+| WARP (`1414:008c`), 10.0.26100.9711 | 0–64, by case | 13/13 | 13/13 | 13/13 |
+
+For example, the first slot-0 case expected 26 samples. Intel returned 64
+and then 26 on adjacent full draws, and the 64 one-pixel queries summed to
+26. The baseline empty query returned zero on every adapter. The fixture
+retained its strict first-query assertion and failed 18/26 cases per Intel
+mode. The desktop ran Windows build 26100.9711, Agility SDK 1.620.2 and DXC
+1.9.2609.5. The laptop baseline above had the D3D12 debug layer enabled.
+On this desktop it was unavailable for all three adapters. The
+[hardware report](https://github.com/R0Y00/Xbox2Windows/issues/737#issuecomment-7161728975)
+includes the per-case counts, instrumentation and replay commands.
+
 ### Buffered depth export
 
 `tools/depth_mask_aot.py` follows the two entry table pointers through scalar
@@ -9077,6 +9104,10 @@ raw DWORD load at offset zero from `t0 space0`, with a resource-free pixel
 stage. The check compiles and rejects shifted, dynamic, wider and wrong-space
 loads and a pixel-stage buffer read. Run it with
 `ctest --preset release --no-tests=error -R '^startup_mesh86_srv_proof$' -V`.
+
+Run `python -B tests/startup_mesh86_srv_proof_check.py` to check the load count
+without DXC. The synthetic DXIL dump passes with one DWORD load and is
+rejected when a second identical load uses the same SRV handle.
 
 On the Release worktree at `76aeef7f` plus these changes, the combined lease,
 SRV proof, export and mapped-page selection passed eight tests. The two mesh
@@ -13623,6 +13654,15 @@ allows the read, including at a branch target. The compute controls exercise con
 
 As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
 handling of out-of-range stores, are assumptions, not measurements.
+
+One descriptor modification is accepted for a raw buffer store: clearing the stride field of dword 1. That is
+`s_and_b32` of dword 1 with `0xc000ffff`, which keeps the base address bits 15:0 and bits 31:30. The result is
+the raw descriptor such a store already assumes. Any other mask, any other dword, a repeated modification, and
+the same clear on an image store stay refused. Loads through the descriptor still treat it as modified.
+
+Case I is case A with the clear before its store. The runner binds a root UAV and reads no descriptor, so the
+GPU run checks the translation, not the stride; the negative controls are the pure-Python refusals.
+
 The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
 
 `startup_gfx2hlsl_compute_check.py` translates three source-built programs:
@@ -13673,6 +13713,32 @@ inactive lanes.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(mbcnt_)?(warp|hardware))$' -V
+```
+
+### Startup compute LDS dword exchange
+
+Case F uses two groups of 64 threads. Each thread stores its group number
+times 256 plus its local X ID into LDS at byte `16 + 4 * X`. After
+`s_waitcnt lgkmcnt(0)` and `s_barrier`, it reads the word from lane
+`X xor 32` and the word from lane 37. Each read completes before its value
+is consumed. The expected UAV contains 256 result words and 64 sentinels.
+On WARP, RTX 4060 and Intel UHD 770, all 320 matched. Reading the same lane
+or broadcasting lane 36 instead changed exactly 128 words per adapter.
+
+The startup translator accepts one straight-line, full-EXEC fill in a 1D
+group, one group barrier, and reads from that initialized span. The fill
+address is the entry X ID shifted left by two. Read addresses come from an
+immediately preceding literal move or AND with an aligned literal mask.
+The bounds check includes the instruction's byte offset. The LDS allocation
+comes from bits 23:15 of `COMPUTE_PGM_RSRC2`, in units of 128 dwords, up to
+the 32 KiB groupshared limit. The barrier becomes an unconditional
+`GroupMemoryBarrierWithGroupSync()`.
+[LLVM AMDGPU compute register fields](https://releases.llvm.org/15.0.0/docs/AMDGPUUsage.html)
+and [HLSL group barrier](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/groupmemorybarrierwithgroupsync).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(f-peer_|f-broadcast_)?(warp|hardware))$' -V
+python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
 ## Startup translator: refusal census
@@ -13738,14 +13804,17 @@ Past the entry block of a program with branches, the read does not copy the VGPR
 - no branch target lies between them (a join, a loop head or a back edge): a branch target clears every VGPR proof;
 - no instruction between them writes `exec`, explicitly or implicitly (`saveexec`, `wrexec`, `v_cmpx`, WQM, `s_movreld`); narrowing is refused as well as widening;
 - the VGPR is not written in between, and no SGPR that the expression reads is written in between (VOP3b carry-out destinations count);
-- every SGPR source was proven uniform since the last branch target, so a value from another path cannot reach it; an SCC from before the last branch target is not trusted.
+- every SGPR source was either written uniformly since the last branch target, or preserved across branch targets by the CFG proof: a one-path register written before a join and untouched along every non-dominating or back-reaching path, or a uniform loop counter initialized uniformly and updated only with uniform scalar ops under uniform `SCC` branches (validated across a fixed-point pass against non-uniform scalar writes and divergent CFG branch regions using dominators and post-dominators; an SCC from before the last branch target is not trusted).
 
-A lane that was inactive at the definition keeps an older VGPR value; the recomputed expression gives every lane the first active lane's value instead. `exec` need not be known at the definition. A conditional branch between the definition and the read is a fall-through, not a join, and is accepted. The one case where hardware can differ is a read with no active lane: it returns lane 0's VGPR, which the program cannot rely on. `tests/startup_gfx2hlsl_readfirstlane_recompute_check.py` checks the accepted forms and refuses each condition above, including a definition under a narrower `exec` than the read, a rewritten scalar input, a loop back edge and a join where two definitions reach.
+A lane that was inactive at the definition keeps an older VGPR value; the recomputed expression gives every lane the first active lane's value instead. `exec` need not be known at the definition. A conditional branch between the definition and the read is a fall-through, not a join, and is accepted. The one case where hardware can differ is a read with no active lane: it returns lane 0's VGPR, which the program cannot rely on. `tests/startup_gfx2hlsl_readfirstlane_recompute_check.py` checks the accepted forms (including one-path scalars and uniform loop counters both inside and after loops) and refuses each condition above, including a definition under a narrower `exec` than the read, a rewritten scalar input, a loop back edge, a divergent `else`-arm write before a join, a non-uniform loop back-edge and a join where two definitions reach.
+
+[`tests/startup_compute_readfirstlane_check.py`](../tests/startup_compute_readfirstlane_check.py) pairs that unit coverage with a source-built gfx1013 compute fixture (`(4, 1, 1)` local threads x `(2, 1, 1)` groups) containing both a one-path SGPR across a uniform forward branch join and a four-iteration uniform loop counter read via `v_readfirstlane_b32` inside the loop and after exit, machine-code refusal patches (non-uniform `s_cbranch_vccnz` back-edge, divergent `else`/`then` write before a join, lane-mask loop update) and 320-word GPU readback with pinned `dropped-one-path`, `dropped-loop-read` and `dropped-post-loop` negative controls. Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 25H2 (build 26200.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 7900 XTX (driver 32.0.32029.2010).
 
 `tests/startup_gfx2hlsl_readfirstlane_uniform_check.py` translates short sequences through the stage's dispatch without shader machine code. It checks emitted assignments for the listed operations, supported modifiers, and in-place and cross-register chains, the median of three that clamps a scalar to `[0, 0.5]`, including the unsigned-division reciprocal estimate (`v_cvt_f32_u32`, `v_rcp_f32`, `v_mul_f32` by `0x4f7ffffe`, `v_cvt_u32_f32`) that compiled shaders read back with `v_readfirstlane_b32`. That chain stays refused from a lane-varying source or a lane mask, across an `exec` write or an overwrite, and from a definition in another block. Refusal cases cover varying sources and offsets, overwrites that invalidate a proof, WQM, a restored `exec` copy and other exec writes, lane masks, overlapping and descriptor-path 64-bit moves, branch and operand restrictions (a read at the first branch target, in a loop whose header is in the entry block, at a backward branch target, in an entry block re-entered by a loop, or after `s_endpgm` in a branch-free program; a read after the first terminator is recomputed), and constructor-less probes with incomplete tracking state. The negative control empties the allowlist and requires every accepted sequence to refuse.
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_readfirstlane_(uniform|recompute)$' -V
+ctest --preset dev --no-tests=error -R '^(startup_gfx2hlsl_readfirstlane_(uniform|recompute)|startup_compute_readfirstlane(_(warp|hardware))?)$' -V
+python -B tests/startup_compute_readfirstlane_check.py --llvm-mc llvm-mc-15
 ```
 
 ## Desktop audio render sink
@@ -14215,6 +14284,29 @@ On Intel UHD Graphics (TGL GT1) with Mesa 26.2.7, DXC 1.10.2605.37 and SPIRV-Too
 python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device Intel
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device llvmpipe
+```
+
+## Vulkan draw of the core translated pixel shaders
+
+`python3 -B tests/pixel_aot_check.py draw-core-vulkan <dxc> <device> [--allow-denorm-mismatch]` runs the `draw-core` set of `check_render`, with its negative controls, on a Vulkan 1.2 device. DXC compiles each translated shader to SPIR-V (`-spirv -fspv-target-env=vulkan1.2 -fvk-use-dx-layout`, b0 to b2 at 0 to 2, t0 and t1 at 16 and 17, s0 at 32) and `spirv-val` checks it. [`tests/vk_offscreen.py`](../tests/vk_offscreen.py) stands in for `offscreen_check` and draws through the `--draw` form of `tests/vk_pixel_draw.c`. It reproduces `--check-pixel`, `--check-pixel-case`, `--check-pixel-batch` and `--check-pixel-quad-lod` with the same exit codes, stderr words and batch status lines. It does not reproduce the other `offscreen_check` modes or title-memory trailers, and there is no debug layer. Every shader is compiled with `-denorm preserve`, so a device without `shaderDenormPreserveFloat32` is a capability skip (77) unless `--allow-denorm-mismatch` is given.
+
+Measured on 2026-11-25 with base `25317c63` plus this change, DXC 1.10.2605.37 and Mesa 26.2.7:
+
+| device | flag | result |
+|---|---|---|
+| Intel UHD Graphics (TGL GT1), ANV, `shaderDenormPreserveFloat32` = 1 | none | exit 0, every negative control detected, about 11 s |
+| lavapipe | none | exit 77 (module declares DenormPreserve 32, device lacks the capability) |
+| lavapipe | `--allow-denorm-mismatch` | exit 0 |
+| NVIDIA RTX 3060 Laptop, driver 620.70.06, `shaderDenormPreserveFloat32` = 0 | none | exit 77 |
+| NVIDIA RTX 3060 Laptop | `--allow-denorm-mismatch` | exit 1, `pixel_mismatch x=16 y=0` |
+
+The NVIDIA mismatch is a measurement: in that pixel, byte 37 reads back `0x3e14a000` where the reference has `0x3e148000`. The reference comes from `export16` in `tools/pixel_aot.py`, which converts with `f32tof16`, steps the half down by one when `f16tof32` of it exceeds the input in magnitude, and widens it again, so the value is rounded toward zero to a binary16. One hypothesis, not tested further, is that the NVIDIA compiler folds `f16tof32(f32tof16(x))` to `x`, so that rounding does not happen. A compute probe on the same device gave the correct binary16 `0x30a5` and a widened value `0x3e149495`, which is consistent with that hypothesis but does not prove it. It is not known whether the NVIDIA D3D12 driver behaves the same way. The run is a diagnostic and says nothing about NVIDIA's subnormal handling.
+
+This shows that these shaders produce the same bits on two Vulkan drivers for the covered modes. It does not cover the other `offscreen_check` modes or title-memory cases, and it is not a D3D12 result.
+
+```bash
+python3 -B tests/pixel_aot_check.py draw-core-vulkan /path/to/dxc Intel
+python3 -B tests/vk_offscreen.py
 ```
 
 ## SAL (/6) lifting in cpu_switch_aot
