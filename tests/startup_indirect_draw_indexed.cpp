@@ -148,13 +148,16 @@ Varying vertex(uint id : SV_VertexID) {
 Varying vertex_rect(uint id : SV_VertexID) {
     Varying result;
     const uint rect = id / 6;
-    const uint corner[6] = {0, 1, 2, 0, 2, 3};
-    const float2 v0 = float2(rect == 0 ? -1 : 0, -1);
-    const float2 v1 = float2(rect == 0 ? 0 : 1, -1);
-    const float2 v2 = float2(rect == 0 ? 0 : 1, 1);
-    const float2 v3 = v0 + v2 - v1;
-    const uint c = corner[id % 6];
-    result.position = float4(c == 0 ? v0 : c == 1 ? v1 : c == 2 ? v2 : v3, 0, 1);
+    // No local array indexed by SV_VertexID: some Gen9 drivers mis-lower that. The corner sequence
+    // 0,1,2,0,2,3 is computed with plain arithmetic and the corner is picked with scalar selects.
+    const uint k = id % 6;
+    const uint c = (k < 3u) ? k : ((k == 3u) ? 0u : (k - 2u));
+    const float x0 = (rect == 0) ? -1.0 : 0.0;
+    const float x1 = (rect == 0) ? 0.0 : 1.0;
+    // v0 = (x0, -1), v1 = (x1, -1), v2 = (x1, 1), v3 = v0 + v2 - v1 = (x0, 1)
+    const float x = (c == 0u || c == 3u) ? x0 : x1;
+    const float y = (c >= 2u) ? 1.0 : -1.0;
+    result.position = float4(x, y, 0, 1);
     result.side = rect;
     return result;
 }
