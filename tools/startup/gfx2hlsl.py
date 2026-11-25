@@ -440,8 +440,111 @@ def reg_range(tok):
     return None
 
 
-# Scalar instructions with no scalar or exec effect, allowed inside a compute block s_cbranch_execz skips.
-SKIPPABLE_SCALAR = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch')
+# Scalar state for the compute execz-block check (Stage.execz_refusals): registers as 's<n>', 'vcc', 'exec', 'm0'
+# and 'scc'. Reads may be over-approximated and must-writes under-approximated; both only add refusals.
+# The low half of a mask (vcc_lo, exec_lo) is 'vcc' / 'exec', the high half 'vcc_hi' / 'exec_hi', and a 64-bit
+# operand both, so a write of one half never counts as writing the other.
+SCALAR_TOKEN = re.compile(r'\bs\[(\d+):(\d+)\]|\bs(\d+)\b|\b(vcc|exec)(_lo|_hi)?\b|\b(m0)\b|\bsrc_(scc)\b')
+EXEC_KEYS = {'exec', 'exec_hi'}
+NO_SCALAR_EFFECT = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch')
+# Forms that print no destination: every printed scalar operand is read. v_cmpx writes EXEC implicitly; its e32 and
+# SDWA forms print only sources, and the repository decoder prints the e64 form's unused SDST field first.
+# s_setpc reads its address; s_movrel* address a register through m0, so their printed operand is not a plain write.
+NO_DESTINATION = ('v_cmpx', 's_setpc', 's_movrel', 'v_movrel')
+IMPLICIT_VCC_READ = ('v_div_fmas',)
+SCC_READERS = ('s_cselect', 's_cmov', 's_addc', 's_subb', 's_cbranch_scc')
+READ_MODIFY_WRITE = ('s_addk_i32', 's_mulk_i32', 's_cmov', 's_bitset', 'v_mac', 'v_fmac')
+TWO_DESTINATIONS = ('v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale', 'v_mad_u64_u32', 'v_mad_i64_i32')
+# Effects outside scalar registers, or control flow the wave takes as a whole: refused inside such a block.
+EXECZ_REFUSED = ('s_endpgm', 's_store', 's_atomic', 's_buffer_store', 's_buffer_atomic', 's_barrier', 's_sendmsg',
+                 's_setreg', 's_setpc', 's_swappc', 's_dcache', 's_icache', 's_gl1', 's_memtime', 's_memrealtime',
+                 's_trap', 's_sleep', 'v_writelane', 's_movrel', 'v_movrel')
+
+
+def scalar_tokens(text):
+    out = set()
+    for lo, hi, single, mask, half, m0, scc in SCALAR_TOKEN.findall(text):
+        if lo:
+            out.update('s%d' % n for n in range(int(lo), int(hi) + 1))
+        elif mask:
+            out.update({'_lo': {mask}, '_hi': {mask + '_hi'}}.get(half, {mask, mask + '_hi'}))
+        else:
+            out.add('s' + single if single else m0 or scc)
+    return out
+
+
+def is_exec(regs):
+    return regs in ({'exec'}, EXEC_KEYS)
+
+
+def exec_stays_clear(name, asm, saved):
+    """True when an exec write cannot set the bit of a lane whose bit is clear: exec & x (s_and_saveexec, v_cmpx,
+    s_and or s_andn2 with exec as the kept operand), or exec | x, exec ^ x or a move of x where x is only ever a copy
+    of exec made inside the same skipped block (so x's bit is clear for that lane too)."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    _, ops, _ = parse(asm)
+    if base.startswith(('s_and_saveexec', 'v_cmpx')):
+        return True
+    if not ops or not is_exec(scalar_tokens(ops[0])):
+        return False
+    srcs = [scalar_tokens(op) for op in ops[1:]]
+    # saved tracks register names, not which exec half was copied, so only a 32-bit restore is trusted
+    copies = lambda regs: bool(regs) and regs <= saved and base.endswith('32')
+    if base in ('s_and_b32', 's_and_b64'):
+        return any(is_exec(regs) for regs in srcs)
+    if base in ('s_andn2_b32', 's_andn2_b64'):
+        return bool(srcs) and is_exec(srcs[0])
+    if base in ('s_or_b32', 's_or_b64', 's_xor_b32', 's_xor_b64') and len(srcs) == 2:
+        return all(is_exec(regs) or copies(regs) for regs in srcs)
+    if base in ('s_mov_b32', 's_mov_b64') and len(srcs) == 1:
+        return copies(srcs[0])
+    return False
+
+
+def exec_copies_after(name, asm, saved, may):
+    """The registers that hold only copies of exec made in the block, after this instruction."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    _, ops, _ = parse(asm)
+    dests = scalar_tokens(ops[0]) - EXEC_KEYS - {'scc'} if ops else set()
+    saved = saved - (may - EXEC_KEYS - {'scc'})
+    if base.startswith('s_and_saveexec') or (base in ('s_mov_b32', 's_mov_b64') and len(ops) == 2
+                                             and is_exec(scalar_tokens(ops[1]))):
+        saved |= dests
+    return saved
+
+
+def scalar_effects(name, asm):
+    """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    _, ops, _ = parse(asm)
+    if base.startswith(NO_SCALAR_EFFECT) or base == 's_endpgm':
+        reads = {'scc'} if base.startswith('s_cbranch_scc') else {'vcc'} if base.startswith('s_cbranch_vcc') else \
+            {'exec'} if base.startswith('s_cbranch_exec') else set()
+        return reads, set(), set()
+    if base.startswith('v_cmpx'):
+        return scalar_tokens(' '.join(ops)) | {'exec'}, {'exec'}, set(EXEC_KEYS)
+    if '_store' in base or base.startswith(('ds_write', 'exp') + NO_DESTINATION) or not ops:
+        return scalar_tokens(' '.join(ops)) | ({'m0'} if 'movrel' in base else set()), set(), set()
+    if base.startswith(('s_cmp', 's_bitcmp')):
+        return scalar_tokens(' '.join(ops)), {'scc'}, {'scc'}
+    two = base.startswith(TWO_DESTINATIONS)
+    dests, srcs = ops[:2] if two else ops[:1], ops[2:] if two else ops[1:]
+    writes = scalar_tokens(' '.join(dests))
+    reads = scalar_tokens(' '.join(srcs))
+    if base.startswith(READ_MODIFY_WRITE):
+        reads |= writes
+    if base.startswith(SCC_READERS) or (base in SCA and 'scc' in SCA[base][0]):
+        reads.add('scc')
+    if base.startswith(IMPLICIT_VCC_READ):
+        reads.add('vcc')
+    may = set()
+    if 'saveexec' in base or 'wrexec' in base:
+        reads.add('exec')
+        writes.add('exec')
+        may |= EXEC_KEYS
+    if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
+        writes.add('scc')
+    return reads, writes, writes | may | ({'scc'} if base.startswith('s_') else set())
 
 # Forms with no scalar destination: their printed operands are all sources (v_cmpx writes only EXEC, which the
 # symbolic tracking does not hold).
@@ -798,11 +901,52 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+def _lds_single(tok):
+    """Single hardware VGPR vN (v0..v255) for bounded LDS exchange validation."""
+    m = re.fullmatch(r'v(\d+)', tok)
+    return int(m.group(1)) if m and int(m.group(1)) < 256 else None
+
+
+def _lds_pair(tok):
+    """Exact contiguous 2-VGPR pair v[n:n+1] (v0..v255) for bounded 64-bit LDS exchanges."""
+    m = re.fullmatch(r'v\[(\d+):(\d+)\]', tok)
+    if not m:
+        return None
+    lo, hi = int(m.group(1)), int(m.group(2))
+    return lo if hi == lo + 1 and hi < 256 else None
+
+
+def lds_byte_offsets(name, mods):
+    if name != 'ds_read2_b32':
+        if not mods:
+            return (0,)
+        if len(mods) == 1 and re.fullmatch(r'offset:\d+', mods[0]):
+            return (int(mods[0][7:]),)
+        raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
+    # DS_READ2 encodes each offset independently in dwords. An omitted field is zero.
+    offsets = {}
+    for mod in mods:
+        field = re.fullmatch(r'offset([01]):(\d+)', mod)
+        if not field or field[1] in offsets or int(field[2]) > 255:
+            raise Unsupported('LDS read2 needs ordinary dword offsets')
+        offsets[field[1]] = 4 * int(field[2])
+    first, second = offsets.get('0', 0), offsets.get('1', 0)
+    if first == second:
+        raise Unsupported('LDS read2 needs two distinct offsets')
+    return first, second
+
+
 def check_lds_exchange(ins, group, words):
-    """Prove one race-free fill of a contiguous LDS span, one uniform barrier, then reads of initialized words."""
+    """Prove one race-free 32-bit or 64-bit fill of a contiguous LDS span, one uniform barrier, then reads of initialized words.
+
+    RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords and
+    ds_write_b64 / ds_read_b64 access two contiguous little-endian dwords (v[n] at addr+offset, v[n+1] at addr+offset+4).
+    LLVM 15 AMDGPUUsage defines COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE in 128-dword (512-byte) units on gfx10.
+    """
     if not 0 < words <= 8192 or group[1:] != (1, 1):
         raise Unsupported('LDS exchange needs a 1D group and a nonzero allocation of at most 32 KiB')
     first = None
+    elem_bytes = None
     published = False
     read = False
     prev = (None, [], [])
@@ -817,29 +961,49 @@ def check_lds_exchange(ins, group, words):
                     or mods or ops not in ([], ['0'], ['0x0'])):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
             published = True
-        elif base in ('ds_write_b32', 'ds_read_b32'):
-            if (len(ops) != 2 or not all(re.fullmatch(r'v[0-9]+', op) for op in ops)
-                    or mods and (len(mods) != 1 or not re.fullmatch(r'offset:\d+', mods[0]))):
-                raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
-            offset = int(mods[0][7:]) if mods else 0
+        elif base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64'):
+            write = base.startswith('ds_write')
+            width = 8 if base.endswith('_b64') else 4
+            addr_op = ops[0] if (write and len(ops) == 2) else (ops[1] if len(ops) == 2 else '')
+            val_op = ops[1] if (write and len(ops) == 2) else (ops[0] if len(ops) == 2 else '')
+            if base == 'ds_read2_b32':
+                if len(ops) != 2 or _lds_pair(val_op) is None or _lds_single(addr_op) is None:
+                    raise Unsupported('LDS read2 needs a VGPR pair and a byte address VGPR')
+            elif (len(ops) != 2 or _lds_single(addr_op) is None
+                  or (_lds_pair(val_op) is None if width == 8 else _lds_single(val_op) is None)):
+                raise Unsupported('LDS exchange needs %s, %s and an optional byte offset'
+                                  % ('two VGPRs' if width == 4 else 'a VGPR address',
+                                     'an aligned 2-VGPR pair' if width == 8 else 'a matching data VGPR'))
+            offsets = lds_byte_offsets(base, mods)
             producer, args, modifiers = prev
-            if base == 'ds_write_b32':
-                # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct dword.
-                if (first is not None or producer != 'v_lshlrev_b32' or args != [ops[0], '2', 'v0']
-                        or modifiers or offset % 4 or offset + group[0] * 4 > words * 4):
-                    raise Unsupported('LDS exchange needs one bounded dword per local X ID')
+            if write:
+                offset, = offsets
+                shift = '3' if width == 8 else '2'
+                # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct element.
+                # 8-byte alignment is not required for LDS dword-addressed writes.
+                if (first is not None or producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0']
+                        or modifiers or offset % 4 or offset + group[0] * width > words * 4):
+                    raise Unsupported('LDS exchange needs one bounded %s per local X ID'
+                                      % ('qword' if width == 8 else 'dword'))
                 first = offset
+                elem_bytes = width
             else:
-                if not published or modifiers or not args or args[0] != ops[1]:
+                if not published or modifiers or not args or args[0] != addr_op:
                     raise Unsupported('LDS read needs a bounded address after the fill barrier')
+                if elem_bytes != width:
+                    raise Unsupported('LDS read width (%dB) does not match initialized fill (%dB)'
+                                      % (width, elem_bytes or 0))
                 if producer == 'v_mov_b32' and len(args) == 2 and re.fullmatch(r'0x[0-9a-f]+|\d+', args[1]):
                     low = high = int(args[1], 0)
                 elif (producer == 'v_and_b32' and len(args) == 3 and re.fullmatch(r'0x[0-9a-f]+|\d+', args[1])
-                      and re.fullmatch(r'v[0-9]+', args[2])):
+                      and _lds_single(args[2]) is not None):
                     low, high = 0, int(args[1], 0)
                 else:
                     raise Unsupported('LDS read needs a literal or literal-masked byte address')
-                if offset % 4 or high % 4 or low + offset < first or high + offset >= first + group[0] * 4:
+                # Every byte offset in [a + offset, a + offset + width) must be 4-byte aligned and inside the filled span.
+                if (low % 4 or high % 4
+                        or any(offset % 4 or low + offset < first or high + offset + (width - 4) >= first + group[0] * width
+                               for offset in offsets)):
                     raise Unsupported('LDS read outside the aligned, initialized span')
                 if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
                     raise Unsupported('LDS read needs a completed LGKM wait')
@@ -1227,6 +1391,73 @@ class Stage:
         words = [self.is_const(n) for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def execz_refusals(self):
+        """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
+
+        The wave runs such a block when any lane is active, so its scalar results are the same for every lane; the
+        model skips the block for an inactive lane. That lane can differ from the wave only by reading, after the
+        join, scalar state the block defines (no lane active means the wave skipped the block too). The block is
+        therefore accepted unchanged when every scalar register, mask and SCC it may define is dead where it joins,
+        and it has no effect outside scalar registers and no branch out of it. An exec write is accepted in a
+        straight-line block (no branch in it, none into it) when it cannot set the bit of a lane whose bit is clear
+        (exec_stays_clear): such a lane's bit is clear on entry, so the wave leaves it clear and its exec at the
+        join is the model's. A live definition, another exec write, a refused effect, a branch leaving the block
+        or a backward s_cbranch_execz is refused."""
+        offsets = [ins[0] for ins in self.ins]
+        index = {off: i for i, off in enumerate(offsets)}
+        effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
+        succ = []
+        targets = []  # every branch target, the proven calculated s_setpc_b64 ones included
+        for i, (off, n, name, asm) in enumerate(self.ins):
+            to = int(parse(asm)[1][0].split('_')[1], 16) if name.startswith(('s_cbranch', 's_branch')) else None
+            if name == 's_setpc_b64':  # a proven calculated jump reaches its target
+                to = getattr(self, 'calculated_pc', {}).get(off)
+            nxt = [i + 1] if i + 1 < len(self.ins) and name not in ('s_branch', 's_endpgm') else []
+            if to is not None:
+                targets.append(to)
+            succ.append(nxt + ([index[to]] if to in index else []))
+        live_in = [set() for _ in self.ins]
+        changed = True
+        while changed:
+            changed = False
+            for i in reversed(range(len(self.ins))):
+                out = set().union(*(live_in[s] for s in succ[i])) if succ[i] else set()
+                reads, writes, _ = effects[i]
+                value = reads | (out - writes)
+                if value != live_in[i]:
+                    live_in[i], changed = value, True
+        refused = {}
+        for b, (off, n, name, asm) in enumerate(self.ins):
+            if name != 's_cbranch_execz':
+                continue
+            t = index.get(int(parse(asm)[1][0].split('_')[1], 16))
+            if t is None or t <= b:
+                refused.setdefault(off, 's_cbranch_execz to a block before it')
+                continue
+            live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
+            saved = set()  # registers whose every write in the block so far is a copy of exec
+            # The copies are tracked in program order, which is every path only in a straight-line block: no branch
+            # in it and no branch into it. Elsewhere an exec write is refused.
+            straight = not any(self.ins[k][2].startswith(('s_cbranch', 's_branch')) for k in range(b + 1, t)) and \
+                not any(index.get(target) in range(b + 1, t) for target in targets)
+            for i in range(b + 1, t):
+                at, _, inner, inner_asm = self.ins[i]
+                may = effects[i][2]
+                reason = None
+                if inner.startswith(EXECZ_REFUSED):
+                    reason = 'effect outside scalar registers'
+                elif inner.startswith(('s_cbranch', 's_branch')) and not (
+                        b < index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1) <= t):
+                    reason = 'branch out of the block'
+                elif may & EXEC_KEYS and not (straight and exec_stays_clear(inner, inner_asm, saved)):
+                    reason = 'exec write'
+                elif (may - EXEC_KEYS) & live:
+                    reason = 'definition of %s, live where the block joins' % ', '.join(sorted((may - EXEC_KEYS) & live))
+                saved = exec_copies_after(inner, inner_asm, saved, may)
+                if reason:
+                    refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
+        return refused
+
     # ---- instruction translation -------------------------------------------------------------
     def joined_registers(self, with_cfg=False):
         """{branch target: registers whose program-order symbol may not hold on every path into it}.
@@ -1367,7 +1598,6 @@ class Stage:
             refusals.append((str(reason), self.kind))
             self.calculated_pc = {}
         targets = set()
-        skipped = []  # compute: (branch, target) of each s_cbranch_execz
         targets.update(target for target in self.calculated_pc.values() if target is not None)
         # (branch, target) of every branch, the proven s_setpc_b64 jumps included
         branches = [(pc, target) for pc, target in self.calculated_pc.items() if target is not None]
@@ -1376,9 +1606,8 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
-                if name == 's_cbranch_execz' and self.kind == 'cs':
-                    skipped.append((off, target))
         join_writes = self.join_writes(branches)
+        refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
         joined, forward_splits, div_targets = self.joined_registers(with_cfg=True)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
@@ -1519,13 +1748,8 @@ class Stage:
                 dests = scalar_destinations(name, asm)
                 written |= every_sgpr if 'any' in dests else dests
                 try:
-                    if any(branch < off < target or target <= off < branch for branch, target in skipped) and (
-                            name.startswith(('s_', 'v_readlane', 'v_readfirstlane', 'v_writelane'))
-                            and not name.startswith(SKIPPABLE_SCALAR)
-                            and not (name == 's_setpc_b64' and off in self.calculated_pc)):
-                        # The wave runs this block when any lane is active, so its scalar state changes for every
-                        # lane; the one-lane model would skip it for an inactive lane.
-                        raise Unsupported('%s inside a block s_cbranch_execz skips per lane' % name)
+                    if off in refused:
+                        raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
@@ -1824,13 +2048,15 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
-        if base in ('ds_write_b32', 'ds_read_b32', 's_barrier'):
+        if base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64', 's_barrier'):
             if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported(base)
             # The refusal census continues past failed instructions. Scan this program only once.
             if not hasattr(self, 'lds_error'):
                 self.lds_error = None
                 try:
+                    if getattr(self, 'pipe', None) is None:
+                        raise Unsupported('LDS exchange needs pipeline metadata')
                     check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
                     self.uses_lds = True
                 except Unsupported as reason:
@@ -1840,14 +2066,31 @@ class Stage:
             if base == 's_barrier':
                 self.emit('GroupMemoryBarrierWithGroupSync();')
             else:
-                write = base == 'ds_write_b32'
+                write = base.startswith('ds_write')
                 address = self.u(ops[0 if write else 1])
-                offset = int(mods[0][7:]) if mods else 0
-                cell = 'lds[(%s + %du) >> 2]' % (address, offset)
-                if write:
-                    self.emit('%s = %s;' % (cell, self.u(ops[1])))
+                offsets = lds_byte_offsets(base, mods)
+                if base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32'):
+                    if write:
+                        self.emit('lds[(%s + %du) >> 2] = %s;' % (address, offsets[0], self.u(ops[1])))
+                    else:
+                        if base == 'ds_read2_b32':
+                            # Either destination can overlap the incoming address VGPR.
+                            self.emit('a = %s;' % address)
+                            address = 'a'
+                        start = reg_range(ops[0])[1]
+                        for index, offset in enumerate(offsets):
+                            self.set_v(start + index, 'lds[(%s + %du) >> 2]' % (address, offset))
                 else:
-                    self.set_v(reg_range(ops[0])[1], cell)
+                    lo = _lds_pair(ops[1 if write else 0])
+                    if write:
+                        d0, d1 = self.u('v%d' % lo), self.u('v%d' % (lo + 1))
+                        self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
+                        self.emit('lds[a] = %s;' % d0)
+                        self.emit('lds[a + 1u] = %s;' % d1)
+                    else:
+                        self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
+                        self.set_v(lo, 'lds[a]')
+                        self.set_v(lo + 1, 'lds[a + 1u]')
             return None
         if base.endswith('_dpp'):
             return self.dpp(base[:-len('_dpp')], ops, mods)
@@ -2684,7 +2927,7 @@ class Stage:
             elif m not in ('idxen', 'offen', 'glc', 'slc', 'dlc'):
                 raise Unsupported('buffer modifier %s' % m)
         if len(ops) != 4:
-            raise Unsupported('buffer load with %d operands' % len(ops))
+            raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
         key = self.descriptor(ops[2])
         buf = self.pipe.resource(key, 'buf')
         soffset = None
@@ -2727,6 +2970,11 @@ class Stage:
         return buf, ' + '.join(terms)
 
     def op_buffer_load_dword(self, ops, mods, count=1):
+        # ops[0] is read before buffer_address() can refuse a short operand list, so an instruction with no
+        # operands at all would reach it as an index error. Everything longer is left to the shared check,
+        # which sees a modifier first: the lds form decodes to three operands and must still refuse on it.
+        if not ops:
+            raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
         self.emit('a = %s;' % address)
@@ -2894,6 +3142,8 @@ class Stage:
         self.op_buffer_store_dword(ops, mods, 4)
 
     def tbuffer(self, ops, mods, count):
+        if not ops:
+            raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
         formats = [m for m in mods if m.startswith('format:')]
         fmt = formats[0][8:-1] if formats else 'BUF_FMT_8_UNORM'  # the disassembler omits the default format
@@ -2940,6 +3190,11 @@ class Stage:
     def image(self, ops, mods, how):
         if getattr(self, 'kind', None) == 'cs' and 'd16' in mods:
             raise Unsupported('compute d16 image load requires validated SRV formats')
+        # Every image form reads vdata, an address and a descriptor, so a shorter operand list would reach
+        # ops[1] or ops[2] as an index error rather than a refusal. Samplers are checked further down, where
+        # the form decides whether one is required.
+        if len(ops) < 3:
+            raise Unsupported('image instruction with %d operands, expected at least 3' % len(ops))
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
         dmask = int([m for m in mods if m.startswith('dmask:')][0][6:], 0)

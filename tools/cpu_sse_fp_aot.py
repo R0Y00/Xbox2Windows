@@ -6,7 +6,7 @@ and rdx are inputs, r8 is the output). XMM0..XMM5 are modeled as portable
 128-bit value structs (two 64-bit lanes). Only legacy encodings are accepted;
 VEX, EVEX and other non-legacy forms reject.
 
-Supported SSE and SSE2 instructions (20 forms from docs/coverage/x64_zen2.tsv groups SSE, SSE2):
+Supported SSE and SSE2 instructions (24 forms from docs/coverage/x64_zen2.tsv groups SSE, SSE2):
   - Packed float arithmetic: addps, subps, mulps, divps, minps, maxps (xmm and
     aligned m128 source, destination read and replaced) and sqrtps (xmm and
     aligned m128 source, destination only written)
@@ -14,6 +14,8 @@ Supported SSE and SSE2 instructions (20 forms from docs/coverage/x64_zen2.tsv gr
     m128 source; xorps xmmN, xmmN self-zeroing accepts an undefined xmmN)
   - Packed double arithmetic: addpd, subpd, mulpd, divpd, minpd, maxpd and sqrtpd,
     with the same operand rules (two 64-bit lanes)
+  - Packed double bitwise logic: andpd, andnpd, orpd, xorpd (xmm and aligned
+    m128 source; xorpd xmmN, xmmN self-zeroing accepts an undefined xmmN)
   - Packed float compare: cmpps (imm8 predicates 0..7, xmm and aligned m128)
   - Packed double compare: cmppd (imm8 predicates 0..7, xmm and aligned m128; imm8 >= 8 is
     an AVX-only predicate and rejects; each 64-bit lane becomes an all-ones or all-zero mask)
@@ -26,7 +28,7 @@ Arithmetic runs under the host MXCSR: the generated code executes the same
 SSE operation at run time, so the rounding mode, DAZ and FTZ are the host's
 and the translator never folds a result at translation time. A guest MXCSR
 write (ldmxcsr, vldmxcsr) is not lifted, exception flags are not observed and
-the scalar forms, the other packed double forms (logic, conversions),
+the scalar forms, the other packed double forms (conversions),
 rcpps and rsqrtps stay rejected. NaN operands are resolved in software (the first
 source operand that is a NaN, made quiet, else the second) so that a compiler
 which commutes an addition cannot change a payload.
@@ -75,6 +77,10 @@ BITWISE_LOGIC_FUNCTIONS = {
     Code.ANDNPS_XMM_XMMM128: "op_andnps",
     Code.ORPS_XMM_XMMM128: "op_orps",
     Code.XORPS_XMM_XMMM128: "op_xorps",
+    Code.ANDPD_XMM_XMMM128: "op_andps",
+    Code.ANDNPD_XMM_XMMM128: "op_andnps",
+    Code.ORPD_XMM_XMMM128: "op_orps",
+    Code.XORPD_XMM_XMMM128: "op_xorps",
 }
 
 LOAD_ALIGNED_VEC_CODES = {Code.MOVAPS_XMM_XMMM128, Code.MOVDQA_XMM_XMMM128}
@@ -464,7 +470,7 @@ def lift_code(name, start, raw):
             defined.add(dst_idx)
         elif ins.code in BITWISE_LOGIC_FUNCTIONS:
             if (
-                ins.code == Code.XORPS_XMM_XMMM128
+                ins.code in (Code.XORPS_XMM_XMMM128, Code.XORPD_XMM_XMMM128)
                 and ins.op0_kind == OpKind.REGISTER
                 and ins.op1_kind == OpKind.REGISTER
                 and ins.op0_register == ins.op1_register
