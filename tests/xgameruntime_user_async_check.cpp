@@ -58,6 +58,9 @@ using UserAddAsync = HRESULT(WINAPI*)(std::uint32_t, XAsyncBlock*);
 using UserAddResult = HRESULT(WINAPI*)(XAsyncBlock*, XUserHandle*);
 using UserGetId = HRESULT(WINAPI*)(XUserHandle, std::uint64_t*);
 using CloseUserHandle = void(WINAPI*)(XUserHandle);
+using UserFindById = HRESULT(WINAPI*)(std::uint64_t, XUserHandle*);
+using ProviderStart = HRESULT(WINAPI*)(XUserHandle, const char*, bool, XAsyncBlock*);
+using CloseProvider = void(WINAPI*)(XGameSaveProviderHandle);
 using ProviderResult = HRESULT(WINAPI*)(XAsyncBlock*, XGameSaveProviderHandle*);
 using GetStatus = HRESULT(WINAPI*)(XAsyncBlock*, bool);
 using GetResultSize = HRESULT(WINAPI*)(XAsyncBlock*, std::size_t*);
@@ -70,6 +73,9 @@ struct Api {
     UserAddResult result = nullptr;
     UserGetId get_id = nullptr;
     CloseUserHandle close_user = nullptr;
+    UserFindById find_user = nullptr;
+    ProviderStart provider_start = nullptr;
+    CloseProvider close_provider = nullptr;
     ProviderResult provider_result = nullptr;
     GetStatus get_status = nullptr;
     GetResultSize get_result_size = nullptr;
@@ -182,6 +188,9 @@ bool load_api(HMODULE module, Api& api)
            find_proc(module, "XUserAddResult", api.result) &&
            find_proc(module, "XUserGetId", api.get_id) &&
            find_proc(module, "XUserCloseHandle", api.close_user) &&
+           find_proc(module, "XUserFindUserById", api.find_user) &&
+           find_proc(module, "XGameSaveInitializeProviderAsync", api.provider_start) &&
+           find_proc(module, "XGameSaveCloseProvider", api.close_provider) &&
            find_proc(module, "XGameSaveInitializeProviderResult", api.provider_result) &&
            find_proc(module, "XAsyncGetStatus", api.get_status) &&
            find_proc(module, "XAsyncGetResultSize", api.get_result_size) &&
@@ -320,6 +329,44 @@ bool wrong_kind_and_close_guard(const Api& api)
     return ok;
 }
 
+bool shared_queue_results(const Api& api)
+{
+    XUserHandle requesting_user = nullptr;
+    if (!expect_hr(api.find_user(synthetic_user_id, &requesting_user), S_OK, "find save user")) return false;
+    Probe user_probe, provider_probe;
+    XAsyncBlock user_block = make_block(&user_probe, record);
+    XAsyncBlock provider_block = make_block(&provider_probe, record);
+    bool ok = expect_hr(api.add(opt_silently, &user_block), S_OK, "start user-add on shared queue") &&
+              expect_hr(api.provider_start(requesting_user, "synthetic-user-and-save", false, &provider_block),
+                        S_OK, "start save provider on shared queue");
+    std::size_t user_size = 0, provider_size = 0;
+    ok = ok && expect_hr(api.get_status(&user_block, false), S_OK, "user status before dispatch") &&
+         expect_hr(api.get_status(&provider_block, false), S_OK, "provider status before dispatch") &&
+         expect_hr(api.get_result_size(&user_block, &user_size), S_OK, "user size before dispatch") &&
+         expect_hr(api.get_result_size(&provider_block, &provider_size), S_OK, "provider size before dispatch") &&
+         expect(user_size == sizeof(XUserHandle) && provider_size == sizeof(XGameSaveProviderHandle),
+                "both results report their typed handle size") &&
+         expect(user_probe.calls == 0 && provider_probe.calls == 0, "queries did not dispatch");
+    XUserHandle user = nullptr;
+    XGameSaveProviderHandle provider = nullptr;
+    ok = ok && expect_hr(api.provider_result(&user_block, &provider), E_INVALIDARG, "provider rejects user block") &&
+         expect_hr(api.result(&provider_block, &user), E_INVALIDARG, "user rejects provider block") &&
+         expect(api.dispatch(queue, port_completion, 0) && user_probe.calls == 1 && provider_probe.calls == 0,
+                "user callback dispatched first") &&
+         expect(api.dispatch(queue, port_completion, 0) && provider_probe.calls == 1,
+                "provider callback dispatched second") &&
+         expect(!api.dispatch(queue, port_completion, 0), "shared queue drained") &&
+         expect_hr(api.result(&user_block, &user), S_OK, "claim user once") &&
+         claimed_user_is_synthetic(api, user) &&
+         expect_hr(api.provider_result(&provider_block, &provider), S_OK, "claim provider once") &&
+         expect(provider != nullptr, "provider is valid");
+    if (user) api.close_user(user);
+    if (provider) api.close_provider(provider);
+    api.close_user(requesting_user);
+    return ok && expect_hr(api.result(&user_block, &user), E_INVALIDARG, "user already consumed") &&
+           expect_hr(api.provider_result(&provider_block, &provider), E_INVALIDARG, "provider already consumed");
+}
+
 // The user table is finite: a start that cannot get a handle fails, frees its
 // slot and block, and later starts work again once handles are closed.
 bool capacity(const Api& api)
@@ -370,7 +417,7 @@ bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* nor
                  manual_contract(api, opt_silently, "start AddDefaultUserSilently") &&
                  manual_contract(api, opt_allowing_ui, "start AddDefaultUserAllowingUI") &&
                  claim_inside_callback(api) && null_callback_and_reuse(api) && refusals(api) &&
-                 wrong_kind_and_close_guard(api) && capacity(api);
+                 wrong_kind_and_close_guard(api) && shared_queue_results(api) && capacity(api);
         if (queue) api.queue_close(queue);
     }
     FreeLibrary(module);

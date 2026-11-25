@@ -11291,7 +11291,7 @@ refused before any image is loaded or mapped. The default `plan(report)` keeps
 the earlier permissive behavior because the offline preflight does not inspect
 host providers. The XGameRuntime fixture is built under
 `out/build/dev/fixture-shims/`, never beside `xmem.dll` or `d3d12_xs.dll`. A
-source-built EXE importing `xgameruntime.dll!XUserAddAsync` is packaged with the
+source-built EXE importing `xgameruntime.dll!XPackageMountWithUiAsync` is packaged with the
 normal shims but without that fixture DLL; `xgameruntime_preflight_stub_refused`
 checks its `external_unverified` status and the strict plan's refusal.
 
