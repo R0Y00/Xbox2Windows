@@ -5161,7 +5161,7 @@ The gfx1013 compute fixture translates one indexed `buffer_store_format_xyzw` th
 
 The view must be live and describe format 75 (`BUF_FMT_32_32_32_32_UINT`) with identity channel selectors. The store uses the view base, stride, dispatch thread index and instruction byte offset. Only a complete aligned texel within the record count, stride and declared u0 extent is written. The fixture models view selection within one bound buffer. [LLVM format table](https://releases.llvm.org/15.0.0/docs/AMDGPUModifierSyntax.html#ufmt) · [AMD RDNA 2 shader ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
-Run `ctest --preset dev -R '^compute_(heap_store_controls|store_aot_heap_view_store_warp)$' --output-on-failure`. The fixture checks all 320 readback words across twelve cases. These include distinct live ranges, one texel ending exactly at the u0 limit, and a partial texel that must leave the sentinel intact. Seven mutations exercise the base, stride, record count, format, lifetime, output extent and slot limit.
+Run `ctest --preset dev -R '^compute_(heap_store_controls|store_aot_heap_view_store_(warp|hardware))$' --output-on-failure`. The fixture checks all 320 readback words across twelve cases. These include distinct live ranges, one texel ending exactly at the u0 limit, and a partial texel that must leave the sentinel intact. Eight mutations exercise the base, stride, record count, format, lifetime, output extent and slot limit. Removing the per-index extent check lets the next thread write past the last complete texel.
 
 ### Heap-view buffer loads
 

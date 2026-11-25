@@ -47,6 +47,7 @@ def lower(program=PROGRAM, **options):
 
 def controls():
     assert base.aot.descriptor_format_word(75) == UINT4
+    # Pin the translator call here. draw() exercises the generated guards against actual UAV contents.
     assert "store_heap_uint4(params[0].x, tid.x, 4u, uint4(tid.x," in lower()
     refuses = base.rejects
     refuses("Unsupported formatted buffer store target or address mode", lower, heap_store_view=None)
@@ -109,6 +110,7 @@ def draw(directory, compiler, renderer, backend):
         (" || index >= view.z", "", 1),
         ("uint stride = view.y >> 16u;", "uint stride = 24u;", 1),
         ("const uint bytes = 512u;", "const uint bytes = 1280u;", 4),
+        ("if (index > (bytes - view.x - offset - 16u) / stride) return;", "", 3),
         (f"view.w != {UINT4:#x}u || ", "", 5),
         ("!= 1u) return;", "== 0u) return;", 2),
         (f"slot >= {VIEW[2]}u", f"slot > {VIEW[2]}u", VIEW[2]),
