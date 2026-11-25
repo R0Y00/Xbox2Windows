@@ -189,7 +189,12 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-8`, so translations paired by number are not reused.
+The shader cache revision is `x2w-startup-shader-13`. Older translations evaluate `s_brev_b32` of a
+constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
+same source and destination register.
+Earlier revisions can also carry a stale scalar symbol across a join or read a stale SCC after
+an operation on a descriptor word.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
@@ -229,6 +234,21 @@ windows, build `startup_overlay_window` and run
 `ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
 The same run raises each of two guests in turn and checks that the raised one is
 selected.
+With `X2W_HIDE_TITLE_WINDOW=1` (exactly `1`), a 500 ms timer on the output window's thread hides the
+title's own visible, unowned windows while presents reach the output window, and hides them again when
+the title shows them. The hide is asynchronous (`ShowWindowAsync`), so a busy title thread does not
+stall the output window. Dialogs (class `#32770`) stay visible. When the latest present did not reach
+the output window, the windows are shown again, so that the GDI fallback above has a window to draw its
+status into. When a hidden window was in front, the output window is asked to take the foreground
+before the hide, and the log says so once when that is refused. Whether keyboard input still reaches
+the title after the hide has not been measured. The switch is opt-in and off by default; without it no
+timer is created. `startup_overlay_window` checks the helper (`TitleWindowHider` in
+`src/startup_stubs/overlay_window.h`) with source-built windows: the switch is off when unset, `0` or
+`10`; the timer is armed only with the switch and its `WM_TIMER` arrives; nothing is hidden before the
+first shown present; the guest is hidden twice and shown again after a present that was not shown; the
+presenter, its owned window and a dialog stay visible. Where the host lets the test set the foreground,
+it also checks that the foreground moves to the output window. A run under Wine did; the fixture prints
+which case applied.
 
 ## Null Texture2D descriptors
 
@@ -396,6 +416,45 @@ spends the line limit with eight zero-address refusals, has a 2048x2048 BC1 10-m
 draws from the untouched entry. It then publishes a supported 1-mip R8 texture and draws from it. It
 expects one counted and named BC1 shape, its line past the limit, one write line for the R8 entry, one
 token null with zero words, and the R8 texels. The control publishes the supported R8 texture in place of the BC1 one and must fail.
+
+### Per-reason refusal census per pipeline key
+
+[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) tracks every distinct
+`(key, reason)` refusal pair separately instead of overwriting earlier reasons on the same pipeline key
+with the last refusal:
+
+- Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
+  call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
+  `total` and `overflow calls` without unbounded allocation.
+- `report(emit, true)` skips emission when nothing changed since the previous periodic report and emits
+  the summary line plus only the `(key, reason)` entries whose counts grew; `report(emit, false)`
+  prints the full table without hiding the next periodic delta.
+- [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) and
+  [`d3d12_draw.inl`](../src/startup_stubs/d3d12_draw.inl) wire an `indirect-draw` census instance into
+  `draw_translated_indirect`: each refused translated indirect draw with a resolved shader key records
+  `(shader_key, refusal_code)` (for example `missing_guest_root`, `sampled_texture_mismatch`,
+  `unsupported_resource_or_entry`, `incomplete_table_buffer`), keeps logging the first occurrence of
+  each of the first 8 distinct `(key, reason)` pairs even after the 32-call refusal log limit is spent,
+  emits deltas in the five-second report, and appends the full `x2w-d3d12 indirect-draw refusals:` lines
+  to `x2w_d3d12_census_report` whenever at least one refusal occurred (leaving zero-refusal runs at the
+  existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
+  are not counted in this census (matching the per-call log gate), so `total` counts only refusals
+  attributed to a resolved translated shader key rather than all `ExecuteIndirect` refusals.
+
+Check without a device via
+`ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
+the pass run verifies interleaved reasons across two keys, detail limits, overflow accounting and delta
+reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCensus` with
+`X2W_CENSUS_KEEP_LAST` and `X2W_CENSUS_KEEP_FIRST`, print both expected reasons with counts in their
+mismatch output, and are marked `WILL_FAIL`.
+
+Check the runtime wiring on WARP and hardware via
+`ctest --preset dev --no-tests=error -R '^startup_indirect_translated_refusal_census_(warp|hardware|control_warp)$' -V`:
+the pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
+key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
+succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
+and both per-call log lines for the shared key; the control replaces the second refusal on key 1 with a
+valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.
 
 ## Root constant buffer views
 
@@ -807,6 +866,14 @@ the process could not be created, 0 when the debugger finished its report, whate
 did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
 runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
 script text only.
+`tools/startup/run.sh` is the Linux counterpart ([Launch environment](wine.md#launch-environment)).
+`python3 -B tests/startup_run_sh_check.py` (ctest `startup_run_sh`, a skip on Windows) runs it under bash
+with a stub Wine, debugger and watcher. It checks the exit code, the debugger's arguments and environment,
+and that the watcher and its child run during the debugger call and are gone after the script exits. The
+watcher stub ignores SIGTERM, so the SIGKILL fallback is exercised. After a Ctrl-C, run.sh ends by
+SIGINT; a TERM sent to run.sh alone waits for the debugger and ends by SIGTERM. Mutated copies of the
+script must fail. run.sh and its check need bash 4.4 or newer, GNU `realpath` and `setsid`, so they run
+on Linux, not on a stock macOS.
 
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
@@ -1104,6 +1171,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
+| `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
@@ -1872,6 +1940,15 @@ These are measured on one executable; treat them as hypotheses for others.
   snapshot equality: build `startup_translated_sampler_bindings_check` and run
   `ctest --preset dev --no-tests=error -R "^startup_translated_sampler_bindings(_shared_axis_control)?$" -V`.
   The control expects all three axes to use the U field and must fail.
+  Table entries take their LOD range from word 1, as `smpl` static samplers do: `MIN_LOD` (bits 11:0) and
+  `MAX_LOD` (bits 23:12), unsigned 4.8 fixed point. An entry with word 1 = 0 samples mip 0 only; the border
+  fallback is not a title descriptor and keeps the full mip range. A `MIN_LOD` above `MAX_LOD` is passed
+  through unchanged; D3D12 documents `MaxLOD >= MinLOD`, and the console behaviour for that case is not
+  established here. `startup_sampler_lod_{warp,hardware}` decode two table entries that differ only in
+  word 1, both with `MinLOD <= MaxLOD`: entry 0 is `MIN_LOD` 2 with `MAX_LOD` 4095/256, entry 1 is
+  `MIN_LOD` 0 with `MAX_LOD` 1. They read a four-mip texture with one value per mip at explicit LODs, and a
+  static `smpc` sampler must keep `LESS`. The `_dropped_` control resets the decoded range and must read
+  mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
   gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
@@ -1884,8 +1961,10 @@ These are measured on one executable; treat them as hypotheses for others.
 - `image_sample`, `image_sample_l` and `image_sample_lz` through a constant sampler carry the descriptor's MIN_LOD and MAX_LOD
   through the same `smpl` line (#2177). A constant sampler with a LOD bias or MIN_LOD above MAX_LOD is now refused for these forms;
   a mip filter of 0 is not (the sampler stays an ordinary `smp` line). A sampler from the heap, including the default-sampler
-  shortcut, still translates as before with an unbounded LOD range: its MIN_LOD, MAX_LOD and bias are not validated, and
-  `gfx2hlsl.py` logs that once per translated module (#2221). `image_sample_c` is unchanged.
+  shortcut, still translates as before: its MIN_LOD, MAX_LOD and bias are not validated, and `gfx2hlsl.py` logs that once per
+  translated module (#2221). With the sampler-heap opt-in, a table entry applies its MIN_LOD and MAX_LOD at run time (see the
+  sampler-heap item above); its LOD bias is not carried, and a MIN_LOD above MAX_LOD is passed through unchanged. The
+  default-sampler shortcut keeps a static sampler with an unbounded LOD range. `image_sample_c` is unchanged.
   `ctest --preset dev --no-tests=error -R '^startup_image_sample_lod'` draws each form on its own against a plain-`smp` control
   (`docs/experiments.md`, "constant-sampler LOD limits").
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
@@ -1949,15 +2028,20 @@ These are measured on one executable; treat them as hypotheses for others.
 - Depth-stencil registers are decoded, and applied only with `X2W_DEPTH_STATE=1` (#1999, item A;
   see the next bullet). State block A of a
   slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
-  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
-  covered. `src/startup_stubs/pipeline_state_decode.h`
+  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally, when the word at +0x004 is 4
+  (vertex pipelines). Mesh pipelines carry 6 there and a second layout, also measured locally: every
+  field from +0x058 on is 0x54 bytes later (`DB_DEPTH_CONTROL` at +0x10C); the reader adds that
+  shift. A block with another value at +0x004 is read at the vertex offsets. The blend reader
+  (`state_block_blend.h`, +0xD0) does not take the shift yet. `src/startup_stubs/pipeline_state_decode.h`
   reads the four words and decodes them into a `D3D12_DEPTH_STENCIL_DESC` and a stencil reference
   with the field layouts of Mesa's `src/amd/registers/gfx10.json`. It refuses stencil ops D3D12
   can't express (`ONES`, `REPLACE_OP`, the logic ops, add or subtract by other than one) and colour
   writes tied to the depth result. It flags, without applying, `DEPTH_BOUNDS_ENABLE` and back-face
   masks or references that differ from the front. A device-free check decodes hand-built words for
   each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
-  Its `_offset_control` run (words one word later) is the negative control
+  Its `_offset_control` run (words one word later) is the negative control. A vertex block and a mesh
+  block each hold a different decodable state at the other layout's offsets; `_mesh_shift_control`
+  (the mesh words at the vertex offsets) is that case's negative control
   (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
 - `X2W_DEPTH_STATE=1` (off by default) takes that decoded state for translated draws of slot 57
   pipelines (`src/startup_stubs/depth_state_apply.h`, applied in `translation_for` in
@@ -2001,23 +2085,58 @@ releases the request. This affects scheduling and preserves the existing audio
 routing and sample format.
 
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
-and `XApuDisconnect`, refuses null or unreadable command headers (`E_POINTER`), null outputs
+and `XApuDisconnect`. `XApuConnect` allocates a zeroed shared buffer of the size given by the
+32-bit value at input `+0x0C` and writes its address to output `+0x00`. In one title's calls the caller read only that
+pointer, and its later decode commands pointed into the buffer. A size of 0, or over a 64 MiB sanity cap, is refused
+(`E_INVALIDARG`) without a handle, and the buffer is released on `XApuDisconnect`. It refuses null
+or unreadable command headers (`E_POINTER`), null or unreadable inputs and null or unwritable outputs
 (`E_POINTER`), and unknown or disconnected handles (`E_HANDLE`), and records one `(type, slot)`
 entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
-index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
+index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (192 KiB per
 connection; additional enqueues return `E_OUTOFMEMORY` without dropping queued entries).
 `XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` retires one entry
 and zeroes the `0x58`-byte result buffer. The experimental `X2W_XAPU_TYPED_COMPLETIONS=1`
 also writes the command type at `+0x00` and slot index at `+0x04`. Decoded bytes at `+0x34`
-remain zero in both modes. An empty
+remain zero in both modes unless the optional Opus decode below is built in. An empty
 queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
 
 Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
 observed callers. The experimental mode echoes any 32-bit type value at `+0x00` verbatim
 (including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
-outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
+outside `+0x00` and `+0x04` zero (`+0x34` carries decoded bytes only in the optional Opus build below). Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
+
+The default build does not depend on libopus. Configuring with `-DX2W_WITH_OPUS=ON` (and `Opus_DIR` pointing at an
+installed libopus CMake package) links libopus into `xapu.dll`. The stand-ins link the static MSVC runtime, so libopus
+must be built with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>`. Tested with libopus 1.5.2;
+its notice is in [`src/startup_stubs/THIRD_PARTY_NOTICES.md`](../src/startup_stubs/THIRD_PARTY_NOTICES.md). With typed
+completions on, a type `3` command then decodes one Opus packet. The command fields as one title fills them:
+`+0x1C` sample rate (32-bit float: 8000, 12000, 16000, 24000 or 48000), `+0x24` frames, `+0x28` packet bytes,
+`+0x2C` packet pointer, `+0x34` output bytes (frames × channels × 4, 1 or 2 channels) and `+0x38` output pointer
+(interleaved 32-bit float). The result carries the decoded byte count at `+0x34`, which is smaller than the output
+size when the packet holds fewer frames. Each slot keeps its own decoder; type `5` resets it and type `2` frees it,
+as does `XApuDisconnect`. A command with no packet (null pointer and 0 bytes) completes with 0 bytes, as without
+libopus. Any other invalid field (rate, channel count, frames over 5760, packet over 64 KiB, unreadable packet,
+unwritable output, slot 256 or above) returns `E_INVALIDARG`. A packet that libopus rejects, or one holding more
+frames than `+0x24`, returns `E_FAIL`, and a command shorter than `0x40` readable bytes returns `E_POINTER`. A full
+queue returns `E_OUTOFMEMORY` before any decode, reset or close. A refused command queues no result, leaves the
+output untouched and keeps the existing decoder object. Invalid arguments and a full queue fail before calling
+libopus. If libopus fails while using an existing decoder, its internal state follows libopus. Decoded samples
+are copied from scratch only after the result is queued.
+
+```powershell
+cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
+cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check
+ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus)$' -V
+```
+
+`startup_xapu_opus` encodes generated 1 kHz tones with the same libopus and checks exact byte counts (3840 for
+48 kHz mono, 7680 for stereo, 1920 for a 10 ms packet in a 20 ms buffer, 1280 for 16 kHz), bit-exact PCM against
+a reference decoder, untouched guard floats past the decoded frames, a malformed packet, each refusal above with
+an untouched output and an empty queue, a full queue that leaves the slot's stream intact, reset and close each
+starting a fresh decoder, a rate change on a live slot, and that type `3` decodes nothing with typed completions
+off. It is registered only in the optional build.
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
@@ -2044,7 +2163,7 @@ code 77 means no usable render endpoint (or an unsupported mix format). It print
 format and Windows build. A skip is neither a pass nor a failure. Every wait is bounded.
 
 Not established: `XApuEnqueueCommand`/`XApuDequeueResult` payload fields beyond `(+0x00, +0x04, +0x34)`,
-the 16-byte second output argument of `XApuConnect`, what is audible (no capture-path check), and any
+the shared buffer's layout and output bytes past `+0x08` of `XApuConnect`, what is audible (no capture-path check), and any
 hardware or driver glitch count.
 
 ## APU heap stand-in

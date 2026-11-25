@@ -3,7 +3,7 @@
 usage: startup_vertex_fetch_formats_check.py <dxc> <offscreen_check> <adapter>
        startup_vertex_fetch_formats_check.py controls
 
-tools/startup/gfx2hlsl.py lowers tbuffer_load_format_* for eleven buffer formats from a table of HLSL
+tools/startup/gfx2hlsl.py lowers tbuffer_load_format_* for the supported buffer formats from a table of HLSL
 expressions: the load of the word or words, the field each component takes and its conversion, and the
 values of the missing components. Only BUF_FMT_8_UINT and BUF_FMT_8_UNORM were run before
 (startup_r8_uint_check.py). This drives each table entry the way that check does: a source-built vertex
@@ -46,9 +46,11 @@ FORMATS = {
     'BUF_FMT_8_8_UNORM': (14, 3, 2, 8, 'unorm', 2),
     'BUF_FMT_16_16_UNORM': (23, 6, 2, 16, 'unorm', 2),
     'BUF_FMT_16_16_SNORM': (24, 6, 2, 16, 'snorm', 2),
+    'BUF_FMT_16_16_UINT': (27, 6, 2, 16, 'uint', 2),
     'BUF_FMT_16_16_FLOAT': (29, 10, 10, 16, 'f16', 2),
     'BUF_FMT_16_16_16_16_FLOAT': (71, 18, 10, 16, 'f16', 4),
     'BUF_FMT_8_8_8_8_UNORM': (56, 5, 3, 8, 'unorm', 4),
+    'BUF_FMT_8_8_8_8_UINT': (60, 5, 3, 8, 'uint', 4),
     'BUF_FMT_32_FLOAT': (22, 8, 4, 32, 'f32', 1),
     'BUF_FMT_32_32_FLOAT': (64, 12, 0, 32, 'f32', 2),
     'BUF_FMT_32_32_32_FLOAT': (74, 16, 4, 32, 'f32', 3),
@@ -132,8 +134,14 @@ void readback(uint id : SV_GroupIndex) {
 MUTATIONS = (
     ('BUF_FMT_8_8_8_8_UNORM', 'second byte from the third', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)'),
     ('BUF_FMT_8_8_8_8_UNORM', 'fourth byte as 255', 'U((w >> 24) / 255.0)', 'U(1.0)'),
+    ('BUF_FMT_8_8_8_8_UINT', 'normalized green byte', 'v5 = (w >> 8) & 255u;', 'v5 = U(((w >> 8) & 255u) / 255.0);'),
+    ('BUF_FMT_8_8_8_8_UINT', 'blue byte from green', 'v6 = (w >> 16) & 255u;', 'v6 = (w >> 8) & 255u;'),
+    ('BUF_FMT_8_8_8_8_UINT', 'alpha byte from blue', 'v7 = w >> 24;', 'v7 = (w >> 16) & 255u;'),
     ('BUF_FMT_8_8_UNORM', 'aligned load instead of ldu', 'ldu(r0, a)', 'r0.Load(a & ~3u)'),
     ('BUF_FMT_16_16_UNORM', 'high half over 65536', 'U((w >> 16) / 65535.0)', 'U((w >> 16) / 65536.0)'),
+    ('BUF_FMT_16_16_UINT', 'normalized low half', 'v4 = w & 65535u;', 'v4 = U((w & 65535u) / 65535.0);'),
+    ('BUF_FMT_16_16_UINT', 'high half from the low half', 'v5 = w >> 16;', 'v5 = w & 65535u;'),
+    ('BUF_FMT_16_16_UINT', 'missing W as 1.0', 'v7 = 1u;', 'v7 = U(1.0);'),
     ('BUF_FMT_16_16_SNORM', 'low half read unsigned', 'float(int(w << 16) >> 16)', 'float((w << 16) >> 16)'),
     ('BUF_FMT_16_16_FLOAT', 'low half from the high half', 'v4 = U(f16tof32(w));', 'v4 = U(f16tof32(w >> 16));'),
     ('BUF_FMT_16_16_16_16_FLOAT', 'second dword aligned down',

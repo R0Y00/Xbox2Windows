@@ -75,8 +75,15 @@ try {
         --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs *> "$LogDir.out"
     $debuggerExit = $LASTEXITCODE
 } finally {
-    # /T: the watcher's parallel workers (and their fxc.exe) are separate processes
-    if ($translator) { & taskkill.exe /T /F /PID $translator.Id 2>&1 | Out-Null }
+    # taskkill /T needs a live parent PID to reach the watcher's workers.
+    if ($translator -and -not $translator.HasExited) {
+        # Stop the workers as well. The watcher or a worker can exit during taskkill;
+        # in Windows PowerShell 5.1 its redirected stderr would then abort the launcher.
+        & {
+            $ErrorActionPreference = "Continue"
+            & taskkill.exe /T /F /PID $translator.Id 2>&1 | Out-Null
+        }
+    }
 }
 Get-Content "$LogDir.out" -TotalCount 5
 exit $debuggerExit

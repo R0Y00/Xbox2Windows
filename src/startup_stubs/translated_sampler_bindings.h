@@ -24,7 +24,8 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 // lod_limits (manifest line smpl, image_sample_b and a constant sampler of image_sample, _l, _lz): the descriptor's LOD clamp is carried over. MIN_LOD (word 1 bits
 // 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json,
 // SQ_IMG_SAMP_WORD1; radeonsi si_state.c:5169-5170 encodes them as S_FIXED(x, 8)), so MinLOD and MaxLOD are the fields
-// divided by 256. Without it MinLOD stays 0 and MaxLOD unbounded, as for heap samplers and the other sample forms.
+// divided by 256. dynamic_sampler() sets it for every heap entry. Without it MinLOD stays 0 and MaxLOD unbounded, as
+// for the other sample forms.
 inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
                                                 bool lod_limits = false)
 {
@@ -183,14 +184,18 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
 
 inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
 {
-    const auto s = decode_sampler(words, 0);
+    // A heap entry is the title's own descriptor, so its MIN_LOD and MAX_LOD apply (#2221).
+    const auto s = decode_sampler(words, 0, false, true);
     return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
             {}, s.MinLOD, s.MaxLOD};
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
 {
-    return dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    // Not a title descriptor: its zero word 1 is not a LOD clamp, so the full mip range stays available.
+    auto s = dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    s.MaxLOD = D3D12_FLOAT32_MAX;
+    return s;
 }
 
 struct NullSamplerCounts {

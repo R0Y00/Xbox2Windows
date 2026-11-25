@@ -19,11 +19,14 @@ int check_startup_export_write_mask(ID3D12Device* device, bool unmasked);
 int check_startup_composite_provenance(ID3D12Device* device);
 int check_startup_range_provenance(ID3D12Device* device);
 void check_dynamic_sampler_index(ID3D12Device* device);
+// Returns 0 on the expected readback, 1 otherwise, 77 when R32_FLOAT lacks a needed capability.
+int check_startup_sampler_lod(ID3D12Device* device, bool drop_clamp);
 float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                  std::uint32_t byte_offset, const char* manifest, const char* binding_case);
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
-                            bool one_dimensional = false, bool two_dimensional = false);
+                            bool one_dimensional = false, bool two_dimensional = false,
+                            UINT first_mip = 0, UINT view_levels = 0);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                   bool depth16, std::uint32_t words[64]);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,

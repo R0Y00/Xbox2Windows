@@ -6,12 +6,16 @@ and rdx are inputs, r8 is the output). XMM0..XMM5 are modeled as portable
 128-bit value structs (two 64-bit lanes). Only legacy encodings are accepted;
 VEX, EVEX and other non-legacy forms reject.
 
-Supported SSE and SSE2 instructions (20 forms from docs/coverage/x64_zen2.tsv groups SSE, SSE2):
+Supported SSE and SSE2 instructions (24 forms from docs/coverage/x64_zen2.tsv groups SSE, SSE2):
   - Packed float arithmetic: addps, subps, mulps, divps, minps, maxps (xmm and
     aligned m128 source, destination read and replaced) and sqrtps (xmm and
     aligned m128 source, destination only written)
+  - Packed float bitwise logic: andps, andnps, orps, xorps (xmm and aligned
+    m128 source; xorps xmmN, xmmN self-zeroing accepts an undefined xmmN)
   - Packed double arithmetic: addpd, subpd, mulpd, divpd, minpd, maxpd and sqrtpd,
     with the same operand rules (two 64-bit lanes)
+  - Packed double bitwise logic: andpd, andnpd, orpd, xorpd (xmm and aligned
+    m128 source; xorpd xmmN, xmmN self-zeroing accepts an undefined xmmN)
   - Packed float compare: cmpps (imm8 predicates 0..7, xmm and aligned m128)
   - Packed double compare: cmppd (imm8 predicates 0..7, xmm and aligned m128; imm8 >= 8 is
     an AVX-only predicate and rejects; each 64-bit lane becomes an all-ones or all-zero mask)
@@ -24,7 +28,7 @@ Arithmetic runs under the host MXCSR: the generated code executes the same
 SSE operation at run time, so the rounding mode, DAZ and FTZ are the host's
 and the translator never folds a result at translation time. A guest MXCSR
 write (ldmxcsr, vldmxcsr) is not lifted, exception flags are not observed and
-the scalar forms, the other packed double forms (logic, conversions),
+the scalar forms, the other packed double forms (conversions),
 rcpps and rsqrtps stay rejected. NaN operands are resolved in software (the first
 source operand that is a NaN, made quiet, else the second) so that a compiler
 which commutes an addition cannot change a payload.
@@ -68,12 +72,24 @@ BINARY_ARITH_FUNCTIONS = {
     Code.MAXPD_XMM_XMMM128: "op_maxpd",
 }
 
+BITWISE_LOGIC_FUNCTIONS = {
+    Code.ANDPS_XMM_XMMM128: "op_andps",
+    Code.ANDNPS_XMM_XMMM128: "op_andnps",
+    Code.ORPS_XMM_XMMM128: "op_orps",
+    Code.XORPS_XMM_XMMM128: "op_xorps",
+    Code.ANDPD_XMM_XMMM128: "op_andps",
+    Code.ANDNPD_XMM_XMMM128: "op_andnps",
+    Code.ORPD_XMM_XMMM128: "op_orps",
+    Code.XORPD_XMM_XMMM128: "op_xorps",
+}
+
 LOAD_ALIGNED_VEC_CODES = {Code.MOVAPS_XMM_XMMM128, Code.MOVDQA_XMM_XMMM128}
 STORE_ALIGNED_VEC_CODES = {Code.MOVAPS_XMMM128_XMM, Code.MOVDQA_XMMM128_XMM}
 
 ALLOWED_CODES = {
     Code.RETNQ,
     *BINARY_ARITH_FUNCTIONS,
+    *BITWISE_LOGIC_FUNCTIONS,
     Code.SQRTPS_XMM_XMMM128,
     Code.SQRTPD_XMM_XMMM128,
     Code.CMPPS_XMM_XMMM128_IMM8,
@@ -344,6 +360,29 @@ static inline Vec128 op_sqrtpd(const Vec128& src) {
 static inline std::uint32_t op_cmpss_d(std::uint32_t a, std::uint32_t b, std::uint8_t imm8) {
     return cmp_f32(d_as_float(a), d_as_float(b), imm8);
 }
+
+// Bitwise SSE packed-FP logic preserves all 128 bits identically (NaNs, -0.0, denormals, Inf).
+static inline Vec128 op_andps(const Vec128& dst, const Vec128& src) {
+    return {{dst.q[0] & src.q[0], dst.q[1] & src.q[1]}};
+}
+
+static inline Vec128 op_andnps(const Vec128& dst, const Vec128& src) {
+    return {{(~dst.q[0]) & src.q[0], (~dst.q[1]) & src.q[1]}};
+}
+
+static inline Vec128 op_orps(const Vec128& dst, const Vec128& src) {
+    return {{dst.q[0] | src.q[0], dst.q[1] | src.q[1]}};
+}
+
+static inline Vec128 op_xorps(const Vec128& dst, const Vec128& src) {
+    return {{dst.q[0] ^ src.q[0], dst.q[1] ^ src.q[1]}};
+}
+
+// Keep self-zeroed vectors opaque to /O2 constant folding so (+0.0 + -0.0) and MXCSR rules hold.
+static inline Vec128 op_zero_vec() {
+    const volatile Vec128 z{};
+    return {{z.q[0], z.q[1]}};
+}
 """
 
 
@@ -428,6 +467,21 @@ def lift_code(name, start, raw):
             src = vec_src128(1, ins, alignment=16)
             dst_idx, dst_name = write_vec(0, ins)
             statements.append(f"{dst_name} = {BINARY_ARITH_FUNCTIONS[ins.code]}({dst}, {src});")
+            defined.add(dst_idx)
+        elif ins.code in BITWISE_LOGIC_FUNCTIONS:
+            if (
+                ins.code in (Code.XORPS_XMM_XMMM128, Code.XORPD_XMM_XMMM128)
+                and ins.op0_kind == OpKind.REGISTER
+                and ins.op1_kind == OpKind.REGISTER
+                and ins.op0_register == ins.op1_register
+            ):
+                dst_idx, dst_name = write_vec(0, ins)
+                statements.append(f"{dst_name} = op_zero_vec();")
+            else:
+                dst = read_vec(0, ins)
+                src = vec_src128(1, ins, alignment=16)
+                dst_idx, dst_name = write_vec(0, ins)
+                statements.append(f"{dst_name} = {BITWISE_LOGIC_FUNCTIONS[ins.code]}({dst}, {src});")
             defined.add(dst_idx)
         elif ins.code == Code.SQRTPS_XMM_XMMM128:
             src = vec_src128(1, ins, alignment=16)

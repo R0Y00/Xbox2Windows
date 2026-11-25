@@ -63,15 +63,17 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 }  // namespace
 
 // array: the same eight texels as two slices of a 2D array (dim:SQ_RSRC_IMG_2D_ARRAY); the default
-// view of a two-slice texture is a Texture2DArray over both. levels (array only, 1 or 3): the array is
-// 4x4 with that many mip levels, and the default view spans all of them. When sampler_line is a
+// view of a two-slice texture is a Texture2DArray over both. Multi-mip fixtures use a 4x4 base.
+// A nonzero view_levels selects an explicit 2D SRV starting at first_mip. When sampler_line is a
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional)
+                            bool two_dimensional, UINT first_mip, UINT view_levels)
 {
-    if (levels < 1 || levels > max_levels || (levels > 1 && !array))
+    if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
+    if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
+        throw std::runtime_error("2D mip window exceeds the resource");
     const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -110,7 +112,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     // A volume is one subresource of two slices; an array is two subresources of one slice each.
     // The subresource of slice s and mip m is m + s * levels.
-    const UINT subresources = array ? side * levels : 1;
+    const UINT subresources = (array ? side : 1) * levels;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side * max_levels]{};
     UINT64 upload_size = 0;
     device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
@@ -124,7 +126,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     for (UINT tz = 0; tz < td.DepthOrArraySize; ++tz)
         for (UINT level = 0; level < levels; ++level) {
             const UINT extent = base >> level;
-            const auto& place = array ? footprints[level + tz * levels] : footprint;
+            const auto& place = footprints[level + (array ? tz * levels : 0)];
             for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
                 for (UINT tx = 0; tx < extent; ++tx) {
                     float texel[4];
@@ -156,7 +158,15 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, rtvs;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create image 3D view heap");
-    device->CreateShaderResourceView(texture.Get(), nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    if (view_levels) {
+        view.Format = td.Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MostDetailedMip = first_mip;
+        view.Texture2D.MipLevels = view_levels;
+    }
+    device->CreateShaderResourceView(texture.Get(), view_levels ? &view : nullptr, views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image 3D RTV heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
