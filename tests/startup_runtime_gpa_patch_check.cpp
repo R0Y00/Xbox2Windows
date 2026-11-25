@@ -2,9 +2,10 @@
 //
 // Which PE imports the stand-in notices on the EXE / package-helper import tables: GetProcAddress and
 // a direct xgameruntime.dll!QueryApiImpl on the regular import table, delay-import hits with
-// delay_import set (without treating the delay IAT as a real export), and ordinal thunks ignored.
-// A synthetic PE32+ image is walked; the mutated control classifies by import name alone (accepting
-// QueryApiImpl from other.dll) and must fail. No Windows loader and no game files.
+// delay_import set, and ordinal thunks ignored. Bound delay QueryApiImpl slots (slot == real export)
+// are safe to rewrite; unbound thunks are not. A synthetic PE32+ image is walked; the mutated
+// control classifies by import name alone (accepting QueryApiImpl from other.dll) and must fail.
+// No Windows loader and no game files.
 #include "startup_stubs/runtime_gpa_patch.h"
 
 #include <cstdint>
@@ -32,8 +33,8 @@ std::vector<unsigned char> build_image()
     using patch::ImportDesc;
     using patch::Thunk64;
     // Layout must keep the import-descriptor array clear of the OFT/IAT/name RVAs it points at.
-    // Descriptors at 0x200 (2×20 → 0x228); delay desc at 0x400; thunks and strings above those.
-    std::vector<unsigned char> image(0x600, 0);
+    // Descriptors at 0x200 (2×20 → 0x228); delay descs at 0x400; thunks and strings above those.
+    std::vector<unsigned char> image(0x700, 0);
     auto* dos = reinterpret_cast<DosStub*>(image.data());
     dos->e_magic = 0x5A4D;
     dos->e_lfanew = 0x80;
@@ -44,7 +45,7 @@ std::vector<unsigned char> build_image()
     dirs[1].virtual_address = 0x200;
     dirs[1].size = sizeof(ImportDesc) * 2;
     dirs[13].virtual_address = 0x400;
-    dirs[13].size = sizeof(DelayDesc);
+    dirs[13].size = sizeof(DelayDesc) * 2;
 
     auto* imp = reinterpret_cast<ImportDesc*>(image.data() + 0x200);
     imp[0].original_first_thunk = 0x240;
@@ -85,9 +86,9 @@ std::vector<unsigned char> build_image()
 
     // Delay-load kernel32!GetProcAddress — reported with delay_import; not a regular IAT rewrite target.
     auto* delay = reinterpret_cast<DelayDesc*>(image.data() + 0x400);
-    delay->dll_name = 0x480;
-    delay->original_first_thunk = 0x4A0;
-    delay->first_thunk = 0x4B0;
+    delay[0].dll_name = 0x480;
+    delay[0].original_first_thunk = 0x4A0;
+    delay[0].first_thunk = 0x4B0;
     std::memcpy(image.data() + 0x480, "KERNEL32.dll", 13);
     reinterpret_cast<Thunk64*>(image.data() + 0x4A0)[0].value = 0x4C0;
     reinterpret_cast<Thunk64*>(image.data() + 0x4B0)[0].value = 0x3000;
@@ -95,6 +96,19 @@ std::vector<unsigned char> build_image()
     std::memcpy(image.data() + 0x4C2, "GetProcAddress", 15);
     reinterpret_cast<Thunk64*>(image.data() + 0x4A0)[1].value = 0;
     reinterpret_cast<Thunk64*>(image.data() + 0x4B0)[1].value = 0;
+
+    // Delay-load xgameruntime!QueryApiImpl — noticed, but only rewriteable after the slot equals the
+    // real export (bound). Slot starts as an in-image thunk value.
+    delay[1].dll_name = 0x500;
+    delay[1].original_first_thunk = 0x520;
+    delay[1].first_thunk = 0x530;
+    std::memcpy(image.data() + 0x500, "xgameruntime.dll", 17);
+    reinterpret_cast<Thunk64*>(image.data() + 0x520)[0].value = 0x540;
+    reinterpret_cast<Thunk64*>(image.data() + 0x530)[0].value = 0x1400;  // unbound thunk stand-in
+    image[0x540] = image[0x541] = 0;
+    std::memcpy(image.data() + 0x542, "QueryApiImpl", 13);
+    reinterpret_cast<Thunk64*>(image.data() + 0x520)[1].value = 0;
+    reinterpret_cast<Thunk64*>(image.data() + 0x530)[1].value = 0;
     return image;
 }
 }
@@ -124,6 +138,13 @@ int main(int argc, char** argv)
     check("QueryApiImpl other dll refused", !patch::classify("other.dll", "QueryApiImpl", &kind));
     check("unrelated refused", !patch::classify("xgameruntime.dll", "SomethingElse", &kind));
 
+    constexpr std::uint64_t real_export = 0x7FF012340000ull;
+    constexpr std::uint64_t proxy = 0x7FF0ABCD0000ull;
+    check("bound delay slot matches real", patch::delay_query_slot_is_bound(real_export, real_export, proxy));
+    check("unbound thunk refused", !patch::delay_query_slot_is_bound(0x1400, real_export, proxy));
+    check("already proxied refused", !patch::delay_query_slot_is_bound(proxy, real_export, proxy));
+    check("empty real refused", !patch::delay_query_slot_is_bound(real_export, 0, proxy));
+
     auto image = build_image();
     int gpa = 0, query = 0, delay_hits = 0, regular_hits = 0;
     std::vector<std::uint32_t> rvas;
@@ -135,11 +156,16 @@ int main(int argc, char** argv)
         else if (hit.kind == patch::Kind::query_api_impl) ++query;
     });
     check("visit finds GetProcAddress (import + delay)", gpa == 2);
-    check("visit finds one xgameruntime QueryApiImpl", query == 1);
-    check("visit hit count", hits == 3);
-    check("ordinal import skipped", gpa == 2 && hits == 3);
-    check("delay vs regular hits", delay_hits == 1 && regular_hits == 2);
-    check("first thunk RVAs", rvas.size() == 3 && rvas[0] == 0x270 && rvas[1] == 0x278 && rvas[2] == 0x4B0);
+    check("visit finds regular + delay QueryApiImpl", query == 2);
+    check("visit hit count", hits == 4);
+    check("ordinal import skipped", gpa == 2 && hits == 4);
+    check("delay vs regular hits", delay_hits == 2 && regular_hits == 2);
+    check("first thunk RVAs",
+          rvas.size() == 4 && rvas[0] == 0x270 && rvas[1] == 0x278 && rvas[2] == 0x4B0 && rvas[3] == 0x530);
+
+    const auto unbound = *reinterpret_cast<const patch::Thunk64*>(image.data() + 0x530);
+    check("synthetic delay QueryApiImpl still unbound",
+          !patch::delay_query_slot_is_bound(unbound.value, real_export, proxy));
 
     if (failures) {
         std::printf("startup_runtime_gpa_patch: FAIL (%d)\n", failures);

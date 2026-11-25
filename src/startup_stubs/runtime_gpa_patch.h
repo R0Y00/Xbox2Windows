@@ -4,10 +4,11 @@
 // resolves QueryApiImpl through a package helper's GetProcAddress (or that imports QueryApiImpl from
 // xgameruntime.dll by name) never hits that hook, so FakeUser / X2W_TRACE_API see no providers.
 // This header lists the import shapes to notice — regular and delay-import tables. The stand-in
-// rewrites only regular IAT slots on the EXE and package-directory helpers: a delay IAT holds a
-// delay-load thunk until first use, so treating it as GetProcAddress or QueryApiImpl is wrong.
-// Ordinal imports are ignored. Pure walk helpers — no Windows calls — so a source-built control can
-// check them.
+// rewrites regular GetProcAddress / QueryApiImpl IAT slots on the EXE and package-directory helpers.
+// A delay IAT holds a delay-load thunk until first use; rewriting that thunk as if it were the
+// export is wrong. After the delay helper binds, the same slot holds the real export address and
+// may be rewritten to the proxy (see delay_query_slot_is_bound). Ordinal imports are ignored.
+// Pure walk helpers — no Windows calls — so a source-built control can check them.
 #pragma once
 
 #include <cstddef>
@@ -47,6 +48,15 @@ inline bool import_is_get_proc_address(const char* name) noexcept
 inline bool import_is_query_api_impl(const char* name) noexcept
 {
     return name && std::strcmp(name, "QueryApiImpl") == 0;
+}
+
+// True when a delay-import QueryApiImpl IAT slot already holds the real export (post-bind) and is
+// not yet the proxy. A still-unbound thunk (any other non-zero value, typically inside the
+// importer) must stay untouched so the delay helper can run.
+inline bool delay_query_slot_is_bound(std::uint64_t slot_value, std::uint64_t real_query,
+                                      std::uint64_t proxy) noexcept
+{
+    return real_query != 0 && slot_value != 0 && slot_value != proxy && slot_value == real_query;
 }
 
 // Decide whether one named import of `dll_name` should be noticed. Ordinal imports are ignored.
@@ -171,7 +181,8 @@ int visit_imports(const unsigned char* base, std::size_t image_size, Fn on_hit)
         }
     }
 
-    // DataDirectory[13] = delay imports (reported with delay_import=true; callers must not rewrite the slot as a real export).
+    // DataDirectory[13] = delay imports (reported with delay_import=true; rewrite only when
+    // delay_query_slot_is_bound says the slot already holds the real export).
     const auto& delay_dir = dirs[13];
     if (delay_dir.virtual_address && delay_dir.size) {
         for (std::uint32_t at = delay_dir.virtual_address;; at += sizeof(DelayDesc)) {

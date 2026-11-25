@@ -965,7 +965,9 @@ add_test(NAME startup_runtime_gpa_patch COMMAND startup_runtime_gpa_patch)
 add_test(NAME startup_runtime_gpa_patch_name_only_control COMMAND startup_runtime_gpa_patch --mutate name-only)
 set_tests_properties(startup_runtime_gpa_patch_name_only_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 # EXE + late-loaded package helper through the real Windows loader: proxied xgameruntime QueryApiImpl,
-# unrelated same-named export stays original. Notification only enqueues; rewrite runs after link.
+# unrelated same-named export stays original, bound delay QueryApiImpl is rewritten, unbound delay
+# thunk and a pre-attach cached pointer are negative controls. Notification only enqueues; rewrite
+# runs after link.
 if (WIN32)
     set(X2W_PROXY_SCOPE_DIR "${CMAKE_CURRENT_BINARY_DIR}/startup_runtime_proxy_scope")
     add_library(startup_runtime_proxy_carrier SHARED
@@ -974,20 +976,25 @@ if (WIN32)
     target_include_directories(startup_runtime_proxy_carrier PRIVATE src)
     target_compile_features(startup_runtime_proxy_carrier PRIVATE cxx_std_17)
     target_link_libraries(startup_runtime_proxy_carrier PRIVATE psapi)
-    add_library(startup_runtime_proxy_helper SHARED
-        tests/startup_runtime_proxy_scope/helper.cpp
-        tests/startup_runtime_proxy_scope/helper.def)
-    target_compile_features(startup_runtime_proxy_helper PRIVATE cxx_std_17)
     add_library(startup_runtime_proxy_xgr SHARED
         tests/startup_runtime_proxy_scope/xgameruntime.cpp
         tests/startup_runtime_proxy_scope/xgameruntime.def)
     target_compile_features(startup_runtime_proxy_xgr PRIVATE cxx_std_17)
     set_target_properties(startup_runtime_proxy_xgr PROPERTIES OUTPUT_NAME xgameruntime)
+    add_library(startup_runtime_proxy_helper SHARED
+        tests/startup_runtime_proxy_scope/helper.cpp
+        tests/startup_runtime_proxy_scope/helper.def)
+    target_compile_features(startup_runtime_proxy_helper PRIVATE cxx_std_17)
+    # Delay-load the fake xgameruntime so the helper's QueryApiImpl slot starts as a thunk and only
+    # holds the real export after first use (the bound-delay rewrite path).
+    target_link_libraries(startup_runtime_proxy_helper PRIVATE startup_runtime_proxy_xgr delayimp)
+    target_link_options(startup_runtime_proxy_helper PRIVATE "/DELAYLOAD:xgameruntime.dll")
     add_library(startup_runtime_proxy_decoy SHARED
         tests/startup_runtime_proxy_scope/decoy.cpp
         tests/startup_runtime_proxy_scope/decoy.def)
     target_compile_features(startup_runtime_proxy_decoy PRIVATE cxx_std_17)
     add_executable(startup_runtime_proxy_scope tests/startup_runtime_proxy_scope/host.cpp)
+    target_include_directories(startup_runtime_proxy_scope PRIVATE src)
     target_compile_features(startup_runtime_proxy_scope PRIVATE cxx_std_17)
     foreach(tgt IN ITEMS startup_runtime_proxy_carrier startup_runtime_proxy_helper startup_runtime_proxy_xgr
                          startup_runtime_proxy_decoy startup_runtime_proxy_scope)

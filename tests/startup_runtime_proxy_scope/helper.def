@@ -1,3 +1,4 @@
 LIBRARY startup_runtime_proxy_helper
 EXPORTS
     resolve_query
+    call_delay_query
