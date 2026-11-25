@@ -330,6 +330,28 @@ Checks:
   and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
   B5G5R5A1 view of a B4G4R4A4 target must be refused.
 
+## Shared-exponent render and unordered-access targets
+
+The packed-target mapping also covers single-sample 2D textures and arrays in
+`R9G9B9E5_SHAREDEXP` (67) that request a render target, a typed UAV, or both.
+When the adapter lacks one of the requested uses and supports all of them for
+`R11G11B10_FLOAT` (26), the stand-in creates format 26. Sampled-only resources,
+depth-stencil, multisampled textures and other dimensions keep format 67.
+The format query also preserves native format 67 where it supports the requested
+uses. [Microsoft Direct3D format specification](https://microsoft.github.io/DirectX-Specs/d3d/D3D12R9G9B9E5Format.html)
+
+The stand-in carries a format-67 tag. RTVs, UAVs and SRVs naming 67 on that
+resource use format 26, including SRVs reconstructed by the translated draw.
+An optimized clear value naming 67 follows the replacement format. A format-67
+view on a native format-67 texture is passed through. A format-67 view on an
+incompatible texture is refused.
+
+Both formats use 32 bits per texel and clamp negative values to zero.
+Format 26 has 6/6/5 mantissa bits with a separate exponent per channel.
+Format 67 has three 9-bit mantissas with a shared exponent. Rendered and
+UAV-written values can round differently. Uploads and copies in the format-67
+bit layout are not converted.
+
 ## Descriptor heap starts that are not addresses
 
 A console executable treats the CPU start of a descriptor heap as an address. A desktop handle is
@@ -990,6 +1012,21 @@ text is grouped as `other (text omitted)` and never copied; raw snippets stay in
 `aliased` or `not aliased` field. Those lines are not counted as unhandled; they are counted by
 outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
 (or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
+
+The `ExecuteIndirect` table reports the highest sampled cumulative count for each outcome and
+command-signature kind in the `x2w-render indirect:` census. A repeated snapshot does not increase
+any count. Each cell can come from a different sample, so avoid summing the cells as one run's total
+when scanning multiple runs. The section appears only after a complete census line and can show zero
+forwarded `dispatchmesh` calls alongside a graphics-pipeline refusal count. Forwarded counts describe
+the runtime's forwarding path. GPU completion and image readback require separate evidence.
+
+The GPU Memory Budget section uses complete `x2w-budget` heartbeat lines from
+`X2W_D3D12_BUDGET=1`. It counts samples above the local DXGI budget and prints
+the sample with the highest usage-to-budget ratio, plus the sample with the most
+retained texture bytes. Each row keeps the usage, budget and texture counters
+from that same heartbeat. Samples with an unavailable or zero local budget
+still contribute texture counts. The over-budget count describes observations
+in the supplied logs.
 
 The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
 memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not

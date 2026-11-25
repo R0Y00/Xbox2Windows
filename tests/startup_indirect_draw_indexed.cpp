@@ -1496,7 +1496,11 @@ int main(int argc, char** argv) try
     const bool lease_fixture = GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_XMEM", lease_xmem, MAX_PATH) != 0;
     const bool dual_lease = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DUAL", nullptr, 0) != 0;
     if (dual_lease) check(lease_fixture && !lease_arguments ? S_OK : E_FAIL, "configure combined mesh XMem fixture");
-    if (lease_fixture && !lease_arguments)
+    const bool loose_root = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_LOOSE_ROOT", nullptr, 0) != 0;
+    if (loose_root)
+        check(lease_fixture && SetEnvironmentVariableA("X2W_MESH86_LOOSE_XMEM_SRV", "1") &&
+            SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", nullptr) ? S_OK : E_FAIL, "enable loose XMem root SRV");
+    else if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
@@ -1554,7 +1558,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || refusal_census || other_refusal_census) {
+    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1642,6 +1646,72 @@ int main(int argc, char** argv) try
                                         writer.Get(), initialize.Get(), append.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
         }
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
+        if (loose_root) {
+            const bool ready = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0) != 0;
+            MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem, nullptr, nullptr, nullptr, nullptr, true);
+            const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            const auto verify = [&](const MeshLeaseDraw& draw, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
+                    DrawKind::mesh, false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false,
+                    &draw);
+            };
+            if (!ready) {
+                const bool ok = verify({source.address(), queue.Get(), black}, "loose mesh requires shader proof");
+                source.free_original();
+                return ok ? 0 : 1;
+            }
+            if (!verify({source.address(), queue.Get(), green}, "loose mesh reads ordinary XMem root SRV") ||
+                !verify({source.address() + 4, queue.Get(), black}, "loose mesh refuses misaligned root") ||
+                !verify({source.address() + 2 * MeshLeaseWriter::page, queue.Get(), black}, "loose mesh refuses unmapped page"))
+                return 1;
+            const std::unique_ptr<void, FreeMemory> unrelated(
+                VirtualAlloc(nullptr, MeshLeaseWriter::page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!unrelated || !verify({reinterpret_cast<UINT64>(unrelated.get()), queue.Get(), black},
+                "loose mesh refuses readable untracked memory")) return 1;
+            const auto registered_desc = D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, MeshLeaseWriter::page,
+                1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+            ComPtr<IUnknown> placed;
+            check(slot<Place>(guest.Get(), 133)(guest.Get(), source.cpu, &registered_desc, D3D12_RESOURCE_STATE_COMMON,
+                nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(placed.GetAddressOf())), "register overlapping buffer");
+            if (!verify({source.address(), queue.Get(), black}, "loose mesh refuses registered resource without a publisher")) return 1;
+            placed.Reset();
+
+            MeshLeaseDraw late{source.address(), queue.Get(), red};
+            late.before_submit = [&] { std::memcpy(source.cpu + source.record_offset, &red, sizeof(red)); };
+            if (!verify(late, "loose mesh sees a CPU write after Close")) return 1;
+            // The queue rejects the entire stale recording, so use already
+            // initialized external DispatchMesh arguments for this control.
+            PlacedBuffer args(device.Get(), guest.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_RESOURCE_FLAG_NONE);
+            const auto upload = make_buffer(device.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ);
+            const D3D12_RANGE empty{};
+            void* memory{};
+            check(upload->Map(0, &empty, &memory), "map loose-root dispatch arguments");
+            std::memcpy(memory, MeshLeaseWriter::old_groups.data(), sizeof(MeshLeaseWriter::old_groups));
+            upload->Unmap(0, nullptr);
+            ComputeCommands seed(device.Get(), nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            seed.list->CopyBufferRegion(args.native.Get(), 0, upload.Get(), 0, sizeof(MeshLeaseWriter::old_groups));
+            seed.submit_and_wait(device.Get());
+            MeshLeaseDraw remap{source.address(), queue.Get(), black};
+            remap.argument = args.wrapped.Get();
+            remap.before_submit = [&] { source.replace_loose_page(); };
+            if (!verify(remap, "loose mesh refuses a remapped page on submit") ||
+                !verify({source.address(), queue.Get(), green}, "new loose mesh recording reads replacement page")) return 1;
+            source.free_original();
+            check_lease_debug(info.Get());
+
+            std::ifstream log{std::filesystem::path(log_path)};
+            const std::string lines{std::istreambuf_iterator<char>(log), {}};
+            log.close();
+            DeleteFileW(log_path.c_str());
+            check(lines.find("mesh XMem loose root bind") != std::string::npos &&
+                  lines.find("mesh XMem submit refused: writer or live page identity changed") != std::string::npos &&
+                  lines.find("mesh XMem loose root SRV has no usable single-page lease") != std::string::npos &&
+                  lines.find("mesh XMem read address is missing or misaligned") != std::string::npos ? S_OK : E_FAIL,
+                  "observe loose binding, stale submission and invalid range refusals");
+            return 0;
+        }
         if (lease_fixture) {
             MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);
             const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);

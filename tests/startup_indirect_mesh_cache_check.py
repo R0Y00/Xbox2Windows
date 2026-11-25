@@ -103,9 +103,12 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, dep
         environment['X2W_MESH86_FIXTURE_XMEM'] = str(lease_xmem)
         for flag in ('X2W_TEST_MESH_XMEM_SKIP_WAIT', 'X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT',
                      'X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT', 'X2W_MESH86_FIXTURE_DUAL',
-                     'X2W_MESH86_FIXTURE_INIT_ONLY', 'X2W_MESH_INDIRECT_XMEM'):
+                     'X2W_MESH86_FIXTURE_INIT_ONLY', 'X2W_MESH_INDIRECT_XMEM',
+                     'X2W_MESH86_FIXTURE_LOOSE_ROOT'):
             environment.pop(flag, None)
-        if mode == 'skip-wait':
+        if mode == 'loose-root':
+            environment['X2W_MESH86_FIXTURE_LOOSE_ROOT'] = '1'
+        elif mode == 'skip-wait':
             environment['X2W_TEST_MESH_XMEM_SKIP_WAIT'] = '1'
         elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument', 'dual-init-only', 'dual-trace', 'dual-trace-disabled'):
             environment.update(X2W_MESH86_FIXTURE_DUAL='1', X2W_MESH_INDIRECT_XMEM='1')
