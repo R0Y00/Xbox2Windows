@@ -147,6 +147,43 @@ F32_HELPERS["mac"] = (
     "uint f32_mac(uint a, uint b, uint c) { precise float p = asfloat(a) * asfloat(b); "
     "precise float r = p + asfloat(c); return asuint(r); }\n"
 )
+# v_ldexp_f32 D, S0, S1 (VOP3A opcode 0x362 of the RDNA 2 ISA guide):
+#   D.f32 = ldexp(S0.f32, S1.i32) = S0.f32 * (2 ** S1.i32).
+# Preserves +/-0 and +/-Inf, quiets sNaN and preserves qNaN payload, normalizes denormal inputs,
+# clamps the signed exponent delta to [-512, 512] to avoid int32 wraparound, overflows to +/-Inf,
+# and rounds subnormal results to nearest-even.
+# Denormal inputs and results assume binary32 denormals are enabled (the IEEE mode); with
+# flush-to-zero in MODE (FP_DENORM), the hardware would flush them. This is not modelled, and
+# the translator does not read MODE.
+F32_HELPERS["ldexp"] = (
+    "uint f32_ldexp(uint a, uint b) {\n"
+    "    uint sign = a & 0x80000000u;\n"
+    "    uint exp = (a >> 23) & 0xffu;\n"
+    "    uint mant = a & 0x7fffffu;\n"
+    "    if (exp == 0xffu) return (mant != 0u) ? (a | 0x00400000u) : a;\n"
+    "    if (exp == 0u && mant == 0u) return a;\n"
+    "    int e = (int)exp;\n"
+    "    if (exp == 0u) {\n"
+    "        uint shift = 23u - firstbithigh(mant);\n"
+    "        mant = (mant << shift) & 0x7fffffu;\n"
+    "        e = 1 - (int)shift;\n"
+    "    }\n"
+    "    e += clamp(asint(b), -512, 512);\n"
+    "    if (e >= 255) return sign | 0x7f800000u;\n"
+    "    if (e <= 0) {\n"
+    "        if (e < -23) return sign;\n"
+    "        uint full = mant | 0x800000u;\n"
+    "        uint shift = (uint)(1 - e);\n"
+    "        uint half_bit = 1u << (shift - 1u);\n"
+    "        uint mask = (1u << shift) - 1u;\n"
+    "        uint rem = full & mask;\n"
+    "        uint q = full >> shift;\n"
+    "        if (rem > half_bit || (rem == half_bit && (q & 1u) != 0u)) q++;\n"
+    "        return sign | q;\n"
+    "    }\n"
+    "    return sign | ((uint)e << 23) | mant;\n"
+    "}\n"
+)
 # v_cvt_u32_f32_e32 D, S0 (VOP1 opcode 0x06 of the RDNA 2 ISA guide):
 #   if (isnan(S0.f)) D.u = 0;
 #   else if (S0.f <= 0.0) D.u = 0;
@@ -772,7 +809,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, image_float_domain=None, buffer_float_domain=None, cpu="gfx1013", lds_bytes=0,
-          lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
+          lds_f32_mode=None, lds_f64_mode=None, f32_mode=None, mubuf_d16_xyz_mode=None,
           descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None, heap_view=None,
           heap_store_view=None, gather_mips=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
@@ -804,6 +841,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
     wave_size is the caller's statement that the program runs as wave32 (32). A lane index is only
     derived for a group of more than 32 threads under that statement.
+    f32_mode is the caller's statement of the binary32 rounding/denormal mode; v_ldexp_f32 requires
+    "ieee-rne-denorm" (round-to-nearest-even with denormals preserved).
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
@@ -917,6 +956,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unsupported formatted output binding")
     if wave_size not in (None, 32):
         raise ValueError("Unsupported wave size statement")
+    if f32_mode not in (None, "ieee-rne-denorm"):
+        raise ValueError(f"Unsupported f32 mode: {f32_mode}")
     if mubuf_d16_xyz_mode is not None and (mubuf_d16_xyz_mode != "preserve-w"
                                            or output_format != MUBUF_D16_OUTPUT_FORMATS[4] or cpu != "gfx1030"):
         raise ValueError("D16 XYZ mode requires a gfx1030 RGBA16 UINT output binding")
@@ -2091,6 +2132,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"v_ldexp_f32 v(\d+), {FLOAT_SOURCE}, {ALU_SOURCE}", line):
+            if f32_mode is None:
+                raise ValueError("v_ldexp_f32 requires a declared f32 mode")
+            if f32_mode != "ieee-rne-denorm":
+                raise ValueError(f"Unsupported f32 mode: {f32_mode}")
+            dst = int(m[1])
+            s0 = float_word(m[2], scalar, vector, pending)
+            s1 = alu_word(m[3], scalar, vector, pending)
+            if dst > 255 or s0 is None:
+                raise ValueError("Unverified float operand")
+            if s1 is None:
+                raise ValueError("Unverified ALU operand")
+            expression = f"f32_ldexp({hlsl_word(s0)}, {hlsl_word(s1)})"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(rf"v_cvt_u32_f32_e32 v(\d+), {FLOAT_SOURCE}", line):
             dst = int(m[1])
             if dst > 255:
@@ -3044,6 +3101,8 @@ def main():
                         help="Private LDS f32 inputs and outputs are normal or +0, with round-to-nearest-even")
     parser.add_argument("--lds-f64-mode", choices=("normal",),
                         help="Private LDS f64 comparisons use normal values or positive zero")
+    parser.add_argument("--f32-mode", choices=("ieee-rne-denorm",),
+                        help="Caller-declared binary32 mode: round-to-nearest-even with denormals preserved")
     parser.add_argument("--lds-bytes", type=int, default=0, help="Known native group LDS allocation")
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), help="Table byte offset bound to raw u0")
@@ -3116,7 +3175,7 @@ def main():
                    buffer_float_domain=args.buffer_float_domain,
                    image_uav_mip=args.image_uav_mip, image_float_domain=args.image_float_domain,
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
-                   lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
+                   lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode, f32_mode=args.f32_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
                    descriptor_format_constant=args.descriptor_format_constant,
                    rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant,
