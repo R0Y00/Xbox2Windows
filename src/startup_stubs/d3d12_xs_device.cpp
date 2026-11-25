@@ -2144,7 +2144,9 @@ struct Pass {
     std::vector<CopyRange> copied_gpu_ranges; // exact CopyBufferRegion destinations on this recording
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
-    ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
+    ID3D12RootSignature* compute_root = nullptr; // latest guest root if it was forwarded
+    x2w_startup::ComPtr<ID3D12RootSignature> desktop_compute_root; // last root actually set on this recording
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
     IndirectGraphicsPipeline indirect_graphics;
@@ -2327,7 +2329,12 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
-    if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
+    if (pass.compute_root) {
+        if (pass.desktop_compute_root.Get() != pass.compute_root)
+            pass.desktop_compute_upload_srvs.fill(0);
+        pass.desktop_compute_root = pass.compute_root;
+        list->SetComputeRootSignature(pass.compute_root);
+    }
 }
 
 // Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
@@ -2925,11 +2932,15 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 address)
 {
     auto* list = recording(self);
-    const auto* params = pass_of(self).compute_params;
-    if (!list || !params || parameter >= params->size() ||
+    auto& pass = pass_of(self);
+    const auto* params = pass.compute_params;
+    if (!list || !params || parameter >= params->size() || parameter >= pass.desktop_compute_upload_srvs.size() ||
         (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
     const auto gpu = list_upload_gpu(self, address, 1);
-    if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) list->SetComputeRootShaderResourceView(parameter, gpu);
+    if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
+        pass.desktop_compute_upload_srvs[parameter] = gpu;
+        list->SetComputeRootShaderResourceView(parameter, gpu);
+    }
 }
 
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).

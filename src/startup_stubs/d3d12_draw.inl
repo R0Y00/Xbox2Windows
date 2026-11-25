@@ -1598,6 +1598,17 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
     constexpr auto shader_reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (!draw.indices.upload)
         require_state(self, indices, (index_previous & shader_reads) | D3D12_RESOURCE_STATE_INDEX_BUFFER);
+
+    // The clamp changes the native compute root and invalidates its arguments.
+    // In render mode slot 43 is the forwarded compute parameter setter.
+    const auto& pass = pass_of(self);
+    if (pass.desktop_compute_root) {
+        list->SetComputeRootSignature(pass.desktop_compute_root.Get());
+        for (UINT parameter = 0; parameter < pass.desktop_compute_upload_srvs.size(); ++parameter) {
+            const auto address = pass.desktop_compute_upload_srvs[parameter];
+            if (address) list->SetComputeRootShaderResourceView(parameter, address);
+        }
+    }
     return scratch.Get();
 }
 
@@ -1712,8 +1723,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
-        if (indexed && (pass.compute_root || pass.compute_pipeline)) {
-            indirect->refusal = "indexed validation cannot replace a live guest compute binding";
+        if (indexed && pass.compute_pipeline) {
+            indirect->refusal = "indexed validation cannot replace a live guest compute pipeline";
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }

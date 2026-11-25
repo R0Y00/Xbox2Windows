@@ -37,6 +37,11 @@ constexpr UINT64 replay_copy_offset = 0xbfffa0, replay_copy_bytes = 0x44;
 
 constexpr char shader[] = R"(
 RWByteAddressBuffer data : register(u0);
+ByteAddressBuffer retained_input : register(t0);
+[numthreads(1,1,1)]
+void consume_retained_compute_root() {
+    data.Store(0, retained_input.Load(0));
+}
 
 [numthreads(1, 1, 1)]
 void write_left() {
@@ -507,7 +512,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false,
-         UINT cached_mesh_targets = 0, bool cached_depth_only = false)
+         UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false)
 {
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool translated_indexed = translated && indexed;
@@ -742,9 +747,44 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
             draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
         slot<Index>(wrapped, 47)(wrapped, &view);
     }
+    ComPtr<ID3D12RootSignature> retained_compute_root;
+    ComPtr<ID3D12PipelineState> retained_compute_pipeline;
+    ComPtr<ID3D12Resource> retained_result;
+    ComPtr<ID3D12Resource> retained_readback;
+    const UINT retained_value = draw_right ? 0xcafe0489 : 0x31ac1579;
+    if (restore_compute) {
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        retained_compute_root = create_root(guest, {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE});
+        const auto native_root = native_object<ID3D12RootSignature>(device, guest, retained_compute_root.Get());
+        retained_compute_pipeline = writer_pipeline(device, native_root.Get(), "consume_retained_compute_root");
+        retained_result = make_buffer(device, 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        retained_readback = make_buffer(device, 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        using Root = void (WINAPI*)(IUnknown*, IUnknown*);
+        using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+        using Srv = void (WINAPI*)(IUnknown*, UINT, UINT64);
+        slot<Root>(wrapped, 33)(wrapped, retained_compute_root.Get());
+        auto* const input = static_cast<UINT*>(slot<Allocate>(wrapped, 148)(wrapped, 16, 16));
+        if (!input) return false;
+        *input = retained_value;
+        slot<Srv>(wrapped, 43)(wrapped, 0, reinterpret_cast<UINT64>(input));
+        if (draw_right) slot<Root>(wrapped, 33)(wrapped, nullptr);
+    }
     const UINT64 offset = refusal == Refusal::short_argument
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), offset, nullptr, 0);
+    if (restore_compute) {
+        // Leave the previously forwarded root + SRV alone. Only install the
+        // consumer PSO and the output UAV that this fixture owns.
+        transition(list, retained_result.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list->SetPipelineState(retained_compute_pipeline.Get());
+        list->SetComputeRootUnorderedAccessView(1, retained_result->GetGPUVirtualAddress());
+        list->Dispatch(1, 1, 1);
+        transition(list, retained_result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(retained_readback.Get(), 0, retained_result.Get(), 0, 4);
+    }
     if (late_index_write) {
         constexpr std::uint16_t narrow_upload[]{99, 0, 1, 2};
         constexpr std::uint32_t wide_upload[]{99, 0, 1, 2};
@@ -769,6 +809,19 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     check(closed, "close guest command list");
     submit(device, list);
 
+    if (restore_compute) {
+        const D3D12_RANGE read{0, 4}, none{0, 0};
+        void* mapped = nullptr;
+        check(retained_readback->Map(0, &read, &mapped), "map restored compute result");
+        UINT actual = 0;
+        std::memcpy(&actual, mapped, 4);
+        retained_readback->Unmap(0, &none);
+        if (actual != retained_value) {
+            std::fprintf(stderr, "restored compute readback=%08x expected=%08x\n", actual, retained_value);
+            return false;
+        }
+        std::printf("restored compute root and one uploaded SRV: GPU readback %08x\n", actual);
+    }
     if (translated) {
         constexpr Words empty{};
         if (std::memcmp(arguments.address, empty.data(), sizeof(empty))) {
@@ -1098,9 +1151,9 @@ int main(int argc, char** argv) try
             ComPtr<ID3D12CommandSignature> signature;
             check(guest->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)), "create translated indexed signature");
             const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
-            const auto verify = [&](ID3D12PipelineState* producer, bool green, Refusal refusal, const char* label) {
+            const auto verify = [&](ID3D12PipelineState* producer, bool green, Refusal refusal, const char* label, bool restore_compute = false) {
                 return run(device.Get(), guest.Get(), writer.Get(), producer, title_root.Get(), pso.Get(), signature.Get(),
-                    kind, green, refusal, label, green ? &green_binding : &red_binding, false, nullptr, upload_index);
+                    kind, green, refusal, label, green ? &green_binding : &red_binding, false, nullptr, upload_index, 0, false, restore_compute);
             };
             if (upload_index) {
                 const bool ok =
@@ -1131,7 +1184,9 @@ int main(int argc, char** argv) try
                 verify(right.Get(), true, Refusal::indexed_vertex_range, "refuse a vertex extent that crosses its allocation") &&
                 verify(left.Get(), false, Refusal::invalid_index, "refuse an index view outside its placement") &&
                 verify(left.Get(), false, Refusal::short_argument, "refuse a short argument record") &&
-                verify(nullptr, false, Refusal::none, "omitted GPU writer leaves target clear");
+                verify(nullptr, false, Refusal::none, "omitted GPU writer leaves target clear") &&
+                verify(left.Get(), false, Refusal::none, "draw and dispatch retain an uploaded compute SRV", true) &&
+                verify(right.Get(), true, Refusal::none, "a guest root call without a desktop root retains native compute arguments", true);
             if (ok) std::filesystem::remove_all(cache);
             DeleteFileW(log_path.c_str());
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;

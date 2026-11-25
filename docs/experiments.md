@@ -8533,7 +8533,10 @@ one rootless indexed record using a matched guest root, one single-sample color
 target, and a GPU-backed index view. The supported translated sources are the
 existing bounded tables and a complete GPU-backed vertex stream at slot zero.
 The translated shader can use one base-vertex entry constant. Start-instance
-inputs and an active guest compute binding are refused.
+inputs and an active guest compute pipeline are refused. The validation dispatch
+restores the last native compute root and its forwarded upload SRVs before the
+translated graphics draw. A guest root call that never reached the native list
+leaves the previous native root and arguments in effect.
 
 A compute pass checks the actual desktop argument and index buffers in command
 order. It accepts a single instance starting at zero and up to 4,096 indices in
@@ -8547,7 +8550,9 @@ The source-built test compares every pixel and the original argument guards. A
 different view offset, a different argument offset and GPU-written base three
 paints the right half. Failed index and vertex-view ranges, an adjusted index
 past the bound stream, a short argument record and an omitted writer leave the
-target clear.
+target clear. Two following compute dispatches read distinct upload words
+from the restored root SRV and check the indexed draw's pixels. The second
+case inserts a guest root call that does not reach the native list.
 
 ```powershell
 cmake --build --preset release --target startup_indirect_draw_indexed
