@@ -1,4 +1,5 @@
 """Check the opt-in DXC compile cache with a fake compiler (no DXC needed)."""
+import json
 import os
 import stat
 import subprocess
@@ -117,6 +118,30 @@ def main():
         replay, nothing = rig.compile("BROKEN stale", out=absent)
         if replay.returncode != 3 or nothing is not None or absent.exists():
             fail("failed compile replayed an output file the compiler never wrote")
+
+        def seed_legacy_failure(source, version):
+            """Write the failure record an older build stored: returncode 3 with a non-empty files map."""
+            cache_dir = Path(rig.cache)
+            known = set(cache_dir.glob("*.json"))
+            with mock.patch.object(dxc_cache, "KEY_VERSION", version):
+                rig.compile(source)
+            (entry,) = set(cache_dir.glob("*.json")) - known
+            record = json.loads(entry.read_text())
+            record["files"] = {"-Fo": b"OLD-SHADER".hex()}
+            entry.write_text(json.dumps(record))
+
+        seed_legacy_failure("BROKEN legacy same key", dxc_cache.KEY_VERSION)
+        old_path = Path(root) / "legacy_same.cso"
+        replay, nothing = rig.compile("BROKEN legacy same key", out=old_path)
+        if replay.returncode != 3 or nothing is not None or old_path.exists():
+            fail("cached failure with files restored an output file")
+
+        seed_legacy_failure("BROKEN legacy v1", "1")
+        before = rig.calls()
+        old_path = Path(root) / "legacy_v1.cso"
+        replay, nothing = rig.compile("BROKEN legacy v1", out=old_path)
+        if rig.calls() != before + 1 or replay.returncode != 3 or nothing is not None or old_path.exists():
+            fail("a record from an older key version was reused")
 
         before = rig.calls()
         rig.compile("void main(){}", cache=False)

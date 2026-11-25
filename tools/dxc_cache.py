@@ -18,7 +18,7 @@ ENV_VAR = "X2W_DXC_CACHE"
 OUTPUT_FLAGS = ("-Fo", "-Fc", "-Fh", "-Fre", "-Fd")
 SUPPORTED_KWARGS = {"check", "capture_output", "text", "timeout"}
 INCLUDE_RE = re.compile(rb"#\s*(include|import)\b|@import")
-KEY_VERSION = "1"
+KEY_VERSION = "2"
 
 
 def _plan(compiler, args):
@@ -188,7 +188,7 @@ def run_dxc(compiler, args, **options):
                       "stderr": _scrub(stderr, mapping).hex(),
                       "files": {flag: data.hex() for flag, data in files.items()}}
             _store(entry, json.dumps(record).encode())
-    else:
+    elif returncode == 0:
         for flag, data in files.items():
             _write_file(outputs[flag], data)
     if capture_output:
