@@ -56,8 +56,8 @@ class RuntimeWave(Wave):
     def lane_spill(self, op, args):
         raise ValueError(f"Unsupported runtime mesh instruction {op}")
 
-    def scalar(self, token):
-        value = super().scalar(token)
+    def scalar(self, token, allow_undef=False):
+        value = super().scalar(token, allow_undef)
         if isinstance(value, RuntimeWord):
             raise ValueError(f"Unproven runtime geometry word {value.index} in {token}")
         return value

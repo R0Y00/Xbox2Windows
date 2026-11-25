@@ -50,6 +50,21 @@ VERTEX_DESCRIPTOR = [0x20000, 0x10000, U32, 0x11014FAC]
 VERTEX_BYTES = 512
 
 
+class _Undefined:
+    """A scalar register no executed instruction has written on this wave.
+
+    A range skipped by s_cbranch_execz leaves its scalar writes undone. The
+    registers keep whatever the hardware held, which no export may depend on.
+    """
+
+    def __repr__(self):
+        return "UNDEF"
+
+
+UNDEF = _Undefined()
+UNDEFINED_SCALAR = "Scalar not written on this wave (skipped range) is used"
+
+
 class Wave:
     def __init__(self, wave, geometry, vertex_header=None):
         self.wave = wave
@@ -76,18 +91,23 @@ class Wave:
         self.indices = {}
         self.m0 = None
 
-    def scalar(self, t):
+    def scalar(self, t, allow_undef=False):
         if t.startswith("s["):
             regs = span(t)
             if len(regs) != 2:
                 raise ValueError("Expected a scalar pair")
-            lo, hi = (self.scalar(f"s{i}") for i in regs)
+            lo, hi = (self.scalar(f"s{i}", allow_undef) for i in regs)
+            if lo is UNDEF or hi is UNDEF:
+                return UNDEF
             return lo | hi << 32
         if re.fullmatch(r"s\d+", t):
             i = int(t[1:])
             if i in self.pending:
                 raise ValueError("Scalar load used before wait")
-            return self.s[i]
+            value = self.s.get(i, UNDEF)
+            if value is UNDEF and not allow_undef:
+                raise ValueError(UNDEFINED_SCALAR)
+            return value
         if t == "exec":
             return self.exec
         if t == "vcc":
@@ -99,6 +119,8 @@ class Wave:
         return int(t, 0)
 
     def put(self, dest, value, wide=False):
+        if value is UNDEF and dest in ("exec", "vcc", "m0"):
+            raise ValueError(UNDEFINED_SCALAR)
         if dest == "exec":
             self.exec = value & WAVE
         elif dest == "vcc":
@@ -120,7 +142,7 @@ class Wave:
             if self.pending.intersection(regs):
                 raise ValueError("Pending scalar destination")
             for j, i in enumerate(regs):
-                self.s[i] = (value >> (32 * j)) & U32
+                self.s[i] = UNDEF if value is UNDEF else (value >> (32 * j)) & U32
 
     def lane_value(self, t, lane):
         if re.fullmatch(r"v\d+", t):
@@ -187,7 +209,10 @@ class Wave:
             self.load(op, args)
             return
         if op.startswith("s_cmp_"):
-            a, b = map(self.scalar, args)
+            a, b = (self.scalar(t, True) for t in args)
+            if a is UNDEF or b is UNDEF:
+                self.scc = None
+                return
             if not isinstance(a, int) or not isinstance(b, int):
                 raise ValueError("Dynamic scalar predicate")
             a, b = a & U32, b & U32
@@ -204,7 +229,15 @@ class Wave:
             self.put(d, old, True)
             self.scc = self.exec != 0
             return
-        vals = [self.scalar(t) for t in src]
+        vals = [self.scalar(t, True) for t in src]
+        if op in ("s_cselect_b32", "s_cselect_b64") and self.scc is not None:
+            # The arm that is not selected is never read.
+            vals = [vals[0] if self.scc else vals[-1]] * 2
+        if any(v is UNDEF for v in vals):
+            self.put(d, UNDEF, op.endswith("_b64"))
+            if not op.startswith(("s_mov", "s_cselect", "s_mul")):
+                self.scc = None
+            return
         if any(type(v) is not int for v in vals):
             raise ValueError("Scalar ALU requires concrete operands")
         a = vals[0]

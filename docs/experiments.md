@@ -3247,7 +3247,21 @@ ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_unary_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_skipped_scalar_" -V
 ```
+
+A scalar register that is written only inside a range skipped by
+`s_cbranch_execz` keeps its earlier hardware value on a wave that skips the
+range. The mesh models (`mesh_entry_aot.py`, and `mesh_dynamic_aot.py` through
+it) now track such a register as undefined on that wave instead of failing on
+the read. Scalar ALU results derived from it stay undefined, and a vector
+operation with no live lane never reads it. The translation still refuses by
+name when an undefined scalar reaches a live lane, a branch predicate,
+`exec`, `vcc`, `m0` or a descriptor address. `mesh_entry_skipped_scalar_cpu`
+checks both waves and six refusal controls; `mesh_entry_skipped_scalar_draw_*`
+draws a program whose wave 1 skips the write and whose wave 0 adds the value
+to the depth, and compares the export trace to an off-by-one depth and to the
+program without the add.
 
 The allocation is not limited to one triangle. `MSG_GS_ALLOC_REQ` may declare
 any vertex and primitive counts within the PSV0 output bounds, and each of the
