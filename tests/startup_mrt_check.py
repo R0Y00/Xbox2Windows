@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import re
-import shutil
 import struct
 import subprocess
 import sys
@@ -116,9 +115,10 @@ def check(work, consumer, backend, kind, dxc, fxc):
     draw, queue_request, request, compile_pair = main.draw, main.queue_request, main.request, main.compile_pair
 
     ps.write_bytes(pixel((INTEGER_WORD, 2, 3, 4), unorm=True))
+    integer_sessions = {fmt: session(f'int{fmt}') for fmt, _, _ in INTEGER_FORMATS}
 
     def integer_format(fmt, expected_type, channels):
-        s = session(f'int{fmt}')
+        s = integer_sessions[fmt]
         key, cleared = s.request(fmt, (fmt, 28))
         # The harness clears every target to (0, 0, 1, 1); integer channels hold those values as words.
         assert cleared == struct.pack(f'<{channels}I', *(0, 0, 1, 1)[:channels]) + bytes.fromhex('0000ffff'), cleared.hex()
@@ -157,15 +157,18 @@ def check(work, consumer, backend, kind, dxc, fxc):
     with ThreadPoolExecutor(max_workers=len(INTEGER_FORMATS)) as pool:
         futures = [pool.submit(integer_format, *entry) for entry in INTEGER_FORMATS]
         variants = {entry[0]: future.result() for entry, future in zip(INTEGER_FORMATS, futures)}
-    for fmt in (42, 43):  # the stale-signedness control below reads these manifests
-        shutil.copy(work / f'int{fmt}' / f'{variants[fmt]}.txt', cache / f'{variants[fmt]}.txt')
     assert len({variants[f] for f, _, _ in INTEGER_FORMATS}) == len(INTEGER_FORMATS)
-    # A SINT artifact under the UINT cache key must be refused before PSO creation.
-    unsigned = cache / f'{variants[42]}.txt'
-    unsigned.write_bytes((cache / f'{variants[43]}.txt').read_bytes())
-    pixels, log = draw(42, wanted_draw=False)
+    # This cache still has the compiled base and UINT pair. Substitute only the signed manifest.
+    # On a base hit the runtime must also republish the three source blobs removed above.
+    uint = integer_sessions[42]
+    unsigned = uint.cache / f'{variants[42]}.txt'
+    unsigned.write_bytes((integer_sessions[43].cache / f'{variants[43]}.txt').read_bytes())
+    pixels, log = uint.draw(42, wanted_draw=False)
     assert 'RTV manifest mismatch' in log and 'desktop pipeline for' not in log, log
     assert pixels.hex() == '000000000000ffff', pixels.hex()
+    base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), uint.root.read_bytes()):016x}'
+    for ext, source in (('a', vs), ('b', ps), ('root', uint.root)):
+        assert (uint.cache / f'req_{base}.{ext}').read_bytes() == source.read_bytes(), ext
     print(f'{kind} {backend} stale signedness control: refused before PSO creation')
 
     def low_bits_control(key, fmt, trunc, expected):
