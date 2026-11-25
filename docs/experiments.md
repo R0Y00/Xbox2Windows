@@ -9508,6 +9508,16 @@ and unproven wave masks remain unsupported. Use
 Append `draw <dxc> <offscreen_check> <warp|hardware>` for CPU-reference readback
 of the SCC paths and lane-masked if/else.
 
+The `startup_mesh57_loop_refusal` check is a source-built program with the same
+exchanges plus one deliberate back-edge after the count exchange
+(`tests/startup_mesh57_loop_refusal.s`). Tip refuses it with
+`slot 57 mesh: a loop outside the group-memory exchanges is not covered`. The
+mutant replaces that back-edge with a second `s_nop` and must not stop on that
+loop message. The oracle is an exact string match; a stub that only checks for
+any `unsupported:` result would accept a wrong reason and is rejected by the
+check. Host-only (no WARP/hardware draw). Run
+`python -B tests/startup_mesh57_loop_refusal_check.py`, or the matching CTest.
+
 A forward `s_cbranch_vccz` or `s_cbranch_vccnz` can also branch on the
 lane's VCC bit when EXEC is full and every incoming path last wrote VCC with
 a full-EXEC `v_cmp_*` from wave-uniform SGPRs or constants. A compare with a
