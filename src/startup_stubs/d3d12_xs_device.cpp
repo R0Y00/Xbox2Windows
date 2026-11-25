@@ -943,6 +943,7 @@ void retire_note_submission(ID3D12CommandQueue* queue, const std::vector<Wrapper
 void drain_retired_resources();
 void drop_mesh_lease_owner(Wrapper* w);
 void discard_mesh_lease_recording(ID3D12CommandList* list);
+void clear_unplaced_buffers(Wrapper* device);
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
@@ -960,6 +961,8 @@ ULONG __stdcall release(Wrapper* self)
             retire_drop_recording(self);
         }
         if (self->own().retire_when_idle) retire_resource(self);
+        if (self->own().kind == device_kind)
+            clear_unplaced_buffers(self);
     }
     return static_cast<ULONG>(refs);
 }
@@ -3071,7 +3074,7 @@ ResolvedView resolve_view(u64 handle, int slot)
         ReleaseSRWLockShared(&note_lock);
     }
     if (!known) {
-        if (slot == 20) out.resource = view_target(handle, slot);
+        if (slot == 20 || slot == 21) out.resource = view_target(handle, slot);
         return out;
     }
     if (static_cast<int>(record.slot) != slot) {
@@ -3090,6 +3093,77 @@ bool format_has_stencil(DXGI_FORMAT format)
 {
     return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
            format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+// List slot 51 (desktop 47 + 4), ClearDepthStencilView(view, flags, depth, stencil, rect count, rects). Desktop
+// resources rest in COMMON here, so the target is moved to DEPTH_WRITE around the clear. The view is
+// read from its shadow record, as OMSetRenderTargets does, so a descriptor the title copied clears the
+// resource it now holds; a handle with no record falls back to the creation-time map.
+void __stdcall list_clear_depth_stencil(Wrapper* self, u64 handle, D3D12_CLEAR_FLAGS flags, float depth, UINT8 stencil,
+                                       UINT rect_count, const D3D12_RECT* rects)
+{
+    if (!self || !self->own().list_open) return;
+    Timed timed(time_list);
+    InterlockedIncrement(&draw_calls_seen);
+    InterlockedIncrement64(&list_slot_calls[51]);
+    InterlockedIncrement64(&list_slot_census[51]);
+    if (trace_frame_active) {
+        const auto ret = reinterpret_cast<u64>(_ReturnAddress()) - reinterpret_cast<u64>(GetModuleHandleW(nullptr));
+        log("x2w-frame tid=%lu list=%llx slot51(0x%llx, 0x%x, %.3f, %u | %u, %p) ret=+0x%llx",
+            GetCurrentThreadId(), reinterpret_cast<u64>(self), handle, static_cast<unsigned>(flags),
+            depth, static_cast<unsigned>(stencil), rect_count, static_cast<const void*>(rects), ret);
+    }
+    const u64 desktop = desktop_cpu_handle(handle);
+    const ResolvedView view = resolve_view(desktop, 21);
+    ID3D12Resource* target = view.resource;
+    static LONG logged;
+    if (first_calls(logged, 4))
+        log("x2w-render ClearDepthStencilView view=0x%llx target=%p flags=0x%x depth=%.3f stencil=%u rects=%u", handle,
+            static_cast<void*>(target), static_cast<unsigned>(flags), depth, static_cast<unsigned>(stencil), rect_count);
+    if (!target) {
+        InterlockedIncrement(&render_target_unresolved);
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-d3d12 ClearDepthStencilView skipped: view 0x%llx is %s", handle,
+                view.wrong_kind ? "not a depth stencil view"
+                                : view.skipped ? "a skipped depth stencil view" : "not a known depth stencil view");
+        return;
+    }
+    if (!(flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL))) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-d3d12 ClearDepthStencilView skipped: zero clear flags 0x%x", static_cast<unsigned>(flags));
+        return;
+    }
+    if ((flags & D3D12_CLEAR_FLAG_DEPTH) && (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH)) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-d3d12 ClearDepthStencilView skipped: depth clear requested on read-only depth view 0x%llx", handle);
+        return;
+    }
+    if ((flags & D3D12_CLEAR_FLAG_STENCIL) && (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL)) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-d3d12 ClearDepthStencilView skipped: stencil clear requested on read-only stencil view 0x%llx", handle);
+        return;
+    }
+    const DXGI_FORMAT format = view_format_of(desktop, target);
+    if ((flags & D3D12_CLEAR_FLAG_STENCIL) && !format_has_stencil(format)) {
+        flags = static_cast<D3D12_CLEAR_FLAGS>(flags & ~D3D12_CLEAR_FLAG_STENCIL);
+        if (!flags) return;
+    }
+    if (rect_count && !x2w_local::readable(rects, std::size_t{rect_count} * sizeof(D3D12_RECT))) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-d3d12 ClearDepthStencilView skipped: unreadable rects array (%u rects at %p)", rect_count, static_cast<const void*>(rects));
+        return;
+    }
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const auto red_sample = red_producers().before(self, list, target, "clear-dsv", 0, 0);
+    list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, flags, depth, stencil,
+                                rect_count, rect_count ? rects : nullptr);
+    red_producers().after(self, red_sample);
+    InterlockedIncrement(&render_clears);
 }
 // List slot 52 (desktop 48 + 4), ClearRenderTargetView(view, colour, rect count, rects). Desktop
 // resources rest in COMMON here, so the target is moved to RENDER_TARGET around the clear. The view is
@@ -5575,6 +5649,11 @@ void build_tables()
     }
     if (render_mode()) {
         list_typed[9] = reinterpret_cast<ListTyped>(&list_close);
+        list_typed[51] = reinterpret_cast<ListTyped>(&list_clear_depth_stencil);
+        // Slot 51 is also entered through the generic invoke() path (the fixture calls list vtable[51]
+        // directly), so it must be present in tables[list_kind] as well as list_typed; siblings 52-55
+        // are only reached through list_typed and do not set both.
+        tables[list_kind][51] = reinterpret_cast<void*>(&list_clear_depth_stencil);
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
         list_typed[15] = reinterpret_cast<ListTyped>(&list_copy_buffer_region);
         list_typed[17] = reinterpret_cast<ListTyped>(&list_copy_resource);

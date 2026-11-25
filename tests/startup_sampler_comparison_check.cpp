@@ -76,6 +76,25 @@ int main()
         expect(bounded[0].Filter == bounded[1].Filter && bounded[0].AddressU == bounded[1].AddressU,
                "smpl decodes the other fields like smp", bounded[0].Filter, bounded[1].Filter);
     }
+    // Comparison samplers with CLAMP_BORDER (6) on either axis and fixed BORDER_COLOR_TYPE 0..2 in word 3 bits 31:30.
+    const D3D12_STATIC_BORDER_COLOR border_colors[3] = {
+        D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+        D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK,
+        D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+    };
+    for (unsigned btype = 0; btype < 3; ++btype) {
+        char line[96];
+        const unsigned w0 = 6u | 2u << 3 | 1u << 12 | 1u << 27;
+        const unsigned w3 = btype << 30;
+        std::snprintf(line, sizeof(line), "smpc 0 0x%x 0x0 0x0 0x%x", w0, w3);
+        x2w_startup::TranslatedSamplers border_smp;
+        expect(border_smp.read_manifest_line(line) && border_smp.statics.size() == 1, "border smpc parsed", btype);
+        const auto decoded = x2w_startup::decode_statics(border_smp);
+        if (decoded.size() != 1) continue;
+        expect(decoded[0].AddressU == D3D12_TEXTURE_ADDRESS_MODE_BORDER &&
+               decoded[0].AddressV == D3D12_TEXTURE_ADDRESS_MODE_CLAMP, "per-axis border/clamp addressing", btype);
+        expect(decoded[0].BorderColor == border_colors[btype], "comparison border color", decoded[0].BorderColor, border_colors[btype]);
+    }
     std::printf(failures ? "startup_sampler_comparison failed\n" : "startup_sampler_comparison ok\n");
     return failures ? 1 : 0;
 }

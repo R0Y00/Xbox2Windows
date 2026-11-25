@@ -392,7 +392,7 @@ def check_shader_records():
     sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
     rejected_forms = {
         "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "v_mul_i32_i24_sdwa",
+        "v_cvt_pkrtz_f16_f32_sdwa",
         "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
@@ -1534,6 +1534,42 @@ def check_sdwa_f16_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_sdwa_int_extra_forms():
+    """The 12 extended integer SDWA forms (bit-scan/reverse, sat_pk_u8_i16, 24-bit multiply, and
+    carry-in add/sub/subrev) count as covered once the translator accepts their fixtures."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in pixel.SDWA_INT_EXTRA_PROGRAMS.values():
+            pixel.translate_int(pixel.uncompressed_export(body))
+        ops = (
+            "v_bfrev_b32_sdwa", "v_ffbl_b32_sdwa", "v_ffbh_u32_sdwa", "v_ffbh_i32_sdwa",
+            "v_sat_pk_u8_i16_sdwa",
+            "v_mul_u32_u24_sdwa", "v_mul_i32_i24_sdwa", "v_mul_hi_u32_u24_sdwa", "v_mul_hi_i32_i24_sdwa",
+            "v_add_co_ci_u32_sdwa", "v_sub_co_ci_u32_sdwa", "v_subrev_co_ci_u32_sdwa",
+        )
+        forms = {("SDWA", op) for op in ops}
+        assert len(forms) == 12
+        neighbours = {
+            ("SDWA", "v_cndmask_b32_sdwa"), ("SDWA", "v_cvt_i32_f32_sdwa"),
+            ("SDWA", "v_cvt_u32_f32_sdwa"), ("SDWA", "v_cvt_pkrtz_f16_f32_sdwa"),
+            ("SDWA", "v_frexp_exp_i32_f32_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        stripped = pixel.ACCEPTED - {"v_add_co_ci_u32_sdwa"}
+        assert ("SDWA", "v_add_co_ci_u32_sdwa") not in fc.gfx_forms(stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1557,6 +1593,7 @@ if __name__ == "__main__":
     check_dpp_f16_arith_round_forms()
     check_dpp_f16_cvt_fmac_ldexp_forms()
     check_sdwa_f16_forms()
+    check_sdwa_int_extra_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sdwa_cmp_coverage()
