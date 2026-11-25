@@ -58,7 +58,7 @@ EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
 # Without -FakeUser, user APIs hit the host runtime; run.ps1 must warn (docs/startup-runtime.md).
 FAKE_USER_WARN = re.compile(
-    r"if\s*\(\s*-not\s+\$FakeUser\s*\)\s*\{\s*"
+    r"if\s*\(\s*-not\s+\$FakeUser\s+-and\s+\$env:X2W_FAKE_USER\s+-ne\s+\"1\"\s*\)\s*\{\s*"
     r'Write-Warning\s+"Without -FakeUser, user API calls go to the host gaming runtime',
     re.I | re.S,
 )
