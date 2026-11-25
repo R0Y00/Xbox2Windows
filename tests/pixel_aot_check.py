@@ -441,6 +441,12 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False, extr
     return Path(path)
 
 
+def write_uint_case(path, constants, words):
+    """Broadcast a raw uint4 to all 64 expected texels of a UINT readback case."""
+    path.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+    return path
+
+
 def check_container_selector(directory: Path, code: bytes, library: str | None = None) -> None:
     archive = directory / "same-name.rpf"
     records = [envelope(code, private_data=metadata) for metadata in (b"first", b"second")]
@@ -11346,6 +11352,167 @@ def sdwa_integer_cases(group):
     return cases
 
 
+# Supplemental per-predicate SDWA 32-bit integer comparison draws (all 16 forms across four 4-channel groups),
+# with A, B, C and D in s44 to s47, B in v18, C in v19 and 1.0 (0x3f800000) in v20. Each channel writes 0 or
+# 0x3f800000 via v_cndmask_b32 from vcc_lo or s52. Together the four groups cover all 16 opcodes, all 7
+# selectors on both src0_sel and src1_sel, zero- and sign-extension on either or both sources, and all
+# SGPR/VGPR source pairs.
+SDWA_INT_CMP_ONE = 0x3f800000
+SDWA_INT_CMP_BODIES = {
+    "i32_lo": [
+        "v_cmp_f_i32_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD",
+        "v_cndmask_b32_e32 v12, 0, v20, vcc_lo",
+        "v_cmp_lt_i32_sdwa s52, sext(s44), v18 src0_sel:BYTE_0 src1_sel:BYTE_1",
+        "v_cndmask_b32_e64 v13, 0, v20, s52",
+        "v_cmp_eq_i32_sdwa vcc_lo, sext(v18), sext(s44) src0_sel:WORD_0 src1_sel:WORD_1",
+        "v_cndmask_b32_e32 v14, 0, v20, vcc_lo",
+        "v_cmp_le_i32_sdwa s52, s44, sext(v19) src0_sel:WORD_0 src1_sel:BYTE_2",
+        "v_cndmask_b32_e64 v15, 0, v20, s52",
+    ],
+    "i32_hi": [
+        "v_cmp_gt_i32_sdwa vcc_lo, s44, sext(s45) src0_sel:BYTE_3 src1_sel:BYTE_2",
+        "v_cndmask_b32_e32 v12, 0, v20, vcc_lo",
+        "v_cmp_ne_i32_sdwa s52, v18, v19 src0_sel:BYTE_1 src1_sel:BYTE_0",
+        "v_cndmask_b32_e64 v13, 0, v20, s52",
+        "v_cmp_ge_i32_sdwa vcc_lo, sext(v18), sext(s44) src0_sel:BYTE_3 src1_sel:WORD_1",
+        "v_cndmask_b32_e32 v14, 0, v20, vcc_lo",
+        "v_cmp_t_i32_sdwa s52, s44, v18 src0_sel:DWORD src1_sel:DWORD",
+        "v_cndmask_b32_e64 v15, 0, v20, s52",
+    ],
+    "u32_lo": [
+        "v_cmp_f_u32_sdwa vcc_lo, v18, s44 src0_sel:DWORD src1_sel:DWORD",
+        "v_cndmask_b32_e32 v12, 0, v20, vcc_lo",
+        "v_cmp_lt_u32_sdwa s52, s44, sext(v18) src0_sel:WORD_0 src1_sel:BYTE_0",
+        "v_cndmask_b32_e64 v13, 0, v20, s52",
+        "v_cmp_eq_u32_sdwa vcc_lo, s44, s45 src0_sel:BYTE_2 src1_sel:BYTE_3",
+        "v_cndmask_b32_e32 v14, 0, v20, vcc_lo",
+        "v_cmp_le_u32_sdwa s52, v18, v19 src0_sel:DWORD src1_sel:DWORD",
+        "v_cndmask_b32_e64 v15, 0, v20, s52",
+    ],
+    "u32_hi": [
+        "v_cmp_gt_u32_sdwa vcc_lo, sext(s44), v18 src0_sel:WORD_1 src1_sel:DWORD",
+        "v_cndmask_b32_e32 v12, 0, v20, vcc_lo",
+        "v_cmp_ne_u32_sdwa s52, sext(v18), sext(s44) src0_sel:BYTE_1 src1_sel:BYTE_1",
+        "v_cndmask_b32_e64 v13, 0, v20, s52",
+        "v_cmp_ge_u32_sdwa vcc_lo, s44, v19 src0_sel:WORD_0 src1_sel:WORD_0",
+        "v_cndmask_b32_e32 v14, 0, v20, vcc_lo",
+        "v_cmp_t_u32_sdwa s52, v18, s44 src0_sel:DWORD src1_sel:DWORD",
+        "v_cndmask_b32_e64 v15, 0, v20, s52",
+    ],
+}
+SDWA_INT_CMP_OPS = tuple(sorted({line.split()[0] for body in SDWA_INT_CMP_BODIES.values() for line in body
+                                 if line.split()[0].endswith("_sdwa")}))
+
+
+def _u32_sext(value, width):
+    return _sext(value, width) & 0xffffffff
+
+
+SDWA_INT_CMP_RESULTS = {
+    "i32_lo": lambda a, b, c, d: (
+        False,
+        _sext(_byte(a, 0), 8) < _byte(b, 1),
+        _sext(_word(b, 0), 16) == _sext(_word(a, 1), 16),
+        _word(a, 0) <= _sext(_byte(c, 2), 8),
+    ),
+    "i32_hi": lambda a, b, c, d: (
+        _byte(a, 3) > _sext(_byte(b, 2), 8),
+        _byte(b, 1) != _byte(c, 0),
+        _sext(_byte(b, 3), 8) >= _sext(_word(a, 1), 16),
+        True,
+    ),
+    "u32_lo": lambda a, b, c, d: (
+        False,
+        _word(a, 0) < _u32_sext(_byte(b, 0), 8),
+        _byte(a, 2) == _byte(b, 3),
+        b <= c,
+    ),
+    "u32_hi": lambda a, b, c, d: (
+        _u32_sext(_word(a, 1), 16) > b,
+        _u32_sext(_byte(b, 1), 8) != _u32_sext(_byte(a, 1), 8),
+        _word(a, 0) >= _word(c, 0),
+        True,
+    ),
+}
+SDWA_INT_CMP_WRONG = {
+    "i32_lo": (
+        (0, 0, lambda a, b, c, d: True, "t for f"),
+        (0, 1, lambda a, b, c, d: _byte(a, 0) < _byte(b, 1), "sign extension dropped on src0"),
+        (0, 1, lambda a, b, c, d: _u32_sext(_byte(a, 0), 8) < _byte(b, 1), "unsigned for signed"),
+        (1, 1, lambda a, b, c, d: _sext(_byte(a, 1), 8) < _byte(b, 1), "BYTE_1 for BYTE_0"),
+        (0, 2, lambda a, b, c, d: _word(b, 0) == _sext(_word(a, 1), 16), "sign extension dropped on src0"),
+        (0, 2, lambda a, b, c, d: _s32(b) == _s32(a), "whole DWORD for WORD_0/WORD_1"),
+        (0, 2, lambda a, b, c, d: _sext(_word(b, 0), 16) != _sext(_word(a, 1), 16), "ne for eq"),
+        (0, 3, lambda a, b, c, d: _word(a, 0) <= _byte(c, 2), "sign extension dropped on src1"),
+        (0, 3, lambda a, b, c, d: _word(a, 0) <= _u32_sext(_byte(c, 2), 8), "unsigned for signed"),
+        (1, 3, lambda a, b, c, d: _word(a, 0) < _sext(_byte(c, 2), 8), "lt for le"),
+        (1, 3, lambda a, b, c, d: _word(a, 1) <= _sext(_byte(c, 2), 8), "WORD_1 for WORD_0"),
+    ),
+    "i32_hi": (
+        (0, 0, lambda a, b, c, d: _byte(a, 3) > _byte(b, 2), "sign extension dropped on src1"),
+        (0, 0, lambda a, b, c, d: _byte(a, 3) > _u32_sext(_byte(b, 2), 8), "unsigned for signed"),
+        (1, 0, lambda a, b, c, d: _byte(a, 3) >= _sext(_byte(b, 2), 8), "ge for gt"),
+        (0, 1, lambda a, b, c, d: b != c, "whole DWORD for BYTE_1/BYTE_0"),
+        (0, 1, lambda a, b, c, d: _byte(b, 0) != _byte(c, 0), "BYTE_0 for BYTE_1"),
+        (0, 1, lambda a, b, c, d: _byte(b, 1) == _byte(c, 0), "eq for ne"),
+        (0, 2, lambda a, b, c, d: _sext(_byte(b, 3), 8) >= _word(a, 1), "sign extension dropped on src1"),
+        (0, 2, lambda a, b, c, d: _u32_sext(_byte(b, 3), 8) >= _u32_sext(_word(a, 1), 16), "unsigned for signed"),
+        (1, 2, lambda a, b, c, d: _byte(b, 3) >= _sext(_word(a, 1), 16), "sign extension dropped on src0"),
+        (0, 3, lambda a, b, c, d: False, "f for t"),
+    ),
+    "u32_lo": (
+        (0, 0, lambda a, b, c, d: True, "t for f"),
+        (0, 1, lambda a, b, c, d: _word(a, 0) < _byte(b, 0), "sign extension dropped on src1"),
+        (0, 1, lambda a, b, c, d: _word(a, 0) < _sext(_byte(b, 0), 8), "signed for unsigned"),
+        (0, 1, lambda a, b, c, d: _word(a, 0) > _u32_sext(_byte(b, 0), 8), "gt for lt"),
+        (0, 2, lambda a, b, c, d: _byte(a, 3) == _byte(b, 3), "BYTE_3 for BYTE_2"),
+        (0, 2, lambda a, b, c, d: _byte(a, 2) == _byte(b, 2), "BYTE_2 for BYTE_3"),
+        (0, 2, lambda a, b, c, d: a == b, "whole DWORD for BYTE_2/BYTE_3"),
+        (0, 2, lambda a, b, c, d: _byte(a, 2) != _byte(b, 3), "ne for eq"),
+        (0, 3, lambda a, b, c, d: _s32(b) <= _s32(c), "signed for unsigned"),
+        (1, 3, lambda a, b, c, d: b < c, "lt for le"),
+    ),
+    "u32_hi": (
+        (0, 0, lambda a, b, c, d: _word(a, 1) > b, "sign extension dropped on src0"),
+        (0, 0, lambda a, b, c, d: _sext(_word(a, 1), 16) > _s32(b), "signed for unsigned"),
+        (0, 0, lambda a, b, c, d: _u32_sext(_word(a, 0), 16) > b, "WORD_0 for WORD_1"),
+        (0, 1, lambda a, b, c, d: b != a, "whole DWORD for BYTE_1"),
+        (0, 1, lambda a, b, c, d: _u32_sext(_byte(b, 0), 8) != _u32_sext(_byte(a, 1), 8), "BYTE_0 for BYTE_1"),
+        (0, 1, lambda a, b, c, d: _u32_sext(_byte(b, 1), 8) == _u32_sext(_byte(a, 1), 8), "eq for ne"),
+        (0, 2, lambda a, b, c, d: _word(a, 0) >= _word(c, 1), "WORD_1 for WORD_0 on src1"),
+        (0, 2, lambda a, b, c, d: _word(c, 0) >= _word(a, 0), "swapped operands"),
+        (1, 2, lambda a, b, c, d: _word(a, 0) > _word(c, 0), "gt for ge"),
+        (0, 3, lambda a, b, c, d: False, "f for t"),
+    ),
+}
+SDWA_INT_CMP_ROWS = {
+    "i32_lo": ((0x81250090, 0x40d18125, 0x3ef01234, 0), (0x40250040, 0x3f802001, 0x3e401234, 0)),
+    "i32_hi": ((0xc0251234, 0x40f05511, 0x3f002255, 0), (0x00801234, 0xc0005511, 0x3f002266, 0)),
+    "u32_lo": ((0x3f400100, 0x40123480, 0xbf800000, 0), (0x3f410100, 0x4012347f, 0x4012347f, 0)),
+    "u32_hi": ((0xc0257000, 0x3f807011, 0xbf803f80, 0), (0x3f803f80, 0x3f809111, 0xbf803f80, 0)),
+}
+
+
+def sdwa_int_compare_group(group):
+    return ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s46", "v_mov_b32_e32 v20, 1.0",
+            *SDWA_INT_CMP_BODIES[group]]
+
+
+def sdwa_int_compare_cases(group):
+    """(row, expected words, status, reason) for every draw of a group: the right rows, then the controls."""
+    rows = SDWA_INT_CMP_ROWS[group]
+    right = [tuple(SDWA_INT_CMP_ONE if flag else 0 for flag in SDWA_INT_CMP_RESULTS[group](*row)) for row in rows]
+    cases = [(row, words, "pass", "") for row, words in zip(rows, right)]
+    for index, channel, wrong, reason in SDWA_INT_CMP_WRONG[group]:
+        words = list(right[index])
+        words[channel] = SDWA_INT_CMP_ONE if wrong(*rows[index]) else 0
+        assert words[channel] != right[index][channel], (group, reason)
+        cases.append((rows[index], tuple(words), "mismatch", reason))
+    for row, words in zip(rows, right):
+        assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+    return cases
+
+
 # Saturating 16-bit packs (v_cvt_pk_u16_u32, v_cvt_pk_i16_i32). Bodies for uncompressed_export(): s44 = A and
 # s45 = B from the constants, v18 = B, v19 = B >> 16 (the high half, always inside both 16-bit ranges when
 # read as unsigned or sign-extended below), v20 = B >> 12 and v21 = B >> 16 arithmetic. A normal binary32
@@ -12611,6 +12778,99 @@ def check_sdwa_integer_lowering():
     # Operations outside the table keep their refusal in the SDWA spelling.
     for bad in (f"v_bfi_b32_sdwa v12, s44, v18 {sdwa}", f"v_mul_u32_u24_sdwa v12, s44, v18 {sdwa}",
                 f"v_add_nc_i32_sdwa v12, s44, v18 {sdwa}", f"v_min3_u32_sdwa v12, s44, v18 {sdwa}"):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+
+
+def check_sdwa_int_compare_lowering():
+    """Supplemental static lowering and refusal checks for the 16 32-bit integer SDWA comparisons."""
+    assert (SDWA_INT_CMP_BODIES.keys() == SDWA_INT_CMP_RESULTS.keys()
+            == SDWA_INT_CMP_WRONG.keys() == SDWA_INT_CMP_ROWS.keys())
+    src0_sels, src1_sels = set(), set()
+    for group, body in SDWA_INT_CMP_BODIES.items():
+        translate_int(uncompressed_export(sdwa_int_compare_group(group)))
+        sdwa_int_compare_cases(group)
+        for line in body:
+            if m := re.search(r"src0_sel:(\S+) src1_sel:(\S+)", line):
+                src0_sels.add(m.group(1))
+                src1_sels.add(m.group(2))
+    assert src0_sels == set(pixel_aot.SDWA_SEL), src0_sels
+    assert src1_sels == set(pixel_aot.SDWA_SEL), src1_sels
+    expected_ops = {f"v_cmp_{op}_{kind}_sdwa" for op in INT_PREDICATES for kind in ("i32", "u32")}
+    assert len(SDWA_INT_CMP_OPS) == 16 and set(SDWA_INT_CMP_OPS) == expected_ops
+    assert expected_ops <= ACCEPTED, expected_ops - ACCEPTED
+
+    def cmp_statement(compare_line, mask_reg="vcc_lo"):
+        cnd = f"v_cndmask_b32_{'e32' if mask_reg in ('vcc', 'vcc_lo') else 'e64'} v12, 0, v19, {mask_reg}"
+        program = uncompressed_export(["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, 1.0", compare_line, cnd])
+        index = program.index(compare_line)
+        lines = [line for line in translate_int(program).splitlines() if line.startswith(f"    bool cmp{index} = ")]
+        assert len(lines) == 1, (compare_line, lines)
+        return lines[0].replace(f"cmp{index} ", "c ", 1)
+
+    a, v = "params[0].w", "asuint(alu20)"
+    # With whole-dword selections every form matches its e32 comparison, and vcc/vcc_lo/s52 emit identical HLSL.
+    for kind in ("i32", "u32"):
+        for op in INT_PREDICATES:
+            whole_vcc = cmp_statement(f"v_cmp_{op}_{kind}_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD")
+            whole_vcc64 = cmp_statement(f"v_cmp_{op}_{kind}_sdwa vcc, s44, v18 src0_sel:DWORD src1_sel:DWORD", "vcc")
+            whole_s52 = cmp_statement(f"v_cmp_{op}_{kind}_sdwa s52, s44, v18 src0_sel:DWORD src1_sel:DWORD", "s52")
+            assert whole_vcc == whole_vcc64 == whole_s52, (kind, op, whole_vcc, whole_vcc64, whole_s52)
+            plain = cmp_statement(f"v_cmp_{op}_{kind}_e32 vcc_lo, s44, v18")
+            if kind == "u32":
+                assert whole_vcc == plain, (kind, op, whole_vcc, plain)
+            else:
+                assert whole_vcc == plain.replace("asint(alu20)", f"asint({v})"), (kind, op, whole_vcc, plain)
+    assert cmp_statement("v_cmp_lt_i32_sdwa s52, sext(s44), v18 src0_sel:BYTE_0 src1_sel:BYTE_1", "s52") == (
+        f"    bool c = asint(asuint(asint({a} << 24u) >> 24u)) < asint((({v} >> 8u) & 0xffu));")
+    assert cmp_statement("v_cmp_lt_u32_sdwa s52, s44, sext(v18) src0_sel:WORD_0 src1_sel:BYTE_0", "s52") == (
+        f"    bool c = (({a} >> 0u) & 0xffffu) < asuint(asint({v} << 24u) >> 24u);")
+
+    good = "v_cmp_lt_i32_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD"
+    for bad, message in (
+        (good.replace("s44,", "sext(s44,"), "Unsupported SDWA comparison operands"),
+        (good.replace("s44,", "s44),"), "Unsupported SDWA comparison operands"),
+        (good.replace("v18 ", "sext(v18 "), "Unsupported SDWA comparison operands"),
+        (good + " clamp", "Unsupported SDWA comparison operands"),
+        ("v_cmp_lt_i32_sdwa vcc_lo, s44, v18 src0_sel:DWORD", "Unsupported SDWA comparison operands"),
+        (good.replace("src0_sel:DWORD", "src0_sel:WORD_2"), "Unsupported SDWA comparison operands"),
+        (good.replace("vcc_lo", "s106"), "Scalar register out of range"),
+        (good.replace("vcc_lo", "s[52:53]"), "VOPC SDWA destination cannot be an SGPR pair"),
+        (good.replace("vcc_lo", "s[51:52]"), "VOPC SDWA destination cannot be an SGPR pair"),
+        (good.replace("vcc_lo", "s[105:106]"), "VOPC SDWA destination cannot be an SGPR pair"),
+        (good.replace("v18", "v0"), "Expected a numeric register"),
+    ):
+        expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]), message)
+    for bad in (
+        "v_cmp_lt_i32_sdwa vcc_lo, s44, v18 dst_sel:DWORD src0_sel:DWORD src1_sel:DWORD",
+        good.replace("s44,", "-s44,"),
+        good.replace("v18 ", "|v18| "),
+        good.replace("v18 ", "abs(v18) "),
+        good.replace("s44,", "sext(-s44),"),
+        good.replace("v18", "v106"),
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+    # A low16 VGPR source (undefined high half) is rejected as non-numeric, matching SDWA_INT.
+    expect_value_error(
+        translate_int,
+        uncompressed_export(["v_mov_b32_e32 v18, s45", "v_add_nc_u16 v24, s44, v18",
+                             "v_cmp_lt_i32_sdwa vcc_lo, v24, v18 src0_sel:WORD_0 src1_sel:WORD_0"]),
+        "Expected a numeric register",
+    )
+    # Pending sample source, pending scalar source/destination and non-entry mask are rejected.
+    base_prog = uncompressed_export(sdwa_int_compare_group("i32_lo"))
+    pos = base_prog.index("s_waitcnt vmcnt(0)")
+    must_reject(translate_int, base_prog[:pos] + ["v_cmp_eq_u32_sdwa vcc_lo, v12, v13 src0_sel:DWORD src1_sel:DWORD"] + base_prog[pos:])
+    load = next(i for i, line in enumerate(base_prog) if line.startswith("s_buffer_load_dwordx4"))
+    pos = base_prog.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate_int, base_prog[:pos] + ["v_cmp_eq_i32_sdwa vcc_lo, s44, s45 src0_sel:DWORD src1_sel:DWORD"] + base_prog[pos:])
+    must_reject(translate_int, base_prog[:pos] + ["v_cmp_eq_i32_sdwa s44, s46, s47 src0_sel:DWORD src1_sel:DWORD"] + base_prog[pos:])
+    pos = base_prog.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate_int, base_prog[:pos] + [good] + base_prog[pos:])
+    # Remaining unlowered SDWA compare neighbours stay refused.
+    for bad in (
+        "v_cmp_lt_i64_sdwa vcc_lo, s[44:45], v[18:19] src0_sel:DWORD src1_sel:DWORD",
+        "v_cmpx_lt_i32_sdwa s44, v18 src0_sel:DWORD src1_sel:DWORD",
+    ):
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
 
@@ -18508,6 +18768,7 @@ _CONTROL_SUBCHECKS = (
     "check_cvt_int_f64_lowering",
     "check_cvt_f32_f64_lowering",
     "check_sdwa_integer_lowering",
+    "check_sdwa_int_compare_lowering",
     "check_sdwa_cmp_controls",
     "check_pack_int16_lowering",
     "check_sat_pack_u8_lowering",
@@ -19140,6 +19401,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
     fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
     fixtures.append((title_program(), translate_title))
+    fixtures.append((uncompressed_export(TITLE_X2_BODY), translate_title))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_PLAIN_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_U32_MOD_BODY), translate_int))
     fixtures.append((uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY), translate_int))
@@ -19158,6 +19420,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((cvt_int_f64_static_binary_program(kind), translate_int) for kind in CVT_INT_F64_STATIC_ROWS)
     fixtures.append((cvt_f32_f64_binary_program(), translate_int))
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
+    fixtures.extend((uncompressed_export(sdwa_int_compare_group(group)), translate_int) for group in SDWA_INT_CMP_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((sat_pack_u8_program(), translate_int))
     fixtures.append((uncompressed_export(pack_b32_group()), translate_int))
@@ -19604,11 +19867,7 @@ def check_integer_readback_draw(directory, compiler, renderer, backend):
     """Round-trip v_mov_b32 bit copies bit-for-bit through the integer readback target."""
     source = directory / "integer_readback.hlsl"
     shader = directory / "integer_readback.cso"
-    pass_case = directory / "integer_readback-pass.case"
-    corrupted_case = directory / "integer_readback-corrupted.case"
     words = (0x7fc00001, 0xffc00003, 0x00000001, 0x80000000)
-    constants = bytearray(256)
-    struct.pack_into("<I", constants, 12, words[0])
     program = uncompressed_export([
         "v_mov_b32_e32 v12, s44",
         f"v_mov_b32_e32 v13, {words[1]:#x}",
@@ -19618,12 +19877,20 @@ def check_integer_readback_draw(directory, compiler, renderer, backend):
     source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
                             integer_export=True), encoding="ascii")
     compile_shader(compiler, source, shader)
-    expected = tuple(struct.unpack("<f", struct.pack("<I", word))[0] for word in words)
-    write_case(pass_case, constants, expected, integer_rt=True)
-    corrupted = list(expected)
-    corrupted[2] = struct.unpack("<f", struct.pack("<I", words[2] ^ 3))[0]
-    write_case(corrupted_case, constants, corrupted, integer_rt=True)
-    run_pixel_batch(renderer, backend, shader, [(corrupted_case, "mismatch"), (pass_case, "pass")])
+    cases = []
+    for name, red, channel, changed_bits in (
+        ("subnormal", words[0], 2, 3),
+        ("positive-snan", 0x7f800001, 0, 0x00400000),
+        ("negative-snan", 0xff812345, 0, 0x00400000),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<I", constants, 12, red)
+        expected = (red, *words[1:])
+        wrong = list(expected)
+        wrong[channel] ^= changed_bits
+        cases.append((write_uint_case(directory / f"{name}-wrong.case", constants, wrong), "mismatch"))
+        cases.append((write_uint_case(directory / f"{name}-exact.case", constants, expected), "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
 
 
 def check_subrev_u32_draw(directory, compiler, renderer, backend):
@@ -19828,6 +20095,36 @@ def check_sdwa_integer_draws(directory, compiler, renderer, backend):
             constants = bytearray(256)
             struct.pack_into("<4I", constants, 12, *row)
             case = directory / f"sdwa_integer-{len(cases)}.case"
+            case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
+            cases.append((case, status))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_sdwa_int_compare_draws(directory, compiler, renderer, backend):
+    """Draw the supplemental per-predicate SDWA 32-bit integer comparison groups through integer readback.
+
+    Each group of SDWA_INT_CMP_BODIES is compiled once and drawn in one renderer batch: every row of
+    SDWA_INT_CMP_ROWS with the right words, then one draw per SDWA_INT_CMP_WRONG entry with one channel
+    replaced by the word a wrong signedness, extension, selection or predicate would give, which must
+    report a mismatch. On a desktop GPU the draws establish that the translated shader computes the stated
+    words, not what the console does.
+    """
+    source = directory / "sdwa_int_compare.hlsl"
+    shader = directory / "sdwa_int_compare.cso"
+    for group in SDWA_INT_CMP_BODIES:
+        source.write_text(translate_int(uncompressed_export(sdwa_int_compare_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for row, words, status, _ in sdwa_int_compare_cases(group):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *row)
+            case = directory / f"sdwa_int_compare-{len(cases)}.case"
             case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"\x01")
             cases.append((case, status))
         try:
@@ -20467,6 +20764,86 @@ def title_program():
     return uncompressed_export(TITLE_BODY)
 
 
+# flat_load_dwordx2 and global_load_dwordx2 look up the whole QWORD: both words come from one range or both read
+# TITLE_MISS. A QWORD across two adjacent ranges is a miss, as TitleLookup (src/title_va_lookup.hlsli) defines.
+# Channels 0 and 1 are the QWORD at A + 2040, channels 2 and 3 the QWORD at B - 2048.
+TITLE_X2_BODY = [
+    "v_mov_b32_e32 v20, s44",
+    "v_mov_b32_e32 v21, s45",
+    "v_mov_b32_e32 v22, s46",
+    "v_mov_b32_e32 v23, s47",
+    "flat_load_dwordx2 v[12:13], v[20:21] offset:2040",
+    "global_load_dwordx2 v[14:15], v[22:23], off offset:-2048",
+    "s_waitcnt vmcnt(0) lgkmcnt(0)",
+]
+TITLE_X2_OFFSETS = (2040, -2048)
+TITLE_X2_CASES = (  # effective addresses (QWORD at A + 2040, QWORD at B - 2048)
+    (0x2_0000_0000, 0x2_0000_1800),  # inside two ranges, in two slots
+    (0x0_0010_00f8, 0x2_0000_0ff8),  # last whole QWORD of two ranges
+    (0x2_0000_0ffc, 0x0_0010_00fc),  # across the adjacent ranges at 0x2_0000_1000; across the end of a range
+    (0x1_8000_0000, 0x0_0000_0800),  # misses: a hole between ranges, and below the first range
+    (0x0_ffff_fffc, 0x1_0000_07f8),  # across the 32-bit boundary inside one range; last QWORD of that range
+    (0x2_0000_1ff8, 0x1_0000_07fc),  # last QWORD of the last range; across the end of a range into a hole
+    (0x2_0000_0000, 0x0_ffff_fffc),  # global offset -2048 borrows across the low 32 bits; QWORD across 2^32 inside one range
+)
+# Wrong references, each with the (case, channel) it changes: the two words swapped, a 4-byte lookup instead of
+# 8, the range accepted for the first word only, and a separate lookup for each word.
+TITLE_X2_MUTATIONS = {"swap": (0, 0), "narrow": (2, 0), "first": (2, 0), "separate": (2, 1)}
+
+
+def title_x2_reference(address, mutation=None):
+    """The two words a QWORD load at address returns; mutation names one wrong reference."""
+    def hit(where, width):
+        for begin, end, slot in TITLE_RANGES:
+            if where % 4 == 0 and begin <= where and where + width <= end:
+                return slot, (where - begin) // 4
+        return None
+
+    whole = hit(address, 8)
+    if mutation == "narrow":
+        whole = hit(address, 4)
+    if whole is not None:
+        words = [title_word(whole[0], whole[1]), title_word(whole[0], whole[1] + 1)]
+    else:
+        words = [pixel_aot.TITLE_MISS] * 2
+    if mutation == "swap":
+        words.reverse()
+    if mutation == "first":
+        first = hit(address, 4)
+        words[0] = title_word(*first) if first else pixel_aot.TITLE_MISS
+    if mutation == "separate":
+        second = hit(address + 4, 4)
+        words[1] = title_word(*second) if second else pixel_aot.TITLE_MISS
+    return words
+
+
+def title_x2_words(addresses, mutation=None):
+    return tuple(word for address in addresses for word in title_x2_reference(address, mutation))
+
+
+def title_x2_constants(addresses):
+    """The values of A and B (constant words 3 to 6) that put the QWORDs at the effective addresses."""
+    a, b = (address - offset for address, offset in zip(addresses, TITLE_X2_OFFSETS))
+    return a, b
+
+
+def title_x2_controls():
+    """Check that the cases cover a hit, a miss and the straddles, and that each mutation changes its channel."""
+    expected = [title_x2_words(addresses) for addresses in TITLE_X2_CASES]
+    for addresses in TITLE_X2_CASES:
+        assert all(address % 4 == 0 for address in addresses) and all(v >= 0 for v in title_x2_constants(addresses))
+    assert expected[0] == (title_word(0, 0), title_word(0, 1), title_word(3, 0x200), title_word(3, 0x201))
+    assert expected[1][:2] == (title_word(1, 0x3e), title_word(1, 0x3f)) and expected[1][3] == 0xa00003ff
+    assert expected[2] == (pixel_aot.TITLE_MISS,) * 4 and expected[3] == (pixel_aot.TITLE_MISS,) * 4
+    assert expected[4] == (title_word(2, 0x1ff), title_word(2, 0x200), title_word(2, 0x3fe), title_word(2, 0x3ff))
+    assert expected[6] == (title_word(0, 0), title_word(0, 1), title_word(2, 0x1ff), title_word(2, 0x200))
+    assert expected[5] == (title_word(3, 0x3fe), title_word(3, 0x3ff), pixel_aot.TITLE_MISS, pixel_aot.TITLE_MISS)
+    for mutation, (index, channel) in TITLE_X2_MUTATIONS.items():
+        assert title_x2_words(TITLE_X2_CASES[index], mutation)[channel] != expected[index][channel], mutation
+    # Both words of a QWORD that starts inside one range and ends in the next are misses, not one hit and one miss.
+    assert title_x2_words(TITLE_X2_CASES[2], "first")[:2] == (title_word(0, 0x3ff), pixel_aot.TITLE_MISS)
+
+
 def translate_title(instructions):
     """translate_int() with the TITLE_RANGES table bound for flat and global loads."""
     return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
@@ -20488,7 +20865,90 @@ def title_controls():
     assert title_words(*TITLE_CASES[2], "carry")[1] == title_words(*TITLE_CASES[2], "mask")[2] == pixel_aot.TITLE_MISS
 
 
+def check_title_load_x2_controls():
+    title_x2_controls()
+    program = uncompressed_export(TITLE_X2_BODY)
+    source = translate_title(program)
+    assert source.count("bool TitleLookup(") == 1 and source.count("uint2 title_load_dwordx2(") == 1
+    assert "address, 8, slot, byteOffset" in source and ".Load2(byteOffset)" in source
+    assert source.count("title_load_dwordx2(uint2(") == 2 and "title_load_dword(uint2(" not in source
+    assert "uint2(0x7f8u, 0x0u)" in source and "uint2(0xfffff800u, 0xffffffffu)" in source
+    # Without a QWORD load the translation is the DWORD one, byte for byte.
+    assert "title_load_dwordx2" not in translate_title(title_program())
+    # Both forms need the same profile and range table as the DWORD loads.
+    expect_value_error(translate_int, program, "Title memory is not bound")
+    def without_flat_binding(instructions):
+        return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                     integer_export=True, title_ranges=len(TITLE_RANGES))
+
+    expect_value_error(without_flat_binding, program, "Flat loads require the global-only address profile")
+    global_program = [line.replace("flat_load_dwordx2", "global_load_dwordx2").replace(":21] offset:2040", ":21], off")
+                      for line in program]
+    assert without_flat_binding(global_program).count("title_load_dwordx2(uint2(") == 2
+    flat = "flat_load_dwordx2 v[12:13], v[20:21] offset:2040"
+
+    def replaced(line):
+        return [line if entry == flat else entry for entry in program]
+
+    # Wider and narrower neighbours, cache-policy bits, saddr, LDS and out-of-range offsets stay refused.
+    for neighbour in ("flat_load_dwordx3 v[12:14], v[20:21]", "flat_load_dwordx4 v[12:15], v[20:21]",
+                      "flat_load_dwordx2 v[12:13], v[20:21] glc", "flat_load_dwordx2 v[12:13], v[20:21] slc",
+                      "flat_load_dwordx2 v[12:13], v[20:21] offset:8 glc slc dlc",
+                      "flat_load_dwordx2 v[12:13], v[20:21] dlc", "global_load_dwordx2 v[12:13], v[20:21], off glc",
+                      "global_load_dwordx2 v[12:13], v[20:21], off slc", "global_load_dwordx2 v[12:13], v[20:21], off dlc",
+                      "global_load_dwordx2 v[12:13], v20, s[44:45]", "global_load_dwordx2 v[12:13], v20, s[44:45] offset:-8",
+                      "global_load_dwordx2 v[12:13], v[20:21], off lds", "global_load_dwordx3 v[12:14], v[20:21], off",
+                      "global_load_dwordx4 v[12:15], v[20:21], off", "flat_load_ubyte v12, v[20:21]", "flat_load_sshort v12, v[20:21]",
+                      "flat_load_short_d16 v12, v[20:21]", "global_load_ubyte v12, v[20:21], off",
+                      "flat_store_dwordx2 v[20:21], v[12:13]", "global_store_dwordx2 v[20:21], v[12:13], off",
+                      "flat_atomic_add_x2 v[12:13], v[20:21], v[14:15] glc",
+                      "flat_atomic_add_x2 v[20:21], v[14:15]", "scratch_load_dwordx2 v[12:13], v20, off",
+                      "scratch_load_dwordx2 v[12:13], off, s48", "scratch_store_dwordx2 off, v[12:13], s48 offset:16"):
+        expect_value_error(translate_title, replaced(neighbour), "Unsupported instruction")
+    # A QWORD needs a register pair and a DWORD one register; the other pairing is a refused load form.
+    for form in ("flat_load_dwordx2 v12, v[20:21]", "flat_load_dword v[12:13], v[20:21]",
+                 "global_load_dword v[12:13], v[20:21], off", "flat_load_dwordx2 v[12:13], v[20:21] offset:2048", "flat_load_dwordx2 v[12:13], v[20:21] offset:-8",
+                 "flat_load_dwordx2 v[12:13], v[20:21], off", "global_load_dwordx2 v[12:13], v[20:21]",
+                 "global_load_dwordx2 v[12:13], v[20:21], off offset:2048",
+                 "global_load_dwordx2 v[12:13], v[20:21], off offset:-2049"):
+        expect_value_error(translate_title, replaced(form), "load form")
+    must_reject(translate_title, replaced("flat_load_dwordx2 v[12:14], v[20:21]"))
+    must_reject(translate_title, replaced("flat_load_dwordx2 v[12:13], v[20:22]"))
+    must_reject(translate_title, replaced("flat_load_dwordx2 v[12:13], v[24:25]"))  # address never written
+    expect_value_error(translate_title, replaced("flat_load_dwordx2 v[255:256], v[20:21]"), "Invalid title memory load")
+    wqm = program.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate_title, program[:wqm] + [flat] + program[wqm:], "Invalid title memory load")
+    # Both destination words are ready only after vmcnt covers the load, and either one blocks a second load.
+    wait = program.index("s_waitcnt vmcnt(0) lgkmcnt(0)")
+    for replacement in ([], ["s_waitcnt lgkmcnt(0)"], ["s_waitcnt vmcnt(1)"]):
+        must_reject(translate_title, program[:wait] + replacement + program[wait + 1:])
+    for use in ("v16, v13, v13", "v16, v12, v12"):
+        expect_value_error(translate_title, program[:wait] + [f"v_add_f32_e32 {use}"] + program[wait:],
+                           "Sample used before vmcnt wait")
+    for overlap in ("v[13:14]", "v[11:12]"):
+        expect_value_error(translate_title, program[:wait] + [f"flat_load_dwordx2 {overlap}, v[20:21]"] + program[wait:],
+                           "Invalid title memory load")
+    loaded = program[:wait + 1] + ["flat_load_dwordx2 v[16:17], v[12:13]", "s_waitcnt vmcnt(0)"] + program[wait + 1:]
+    assert translate_title(loaded).count("title_load_dwordx2(uint2(") == 3
+    # A DWORD load in flight in the low register of the pair blocks the QWORD load, with no wait between them.
+    start = program.index(flat)
+    expect_value_error(translate_title, program[:start] + ["flat_load_dword v12, v[20:21]"] + program[start:],
+                       "Invalid title memory load")
+    # The last VGPR pair is a valid destination in both segments.
+    for edge in ("flat_load_dwordx2 v[254:255], v[20:21]", "global_load_dwordx2 v[254:255], v[22:23], off"):
+        edge_program = program[:wait + 1] + [edge, "s_waitcnt vmcnt(0)"] + program[wait + 1:]
+        assert translate_title(edge_program).count("title_load_dwordx2(uint2(") == 3
+    # A QWORD load counts as one load in vmcnt: after vmcnt(1) the older DWORD is ready and the QWORD is not.
+    partial = program[:start] + ["flat_load_dword v10, v[20:21]", flat, "s_waitcnt vmcnt(1)"]
+    tail = program[start + 1:]
+    assert translate_title(partial + ["v_add_f32_e32 v16, v10, v10"] + tail).count("title_load_dword(uint2(") == 1
+    for early in ("v16, v12, v12", "v16, v13, v13"):
+        expect_value_error(translate_title, partial + [f"v_add_f32_e32 {early}"] + tail,
+                           "Sample used before vmcnt wait")
+
+
 def check_title_load_controls():
+    check_title_load_x2_controls()
     title_controls()
     program = title_program()
     source = translate_title(program)
@@ -20519,12 +20979,12 @@ def check_title_load_controls():
 
     # Neighbours that stay unsupported: other widths, sub-DWORD and D16 loads, stores, atomics, scratch, the
     # global saddr and LDS forms, cache-policy bits, and offsets outside each segment's assembler range.
-    for neighbour in ("flat_load_dwordx2 v[12:13], v[20:21]", "flat_load_dwordx3 v[12:14], v[20:21]",
+    for neighbour in ("flat_load_dwordx3 v[12:14], v[20:21]",
                       "flat_load_dwordx4 v[12:15], v[20:21]", "flat_load_ubyte v12, v[20:21]",
                       "flat_load_sbyte v12, v[20:21]", "flat_load_ushort v12, v[20:21]",
                       "flat_load_sshort v12, v[20:21]", "flat_load_short_d16 v12, v[20:21]",
                       "flat_load_short_d16_hi v12, v[20:21]", "flat_store_dword v[20:21], v12",
-                      "flat_atomic_add v12, v[20:21], v13 glc", "global_load_dwordx2 v[12:13], v[20:21], off",
+                      "flat_atomic_add v12, v[20:21], v13 glc", "global_load_dwordx3 v[12:14], v[20:21], off",
                       "global_load_ubyte v12, v[20:21], off", "global_store_dword v[20:21], v12, off",
                       "global_load_dword v12, v20, s[44:45]", "global_load_dword v12, v20, s[44:45] offset:-8",
                       "global_load_dword v[20:21], off lds", "scratch_load_dword v12, v20, off",
@@ -20576,6 +21036,22 @@ def check_title_load_draws(directory, compiler, renderer, backend):
     for mutation, (index, _) in TITLE_MUTATIONS.items():
         a, b = TITLE_CASES[index]
         cases += [(case(mutation, a, b, title_words(a, b, mutation)), "mismatch"), cases[index]]
+    run_pixel_batch(renderer, backend, shader, cases)
+    # The QWORD loads: the same ranges and buffers, a second shader and one batch of 15 draws.
+    source = directory / "title_loads_x2.hlsl"
+    shader = directory / "title_loads_x2.cso"
+    source.write_text(translate_title(uncompressed_export(TITLE_X2_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    def case_x2(name, addresses, words):
+        a, b = title_x2_constants(addresses)
+        return case(f"x2_{name}", a, b, words)
+
+    title_x2_controls()
+    cases = [(case_x2(n, addresses, title_x2_words(addresses)), "pass") for n, addresses in enumerate(TITLE_X2_CASES)]
+    for mutation, (index, _) in TITLE_X2_MUTATIONS.items():
+        addresses = TITLE_X2_CASES[index]
+        cases += [(case_x2(mutation, addresses, title_x2_words(addresses, mutation)), "mismatch"), cases[index]]
     run_pixel_batch(renderer, backend, shader, cases)
     return 0
 
@@ -24854,6 +25330,7 @@ FLAT_SCRATCH_WORDS = (
     (0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10),
     (0xdeadbeef, 0xcafebabe, 0xfeedface, 0xbaadf00d),
     (0x00000000, 0x11111111, 0x22222222, 0x33333333),
+    (0x7f800001, 0xff812345, 0x7fcabcde, 0xffe76543),
 )
 
 
@@ -24970,9 +25447,7 @@ def check_flat_scratch_draws(directory, compiler, renderer, backend):
             struct.pack_into("<4I", constants, 12, *words)
             case_path = directory / f"scratch-{group}-{idx}.case"
             expected_words = words if group == 0 else (words[0], words[1], words[1], words[3])
-            expected = tuple(as_float(w) for w in expected_words)
-            write_case(case_path, bytes(constants), expected, integer_rt=True)
-            cases.append(case_path)
+            cases.append(write_uint_case(case_path, constants, expected_words))
         return cases
 
     cases = [make_cases(0), make_cases(1)]
@@ -25347,7 +25822,7 @@ def main():
         directory = Path(tmp)
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
-                    "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
+                    "draw-sdwa-integer", "draw-sdwa-int-compare", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
                     "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-cvt-int-f64", "draw-cvt-f32-f64", "draw-pack-int16", "draw-pack-b32",
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
@@ -25377,6 +25852,7 @@ def main():
                         "draw-cvt-int-f64": check_cvt_int_f64_draws,
                         "draw-cvt-f32-f64": check_cvt_f32_f64_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
+                        "draw-sdwa-int-compare": check_sdwa_int_compare_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,
                         "draw-align": check_align_draws,

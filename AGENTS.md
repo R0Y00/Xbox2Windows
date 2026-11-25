@@ -176,9 +176,11 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_watch_check.py
 ./out/pe-env/bin/python -B tests/startup_translator_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
+./out/pe-env/bin/python -B tests/startup_archive_requests_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_refusals_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_request_offline_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_waitcnt_depctr_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
@@ -191,6 +193,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_get_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_ci_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_saveexec_same_reg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compare_dst_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
@@ -226,12 +229,14 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sgpr_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cmp16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_signext_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_brev_fold_check.py
 ./out/pe-env/bin/python -B tests/run_checks_parallel_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_handler_arity_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_arity_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support
