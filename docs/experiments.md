@@ -3453,6 +3453,9 @@ register defined in one arm only, and scalar ALU on the joined registers.
 `tests/mesh_join_descriptor_check.py` checks the lowering and these refusals
 in pure Python and, with `<dxc> <renderer> <adapter>`, draws both arms and the
 null arm on D3D12 against the mesh export trace and a pixel reference.
+Reversing the two descriptor arms and changing `s_cbranch_scc0` to
+`s_cbranch_scc1` preserves the image. One input selects vertex depth 1.625
+and clips the entire triangle; the other table would give a visible depth of 0.5.
 The Linux run covers only the Python part; the D3D12 draw runs on Windows.
 
 ```sh

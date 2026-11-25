@@ -304,7 +304,7 @@ class Wave:
             )
         return [f"({cond.expr} ? {t} : {f})" for t, f in zip(*arms)]
 
-    def join_arms(self, decoded, expressions, jumps, pc, offset, target_offset, cond):
+    def join_arms(self, decoded, expressions, jumps, pc, target_offset, cond, *, branch_on_true):
         """Run both arms of a uniform branch on a constant predicate and merge them.
 
         Only scalar ALU and loads may appear inside an arm; the arms write no
@@ -335,6 +335,9 @@ class Wave:
             if (self.exec, self.vcc, self.m0) != before:
                 raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
             outcomes.append((self.s, self.pending, self.pending_v))
+        # Outcomes are in fall-through, taken order. Select needs true, false.
+        if branch_on_true:
+            outcomes.reverse()
         (true_s, true_p, true_v), (false_s, false_p, false_v) = outcomes
         self.pending_v = true_v | false_v
         if true_s.keys() != false_s.keys():
@@ -758,10 +761,10 @@ class Wave:
                     self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
-            elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
+            elif op in ("s_cbranch_scc0", "s_cbranch_scc1") and isinstance(self.scc, Dyn):
                 pc = self.join_arms(
-                    decoded, expressions, jumps, pc, offset,
-                    branch_target(offset, tail), self.scc,
+                    decoded, expressions, jumps, pc, branch_target(offset, tail),
+                    self.scc, branch_on_true=op == "s_cbranch_scc1",
                 )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
