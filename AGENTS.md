@@ -140,6 +140,8 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/xgameruntime_table_check.py
 ./out/pe-env/bin/python -B tests/docs_links_check.py
 ./out/pe-env/bin/python -B tests/bidi_controls_check.py
+# With no arguments, this tests result classification without Vulkan or DXC.
+./out/pe-env/bin/python -B tests/pixel_denorm_vulkan_check.py
 ./out/pe-env/bin/python -B tests/gpu_report_format_check.py
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
 ./out/pe-env/bin/python -B tests/rectlist_topology_check.py
