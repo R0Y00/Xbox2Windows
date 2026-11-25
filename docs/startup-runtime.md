@@ -2101,6 +2101,12 @@ memory-type and state rules are unchanged. The five-second `x2w-d3d12 views note
   that call count is its sole failure. Neither is `WILL_FAIL`, so a crash cannot pass them. A
   refused allocation or mapping is a capability skip (77) in the controls.
 
+## Command-list upload allocation (slot 148)
+
+In render mode, slot 148 takes a byte count and a power-of-two alignment and returns CPU-writable D3D12 upload memory for the current recording. An invalid request or a closed list returns null. Compute and graphics root SRV slots 43 and 44 translate an aligned address within the current recording into its desktop GPU address. The desktop command allocator retains the pages until every recorded reference and tracked queue submission has retired and the allocator can be reset. A failed submission-fence signal prevents reuse.
+
+The fixture export `x2w_d3d12_upload_gpu_address(list, cpu, bytes)` reports the GPU address only for a nonempty range contained in one allocation of the open recording. The independent client and its four WARP and hardware configurations are described in [#2210](https://github.com/R0Y00/Xbox2Windows/pull/2210).
+
 ## Textures published by address (device slot 70)
 
 Device slot 70 gets a resource description, a view and the address of the texels. When a live
