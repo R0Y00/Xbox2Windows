@@ -189,6 +189,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_get_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_saveexec_same_reg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compare_dst_check.py

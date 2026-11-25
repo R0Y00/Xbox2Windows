@@ -9106,6 +9106,10 @@ stage. The check compiles and rejects shifted, dynamic, wider and wrong-space
 loads and a pixel-stage buffer read. Run it with
 `ctest --preset release --no-tests=error -R '^startup_mesh86_srv_proof$' -V`.
 
+Run `python -B tests/startup_mesh86_srv_proof_check.py` to check the load count
+without DXC. The synthetic DXIL dump passes with one DWORD load and is
+rejected when a second identical load uses the same SRV handle.
+
 On the Release worktree at `76aeef7f` plus these changes, the combined lease,
 SRV proof, export and mapped-page selection passed eight tests. The two mesh
 cases returned 77 on the adapters listed above. `dumpbin /exports` showed
@@ -13622,6 +13626,15 @@ allows the read, including at a branch target. The compute controls exercise con
 
 As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
 handling of out-of-range stores, are assumptions, not measurements.
+
+One descriptor modification is accepted for a raw buffer store: clearing the stride field of dword 1. That is
+`s_and_b32` of dword 1 with `0xc000ffff`, which keeps the base address bits 15:0 and bits 31:30. The result is
+the raw descriptor such a store already assumes. Any other mask, any other dword, a repeated modification, and
+the same clear on an image store stay refused. Loads through the descriptor still treat it as modified.
+
+Case I is case A with the clear before its store. The runner binds a root UAV and reads no descriptor, so the
+GPU run checks the translation, not the stride; the negative controls are the pure-Python refusals.
+
 The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
 
 `startup_gfx2hlsl_compute_check.py` translates three source-built programs:

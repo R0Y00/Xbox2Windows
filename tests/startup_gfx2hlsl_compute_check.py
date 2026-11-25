@@ -261,11 +261,22 @@ SPLICE = {
     'buffer_store_dword v5, v4, s[16:19], 0 offen': '001070e004050480',
     'buffer_store_dword v5, v4, s[16:19], 0 offen offset:6': '061070e004050480',
     'buffer_store_dword v5, v4, s[16:19], 0 offen offset:4092': 'fc1f70e004050480',
+    's_and_b32 s17, s17, 0xc000ffff': '11ff1187ffff00c0',
+    's_and_b32 s17, s17, 0xc000fff0': '11ff1187f0ff00c0',
+    's_and_b32 s18, s18, 0xc000ffff': '12ff1287ffff00c0',
+    's_and_b32 s17, 0xc000ffff, s17': 'ff111187ffff00c0',
+    's_and_b32 s21, s21, 0xc000ffff': '15ff1587ffff00c0',
 }
 
 
 def splice(*lines, at=STORE_A):
     return WORDS_A[:at] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[at:]
+
+
+# Case I is case A with the store descriptor's stride field cleared before the store (expected words as case A).
+STRIDE_CLEAR = 's_and_b32 s17, s17, 0xc000ffff'
+CASES['I'] = (SOURCE_A.replace('buffer_store_dword', STRIDE_CLEAR + '\nbuffer_store_dword'), splice(STRIDE_CLEAR),
+              *CASES['A'][2:])
 
 
 def root_blob(constants=2):
@@ -284,6 +295,8 @@ def input_word(i):
 
 
 def expected(name):
+    if name == 'I':
+        return expected('A')
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
     if name == 'E':
@@ -476,6 +489,24 @@ def check_controls():
     for lines in (['s_mov_b32 s18, 0'], ['s_or_b32 s17, s17, 0x40000'], ['s_and_b32 s18, s18, 0xffff'],
                   ['buffer_store_dword v5, v4, s[16:19], 0 offen', 's_mov_b32 s18, 4']):
         refused('modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
+    # Clearing the stride field of dword 1 (s_and with 0xc000ffff, either operand order) gives the raw descriptor a
+    # byte-address store assumes: accepted, and case I runs it on the GPU. Any other mask, another dword, or the same
+    # mask on an image store stays refused.
+    for line in ('s_and_b32 s17, s17, 0xc000ffff', 's_and_b32 s17, 0xc000ffff, s17'):
+        cleared = translate('A', code=splice(line)).hlsl_cs()
+        assert '    u0.Store(a, v5);' in cleared.splitlines(), cleared
+    for line in ('s_and_b32 s17, s17, 0xc000fff0', 's_and_b32 s18, s18, 0xc000ffff'):
+        refused('buffer store through a modified descriptor', lambda line=line: translate('A', code=splice(line)).hlsl_cs())
+    # The clear changes SCC (descriptor data in a scalar ALU op), so a read before a fresh compare is refused by the
+    # stale-SCC rule; with a compare in between the read is emitted. A repeated modification stays refused.
+    clear = 's_and_b32 s17, s17, 0xc000ffff'
+    for reader in ('s_cselect_b32 s20, 1, 0', 's_cbranch_scc1 1'):
+        refused('scc from descriptor data', lambda reader=reader: translate(
+            'A', code=splice(clear, reader, 'v_mov_b32 v5, s20')).hlsl_cs())
+    assert 's20 = scc ?' in translate('A', code=splice(clear, 's_cmp_lt_u32 s7, 4', 's_cselect_b32 s20, 1, 0',
+                                                       'v_mov_b32 v5, s20')).hlsl_cs()
+    for lines in ((clear, clear), (clear, 's_or_b32 s17, s17, 0x40000'), ('s_or_b32 s17, s17, 0x40000', clear)):
+        refused('buffer store through a modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
     # The modification is recorded for the descriptor the word belongs to (byte 16 of the x8 load), not for the
     # load's first descriptor: loads through the read descriptor at byte 0 are unaffected.
     refusals = []
