@@ -1441,6 +1441,31 @@ class Stage:
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
 
+    def op_v_cvt_pk_u8_f32(self, ops, mods):
+        # VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides:
+        #   D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])
+        # The guides leave flt32_to_uint8 undefined (rounding, bounds, NaN and negative results are not
+        # stated), so S0 must be +0.0 or an integer in [1, 255], where every reading gives the same byte.
+        # A constant S0 outside that set is refused; a register is not known statically, so the program
+        # must keep it inside the set. The clamp only keeps the HLSL conversion defined.
+        if mods:
+            raise Unsupported('v_cvt_pk_u8_f32 with modifiers')
+        if len(ops) != 4:
+            raise Unsupported('v_cvt_pk_u8_f32 with %d operands, expected 4' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            raise Unsupported('v_cvt_pk_u8_f32 destination %s' % ops[0])
+        if not reg_range(ops[1]):
+            src = self.u(ops[1])
+            bits = int(src[:-1], 16)
+            value = struct.unpack('<f', struct.pack('<I', bits))[0]
+            if bits != 0 and not (value.is_integer() and 1 <= value <= 255):
+                raise Unsupported('v_cvt_pk_u8_f32 with constant source %s outside +0.0 and 1..255' % ops[1])
+        value, select, rest = self.u(ops[1]), self.u(ops[2]), self.u(ops[3])
+        shift = '((%s & 3u) << 3u)' % select
+        self.set_v(dst[1], '((%s & ~(0xffu << %s)) | ((uint(clamp(F(%s), 0.0, 255.0)) & 0xffu) << %s))'
+                   % (rest, shift, value, shift))
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         if (mods or not self.tracks_uniformity() or getattr(self, 'has_branches', True) or
