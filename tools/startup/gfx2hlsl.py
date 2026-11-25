@@ -1485,29 +1485,6 @@ class Stage:
             out.append(self.u(t))
         return out
 
-    def scalar_lshl_add(self, base, shift, ops, mods):
-        """D = (S0 << shift) + S1 on 32 bits; SCC is the carry out of the 64-bit sum."""
-        if mods or len(ops) != 3:
-            raise Unsupported('%s with %d operands' % (base, len(ops)))
-        dest = self.scalar_word_dest(base, ops[0])
-        a, b = self.scalar_word_sources(base, ops[1:])
-        total = '((%s << %d) + %s)' % (a, shift, b)
-        # SCC first: the destination may be one of the sources. Bits shifted out of S0, or a wrapped add, carry.
-        self.emit('scc = ((%s >> %d) != 0u) || (%s < %s);' % (a, 32 - shift, total, b))
-        if dest == 'm0':
-            self.sym.pop('m0', None)
-            self.emit('m0 = %s;' % total)
-        else:
-            self.masks.discard(dest)
-            self.set_s(dest, total)
-        return None
-
-    def op_s_lshl2_add_u32(self, ops, mods):
-        return self.scalar_lshl_add('s_lshl2_add_u32', 2, ops, mods)
-
-    def op_s_lshl3_add_u32(self, ops, mods):
-        return self.scalar_lshl_add('s_lshl3_add_u32', 3, ops, mods)
-
     def op_s_bitset0_b32(self, ops, mods):
         """D[S0[4:0]] = 0: the destination is read and written; SCC is unchanged."""
         if mods or len(ops) != 2:

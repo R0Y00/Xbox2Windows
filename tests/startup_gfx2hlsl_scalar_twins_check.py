@@ -1,10 +1,9 @@
-"""Scalar s_lshl2_add_u32, s_lshl3_add_u32, s_bitset0_b32 and s_ff0_i32_b32 in tools/startup/gfx2hlsl.py (#1723).
+"""Scalar s_bitset0_b32 and s_ff0_i32_b32 in tools/startup/gfx2hlsl.py (#1723).
 
 Each instruction word is built from the RDNA 2 SOP1/SOP2 layouts that tools/disasm_rdna2.py reads, decoded,
 translated, and the emitted lines are run in order on the CPU by the evaluator of
 startup_gfx2hlsl_bit_alu_check.py over edge values. The references use plain integer arithmetic from the ISA text:
 
-  s_lshl{n}_add_u32  D = ((S0 << n) + S1) mod 2^32, SCC = the 64-bit sum reaches 2^32
   s_bitset0_b32      D = D with bit S0[4:0] cleared, SCC unchanged
   s_ff0_i32_b32      D = index of the lowest zero bit of S0, -1 when none, SCC unchanged
 
@@ -67,22 +66,6 @@ def refused(word, text):
     raise AssertionError('expected a refusal containing %r' % text)
 
 
-def lshl_add_ref(n, a, b):
-    total = (a << n) + b
-    return total & MASK, int(total >= 1 << 32)
-
-
-def check_lshl_add(name, n):
-    # s2 = S0, s3 = S1, destination s4; then the destination aliasing S1 (s3) and S0 (s2).
-    for dst in (4, 3, 2):
-        lines = translate(sop2(name, dst, 2, 3))
-        for a in VALUES:
-            for b in VALUES:
-                env = run(lines, {'s2': a, 's3': b})
-                want, carry = lshl_add_ref(n, a, b)
-                assert (env['s%d' % dst], env['scc']) == (want, carry), (name, dst, hex(a), hex(b), lines)
-
-
 def check_bitset0():
     for dst in (4, 6):
         lines = translate(sop1('s_bitset0_b32', dst, 2))
@@ -103,19 +86,12 @@ def check_ff0():
 
 
 def check_m0_and_refusals():
-    lines = translate(sop2('s_lshl2_add_u32', M0, 2, 3))
-    assert any(l.startswith('m0 = ') for l in lines) and any(l.startswith('scc = ') for l in lines), lines
     lines = translate(sop1('s_bitset0_b32', M0, 2))
     assert any(l.startswith('m0 = ') for l in lines) and not any(l.startswith('scc') for l in lines), lines
-    refused(sop2('s_lshl3_add_u32', 4, 106, 3), 'lane mask')   # vcc_lo
-    refused(sop2('s_lshl3_add_u32', 106, 2, 3), 'destination')
-    refused(sop2('s_lshl2_add_u32', 4, 16, 3), 'descriptor data')  # s16 holds a descriptor word
     refused(sop1('s_bitset0_b32', 4, 126), 'lane mask')   # exec_lo
 
 
 def main():
-    check_lshl_add('s_lshl2_add_u32', 2)
-    check_lshl_add('s_lshl3_add_u32', 3)
     check_bitset0()
     check_ff0()
     check_m0_and_refusals()
