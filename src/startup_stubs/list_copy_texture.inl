@@ -61,6 +61,16 @@ void copy_texture_block(ID3D12Resource* texture, x2w_list_copy_texture::Side& si
     side.bytes_per_block = static_cast<std::uint32_t>(row_bytes / blocks);
 }
 
+// Upload buffers stay in GENERIC_READ and readback buffers in COPY_DEST: the desktop refuses a barrier on either.
+bool fixed_heap_state(ID3D12Resource* resource, D3D12_HEAP_TYPE& type)
+{
+    D3D12_HEAP_PROPERTIES props{};
+    D3D12_HEAP_FLAGS flags{};
+    if (FAILED(resource->GetHeapProperties(&props, &flags))) return false;
+    type = props.Type;
+    return type == D3D12_HEAP_TYPE_UPLOAD || type == D3D12_HEAP_TYPE_READBACK;
+}
+
 }  // namespace
 
 // List slot 16 (unshifted, like slots 12 to 25), CopyTextureRegion(dst, x, y, z, src, box).
@@ -92,8 +102,26 @@ void __stdcall list_copy_texture(Wrapper* self, const D3D12_TEXTURE_COPY_LOCATIO
     if (box && x2w_local::readable(box, sizeof(*box))) copy_box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
     const auto verdict = x2w_list_copy_texture::check(side_dst, x, y, z, side_src, box ? &copy_box : nullptr);
     if (verdict != x2w_list_copy_texture::Verdict::ok) return refuse(x2w_list_copy_texture::name(verdict));
-    require_state(self, real_src, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    require_state(self, real_dst, D3D12_RESOURCE_STATE_COPY_DEST);
+    // One resource tracks one state, so two subresources of it cannot be COPY_SOURCE and COPY_DEST at once.
+    if (real_src == real_dst) return refuse("same_resource");
+    D3D12_HEAP_TYPE heap = D3D12_HEAP_TYPE_DEFAULT;
+    const bool src_fixed = fixed_heap_state(real_src, heap);
+    if (src_fixed && heap == D3D12_HEAP_TYPE_READBACK) return refuse("bad_heap");
+    const bool dst_fixed = fixed_heap_state(real_dst, heap);
+    if (dst_fixed && heap == D3D12_HEAP_TYPE_UPLOAD) return refuse("bad_heap");
+    Wrapper* const src_wrapper = as_wrapper(src->pResource);
+    Wrapper* const dst_wrapper = as_wrapper(dst->pResource);
+    // A copied (non-aliased) buffer has no refresh path here, so its desktop bytes may be stale.
+    if (side_src.kind == x2w_list_copy_texture::Kind::placed_footprint) {
+        const auto* info = resource_info(src_wrapper);
+        if (info && info->placement == Placement::copied_buffer) return refuse("stale_source");
+    }
+    // Bring a texture's desktop copy up to date with its guest backing before the copy reads or partly overwrites it,
+    // and record that upload so a later sample does not replace the copied texels.
+    if (side_src.kind == x2w_list_copy_texture::Kind::subresource) upload_texture(self, src_wrapper, real_src);
+    if (side_dst.kind == x2w_list_copy_texture::Kind::subresource) upload_texture(self, dst_wrapper, real_dst);
+    if (!src_fixed) require_state(self, real_src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (!dst_fixed) require_state(self, real_dst, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION to = *dst, from = *src;
     to.pResource = real_dst;
     from.pResource = real_src;

@@ -55,6 +55,16 @@ int main(int argc, char** argv)
     expect(check(texture(64, 64, 4), 6, 0, 0, texture(64, 64, 4), nullptr), Verdict::bad_alignment, "block alignment");
     expect(check(footprint(64, 64, 0, 256, 8, 256 * 16, 4), 0, 0, 0, texture(64, 64, 4), nullptr), Verdict::ok, "bc footprint");
 
+    // The destination origin counts: a 1x1 RGBA8 copy at Y=63 of a 64x64, 256-pitch footprint ends at byte 16132.
+    expect(check(footprint(64, 64, 0, 256, 4, 256), 0, 63, 0, texture(1, 1), nullptr), Verdict::footprint_overflow, "dest origin counts");
+    expect(check(footprint(64, 64, 0, 256, 4, 16132), 0, 63, 0, texture(1, 1), nullptr), Verdict::ok, "dest origin fits");
+    // The source box origin counts too.
+    expect(check(texture(1, 1), 0, 0, 0, footprint(64, 64, 0, 256, 4, 256), &(const Box&)Box{0, 63, 0, 1, 64, 1}), Verdict::footprint_overflow, "box origin counts");
+    // 3D: a slice is as tall as the footprint (64 rows), not as the copy (1 row).
+    Side volume = footprint(64, 64, 0, 256, 4, 256 * 64);
+    volume.depth = 4;
+    expect(check(volume, 0, 0, 1, texture(1, 1), nullptr), Verdict::footprint_overflow, "slice stride from footprint height");
+
     Side ms = texture(64, 64);
     ms.multisampled = true;
     expect(check(texture(64, 64), 0, 0, 0, ms, nullptr), Verdict::sample_mismatch, "multisampled source");

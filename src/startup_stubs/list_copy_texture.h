@@ -59,15 +59,20 @@ inline const char* name(Verdict v) noexcept
     return "unknown";
 }
 
-// Bytes a footprint of the given size reaches, from its offset (the last row is not padded).
-inline bool footprint_end(const Side& s, std::uint32_t w, std::uint32_t h, std::uint32_t d, std::uint64_t& end) noexcept
+// Bytes a footprint reaches for a w x h x d copy that starts at texel (ox, oy, oz) inside it, from its offset
+// (the last row is not padded; slices are as tall as the footprint, not the copy).
+inline bool footprint_end(const Side& s, std::uint32_t w, std::uint32_t h, std::uint32_t d, std::uint32_t ox, std::uint32_t oy,
+                          std::uint32_t oz, std::uint64_t& end) noexcept
 {
     if (!w || !h || !d) { end = s.offset; return true; }
     const std::uint64_t row = std::uint64_t{(w + s.block_w - 1) / s.block_w} * s.bytes_per_block;
     const std::uint64_t rows = (h + s.block_h - 1) / s.block_h;
-    if (row > s.row_pitch) return false;
-    const std::uint64_t slice = std::uint64_t{s.row_pitch} * (rows - 1) + row;
-    const std::uint64_t total = std::uint64_t{s.row_pitch} * rows * (d - 1) + slice;
+    const std::uint64_t start_x = std::uint64_t{ox / s.block_w} * s.bytes_per_block;
+    const std::uint64_t start_row = oy / s.block_h;
+    const std::uint64_t slice_rows = (std::uint64_t{s.height} + s.block_h - 1) / s.block_h;
+    if (start_x + row > s.row_pitch) return false;
+    const std::uint64_t slice = std::uint64_t{s.row_pitch} * (start_row + rows - 1) + start_x + row;
+    const std::uint64_t total = std::uint64_t{s.row_pitch} * slice_rows * (std::uint64_t{oz} + d - 1) + slice;
     end = s.offset + total;
     return end >= s.offset;
 }
@@ -91,7 +96,9 @@ inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uin
         if (!s->row_pitch || s->row_pitch % 256) return Verdict::bad_pitch;
         if (s->offset % 512) return Verdict::bad_offset;
         std::uint64_t end = 0;
-        if (!footprint_end(*s, w, h, d, end)) return Verdict::bad_pitch;
+        const bool is_dst = s == &dst;
+        if (!footprint_end(*s, w, h, d, is_dst ? x : use.left, is_dst ? y : use.top, is_dst ? z : use.front, end))
+            return Verdict::bad_pitch;
         if (end > s->resource_bytes) return Verdict::footprint_overflow;
     }
     return Verdict::ok;
