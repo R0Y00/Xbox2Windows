@@ -66,10 +66,11 @@ UINT texture_words_per_texel(DXGI_FORMAT format)
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
 
-// source replaces the generated t0 words when a store case supplies its own, and initial
-// replaces the sentinel words that seed the output buffer.
+// source replaces the generated t0 words when a store case supplies its own, initial replaces the
+// sentinel words that seed the output buffer, and root_constants replaces the b0 CBV constants.
 static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>* source = nullptr,
-                        const std::array<UINT, capacity>* initial = nullptr)
+                        const std::array<UINT, capacity>* initial = nullptr,
+                        const std::array<UINT, constants.size()>* root_constants = nullptr)
 {
     void* mapped = nullptr;
     const D3D12_RANGE no_reads{};
@@ -81,7 +82,8 @@ static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>
     }
     auto* cb = static_cast<unsigned char*>(mapped) + constants_offset;
     std::memset(cb, 0, 4 * alignment);
-    std::memcpy(cb, constants.data(), sizeof(constants));
+    const auto& cb0 = root_constants ? *root_constants : constants;
+    std::memcpy(cb, cb0.data(), sizeof(cb0));
     for (UINT i = 1; i < 4; ++i) std::memcpy(cb + i * alignment, &constants[12 + i], sizeof(UINT));
     upload->Unmap(0, nullptr);
 }
@@ -148,8 +150,11 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
 static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                          ID3D12Resource* input, ID3D12Resource* output,
                                          ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1, UINT output_mip = 0,
-                                         UINT input_register = srvs - 1, UINT texture_first_mip = 0)
+                                         UINT input_register = srvs - 1, UINT texture_first_mip = 0,
+                                         UINT output_words = capacity)
 {
+    if (output_words == 0 || output_words > capacity)
+        throw std::runtime_error("Invalid compute UAV word count");
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     desc.NumDescriptors = uavs + srvs;
     desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -161,7 +166,7 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R32_TYPELESS;
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    uav.Buffer.NumElements = capacity;
+    uav.Buffer.NumElements = output_words;
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     if (output_register >= uavs) throw std::runtime_error("Invalid output register");
     const auto output_desc = output->GetDesc();
@@ -241,9 +246,11 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
                         const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
                         DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr,
-                        bool dpp_case = false, bool sized_views = false, UINT texture_first_mip = 0)
+                        bool dpp_case = false, bool sized_views = false, UINT texture_first_mip = 0,
+                        UINT uav_words = capacity)
 {
     if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
+    if (uav_words == 0 || uav_words > capacity) throw std::runtime_error("Invalid compute UAV word count");
     ComPtr<ID3D12RootSignature> signature;
     check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&signature)),
           "Create compute root signature");
@@ -258,7 +265,8 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     fill_upload(input.Get(), store && store->has_source ? &store->source : nullptr,
-                store && store->has_initial ? &store->initial : nullptr);
+                store && store->has_initial ? &store->initial : nullptr,
+                store ? &store->root_constants : nullptr);
     ComputeCommands commands(device, pipeline.Get());
     auto& list = commands.list;
     ComPtr<ID3D12Resource> texture_upload, texture;
@@ -273,7 +281,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         // signature's UAV range starts at u0, while the root-descriptor path keeps u12.
         auto* image = rendered_texture ? rendered_texture : texture.Get();
         // A sized-view case binds both raw buffers at u0 and t0, so GetDimensions reports the view's byte size.
-        heap = sized_views ? bind_tables(device, list.Get(), input.Get(), output.Get(), nullptr, 0, 0, 0)
+        heap = sized_views ? bind_tables(device, list.Get(), input.Get(), output.Get(), nullptr, 0, 0, 0, 0, uav_words)
                            : bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1,
                                          0, srvs - 1, texture_first_mip);
     } else {
@@ -341,8 +349,10 @@ void check_compute(ID3D12Device* device, bool tables)
 }
 
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference,
-                        bool dpp_case, bool sized_views)
+                        bool dpp_case, bool sized_views, UINT uav_words)
 {
+    if (sized_views && uav_words > capacity)
+        throw std::runtime_error("Invalid compute UAV word count");
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
     const auto size = file.tellg();
@@ -383,12 +393,16 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
                 store.has_source = true;
             }
         }
-        if (sized_views)
+        if (sized_views) {
+            const UINT effective_uav_words = uav_words ? uav_words : capacity;
+            if (effective_uav_words > capacity)
+                throw std::runtime_error("Invalid compute UAV word count");
             run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, nullptr,
-                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case, true);
-        else
+                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case, true, 0, effective_uav_words);
+        } else {
             run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
                         DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
+        }
     } else {
         run_compute(device, false, shader, shader, conversion_pair);
     }

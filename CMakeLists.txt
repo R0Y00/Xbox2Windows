@@ -1346,6 +1346,26 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
 endforeach()
 
+# X2W_D3D12_RETIRE_REASONS=1 names why released resources still hold their desktop object (needs RELEASE_RETIRED and
+# BUDGET). `off` (no RETIRE_REASONS) and `no-retire` (no RELEASE_RETIRED) are negative controls: the line must stay empty.
+add_executable(startup_resource_retire_reasons tests/startup_resource_retire_reasons.cpp)
+target_include_directories(startup_resource_retire_reasons PRIVATE src)
+target_compile_features(startup_resource_retire_reasons PRIVATE cxx_std_17)
+target_link_libraries(startup_resource_retire_reasons PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    set(reasons_base "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+    add_test(NAME startup_resource_retire_reasons_${backend} COMMAND startup_resource_retire_reasons ${backend})
+    set_tests_properties(startup_resource_retire_reasons_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${reasons_base};X2W_D3D12_RELEASE_RETIRED=1;X2W_D3D12_RETIRE_REASONS=1")
+    add_test(NAME startup_resource_retire_reasons_off_${backend} COMMAND startup_resource_retire_reasons ${backend} off)
+    set_tests_properties(startup_resource_retire_reasons_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${reasons_base};X2W_D3D12_RELEASE_RETIRED=1")
+    add_test(NAME startup_resource_retire_reasons_no_retire_${backend} COMMAND startup_resource_retire_reasons ${backend} no-retire)
+    set_tests_properties(startup_resource_retire_reasons_no_retire_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${reasons_base};X2W_D3D12_RETIRE_REASONS=1")
+endforeach()
+
+
 add_executable(startup_resource_retire_title tests/startup_resource_retire_title.cpp)
 target_include_directories(startup_resource_retire_title PRIVATE src)
 target_compile_features(startup_resource_retire_title PRIVATE cxx_std_17)
@@ -1360,6 +1380,28 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_resource_retire_title_off_${backend} COMMAND startup_resource_retire_title ${backend} off)
     set_tests_properties(startup_resource_retire_title_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_RESOURCE_INDEX_CHECK=1;X2W_D3D12_DEBUG=0")
+endforeach()
+
+# X2W_D3D12_RELEASE_RETIRED_VIEWS=1 frees a released class texture that only tracked slot-18 descriptor slots keep alive by
+# replacing those slots with null descriptors. `keep` is the negative control (views switch off, or retire switch off).
+add_executable(startup_resource_retire_views tests/startup_resource_retire_views.cpp)
+target_include_directories(startup_resource_retire_views PRIVATE src)
+target_compile_features(startup_resource_retire_views PRIVATE cxx_std_17)
+target_link_libraries(startup_resource_retire_views PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    foreach(debug IN ITEMS 0 1)
+        set(retire_views_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=${debug}")
+        add_test(NAME startup_resource_retire_views_${backend}_debug${debug} COMMAND startup_resource_retire_views ${backend})
+        set_tests_properties(startup_resource_retire_views_${backend}_debug${debug} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${retire_views_env};X2W_D3D12_RELEASE_RETIRED=1;X2W_D3D12_RELEASE_RETIRED_VIEWS=1")
+    endforeach()
+    set(retire_views_keep "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+    add_test(NAME startup_resource_retire_views_keep_${backend} COMMAND startup_resource_retire_views ${backend} keep)
+    set_tests_properties(startup_resource_retire_views_keep_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${retire_views_keep};X2W_D3D12_RELEASE_RETIRED=1")
+    add_test(NAME startup_resource_retire_views_noretire_${backend} COMMAND startup_resource_retire_views ${backend} keep)
+    set_tests_properties(startup_resource_retire_views_noretire_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${retire_views_keep};X2W_D3D12_RELEASE_RETIRED_VIEWS=1")
 endforeach()
 
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
@@ -1834,6 +1876,7 @@ endforeach()
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_store.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
+target_sources(offscreen_check PRIVATE tests/startup_entry_words.cpp)
 # The storage root handed to the executable ends in a separator and is never cut off
 # (src/startup_stubs/storage_root.h); the mutated run is the negative control.
 add_executable(startup_storage_root_check tests/startup_storage_root_check.cpp)
@@ -3210,6 +3253,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: signed and unsigned three-source integer min, max and median.
     add_test(NAME startup_gfx2hlsl_int_med3_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_int_med3_check.py")
+    # v_med3_f32 with a NaN source is the minimum of the three (ISA p. 343): the preamble's med3_32 tests the
+    # encoding, the integer medians are unchanged, and the old branchless helper must be rejected.
+    add_test(NAME startup_gfx2hlsl_f32_med3_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_med3_check.py")
+    # The same four words drawn on WARP and the card, the NaN among them from the entry constants; the
+    # branchless lowering must mismatch on that lane.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_f32_med3_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_med3_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_f32_med3_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     # Startup shader translator: s_cselect_b32 into the wave32 lane masks vcc_lo and exec_lo.
     add_test(NAME startup_gfx2hlsl_cselect_mask_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cselect_mask_check.py")
@@ -3400,6 +3455,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The pixel input mask scan finds where a pipeline stores the two masks, from shader register use (#1629).
     add_test(NAME startup_ps_input_scan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_ps_input_scan_check.py")
+    add_test(NAME startup_ps_input_scan_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_ps_input_scan_cli_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_packed_screen_position_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py" "${DXC_EXECUTABLE}"
@@ -3529,6 +3586,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         set_tests_properties(startup_gfx2hlsl_fma_mix_dispatch_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME startup_gfx2hlsl_neg_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_neg_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_neg_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_neg_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_neg_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl compute buffer_store_format_d16_x: multi-format, bounds/OOB, atomic CAS RMW and EXEC guard (Refs #2274).
+    add_test(NAME startup_compute_store_d16_x_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_compute_store_d16_x_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_store_d16_x_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_store_d16_x_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_store_d16_x_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS f32-drop-store f32-wrong-half f32-drop-oob unorm16-trunc p-drop-soffset p-drop-keep s-fold-soff-stride e-drop-exec b-short-binding b-tight-host-guard)
+            add_test(NAME startup_compute_store_d16_x_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_compute_store_d16_x_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_store_d16_x_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+    endforeach()
     # gfx2hlsl compute stage: entry registers, numthreads and the offen buffer store, dispatched on a plain device (#1412).
     add_test(NAME startup_gfx2hlsl_compute_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py")
@@ -3615,6 +3696,23 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_mul_mad_i24_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl dual-offset/stride-64 32-bit LDS ops and 32-bit LDS atomics (Refs #1541, #2274).
+    add_test(NAME startup_compute_lds_dual_atomics_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_dual_atomics_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_lds_dual_atomics_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_dual_atomics_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_lds_dual_atomics_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS d-wrong-st64-stride d-drop-oob-zero d-drop-align d-drop-exec d-alias-overwrite
+                a-swap-minmax a-drop-exec a-drop-wrxchg-rtn a-oob-nonzero r-drop-add-rtn)
+            add_test(NAME startup_compute_lds_dual_atomics_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_dual_atomics_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_lds_dual_atomics_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+    endforeach()
     # XG slots 2 and 8 for a texture given the 4 KiB allocation answer (src/startup_stubs/small_texture_4k.h):
     # the copy must stay in front of a guard page; the mutated run is not limited and must fail.
     add_test(NAME startup_small_texture_4k_xg COMMAND "${INTAKE_PYTHON}" -B
@@ -3681,6 +3779,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
+    find_program(STARTUP_POWERSHELL NAMES powershell pwsh REQUIRED)
+    add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")
+    set_tests_properties(startup_stage_package PROPERTIES TIMEOUT 120)
     add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
         "$<TARGET_FILE:startup_debug_calls>")
@@ -3948,6 +4050,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_offline_check.py")
     add_test(NAME compute_container_index COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute_container_index_check.py")
+    add_test(NAME compute_container_index_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute_container_index_cli_check.py")
     # Offline re-key of saved shader requests under the current cache revision (pure Python).
     add_test(NAME startup_shader_cache_rekey COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_rekey_check.py")
@@ -8655,6 +8759,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/mesh_scc_any_lane_check.py")
     add_test(NAME mesh_loop_census COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_loop_census_check.py")
+    add_test(NAME mesh_loop_census_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_loop_census_cli_check.py")
     add_test(NAME mesh_entry_exec_restore_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" exec-restore)
     add_test(NAME mesh_amplification_refusal COMMAND "${INTAKE_PYTHON}" -B
@@ -8746,6 +8852,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             add_test(NAME mesh_od_pipeline_check COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/mesh_od_pipeline_check.py")
             set_tests_properties(mesh_od_pipeline_check PROPERTIES TIMEOUT 30)
+            add_test(NAME mesh_od_pipeline_cli_check COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/mesh_od_pipeline_cli_check.py")
+            set_tests_properties(mesh_od_pipeline_cli_check PROPERTIES TIMEOUT 30)
         endif()
         add_test(NAME mesh_depth_pair_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_depth_pair_check.py" "${DXC_EXECUTABLE}"
@@ -8933,6 +9042,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mubuf_reduction_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mubuf_reduction_${adapter}.txt")
+        add_test(NAME compute_store_aot_gfx1013_buffer_atomics_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_buffer_atomics_check.py" --draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_gfx1013_buffer_atomics_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_gfx1013_buffer_atomics_${adapter}.txt")
         add_test(NAME compute_store_aot_alu_minmax3_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_alu_minmax3_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -9932,6 +10046,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/bink_descriptors_aot_check.py")
     add_test(NAME range_manifest_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/range_manifest_check.py")
+    add_test(NAME pe_resource_inventory_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/resource_inventory_cli_check.py")
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "
@@ -9989,3 +10105,57 @@ if(EXISTS "${INTAKE_PYTHON}")
             --host $<TARGET_FILE:rcas_coordinate_readback> --backend warp --case ${control})
     endforeach()
 endif()
+
+# Start the slowest tests first so the ctest worker pool has no long tail at the end.
+# COST only changes scheduling order under `ctest --parallel`; no test, argument or assertion changes.
+# Costs are measured seconds (approx.) from the Windows CI ctest log taken when this list was added
+# (2026-11-25, main at a6c8d80dc); re-measure when the order looks wrong. Keep the list in descending cost order:
+# the loop below stops the configure if it is not. Names absent in a configuration are skipped.
+set(X2W_SLOW_TEST_COSTS
+    startup_debug 56
+    compute_store_aot_heap_view_store_warp 51
+    compute_store_aot_descriptor_load_format_warp 51
+    cpu_aot_sse_fp_pd 44
+    cpu_aot_x87_fprem 41
+    compute_store_aot_heap_view_load_warp 37
+    startup_run_ps1 37
+    pixel_aot_warp 36
+    pixel_aot_bits_warp 36
+    startup_gamesave_read_publish_locked 33
+    pixel_aot_core_vector_warp 33
+    pixel_aot_three_way_warp 33
+    form_coverage 33
+    startup_vertex_fetch_formats_warp 32
+    pixel_aot_buffer_color_warp 31
+    sampled_coverage_warp 31
+    startup_storage_worker_start 30
+    cpu_aot_x87_scale 30
+    startup_mrt_fxc_warp 30
+    startup_heartbeat_commit 30
+    pixel_aot_predicate_rounding_warp 30
+    startup_mrt_dxc_warp 28
+    cpu_aot_xchg 27
+    depth_mask_unary_draw_warp 26
+    pixel_aot_comparisons_warp 26)
+list(LENGTH X2W_SLOW_TEST_COSTS X2W_SLOW_TEST_COSTS_LEN)
+math(EXPR X2W_SLOW_TEST_COSTS_LAST "${X2W_SLOW_TEST_COSTS_LEN} - 1")
+math(EXPR X2W_SLOW_TEST_COSTS_ODD "${X2W_SLOW_TEST_COSTS_LEN} % 2")
+if(X2W_SLOW_TEST_COSTS_ODD)
+    message(FATAL_ERROR "X2W_SLOW_TEST_COSTS must hold name/cost pairs")
+endif()
+set(X2W_SLOW_TEST_PREV_COST "")
+foreach(i RANGE 0 ${X2W_SLOW_TEST_COSTS_LAST} 2)
+    math(EXPR j "${i} + 1")
+    list(GET X2W_SLOW_TEST_COSTS ${i} slow_name)
+    list(GET X2W_SLOW_TEST_COSTS ${j} slow_cost)
+    if(NOT slow_cost MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "X2W_SLOW_TEST_COSTS: cost of ${slow_name} is not an integer: ${slow_cost}")
+    endif()
+    if(NOT X2W_SLOW_TEST_PREV_COST STREQUAL "" AND slow_cost GREATER X2W_SLOW_TEST_PREV_COST)
+        message(FATAL_ERROR "X2W_SLOW_TEST_COSTS must be in descending cost order: ${slow_name} (${slow_cost}) follows ${X2W_SLOW_TEST_PREV_COST}")
+    endif()
+    set(X2W_SLOW_TEST_PREV_COST ${slow_cost})
+    if(TEST ${slow_name})
+        set_tests_properties(${slow_name} PROPERTIES COST ${slow_cost})
+    endif()
+endforeach()

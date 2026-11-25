@@ -74,6 +74,10 @@ public:
         return refs;
     }
 
+    // Read-only identity for the opt-in retire diagnostics (X2W_D3D12_RETIRE_REASONS).
+    Category category() const { return category_; }
+    LONG64 bytes() const { return bytes_; }
+
     void begin_use()
     {
         AcquireSRWLockExclusive(&lock);
@@ -126,6 +130,16 @@ inline Ticket* attach(ID3D12Object* object, Category category, UINT64 bytes, UIN
     }
     InterlockedIncrement64(&unmeasured);
     return nullptr;
+}
+
+// The ticket stored on a live desktop object, with a reference the caller releases, or null.
+inline Ticket* ticket_of(ID3D12Object* object)
+{
+    constexpr GUID key{0x28213cf4, 0x25cf, 0x42be, {0x80, 0xf1, 0xc5, 0x9e, 0x97, 0xf7, 0x20, 0xd1}};
+    IUnknown* stored = nullptr;
+    UINT size = sizeof(stored);
+    if (FAILED(object->GetPrivateData(key, &size, &stored)) || !stored) return nullptr;
+    return static_cast<Ticket*>(stored);
 }
 
 inline Ticket* resource(ID3D12Device* device, ID3D12Resource* resource, Category category)

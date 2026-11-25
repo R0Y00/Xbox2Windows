@@ -320,7 +320,7 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
                 retire_release_view_ref(reinterpret_cast<const void*>(view_records()[prev - 1].resource));
         }
     } else if (slot == 18 && resource) {
-        retire_leave_class(reinterpret_cast<const void*>(resource));
+        retire_leave_class(reinterpret_cast<const void*>(resource), RetireLeft::view);
     }
     ReleaseSRWLockExclusive(&note_lock);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
@@ -367,7 +367,7 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
             const std::uint32_t src_id = from[i];
             if (src_id && src_id - 1 < view_records().size() &&
                 view_records()[src_id - 1].slot == 18 && view_materialized()[src_id - 1])
-                retire_leave_class(reinterpret_cast<const void*>(view_records()[src_id - 1].resource));
+                retire_leave_class(reinterpret_cast<const void*>(view_records()[src_id - 1].resource), RetireLeft::view_copy);
         }
     }
     ReleaseSRWLockExclusive(&note_lock);
