@@ -249,6 +249,9 @@ def main():
         return (f"[root {root:#x}]" if root else "") + text
 
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
+    # --trace-calls 1: also break on gaming-runtime and movie-player calls. Every hit stops the whole
+    # process, so these hooks are off by default; the movie-player report (bink_report) needs them.
+    trace_calls = trace and opts.get("--trace-calls") == "1"
     k32.GetModuleHandleW.restype = wt.HMODULE
     ntdll = k32.GetModuleHandleW("ntdll.dll")
     k32.GetProcAddress.restype = ctypes.c_void_p
@@ -535,7 +538,7 @@ def main():
             name = final_path(h_file) if h_file else "?"
             modules[base] = name
             log(f"{time.time() - start:7.3f} load {name} at {base:#x}")
-            if trace and name.lower() == "xgameruntime.dll":
+            if trace_calls and name.lower() == "xgameruntime.dll":
                 # Gaming runtime: log which API interfaces the title asks for and the result.
                 k32.LoadLibraryExW.restype = wt.HMODULE
                 local = k32.LoadLibraryExW(r"C:\Windows\System32\xgameruntime.dll", None, 1)
@@ -545,7 +548,7 @@ def main():
                         hooks[base + (address - local)] = (export, "runtime")
                         if loader_break_seen:
                             arm(base + (address - local))
-            if trace and name.lower() == "bink2scarlett.dll":
+            if trace_calls and name.lower() == "bink2scarlett.dll":
                 # Movie player: log opens/closes/frames and remember the registered frame buffers.
                 k32.LoadLibraryExW.restype = wt.HMODULE
                 local = k32.LoadLibraryExW(os.path.join(os.path.dirname(exe), name), None, 1)
@@ -612,6 +615,7 @@ def main():
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
                                                   main_base <= ex_addr < main_base + 0x10000000):
                 stop = (ex_code, ex_addr, tid, first, params)
+                log(f"debugger stop {ex_code:#010x} {'first' if first else 'second'}-chance")
                 break
             elif ex_code in (0x406D1388, 0x40010006):
                 status = DBG_CONTINUE
@@ -728,6 +732,7 @@ def main():
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))
+    print(f"  call tracing: {'on' if trace_calls else 'off'} (runtime and movie-player call hooks; --trace-calls 1)")
 
     def capture_window():
         """Saves what the title's window currently shows on screen (client area) as window.png."""

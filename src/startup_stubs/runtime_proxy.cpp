@@ -33,6 +33,8 @@ struct Proxy {
     void** vtable;
     void* real;
     int provider;
+    const GUID* local_iid = nullptr;
+    LONG rejected_iid = 0;
 };
 GUID provider_ids[max_providers];
 Proxy* proxies[max_providers];
@@ -54,12 +56,66 @@ constexpr u64 local_user_id = 0x0009000012345678ull;
 constexpr GUID store_provider_id{0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
 constexpr u64 store_context_handle = 0x58325753'00000001ull;  // not a pointer the runtime knows
 bool fake_user() noexcept { return x2w_local::env_on("X2W_FAKE_USER"); }
+// X2W_RUNTIME_LOCAL=1 (with X2W_RUNTIME_PROXY and X2W_FAKE_USER): when the system runtime cannot
+// initialise (no Gaming Services), report the initialisation as done and hand out local objects for
+// the providers the fake layer answers. Unanswered methods of those objects fail with E_NOTIMPL.
+bool runtime_local() noexcept { return x2w_local::env_on("X2W_RUNTIME_LOCAL"); }
+volatile LONG local_active;  // set once a real initialisation failed and was answered locally
+using InitApi = u64(__stdcall*)(u64, u64, u64, u64);
+InitApi real_init[3];
+constexpr const char* init_names[3] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2"};
 int user_provider = -1, save_provider = -1;
 // The user provider also hands out a second interface (iid cef4fac0...) whose slot 3 is
 // GetGamertag(handle, component, size, buffer, &used). It is proxied as an entry of its own (shown as
 // provider cef4fac0), not as the main user object, whose slot 3 duplicates a handle.
 int gamertag_provider = -1;
 constexpr unsigned long gamertag_iid_data1 = 0xcef4fac0;
+
+struct ApiPair { GUID provider, iid; };
+constexpr ApiPair local_pairs[] = {
+    {{0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}},
+     {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}}},
+    {{0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}},
+     {0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}}},
+    {store_provider_id,
+     {0x2d42fea5, 0xe71d, 0x4b76, {0x97, 0xcd, 0xc5, 0x0a, 0xfb, 0xb3, 0xae, 0x5d}}},
+    {store_provider_id,
+     {0xb09d803c, 0x2414, 0x4a05, {0x82, 0xc6, 0x66, 0xdf, 0xdc, 0x9e, 0x9a, 0x44}}},
+    {{0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}},
+     {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}}},
+    {{0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}},
+     {0x1bfff3af, 0xf14a, 0x40a3, {0x8e, 0x35, 0x9a, 0xda, 0x90, 0x65, 0x93, 0xf9}}},
+    {{0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}},
+     {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}}},
+    {{0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}},
+     {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}}},
+};
+// Storage has its own object and remains available under the fake-user gate alone.
+constexpr ApiPair storage_pair{
+    {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}},
+    {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}}
+};
+constexpr GUID iunknown_iid{0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};  // IID_IUnknown
+
+bool matches_pair(const ApiPair& pair, const GUID* provider, const GUID* iid)
+{
+    return provider && iid && IsEqualGUID(pair.provider, *provider) && IsEqualGUID(pair.iid, *iid);
+}
+
+HRESULT local_query_interface(void* self, unsigned long provider, const GUID* implemented,
+                              const GUID* iid, void** out, LONG& rejected)
+{
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
+    if (iid && x2w_local::readable(iid, sizeof(*iid)) &&
+        (IsEqualGUID(*iid, iunknown_iid) || (implemented && IsEqualGUID(*iid, *implemented)))) {
+        *out = self;
+        return S_OK;
+    }
+    *out = nullptr;
+    if (InterlockedCompareExchange(&rejected, 1, 0) == 0)
+        x2w_local::logf("x2w-runtime local: %08lx::QueryInterface refused IID, E_NOINTERFACE", provider);
+    return E_NOINTERFACE;
+}
 // Async blocks completed on behalf of a local answer (see complete_async): calls that mention them
 // are always logged, and the borrowed operation's own failure code is not passed on for them.
 u64 tracked_blocks[64];
@@ -76,6 +132,7 @@ bool user_call(int slot, u64* args, u64* result);
 bool save_call(int slot, u64* args, u64* result);
 bool area_call(const GUID& provider_id, int slot, u64* args, u64* result);
 u64 complete_async(u64 async_block);
+u64 local_user_add(u64 async_block);
 void* storage_object();
 const char* storage_path();
 constexpr unsigned long save_provider_data1 = 0x704c3f58;  // hypothesis: the game-save API (first seen: slot 4 with the user handle)
@@ -102,7 +159,10 @@ using x2w_api_trace::no_argument;
 template <int N>
 __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6, u64 s7)
 {
-    const bool log_it = N >= 3 && InterlockedIncrement(&call_counts[self->provider][N]) <= 6;
+    // call_counts also feeds the periodic call-rate summary, so it keeps counting; a count that has
+    // passed 2^31 is negative and must not log again.
+    const LONG call = N >= 3 ? InterlockedIncrement(&call_counts[self->provider][N]) : 0;
+    const bool log_it = call > 0 && call <= 6;
     u64 args[11] = {a, b, c, s0, s1, s2, s3, s4, s5, s6, s7};
     // Declared outputs are snapshotted so the write is seen rather than assumed; nothing else is read. The
     // snapshot is bounded by the declared width, so a one-byte flag, a DWORD and a caller-sized buffer
@@ -171,6 +231,21 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
             }
         }
     }
+    if (!handled && !self->real) {
+        // A local object (X2W_RUNTIME_LOCAL) has no runtime object behind it.
+        handled = true;
+        if (N == 0) {  // QueryInterface(iid, &object)
+            result = static_cast<unsigned>(local_query_interface(self, provider_ids[self->provider].Data1,
+                self->local_iid, reinterpret_cast<const GUID*>(a), reinterpret_cast<void**>(b), self->rejected_iid));
+        } else if (N == 1 || N == 2) {  // AddRef, Release keep local objects for the process lifetime.
+            result = 1;
+        } else {
+            result = 0x80004001;  // E_NOTIMPL
+            static LONG unanswered[max_providers][max_slots];
+            if (InterlockedIncrement(&unanswered[self->provider][N]) == 1)
+                x2w_local::logf("x2w-runtime local: %08lx::slot%d has no answer, E_NOTIMPL", provider_ids[self->provider].Data1, N);
+        }
+    }
     if (!handled) {
         const Method method = reinterpret_cast<Method>((*reinterpret_cast<void***>(self->real))[N]);
         result = method(self->real, a, b, c, s0, s1, s2, s3, s4, s5, s6, s7);
@@ -196,7 +271,7 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
         x2w_local::logf("x2w-api %08lx::slot%d -> 0x%08x %s out=%s", provider_ids[self->provider].Data1, N,
                         static_cast<unsigned>(result & 0xffffffffu), handled ? "local" : "real", out);
     }
-    if (log_it || (about_tracked && InterlockedIncrement(&tracked_logged) <= 120))
+    if (log_it || (about_tracked && x2w_local::first_calls(tracked_logged, 120)))
         x2w_local::logf("x2w-runtime %08lx::slot%d(0x%llx, 0x%llx, 0x%llx | 0x%llx, 0x%llx) -> 0x%llx%s%s from +0x%llx", provider_ids[self->provider].Data1, N,
                         a, b, c, s0, s1, result, handled ? " (local user)" : "",
                         about_tracked ? (raw_result != result ? " (tracked async, failure hidden)" : " (tracked async)") : "",
@@ -212,14 +287,33 @@ void fill_slots(std::index_sequence<I...>)
 HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
 {
     const HRESULT hr = real_query(provider, iid, out);
-    if (FAILED(hr) && out && provider && provider->Data1 == 0xf4faf4d4 && fake_user()) {
+    const bool output_writable = FAILED(hr) && fake_user() && x2w_local::writable(out, sizeof(*out));
+    const bool pair_readable = output_writable && x2w_local::readable(provider, sizeof(*provider)) &&
+                               x2w_local::readable(iid, sizeof(*iid));
+    if (pair_readable && matches_pair(storage_pair, provider, iid)) {
         // Persistent local storage: the system runtime has none for an unpackaged process.
         static LONG logged;
         if (x2w_local::first_calls(logged, 2)) x2w_local::logf("x2w-runtime persistent local storage: local object instead of 0x%08lx", static_cast<unsigned long>(hr));
         *out = storage_object();
         return S_OK;
     }
-    if (FAILED(hr) || !out || !*out || !provider) return hr;
+    const ApiPair* local = nullptr;
+    if (output_writable && InterlockedCompareExchange(&local_active, 0, 0)) {
+        *out = nullptr;
+        if (!pair_readable) return hr;
+        for (const auto& pair : local_pairs) {
+            if (matches_pair(pair, provider, iid)) {
+                local = &pair;
+                break;
+            }
+        }
+        if (local) {
+            static LONG logged;
+            if (x2w_local::first_calls(logged, 24))
+                x2w_local::logf("x2w-runtime local: provider %08lx real 0x%08lx -> local object", provider->Data1, static_cast<unsigned long>(hr));
+        }
+    }
+    if (!out || !provider || (!local && (FAILED(hr) || !*out))) return hr;
     GUID key = *provider;
     const bool gamertag = provider->Data1 == user_provider_data1 && iid && iid->Data1 == gamertag_iid_data1;
     if (gamertag) key.Data1 = gamertag_iid_data1;
@@ -238,12 +332,35 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
     }
     Proxy* proxy = nullptr;
     if (index >= 0) {
-        if (!proxies[index] || proxies[index]->real != *out) proxies[index] = new Proxy{slot_table, *out, index};
+        if (local) {
+            // Each pair keeps its own interface identity even when two IIDs share a provider index.
+            static Proxy* local_proxies[sizeof(local_pairs) / sizeof(*local_pairs)];
+            auto& entry = local_proxies[local - local_pairs];
+            if (!entry) entry = new Proxy{slot_table, nullptr, index, &local->iid};
+            proxies[index] = entry;
+        } else if (!proxies[index] || proxies[index]->real != *out) {
+            proxies[index] = new Proxy{slot_table, *out, index};
+        }
         proxy = proxies[index];
     }
     ReleaseSRWLockExclusive(&proxy_lock);
     if (proxy) *out = proxy;
+    if (local) return proxy ? S_OK : hr;
     return hr;
+}
+
+// X2W_RUNTIME_LOCAL: the first failed InitializeApiImpl* call is reported as S_OK. Once latched,
+// every later initialisation call returns S_OK without calling the real export.
+template <int K>
+u64 __stdcall proxy_init(u64 a, u64 b, u64 c, u64 d)
+{
+    if (InterlockedCompareExchange(&local_active, 0, 0)) return 0;
+    const u64 real = real_init[K] ? real_init[K](a, b, c, d) : 0x80004005;
+    if (static_cast<HRESULT>(real & 0xffffffffu) >= 0) return real;
+    if (InterlockedExchange(&local_active, 1) == 0)
+        x2w_local::logf("x2w-runtime local: %s(0x%llx, 0x%llx) real 0x%08lx -> S_OK (local runtime)", init_names[K], a, b,
+                        static_cast<unsigned long>(real & 0xffffffffu));
+    return 0;
 }
 
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
@@ -255,6 +372,14 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
         if (std::strcmp(name, "QueryApiImpl") == 0) {
             real_query = reinterpret_cast<QueryApi>(real);
             return reinterpret_cast<FARPROC>(&proxy_query);
+        }
+        if (runtime_local() && fake_user()) {
+            static constexpr InitApi wrappers[3] = {&proxy_init<0>, &proxy_init<1>, &proxy_init<2>};
+            for (int k = 0; k < 3; ++k) {
+                if (std::strcmp(name, init_names[k]) != 0) continue;
+                real_init[k] = reinterpret_cast<InitApi>(real);
+                return reinterpret_cast<FARPROC>(wrappers[k]);
+            }
         }
     }
     return real;
@@ -308,6 +433,10 @@ bool user_call(int slot, u64* args, u64* result)
     case 5:  // XUserCompare(a, b)
         if (args[0] != local_user_handle && args[1] != local_user_handle) return false;
         *result = args[0] == args[1] ? 0 : 1;
+        return true;
+    case 7:  // XUserAddAsync(options, async): with a local runtime there is no real operation to borrow
+        if (!InterlockedCompareExchange(&local_active, 0, 0)) break;  // unchanged without a local runtime
+        *result = local_user_add(args[1]);
         return true;
     case 8:  // XUserAddResult(async, &handle): the real operation ends with "no default user"; answer with the local user
         if (out(args[1], 8)) *reinterpret_cast<u64*>(args[1]) = local_user_handle;
@@ -488,6 +617,35 @@ u64 async_submit(int slot, u64 update, u64 block)
     const auto status = static_cast<HRESULT>(submit_update(update));
     using Complete = void(WINAPI*)(void*,void*,HRESULT,size_t);
     reinterpret_cast<Complete>(methods[10])(service, async, status, 0);
+    return S_OK;
+}
+
+// X2W_RUNTIME_LOCAL: XUserAddAsync completes at once with S_OK through the same XAsync service;
+// XUserAddResult (user slot 8) then hands out the local user.
+constexpr char user_add_identity[] = "local XUserAddAsync";
+u64 local_user_add(u64 block)
+{
+    if (!block || !real_query) return e_fail;
+    void* service = nullptr;
+    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    if (FAILED(query) || !service) {
+        x2w_local::logf("x2w-runtime local: XUserAddAsync, async service unavailable 0x%08lx", static_cast<unsigned long>(query));
+        return FAILED(query) ? static_cast<unsigned>(query) : e_fail;
+    }
+    auto** methods = *static_cast<void***>(service);
+    struct ApiRef {
+        void* object;
+        ULONG (WINAPI* release)(void*);
+        ~ApiRef() { release(object); }
+    } api{service, reinterpret_cast<ULONG(WINAPI*)(void*)>(methods[2])};
+    auto* async = reinterpret_cast<void*>(block);
+    using Begin = HRESULT(WINAPI*)(void*, void*, void*, const void*, const char*, decltype(&submit_provider));
+    const auto hr = reinterpret_cast<Begin>(methods[7])(service, async, nullptr, user_add_identity, user_add_identity, submit_provider);
+    if (FAILED(hr)) return static_cast<unsigned>(hr);
+    using Complete = void(WINAPI*)(void*, void*, HRESULT, size_t);
+    reinterpret_cast<Complete>(methods[10])(service, async, S_OK, 0);
+    static LONG logged;
+    if (x2w_local::first_calls(logged, 4)) x2w_local::logf("x2w-runtime local: XUserAddAsync completed with the local user");
     return S_OK;
 }
 
@@ -677,6 +835,9 @@ u64 complete_async(u64 async_block)
     if (!user || !async_block) return 0x80004005;
     const LONG index = InterlockedIncrement(&tracked_count) - 1;
     if (index < 64) tracked_blocks[index] = async_block;
+    // A local user object (X2W_RUNTIME_LOCAL) has no runtime operation to borrow: complete the block
+    // through the XAsync service directly, as the local XUserAddAsync does.
+    if (!user->real) return local_user_add(async_block);
     const Method add = reinterpret_cast<Method>((*reinterpret_cast<void***>(user->real))[7]);
     return add(user->real, 1 /* add default user silently */, async_block, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
@@ -997,8 +1158,12 @@ const char* storage_path()
     }, nullptr, nullptr);
     return path;
 }
-HRESULT __stdcall storage_query(StorageObject* self, const GUID*, void** out) { if (out) *out = self; return S_OK; }
-u64 __stdcall storage_ref(StorageObject*) { return 1; }
+HRESULT __stdcall storage_query(StorageObject* self, const GUID* iid, void** out)
+{
+    static LONG rejected;
+    return local_query_interface(self, storage_pair.provider.Data1, &storage_pair.iid, iid, out, rejected);
+}
+u64 __stdcall storage_ref(StorageObject*) { return 1; }  // Process-lifetime object.
 HRESULT __stdcall storage_path_size(StorageObject*, std::size_t* out)
 {
     if (out) *out = std::strlen(storage_path()) + 1;

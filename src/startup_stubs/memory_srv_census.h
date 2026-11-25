@@ -30,6 +30,8 @@ namespace x2w_startup {
 constexpr const char* memory_srv_reasons[] = {
     "null_destination", "unreadable_resource", "unreadable_view", "null_address",
     "unsupported_description", "destination_outside_view_heaps", "buffer_unavailable", "texture_unavailable",
+    // the partial-tile holds of device_memory_srv (upstream #2105)
+    "partial_tile_xg_rows", "partial_tile_beyond_xg_size",
 };
 constexpr int memory_srv_reason_count = static_cast<int>(sizeof(memory_srv_reasons) / sizeof(memory_srv_reasons[0]));
 

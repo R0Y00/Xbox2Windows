@@ -1135,12 +1135,33 @@ OperationResult run_startup_cb_blend(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-export-write-mask: a manifest 'wmask' line keeps the unwritten channels of the target (#1674).
+// --startup-export-write-mask-unmasked: without the mask every channel is written, so every case differs.
+template<bool Unmasked>
+OperationResult run_startup_export_write_mask(const OperationContext& ctx)
+{
+    const int mismatches = check_startup_export_write_mask(ctx.device, Unmasked);
+    if (Unmasked ? mismatches == 0 : mismatches != 0)
+        return {OutcomeKind::fail, Unmasked ? "unmasked draws still kept the unwritten channels" : "a channel outside the export mask was written"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-composite-provenance: source, destination before and destination after a composite draw on one
 // list distinguish a drawn centre, a clipped centre and a UV that selects the source corner (#1628).
 OperationResult run_startup_composite_provenance(const OperationContext& ctx)
 {
     if (check_startup_composite_provenance(ctx.device) != 0)
         return {OutcomeKind::fail, "composite provenance differs from the model or a mutant matched"};
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-range-provenance: a draw over a bound buffer window reads the colour its producer wrote before the
+// fence that separated them, and a neighbouring, stale or unwritten window reads a different or zero colour
+// (#870).
+OperationResult run_startup_range_provenance(const OperationContext& ctx)
+{
+    if (check_startup_range_provenance(ctx.device) != 0)
+        return {OutcomeKind::fail, "range provenance differs from the model or a mutant matched"};
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1177,14 +1198,24 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
     const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
     const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
-    const float z = std::stof(ctx.argv[5]);
+    const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
+    float z = 0.0f;
+    if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
+        char* end = nullptr;
+        const unsigned long long raw = std::strtoull(ctx.argv[5], &end, 16);
+        if (!end || *end != '\0' || raw > 0xffffffffull) return {OutcomeKind::fail, "packed 2D coordinate is not a 32-bit hex word"};
+        const auto raw32 = static_cast<std::uint32_t>(raw);
+        std::memcpy(&z, &raw32, sizeof(z));
+    } else {
+        z = std::stof(ctx.argv[5]);
+    }
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
     check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1,
-                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0);
+                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0, two_dimensional);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1383,6 +1414,7 @@ const OperationSpec kOperations[] = {
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
@@ -1485,7 +1517,10 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
     {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
+    {"--startup-range-provenance", 3, 3, nullptr, kNoGate, run_startup_range_provenance},
     {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
+    {"--startup-export-write-mask", 3, 3, nullptr, kNoGate, run_startup_export_write_mask<false>},
+    {"--startup-export-write-mask-unmasked", 3, 3, nullptr, kNoGate, run_startup_export_write_mask<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
     {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},

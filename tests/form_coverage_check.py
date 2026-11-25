@@ -864,6 +864,10 @@ def check_parsing():
            "x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
            "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\n    emit rax\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
     assert fc.masm_mnemonics(asm) == {"cmpxchg", "movsb", "jae", "jne", "mov", "ud2", "ret"}, fc.masm_mnemonics(asm)
+    # Anonymous labels, conditional-assembly directives and assembly-time assignments are not instructions.
+    pseudo_ops_asm = ("@@:\n    mov eax, ecx\n    jmp @b\nword_index = 0\n"
+                      "REPT 2\n    nop\nENDM\nIFIDNI <a>, <b>\n    ret\nENDIF\n")
+    assert fc.masm_mnemonics(pseudo_ops_asm) == {"mov", "jmp", "nop", "ret"}, fc.masm_mnemonics(pseudo_ops_asm)
     with tempfile.TemporaryDirectory() as tmp:
         isolated = fc.measure({}, sample_repo(tmp, {"branch": asm}))["x64_zen2"]
         assert isolated["fixture_forms_not_in_reference"] == [], isolated["fixture_forms_not_in_reference"]
@@ -873,6 +877,7 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
     unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
+    assert unmatched == [], unmatched
 
 
 def check_junit_errors():
@@ -929,8 +934,56 @@ def check_junit_errors():
             assert expected in run.stderr, (name, run.stderr)
 
 
+def check_records_errors():
+    """A --records path that is not a directory is reported with exit status 2, because reading nothing from it
+    would count every record-mode and shader form as uncovered. A directory whose records all come from another
+    run is measured as before, with a warning; an empty directory (no recording test ran) is silent."""
+    import subprocess
+    tool = Path(fc.__file__)
+    start = datetime(2026, 11, 21, 21, 5, 21).timestamp()  # CTest writes local time
+    junit_text = ('<testsuite time="1" timestamp="2026-11-21T21:05:21">'
+                  '<testcase name="pixel_aot_warp" status="run"/></testsuite>')
+
+    def run(records, *extra):
+        return subprocess.run([sys.executable, "-B", str(tool), str(junit), "--records", str(records), *extra],
+                              capture_output=True, text=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        junit = Path(tmp) / "results.xml"
+        junit.write_text(junit_text, encoding="utf-8")
+        not_a_dir = Path(tmp) / "records.txt"
+        not_a_dir.write_text("s_endpgm\n", encoding="utf-8")
+        for path, expected in ((Path(tmp) / "missing", "records directory does not exist"),
+                               (not_a_dir, "records path is not a directory")):
+            for extra in ((), ("--gaps", "gfx1013")):
+                result = run(path, *extra)
+                assert result.returncode == 2, (path, extra, result.returncode, result.stderr)
+                assert "Traceback" not in result.stderr, result.stderr
+                assert result.stderr == f"form_coverage: {path}: {expected}\n", result.stderr
+                assert result.stdout == "", result.stdout
+        records = Path(tmp) / "records"
+        records.mkdir()
+        empty = run(records)
+        assert empty.returncode == 0 and empty.stderr == "", (empty.returncode, empty.stderr)
+        assert "Shader translation records from this run: none" in empty.stdout, empty.stdout
+        record = records / "pixel_aot_warp.txt"
+        record.write_text("s_endpgm\n", encoding="utf-8")
+        os.utime(record, (start + 0.5, start + 0.5))
+        fresh = run(records)
+        assert fresh.returncode == 0 and fresh.stderr == "", (fresh.returncode, fresh.stderr)
+        assert "Shader translation records from this run: pixel_aot_warp" in fresh.stdout, fresh.stdout
+        # Negative control: the same record written an hour before the run is ignored, and the tool says so.
+        os.utime(record, (start - 3600, start - 3600))
+        for extra, header in (((), "Tests: 1 passed"), (("--gaps", "gfx1013"), "group\tform\tevidence\n")):
+            stale = run(records, *extra)
+            assert stale.returncode == 0, (extra, stale.returncode, stale.stderr)
+            assert stale.stderr == (f"form_coverage: {records}: none of the 1 records here was written during "
+                                    "this JUnit run, so no record-mode or shader form is counted\n"), stale.stderr
+            assert header in stale.stdout, stale.stdout
+
+
 def check_gaps():
-    reference = {("VOP1", "v_a"), ("VOP3", "v_a_e64"), ("VOP3", "v_b_e64"), ("VOP1", "v_c")}
+    reference ={("VOP1", "v_a"), ("VOP3", "v_a_e64"), ("VOP3", "v_b_e64"), ("VOP1", "v_c")}
     fixtures = {"passing": ({"v_a_e32"}, "pass"),
                 "skipping": ({"v_a_e32", "v_a_e64"}, "skip"),
                 "failing": ({"v_a_e64", "v_b_e64"}, "fail")}
@@ -1362,6 +1415,42 @@ def check_sdwa_cmp_coverage():
         assert ("SDWA", "v_cmp_lt_f16_sdwa") not in fc.gfx_forms(stripped, reference), name
 
 
+def check_dpp_f16_arith_round_forms():
+    """The 16 quad-local DPP16/DPP8 binary16 arithmetic and rounding forms count as covered once
+    the translator accepts their fixtures; unlowered f16 DPP/SDWA neighbours stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in pixel.DPP_F16_ARITH_ROUND_PROGRAMS.values():
+            pixel.translate_f16(pixel.uncompressed_export(body))
+        ops = ("add", "sub", "subrev", "mul", "floor", "ceil", "trunc", "rndne")
+        forms = {(group, f"v_{op}_f16_dpp") for group in ("DPP16", "DPP8") for op in ops}
+        assert len(forms) == 16
+        neighbours = {
+            ("DPP16", "v_min_f16_dpp"), ("DPP8", "v_min_f16_dpp"),
+            ("DPP16", "v_max_f16_dpp"), ("DPP8", "v_max_f16_dpp"),
+            ("DPP16", "v_fract_f16_dpp"), ("DPP8", "v_fract_f16_dpp"),
+            ("DPP16", "v_fmac_f16_dpp"), ("DPP8", "v_fmac_f16_dpp"),
+            ("DPP16", "v_ldexp_f16_dpp"), ("DPP8", "v_ldexp_f16_dpp"),
+            ("SDWA", "v_add_f16_sdwa"), ("SDWA", "v_floor_f16_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        # Control: removing one opcode removes both its DPP16 and DPP8 forms from the count.
+        stripped = pixel.ACCEPTED - {"v_add_f16_dpp"}
+        assert not {("DPP16", "v_add_f16_dpp"), ("DPP8", "v_add_f16_dpp")} & fc.gfx_forms(
+            stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1382,6 +1471,7 @@ if __name__ == "__main__":
     check_f16_fmac_ldexp_forms()
     check_f16_cvt_int16_forms()
     check_f16_to_int16_forms()
+    check_dpp_f16_arith_round_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sdwa_cmp_coverage()
@@ -1389,6 +1479,7 @@ if __name__ == "__main__":
     check_s_version_form()
     check_parsing()
     check_junit_errors()
+    check_records_errors()
     check_gaps()
     check_dashboard()
     check_avx2_regs()
