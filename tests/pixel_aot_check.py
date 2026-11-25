@@ -17,6 +17,7 @@ import zlib
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import dxc_cache
 import pixel_aot
 from pixel_aot import ALU, disassemble, native_program
 
@@ -364,7 +365,7 @@ def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MO
     if SPIRV_ARGS is not None:
         command += SPIRV_ARGS
     command.append(source)
-    subprocess.run(command, check=True)
+    dxc_cache.run_dxc(command[0], command[1:], check=True)
     if SPIRV_ARGS is not None:
         subprocess.run(["spirv-val", "--target-env", "vulkan1.2", shader], check=True)
 
