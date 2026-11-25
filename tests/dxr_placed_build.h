@@ -2,6 +2,7 @@
 
 #include "desktop_gpu.h"
 #include "startup_stubs/placed_build.h"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <stdexcept>
@@ -18,6 +19,11 @@ class PlacedBuildScene {
     };
     Microsoft::WRL::ComPtr<IUnknown> guest_;
     std::array<Buffer, 8> buffers_;
+    struct Placed {
+        UINT64 dest{}, scratch{};
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO sizes{};
+    };
+    std::array<Placed, 2> titles_; // BLAS, TLAS as built by prepare()
 
 public:
     // Wrong-routing control (issue #874): also build a decoy BLAS from another triangle into its own placed
@@ -66,10 +72,16 @@ public:
         constexpr auto scratch_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         if (!bottom_size.ScratchDataSizeInBytes || !top_size.ScratchDataSizeInBytes)
             throw std::runtime_error("This scratch-boundary fixture requires nonzero BLAS and TLAS scratch sizes");
+        // A scratch buffer serves the build and, later, the update, so it holds the larger of the two.
+        const auto scratch_bytes = [](const auto& sizes) {
+            return (std::max)(sizes.ScratchDataSizeInBytes, sizes.UpdateScratchDataSizeInBytes);
+        };
         const auto blas = place(0, dest_offset + bottom_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
         const auto tlas = place(1, dest_offset + top_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
-        const auto bs = place(2, scratch_offset + bottom_size.ScratchDataSizeInBytes, scratch_state) + scratch_offset;
-        const auto ts = place(3, scratch_offset + top_size.ScratchDataSizeInBytes, scratch_state) + scratch_offset;
+        const auto bs = place(2, scratch_offset + scratch_bytes(bottom_size), scratch_state) + scratch_offset;
+        const auto ts = place(3, scratch_offset + scratch_bytes(top_size), scratch_state) + scratch_offset;
+        titles_[0] = {blas, bs, bottom_size};
+        titles_[1] = {tlas, ts, top_size};
         const auto short_scratch = place(4, scratch_offset + top_size.ScratchDataSizeInBytes - 1, scratch_state) + scratch_offset;
         constexpr UINT64 unmapped = 0x1000; // outside the user allocation range
         const auto must_reject = [&](UINT64 dest, UINT64 scratch) {
@@ -147,6 +159,17 @@ public:
         if (moved.SourceAccelerationStructureData != base.DestAccelerationStructureData + dest_offset ||
             moved.SourceAccelerationStructureData == moved.DestAccelerationStructureData)
             throw std::runtime_error("An out-of-place update lost the source address or aliased the destination");
+    }
+
+    // Re-resolve one placed structure (0 = BLAS, 1 = TLAS) as an in-place PERFORM_UPDATE of itself. The source is the
+    // title address the structure was built at, so the update runs through the same slot-133 placement lookup as the
+    // build. The caller keeps ALLOW_UPDATE from the initial build; the resolver cannot see it.
+    void resolve_update(unsigned which, D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build) {
+        const auto& placed = titles_.at(which);
+        build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        build.SourceAccelerationStructureData = placed.dest;
+        check(x2w_startup::resolve_placed_build(guest_.Get(), placed.dest, placed.scratch, placed.sizes, build),
+            "Resolve placed in-place update");
     }
 
     // The decoy BLAS for the wrong-routing control, placed and resolved through the same slot-133 path.
