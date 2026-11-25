@@ -257,6 +257,185 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     return match;
 }
 
+// Backing for unplaced buffer memory SRVs: 64 KiB page-aligned placed resource on an existing heap
+// (OpenExistingHeapFromAddress zero-copy aliasing on hardware) or committed UPLOAD buffer (fallback).
+struct UnplacedBufferEntry {
+    Wrapper* device = nullptr;
+    void* allocation_base = nullptr;
+    u64 page_start = 0;
+    u64 page_span = 0;
+    bool is_upload = false;
+    x2w_startup::ComPtr<ID3D12Resource> resource;
+    Wrapper* wrapper = nullptr;
+};
+
+std::mutex unplaced_buffer_mutex;
+std::vector<UnplacedBufferEntry> unplaced_buffers;
+
+void clear_unplaced_buffers(Wrapper* device)
+{
+    std::lock_guard lock(unplaced_buffer_mutex);
+    for (auto it = unplaced_buffers.begin(); it != unplaced_buffers.end();) {
+        if (it->device == device) {
+            if (it->wrapper) {
+                retire_placement(it->wrapper);
+                if (it->wrapper->own().budget) it->wrapper->own().budget->end_use();
+                if (it->wrapper->own().backing_budget) it->wrapper->own().backing_budget->end_use();
+                it->wrapper->own().real = nullptr;
+                InterlockedDecrement(&it->wrapper->own().refs);
+            }
+            it->resource.Reset();
+            it = unplaced_buffers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc)
+{
+    if (address_resource_overlap(address, span_bytes)) return nullptr;
+    u64 page_start = 0, page_span = 0;
+    if (!x2w_startup::unplaced_buffer_extent(address, span_bytes, page_start, page_span))
+        return nullptr;
+
+    x2w_startup::PlacedBufferRange memory{};
+    if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, memory) ||
+        !memory.covered)
+        return nullptr;
+
+    const auto nearby = placed_buffer_range(device, page_start, page_span, true);
+    if (nearby.reject || nearby.owner) return nullptr;
+
+    auto* desktop = device_of(device);
+    if (!desktop) return nullptr;
+
+    std::lock_guard lock(unplaced_buffer_mutex);
+    for (auto& entry : unplaced_buffers) {
+        if (entry.device == device && entry.allocation_base == memory.base &&
+            x2w_startup::unplaced_buffer_covers(entry.page_start, entry.page_span, address, span_bytes)) {
+            x2w_startup::PlacedBufferRange verify{};
+            if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(entry.page_start), entry.page_span, verify) ||
+                !verify.covered || verify.base != memory.base) {
+                continue;
+            }
+            if (entry.is_upload && entry.resource) {
+                void* mapped = nullptr;
+                D3D12_RANGE read_range{0, 0};
+                if (SUCCEEDED(entry.resource->Map(0, &read_range, &mapped))) {
+                    std::memcpy(mapped, reinterpret_cast<const void*>(entry.page_start), static_cast<std::size_t>(entry.page_span));
+                    entry.resource->Unmap(0, nullptr);
+                }
+            }
+            return entry.wrapper;
+        }
+    }
+
+    x2w_startup::ComPtr<ID3D12Resource> native_resource;
+    bool is_upload = false;
+    ID3D12Heap* heap = nullptr;
+    x2w_budget::Ticket* backing_budget = nullptr;
+
+    D3D12_FEATURE_DATA_EXISTING_HEAPS existing_support{};
+    const bool existing_heaps_supported =
+        SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &existing_support, sizeof(existing_support))) &&
+        existing_support.Supported;
+
+    if (existing_heaps_supported && memory.type == MEM_PRIVATE) {
+        std::lock_guard placed_lock(placed_mutex);
+        for (const auto& [known, h] : existing_heaps) {
+            if (known == memory.base) {
+                heap = h.real;
+                backing_budget = h.budget;
+                break;
+            }
+        }
+        if (!heap) {
+            ID3D12Device3* device3 = nullptr;
+            if (SUCCEEDED(desktop->QueryInterface(IID_PPV_ARGS(&device3)))) {
+                if (SUCCEEDED(device3->OpenExistingHeapFromAddress(memory.base, IID_PPV_ARGS(&heap)))) {
+                    backing_budget = x2w_budget::backing_heap(heap, 0);
+                    existing_heaps.emplace_back(memory.base, ExistingHeap{heap, backing_budget});
+                }
+                device3->Release();
+            }
+        }
+        if (heap) {
+            const u64 base_u64 = reinterpret_cast<u64>(memory.base);
+            const u64 heap_offset = page_start - base_u64;
+            const u64 heap_size = heap->GetDesc().SizeInBytes;
+            if (heap_offset <= heap_size && page_span <= heap_size - heap_offset) {
+                D3D12_RESOURCE_DESC desc{};
+                desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                desc.Width = page_span;
+                desc.Height = 1;
+                desc.DepthOrArraySize = 1;
+                desc.MipLevels = 1;
+                desc.Format = DXGI_FORMAT_UNKNOWN;
+                desc.SampleDesc.Count = 1;
+                desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+                desktop->CreatePlacedResource(heap, heap_offset, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                              nullptr, IID_PPV_ARGS(&native_resource));
+            }
+        }
+    }
+
+    if (!native_resource) {
+        D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = page_span;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_UNKNOWN;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        if (SUCCEEDED(desktop->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                      IID_PPV_ARGS(&native_resource)))) {
+            is_upload = true;
+            void* mapped = nullptr;
+            D3D12_RANGE read_range{0, 0};
+            if (SUCCEEDED(native_resource->Map(0, &read_range, &mapped))) {
+                std::memcpy(mapped, reinterpret_cast<const void*>(page_start), static_cast<std::size_t>(page_span));
+                native_resource->Unmap(0, nullptr);
+            }
+        }
+    }
+
+    if (!native_resource) return nullptr;
+
+    Wrapper* w = wrap(native_resource.Get(), resource_kind);
+    w->own().title_memory = reinterpret_cast<void*>(page_start);
+    D3D12_RESOURCE_DESC rdesc{};
+    rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rdesc.Width = page_span;
+    rdesc.Height = 1;
+    rdesc.DepthOrArraySize = 1;
+    rdesc.MipLevels = 1;
+    rdesc.Format = DXGI_FORMAT_UNKNOWN;
+    rdesc.SampleDesc.Count = 1;
+    rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rdesc.Flags = is_upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+    note_resource(w, &rdesc, page_span);
+    if (!is_upload) {
+        w->own().budget = x2w_budget::resource(desktop, native_resource.Get(), x2w_budget::placed);
+        w->own().backing_budget = backing_budget;
+        if (backing_budget) backing_budget->begin_use();
+    } else {
+        w->own().budget = x2w_budget::committed(desktop, native_resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
+    }
+
+    unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, native_resource, w});
+    return w;
+}
+
 // Keep metadata for published tiled SRVs; allocate GPU memory only when a
 // translated draw actually samples one. A later write to the same address is
 // picked up by the uploader even when the description and view token are reused.
@@ -519,6 +698,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
+        if (!buffer) {
+            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource);
+        }
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
         if (!buffer || !info ||
