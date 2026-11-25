@@ -368,6 +368,7 @@ int main(int argc, char** argv)
 
     // A copy into a title-backed texture that is recorded, then discarded by Close and Reset without ever being
     // submitted, did not happen: the texture still takes its first upload from its own memory.
+    if (!ok(invoke(list, 139, arg(allocator), 0))) return 38;
     invoke(list, 17, arg(title_discarded), arg(empty_d.Get()));
     if (!step("10a CopyResource into a title-backed texture, then discarded", {0, 1, 0, 0}, seen)) return 37;
     invoke(list, 9);
