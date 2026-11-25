@@ -852,12 +852,16 @@ def native_exports_for_host(native: dict, has_xsavec: bool, has_xsaveopt: bool =
     """Drop native xsavec/xsaveopt fixtures on hosts without them: executing them would raise #UD.
 
     The compacted XRSTOR fixtures go with XSAVEC: the compacted format is enumerated by the same CPUID bit, and
-    without it a restore with XCOMP_BV[63] set always raises #GP.
+    without it a restore with XCOMP_BV[63] set always raises #GP. SSE_COMPACTED_CONTROL_EXPORT always restores a
+    compacted image, so it is one of them.
     """
     return {
         name: fn
         for name, fn in native.items()
-        if (has_xsavec or (name not in XSAVEC_EXPORTS and name not in COMPACTED_EXPORTS))
+        if (
+            has_xsavec
+            or (name not in XSAVEC_EXPORTS and name not in COMPACTED_EXPORTS and name != SSE_COMPACTED_CONTROL_EXPORT)
+        )
         and (
             has_xsaveopt
             or (name not in XSAVEOPT_EXPORTS and name not in ("op_xrstor64_avx_xsaveopt64_avx", SSE_COMPACTED_CONTROL_EXPORT))
@@ -1125,8 +1129,13 @@ def check_entry_state_contracts(
     compacted_altered_lib,
     mxcsr_mask: int,
     deprecates_cs_ds: bool,
+    has_xsavec: bool,
 ) -> None:
-    """Verify explicit entry-state contract metadata and non-default entry controls."""
+    """Verify explicit entry-state contract metadata and non-default entry controls.
+
+    has_xsavec: the host restores compacted images natively (CPUID.(0xD,1):EAX[1]); without it the native
+    compacted restore would #GP, so only the standard-image native comparison runs.
+    """
     for lib, expected_profile, expected_flag, expected_compacted in (
         (lifted_lib, b"defined", 0, 0),
         (altered_lib, b"defined", 0, 0),
@@ -1218,11 +1227,12 @@ def check_entry_state_contracts(
     got_l_sse = invoke_lifted(compacted_fns["op_xrstor64_sse_compacted_avx_xsaveopt64_avx"], sse_in, compacted_avx)
     assert struct.unpack_from("<I", got_l_sse, 24)[0] == (0x5F80 & mxcsr_mask)
     if "op_xrstor64_avx_xsaveopt64_avx" in native_fns:
-        got_n_comp = invoke_native(
-            harness, native_fns["op_xrstor64_avx_xsaveopt64_avx"], compacted_avx, dummy, entry_ptr=sse_ptr
-        )
-        assert struct.unpack_from("<I", got_n_comp, 24)[0] == (0x3F80 & mxcsr_mask)
-        assert got_n_comp != got_l_comp
+        if has_xsavec:
+            got_n_comp = invoke_native(
+                harness, native_fns["op_xrstor64_avx_xsaveopt64_avx"], compacted_avx, dummy, entry_ptr=sse_ptr
+            )
+            assert struct.unpack_from("<I", got_n_comp, 24)[0] == (0x3F80 & mxcsr_mask)
+            assert got_n_comp != got_l_comp
         got_n_std = invoke_native(
             harness, native_fns["op_xrstor64_avx_xsaveopt64_avx"], standard_avx, dummy, entry_ptr=sse_ptr
         )
@@ -1966,6 +1976,7 @@ def check_differential(
             compacted_altered_lib,
             mxcsr_mask,
             deprecates_cs_ds,
+            has_xsavec,
         )
         misalign_checks, hdr_mxcsr_checks = check_fault_controls(
             harness, native, lifted, canonical, mxcsr_mask
@@ -2077,6 +2088,11 @@ def check_differential(
         )
         assert not unsupported & set(gated) and set(native) - unsupported == set(gated)
         check_fault_controls(harness, gated, lifted, canonical, mxcsr_mask)
+        # XSAVEOPT without XSAVEC (Haswell, Broadwell): the compacted SSE control goes, the general
+        # XRSTOR(4) -> XSAVEOPT64(4) export stays for its standard-image comparison.
+        gated_opt = native_exports_for_host(native, False, True)
+        assert SSE_COMPACTED_CONTROL_EXPORT not in gated_opt and "op_xrstor64_avx_xsaveopt64_avx" in gated_opt
+        assert not (set(XSAVEC_EXPORTS) | set(COMPACTED_EXPORTS)) & set(gated_opt)
 
         es0_64 = fp_caps[(True, True, False)][:3]
         es1_64 = fp_caps[(True, True, True)][:3]

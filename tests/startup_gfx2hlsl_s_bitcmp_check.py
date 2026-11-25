@@ -57,6 +57,11 @@ for mnemonic, want in (('s_bitcmp1_b32', 1), ('s_bitcmp0_b32', 0)):
                     print('MISMATCH %s word=%#x index=%#x got=%s want=%s' % (line, word, index, got, expected))
 
 for mnemonic in ('s_bitcmp0_b32', 's_bitcmp1_b32'):
+    stage = Probe()
+    stage.varying_s = {44}
+    stage.scc_uniform = True
+    stage.one(mnemonic, f'{mnemonic} s44, 1')
+    assert not stage.scc_uniform, stage.lines
     for operands in ('exec_lo, 1', 'vcc_lo, 1', 's12, 1', 's44, s12', 's44, vcc_lo'):
         stage = Probe()
         stage.masks.add(12)
