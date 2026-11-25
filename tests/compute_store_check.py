@@ -2040,7 +2040,7 @@ def ff1_scalar_controls():
             variant(FF1_SCALAR, ("s20, s4", "s12, s4")), 32, **FF1_SCALAR_BINDING)
     rejects("Unsupported compute instruction: s_ff0_i32_b32", aot.lower,
             variant(FF1_SCALAR, ("s_ff1_i32_b32 s20, s4", "s_ff0_i32_b32 s20, s4")), 32, **FF1_SCALAR_BINDING)
-    rejects("Unsupported compute instruction: s_cselect_b32", aot.lower,
+    rejects("Unverified SCC for scalar select", aot.lower,
             variant(FF1_SCALAR, ("s_ff1_i32_b32 s20, s4", "s_ff1_i32_b32 s20, s4\ns_cselect_b32 s24, s20, 0")),
             32, **FF1_SCALAR_BINDING)
 
@@ -3118,7 +3118,7 @@ def salu_i32_controls():
         (unsupported + "s_abs_i32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, -s16"),)),
         (unsupported + "s_add_i32_e64", (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32_e64 s16, 0x7fffffff, 1"),)),
         (unsupported + "s_abs_u32", (("s_abs_i32 s22, 0x80000000", "s_abs_u32 s22, 0x80000000"),)),
-        (unsupported + "s_cselect_b32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, 0x80000000\ns_cselect_b32 s22, 1, 2"),)),
+        ("Unverified SCC for scalar select", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, 0x80000000\ns_cselect_b32 s22, 1, 2"),)),
     ):
         rejects(message, lambda *c: aot.lower(variant(SALU_I32, *c), 64, **SALU_I32_BINDING), *changes)
     # Pending constant-buffer load as source or destination:

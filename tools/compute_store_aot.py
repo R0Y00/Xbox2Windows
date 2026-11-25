@@ -191,6 +191,9 @@ CVT_PK_U8 = {
 }
 FLOAT_SOURCE = r"(s\d+|v\d+|-?\d+\.\d+|0x[0-9a-f]+|-?\d+)"
 SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
+# Instruction prefixes that never write SCC, so a compare result survives them.
+SCC_PRESERVING = ("s_cselect_b32", "s_mov_b32", "s_movk_i32", "s_load", "s_buffer_load", "s_waitcnt",
+                  "s_nop", "s_clause", "v_", "buffer_")
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
@@ -296,21 +299,25 @@ def hlsl_word(value):
     return f"tid.{AXES[value[1]]}" if value[0] == "thread" else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
 
 
-def alu_word(token, scalar, vector, pending):
-    """The known word an ALU source names, or None: a VGPR, a loaded SGPR, an inline constant or a literal."""
+def alu_word(token, scalar, vector, pending, sizes=None):
+    """The known word an ALU source names, or None: a VGPR, a loaded SGPR, an inline constant or a literal.
+
+    sizes maps a descriptor word tag to the HLSL expression of the size the caller guarantees for it."""
     if token[0] == "v":
         value = vector.get(int(token[1:]))
     elif token[0] == "s":
         n = int(token[1:])
         value = scalar.get(n) if n <= 105 and n not in pending else None
+        if sizes and isinstance(value, tuple) and value in sizes:
+            value = ("alu", sizes[value])
     else:
         value = int(token, 0) & 0xffffffff if -(1 << 31) <= int(token, 0) <= 0xffffffff else None
     return value if is_word(value) else None
 
 
-def float_word(token, scalar, vector, pending):
+def float_word(token, scalar, vector, pending, sizes=None):
     """The known word a binary32 source names, or None: as alu_word, but a constant must be a finite normal value or zero."""
-    word = FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending)
+    word = FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending, sizes)
     if isinstance(word, int) and ((word >> 23) & 0xff == 0xff or ((word >> 23) & 0xff == 0 and word & 0x7fffff)):
         return None
     return word
@@ -875,6 +882,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             raise ValueError("Invalid heap view binding")
     format_load_index = 0
     scalar = {table_reg: "table"}
+    # Descriptor word 2 (num_records) may be read as a number only for a raw buffer, where the caller states
+    # that it equals the bound view's byte size: no stride, no image output. Other fields stay opaque.
+    sizes = {}
+    if descriptor_offset is not None and stride is None and not image_output:
+        sizes[("uav", 2)] = "uav_bytes()"
+    if source_descriptor is not None and source_stride is None:
+        sizes[("srv", 2)] = "srv_bytes()"
+    # HLSL for SCC as set by the last s_cmp, valid only until another instruction may write SCC.
+    scc = None
     for axis, reg in group_regs.items():
         scalar[reg] = ("group", axis)
     vector = {axis: ("local", axis) for axis in range(local_axes) if axis == 0 or dims[axis] > 1}
@@ -939,6 +955,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if int(m[1], 0) > 0x3f:
                 raise ValueError("Invalid s_clause operand")
             continue
+        if not line.startswith(SCC_PRESERVING):
+            scc = None
         if not line.startswith("s_waitcnt") and vector_operands(line) & loading.keys():
             raise ValueError("Vector load result used or overwritten before s_waitcnt vmcnt(0)")
         if line in ("s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(0) vmcnt(0)", "s_waitcnt vmcnt(0) lgkmcnt(0)",
@@ -964,7 +982,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 sdst_reg = int(sdst[1:])
                 if sdst_reg > 105 or sdst_reg in pending:
                     raise ValueError("Unverified compare destination")
-            words = [alu_word(token, scalar, vector, pending) for token in operands]
+            words = [alu_word(token, scalar, vector, pending, sizes) for token in operands]
             if any(token.startswith("v") and int(token[1:]) > 255 for token in operands) or None in words:
                 raise ValueError("Unverified lane guard compare")
             a, b = map(hlsl_word, words)
@@ -1079,10 +1097,30 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             or re.fullmatch(rf"(s_abs_i32) s(\d+), {SALU_SOURCE}", line)
         ):
             op, dst = m[1], int(m[2])
-            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            words = [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
             if dst > 105 or dst in pending or None in words:
                 raise ValueError("Unverified scalar ALU operand")
             expression = SALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            scalar[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"s_cmp_(eq|lg)_([iu])32 {SALU_SOURCE}, {SALU_SOURCE}", line):
+            # SCC = S0 == S1 (eq) or S0 != S1 (lg); the signedness does not change a 32-bit equality.
+            words = [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
+            if None in words:
+                raise ValueError("Unverified scalar compare operand")
+            scc = f"({hlsl_word(words[0])} {'==' if m[1] == 'eq' else '!='} {hlsl_word(words[1])})"
+            if len(scc) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+        elif m := re.fullmatch(rf"s_cselect_b32 s(\d+), {SALU_SOURCE}, {SALU_SOURCE}", line):
+            # SOP2: D = SCC ? S0 : S1. SCC must come from an s_cmp with only SCC-preserving code between.
+            dst = int(m[1])
+            words = [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[1:]]
+            if dst > 105 or dst in pending or None in words:
+                raise ValueError("Unverified scalar select operand")
+            if scc is None:
+                raise ValueError("Unverified SCC for scalar select")
+            expression = f"({scc} ? {hlsl_word(words[0])} : {hlsl_word(words[1])})"
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             scalar[dst] = ("alu", expression)
@@ -1116,7 +1154,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             dst, lo, hi = map(int, m.groups())
             if dst > 105 or dst in pending or lo % 2 or hi != lo + 1 or hi > 105:
                 raise ValueError("Invalid scalar bit count register or pending destination")
-            words = [alu_word(f"s{reg}", scalar, vector, pending) for reg in (lo, hi)]
+            words = [alu_word(f"s{reg}", scalar, vector, pending, sizes) for reg in (lo, hi)]
             if None in words:
                 raise ValueError("Unverified scalar bit count source")
             if all(isinstance(word, int) for word in words):
@@ -1138,7 +1176,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             expression = None
             if src != expected_src:
                 if width == "b32" and re.fullmatch(r"s\d+", src):
-                    word = alu_word(src, scalar, vector, pending)
+                    word = alu_word(src, scalar, vector, pending, sizes)
                     if word is not None:
                         expression = f"firstbitlow({hlsl_word(word)})"
                 elif width == "b64" and (pair := re.fullmatch(r"s\[(\d+):(\d+)\]", src)):
@@ -1180,7 +1218,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             dst, src0, src1, mask_tok = int(m[1]), m[2], m[3], m[4]
             if dst > 255:
                 raise ValueError("Invalid vector destination")
-            words = [alu_word(token, scalar, vector, pending) for token in (src0, src1)]
+            words = [alu_word(token, scalar, vector, pending, sizes) for token in (src0, src1)]
             if None in words:
                 raise ValueError("Unverified ALU operand")
             if mask_tok == "vcc_lo":
@@ -1244,7 +1282,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             # A wave-wide SGPR read is emulated from logical 1D wave32 groupshared storage. Dynamic lane
             # selectors and incomplete logical waves are refused so every selected source is defined.
             dst, src = int(m[1]), int(m[2])
-            lane = alu_word(m[3], scalar, vector, pending)
+            lane = alu_word(m[3], scalar, vector, pending, sizes)
             threads = dims[0] * dims[1] * dims[2]
             if (dst > 105 or dst in pending or src > 255 or guard_span is not None
                     or dims[1:] != (1, 1) or not isinstance(lane, int) or not 0 <= lane < 32
@@ -1268,7 +1306,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             # desktop wave width: a group of at most 32 threads is one wave of either size, a larger group needs
             # the wave32 statement. The mask must be uniform (a scalar word); exec is not read.
             half, dst = m[1], int(m[2])
-            mask, base = (alu_word(token, scalar, vector, pending) for token in m.groups()[2:])
+            mask, base = (alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:])
             if (dst > 255 or mask is None or base is None
                     or (dims[0] * dims[1] * dims[2] > 32 and wave_size != 32)):
                 raise ValueError("Unverified lane count operand or wave size")
@@ -1284,8 +1322,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             # SV_GroupIndex modulo the wave size: at most 32 threads is one wave of either size, a larger
             # group requires the wave32 statement.
             dst = int(m[1])
-            src = alu_word(m[2], scalar, vector, pending)
-            lane = alu_word(m[3], scalar, vector, pending)
+            src = alu_word(m[2], scalar, vector, pending, sizes)
+            lane = alu_word(m[3], scalar, vector, pending, sizes)
             old = vector.get(dst)
             if dst > 255:
                 raise ValueError("Invalid writelane vector destination")
@@ -1892,8 +1930,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         elif m := re.fullmatch(rf"(v_cvt_pk_u8_f32) v(\d+), {FLOAT_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line):
             # VOP3 without input or output modifiers. S0 is the binary32 value, S1 the byte select, S2 the other bytes.
             op, dst = m[1], int(m[2])
-            words = [float_word(m[3], scalar, vector, pending),
-                     *(alu_word(token, scalar, vector, pending) for token in m.groups()[3:])]
+            words = [float_word(m[3], scalar, vector, pending, sizes),
+                     *(alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[3:])]
             if (dst > 255 or None in words or isinstance(words[0], int)
                     and not (words[0] == 0 or 0x3f800000 <= words[0] <= 0x437f0000
                              and struct.unpack("<f", struct.pack("<I", words[0]))[0].is_integer())):
@@ -1920,7 +1958,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
         elif m := re.fullmatch(rf"(v_(?:add|sub|subrev|mul)_f32_e32) v(\d+), {FLOAT_SOURCE}, (v\d+)", line):
             op, dst = m[1], int(m[2])
-            words = [float_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            words = [float_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
             if dst > 255 or None in words:
                 raise ValueError("Unverified float operand")
             expression = FALU[op].format(*map(hlsl_word, words))
@@ -1944,7 +1982,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if dst > 255:
                 raise ValueError("Invalid vector destination")
             token = m[2]
-            word = FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending)
+            word = FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending, sizes)
             if word is None:
                 raise ValueError("Unverified float operand")
             expression = f"cvt_u32_f32({hlsl_word(word)})"
@@ -1993,10 +2031,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32|v_bcnt_u32_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
-              and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
+              and None not in [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
             op, dst = m[1], int(m[2])
-            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            words = [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
             if dst > 255 or None in words:
                 raise ValueError("Unverified ALU operand")
             expression = ALU[op].format(*map(hlsl_word, words))
@@ -2067,7 +2105,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 sdst_reg = int(sdst[1:])
                 if sdst_reg > 105 or sdst_reg in pending:
                     raise ValueError("Unverified carry destination")
-            words = [alu_word(token, scalar, vector, pending) for token in (src0, src1)]
+            words = [alu_word(token, scalar, vector, pending, sizes) for token in (src0, src1)]
             if None in words:
                 raise ValueError("Unverified ALU operand")
             a, b = map(hlsl_word, words)
@@ -2786,6 +2824,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         descriptor_hlsl += heap_view_hlsl(heap_table, heap_count, heap_bytes)
     if heap_store_view is not None:
         descriptor_hlsl += heap_store_view_hlsl(heap_table, heap_count, output_bytes)
+    # GetDimensions on a raw buffer returns its size in bytes, the value of descriptor word 2.
+    for name, view in (("uav_bytes", "outputData"), ("srv_bytes", "inputData")):
+        if f"{name}(" in body:
+            descriptor_hlsl += f"uint {name}() {{ uint n; {view}.GetDimensions(n); return n; }}\n"
     return (f"{cbuffer}{uav} outputData : register(u0);\n{descriptor_hlsl}"
             f"[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")

@@ -97,8 +97,14 @@ Windows build, commit and debug-layer status.
 
 ## Pure-Python checks
 
-These checks do not need Windows, D3D12 or game files. The list matches the
-platform-independent Python job in `.github/workflows/windows.yml`:
+These checks do not need Windows, D3D12 or game files. From the repository
+root, run the first two commands below to set up the environment, then choose
+individual checks as needed.
+
+The full Linux CI list is in the `Run Python checks` step of the `python-linux`
+job in the [CI workflow](.github/workflows/windows.yml). To run it locally,
+copy the step's `tools/run_checks_parallel.py` command with all its arguments
+and replace the leading `python` with `./out/pe-env/bin/python`.
 
 ```bash
 python3 -m venv out/pe-env
@@ -190,9 +196,10 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_load_format_check.py
 ./out/pe-env/bin/python -B tests/compute_heap_view_check.py
 ./out/pe-env/bin/python -B tests/compute_heap_store_check.py
-./out/pe-env/bin/python -B tests/mesh_heap_sampler_check.py
+./out/pe-env/bin/python -B tests/compute_desc_numeric_check.py controls
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
+./out/pe-env/bin/python -B tests/mesh_heap_sampler_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_c_check.py
@@ -200,6 +207,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_triage_run_check.py
 ./out/pe-env/bin/python -B tests/startup_run_ps1_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_bit_alu_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sgpr_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
