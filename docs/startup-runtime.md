@@ -204,11 +204,13 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
-constant at run time instead of folding it into a known word, which changes the emitted HLSL, and
-lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
-The matching compute (`x2w-startup-shader-15cs`) and fixed slot 57 mesh
-(`x2w-startup-mesh-57-2`) keys also advance because those stages use the shared lowering.
+The shader cache revision is `x2w-startup-shader-16`. Earlier translations lower `v_fract_f32`
+through a bare `frac` instead of the clamped `fract32` helper. The matching compute
+(`x2w-startup-shader-16cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
+because those stages use the shared lowering.
+Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
+rounding mode.
+Revisions before 14 evaluate constant `s_brev_b32` at run time instead of folding it into a known word.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
@@ -2345,6 +2347,16 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset dev --no-tests=error -R "^startup_(depth_state|slot57_depth)" -V`). Not covered:
   raster bias, depth bounds, back-face-only state, the title's own `OMSetStencilRef` order, clears
   (#1806), and any pipeline layout other than the measured one.
+- Rasterizer state (#1999, item B) has a decoder for the register value only:
+  `src/startup_stubs/rasterizer_state_decode.h` turns a `PA_SU_SC_MODE_CNTL` value into the cull mode,
+  front-face winding and fill mode of a `D3D12_RASTERIZER_DESC`, with the field positions of the amdgpu
+  `gc_10_3_0_sh_mask.h` header and Mesa's `gfx10.json`. Where a slot 57 pipeline keeps that word is not
+  part of it and is left open until independently established. It refuses both faces culled, point or
+  mixed polygon modes, polygon offset, last-vertex provoking and disabled perspective correction. The
+  caller's `flip_winding` inverts the FACE convention, which is not established against the D3D12
+  viewport. A device-free check covers each cull mode, winding and fill form and the refusals; its
+  `_face_control`, `_cull_control` and `_fill_control` runs read one field wrongly and must fail
+  (`ctest --preset dev --no-tests=error -R "^startup_rasterizer_decode" -V`). Not used by draws yet.
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
@@ -2962,7 +2974,8 @@ check only:
 - Argument checks (`src/startup_stubs/list_copy_texture.h`): footprint on both sides, empty or inverted box,
   source and destination bounds, row pitch (multiple of 256), offset (multiple of 512), footprint end inside
   the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
-  block alignment, every multiply and add in the footprint arithmetic checked for wrapping.
+  block alignment, every multiply and add in the footprint arithmetic checked for wrapping. Block-compressed
+  bounds are whole 4x4 blocks, as in D3D12: a 2x2 or 1x1 mip takes the 4x4 footprint GetCopyableFootprints gives it.
 - Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
   `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
   (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).

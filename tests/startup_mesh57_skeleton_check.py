@@ -3,6 +3,7 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
 word and both waves pass a barrier; later the same lane stores the primitive and vertex counts, both waves pass
@@ -14,6 +15,7 @@ Without arguments: the fixture translates through the slot 57 request path, and 
 refused with its own message. `binary` compares the embedded words with llvm-mc. `draw` compiles the request
 path's output (ms_6_5, ps_6_0), draws it and compares the read-back target with a CPU rasteriser written here;
 a reference with one wrong pixel must fail.
+The exchange mode uses the runtime-published request and the same pixel comparison.
 """
 import os
 from pathlib import Path
@@ -232,17 +234,51 @@ def rasterise(points, colours, indices, verts, prims):
     return image
 
 
-def draw(dxc, renderer, adapter):
+def publish_request(directory, publisher, adapter):
+    ms, ps = code(MESH), code(PIXEL)
+    (directory / 'ms.bin').write_bytes(ms)
+    (directory / 'ps.bin').write_bytes(ps)
+    env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory))
+    result = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
+    print(result.stdout, end='')
+    if result.returncode:
+        if result.returncode != 77:
+            print(result.stderr, end='')
+        return result.returncode, None
+    cache = directory / 'requests'
+    pair = [path for path in cache.glob('req_*.ps57') if path.stat().st_size]
+    expect('one published mesh and pixel request', len(pair), 1)
+    if len(pair) != 1:
+        return 1, None
+    root_blob = pair[0].with_suffix('.root').read_bytes()
+    key = G.mesh57_key(ms, ps, root_blob)
+    expect('published key matches the offline reader', pair[0].stem, f'req_{key:016x}')
+    expect('published mesh matches the fixture', pair[0].with_suffix('.m57').read_bytes(), ms)
+    expect('published pixel matches the fixture', pair[0].read_bytes(), ps)
+    if FAILED:
+        return 1, None
+    return 0, (cache, key, root_blob)
+
+
+def draw(dxc, renderer, adapter, publisher=None):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
     points, colours, indices = geometry()
     with tempfile.TemporaryDirectory() as tmp:
-        key, result = request(tmp, MESH)
+        if publisher:
+            status, published = publish_request(Path(tmp), publisher, adapter)
+            if status:
+                return status
+            cache, key, root_blob = published
+            result = G.translate_request(str(cache), key)
+        else:
+            cache, root_blob = Path(tmp), root()
+            key, result = request(tmp, MESH)
         expect('the fixture translates and compiles', result, 'ok')
         if result != 'ok':
             return 0
-        name = str(Path(tmp) / ('%016x' % key))
-        uds = G.MeshPipeline(code(MESH), code(PIXEL), root()).uds
+        name = str(cache / ('%016x' % key))
+        uds = G.MeshPipeline(code(MESH), code(PIXEL), root_blob).uds
         # (vertex count, primitive count, thread of vertex slot 0, flags of the first primitive words): all, fewer
         # primitives, fewer vertices (indices clamp), no vertex; every thread, with the triangles on vertices
         # 112..123 (wave 1, lanes 48..59), each named by eight primitives and the other 96 primitives on vertex 0
@@ -250,6 +286,8 @@ def draw(dxc, renderer, adapter):
         # Each case is one process and one device, which takes seconds on a hardware adapter.
         cases = ((12, 4, 0, ()), (12, 1, 0, ()), (7, 4, 0, ()), (0, 4, 0, ()),
                  (128, 128, 112, (1 << 31, 1 << 9 | 1 << 19 | 1 << 29)))
+        if publisher:
+            cases = cases[:1]
         for case in cases:
             verts, prims, first, flags = case
             named = [tuple(first + i for i in triangle) for triangle in indices]
@@ -290,6 +328,8 @@ def main(argv):
     if argv[1:2] == ['binary'] and len(argv) == 3:
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
+        status = draw(*argv[2:])
+    elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
     elif len(argv) == 1:
         controls()
