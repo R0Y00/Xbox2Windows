@@ -1483,6 +1483,7 @@ struct TranslatedIndirectDraw {
     IndirectIndexView indices;
     u64 shader_key = 0;
     const char* refusal = "translated pipeline or target unavailable";
+    const char* refusal_code = "pipeline_or_target_unavailable";
 };
 
 struct IndexedValidationPipeline {
@@ -1719,17 +1720,21 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (indirect && tr) indirect->shader_key = tr->key;
     std::uint32_t d16_unorm16[32] = {};
     if (!tr || tr->state != 1 || !d16_srvs_ready(*tr, pass, d16_unorm16)) {
+        if (indirect && tr)
+            indirect->refusal_code = tr->state != 1 ? "translation_not_ready" : "d16_srv_not_ready";
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
     if (indirect) {
         if (!bound->guest_root || bound->guest_root != pass.root) {
             indirect->refusal = "translated draw requires the guest pipeline's root signature";
+            indirect->refusal_code = "missing_guest_root";
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
         if (indexed && pass.compute_pipeline) {
             indirect->refusal = "indexed validation cannot replace a live guest compute pipeline";
+            indirect->refusal_code = "live_compute_pipeline";
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
@@ -1751,13 +1756,19 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
         if (!*entry || tr->samplers.heap) {
             indirect->refusal = "translated draw uses an unsupported resource or draw-dependent entry value";
+            indirect->refusal_code = "unsupported_resource_or_entry";
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
     }
     ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
-    if (indexed_rect && !pipeline) indirect->refusal = "translated indexed rectangle geometry unavailable";
+    if (indexed_rect && !pipeline) {
+        indirect->refusal = "translated indexed rectangle geometry unavailable";
+        indirect->refusal_code = "indexed_rect_unavailable";
+    }
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+        if (indirect && !(indexed_rect && !pipeline))
+            indirect->refusal_code = !pipeline ? "pipeline_unavailable" : "sampler_heap_unavailable";
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -1865,6 +1876,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             if (indirect && (!texture || record.slot != 18 || texture == pass.target0)) {
                 indirect->refusal = "translated draw requires a matching sampled texture distinct from the target";
+                indirect->refusal_code = "sampled_texture_mismatch";
                 ReleaseSRWLockExclusive(&draw_lock);
                 return false;
             }
@@ -1891,6 +1903,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             if (indirect && !texture) {
                 indirect->refusal = "translated draw could not bind its sampled texture";
+                indirect->refusal_code = "sampled_texture_unbindable";
                 ReleaseSRWLockExclusive(&draw_lock);
                 return false;
             }
@@ -1928,6 +1941,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (!view.resource || view.resource == indirect->argument || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) {
                 indirect->refusal = srv.source == 1 ? "translated indexed draw requires a complete GPU-backed vertex stream"
                                                     : "translated draw requires a complete GPU-backed table buffer range";
+                indirect->refusal_code = srv.source == 1 ? "incomplete_vertex_stream" : "incomplete_table_buffer";
                 ReleaseSRWLockExclusive(&draw_lock);
                 return false;
             }
@@ -2060,6 +2074,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         validated = validate_indexed_arguments(self, list, *tr, *indirect, indexed_vertices);
         if (!validated) {
             indirect->refusal = "translated indexed argument validation could not be recorded";
+            indirect->refusal_code = "indexed_validation_failed";
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
@@ -2141,8 +2156,11 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
     TranslatedIndirectDraw draw{signature, argument, offset, indices};
     if (!draw_translated(self, indices.resource != nullptr, 0, 0, 0, 0, 0, &draw)) {
         static LONG refused;
-        if (draw.shader_key && first_calls(refused, 32))
-            log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);
+        if (draw.shader_key) {
+            const bool first_pair = indirect_draw_refusal_census.note(draw.shader_key, draw.refusal_code);
+            if (first_pair || first_calls(refused, 32))
+                log("x2w-render translated ExecuteIndirect Draw refused, shader %016llx: %s", draw.shader_key, draw.refusal);
+        }
         return draw.refusal;
     }
     InterlockedIncrement(&translated_draws);

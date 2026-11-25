@@ -39,6 +39,7 @@
 #include "startup_stubs/placed_buffer_range.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
+#include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/list_copy.h"
@@ -92,10 +93,12 @@ namespace {
 
 using u64 = std::uint64_t;
 constexpr int slot_count = 512;
-// Refused slot 70 calls and "token" texture nulls (memory_srv_census.h), printed with the five-second report.
+// Refused slot 70 calls, "token" texture nulls (memory_srv_census.h), and translated indirect draw
+// refusals per (pipeline key, reason) (per_reason_refusal_census.h), printed with the five-second report.
 x2w_startup::MemorySrvCensus memory_srv_census;
 x2w_startup::TokenNullCensus token_null_census;
 x2w_startup::MemorySrvWrites memory_srv_writes;
+x2w_startup::PerReasonRefusalCensus indirect_draw_refusal_census{"indirect-draw"};
 
 enum Kind : int {
     device_kind, queue_kind, fence_kind, allocator_kind, list_kind, descriptor_heap_kind, root_signature_kind,
@@ -4661,6 +4664,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         memory_srv_census.report([](const char* line) { log("%s", line); }, true);
         token_null_census.report([](const char* line) { log("%s", line); }, true);
         memory_srv_writes.report([](const char* line) { log("%s", line); }, true);
+        indirect_draw_refusal_census.report([](const char* line) { log("%s", line); }, true);
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
@@ -4682,6 +4686,7 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_census_report(char* out, 
     memory_srv_census.report(emit, false);
     token_null_census.report(emit, false);
     memory_srv_writes.report(emit, false);
+    if (indirect_draw_refusal_census.total()) indirect_draw_refusal_census.report(emit, false);
     if (out && capacity) out[length < capacity ? length : capacity - 1] = 0;
     return length;
 }

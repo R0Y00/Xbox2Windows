@@ -419,11 +419,9 @@ token null with zero words, and the R8 texels. The control publishes the support
 
 ### Per-reason refusal census per pipeline key
 
-[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) is a standalone,
-device-free header ready to be wired into runtime refusal callers (such as slot-67 compute dispatch
-and binding paths; it is not yet wired into `d3d12_xs_device.cpp` or the five-second report). It
-tracks every distinct `(key, reason)` refusal pair separately instead of overwriting earlier reasons on
-the same key with the last refusal:
+[`PerReasonRefusalCensus`](../src/startup_stubs/per_reason_refusal_census.h) tracks every distinct
+`(key, reason)` refusal pair separately instead of overwriting earlier reasons on the same pipeline key
+with the last refusal:
 
 - Up to 128 distinct `(key, reason)` pairs are stored with sanitized 64-byte reason strings, independent
   call counts, and `detail_entries = 8` first-seen detail budget hints; entries past the cap advance
@@ -431,6 +429,15 @@ the same key with the last refusal:
 - `report(emit, true)` skips emission when nothing changed since the previous periodic report and emits
   the summary line plus only the `(key, reason)` entries whose counts grew; `report(emit, false)`
   prints the full table without hiding the next periodic delta.
+- [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) and
+  [`d3d12_draw.inl`](../src/startup_stubs/d3d12_draw.inl) wire an `indirect-draw` census instance into
+  `draw_translated_indirect`: each refused translated indirect draw with a resolved shader key records
+  `(shader_key, refusal_code)` (for example `missing_guest_root`, `sampled_texture_mismatch`,
+  `unsupported_resource_or_entry`, `incomplete_table_buffer`), keeps logging the first occurrence of
+  each of the first 8 distinct `(key, reason)` pairs even after the 32-call refusal log limit is spent,
+  emits deltas in the five-second report, and appends the full `x2w-d3d12 indirect-draw refusals:` lines
+  to `x2w_d3d12_census_report` whenever at least one refusal occurred (leaving zero-refusal runs at the
+  existing four memory-SRV lines).
 
 Check without a device via
 `ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
@@ -438,6 +445,14 @@ the pass run verifies interleaved reasons across two keys, detail limits, overfl
 reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCensus` with
 `X2W_CENSUS_KEEP_LAST` and `X2W_CENSUS_KEEP_FIRST`, print both expected reasons with counts in their
 mismatch output, and are marked `WILL_FAIL`.
+
+Check the runtime wiring on WARP and hardware via
+`ctest --preset dev --no-tests=error -R '^startup_indirect_translated_refusal_census_(warp|hardware|control_warp)$' -V`:
+the pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
+key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
+succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
+and both per-call log lines for the shared key; the control replaces the second refusal on key 1 with a
+valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.
 
 ## Root constant buffer views
 
