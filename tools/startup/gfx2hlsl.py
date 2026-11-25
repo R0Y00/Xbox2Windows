@@ -3083,8 +3083,8 @@ VEC_H = {
     'v_add_f16': (2, 'h', '{0} + {1}', 'h'), 'v_sub_f16': (2, 'h', '{0} - {1}', 'h'),
     'v_subrev_f16': (2, 'h', '{1} - {0}', 'h'), 'v_mul_f16': (2, 'h', '{0} * {1}', 'h'),
     'v_min_f16': (2, 'h', 'min({0}, {1})', 'h'), 'v_max_f16': (2, 'h', 'max({0}, {1})', 'h'),
-    'v_fmac_f16': (2, 'h', '{0} * {1} + {2}', 'h'), 'v_fmamk_f16': (3, 'h', '{0} * {1} + {2}', 'h'),
-    'v_fmaak_f16': (3, 'h', '{0} * {1} + {2}', 'h'),
+    'v_fmac_f16': (2, 'h', 'fma16o({0}, {1}, {2})', 'h'), 'v_fmamk_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
+    'v_fmaak_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
     'v_cvt_f16_i16': (1, 'i16', '{0}', 'h'), 'v_cvt_f16_u16': (1, 'u16', '{0}', 'h'),
     'v_cvt_i16_f16': (1, 'h', 'isnan({0}) ? 0u : (uint(int(clamp(trunc({0}), -32768.0, 32767.0))) & 0xffffu)', 'u'),
     'v_cvt_u16_f16': (1, 'h', 'isnan({0}) ? 0u : uint(clamp(trunc({0}), 0.0, 65535.0))', 'u'),
@@ -3373,6 +3373,19 @@ class Pipeline:
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
                ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
+               # a * b + c for binary16 inputs with one rounding (#2073): the product is exact in binary32, TwoSum recovers
+               # the error of the binary32 sum, and an inexact even result moves to the odd neighbour toward the true
+               # value (round to odd), so the f16rn that follows is the only rounding that can change the result.
+               'float fma16o(float a, float b, float c) {',
+               '    precise float p = a * b;',
+               '    precise float s = p + c;',
+               '    precise float t = s - p;',
+               '    precise float e = (p - (s - t)) + (c - t);',
+               '    if (!isfinite(s) || e == 0.0) return s;',
+               '    uint u = asuint(s);',
+               '    if ((u & 1u) == 0u) u = ((e > 0.0) == (s > 0.0)) ? u + 1u : u - 1u;',
+               '    return asfloat(u);',
+               '}',
                # binary32 to binary16 rounded to nearest even: f32tof16 truncates, a binary16 result must round (#1723).
                'uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
                ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'

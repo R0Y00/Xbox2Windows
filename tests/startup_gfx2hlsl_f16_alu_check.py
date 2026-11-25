@@ -37,6 +37,24 @@ def f2h(value):
     return struct.unpack('<H', struct.pack('<e', value))[0]
 
 
+def r32(x):
+    return struct.unpack('<f', struct.pack('<f', x))[0]
+
+
+def fma16o(a, b, c):
+    """Python model of the HLSL fma16o helper: every operation rounded to binary32, round to odd on the sum."""
+    p = r32(a * b)
+    s = r32(p + c)
+    t = r32(s - p)
+    e = r32(r32(p - r32(s - t)) + r32(c - t))
+    if not math.isfinite(s) or e == 0.0:
+        return s
+    u = struct.unpack('<I', struct.pack('<f', s))[0]
+    if u & 1 == 0:
+        u = u + 1 if (e > 0.0) == (s > 0.0) else u - 1
+    return struct.unpack('<f', struct.pack('<I', u))[0]
+
+
 def stage():
     s = G.Stage.__new__(G.Stage)
     s.lines, s.sym, s.used_s, s.used_v, s.masks = [], {}, set(), set(), set()
@@ -53,7 +71,7 @@ def run(asm, regs):
     dst, expr = re.fullmatch(r'(v\d+) = (.*);', s.lines[0]).groups()
     env = {f'v{i}': v for i, v in enumerate(regs)}
     env.update(
-        f16tof32=lambda x: h2f(x), f16rn=lambda x: f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00), saturate=lambda x: min(max(x, 0.0), 1.0),
+        f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00), saturate=lambda x: min(max(x, 0.0), 1.0),
         abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
         trunc=lambda x: float(int(x)), isnan=math.isnan,
         asint=lambda x: x - (1 << 32) if x >> 31 else x, float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
@@ -76,6 +94,11 @@ CASES = [
     ('v_fmac_f16 v2, v0, v1', [TWO, THREE, ONE], f2h(7.0)),
     ('v_fmamk_f16 v3, v0, 0x4000, v1', [THREE, ONE], f2h(7.0)),
     ('v_fmaak_f16 v3, v0, v1, 0x3c00', [THREE, TWO], f2h(7.0)),
+    # Binary32 sum then binary16 would be one unit low on each (#2073); one rounding gives these words.
+    ('v_fmac_f16 v2, v0, v1', [0x4a54, 0x1ef4, 0x4e2d], 0x4e33),
+    ('v_fmac_f16 v2, v0, v1', [0x51ea, 0xbf3e, 0x1d5f], 0xd55b),
+    ('v_fmac_f16 v2, v0, v1', [0x2bd5, 0xbe83, 0x4528], 0x450f),
+    ('v_fmac_f16 v2, v0, v1', [0x3915, 0x387a, 0x4b71], 0x4b9f),
     ('v_add_f16 v3, 1.0, v1', [0, TWO], THREE),
     ('v_mul_f16 v3, 0.15915494, v1', [0, f2h(100.0)], f2h(h2f(f2h(0.15915494)) * 100.0)),
     ('v_mul_f16 v3, 0.15915494, v1', [0, 0x3002], 0x251b),

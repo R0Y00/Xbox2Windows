@@ -110,6 +110,10 @@ F = G_
 ARITH = [(F['1'], F['2']), (F['3'], F['m1']), (F['0.1'], F['0.3']), (F['100'], F['1000']),
          (F['m2.5'], F['half']), (F['1.5'], F['7']), (F['300'], F['m3']), (F['3.25'], F['2.75'])]
 ACC = [F['1'], F['m1'], F['half'], F['100'], F['2'], F['0'], F['3'], F['7']]
+# (a, b, c) binary16 triples where rounding the binary32 sum and then binary16 differs from one rounding (#2073).
+# Measured on AMD RX 9070 XT and WARP: the earlier f16rn(a*b + c) lowering was one binary16 unit low on each.
+FMAC_DOUBLE_ROUNDING = [(0x4a54, 0x1ef4, 0x4e2d), (0x51ea, 0xbf3e, 0x1d5f), (0x2bd5, 0xbe83, 0x4528),
+                        (0x3915, 0x387a, 0x4b71)]
 INTS = [(0x0003, 0), (0xfffd, 0), (0x8403, 0), (0x7fff, 0), (0x8000, 0), (0, 0), (0xffff, 0), (0x00ff, 0)]
 FLOATS = [(F['2.75'], 0), (F['m2.75'], 0), (F['60000'], 0), (F['m60000'], 0), (F['half'], 0), (F['m1'], 0),
           (F['100'], 0), (f2h(0.99951171875), 0)]
@@ -121,6 +125,9 @@ for _name, (_arity, _vop1, _ref) in OPS.items():
         DRAW[_name] = sets(FLOATS)
     else:
         DRAW[_name] = sets(ARITH, ACC if _name == 'v_fmac_f16' else None)
+# Four double-rounding lanes replace the first four fixture lanes of v_fmac_f16 (eight lanes stay two draws).
+DRAW['v_fmac_f16'] = [tuple(w | HIGH[(i + k) % 4] for k, w in enumerate(t)) for i, t in
+                      enumerate(FMAC_DOUBLE_ROUNDING)] + DRAW['v_fmac_f16'][4:]
 
 
 def body_source(op):
@@ -215,6 +222,12 @@ def controls():
     check('model: a negative value converts to u16 zero', OPS['v_cvt_u16_f16'][2](F['m1'], 0, 0) == 0)
     check('model: NaN converts to zero', OPS['v_cvt_i16_f16'][2](0x7e00, 0, 0) == 0)
     check('model: 0xfffd is -3 as i16', OPS['v_cvt_f16_i16'][2](0xfffd, 0, 0) == F['m3'])
+    for a, b, c, want in ((0x4a54, 0x1ef4, 0x4e2d, 0x4e33), (0x51ea, 0xbf3e, 0x1d5f, 0xd55b),
+                          (0x2bd5, 0xbe83, 0x4528, 0x450f), (0x3915, 0x387a, 0x4b71, 0x4b9f)):
+        check('model: fmac %04x*%04x+%04x is one rounding' % (a, b, c), OPS['v_fmac_f16'][2](a, b, c) == want)
+    check('draw: fmac covers the double-rounding triples',
+          all(tuple(w & 0xffff for w in x) in FMAC_DOUBLE_ROUNDING
+                                            for x in DRAW['v_fmac_f16'][:4]))
     for op in OPS:
         check('%s: every draw reference has a zero upper half' % op,
               all(reference(op, x) >> 16 == 0 for x in DRAW[op]))
