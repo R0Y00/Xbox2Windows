@@ -740,7 +740,7 @@ bool dstorage_checks() {
         bool bounds_ok = true;
         for (unsigned i = 0; i < 3; ++i) {
             const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
-            bounds_ok &= hr == (i == 1 ? E_FAIL : S_OK);
+            bounds_ok &= hr == (i == 1 ? HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) : S_OK);
             for (unsigned j = 0; j < 6; ++j)
                 bounds_ok &= destinations[i][j] == (i == 0 && j >= 1 && j <= 4 ? 0 : 0xa5);
         }
@@ -1836,7 +1836,8 @@ bool dstorage_directory_batches()
     const wchar_t* names[]{L"small.ttpf", L"large.ttpf"};
     for (unsigned i = 0; i < 2; ++i)
         if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, names[i], nullptr, &files[i])) return false;
-    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, nullptr, nullptr, &object)) return false;
+    const unsigned char queue_description[0x20] = {};
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, queue_description, nullptr, &object)) return false;
     auto* queue = static_cast<Object*>(object);
     const unsigned count = static_cast<unsigned>(requests.size());
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, count, "directory", nullptr, &object)) return false;
