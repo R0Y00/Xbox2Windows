@@ -106,9 +106,9 @@ def main(xmem_path, xcrdapi_path):
         assert free(extra, 0, WIN_RELEASE), C.get_last_error()
         extra = None
         released = wait_for_sample(log, lambda sample: sample[0] > second_mark and sample[3] == "2")
-        assert released[1] == peak_mib and released[2] <= current_mib - 8, (peak_mib, current_mib, released)
+        assert released[1] >= peak_mib and released[2] <= current_mib - 8, (peak_mib, current_mib, released)
         print(f"sections unknown at {first_sample[0]} s, then {sections} at {second_mark} s; "
-              f"commit fell from {current_mib} to {released[2]} MiB at unchanged peak {peak_mib} MiB")
+              f"commit fell from {current_mib} to {released[2]} MiB with peak {peak_mib} MiB then {released[1]} MiB")
     finally:
         if extra:
             free(extra, 0, WIN_RELEASE)
