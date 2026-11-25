@@ -11,6 +11,7 @@ Instruction bytes are constructed from the field layout the checked-in decoder r
 (`tools/disasm_rdna2.py`, VOP3A branch): w0 [9:8] abs for src1 and src0; w1 [31:29] neg.
 """
 import os
+import re
 import struct
 import sys
 
@@ -148,9 +149,9 @@ def without_abs(sets):
 
 def check_draw(dxc, renderer, adapter, fxc=None):
     text = G.Pipeline(vs_words(DRAW_SETS[0]), PS_WORDS, root_blob()).hlsl_ps()
-    if text.count('0x7fffffffu') != 4:
+    if ''.join(l for l in text.splitlines() if l.strip().startswith('v1') and ' = (' in l).count('0x7fffffffu') != 4:
         raise AssertionError('expected four abs masks in the emitted select\n' + text)
-    mutated = text.replace('& 0x7fffffffu', '& 0xffffffffu')
+    mutated = re.sub(r'(v1[2-5] = .*)& 0x7fffffffu', lambda m: m.group(1) + '& 0xffffffffu', text)
     compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
