@@ -55,10 +55,21 @@ void fail(const std::string& name, const std::string& what)
     ++failures;
 }
 
-bool refused_factor(std::uint32_t f, bool alpha_factor)
+// alpha_field: SrcBlendAlpha / DestBlendAlpha, where CONSTANT_ALPHA reads the constant's alpha as
+// CONSTANT_COLOR does, so BLEND_FACTOR expresses it without the alpha blend factor feature.
+bool refused_factor(std::uint32_t f, bool alpha_factor, bool alpha_field = false)
 {
     return f == BOTH_SRC_ALPHA || f == BOTH_INV_SRC_ALPHA || f > ONE_MINUS_CONSTANT_ALPHA ||
-           (!alpha_factor && (f == CONSTANT_ALPHA || f == ONE_MINUS_CONSTANT_ALPHA));
+           (!alpha_factor && !alpha_field && (f == CONSTANT_ALPHA || f == ONE_MINUS_CONSTANT_ALPHA));
+}
+
+// The D3D12 factor of a BlendOp value in SrcBlendAlpha / DestBlendAlpha for a device with or without
+// AlphaBlendFactorSupported.
+D3D12_BLEND want_alpha(std::uint32_t f, bool alpha_factor)
+{
+    if (!alpha_factor && f == CONSTANT_ALPHA) return D3D12_BLEND_BLEND_FACTOR;
+    if (!alpha_factor && f == ONE_MINUS_CONSTANT_ALPHA) return D3D12_BLEND_INV_BLEND_FACTOR;
+    return alpha_slot[f];
 }
 
 const char* factor_reason(std::uint32_t f)
@@ -98,7 +109,7 @@ void expect_blend(const std::string& name, const Decoded& d, const Want& w, std:
     }
 }
 
-D3D12_BLEND want_dest_alpha(std::uint32_t f) { return colour_dest_alpha ? colour_slot[f] : alpha_slot[f]; }
+D3D12_BLEND want_dest_alpha(std::uint32_t f, bool alpha_factor) { return colour_dest_alpha ? colour_slot[f] : want_alpha(f, alpha_factor); }
 
 // Each 5-bit value in each slot, with the other three slots at ONE / ZERO.
 void check_slots()
@@ -112,15 +123,15 @@ void check_slots()
                 const auto d = x2w_cb_blend::decode(control_word(v[0], ADD, v[1], v[2], ADD, v[3], true, true), 0xF, alpha_factor);
                 const std::string name = std::string(slot_names[slot]) + " factor " + std::to_string(f) +
                                          (alpha_factor ? " (alpha blend factor)" : "");
-                if (refused_factor(f, alpha_factor)) {
+                if (refused_factor(f, alpha_factor, slot >= 2)) {
                     expect_refused(name, d, factor_reason(f));
                     continue;
                 }
                 Want w{D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD};
                 if (slot == 0) w.s = colour_slot[f];
                 if (slot == 1) w.d = colour_slot[f];
-                if (slot == 2) w.sa = alpha_slot[f];
-                if (slot == 3) w.da = want_dest_alpha(f);
+                if (slot == 2) w.sa = want_alpha(f, alpha_factor);
+                if (slot == 3) w.da = want_dest_alpha(f, alpha_factor);
                 expect_blend(name, d, w);
             }
         }
@@ -140,7 +151,7 @@ void check_slots()
             expect_blend("shared source factor " + tag, as_source,
                          {colour_slot[f], D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, alpha_slot[f], D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD});
             expect_blend("shared destination factor " + tag, as_dest,
-                         {D3D12_BLEND_ONE, colour_slot[f], D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, want_dest_alpha(f), D3D12_BLEND_OP_ADD});
+                         {D3D12_BLEND_ONE, colour_slot[f], D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, want_dest_alpha(f, alpha_factor), D3D12_BLEND_OP_ADD});
         }
     }
 }
@@ -233,7 +244,12 @@ void check_words()
     expect_blend("raw 74331291 (alpha blend factor)", x2w_cb_blend::decode(0x74331291, 0xF, true),
                  {D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA, D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_ALPHA_FACTOR,
                   D3D12_BLEND_INV_ALPHA_FACTOR, D3D12_BLEND_OP_SUBTRACT});
-    expect_refused("raw 74331291", x2w_cb_blend::decode(0x74331291, 0xF, false), "CONSTANT_ALPHA");
+    // Without the feature, CONSTANT_ALPHA on the alpha channel is the blend factor's alpha.
+    expect_blend("raw 74331291", x2w_cb_blend::decode(0x74331291, 0xF, false),
+                 {D3D12_BLEND_SRC1_ALPHA, D3D12_BLEND_INV_SRC1_ALPHA, D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_BLEND_FACTOR,
+                  D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_OP_SUBTRACT});
+    // In a colour slot it needs ALPHA_FACTOR: the same fields swapped between the channels.
+    expect_refused("raw 72911433", x2w_cb_blend::decode(0x72911433, 0xF, false), "CONSTANT_ALPHA");
 }
 }  // namespace
 
