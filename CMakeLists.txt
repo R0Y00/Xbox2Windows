@@ -3555,6 +3555,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     add_test(NAME spirv_window_checks COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/spirv_sampler_split_check.py")
+    add_test(NAME spirv_address_window_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/spirv_address_window_check.py")
     # Outside a Git checkout, such as a source archive, the tracked-path check cannot run.
     set_tests_properties(docs_links PROPERTIES SKIP_RETURN_CODE 77)
 
