@@ -62,10 +62,10 @@ FAKE_USER_WARN = re.compile(
     r'Write-Warning\s+"Without -FakeUser, user API calls go to the host gaming runtime',
     re.I | re.S,
 )
-FAKE_USER_WARN_LINE = (
-    'Write-Warning "Without -FakeUser, user API calls go to the host gaming runtime '
-    '(docs/startup-runtime.md)."'
+FAKE_USER_WARNING = (
+    "Without -FakeUser, user API calls go to the host gaming runtime (docs/startup-runtime.md)."
 )
+FAKE_USER_WARN_LINE = f'Write-Warning "{FAKE_USER_WARNING}"'
 
 
 def decode(raw):
@@ -80,7 +80,7 @@ def alive(pid):
     return f'"{pid}"' in out.stdout
 
 
-def run_case(shell, script, code, work, translate=False, switches=(), passed=()):
+def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
@@ -100,6 +100,9 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=())
     exe.write_bytes(b"")
     data.mkdir()
     env = dict(os.environ)
+    env.pop("X2W_FAKE_USER", None)
+    if fake_user_env:
+        env["X2W_FAKE_USER"] = "1"
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
     # goes first so the stub runs under the Python that runs this check.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
@@ -118,9 +121,12 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=())
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
     printed = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    if printed != STUB_LINES[:HEAD_LINES]:
-        found.append(f"stub exit {code}: printed {printed} instead of the first {HEAD_LINES} "
-                     f"debugger lines (stderr: {out.stderr.strip()!r})")
+    want_output = STUB_LINES[:HEAD_LINES]
+    if not fake_user_env and "-FakeUser" not in switches:
+        want_output = [f"WARNING: {FAKE_USER_WARNING}", *want_output]
+    if printed != want_output:
+        found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
+                     f"(stderr: {out.stderr.strip()!r})")
     summary = Path(str(log) + ".out")
     if not summary.is_file():
         found.append(f"stub exit {code}: {summary.name} was not written")
@@ -153,6 +159,10 @@ def run_problems(shell, script, work, first_only):
         found += run_case(shell, script, code, work)
         if found and first_only:
             return found
+    found += run_case(shell, script, 0, work, switches=["-FakeUser"])
+    found += run_case(shell, script, 0, work, fake_user_env=True)
+    if found and first_only:
+        return found
     # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
     if found and first_only:
@@ -238,9 +248,6 @@ def main():
                 continue
             mutants = mutants_of(script)
             if shells:
-                # The FakeUser warning is asserted by text_problems below; an executed
-                # run still succeeds without it, so it is not a shell mutant.
-                mutants.pop("no FakeUser warning", None)
                 # only an executed run can see the translator outlive the script
                 stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
                 mutants["translator left running"] = None if stopless == script else stopless
@@ -249,14 +256,6 @@ def main():
             for label, mutant in mutants.items():
                 if mutant is None or not check(mutant, True):
                     failures.append(f"{name}: mutant '{label}' was not detected")
-        if shells:
-            # Windows hosts that execute the script still need the FakeUser text gate.
-            text_bad = text_problems(script)
-            failures += [f"text: {item}" for item in text_bad]
-            if not text_bad:
-                no_warn = mutants_of(script).get("no FakeUser warning")
-                if no_warn is None or not text_problems(no_warn):
-                    failures.append("text: mutant 'no FakeUser warning' was not detected")
     for item in failures:
         print("FAIL", item)
     print(f"startup run.ps1 exit code: {len(failures)} failed ({mode})")
