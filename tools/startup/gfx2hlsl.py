@@ -2782,7 +2782,11 @@ class Stage:
         a = '(%s / 3)' % n
         b = '((%s - %s) / 2)' % (n, a)
         c = '(%s - %s - %s)' % (n, a, b)
-        expr = '((%s * exp2(float(%s))) * exp2(float(%s))) * exp2(float(%s))' % (self.f(ops[1]), a, b, c)
+        # A NaN keeps its word: the product would give a payload the hardware chooses (an RTX 3070 Ti reads
+        # 0x7fc00000 * 2^k back as 0x7fffffff).
+        bits = self.float_bits(ops[1])
+        expr = 'F(((%s & 0x7fffffffu) > 0x7f800000u) ? %s : U(((%s * exp2(float(%s))) * exp2(float(%s))) * exp2(float(%s))))' % (
+            bits, bits, self.f(ops[1]), a, b, c)
         self.set_vf(reg_range(ops[0])[1], expr, mods)
 
     def op_v_readfirstlane_b32(self, ops, mods):

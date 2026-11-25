@@ -34,12 +34,22 @@ def f32(x):
         return math.copysign(math.inf, x)
 
 
+class F32(float):
+    """binary32 value that keeps its source word: struct.unpack('<f') sets the quiet bit of a signaling NaN on
+    some Python builds (3.11, 3.12), so F() -> U() would change the word."""
+    word = None
+
+
 def bits(x):
+    if isinstance(x, F32) and x.word is not None:
+        return x.word
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
 
 def value(word):
-    return struct.unpack('<f', struct.pack('<I', word & MASK))[0]
+    r = F32(struct.unpack('<f', struct.pack('<I', word & MASK))[0])
+    r.word = word & MASK
+    return r
 
 
 def to_int(x):
