@@ -42,3 +42,19 @@ for words in ([CVT_V4, S_BRANCH_NEXT, READ_V4, END],
     else:
         raise AssertionError("accepted an unproven readfirstlane: %r" % (words,))
 print("readfirstlane with branches: block-local proof accepted; three unproven reads rejected")
+
+
+# The whole-program scan: implicit exec writes, a per-lane SCC and m0 must reach an earlier block through a loop.
+def scan(*asm):
+    stage = gfx.Stage.__new__(gfx.Stage)
+    stage.ins = [(4 * i, 1, line.split()[0], line) for i, line in enumerate(asm)]
+    return stage.scan_branch_safety()
+
+
+assert not scan("s_andn2_wrexec_b64 s[2:3], s[4:5]")[0]
+assert not scan("s_andn2_wrexec_b32 s2, s4")[0]
+tainted = scan("v_cmp_lt_f32 vcc_lo, v1, v2", "s_cmp_eq_u32 vcc_lo, 0", "s_cselect_b32 s2, 1, 0")[1]
+assert 2 in tainted, tainted
+assert 2 in scan("v_cmp_lt_f32 vcc_lo, v1, v2", "s_mov_b32 m0, vcc_lo", "s_mov_b32 s2, m0")[1]
+assert 2 not in scan("s_mov_b32 s3, 5", "s_cmp_eq_u32 s3, 0", "s_cselect_b32 s2, 1, 0")[1]
+print("readfirstlane branch scan: wrexec, per-lane SCC and m0 are tracked")

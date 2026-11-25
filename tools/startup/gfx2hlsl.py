@@ -735,32 +735,47 @@ class Stage:
 
     def scan_branch_safety(self):
         """-> (proof_ok, tainted_s) for a program with branches. VGPR uniformity is proven inside one basic block
-        only (see translate), and only when no instruction anywhere writes exec, so exec_known holds on every path.
-        tainted_s holds each scalar register that can carry a per-lane value (a compare or exec-derived mask),
-        found over the whole program because a loop can bring a later write back to an earlier read."""
-        lane_names = ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+        only (see translate), and only when no instruction anywhere writes exec (including the implicit writes of
+        saveexec, wrexec and v_cmpx), so exec_known holds on every path. tainted_s holds each scalar register
+        (and 'm0') that can carry a per-lane value: a compare, an exec-derived mask, or a select on a per-lane SCC.
+        It is found over the whole program because a loop can bring a later write back to an earlier read."""
+        lane_names = ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi', 'vccz', 'execz')
         parsed = []
         proof_ok = True
         for _, _, name, asm in self.ins:
             _, ops, _ = parse(asm)
             parsed.append((name, ops))
-            if ops and (ops[0] in ('exec', 'exec_lo', 'exec_hi') or 'saveexec' in name or name.startswith('v_cmpx')):
+            if (ops and ops[0] in ('exec', 'exec_lo', 'exec_hi')) or 'saveexec' in name or 'wrexec' in name or \
+                    name.startswith('v_cmpx'):
                 proof_ok = False
+
+        def keys(tok):
+            if tok == 'm0':
+                return ['m0']
+            r = reg_range(tok)
+            return list(range(r[1], r[2] + 1)) if r and r[0] == 's' else []
+
         tainted = set()
+        scc_tainted = False
         changed = True
         while changed:
             changed = False
             for name, ops in parsed:
-                dst = reg_range(ops[0]) if ops else None
-                if not dst or dst[0] != 's' or name.startswith('v_readfirstlane'):
+                if not ops or name.startswith('v_readfirstlane'):
                     continue
-                hot = name.startswith('v_cmp') or any(op in lane_names for op in ops[1:])
-                for tok in ops[1:]:
-                    src = reg_range(tok)
-                    if src and src[0] == 's' and any(r in tainted for r in range(src[1], src[2] + 1)):
-                        hot = True
-                if hot and not all(r in tainted for r in range(dst[1], dst[2] + 1)):
-                    tainted.update(range(dst[1], dst[2] + 1))
+                no_dst = re.match(r's_(cmp|bitcmp|cbranch)', name) is not None
+                srcs = ops if no_dst else ops[1:]
+                src_hot = any(tok in lane_names or any(k in tainted for k in keys(tok)) for tok in srcs)
+                # Any scalar op fed by a per-lane value may leave a per-lane SCC (compare, and/or, shifts, ...).
+                if name.startswith('s_') and src_hot and not scc_tainted:
+                    scc_tainted = changed = True
+                dst = [] if no_dst else keys(ops[0])
+                if not dst:
+                    continue
+                hot = name.startswith('v_cmp') or src_hot or (
+                    scc_tainted and re.match(r's_(cselect|cmov|addc|subb)', name) is not None)
+                if hot and not all(k in tainted for k in dst):
+                    tainted.update(dst)
                     changed = True
         return proof_ok, tainted
 
