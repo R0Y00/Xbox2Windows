@@ -2509,13 +2509,14 @@ class Stage:
         self.image(ops, mods, 'load_mip')
 
     def fixed_table_image(self, operand, name):
-        """The compute manifest binds the original table view, including all eight descriptor words."""
+        """Return the table location if the manifest can bind the original eight-word image view."""
         image = reg_range(operand)
         first = self.sym.get(image[1]) if image and image[0] == 's' and image[2] - image[1] == 7 else None
         if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 8:
             raise Unsupported('%s requires a fixed table image descriptor' % name)
         for i in range(8):
             word = first[:3] + (first[3] + i,)
+            # A write through a second load of this descriptor can leave these SGPR symbols intact.
             if self.sym.get(image[1] + i) != word or desc_key(word) in self.pipe.modified:
                 raise Unsupported('%s through a modified image descriptor' % name)
         return self.descriptor(operand)

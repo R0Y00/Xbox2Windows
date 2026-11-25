@@ -544,11 +544,11 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         throw std::runtime_error("Invalid compute image store reference");
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-    check(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
+    check(check_feature(device, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
           "Check texture UAV format");
     if (uav_load) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-        check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
+        check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
               "Check typed UAV loads for additional formats");
         if (!options.TypedUAVLoadAdditionalFormats) {
             std::puts("R32G32B32A32_FLOAT requires TypedUAVLoadAdditionalFormats");
