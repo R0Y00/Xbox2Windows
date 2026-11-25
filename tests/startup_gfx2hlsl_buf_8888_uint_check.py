@@ -41,6 +41,9 @@ def main():
         got = evaluate(word)
         assert got == want, (hex(word), got, want)
     assert [n for n, _ in translate()[1:]] == [8, 9, 10, 11]
+    # The vertex-fetch twin table: DXGI R8G8B8A8_UINT (30) names this format, four bytes wide.
+    assert gfx2hlsl.FETCH_DXGI[30] == ('BUF_FMT_8_8_8_8_UINT', 4), gfx2hlsl.FETCH_DXGI.get(30)
+    assert all(name in gfx2hlsl.FETCH_FORMATS for name, _ in gfx2hlsl.FETCH_DXGI.values())
     print('ok')
 
 
