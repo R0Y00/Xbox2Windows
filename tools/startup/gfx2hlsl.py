@@ -447,6 +447,9 @@ def parse(asm):
 
 FLOATS = {'0.5': 0.5, '-0.5': -0.5, '1.0': 1.0, '-1.0': -1.0, '2.0': 2.0, '-2.0': -2.0, '4.0': 4.0, '-4.0': -4.0,
           '0.15915494': 0.15915494}
+INLINE_F16 = {'0.5': 0x3800, '-0.5': 0xb800, '1.0': 0x3c00, '-1.0': 0xbc00,
+              '2.0': 0x4000, '-2.0': 0xc000, '4.0': 0x4400, '-4.0': 0xc400,
+              '0.15915494': 0x3118}
 
 
 def fbits(x):
@@ -4240,34 +4243,73 @@ class Stage:
         self.attrs.setdefault(attr, set()).add(how)
         return attr, component
 
-    def mix(self, ops, mods, high):
-        """v_fma_mix{lo,hi}_f16: fma of operands that are f32 or f16 halves; the f16 result goes to one half."""
-        sel = [0, 0, 0]
+    def mix(self, ops, mods, dest_mode):
+        """v_fma_mix_f32 / v_fma_mix{lo,hi}_f16: fma of operands that are f32 or f16 halves."""
+        name = 'v_fma_mix_f32' if dest_mode == 'f32' else 'v_fma_mix%s_f16' % dest_mode
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands, expected 4' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        op_sel = [0, 0, 0]
+        op_sel_hi = [0, 0, 0]
+        seen = set()
+        clamp = False
         for m in mods:
-            if m.startswith('op_sel_hi:'):
-                sel = [int(x) for x in m[11:-1].split(',')]
-            elif m.startswith('op_sel:'):
-                raise Unsupported('op_sel on fma_mix')
-        def operand(tok, is_half):
+            if m == 'clamp' and 'clamp' not in seen:
+                seen.add('clamp')
+                clamp = True
+                continue
+            sel_match = re.fullmatch(r'(op_sel|op_sel_hi):\[([01],[01],[01])\]', m)
+            if not sel_match or sel_match.group(1) in seen:
+                raise Unsupported('%s with %s' % (name, m))
+            seen.add(sel_match.group(1))
+            bits = [int(x) for x in sel_match.group(2).split(',')]
+            if sel_match.group(1) == 'op_sel':
+                op_sel = bits
+            else:
+                op_sel_hi = bits
+        if any(hi and not f16 for hi, f16 in zip(op_sel, op_sel_hi)):
+            raise Unsupported('op_sel high half without op_sel_hi on fma_mix')
+
+        def operand(tok, is_half, is_hi):
             if not is_half or tok in ('-0', '0'):
                 return self.f(tok)
-            return 'f16tof32(%s)' % self.u(tok, low16_only=True)
-        expr = '%s * %s + %s' % tuple(operand(t, s) for t, s in zip(ops[1:4], sel))
-        if 'clamp' in mods:
+            neg, base_tok = self.split_neg(tok)
+            absolute = base_tok.startswith('|') and base_tok.endswith('|')
+            if absolute:
+                base_tok = base_tok[1:-1]
+            if base_tok in INLINE_F16:
+                word = '0x%04xu' % INLINE_F16[base_tok]
+            else:
+                word = self.u(base_tok, low16_only=not is_hi)
+            val = 'f16tof32(%s >> 16)' % word if is_hi else 'f16tof32(%s)' % word
+            if absolute:
+                val = 'abs(%s)' % val
+            return '(-%s)' % val if neg else val
+
+        expr = '%s * %s + %s' % tuple(operand(t, f16, hi) for t, f16, hi in zip(ops[1:4], op_sel_hi, op_sel))
+        d = dst[1]
+        if dest_mode == 'f32':
+            self.set_vf(d, expr, ('clamp',) if clamp else ())
+            return
+        if clamp:
             expr = 'saturate(%s)' % expr
-        d = reg_range(ops[0])[1]
         self.used_v.add(d)
-        if high:
+        if dest_mode == 'hi':
             self.set_v(d, '(v%d & 0xffffu) | (f32tof16(%s) << 16)' % (d, expr))
         else:
             keep_low16 = d in self.low16_only_v
             self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(%s)' % (d, expr), low16_only=keep_low16)
 
+    def op_v_fma_mix_f32(self, ops, mods):
+        self.mix(ops, mods, 'f32')
+
     def op_v_fma_mixlo_f16(self, ops, mods):
-        self.mix(ops, mods, False)
+        self.mix(ops, mods, 'lo')
 
     def op_v_fma_mixhi_f16(self, ops, mods):
-        self.mix(ops, mods, True)
+        self.mix(ops, mods, 'hi')
 
     def i64_words(self, tok):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
