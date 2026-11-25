@@ -48,6 +48,19 @@ def main():
         op, operands = bad.split(' ', 1)
         message = run(symbols, op, operands)
         assert isinstance(message, str) and 's_load destination' in message, (bad, message)
+    # The loaded descriptor replaced vcc: reads are refused until vcc is written again.
+    s = run(TABLE, 's_load_dwordx4', 's[104:107], s[4:5], 0x20')
+    for read in (lambda: s.u('vcc_lo'), lambda: s.emit('v0 = (vcc & 1) ? 1u : 0u;')):
+        try:
+            read()
+        except G.Unsupported as error:
+            assert 'vcc read' in str(error), error
+        else:
+            raise AssertionError('vcc read accepted after s_load into s[104:107]')
+    s.emit('vcc = (v1 == 0u) & 1;')
+    assert s.u('vcc_lo') == 'vcc'
+    s = run(TABLE, 's_load_dwordx4', 's[100:103], s[4:5], 0x20')
+    assert s.u('vcc_lo') == 'vcc'
     print('ok')
 
 

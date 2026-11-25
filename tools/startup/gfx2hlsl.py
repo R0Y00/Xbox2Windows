@@ -512,6 +512,8 @@ class Stage:
     def u(self, tok):
         """uint expression for a 32-bit operand."""
         if tok in ('vcc_lo', 'vcc'):
+            if getattr(self, 'vcc_lost', False):
+                raise Unsupported('vcc read after a descriptor load into s106/s107')
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
             return 'exec'
@@ -579,6 +581,14 @@ class Stage:
         return s[1] if s and s[0] == 'const' else None
 
     def emit(self, text):
+        if getattr(self, 'vcc_lost', False):
+            # s106/s107 hold a descriptor, so vcc has no modelled value until it is written again.
+            m = re.match(r'vcc = (.*);$', text)
+            rhs = m.group(1) if m else text
+            if re.search(r'\bvcc\b', rhs):
+                raise Unsupported('vcc read after a descriptor load into s106/s107')
+            if m:
+                self.vcc_lost = False
         self.lines.append(text)
 
     def set_v(self, n, expr):
@@ -849,6 +859,8 @@ class Stage:
         if base == 's_branch':
             return ('jump', int(ops[0].split('_')[1], 16))
         if base.startswith('s_cbranch_'):
+            if base[10:].startswith('vcc') and getattr(self, 'vcc_lost', False):
+                raise Unsupported('vcc read after a descriptor load into s106/s107')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
             return ('branch', cond, int(ops[0].split('_')[1], 16))
@@ -1414,6 +1426,8 @@ class Stage:
                 return
             for i in range(count):
                 self.sym[dst[1] + i] = ('desc', p[1], off, i)
+            if into_vcc:
+                self.vcc_lost = True
             return
         if into_vcc:
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
