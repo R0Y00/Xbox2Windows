@@ -9005,6 +9005,11 @@ the writer. `order` records a cross-queue wait, a shared wait, same-queue
 ordering or an omitted wait in a control. A `recorded` call reaches a
 desktop command list. A `forwarded` submission reaches the desktop queue.
 
+The paired trace fixture runs on WARP and hardware. An additional WARP
+control leaves the selector unset, supplies a nondecimal suffix, and supplies
+a value that would truncate to the ordered call's ordinal. Each control must
+pass the paired pixel readback without emitting any trace rows.
+
 The recent-copy rows search the last 1,024 submitted copy destinations
 recorded by the XMem lease tracker. These cover forwarded slot 15 and slot 17
 copies into eligible copied placements. A placement overlap is a candidate
