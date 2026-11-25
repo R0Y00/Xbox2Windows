@@ -2974,6 +2974,9 @@ class Stage:
             return self.export(asm)
         if base in (*LDS_EXCHANGE_OPS, 's_barrier'):
             if getattr(self, 'kind', None) != 'cs':
+                handler = getattr(self, 'op_' + base, None)
+                if handler:
+                    return handler(ops, mods)
                 raise Unsupported(base)
             # The refusal census continues past failed instructions. Scan this program only once.
             if not hasattr(self, 'lds_error'):
