@@ -620,6 +620,12 @@ def fbits(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
 
+def ptr_high_symbol(source, offset):
+    """High word of a 64-bit pointer advanced by a literal offset: the original word, or the one a completed
+    s_addc_u32 produced for exactly that accumulated offset (an advanced word never equals another offset's)."""
+    return ('ptrhi', source) if not offset else ('ptrhi', source, offset)
+
+
 # Sources whose pointer is a 64-bit register pair (the low word 'ptr', the high word 'ptrhi').
 PTR64_SOURCES = ('root', 'vbtab')
 
@@ -3418,17 +3424,17 @@ class Stage:
             added = int(srcs[1], 0)
             if added > 0xfffff:
                 raise Unsupported('descriptor pointer offset %s' % srcs[1])
-            offset = syms[0][2] if len(syms[0]) > 2 else 0
-            if not isinstance(offset, int):
+            before = syms[0][2] if len(syms[0]) > 2 else 0
+            if not isinstance(before, int):
                 raise Unsupported('add through a pointer with unknown byte offset')
-            if getattr(self, 'forward_table_adds', False) and offset + added > 0xfffff:
-                raise Unsupported('accumulated table pointer offset %#x' % (offset + added))
-            self.sym[d] = ('ptr', syms[0][1], offset + added)
+            if getattr(self, 'forward_table_adds', False) and before + added > 0xfffff:
+                raise Unsupported('accumulated table pointer offset %#x' % (before + added))
+            self.sym[d] = ('ptr', syms[0][1], before + added)
             if syms[0][1][0] in PTR64_SOURCES and d + 1 <= 105:
                 # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
                 # instruction starts so that the high-word add is accepted right behind it and nowhere else.
                 size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
-                self.ptr_low_add = (d, self.pc + size, syms[0][1])
+                self.ptr_low_add = (d, self.pc + size, syms[0][1], before, before + added)
                 # The pair stays open until the matching s_addc_u32 completes it. The high register is left as it
                 # is (in place it is still the original high source); a load through an open pair is refused.
                 self.__dict__.setdefault('ptr_open_pairs', set()).add(d)
@@ -3439,9 +3445,9 @@ class Stage:
         # The high operand is judged by what it holds, not by where it sits: a copied high word still counts.
         if (not mark or srcs[1] != '0' or not low or low[0] != 'ptr' or not hi or hi[0] != 's'
                 or mark[:2] != (d - 1, getattr(self, 'pc', 0)) or low[1] != mark[2]
-                or self.sym.get(hi[1]) != ('ptrhi', mark[2])):
+                or self.sym.get(hi[1]) != ptr_high_symbol(mark[2], mark[3])):
             return False
-        self.sym[d] = ('ptrhi', mark[2])
+        self.sym[d] = ptr_high_symbol(mark[2], mark[4])
         getattr(self, 'ptr_open_pairs', set()).discard(d - 1)
         # This s_addc_u32 is the only reader of the low add's elided carry; any other SCC reader stays refused.
         self.__dict__.setdefault('ptr_addc_pcs', set()).add(self.pc)
@@ -3918,10 +3924,10 @@ class Stage:
             # The 'added' mark (an add whose offset is not tracked, as in a program with branches): no byte offset.
             raise Unsupported('s_load through s%d: the pointer was advanced by an untracked offset' % base[1])
         base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
-        if (base_off or len(p) > 2) and p[1][0] in PTR64_SOURCES:
+        if p[1][0] in PTR64_SOURCES:
             # An advanced 64-bit pointer needs its high word completed by the matching s_addc_u32;
             # a table pointer is 32 bits wide and has no high word.
-            if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[1] + 1) != ('ptrhi', p[1]):
+            if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[1] + 1) != ptr_high_symbol(p[1], base_off):
                 raise Unsupported('s_load through s%d: its high word is not the matching advanced pair' % base[1])
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
         token = smem_offset(ops[2])
@@ -6616,6 +6622,43 @@ VEC_U = {
     'v_cvt_pk_i16_i32': (2, '(asuint(clamp(asint({0}), -32768, 32767)) & 0xffffu) | '
                             '(asuint(clamp(asint({1}), -32768, 32767)) << 16u)'),
 }
+
+
+def _mul24_hi_i32():
+    """High 32 bits of the 48-bit product of two signed 24-bit fields, in 32-bit integer arithmetic.
+
+    With a = ah * 2^12 + al (al in 0..4095, ah the sign-extended top 12 bits) the product is
+    hh * 2^24 + mid * 2^12 + lo, so p >> 12 = hh * 2^12 + t with t = mid + (lo >> 12), and
+    p >> 32 = (hh + (t >> 12)) >> 8 exactly (floor division nests), which stays inside 32 bits.
+    """
+    def top(n):
+        return '(asint({%d} << 8) >> 20)' % n
+
+    def low(n):
+        return 'asint({%d} & 0xfffu)' % n
+    hh = '(%s * %s)' % (top(0), top(1))
+    mid = '(%s * %s + %s * %s)' % (top(0), low(1), low(0), top(1))
+    t = '(%s + ((%s * %s) >> 12))' % (mid, low(0), low(1))
+    return 'asuint(((%s + (%s >> 12)) >> 8))' % (hh, t)
+
+
+VEC_U.update({
+    # AMD RDNA 2 ISA reference: the 24-bit multiplies read the low 24 bits of each source, the signed forms as a
+    # two's complement field. The mul and mad forms keep the low 32 bits of the product; the hi forms keep bits 63..32
+    # of the 48-bit product. The 24-bit field is sign-extended with a left shift of 8 and an arithmetic right shift.
+    # v_mul_hi_u32_u24 is deliberately not lowered. Its result is at most 0xffff, so as a float output word it is
+    # always a binary32 denormal, and FXC 10.0.26100 at ps_5_1 (the startup path) folds a float output whose
+    # provable range lies below 0x00800000 to a constant zero (any form tried, even a plain shift without a
+    # product). The same words through a uint4 output survive, and DXC keeps them. v_mul_hi_i32_i24 can reach
+    # the whole 32-bit range, so FXC keeps it. A refusal is visible; zeros are not.
+    'v_mul_hi_i32_i24': (2, _mul24_hi_i32()),
+    'v_xnor_b32': (2, '~({0} ^ {1})'),
+    # v_alignbit_b32 takes bits [S2[4:0] + 31 : S2[4:0]] of the 64-bit value {S0, S1}; a zero shift returns S1 and
+    # the guard avoids a shift by 32. v_alignbyte_b32 does the same with S2[1:0] * 8 bits.
+    'v_alignbit_b32': (3, '(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))'),
+    'v_alignbyte_b32': (3, '(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - ({2} & 3u) * 8u))))'),
+})
+
 VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 # Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
