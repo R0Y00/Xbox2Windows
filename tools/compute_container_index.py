@@ -2,12 +2,14 @@
 
 import argparse
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 import hashlib
 import json
 import mmap
 from pathlib import Path
 import re
 import struct
+import zlib
 
 from resource_inventory import scene_records
 
@@ -36,9 +38,34 @@ def dispatch_counts(trace):
     return counts
 
 
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_inputs(archive: Path, cache: Path, trace: Path | None) -> None:
+    if archive.is_dir():
+        raise ValueError(f"Archive path is a directory: {archive}")
+    if trace is not None and _same_path(trace, archive):
+        raise ValueError(f"Trace path collides with archive: {trace}")
+    if not archive.is_file():
+        raise ValueError(f"Archive path is not a regular file: {archive}")
+    if not cache.exists():
+        raise ValueError(f"Cache directory does not exist: {cache}")
+    if not cache.is_dir():
+        raise ValueError(f"Cache path is not a directory: {cache}")
+    if trace is not None:
+        if trace.is_dir():
+            raise ValueError(f"Trace path is a directory: {trace}")
+        if not trace.is_file():
+            raise ValueError(f"Trace path is not a regular file: {trace}")
+
+
 def build_index(archive, cache, trace):
+    _validate_inputs(archive, cache, trace)
     observed = dispatch_counts(trace) if trace is not None else None
-    request_paths = {match[1]: path for path in cache.iterdir()
+    request_paths = {match[1]: path for path in sorted(cache.iterdir())
                      if path.is_file() and (match := REQUEST.fullmatch(path.name))}
     keys = sorted(observed if observed is not None else request_paths)
     rows = {}
@@ -85,8 +112,12 @@ def build_index(archive, cache, trace):
             candidate = candidates[digest].setdefault(sha, {"sha256": sha, "hash_flags": flags, "records": 0})
             candidate["records"] += 1
 
-    with archive.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        inventory = scene_records(data, observe=observe)
+    with archive.open("rb") as stream:
+        if stream.seek(0, 2):
+            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                inventory = scene_records(data, observe=observe)
+        else:
+            inventory = scene_records(b"", observe=observe)
     for key, digest in digests.items():
         matches = sorted(candidates[digest].values(), key=lambda candidate: candidate["sha256"])
         if not matches:
@@ -108,18 +139,20 @@ def build_index(archive, cache, trace):
     }
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path, help="local archive with named shader records")
     parser.add_argument("cache", type=Path, help="local runtime cache containing req_<key>.c67 and .data files")
     parser.add_argument("--trace", type=Path, help="select keys from direct and indirect dispatch trace rows")
     args = parser.parse_args(argv)
     try:
+        _validate_inputs(args.archive, args.cache, args.trace)
         report = build_index(args.archive, args.cache, args.trace)
-    except (OSError, ValueError) as exc:
-        parser.error(str(exc))
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
+        parser.exit(1, f"{type(exc).__name__}: {exc}\n")
     print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

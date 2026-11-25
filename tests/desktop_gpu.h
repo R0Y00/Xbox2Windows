@@ -133,6 +133,9 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
 struct ComputeCommands {
     ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline,
                     D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    // Records on a new list for an existing queue of the list's type. Releasing the commands then
+    // leaves that queue alive.
+    ComputeCommands(ID3D12Device* device, ID3D12CommandQueue* existing, ID3D12PipelineState* pipeline);
     void submit_and_wait(ID3D12Device* device);
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
