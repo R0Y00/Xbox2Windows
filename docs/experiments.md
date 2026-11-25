@@ -14888,3 +14888,17 @@ check and requires the old exception to come back:
 The checks are `tests/startup_gfx2hlsl_handler_arity_check.py`, `…_image_arity_check.py`,
 `…_operand_count_check.py` and `…_scalar_arity_check.py`. They run on Linux and Windows without D3D12 or game
 data, because a refusal is observable at the `Stage` entry point.
+## Startup translator: v_sad_u8, v_sad_u16 and v_sad_u32
+
+[`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) now lowers the gfx1013 VOP3A unsigned sum-of-absolute-differences instructions `v_sad_u8` (`0x15a`), `v_sad_u16` (`0x15c`) and `v_sad_u32` (`0x15d`) in `VEC_U` to three on-demand preamble helpers emitted in `Pipeline.common()` only when referenced by a stage (`sad_u8`, `sad_u16`, `sad_u32`):
+
+- `sad_u8(uint a, uint b, uint c)` sums `uint(abs(int((a >> shift) & 0xffu) - int((b >> shift) & 0xffu)))` over shifts `0, 8, 16, 24`, plus `c` with 32-bit unsigned wraparound.
+- `sad_u16(uint a, uint b, uint c)` computes `uint(abs(int(a & 0xffffu) - int(b & 0xffffu))) + uint(abs(int(a >> 16) - int(b >> 16))) + c` with 32-bit unsigned wraparound.
+- `sad_u32(uint a, uint b, uint c)` computes `(a > b ? a - b : b - a) + c` using unsigned comparison rather than signed `int` subtraction.
+- Output modifiers (`clamp`, `omod`), `op_sel`, source `abs`/`neg` bits (checked in both `check_encoding` and `Stage.u`), and wrong operand counts remain refused with `Unsupported`.
+
+[`tests/startup_gfx2hlsl_sad_check.py`](../tests/startup_gfx2hlsl_sad_check.py) decodes synthetic gfx1013 VOP3A bytes via `G.decode()` only (no game data), verifies on-demand helper emission across `Pipeline` and `ComputePipeline`, evaluates the emitted HLSL across 600 edge/grid triples for `v_sad_u8`, 600 for `v_sad_u16` and 605 for `v_sad_u32` (covering `0xffffffff`, `0x80000000`, `0x7fffffff`, byte/halfword boundary carries and `S2` wraparound), checks all modifier/arity/unlowered refusals, and runs mutated-HLSL negative controls (dropped high byte, dropped high halfword, signed `int` subtraction). In `draw` mode on Microsoft WARP (`10.0.26100.9818`, DXC `ps_6_0` and FXC `10.0.26100` `ps_5_1`), all 18 good draws (9 per compiler) matched the Python reference and all 6 mutated draws (3 per compiler) produced the exact mutated readback words. The `_hardware` test was not run in this session.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sad_(controls|warp|hardware)$' -V
+```

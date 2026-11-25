@@ -367,6 +367,12 @@ def check_encoding(code, off, n, name, asm):
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0x700 or word1 & 0xe0000000:
             raise Unsupported('%s with neg/abs: not a 16-bit integer source modifier' % name)
+    if name in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32'):
+        # VOP3A integer SAD forms take no source abs/neg; refuse those bits here so neg on an inline
+        # integer does not print as -N and get accepted as a negative constant.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & 0x700 or word1 & 0xe0000000:
+            raise Unsupported('%s with neg/abs' % name)
     if name == 'v_cndmask_b32_e64':
         # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -2545,6 +2551,10 @@ class Stage:
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
             else:
                 args = [self.u(o) for o in ops[1:1 + arity]]
+            if base in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32'):
+                pipe = getattr(self, 'pipe', None)
+                if pipe is not None and isinstance(getattr(pipe, 'uses_sad', None), set):
+                    pipe.uses_sad.add(base)
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
             return self.scalar(base, ops)
@@ -5357,6 +5367,9 @@ VEC_U = {
     'v_ffbh_u32': (1, '({0} == 0u ? 0xffffffffu : 31u - firstbithigh({0}))'),
     'v_ffbh_i32': (1, '({0} == 0u || {0} == 0xffffffffu ? 0xffffffffu : 31u - firstbithigh(asint({0}) < 0 ? ~{0} : {0}))'),
     'v_bfrev_b32': (1, 'reversebits({0})'),
+    'v_sad_u8': (3, 'sad_u8({0}, {1}, {2})'),
+    'v_sad_u16': (3, 'sad_u16({0}, {1}, {2})'),
+    'v_sad_u32': (3, 'sad_u32({0}, {1}, {2})'),
 }
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 # Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
@@ -5513,6 +5526,7 @@ class Pipeline:
     vertex_kind = 'vs'
     uses_pack16_rne = False
     uses_gather_2d_lod = False
+    uses_sad = ()
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
@@ -5544,6 +5558,7 @@ class Pipeline:
         self.uses_sampler_heap = False
         self.uses_pack16_rne = False
         self.uses_gather_2d_lod = False
+        self.uses_sad = set()
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -5764,6 +5779,22 @@ class Pipeline:
                 '    return result;',
                 '}',
             ))
+        if 'v_sad_u8' in self.uses_sad:
+            out.append(
+                'uint sad_u8(uint a, uint b, uint c) {'
+                ' return uint(abs(int(a & 0xffu) - int(b & 0xffu)))'
+                ' + uint(abs(int((a >> 8) & 0xffu) - int((b >> 8) & 0xffu)))'
+                ' + uint(abs(int((a >> 16) & 0xffu) - int((b >> 16) & 0xffu)))'
+                ' + uint(abs(int((a >> 24) & 0xffu) - int((b >> 24) & 0xffu))) + c; }')
+        if 'v_sad_u16' in self.uses_sad:
+            out.append(
+                'uint sad_u16(uint a, uint b, uint c) {'
+                ' return uint(abs(int(a & 0xffffu) - int(b & 0xffffu)))'
+                ' + uint(abs(int(a >> 16) - int(b >> 16))) + c; }')
+        if 'v_sad_u32' in self.uses_sad:
+            out.append(
+                'uint sad_u32(uint a, uint b, uint c) {'
+                ' return (a > b ? a - b : b - a) + c; }')
         return out
 
     def interface(self, for_pixel):
@@ -5892,6 +5923,7 @@ class ComputePipeline(Pipeline):
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.uses_gather_2d_lod = False
+        self.uses_sad = set()
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: anything but a stride clear
         self.lod_unvalidated = set()
