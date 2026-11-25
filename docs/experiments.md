@@ -5654,6 +5654,26 @@ The `BFE` fixture in `tests/compute_store_check.py` is source-built in LLVM 15 s
 ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_absdiff_warp$' -V
 ```
 
+#### Descriptor size as a number, scalar compare and select
+
+A raw buffer descriptor loaded with `s_load_dwordx4` stays opaque, with one exception. Word 2 is `num_records`. When the descriptor has no stride (a raw view), the caller states that it equals the bound view's byte size, so `compute_store_aot.py` lowers a read of that word to `GetDimensions` on the bound view (`uav_bytes()` for the output descriptor, `srv_bytes()` for the source descriptor). The helper is declared only when the program uses it. The check binds 1280-byte raw views, so the word reads `0x500`.
+
+A scalar compare and select may then use it:
+
+- `s_cmp_eq_i32`, `s_cmp_eq_u32`, `s_cmp_lg_i32` and `s_cmp_lg_u32` set an SCC expression.
+- `s_cselect_b32 sD, a, b` returns `a` when that expression holds, otherwise `b`.
+- `v_writelane_b32` may take the size word as its scalar source.
+
+SCC survives only instructions that do not write it (`s_cselect_b32`, `s_mov_b32`, `s_movk_i32`, loads, `s_waitcnt`, `s_nop`, `s_clause` and vector instructions). Any other instruction clears it, and a select with no live SCC is refused with `Unverified SCC for scalar select`.
+
+Refused, each with a diagnostic: every other descriptor word, a descriptor with a stride, an image output, the constant buffer descriptor, a pending load, other compares (`s_cmp_lt_*`, 64-bit forms), `s_cselect_b64`, vector select operands and SCC branches. The earlier `s_cselect_b32` refusals in the store and absdiff checks now report the missing SCC instead of an unsupported instruction.
+
+`tests/compute_desc_numeric_check.py` holds the fixture, gfx1013 text in LLVM 15 spelling. `controls` checks the exact HLSL and the refusals. `draw` dispatches one thread on D3D12 and reads back `7, 13, 0x500, 0x500`. It also checks four wrong references and four mutated shaders, which must each fail. The draw test is registered but was not run on Linux, where there is no DXC or D3D12.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^(compute_desc_numeric_controls|compute_store_aot_desc_numeric_warp)$' -V
+```
+
 #### Signed scalar add, subtract and absolute value
 
 `s_add_i32 sD, a, b` (SOP2), `s_sub_i32 sD, a, b` (SOP2), and `s_abs_i32 sD, a` (SOP1) act on known 32-bit scalar words with wrap-around two's-complement semantics. Per the RDNA2 ISA, `s_add_i32` and `s_sub_i32` compute `(int64)S0.i32 +/- (int64)S1.i32` truncated to 32 bits, lowering to `({0} + {1})` and `({0} - {1})` in HLSL `uint` arithmetic; `s_abs_i32` computes `(S0.i32 < 0) ? -S0.i32 : S0.i32`, wrapping `0x80000000` (`INT_MIN`) to `0x80000000` and lowering to `asuint(abs(asint({0})))`. SCC (signed overflow for add/sub, nonzero result for abs) stays unread. Unknown or pending sources, destinations past `s105` or pending loads, literals wider than 32 bits, vector sources, modifiers (`clamp`, `mul:2`, `|...|`, `-s...`), other spellings (`s_add_i32_e64`, `s_abs_u32`), and SCC consumers (`s_cselect_b32`) are refused.
