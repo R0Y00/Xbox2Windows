@@ -14291,6 +14291,17 @@ cmake --build --preset release --target startup_stream_depth
 ctest --preset release --no-tests=error -R '^startup_stream_depth_(warp|hardware)$' -V
 ```
 
+## Startup translator: null-target export after a colour export
+
+`exp null, off, off, off, off done vm` writes no channel. The `vm` flag still emits the existing discard outside the entry execution mask, so a pixel shader that only discards keeps its kill; the null target itself adds no `SV_Target` and no write mask. A null export after `mrt0` leaves the colour target intact. `tests/startup_gfx2hlsl_export_null_check.py` covers the translation, classification and refusals. `tests/startup_gfx2hlsl_export_null_draw_check.py draw <dxc> <offscreen_check> <warp|hardware>` compiles a null-after-`mrt0` stage with DXC `ps_6_0`, draws 4x4 pixels, and compares all 64 words with the four constants the fixture writes; a control that writes `mrt0` from the null site must produce a pixel mismatch. Limits: this is translation and a mixed null-plus-colour draw, not a runtime PSO test with zero render-target views.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+python -B tests/startup_gfx2hlsl_export_null_check.py
+python -B tests/startup_gfx2hlsl_export_null_draw_check.py draw "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe" out/build/release/offscreen_check.exe warp
+ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_export_null' -V
+```
+
 ## Startup translator: depth-comparison image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_c_lz` and `image_sample_c` forms of a 2D texture to `tex.SampleCmpLevelZero(smp, float2(u, v), reference)` and; `image_sample_c` is lowered to `SampleCmpLevelZero` only when the sampler MAX_LOD is 0, and any other MAX_LOD is refused because the comparison sampler state ignores the mip filter and implicit mip selection is not lowered. The first address register is the reference, then u and v: `v[0:2]` compares `v0` at `(v1, v2)`, and the NSA list `[v3, v0, v1]` compares `v3` at `(v0, v1)`. Only `dmask:0x1` is lowered, and the result is the one float the comparison returns. The sampler must be four constant words that `pixel_aot.comparison_sampler_state` accepts (CLAMP_LAST_TEXEL, point or bilinear XY filter with the matching TRUNC_COORD, no anisotropy or bias); the comparison function is word 0 bits 14:12. It is bound as a `SamplerComparisonState` and written to the manifest as `smpc N w0 w1 w2 w3` beside the existing `smp` lines, so a sampler used by an ordinary sample and by a comparison gets two bindings. `src/startup_stubs/translated_sampler_bindings.h` builds the matching D3D12 static sampler (comparison filter 0x80 or 0x94, function = hardware function + 1) and keeps manifest order as register order.
