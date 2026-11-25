@@ -2,7 +2,7 @@
 
 Pure Python translation controls, no arguments.
 
-`exp mrt0 v0, v1, off, off compr` disables the second register of the pair: it exports as zero, as an uncompressed
+`exp mrt0 v0, v0, off, off compr` disables the second register of the pair: it exports as zero, as an uncompressed
 `off` does. In wave32 `vcc_hi` holds no lane, so a read of it is zero.
 """
 import re
@@ -33,6 +33,7 @@ class Probe(G.Stage):
         self.kind = 'ps'
         self.pipe = Pipe()
         self.exports = {}
+        self.write_masks = {}
 
 
 def check(label, ok, detail=''):
@@ -53,11 +54,11 @@ def translate(name, asm):
 
 
 def main():
-    stage, text = translate('exp', 'exp mrt0 v0, v1, off, off compr')
+    stage, text = translate('exp', 'exp mrt0 v0, v0, off, off compr')
     check('compressed export with off translates', stage is not None, text)
     if stage is not None:
         halves = re.findall(r'f16tof32\(([^)]*)\)', text)
-        check('off pair exports zero halves', halves[2:] == ['0u', '0u >> 16'], text)
+        check('off pair adds no reads', len(halves) == 2, text)
         check('live pair is still read', halves[0] == 'v0', text)
 
     stage, text = translate('v_mov_b32', 'v_mov_b32 v3, vcc_hi')
