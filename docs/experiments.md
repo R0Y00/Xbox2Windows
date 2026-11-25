@@ -3423,6 +3423,51 @@ all 1,024 pixels for each of the eight cases. Physical hardware and startup
 pipeline integration remain open in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45485172952)
 
+### Sampler heap samplers in bounded runtime mesh
+
+With `--sampler-heap-sgpr <n>` (off by default), `tools/mesh_dynamic_aot.py`
+lowers `image_sample_lz` of a 2D texture whose sampler is loaded from the sampler
+heap. Entry SGPR `s<n>` holds the 32-bit heap base. The sampler is
+`s_load_dwordx4` from that base (zero high word) plus a constant offset, or plus a
+register offset that every input case makes concrete through the existing
+geometry-word comparisons. The shader reads the table that `gfx2hlsl.py` uses
+with `X2W_SAMPLER_HEAP=1` ([#1217](https://github.com/R0Y00/Xbox2Windows/pull/1217),
+[#1237](https://github.com/R0Y00/Xbox2Windows/pull/1237)):
+`SamplerState qh[2048] : register(s0, space1)`, entry n at byte offset 16 n,
+entry 2047 reserved for the host fallback. The texture descriptor is the eight
+words at byte `0x40` of the `s17` table and becomes `Texture2D<float4> meshTexture
+: register(t1)`.
+
+Refused by name: an offset that still depends on an unknown geometry word, a
+constant offset that is not a 16-byte entry below 2047, a sampler word changed
+after the load, a heap word mixed with another value by `s_cselect`, a sampler
+operand that no longer holds the four words of one load, static sampler words,
+arithmetic on the heap base, a non-zero high address word, other image
+instructions and image modifiers. `s_mov` copies of the loaded words are kept.
+
+`tests/mesh_heap_sampler.s` is a source-built quad whose PARAM0 is one sample of a
+4x1 RGBA8 texture with a 2x1 second level at (1.25, 0.5). Geometry word 0 = `0x10`
+or `0x20` is the register offset; any other word takes the constant offset `0x30`.
+The four heap entries differ in address mode (wrap, clamp) and LOD clamp
+(`MIN_LOD` 0 or 1), so each path reads a different texel. Entry 0 holds zero words,
+the sampler of `gfx2hlsl.py`'s default shortcut. The expected colors come from an
+independent model of the program's control flow and of the sampler fields.
+
+```sh
+python -B tests/mesh_heap_sampler_check.py
+python -B tests/mesh_heap_sampler_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_heap_sampler_" -V
+```
+
+The CPU mode also removes each guard in turn (offset alignment and range, bounded
+offset, four words of one load) and requires the check to fail. The draw mode reads
+back five inputs, then three controls that must change the readback: entries 1
+and 2 swapped in the table, the translated shader with every entry replaced by
+entry 0 (the default sampler), and the bounded-offset guard removed from a
+program whose constant path loads through the register instead. The fixture
+decodes `MIN_LOD` and `MAX_LOD` from sampler word 1 itself; the stand-in's
+`decode_sampler` does not read them yet.
+
 ### Constant-lane scalar spills in bounded mesh
 
 The bounded mesh translator models two wave64s and follows each wave's concrete

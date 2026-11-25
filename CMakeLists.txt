@@ -1317,7 +1317,7 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_sampler_x.hlsl"
     DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
-target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
+target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp tests/mesh_heap_sampler_draw.cpp)
 # Sampler word decoding, manifest lines and title sampler snapshots behind those draws
 # (src/startup_stubs/translated_sampler_bindings.h), without a device. The mutated run is the negative control.
 add_executable(startup_translated_sampler_bindings_check tests/startup_translated_sampler_bindings_check.cpp)
@@ -7035,6 +7035,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/src")
     add_test(NAME mesh_dynamic_geometry_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_geometry_check.py")
+    add_test(NAME mesh_heap_sampler_cpu COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_heap_sampler_check.py")
     add_test(NAME mesh_dynamic_aot_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_aot_check.py")
     add_test(NAME mesh_lane_spill_cpu COMMAND "${INTAKE_PYTHON}" -B
@@ -7107,6 +7109,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_depth_pair_check.py" fallback "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_depth_pair_fallback_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_heap_sampler_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_heap_sampler_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_heap_sampler_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(NAME mesh_lit_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_lit_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
