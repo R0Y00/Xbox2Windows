@@ -226,8 +226,18 @@ def mip_controls():
     accepted[1] |= 0x10  # unorm
     assert 't = %s;' % MIP_CALL in translate(mip_words(1, 0, bytes(accepted))).hlsl_ps()
 
-    # Refused: packed 16-bit data or addresses and fault-status returns need their own lowering.
-    for flag, byte, mask in (('d16', 7, 0x80), ('a16', 7, 0x40), ('tfe', 2, 0x01)):
+    # Packed 16-bit data narrows the four channels into v[0:1] and marks SRV 0 for exact D16 validation.
+    d16 = bytearray(MIP_IMAGE)
+    d16[7] |= 0x80
+    d16_pipe = translate(mip_words(1, 0, bytes(d16)))
+    d16_ps = d16_pipe.hlsl_ps()
+    assert 't = %s;' % MIP_CALL in d16_ps, d16_ps
+    assert 'v0 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in d16_ps, d16_ps
+    assert 'v1 = pack16_d16(t.z, ud4) | (pack16_d16(t.w, ud4) << 16);' in d16_ps, d16_ps
+    assert 'd16srv 0 exact' in d16_pipe.manifest().splitlines(), d16_pipe.manifest()
+
+    # Refused: packed addresses and fault-status returns need their own lowering.
+    for flag, byte, mask in (('a16', 7, 0x40), ('tfe', 2, 0x01)):
         refused = bytearray(MIP_IMAGE)
         refused[byte] |= mask
         try:

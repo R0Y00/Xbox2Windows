@@ -93,16 +93,27 @@ def assess_pixel(digest, instructions):
 
 
 def report(manifest, pipelines, root, llvm=None):
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a JSON object")
+    records = manifest.get("shaders")
+    if not isinstance(records, list):
+        raise ValueError("manifest 'shaders' must be a list")
+    if not isinstance(pipelines, dict):
+        raise ValueError("pipelines must be a JSON object")
+    pipeline_entries = pipelines.get("pipelines")
+    if not isinstance(pipeline_entries, list):
+        raise ValueError("pipelines 'pipelines' must be a list")
     root = root.resolve()
-    records = manifest["shaders"]
     indexed = defaultdict(list)
     for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("manifest shader entries must be JSON objects")
         if "sha256" in record:
             indexed[shader_key(record)].append(record)
     assessments = {}
     ids = set()
     rows = []
-    for pipeline in pipelines["pipelines"]:
+    for pipeline in pipeline_entries:
         if not isinstance(pipeline, dict):
             raise ValueError("pipeline entries must be JSON objects")
         identity = pipeline["id"]
@@ -158,20 +169,34 @@ def report(manifest, pipelines, root, llvm=None):
             "pipeline_status_counts": dict(status_counts), "pipelines": rows}
 
 
-def main():
+def _validate_cli_paths(manifest_path: Path, pipelines_path: Path, llvm: str | None) -> None:
+    for label, path in (("manifest", manifest_path), ("pipelines", pipelines_path)):
+        if path.exists() and path.is_dir():
+            raise ValueError(f"{label} path is an existing directory: {path}")
+    if llvm is not None:
+        llvm_path = Path(llvm)
+        if not llvm_path.exists():
+            raise FileNotFoundError(f"--llvm library not found: {llvm}")
+        if llvm_path.is_dir() or not llvm_path.is_file():
+            raise ValueError(f"--llvm path must be a regular file: {llvm}")
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path, help="manifest.json from extract_shaders.py --format native or both")
     parser.add_argument("pipelines", type=Path, help="JSON metadata with pipeline IDs and stage/digest references")
     parser.add_argument("--llvm", help="AMDGPU LLVM library for optional pixel and mesh lowering checks and compute ISA recognition")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        _validate_cli_paths(args.manifest, args.pipelines, args.llvm)
         result = report(json.loads(args.manifest.read_text(encoding="utf-8")),
                         json.loads(args.pipelines.read_text(encoding="utf-8")),
                         args.manifest.resolve().parent, args.llvm)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         parser.exit(1, f"PSO report: {exc}\n")
     print(json.dumps(result, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
