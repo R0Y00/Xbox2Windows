@@ -853,6 +853,11 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
+# Depth target binding for translated draws (list slot 50, #1999 item D): depth values and debug-layer
+# messages after the fence, and an unresolved depth handle.
+add_executable(startup_draw_depth_target tests/startup_draw_depth_target.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_draw_depth_target PRIVATE cxx_std_17)
+target_link_libraries(startup_draw_depth_target PRIVATE d3d12_xs_shim d3d12 dxgi)
 
 # Console queue Wait (slot 17) waits on the GPU instead of signalling the fence.
 add_executable(startup_queue_wait tests/startup_queue_wait.cpp)
@@ -2505,6 +2510,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_depth_check.py"
             "$<TARGET_FILE:startup_stream_depth>" "${backend}")
         set_tests_properties(startup_stream_depth_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # The drop control draws the bound case with an unresolved depth handle and must fail only its picture.
+        add_test(NAME startup_draw_depth_target_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_depth_target_check.py"
+            "$<TARGET_FILE:startup_draw_depth_target>" "${backend}" check)
+        add_test(NAME startup_draw_depth_target_drop_control_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_depth_target_check.py"
+            "$<TARGET_FILE:startup_draw_depth_target>" "${backend}" drop)
+        set_tests_properties(startup_draw_depth_target_${backend} startup_draw_depth_target_drop_control_${backend}
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_draw_depth_target_drop_control_${backend} PROPERTIES WILL_FAIL TRUE)
         foreach(compiler IN ITEMS fxc dxc)
             add_test(NAME startup_mrt_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
