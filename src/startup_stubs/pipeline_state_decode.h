@@ -3,7 +3,11 @@
 //
 // State block A holds DB_DEPTH_CONTROL at +0xB8, DB_STENCIL_CONTROL at +0xBC and DB_STENCILREFMASK /
 // DB_STENCILREFMASK_BF at +0xC0 / +0xC4, before the CB_BLENDn_CONTROL words at +0xD0 (#1216). The
-// positions were measured locally; other pipeline layouts are not covered.
+// positions were measured locally on the vertex-pipeline layout, whose word at +0x004 is 4.
+//
+// Mesh pipelines use a second layout, told apart by the word at +0x004 being 6: every field from +0x058
+// on sits 0x54 bytes later (so DB_DEPTH_CONTROL is at +0x10C), and the words before +0x058 keep their
+// offsets. Also measured locally; a block with any other value at +0x004 is read at the vertex offsets.
 //
 // Field layouts and enumerations follow Mesa's src/amd/registers/gfx10.json (MIT): DB_DEPTH_CONTROL
 // STENCIL_ENABLE [0], Z_ENABLE [1], Z_WRITE_ENABLE [2], DEPTH_BOUNDS_ENABLE [3], ZFUNC [6:4],
@@ -25,21 +29,36 @@
 
 namespace x2w_pipeline_state {
 
-// ---- state block A offsets ----
+// ---- state block A offsets (vertex-pipeline layout) ----
 constexpr std::size_t a_depth = 0x0b8, a_stencil = 0x0bc, a_refmask = 0x0c0, a_refmask_bf = 0x0c4;
+// The mesh-pipeline layout: the word at +0x004 and the shift applied from +0x058 on.
+constexpr std::size_t a_layout = 0x004, a_mesh_shift_from = 0x058, a_mesh_shift = 0x54;
+constexpr std::uint32_t a_layout_mesh = 6;
 
 constexpr std::uint32_t bits(std::uint32_t v, unsigned lo, unsigned hi) { return (v >> lo) & ((1u << (hi - lo + 1)) - 1); }
+
+// Bytes to add to a vertex-layout offset at or after +0x058 for this block (0 or a_mesh_shift).
+inline std::size_t state_block_a_shift(const unsigned char* a, std::size_t bytes)
+{
+    if (!a || bytes < a_layout + 4) return 0;
+    std::uint32_t layout;
+    std::memcpy(&layout, a + a_layout, 4);
+    return layout == a_layout_mesh ? a_mesh_shift : 0;
+}
 
 // The depth-stencil register words of one state block A.
 struct DepthStencilWords {
     std::uint32_t depth = 0, stencil = 0, refmask = 0, refmask_bf = 0;
+    bool mesh_layout = false;  // read at the mesh-pipeline offsets
 };
 
-// False, leaving w alone, when the block is too short for the words.
+// False, leaving w alone, when the block is too short for the words at its layout's offsets.
 inline bool read_depth_stencil_words(const unsigned char* a, std::size_t bytes, DepthStencilWords& w)
 {
-    if (!a || bytes < a_refmask_bf + 4) return false;
-    auto u = [&](std::size_t off) { std::uint32_t v; std::memcpy(&v, a + off, 4); return v; };
+    const std::size_t s = state_block_a_shift(a, bytes);
+    if (!a || bytes < a_refmask_bf + s + 4) return false;
+    w.mesh_layout = s != 0;
+    auto u = [&](std::size_t off) { std::uint32_t v; std::memcpy(&v, a + off + s, 4); return v; };
     w.depth = u(a_depth);
     w.stencil = u(a_stencil);
     w.refmask = u(a_refmask);

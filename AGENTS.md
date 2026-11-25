@@ -105,6 +105,8 @@ The full Linux CI list is in the `Run Python checks` step of the `python-linux`
 job in the [CI workflow](.github/workflows/windows.yml). To run it locally,
 copy the step's `tools/run_checks_parallel.py` command with all its arguments
 and replace the leading `python` with `./out/pe-env/bin/python`.
+See the [Linux quick start](docs/non-windows-hosts.md#quick-start-on-linux)
+for how skips affect the runner's exit status.
 
 ```bash
 python3 -m venv out/pe-env
@@ -154,11 +156,13 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_sampler_heap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_l_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_b_check.py
+./out/pe-env/bin/python -B tests/startup_image_sample_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_image_3d_check.py
 ./out/pe-env/bin/python -B tests/startup_image_load_mip_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
+./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
@@ -174,6 +178,8 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_request_offline_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
@@ -182,6 +188,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compare_dst_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_build_rev_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_root_check.py
@@ -197,14 +204,20 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_heap_view_check.py
 ./out/pe-env/bin/python -B tests/compute_heap_store_check.py
 ./out/pe-env/bin/python -B tests/compute_desc_numeric_check.py controls
+./out/pe-env/bin/python -B tests/compute_alu_lane_gaps_check.py
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
+./out/pe-env/bin/python -B tests/mesh_clip_cull_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
+./out/pe-env/bin/python -B tests/mesh_heap_sampler_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
+./out/pe-env/bin/python -B tests/mesh_join_descriptor_check.py
+./out/pe-env/bin/python -B tests/mesh_loop_census_check.py
 ./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_c_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_alu_check.py
 ./out/pe-env/bin/python -B tests/startup_triage_run_check.py
 ./out/pe-env/bin/python -B tests/startup_run_ps1_check.py
+./out/pe-env/bin/python -B tests/startup_run_sh_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_bit_alu_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sgpr_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
