@@ -63,7 +63,7 @@ def require_hooked(module, export, hooked_module, hooked_exports):
 
 def main(probe, calls_dll):
     sys.path.insert(0, str(DEBUG.parent))
-    from debug_launch import MOVIE_CALL_HOOKS, MOVIE_MODULE, read_qword
+    from debug_launch import MOVIE_CALL_HOOKS, MOVIE_MODULE, read_qword, read_stack
     require_hooked(HOOKED_MODULE, HOOKED_EXPORT, MOVIE_MODULE, MOVIE_CALL_HOOKS)
     # Control: the guard rejects the fixture once its export is dropped from the hook list.
     try:
@@ -77,6 +77,15 @@ def main(probe, calls_dll):
         assert read_qword(lambda address, size: word[:readable], 0) is None
     assert read_qword(lambda address, size: word[:size], 0) == 0x8967452301efcdab
     assert read_qword(lambda address, size: bytes(size), 0) == 0
+    # read_stack on a stack whose committed pages end at 0x7000: a read past that end fails as a whole,
+    # so only the retry within RSP's page recovers the words nearest RSP.
+    def stack_read(address, size):
+        return bytes((address + i) & 0xff for i in range(size)) if address + size <= 0x7000 else b""
+    for rsp, recovered in ((0x6000, 1600), (0x6a00, 1536), (0x6fe0, 32), (0x6ff8, 8)):
+        data = read_stack(stack_read, rsp, 200)
+        assert len(data) == 1600 and data[:recovered] == stack_read(rsp, recovered), hex(rsp)
+        assert data[recovered:] == bytes(1600 - recovered), hex(rsp)
+    assert read_stack(lambda address, size: b"", 0x6000, 200) == bytes(1600)
     probe = Path(probe).resolve()
     image = probe.name
     with tempfile.TemporaryDirectory() as temporary:
