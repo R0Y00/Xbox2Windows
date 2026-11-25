@@ -18,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE.parent / 'tools'))
 import gfx2hlsl as G  # noqa: E402
+from startup_gfx2hlsl_calculated_target_check import POSITIVE, assert_result, translate  # noqa: E402
 
 REASON = ('s_getpc_b64: the shader load address is only elided for a program that also calculates a branch target')
 failures = []
@@ -69,21 +70,9 @@ reason, _ = refusal(['s_getpc_b64 s[4:5]'])
 check('the refusal is longer than the mnemonic', reason != 's_getpc_b64', repr(reason))
 check('the refusal mentions the load address', reason is not None and 'load address' in reason, repr(reason))
 
-# Negative control: with a proven s_setpc_b64 target the pair is elided, so nothing is refused and no line is
-# emitted for the GETPC itself. The program is the shape startup_gfx2hlsl_calculated_target_check.py uses.
-PROVEN = [
-    's_getpc_b64 s[20:21]',
-    's_add_u32 s20, s20, 0x10',
-    's_addc_u32 s21, s21, 0',
-    's_setpc_b64 s[20:21]',
-    's_endpgm',
-]
-reason, lines = refusal(PROVEN)
-check('control: a proven calculated target does not reach the named refusal',
-      reason is None or not str(reason).startswith('s_getpc_b64: the shader load address'),
-      repr(reason))
-check('control: the proven program emits no line for the elided GETPC',
-      all('s20' not in line and 's21' not in line for line in lines), repr(lines[:4]))
+# A proven control must translate and skip the decoy.
+assert_result(translate(POSITIVE), (0, 20, 24), 24)
+print('control: the proven calculated jump translates and skips the decoy: ok')
 
 print('getpc refusal checks: %d failed' % len(failures))
 if failures:
