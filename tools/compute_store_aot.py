@@ -704,13 +704,18 @@ def heap_view_hlsl(table_offset, view_count, buffer_bytes):
     )
 
 
-def heap_store_view_hlsl(table_offset, view_count, output_bytes, *, single_d16=False):
-    """Store UINT4/FLOAT4 or one expanded half float through a live side-table record."""
-    width = 4 if single_d16 else 16
-    if single_d16:
+def heap_store_view_hlsl(table_offset, view_count, output_bytes, *, components=4):
+    """Store UINT4 or expanded binary16 components through a live side-table record."""
+    width = 4 * components
+    if components in (1, 2):
         sig = "void store_heap_word_d16(uint slot, uint index, uint offset, uint value)"
-        fmt_check = f"    if (view.w != {descriptor_format_word(22):#x}u || (view.y & 0xc000ffffu) != 0u) return;"
-        write = "    outputData.Store(view.x + index * stride + offset, asuint(f16tof32(value & 0xffffu)));"
+        format_word = descriptor_format_word(22 if components == 1 else 64)  # BUF_FMT_32_FLOAT or BUF_FMT_32_32_FLOAT
+        fmt_check = f"    if (view.w != {format_word:#x}u || (view.y & 0xc000ffffu) != 0u) return;"
+        if components == 1:
+            write = "    outputData.Store(view.x + index * stride + offset, asuint(f16tof32(value & 0xffffu)));"
+        else:
+            write = ("    outputData.Store2(view.x + index * stride + offset, "
+                     "asuint(f16tof32(uint2(value & 0xffffu, value >> 16u))));")
     else:
         sig = "void store_heap_words4(uint slot, uint index, uint offset, bool d16, uint4 value)"
         fmt_check = (f"    uint formatWord = d16 ? {descriptor_format_word(77):#x}u : {descriptor_format_word(75):#x}u;\n"
@@ -935,6 +940,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    heap_store_components = 4
     format_store_index = 0
     atomic_update = False
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
@@ -2732,8 +2738,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
                 if heap_store_view is not None:
-                    if channels not in ("xyzw", "d16_xyzw", "d16_x"):
-                        raise ValueError("Heap store view requires buffer_store_format_xyzw, buffer_store_format_d16_xyzw or buffer_store_format_d16_x")
+                    if channels not in ("xyzw", "d16_xyzw", "d16_xy", "d16_x"):
+                        raise ValueError("Heap store view requires buffer_store_format_xyzw or a D16 x, xy or xyzw store")
                     if not any(tag == ("constant_word", heap_slot_word) and reg not in pending
                                for reg, tag in scalar.items()):
                         raise ValueError("Heap store view slot constant is not ready")
@@ -2864,7 +2870,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
             if heap_store_view is not None:
                 slot = hlsl_word(("constant_word", heap_slot_word))
-                if channels == "d16_x":
+                heap_store_components = components
+                if channels in ("d16_x", "d16_xy"):
                     stores.append(f"    store_heap_word_d16({slot}, {address}, {offset}u, {words[0]});")
                 else:
                     supplied = words + ["0u"] * (4 - len(words))
@@ -2947,9 +2954,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if heap_view is not None:
         descriptor_hlsl += heap_view_hlsl(heap_table, heap_count, heap_bytes)
     if heap_store_view is not None:
-        descriptor_hlsl += heap_store_view_hlsl(
-            heap_table, heap_count, output_bytes, single_d16="store_heap_word_d16(" in body
-        )
+        descriptor_hlsl += heap_store_view_hlsl(heap_table, heap_count, output_bytes, components=heap_store_components)
     # GetDimensions on a raw buffer returns its size in bytes, the value of descriptor word 2.
     for name, view in (("uav_bytes", "outputData"), ("srv_bytes", "inputData")):
         if f"{name}(" in body:
@@ -2998,7 +3003,8 @@ def main():
                              "SLOT_WORD; the record table is at byte TABLE_OFFSET of the BUFFER_BYTES-byte t0 and holds COUNT views")
     parser.add_argument("--heap-store-view", nargs=5, type=lambda n: int(n, 0),
                         metavar=("SLOT_WORD", "TABLE_OFFSET", "COUNT", "TABLE_BUFFER_BYTES", "OUTPUT_BYTES"),
-                        help="select a UINT4 or D16-to-FLOAT4 store view from t0 and bound writes by OUTPUT_BYTES of u0")
+                        help="select a UINT4 or expanded D16 FLOAT1/FLOAT2/FLOAT4 store view from t0 "
+                             "and bound writes by OUTPUT_BYTES of u0")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
