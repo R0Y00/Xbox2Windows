@@ -16,6 +16,7 @@ struct MeshLeaseWriter {
     const UINT64 record_bytes;
     const UINT64 record_offset;
     const UINT expected_group_x;
+    const bool loose;
     Allocate alloc;
     Map map;
     Free free_pages;
@@ -40,14 +41,24 @@ struct MeshLeaseWriter {
 
     MeshLeaseWriter(ID3D12Device* d, ID3D12Device* g, const wchar_t* dll,
                     ID3D12RootSignature* writer_root = nullptr, ID3D12PipelineState* writer = nullptr,
-                    MeshLeaseWriter* mirror_owner = nullptr, ID3D12PipelineState* append = nullptr)
+                    MeshLeaseWriter* mirror_owner = nullptr, ID3D12PipelineState* append = nullptr, bool loose_root = false)
         : device(d), guest(g), xmem(LoadLibraryW(dll)), record_bytes(writer ? sizeof(old_groups) : sizeof(red)),
           record_offset(mirror_owner ? 0x80 : word_offset), expected_group_x(mirror_owner && !append ? 0 : new_groups[0]),
-          alloc(function<Allocate>("XMemAllocatePhysicalPages")),
+          loose(loose_root), alloc(function<Allocate>("XMemAllocatePhysicalPages")),
           map(function<Map>("XMemMapPhysicalPagesScatter")), free_pages(function<Free>("XMemFreePhysicalPages")),
           pin(function<Pin>("x2w_xmem_lease_section")), unpin(function<Unpin>("x2w_xmem_release_section"))
     {
-        if (mirror_owner) {
+        if (loose) {
+            check(SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", "1") && SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", "1") ? S_OK : E_FAIL, "enable shared XMem pages");
+            const auto reserve = function<Reserve>("XMemVirtualAlloc");
+            cpu = static_cast<unsigned char*>(reserve(nullptr, 4 * page, 0x20402000, 0x21, PAGE_READWRITE));
+            mirror = reinterpret_cast<UINT64>(cpu);
+            ULONG_PTR first_count = 1, second_count = 1;
+            void* const addresses[]{cpu, cpu ? cpu + page : nullptr};
+            check(cpu && alloc(0x280, &first_count, original) && first_count == 1 &&
+                alloc(0x280, &second_count, original + 1) && second_count == 1 && map(addresses, 2, original) ? S_OK : E_FAIL,
+                "map ordinary CPU XMem pages");
+        } else if (mirror_owner) {
             cpu = mirror_owner->cpu + page;
             mirror = mirror_owner->mirror + page;
         } else {
@@ -76,6 +87,7 @@ struct MeshLeaseWriter {
             std::memcpy(cpu + page + record_offset, &green, sizeof(green));
         }
         published_page = inspect(address());
+        if (loose) return;
 
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, writer && !mirror_owner ? 2 * page : page,
             1, 1, 1, DXGI_FORMAT_UNKNOWN,
@@ -152,10 +164,11 @@ struct MeshLeaseWriter {
     std::pair<ULONG64, ULONG64> inspect(UINT64 guest_address)
     {
         X2WXMemSectionLease lease{};
-        check(pin(x2w_xmem_section_lease_version, guest_address, record_bytes, &lease, sizeof(lease)) ? S_OK : E_FAIL,
+        const UINT version = loose ? x2w_xmem_single_page_lease_version : x2w_xmem_section_lease_version;
+        check(pin(version, guest_address, record_bytes, &lease, sizeof(lease)) ? S_OK : E_FAIL,
               "inspect XMem page");
         CloseHandle(lease.section);
-        check(unpin(x2w_xmem_section_lease_version, lease.id) ? S_OK : E_FAIL, "release inspection lease");
+        check(unpin(version, lease.id) ? S_OK : E_FAIL, "release inspection lease");
         return {lease.section_offset, lease.first_byte};
     }
 
@@ -215,6 +228,18 @@ struct MeshLeaseWriter {
         void* const addresses[]{cpu, cpu + page};
         const ULONG_PTR empty[]{0, 0};
         check(map(addresses, 2, empty) && free_pages(2, original) ? S_OK : E_FAIL, "release the original XMem grant");
+    }
+
+    void replace_loose_page()
+    {
+        void* const address = cpu;
+        const ULONG_PTR empty{};
+        ULONG_PTR replacement{}, count = 1;
+        check(map(&address, 1, &empty) && alloc(0x280, &count, &replacement) && count == 1 &&
+            map(&address, 1, &replacement) && free_pages(1, original) ? S_OK : E_FAIL,
+            "replace the mapped generation at the same address");
+        original[0] = replacement;
+        std::memcpy(cpu + record_offset, &green, sizeof(green));
     }
 
     std::pair<ULONG64, ULONG64> allocate_probe(UINT64 index)
