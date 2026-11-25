@@ -1318,6 +1318,98 @@ bool check_translated_refusal_census(const std::wstring& log_path)
     for (const auto& line : entries) std::printf("%s\n", line.c_str());
     return true;
 }
+
+bool check_indirect_other_refusal_census(const std::wstring& log_path)
+{
+    const std::size_t needed = x2w_d3d12_census_report(nullptr, 0);
+    std::string report(needed + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    report.resize(std::strlen(report.c_str()));
+    std::string summary;
+    std::vector<std::string> entries;
+    bool saw_indirect_draw = false;
+    std::size_t pos = 0;
+    while (pos < report.size()) {
+        std::size_t end = report.find('\n', pos);
+        if (end == std::string::npos) end = report.size();
+        std::string line = report.substr(pos, end - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("x2w-d3d12 indirect-other refusals:", 0) == 0) summary = line;
+        else if (line.rfind("x2w-d3d12 indirect-other refusal ", 0) == 0) entries.push_back(line);
+        else if (line.rfind("x2w-d3d12 indirect-draw refusal", 0) == 0) saw_indirect_draw = true;
+        pos = end + 1;
+    }
+    if (saw_indirect_draw) {
+        std::fprintf(stderr, "indirect-other refusal census saw unexpected indirect-draw refusal lines\n");
+        return false;
+    }
+    const std::string expected =
+        "x2w-d3d12 indirect-other refusals: total 4; distinct keys 2, distinct pairs 3 (overflow calls 0)";
+    if (summary != expected) {
+        std::fprintf(stderr, "indirect-other refusal census mismatch:\n  got      '%s'\n  expected '%s'\n",
+                     summary.c_str(), expected.c_str());
+        return false;
+    }
+    if (entries.size() != 3) {
+        std::fprintf(stderr, "indirect-other refusal census expected 3 detail lines, got %zu\n", entries.size());
+        return false;
+    }
+    struct ParsedEntry {
+        unsigned index = 0;
+        std::string key;
+        std::string reason;
+        unsigned long long calls = 0;
+    };
+    std::vector<ParsedEntry> parsed;
+    for (const auto& line : entries) {
+        unsigned index = 0;
+        char key[32]{};
+        char reason[64]{};
+        unsigned long long calls = 0;
+        if (std::sscanf(line.c_str(), "x2w-d3d12 indirect-other refusal %u: key=%16[0-9a-f] reason=%63s calls=%llu",
+                        &index, key, reason, &calls) != 4 || std::strlen(key) != 16) {
+            std::fprintf(stderr, "malformed indirect-other refusal detail line: '%s'\n", line.c_str());
+            return false;
+        }
+        parsed.push_back({index, key, reason, calls});
+    }
+    const std::string zero_key = "0000000000000000";
+    const bool entries_ok =
+        parsed[0].index == 1 && parsed[0].key != zero_key &&
+        parsed[0].reason == "missing_viewport_or_scissor" && parsed[0].calls == 2 &&
+        parsed[1].index == 2 && parsed[1].key == parsed[0].key &&
+        parsed[1].reason == "argument_outside_placed_buffer" && parsed[1].calls == 1 &&
+        parsed[2].index == 3 && parsed[2].key == zero_key &&
+        parsed[2].reason == "graphics_multi_command" && parsed[2].calls == 1;
+    if (!entries_ok) {
+        std::fprintf(stderr, "indirect-other refusal census entries did not match expected per-(key, reason) rows:\n");
+        for (const auto& line : entries) std::fprintf(stderr, "  %s\n", line.c_str());
+        return false;
+    }
+    std::ifstream file(log_path, std::ios::binary);
+    std::string log_line;
+    bool saw_vp_log = false, saw_arg_log = false, saw_multi_log = false;
+    const std::string want_vp = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
+        " [missing_viewport_or_scissor]: indirect graphics requires one matching target, viewport and scissor";
+    const std::string want_arg = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
+        " [argument_outside_placed_buffer]: argument record is outside a unique placed buffer";
+    const std::string want_multi = "x2w-render ExecuteIndirect refused, key " + zero_key +
+        " [graphics_multi_command]: indirect graphics requires one command and no count buffer";
+    while (std::getline(file, log_line)) {
+        if (!log_line.empty() && log_line.back() == '\r') log_line.pop_back();
+        if (log_line == want_vp) saw_vp_log = true;
+        if (log_line == want_arg) saw_arg_log = true;
+        if (log_line == want_multi) saw_multi_log = true;
+    }
+    if (!saw_vp_log || !saw_arg_log || !saw_multi_log) {
+        std::fprintf(stderr, "indirect-other refusal log lines missing (vp=%d, arg=%d, multi=%d)\n",
+                     saw_vp_log ? 1 : 0, saw_arg_log ? 1 : 0, saw_multi_log ? 1 : 0);
+        return false;
+    }
+    std::printf("%s\n", summary.c_str());
+    for (const auto& line : entries) std::printf("%s\n", line.c_str());
+    return true;
+}
 bool fixed_mesh_create_contract(ID3D12Device* guest)
 {
     const D3D12_ROOT_SIGNATURE_DESC root_desc{};
@@ -1412,12 +1504,14 @@ int main(int argc, char** argv) try
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
     const bool refusal_census_control = argc == 3 && std::strcmp(argv[2], "translated-refusal-census-control") == 0;
     const bool refusal_census = refusal_census_control || (argc == 3 && std::strcmp(argv[2], "translated-refusal-census") == 0);
+    const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
+    const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
     const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = copy_on || copy_off || refusal_census || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = copy_on || copy_off || refusal_census || other_refusal_census || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -1460,7 +1554,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || refusal_census) {
+    if (indexed || lease_arguments || dual_lease || refusal_census || other_refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1799,6 +1893,21 @@ int main(int argc, char** argv) try
                     DrawKind::vertices, false, Refusal::copied_table_buffer, "census key3 incomplete_table_buffer #2", &copied_buffer) &&
                 verify(producer.Get(), false, Refusal::none, "census valid draw does not increment refusals");
             if (ok) ok = check_translated_refusal_census(log_path);
+            std::filesystem::remove_all(cache);
+            DeleteFileW(log_path.c_str());
+            return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
+        if (other_refusal_census) {
+            bool ok = verify(producer.Get(), false, Refusal::none, "other census warm up translated pipeline key") &&
+                verify(producer.Get(), false, Refusal::missing_viewport, "other census key1 missing_viewport_or_scissor #1") &&
+                verify(producer.Get(), false, other_refusal_census_control ? Refusal::none : Refusal::short_argument,
+                       other_refusal_census_control ? "other census control valid draw replaces second reason"
+                                                    : "other census key1 argument_outside_placed_buffer") &&
+                verify(producer.Get(), false, Refusal::missing_viewport, "other census key1 missing_viewport_or_scissor #2");
+            if (ok) {
+                refuse_each_reason(guest.Get(), signature.Get());
+                ok = check_indirect_other_refusal_census(log_path);
+            }
             std::filesystem::remove_all(cache);
             DeleteFileW(log_path.c_str());
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
