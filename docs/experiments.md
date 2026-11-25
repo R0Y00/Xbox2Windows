@@ -5656,7 +5656,7 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_absdiff_warp$' -
 
 #### Descriptor size as a number, scalar compare and select
 
-A raw buffer descriptor loaded with `s_load_dwordx4` stays opaque, with one exception. Word 2 is `num_records`. When the descriptor has no stride (a raw view), the caller states that it equals the bound view's byte size, so `compute_store_aot.py` lowers a read of that word to `GetDimensions` on the bound view (`uav_bytes()` for the output descriptor, `srv_bytes()` for the source descriptor). The helper is declared only when the program uses it. The check binds 1280-byte raw views, so the word reads `0x500`.
+A raw buffer descriptor loaded with `s_load_dwordx4` stays opaque, with one exception. Word 2 is `num_records`. When the descriptor has no stride (a raw view), the caller states that it equals the bound view's byte size, so `compute_store_aot.py` lowers a read of that word to `GetDimensions` on the bound view (`uav_bytes()` for the output descriptor, `srv_bytes()` for the source descriptor). The helper is declared only when the program uses it. The check binds 1280-byte raw views, so the word reads `0x500`. Root descriptors carry no size (WARP reports `0xfffffffc`), so the draw case runs through `offscreen_check --compute-store-sized-case`, which binds both buffers as descriptor-table views at `u0` and `t0`.
 
 A scalar compare and select may then use it:
 

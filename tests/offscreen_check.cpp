@@ -508,6 +508,14 @@ OperationResult run_compute_store_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// The store case with both raw buffers bound as descriptor-table views of the full 1280 bytes, so a
+// shader reading a descriptor's size sees the view size (root descriptors carry none).
+OperationResult run_compute_store_sized_case(const OperationContext& ctx)
+{
+    check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4], false, true);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_compute_store_dpp_case(const OperationContext& ctx)
 {
     check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4], true);
@@ -1436,6 +1444,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-sized-case", 5, 5, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
     {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},

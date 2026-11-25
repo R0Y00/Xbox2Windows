@@ -123,7 +123,7 @@ def draw(directory, compiler, renderer, backend):
     source = lower()
     src.write_text(source, encoding="ascii")
     subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
-    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    cmd = [renderer, backend, "--compute-store-sized-case", cso, case]
     good = run(cmd, case, expected_words())
     sys.stderr.write(good.stderr)
     if good.returncode:
