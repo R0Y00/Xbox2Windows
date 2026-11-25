@@ -30,7 +30,7 @@ KEY = 0x9e674214a4ef3b73  # compute_key of the parts above
 
 def framed_key():
     h = 1469598103934665603
-    for b in b'x2w-startup-shader-12cs':
+    for b in b'x2w-startup-shader-13cs':
         h = ((h ^ b) * 1099511628211) & 0xffffffffffffffff
     for part in (CODE, DATA, ROOT, DESC, STATE_A, STATE_B):
         for b in struct.pack('<Q', len(part)) + part:

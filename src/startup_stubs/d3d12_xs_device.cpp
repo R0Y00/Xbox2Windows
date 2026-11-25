@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
+#include "xmem_page_batch.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/overlay_window.h"
@@ -3186,6 +3187,26 @@ HRESULT __stdcall queue_timestamp_frequency(Wrapper* self, UINT64* frequency)
     return hr;
 }
 
+// The page grants, section offsets and destination views are owned by XMem.
+// Hold the installed provider for this batch; a queue can predate xmem.dll.
+HRESULT WINAPI queue_page_mappings(Wrapper*, UINT count, const X2WPageBatch* batches,
+                                   UINT64 pool, UINT pool_pages, UINT flags)
+{
+    HMODULE xmem = nullptr;
+    if (!GetModuleHandleExW(0, L"xmem.dll", &xmem)) return HRESULT_FROM_WIN32(GetLastError());
+    const auto map = reinterpret_cast<decltype(&X2WMapPageBatch)>(GetProcAddress(xmem, "X2WMapPageBatch"));
+    const HRESULT hr = map ? map(count, batches, pool, pool_pages, flags, nullptr)
+                           : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    FreeLibrary(xmem);
+    if (FAILED(hr)) {
+        static LONG failures;
+        if (first_calls(failures, 2))
+            log("x2w-d3d12 CommandQueue::slot31 count=%u poolPages=%u flags=0x%x -> 0x%08lx",
+                count, pool_pages, flags, static_cast<unsigned long>(hr));
+    }
+    return hr;
+}
+
 // Queue slots whose Xbox meaning is unknown, dispatched by argument shape:
 // - (fence wrapper, value): Signal on the desktop queue. Slot 17 (Wait) has the same shape and is
 //   handled by queue_wait below; on other slots a wait would complete the fence early.
@@ -4713,6 +4734,7 @@ void build_tables()
     fill_queue_dynamic(tables[queue_kind], std::make_index_sequence<64>{});
     tables[queue_kind][17] = reinterpret_cast<void*>(&queue_wait);
     tables[queue_kind][18] = reinterpret_cast<void*>(&queue_timestamp_frequency);
+    tables[queue_kind][31] = reinterpret_cast<void*>(&queue_page_mappings);
     tables[queue_kind][32] = reinterpret_cast<void*>(&queue_present);
 
     // Fence: GetCompletedValue, SetEventOnCompletion, Signal, GetCreationFlags.
