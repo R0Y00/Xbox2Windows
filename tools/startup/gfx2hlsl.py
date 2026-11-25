@@ -2468,9 +2468,17 @@ class Stage:
                 offset, width = int(field.group(2) or 0), int(field.group(3) or 32)
                 try:
                     value = int(ops[1], 0) & 0xffffffff
-                except (ValueError, IndexError):
+                except IndexError:
                     value = None
-                if value is None or ((value & ((1 << width) - 1)) << offset) & 3:
+                except ValueError:
+                    # The disassembler prints some inline constants as floats (1.0, 0.5): take their binary32 bits.
+                    try:
+                        value = struct.unpack('<I', struct.pack('<f', float(ops[1])))[0]
+                    except (ValueError, OverflowError):
+                        raise Unsupported('%s %s: immediate not decoded' % (base, ', '.join(ops)))
+                if value is None:
+                    raise Unsupported('%s %s: immediate not decoded' % (base, ', '.join(ops)))
+                if ((value & ((1 << width) - 1)) << offset) & 3:
                     raise Unsupported('%s %s writes the binary32 rounding mode MODE[1:0]' % (base, ', '.join(ops)))
             if not ops or not ops[0].strip().startswith('hwreg('):
                 raise Unsupported('%s %s: hardware register not decoded' % (base, ', '.join(ops)))

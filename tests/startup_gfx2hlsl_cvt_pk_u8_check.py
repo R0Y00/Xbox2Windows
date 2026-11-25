@@ -348,6 +348,13 @@ def run_controls():
     for asm in ('s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0', 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3',
                 's_setreg_imm32_b32 hwreg(HW_REG_MODE), 0xf0', 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 2), 0'):
         check('accepted: ' + asm, refuses([asm]) is None)
+    # An inline constant the disassembler prints as a float is read as its binary32 bits (1.0 is 0x3f800000).
+    for asm in ('s_setreg_imm32_b32 hwreg(HW_REG_MODE), 1.0', 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 2), 0.5'):
+        check('accepted: ' + asm, refuses([asm]) is None)
+    reason = refuses(['s_setreg_imm32_b32 hwreg(HW_REG_MODE), 1.0e-45'])   # bits 0x00000001
+    check('float literal with MODE[1:0] set is a MODE write', reason is not None and 'writes the binary32 rounding mode' in reason)
+    reason = refuses(['s_setreg_imm32_b32 hwreg(HW_REG_MODE), foo'])
+    check('undecodable immediate says so', reason is not None and 'immediate not decoded' in reason)
 
 
 if __name__ == '__main__':
