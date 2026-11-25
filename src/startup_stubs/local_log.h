@@ -82,12 +82,26 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
     return done;
 }
 
+// With X2W_XMEM_LAZY_COMMIT, physical pages are committed on first touch (xmem_mapped_pages.cpp). A check of the
+// commit state, or a write that cannot fault (kernel I/O, GPU), commits the range first. A no-op without xmem.dll
+// or without the switch.
+inline void commit_lazy(const void* pointer, std::size_t bytes) noexcept
+{
+    using CommitRange = BOOL(WINAPI*)(const void*, SIZE_T);
+    static const CommitRange commit_range = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<CommitRange>(GetProcAddress(xmem, "x2w_xmem_commit_range")) : nullptr;
+    }();
+    if (commit_range) commit_range(pointer, bytes);
+}
+
 // Readability by probing (see probe_readable); writability by one VirtualQuery (rare callers).
 inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexcept
 {
     const auto start = reinterpret_cast<std::uintptr_t>(pointer);
     if (start < 0x10000 || start > 0x00007FFFFFFEFFFFull || bytes == 0) return false;
     if (!write) return probe_readable(start, bytes) == bytes;
+    commit_lazy(pointer, bytes);
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(pointer, &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
     const DWORD protect = info.Protect & 0xFF;

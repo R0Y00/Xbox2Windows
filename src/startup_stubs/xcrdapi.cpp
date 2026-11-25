@@ -159,6 +159,7 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     if (bytes == 0) return true;
     std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
     const std::uintptr_t end = cursor + bytes;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION info{};

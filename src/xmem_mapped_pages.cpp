@@ -24,6 +24,7 @@ struct Backing {
     ULONG_PTR views = 0;
     ULONG64 offset = 0;  // the page is one 64 KiB slot of a shared section (see section_for)
     std::size_t slab = 0;  // index of that section among the slabs
+    bool committed = true;  // false while a lazily mapped slot is untouched (X2W_XMEM_LAZY_COMMIT)
 };
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
@@ -99,11 +100,67 @@ bool commit_slot(HANDLE slab, ULONG64 offset, bool zero)
     return ok;
 }
 
-HANDLE section_for(ULONG_PTR page)
+// Experimental (X2W_XMEM_LAZY_COMMIT=1, #1199): a fresh slot is not committed when its page is mapped. The first
+// CPU access faults and lazy_commit_fault commits that slot. Writers that do not fault -- kernel-mode I/O into
+// mapped pages, GPU placement, stand-in writes behind a commit-state check -- call x2w_xmem_commit_range first.
+// Reused slots and x2w_xmem_write_physical still commit before use.
+bool lazy_commit()
+{
+    static const bool on = x2w_local::env_on("X2W_XMEM_LAZY_COMMIT");
+    return on;
+}
+
+// Commits a lazily mapped slot under memory.mutex; false with the system error if the commit fails.
+bool commit_backing(Backing& backing)
+{
+    if (backing.committed) return true;
+    if (!commit_slot(backing.section, backing.offset, false)) return false;
+    backing.committed = true;
+    return true;
+}
+
+// The backing behind a mapped address (CPU view, or its GPU-view mirror), under memory.mutex.
+Backing* backing_at(ULONG_PTR address)
+{
+    if (memory.mirror_bytes && address - memory.mirror_gpu < memory.mirror_bytes)
+        address = address - memory.mirror_gpu + memory.mirror_cpu;  // the GPU view shows the same section
+    const auto view = memory.views.find(address & ~(ULONG_PTR{page_bytes} - 1));
+    if (view == memory.views.end()) return nullptr;
+    const auto backing = memory.backings.find(view->second);
+    return backing == memory.backings.end() ? nullptr : &backing->second;
+}
+
+LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
+{
+    const EXCEPTION_RECORD* record = e->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR address = record->ExceptionInformation[1];
+    // A thread that raced another one to the same slot finds it committed: retry once, then pass the fault on.
+    thread_local ULONG_PTR retried = 0;
+    const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
+    const std::lock_guard guard(memory.mutex);
+    Backing* backing = backing_at(address);
+    if (!backing) return EXCEPTION_CONTINUE_SEARCH;
+    if (backing->committed) {
+        if (retried == page) return EXCEPTION_CONTINUE_SEARCH;
+        retried = page;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (!commit_backing(*backing)) return EXCEPTION_CONTINUE_SEARCH;
+    retried = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+HANDLE section_for(ULONG_PTR page, bool need_commit = true)
 {
     const auto existing = memory.backings.find(page);
-    if (existing != memory.backings.end())
+    if (existing != memory.backings.end()) {
+        if (need_commit && !commit_backing(existing->second)) return nullptr;
         return existing->second.section;
+    }
+    // A fresh slot (never used) of a SEC_RESERVE slab reads as zero once committed, so it can wait for its first
+    // touch. A reused slot is committed and zeroed now, as before.
+    const bool defer = !need_commit && lazy_commit();
     x2w_xmem::SlabSlots<HANDLE>::Slot slot;
     if (memory.slots.lowest_free(slot)) {
         if (!commit_slot(slot.slab, slot.offset, true)) return nullptr;
@@ -113,10 +170,11 @@ HANDLE section_for(ULONG_PTR page)
     }
     const ULONG64 slab_bytes = memory.slots.slab_bytes();
     bool first_slot_committed = false;
-    const auto make_slab = [slab_bytes, &first_slot_committed](HANDLE& slab) {
+    const auto make_slab = [slab_bytes, &first_slot_committed, defer](HANDLE& slab) {
         slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                   static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
         if (!slab) return false;
+        if (defer) return true;
         first_slot_committed = commit_slot(slab, 0, false);
         if (!first_slot_committed) {
             const DWORD error = GetLastError();
@@ -126,14 +184,14 @@ HANDLE section_for(ULONG_PTR page)
         return first_slot_committed;
     };
     if (!memory.slots.take_fresh(make_slab, [](HANDLE slab) { CloseHandle(slab); }, slot)) return nullptr;
-    if (!first_slot_committed && !commit_slot(slot.slab, slot.offset, false)) {
+    if (!defer && !first_slot_committed && !commit_slot(slot.slab, slot.offset, false)) {
         const DWORD error = GetLastError();
         memory.slots.unwind_fresh(slot);
         SetLastError(error);
         return nullptr;
     }
     try {
-        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index});
+        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index, !defer});
     } catch (...) {
         memory.slots.unwind_fresh(slot);
         throw;
@@ -468,7 +526,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
         // multi-gigabyte batch then takes a few views instead of one per 64 KiB page.
         if (tokens) {
             for (const auto& [address, page] : batch) {
-                if (!section_for(page)) return FALSE;
+                if (!section_for(page, false)) return FALSE;  // committed on first touch with X2W_XMEM_LAZY_COMMIT
             }
             std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
             auto first = batch.begin();
@@ -781,6 +839,79 @@ extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in
     *slots_free = memory.slots.slots_free();
     return TRUE;
 }
+
+// Experimental export (X2W_XMEM_LAZY_COMMIT): commits the lazily mapped slots behind [address, address + bytes)
+// before a writer that cannot fault one in uses the range: kernel-mode I/O into mapped pages fails with
+// STATUS_ACCESS_VIOLATION instead of faulting, and the GPU reads and writes placed resources without the CPU.
+// GPU-view addresses resolve to the same slots. TRUE without the switch or when nothing in the range is lazy;
+// FALSE with the system error when a commit fails.
+extern "C" BOOL WINAPI x2w_xmem_commit_range(const void* address, SIZE_T bytes)
+{
+    if (!lazy_commit() || !address || !bytes) return TRUE;
+    const auto start = reinterpret_cast<ULONG_PTR>(address);
+    const ULONG_PTR end = bytes > ~ULONG_PTR{0} - start ? ~ULONG_PTR{0} : start + bytes;
+    const std::lock_guard guard(memory.mutex);
+    for (ULONG_PTR page = start & ~(ULONG_PTR{page_bytes} - 1); page < end; page += page_bytes) {
+        Backing* backing = backing_at(page);
+        if (backing && !commit_backing(*backing)) return FALSE;
+        if (page > ~ULONG_PTR{0} - page_bytes) break;
+    }
+    return TRUE;
+}
+
+namespace {
+// The title reads files straight into mapped physical pages; a kernel-mode write into an uncommitted slot fails
+// with STATUS_ACCESS_VIOLATION (no fault), so with X2W_XMEM_LAZY_COMMIT the main module's ReadFile import commits
+// the buffer first.
+using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+ReadFileFn real_read_file;
+
+BOOL WINAPI read_file_committed(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped)
+{
+    if (buffer && bytes && !x2w_xmem_commit_range(buffer, bytes)) return FALSE;
+    return real_read_file(file, buffer, bytes, read, overlapped);
+}
+
+// Points the main module's imports of name at replacement; returns how many import slots were changed.
+int patch_main_import(const char* name, const void* replacement) noexcept
+{
+    auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    if (!base) return 0;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    int patched = 0;
+    for (auto* imp = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); dir.Size && imp->Name; ++imp) {
+        const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
+            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), name) != 0) continue;
+            DWORD old = 0;
+            if (!VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), PAGE_READWRITE, &old)) continue;
+            slots->u1.Function = reinterpret_cast<ULONGLONG>(replacement);
+            VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), old, &old);
+            ++patched;
+        }
+    }
+    return patched;
+}
+
+// With the switch, install the fault handler and the ReadFile wrapper when xmem.dll loads, before the title runs.
+// The module is pinned: the handler must outlive any unload.
+const bool lazy_commit_installed = [] {
+    if (!lazy_commit()) return false;
+    HMODULE self = nullptr;
+    const bool handler = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                            reinterpret_cast<LPCWSTR>(&lazy_commit_fault), &self) &&
+                         AddVectoredExceptionHandler(1, lazy_commit_fault);
+    real_read_file = reinterpret_cast<ReadFileFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReadFile"));
+    const int reads = real_read_file ? patch_main_import("ReadFile", reinterpret_cast<const void*>(&read_file_committed)) : 0;
+    x2w_local::logf("x2w-xmem lazy commit (X2W_XMEM_LAZY_COMMIT): fault handler %s, %d ReadFile import(s) wrapped",
+                    handler ? "on" : "failed", reads);
+    return handler;
+}();
+}  // namespace
 
 // Experimental export: writes bytes into physical pages named by the title's
 // page tokens (page number << 4, as XMemMapPhysicalPages takes them), starting offset bytes into the

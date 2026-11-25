@@ -8861,6 +8861,34 @@ cmake --build --preset dev --target xmem_startup_below_40_check
 ctest --preset dev --no-tests=error -R '^xmem_startup_below_40' -V
 ```
 
+### Mapped pages committed on first touch
+
+Experimental, for [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199). Physical pages are 64 KiB slots of `SEC_RESERVE` slabs (see [Startup memory accounting](startup-runtime.md#startup-memory-accounting)). By default a fresh slot is committed when its page is first mapped. A startup run maps far more pages than it touches before the main load, and slab commit is charged to the system commit limit, not to the process. On a 16 GB host this pushes the system to its commit limit during the load.
+
+`X2W_XMEM_LAZY_COMMIT=1` leaves a fresh slot uncommitted when its page is mapped. The first CPU access faults, and a vectored exception handler installed when `xmem.dll` loads commits that slot and resumes the thread. A thread that loses the race to commit the same slot finds it committed and retries once. GPU-view addresses resolve to the CPU-view slot (the same section). Reused slots and `x2w_xmem_write_physical` still commit before use, as before.
+
+Some writers cannot fault a slot in, so they commit the range first through the experimental export `x2w_xmem_commit_range(address, bytes)`:
+
+- **Kernel-mode I/O.** `ReadFile` into an uncommitted mapped page fails with `ERROR_NOACCESS` instead of faulting. The main module's `ReadFile` import is wrapped to commit the buffer first.
+- **GPU placement.** Device slot 133 commits a placed buffer's range before it measures the allocation.
+- **Stand-in writes behind a commit check**, such as the DirectStorage destination check.
+
+Without the switch, nothing changes: no handler is installed, no import is wrapped, and `x2w_xmem_commit_range` returns TRUE.
+
+Measured in startup runs on Windows 10 22H2 (16 GB RAM, RTX 3080 Ti), same build and input, two runs each, with `-MemoryGiB 16`: system commit stayed about 5 GiB lower from 20 s to 170 s (23.3–24.6 GiB against 29.0–29.5 GiB), and 1.6 to 3.1 GiB lower in the late load, when most mapped pages have been touched. The process's own commit charge was the same with and without the switch. Where a run ends was not changed: on that host the late load also reaches the process commit cap.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `xmem_lazy_commit` | With the switch: mapping 1,024 pages (64 MiB) grows system commit by less than 24 MiB, and the pages stay `MEM_RESERVE`. A CPU write commits only its page, reads back, and the rest of the page reads zero. `ReadFile` into an untouched page fails with `ERROR_NOACCESS`; after `x2w_xmem_commit_range` the same read succeeds. Eight threads writing to the same 32 untouched pages at once all succeed. Released pages are zero-filled when their slots are reused. |
+| `xmem_lazy_commit_off` | Control, with `X2W_XMEM_LAZY_COMMIT=0`: the same 1,024-page mapping commits every page when it is mapped (system commit grows by about 64 MiB), and `x2w_xmem_commit_range` returns TRUE. |
+
+The other `xmem_` cases run without the switch and check that the default path is unchanged.
+
+```powershell
+cmake --build --preset release --target xmem_shim
+ctest --preset release --no-tests=error -R '^xmem_' -V
+```
+
 ### Second commit and protection comparison
 
 `xmem_commit_protection` ([`tests/xmem_commit_protection_check.cpp`](../tests/xmem_commit_protection_check.cpp)) is a source-built x64 check for [#870](https://github.com/R0Y00/Xbox2Windows/issues/870) using synthetic 64 KiB page patterns. Its scope is separate from the first-commit alignment/zero-fill/rounding check (`xmem_committed_memory`), the reserve-only profile in [#888](https://github.com/R0Y00/Xbox2Windows/pull/888), and the device/queue work in [#874](https://github.com/R0Y00/Xbox2Windows/issues/874).
