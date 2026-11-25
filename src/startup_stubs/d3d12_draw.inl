@@ -713,6 +713,27 @@ void request_translation(Wrapper* pipeline)
             known ? "already known" : "new");
 }
 
+// Side-effect-free pipeline key lookup for ExecuteIndirect refusal attribution: never writes
+// translation request files and returns 0 when the pipeline has no known console shader key.
+u64 known_pipeline_key(Wrapper* pipeline)
+{
+    if (!pipeline) return 0;
+    if (pipeline->own().mesh86_key) return pipeline->own().mesh86_key;
+    if (pipeline->own().compute_trace_key) return pipeline->own().compute_trace_key;
+    if (pipeline->own().real) return 0;
+    AcquireSRWLockShared(&draw_lock);
+    const auto& by_pipeline = translation_by_pipeline();
+    const auto known = by_pipeline.find(pipeline);
+    u64 key = known != by_pipeline.end() && known->second && known->second->translation
+        ? known->second->translation->key : 0;
+    ReleaseSRWLockShared(&draw_lock);
+    if (!key) {
+        const PipelineInfo* info = pipeline_info(pipeline);
+        if (info && info->path == 86 && info->stream_translation) key = info->stream_translation->key;
+    }
+    return key;
+}
+
 bool needs_rtv_variant(DXGI_FORMAT format)
 {
     switch (format) {
