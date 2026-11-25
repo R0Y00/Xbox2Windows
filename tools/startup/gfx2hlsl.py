@@ -1233,12 +1233,22 @@ class Stage:
         return False, tok
 
     def u_src(self, tok):
-        """uint expression for an integer-context source that the disassembler may print negated."""
-        # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
-        # pattern a float negation produces. Only handlers that model it ask for this; other integer
-        # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
+        """uint expression for an integer-context source that the disassembler may print with abs and/or neg."""
+        # In VOP3 integer-context select instructions, `|x|` clears bit 31 first and `-`/`neg(x)` flips
+        # bit 31 afterwards (the same bit-level IEEE binary32 modifiers). Other integer instructions
+        # keep using u(), so an unexpected abs or neg stays a refusal rather than silently changing bits.
         neg, tok = self.split_neg(tok)
-        return '(%s ^ 0x80000000u)' % self.u(tok) if neg else self.u(tok)
+        absolute = tok.startswith('|') and tok.endswith('|')
+        if absolute:
+            tok = tok[1:-1]
+        expr = self.u(tok)
+        if absolute and neg:
+            return '(%s | 0x80000000u)' % expr
+        if absolute:
+            return '(%s & 0x7fffffffu)' % expr
+        if neg:
+            return '(%s ^ 0x80000000u)' % expr
+        return expr
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""

@@ -69,6 +69,14 @@ check('-register still flips the sign bit',
       translate('v_cndmask_b32_e64 v31, v30, -v30, s0') == 'v31 = (s0 & 1) ? (v30 ^ 0x80000000u) : v30;')
 check('plain -1 stays the integer',
       translate('v_cndmask_b32_e64 v31, v30, -1, s0') == 'v31 = (s0 & 1) ? 0xffffffffu : v30;')
+check('|register| on the select clears the sign bit',
+      translate('v_cndmask_b32_e64 v31, v30, |v30|, s0') == 'v31 = (s0 & 1) ? (v30 & 0x7fffffffu) : v30;')
+check('-|register| and neg(|register|) on the select clear then flip (set) the sign bit',
+      translate('v_cndmask_b32_e64 v31, -|v30|, neg(|v30|), s0')
+      == 'v31 = (s0 & 1) ? (v30 | 0x80000000u) : (v30 | 0x80000000u);')
+check('malformed | on the select is refused', refused('v_cndmask_b32_e64 v31, v30, |v30, s0'))
+check('|register| on an integer op that does not model it stays refused',
+      refused('v_and_b32_e64 v1, |v2|, v3'))
 
 # Float sources go through the same modifier.
 check('neg(register) on a float add',
