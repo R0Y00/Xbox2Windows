@@ -3362,7 +3362,12 @@ class Stage:
         elif dst in ('vcc', 'vcc_lo'):
             self.emit('vcc = %s;' % expr)
         else:
-            d = reg_range(dst)[1]
+            # vcc_hi, exec_hi, m0 or a literal are not an SGPR the one-lane model holds a mask in; reg_range
+            # returned None for them and the index raised TypeError, which ended the whole translation.
+            reg = reg_range(dst)
+            if not reg or reg[0] != 's':
+                raise Unsupported('%s into %s' % (base, dst))
+            d = reg[1]
             self.set_s(d, expr)
             self.masks.add(d)
 
