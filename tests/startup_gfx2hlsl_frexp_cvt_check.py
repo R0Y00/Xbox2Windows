@@ -8,7 +8,8 @@ Each operation is lowered by the translator, then the emitted HLSL line is run o
   frexp_mant: sign and mantissa in [0.5, 1) of a normal input; zero and denormal give a signed zero; inf and NaN
               pass through.
   frexp_exp:  the matching exponent; 0 for zero, denormal, inf and NaN.
-  cvt_flr / cvt_rpi: floor(x) / floor(x + 0.5), saturated to int32, NaN reads 0.
+  cvt_flr / cvt_rpi: floor(x) / floor(x + 0.5) in exact arithmetic, saturated to int32; a NaN reads 0x7fffffff
+              (sign clear) or 0x80000000 (sign set), as measured on RDNA 2 (CVT_FLR_RPI_EXCEPTIONAL).
   ldexp:      S0 * 2^S1 with S1 a signed integer.
 Not covered: denormal inputs and results of v_ldexp_f32 (the denormal mode decides them) and signaling-NaN payloads.
 """
@@ -50,12 +51,20 @@ def to_int(x):
 FUNCS = {
     'U': bits, 'F': value, 'uint': lambda x: int(x) & MASK, 'int': to_int, 'float': float,
     'floor': lambda x: x if math.isinf(x) else float(math.floor(x)), 'max': max, 'exp2': lambda x: f32(2.0 ** x),
-    'isnan': lambda x: x != x, 'clamp': lambda x, lo, hi: min(max(x, lo), hi), 'saturate': lambda x: min(max(x, 0.0), 1.0),
+    'clamp': lambda x, lo, hi: min(max(x, lo), hi), 'saturate': lambda x: min(max(x, 0.0), 1.0),
 }
 
 
 def idiv(a, b):
     return int(a / b)
+
+
+def add(a, b):
+    return f32(a + b) if isinstance(a, float) or isinstance(b, float) else (a + b) & MASK
+
+
+def sub(a, b):
+    return f32(a - b) if isinstance(a, float) or isinstance(b, float) else a - b
 
 
 def mul(a, b):
@@ -101,6 +110,10 @@ class Parser:
                 node = 'idiv(%s, %s)' % (node, right)
             elif op == '*':
                 node = 'mul(%s, %s)' % (node, right)
+            elif op == '+':
+                node = 'add(%s, %s)' % (node, right)
+            elif op == '-':
+                node = 'sub(%s, %s)' % (node, right)
             else:
                 node = '(%s %s %s)' % (node, op, right)
         return node
@@ -139,7 +152,7 @@ def lowered(base, asm):
 
 
 def run(text, **regs):
-    env = dict(FUNCS, idiv=idiv, mul=mul, **regs)
+    env = dict(FUNCS, idiv=idiv, mul=mul, add=add, sub=sub, **regs)
     return eval(Parser(text).out, {'__builtins__': {}}, env)
 
 
@@ -159,20 +172,20 @@ def ref_frexp_exp(w):
     return 0 if e in (0, 255) else math.frexp(value(w))[1] & MASK
 
 
-def saturate_int(x):
+def saturate_int(x, word):
     if x != x:
-        return 0
+        return 0x7fffffff + (word >> 31)
     return max(-2 ** 31, min(2 ** 31 - 1, math.floor(x))) & MASK if not math.isinf(x) else (
         MASK >> 1 if x > 0 else 0x80000000)
 
 
 def ref_cvt_flr(w):
-    return saturate_int(value(w))
+    return saturate_int(value(w), w)
 
 
 def ref_cvt_rpi(w):
     x = value(w)
-    return saturate_int(x if math.isinf(x) or x != x else math.floor(x + 0.5))
+    return saturate_int(x if math.isinf(x) or x != x else math.floor(x + 0.5), w)
 
 
 def ref_ldexp(a, n):
@@ -190,7 +203,9 @@ NAN, INF = 0x7fc00000, 0x7f800000
 FLOATS = [0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 0.75, 1.5, -2.5, 3.0, 0.1, -0.1, 0.4999, 0.5001, -0.5001, 1e-5,
           123456.789, -98765.4, 1.0e20, -1.0e20, 2.0 ** -126, 2.0 ** 127, 1.7014118e38, 8388608.5, 2147483520.0,
           -2147483648.0, 2.0 ** 31, -2.0 ** 33, 3.4028235e38, -3.4028235e38]
-WORDS = [bits(x) for x in FLOATS] + [NAN, INF, INF | 0x80000000, 0x00000001, 0x80400000, 0x007fffff]
+WORDS = [bits(x) for x in FLOATS] + [NAN, INF, INF | 0x80000000, 0x00000001, 0x80400000, 0x007fffff,
+                                      0xffc00000, 0x7f800001, 0xff800001, 0x7fffffff, 0xffffffff,
+                                      0x3effffff, 0xbf000001, 0x4b000001, 0xcb000001, 0x4b7fffff, 0x4effffff]
 SHIFTS = [0, 1, -1, 5, -5, 24, -24, 100, -100, 126, -126, 127, -127, 200, -200, 299, 300, 301, -300, 1000, -1000,
           2 ** 31 - 1, -2 ** 31]
 

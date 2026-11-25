@@ -38,7 +38,7 @@ REFERENCE = {'v_frexp_mant_f32': R.ref_frexp_mant, 'v_frexp_exp_i32_f32': R.ref_
 MUTATION = {'v_frexp_mant_f32': ('0x3f000000u', '0x3f800000u'),
             'v_frexp_exp_i32_f32': ('- 126u', '- 127u'),
             'v_cvt_flr_i32_f32': ('floor(', 'ceil('),
-            'v_cvt_rpi_i32_f32': ('+ 0.5', '+ 0.25'),
+            'v_cvt_rpi_i32_f32': ('>= 0.5', '>= 0.75'),
             'v_ldexp_f32': ('exp2(float(', '-exp2(float(')}
 BODY_SOURCE = {op: ''.join('%s v%d, v%d\n' % (op, 12 + i, i) for i in range(4)) for op in UNARY}
 BODY_SOURCE['v_ldexp_f32'] = ''.join('v_ldexp_f32 v%d, v%d, v%d\n' % (12 + i, i, 4 + i) for i in range(4))
@@ -47,7 +47,8 @@ BODY_SOURCE['v_ldexp_f32'] = ''.join('v_ldexp_f32 v%d, v%d, v%d\n' % (12 + i, i,
 UNARY_INPUTS = [R.bits(x) for x in (1.0, -1.0, 0.5, 0.75, -2.5, 3.0, 0.1, -0.1, 0.4999, 0.5001, 123456.789,
                                     -98765.4, 1.0e20, -1.0e20, 2.0 ** 127, 8388608.5, 2147483520.0,
                                     -2147483648.0, 2.0 ** 31, -2.0 ** 33, 3.4028235e38, 0.0, -0.0, 2.0 ** -126)]
-UNARY_INPUTS += [R.INF, R.INF | 0x80000000, R.NAN, 0x7f7fffff]
+UNARY_INPUTS += [R.INF, R.INF | 0x80000000, R.NAN, 0x7f7fffff,
+                0xffc00000, 0x3effffff, 0x4b000001, 0xff800001]
 LDEXP_INPUTS = [(R.bits(a), n & MASK) for a, n in (
     (1.0, 1), (1.5, -1), (-1.5, 5), (0.1, 24), (123456.789, -20), (-3.0, 100), (1.0, 127), (1.0, -126),
     (1.0, 200), (-1.0, -200), (0.0, 5), (-0.0, -5), (1.0, 2 ** 31 - 1), (1.0, -2 ** 31), (2.0, 300), (1.5, 0))]

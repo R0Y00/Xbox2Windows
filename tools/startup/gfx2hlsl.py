@@ -2748,23 +2748,29 @@ class Stage:
         e = '((%s >> 23) & 255u)' % self.float_bits(ops[1])
         self.set_v(reg_range(ops[0])[1], '(%s == 0u || %s == 255u) ? 0u : (%s - 126u)' % (e, e, e))
 
-    def float_to_int(self, base, ops, mods, rounded):
-        # Saturating conversion of the rounded float; NaN reads 0. v_cvt_flr rounds toward -inf, v_cvt_rpi
-        # rounds floor(x + 0.5). A value at or above 2^31 reads INT_MAX; one below -2^31 reads INT_MIN.
+    def float_to_int(self, base, ops, mods, rpi):
+        # Saturating conversion. v_cvt_flr rounds toward -inf; v_cvt_rpi adds 1 to floor(x) when the exact
+        # fraction x - floor(x) is at least 0.5 (binary32 x + 0.5 would round 0x3effffff up and 2^23 + 1 off).
+        # A NaN reads 0x7fffffff with its sign bit clear and 0x80000000 with it set; a value at or above 2^31
+        # reads INT_MAX and one below -2^31 reads INT_MIN (native RDNA 2 words, tests/pixel_aot_check.py).
         if mods:
             raise Unsupported('%s with modifiers' % base)
         if len(ops) != 2:
             raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
         x = self.f(ops[1])
-        r = 'floor(%s)' % (rounded % x)
-        self.set_v(reg_range(ops[0])[1], 'isnan(%s) ? 0u : (%s >= 2147483648.0) ? 0x7fffffffu : uint(int(max(%s, -2147483648.0)))' % (
-            x, r, r))
+        r = 'floor(%s)' % x
+        if rpi:
+            r = '(%s + (((%s) - %s) >= 0.5 ? 1.0 : 0.0))' % (r, x, r)
+        bits = self.float_bits(ops[1])
+        self.set_v(reg_range(ops[0])[1], '((%s & 0x7fffffffu) > 0x7f800000u) ? (0x7fffffffu + (%s >> 31)) : '
+                   '(%s >= 2147483648.0) ? 0x7fffffffu : uint(int(clamp(%s, -2147483648.0, 2147483520.0)))' % (
+                       bits, bits, x, r))
 
     def op_v_cvt_flr_i32_f32(self, ops, mods):
-        self.float_to_int('v_cvt_flr_i32_f32', ops, mods, '%s')
+        self.float_to_int('v_cvt_flr_i32_f32', ops, mods, False)
 
     def op_v_cvt_rpi_i32_f32(self, ops, mods):
-        self.float_to_int('v_cvt_rpi_i32_f32', ops, mods, '%s + 0.5')
+        self.float_to_int('v_cvt_rpi_i32_f32', ops, mods, True)
 
     def op_v_ldexp_f32(self, ops, mods):
         # D = S0 * 2^S1 with S1 a signed integer, clamped to +-300 (the result is 0 or inf past that anyway).
