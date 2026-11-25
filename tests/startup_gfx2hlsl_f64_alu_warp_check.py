@@ -115,7 +115,7 @@ def mutate_text(op, text):
     if op == 'v_cvt_f32_f64':
         mutated = text.replace('asuint((float)', 'asuint(-(float)')
     else:
-        mutated = re.sub(r'(v\d+) = lo; (v\d+) = hi;', r'\1 = hi; \2 = lo;', text)
+        mutated = re.sub(r'(v\d+) = (f64lo\d+);\s*(v\d+) = (f64hi\d+);', r'\1 = \4; \3 = \2;', text)
     assert mutated != text, op
     return mutated
 

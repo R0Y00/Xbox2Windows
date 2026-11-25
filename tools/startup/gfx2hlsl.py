@@ -330,6 +330,11 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('image_load_mip tfe')
         if word1 & (1 << 30):
             raise Unsupported('image_load_mip a16')
+    if name == 'v_cvt_f64_f32_e64':
+        # An inline integer is read as raw float bits; the printed -1 or -0 cannot tell NEG from a plain constant.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if 128 <= word1 & 0x1ff <= 208 and (word0 & (1 << 8) or word1 & (1 << 29)):
+            raise Unsupported('v_cvt_f64_f32_e64 NEG or ABS on an inline integer')
     if name == 'v_cndmask_b32_e64':
         # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -2722,6 +2727,14 @@ class Stage:
             raise Unsupported('%s destination %s' % (name, tok))
         return dst[1], dst[2]
 
+    def f64_store(self, lo, hi, value):
+        # Evaluate into temporaries first, then write each half as its own `vN = ...` line so the vertex fetch guard sees both.
+        self.f64_temps = getattr(self, 'f64_temps', 0) + 1
+        tl, th = 'f64lo%d' % self.f64_temps, 'f64hi%d' % self.f64_temps
+        self.emit('uint %s, %s; asuint(%s, %s, %s);' % (tl, th, value, tl, th))
+        self.set_v(lo, tl)
+        self.set_v(hi, th)
+
     def f64_op(self, name, ops, mods, arity, text):
         if mods:
             raise Unsupported('%s with %s' % (name, mods))
@@ -2729,12 +2742,7 @@ class Stage:
             raise Unsupported('%s with %d operands, expected %d' % (name, len(ops), arity + 1))
         lo, hi = self.f64_pair_destination(name, ops[0])
         value = text.format(*[self.f64_source(o) for o in ops[1:]])
-        if hasattr(self, 'uniform_v'):
-            self.uniform_v.discard(lo)
-            self.uniform_v.discard(hi)
-        self.used_v.update((lo, hi))
-        body = '{ uint lo, hi; asuint(%s, lo, hi); v%d = lo; v%d = hi; }' % (value, lo, hi)
-        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+        self.f64_store(lo, hi, value)
 
     def op_v_add_f64(self, ops, mods):
         self.f64_op('v_add_f64', ops, mods, 2, '{0} + {1}')
@@ -2762,12 +2770,7 @@ class Stage:
             raise Unsupported('v_cvt_f64_f32 with %d operands, expected 2' % len(ops))
         lo, hi = self.f64_pair_destination('v_cvt_f64_f32', ops[0])
         value = 'double(%s)' % self.f(ops[1])
-        if hasattr(self, 'uniform_v'):
-            self.uniform_v.discard(lo)
-            self.uniform_v.discard(hi)
-        self.used_v.update((lo, hi))
-        body = '{ uint lo, hi; asuint(%s, lo, hi); v%d = lo; v%d = hi; }' % (value, lo, hi)
-        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+        self.f64_store(lo, hi, value)
 
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
