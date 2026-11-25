@@ -174,7 +174,7 @@ def draw(directory, compiler, renderer, backend):
     case.write_bytes(struct.pack("<321I", 1, *expected))
     checked += mutate(directory, compiler, source_b, case, cmd, cso, (
         ("exec mask as zero", "countbits(0xffffffffu &", "countbits(0x00000000u &"),
-        ("rank over the group", "(gindex & 31u)", "(gindex & 63u)"),
+        ("rank over half the wave", "(gindex & 31u)", "(gindex & 15u)"),
         ("count dropped", f"0x{ones(EXEC_WORD):08x}u", "0x00000000u")))
 
     # Program A: groups of 32, read-compute binding with the params constants.
