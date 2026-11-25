@@ -364,14 +364,16 @@ def expected(name):
         return expected('A')
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
-    if name == 'G':
+    producer_offsets = {'G': (1, 32), 'G-offset0-only': (31, 0), 'G-offset1-only': (0, 31)}
+    if name in producer_offsets:
+        # The original fill begins at dword 4, the single-field variants at dword 0.
+        first, second = producer_offsets[name]
         for group in range(2):
             stored = [4 * ((lane ^ (8 * group)) & 31) for lane in range(64)]
             for lane in range(64):
-                # The fill begins at dword 4. Offset0 and offset1 select lanes base+1 and base+32.
                 base = lane & 31
                 index = 2 * (64 * group + lane)
-                out[index:index + 2] = [stored[base + 1], stored[base + 32]]
+                out[index:index + 2] = [stored[base + first], stored[base + second]]
         return out
     if name == 'F':
         for group in range(2):
@@ -433,6 +435,16 @@ def patch(words, old, new):
     old, new = bytes.fromhex(old), bytes.fromhex(new)
     assert words.count(old) == 1, old.hex()
     return words.replace(old, new)
+
+
+# Move the fill to dword zero so either read field can be omitted. Both variants retain the
+# overlapping destination/address and participate in the regular LLVM reassembly and GPU dispatch.
+for field, offset_bytes in (('offset0', '1f00'), ('offset1', '001f')):
+    source = SOURCE_G.replace('ds_write_b32 v4, v5 offset:16', 'ds_write_b32 v4, v5')
+    source = source.replace('offset0:5 offset1:36', field + ':31')
+    words = patch(WORDS_G, '100034d804050000', '000034d804050000')
+    words = patch(words, '0524dcd806000006', offset_bytes + 'dcd806000006')
+    CASES[f'G-{field}-only'] = (source, words, *CASES['G'][2:])
 
 
 MBCNT_REFUSALS = (
@@ -552,9 +564,8 @@ def check_lds():
         refused(reason, lambda: translate('G', code=patch(WORDS_G, pair, other)))
     # Offset fields omitted by the disassembler default independently to zero. With the fill at zero,
     # both zero and +31 dwords are valid from any masked base in this fixture.
-    zero_fill = patch(WORDS_G, store, '000034d804050000')
-    for offsets, expected_offsets in (('1f00', (124, 0)), ('001f', (0, 124))):
-        shader = translate('G', code=patch(zero_fill, pair, offsets + pair[4:])).hlsl_cs()
+    for name, expected_offsets in (('G-offset0-only', (124, 0)), ('G-offset1-only', (0, 124))):
+        shader = translate(name).hlsl_cs()
         for dest, offset in zip((6, 7), expected_offsets):
             assert f'v{dest} = lds[(a + {offset}u) >> 2];' in shader
     assert 'groupshared' not in translate('A', rsrc2=CASES['A'][2] | 1 << 15).hlsl_cs()
