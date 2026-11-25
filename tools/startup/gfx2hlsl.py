@@ -1822,11 +1822,18 @@ class Stage:
         if base == 'exp':
             return self.export(asm)
         if base in ('ds_write_b32', 'ds_read_b32', 's_barrier'):
-            if self.kind != 'cs':
+            if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported(base)
-            if not getattr(self, 'lds_checked', False):
-                check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
-                self.lds_checked = True
+            # The refusal census continues past failed instructions. Scan this program only once.
+            if not hasattr(self, 'lds_error'):
+                self.lds_error = None
+                try:
+                    check_lds_exchange(self.ins, self.pipe.group, self.pipe.lds_words)
+                    self.uses_lds = True
+                except Unsupported as reason:
+                    self.lds_error = str(reason)
+            if self.lds_error is not None:
+                raise Unsupported(self.lds_error)
             if base == 's_barrier':
                 self.emit('GroupMemoryBarrierWithGroupSync();')
             else:
@@ -4560,7 +4567,7 @@ class ComputePipeline(Pipeline):
         if s.exports:
             raise Unsupported('export in a compute program')
         body = s.body()
-        shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'lds_checked', False) else []
+        shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'

@@ -22,6 +22,7 @@ reads the read buffer at that index and stores to its own destination:
   16-31 under partial EXEC. Two 4x2x4 groups write separate records to the raw buffer.
 - case E runs five SAVEEXEC forms with overlapping and distinct source registers. Four single-thread groups
   cover both input bits for EXEC and S0; each stores the saved EXEC, resulting SCC and new EXEC.
+- case F exchanges LDS dwords across the two halves of each 64-thread group and broadcasts lane 37.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -209,6 +210,35 @@ def saveexec_fixture():
     return '\n'.join(line for line, _ in program) + '\n', bytes.fromhex(''.join(word for _, word in program))
 
 
+SOURCE_F = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 8
+v_add_nc_u32 v5, s20, v0
+v_lshlrev_b32 v4, 2, v0
+ds_write_b32 v4, v5 offset:16
+s_waitcnt lgkmcnt(0)
+s_barrier
+v_xor_b32 v8, 0x80, v4
+v_and_b32 v8, 0xfc, v8
+ds_read_b32 v6, v8 offset:16
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v8, 0
+ds_read_b32 v7, v8 offset:164
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s21, s7, 6
+v_add_nc_u32 v9, s21, v0
+v_lshlrev_b32 v9, 3, v9
+buffer_store_dwordx2 v[6:7], v9, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_F = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0788148f14000a4a82000834100034d804050000'
+    '7fc08cbf00008abfff08103a80000000ff101036fc0000001000d8d8080000067fc08cbf8002107e'
+    'a400d8d8080000077fc08cbf0786158f1500124a83121234001074e009060480000081bf')
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -217,6 +247,7 @@ CASES = {
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'E': (*saveexec_fixture(), USER7 | TGID_X | tidig(1), (1, 1, 1), (4, 1, 1)),
+    'F': (SOURCE_F, WORDS_F, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -286,6 +317,12 @@ def input_word(i):
 def expected(name):
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    if name == 'F':
+        for group in range(2):
+            for lane in range(64):
+                index = (64 * group + lane) * 2
+                out[index:index + 2] = [256 * group + (lane ^ 32), 256 * group + 37]
+        return out
     if name == 'E':
         # Group IDs 0..3 encode (old EXEC, S0) = (0,0), (0,1), (1,0), (1,1).
         # Store old EXEC in bit 2, SCC in bit 1 and new EXEC in bit 0. Both operand layouts agree.
@@ -402,7 +439,53 @@ def check_descriptor_scc():
     assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, move).hlsl_cs()
 
 
+def check_lds():
+    # Actual instruction substitutions in the LLVM-assembled exchange. Keep the prefix, except where the
+    # local-ID proof itself is under test; a different first refusal would hide the regression.
+    store = '100034d804050000'
+    peer = '1000d8d808000006'
+    broadcast = 'a400d8d808000007'
+    wait = '7fc08cbf'
+    barrier = '00008abf'
+    nop = '000080bf'
+    hlsl = translate('F').hlsl_cs()
+    sync = 'GroupMemoryBarrierWithGroupSync();'
+    assert hlsl.count(sync) == 1 and hlsl.index('] = v5;') < hlsl.index(sync) < hlsl.index('v6 = lds[')
+    for old, new, reason in (
+        ('82000834', '8002007e82000834', 'unchanged entry local X'),  # write v0 before computing the address
+        ('82000834', '00cb087e82000834', 'unchanged entry local X'),  # v_swap also writes its second operand
+        ('82000834', '82020834', 'one bounded dword'),              # use Y instead of X
+        (store, '040134d804050000', 'one bounded dword'),             # last lane exceeds the 512-byte allocation
+        (store, store + store, 'one bounded dword'),                  # overlapping fill
+        (wait + barrier, nop + barrier, 'completed fill'),
+        (barrier, nop, 'after the fill barrier'),
+        (barrier, barrier + barrier, 'one barrier'),
+        (peer, '0c00d8d808000006', 'initialized span'),               # read before the filled span
+        (broadcast, '1001d8d808000007', 'initialized span'),          # first dword after the span
+        (broadcast, '1200d8d808000007', 'aligned'),
+        (broadcast, 'a400dad808000007', 'optional byte offset'),      # GDS
+        ('ff101036fc000000', 'ff101036ff000000', 'aligned'),          # mask leaves unaligned byte addresses
+        ('8002107e', '0403107e', 'literal or literal-masked'),        # unbounded VGPR address
+        (peer + wait, peer + nop, 'completed LGKM wait'),
+        (store, '8003febe' + store, 'entry EXEC'),
+        (store, '020084bf' + store, 'straight-line'),
+    ):
+        refused(reason, lambda: translate('F', code=patch(WORDS_F, old, new)))
+    base = USER7 | TGID_X
+    for units in (0, 65):
+        refused('allocation', lambda: translate('F', rsrc2=base | units << 15))
+    refused('1D group', lambda: translate('F', group=(32, 2, 1)))
+    # Slide the whole span to the end of the 512-byte allocation. Thread 63 now writes its last dword.
+    at_end = patch(WORDS_F, store, '000134d804050000')
+    at_end = patch(at_end, peer, '0001d8d808000006')
+    at_end = patch(at_end, broadcast, '9401d8d808000007')
+    assert 'lds[(v4 + 256u) >> 2] = v5;' in translate('F', code=at_end).hlsl_cs()
+    assert 'groupshared uint lds[8192];' in translate('F', rsrc2=base | 64 << 15).hlsl_cs()
+    assert 'groupshared' not in translate('A', rsrc2=CASES['A'][2] | 1 << 15).hlsl_cs()
+
+
 def check_controls():
+    check_lds()
     check_descriptor_scc()
     check_mbcnt()
     a = translate('A')
@@ -538,6 +621,8 @@ CONTROLS = {
     'd-base': ('D', MBCNT_COUNT + ' + v6', MBCNT_COUNT),
     'd-hi': ('D', 'v9 = v8;', f'v9 = v8 + {MBCNT_COUNT};'),
     'd-exec': ('D', 'if (exec & 1) v10 =', 'v10 ='),
+    'f-peer': ('F', '0x00000080u ^ v4', 'v4'),
+    'f-broadcast': ('F', 'lds[(v8 + 164u) >> 2]', 'lds[(v8 + 160u) >> 2]'),
 }
 
 # Independent first bad word for each D mutation, including lane zero and the
