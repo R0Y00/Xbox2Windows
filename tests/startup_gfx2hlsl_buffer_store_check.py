@@ -98,8 +98,19 @@ def main():
                   '%s %s' % (result, fail_reason(name)))
 
         # 3. A scalar byte offset adds to the immediate.
-        result, name = request(folder, LOAD_DESCRIPTOR + DEFINE_V + encode_mubuf(STORE_OPS['dwordx3'], imm=4, soffset=130) + EXPORT_POSITION)
-        check('scalar offset plus immediate', result == 'ok' and 'a = 6;' in name.with_suffix('.vs.hlsl').read_text(),
+        result, name = request(folder, LOAD_DESCRIPTOR + DEFINE_V + encode_mubuf(STORE_OPS['dwordx3'], imm=4, soffset=132) + EXPORT_POSITION)
+        check('scalar offset plus immediate', result == 'ok' and 'a = 8;' in name.with_suffix('.vs.hlsl').read_text(),
+              '%s %s' % (result, fail_reason(name)))
+
+        # 3b. An unaligned effective offset, and a descriptor whose base was changed, are refused.
+        for label, code in (('unaligned inline offset', encode_mubuf(STORE_OPS['dwordx3'], imm=4, soffset=130)),
+                            ('unaligned immediate', encode_mubuf(STORE_OPS['dwordx3'], imm=6))):
+            result, name = request(folder, LOAD_DESCRIPTOR + DEFINE_V + code + EXPORT_POSITION)
+            check('%s is refused' % label, result.startswith('unsupported') and 'unaligned' in fail_reason(name),
+                  '%s %s' % (result, fail_reason(name)))
+        add_base = struct.pack('<I', 0x80000000 | (32 << 16) | (144 << 8) | 32)  # s_add_u32 s32, s32, 16
+        result, name = request(folder, LOAD_DESCRIPTOR + add_base + DEFINE_V + encode_mubuf(STORE_OPS['dwordx3']) + EXPORT_POSITION)
+        check('store through a modified descriptor is refused', result.startswith('unsupported') and 'modified' in fail_reason(name),
               '%s %s' % (result, fail_reason(name)))
 
         # 4. Control: a program with only a load keeps manifest version 1 and no writable view.

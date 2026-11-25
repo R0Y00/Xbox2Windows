@@ -2144,18 +2144,25 @@ class Stage:
         key = self.descriptor(ops[2])
         if key[0][0] != 'table' or key[1] is None:
             raise Unsupported('buffer store through %s' % (key,))
+        if key in self.pipe.modified:
+            raise Unsupported('buffer store through a modified descriptor')
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
             soffset = ''
+            if offset % 4:
+                raise Unsupported('buffer store at unaligned byte offset %d' % offset)
         else:
             sreg = reg_range(ops[3])
             if not sreg or sreg[0] != 's' or sreg[1] != sreg[2] or sreg[1] > 105:
                 raise Unsupported('buffer soffset %s' % ops[3])
+            if offset % 4:
+                raise Unsupported('buffer store at unaligned immediate offset %d' % offset)
             soffset = '%s + ' % self.S(sreg[1])
         uav = self.pipe.uav(key, 'raw')
         words = ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
         store = '%s.Store%s(a, %s);' % (uav, '' if count == 1 else str(count), 'uint%d(%s)' % (count, words) if count > 1 else words)
-        self.emit('a = %s%d;' % (soffset, offset))
+        # Store* needs a multiple of four: the immediate is checked above; a register offset is rounded down.
+        self.emit('a = (%s%d) & 0xfffffffcu;' % (soffset, offset) if soffset else 'a = %d;' % offset)
         self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
 
     def op_buffer_store_dword(self, ops, mods, count=1):
