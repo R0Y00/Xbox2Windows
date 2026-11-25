@@ -250,10 +250,24 @@ def evaluate(line, regs, rounder=round, extra=None):
     expr = line.split(' = ', 1)[1].rstrip(';')
     expr = re.sub(r'\b0x([0-9a-f]+)u\b', r'0x\1', expr)
     expr = re.sub(r'\b(\d+)u\b', r'\1', expr)
-    expr = re.sub(r'\((F\(\w+\) > 0\.0) \? (uint\(round\(min\(F\(\w+\), 255\.0\)\)\)) : 0\)', r'(\2 if \1 else 0)', expr)
+    expr = re.sub(r'\(\(\((\w+) - 1\) < 0x7f800000\) \? (uint\(round\(min\(F\(\w+\), 255\.0\)\)\)) : 0\)',
+                  r'(\2 if ((\1 - 1) & 0xffffffff) < 0x7f800000 else 0)', expr)
+    if '?' in expr:
+        raise AssertionError('lowering text changed, evaluator cannot parse: ' + line)
     env = {'F': as_float, 'uint': lambda x: int(x), 'min': min, 'round': rounder, 'trunc': math.trunc, **regs}
     env.update(extra or {})
-    return eval(expr, {'__builtins__': {}}, env) & MASK  # the expression is the translator's own text
+    try:
+        return eval(expr, {'__builtins__': {}}, env) & MASK  # the expression is the translator's own text
+    except SyntaxError as error:
+        raise AssertionError('lowering text changed, evaluator cannot parse: %s (%s)' % (line, error))
+
+
+def catch(fn):
+    try:
+        fn()
+    except AssertionError as error:
+        return error
+    return AssertionError('no error')
 
 
 def half_away(x):
@@ -287,11 +301,21 @@ def measured_controls():
     negative = lambda bits: as_float(bits) < 0.0
     check('truncation is detected', differs(line, extra={'round': math.trunc}) and 'round(' in line)
     check('round half away is detected', differs(line, half_away))
-    no_guard = re.sub(r'\(F\((v\d+)\) > 0\.0 \? (.*?) : 0u\)', r'\2', line)
+    no_guard = re.sub(r'\(\(\((v\d+) - 1u\) < 0x7f800000u\) \? (.*?) : 0u\)', r'\2', line)
     check('the guard is in the text', no_guard != line)
     check('NaN not mapped to 0 is detected', differs(no_guard, only=nan))
     check('negatives wrapped is detected', differs(no_guard, only=negative))
     check('guard keeps NaN at 0', evaluate(line, {'v0': 0x7fc00000, 'v4': 0, 'v8': 0}) == 0)
+    # The guard is an integer test on the raw word, for a register, a scalar register and a constant S0 alike.
+    check('guard is an integer compare', '- 1u) < 0x7f800000u' in line and '> 0.0' not in line)
+    check('guard on an SGPR', '((s4 - 1u) < 0x7f800000u)' in emitted('v_cvt_pk_u8_f32 v12, s4, v4, v8'))
+    check('guard on a constant', '((0x3f800000u - 1u) < 0x7f800000u)' in emitted('v_cvt_pk_u8_f32 v12, 1.0, v4, v8'))
+    for bits in (0x00000001, 0x007fffff, 0x7f800000):   # smallest subnormal, largest subnormal, +inf pass the guard
+        check('guard open at %08x' % bits, ((bits - 1) & 0xffffffff) < 0x7f800000)
+    for bits in (0, 0x80000000, 0x80000001, 0xff800000, 0x7f800001, 0x7fc00000, 0xffffffff):
+        check('guard shut at %08x' % bits, not ((bits - 1) & 0xffffffff) < 0x7f800000)
+    check('a changed lowering text is reported, not a SyntaxError',
+          'cannot parse' in (lambda: [str(e) for e in [catch(lambda: evaluate(line.replace('255.0', '255.0) ?'), {'v0': 0}))]][0])())
 
 
 def selector_controls():

@@ -4349,8 +4349,10 @@ class Stage:
         # see docs/experiments.md): round to nearest even, saturated to [0, 255], NaN and negatives (-0.0, -inf
         # included) give 0, +inf gives 255. MODE[1:0] = 3 (round toward zero) truncates instead, which is why a write
         # of those bits is refused in s_setreg_imm32_b32. s_denorm_mode 0 changed nothing.
-        # Lowering: S0 > 0.0 is false for NaN, negatives and both zeros, so those take the 0u arm without relying on
-        # how min/max treat a NaN operand (DXIL FMax/FMin return the other operand, other back ends may not).
+        # Lowering: (bits - 1u) < 0x7f800000u holds exactly from the smallest positive subnormal to +inf and fails
+        # for both zeros, every negative and every NaN, so those take the 0u arm. It is an integer test on the raw
+        # word: a float compare may be folded under fast-math (DXC emits `fcmp fast ogt`, so NaN would depend on
+        # the driver), and min/max treat a NaN operand differently between back ends.
         # Above zero, min(S0, 255.0) saturates (+inf included) and HLSL round() is round_ne (DXIL Round_ne), so the
         # conversion is exact and in range.
         if mods:
@@ -4364,10 +4366,11 @@ class Stage:
             src = reg_range(ops[1])
             if src[1] != src[2]:
                 raise Unsupported('v_cvt_pk_u8_f32 source %s' % ops[1])
-        value, select, rest = 'F(%s)' % self.u(ops[1]), self.u(ops[2]), self.u(ops[3])
+        bits, select, rest = self.u(ops[1]), self.u(ops[2]), self.u(ops[3])
+        value = 'F(%s)' % bits
         shift = '((%s & 3u) << 3u)' % select
-        self.set_v(dst[1], '((%s & ~(0xffu << %s)) | (((%s > 0.0 ? uint(round(min(%s, 255.0))) : 0u) & 0xffu) << %s))'
-                   % (rest, shift, value, value, shift))
+        self.set_v(dst[1], '((%s & ~(0xffu << %s)) | (((((%s - 1u) < 0x7f800000u) ? uint(round(min(%s, 255.0))) : 0u) & 0xffu) << %s))'
+                   % (rest, shift, bits, value, shift))
 
     def op_s_ff1_i32_b32(self, ops, mods):
         if self.kind != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':

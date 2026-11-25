@@ -206,6 +206,8 @@ The translation is refused when:
 
 The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
 constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
+rounding mode.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
