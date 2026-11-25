@@ -11114,6 +11114,241 @@ def check_sdwa_f16_draw(directory, compiler, renderer, backend):
     return 0
 
 
+# Extended 32-bit integer SDWA fixtures covering 12 SDWA forms: bit-scan/reverse (bfrev/ffbl/ffbh_u32/ffbh_i32),
+# saturate-pack (sat_pk_u8_i16), 24-bit multiplies (mul/mul_hi i24/u24), and carry-in add/sub/subrev (co_ci_u32).
+# Runtime inputs arrive in constant buffer words s44..s47 (with v18 = s45) so DXC never folds the operations.
+SDWA_INT_EXTRA_PROGRAMS = {
+    "bitscan_satpk": [
+        "v_mov_b32_e32 v18, s45",
+        # ch0: reverse bits of zero-extended WORD_1(s44).
+        "v_bfrev_b32_sdwa v12, s44 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1",
+        # ch1: ffbl(sext(BYTE_1(v18))) in WORD_0, ffbh_u32(WORD_0(s46)) in WORD_1 with UNUSED_PRESERVE.
+        "v_ffbl_b32_sdwa v13, sext(v18) dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+        "v_ffbh_u32_sdwa v13, s46 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        # ch2: ffbh_i32(sext(BYTE_0(s44))).
+        "v_ffbh_i32_sdwa v14, sext(s44) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0",
+        # ch3: sat_pk_u8_i16(s47) in WORD_0, sat_pk_u8_i16(sext(BYTE_2(v18))) in WORD_1 with UNUSED_PRESERVE.
+        "v_sat_pk_u8_i16_sdwa v15, s47 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:DWORD",
+        "v_sat_pk_u8_i16_sdwa v15, sext(v18) dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_2",
+    ],
+    "mul24": [
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v15, 0x0000cafe",
+        # ch0: unsigned 24-bit multiply low of WORD_1(s44) and DWORD(v18) (bits 31:24 of v18 masked off).
+        "v_mul_u32_u24_sdwa v12, s44, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD",
+        # ch1: signed 24-bit multiply low of sext(WORD_0(s44)) and sext(BYTE_3(s45)).
+        "v_mul_i32_i24_sdwa v13, sext(s44), sext(s45) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:BYTE_3",
+        # ch2: unsigned 24-bit multiply high of DWORD(s46) and DWORD(s47), placed in WORD_0 with UNUSED_PAD.
+        "v_mul_hi_u32_u24_sdwa v14, s46, s47 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+        # ch3: signed 24-bit multiply high of DWORD(s46) and sext(WORD_1(s47)), placed in WORD_1 keeping 0xcafe.
+        "v_mul_hi_i32_i24_sdwa v15, s46, sext(s47) dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:WORD_1",
+    ],
+    "co_ci": [
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v19, s46",
+        "v_mov_b32_e32 v20, s47",
+        "v_mov_b32_e32 v14, 0x00001337",
+        "v_cmp_lt_u32_e32 vcc_lo, s44, v18",
+        # ch0: sext(BYTE_0(s44)) + WORD_0(v19) + ci0 -> v12, updates vcc_lo with 32-bit carry-out.
+        "v_add_co_ci_u32_sdwa v12, vcc_lo, sext(s44), v19, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:WORD_0",
+        # ch1: WORD_1(s47) - WORD_1(v18) - borrow_in -> WORD_0 of v13, updates vcc_lo with 32-bit borrow-out.
+        "v_sub_co_ci_u32_sdwa v13, vcc_lo, s47, v18, vcc_lo dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_1",
+        # ch2: BYTE_0(v20) - sext(BYTE_1(s44)) - borrow_in -> WORD_1 of v14 keeping 0x1337, updates vcc_lo.
+        "v_subrev_co_ci_u32_sdwa v14, vcc_lo, sext(s44), v20, vcc_lo dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1 src1_sel:BYTE_0",
+        # ch3: final borrow-out flag (0 or 1).
+        "v_cndmask_b32_e64 v15, 0, 1, vcc_lo",
+    ],
+}
+SDWA_INT_EXTRA_ROWS = {
+    "bitscan_satpk": (
+        (0x123400fe, 0x007f8000, 0x11110080, 0x012cfff6),
+        (0x8001007f, 0x00800000, 0xdead0000, 0x00c8002a),
+        (0x000000ff, 0x00ff0400, 0x00008000, 0x80007fff),
+    ),
+    "mul24": (
+        (0x0003fffe, 0xfd123456, 0xaa800001, 0x8000ffff),
+        (0xffff0005, 0xfeffffff, 0x557fffff, 0x7fff0001),
+        (0x12348000, 0x02abcdef, 0xff010000, 0xfffe0000),
+    ),
+    "co_ci": (
+        # Row 0: s44 < s45 -> ci0=1; add(-1, 5, 1)=5 carry=1; sub(2, 5, 1)=-4 borrow=1; subrev(sext(0xfe)=-2, 10, 1)=11 borrow=0.
+        (0x0000feff, 0x00050000, 0x00000005, 0x0002000a),
+        # Row 1: s44 > s45 -> ci0=0; add(3, 7, 0)=10 carry=0; sub(9, 4, 0)=5 borrow=0; subrev(sext(0x05)=5, 2, 0)=-3 borrow=1.
+        (0x10000503, 0x00040000, 0x00000007, 0x00090002),
+        # Row 2: boundary carry propagation: ci0=1; add(-1, 0, 1)=0 carry=1; sub(0, 0, 1)=-1 borrow=1; subrev(0, 0, 1)=-1 borrow=1.
+        (0x000000ff, 0x00001000, 0x00000000, 0x00000000),
+    ),
+}
+SDWA_INT_EXTRA_MUTATIONS = {
+    "bitscan_satpk": (
+        ("src0_sel:WORD_1", "src0_sel:WORD_0"),
+        ("v_ffbl_b32_sdwa v13, sext(v18)", "v_ffbh_u32_sdwa v13, sext(v18)"),
+        ("v_ffbh_u32_sdwa v13, s46 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE",
+         "v_ffbh_u32_sdwa v13, s46 dst_sel:WORD_1 dst_unused:UNUSED_PAD"),
+        ("v_ffbh_i32_sdwa v14, sext(s44)", "v_ffbh_u32_sdwa v14, sext(s44)"),
+        ("v_sat_pk_u8_i16_sdwa v15, sext(v18) dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE",
+         "v_sat_pk_u8_i16_sdwa v15, sext(v18) dst_sel:WORD_1 dst_unused:UNUSED_PAD"),
+    ),
+    "mul24": (
+        ("v_mul_u32_u24_sdwa v12, s44, v18", "v_mul_i32_i24_sdwa v12, s44, v18"),
+        ("v_mul_i32_i24_sdwa v13, sext(s44), sext(s45)", "v_mul_u32_u24_sdwa v13, sext(s44), sext(s45)"),
+        ("v_mul_hi_u32_u24_sdwa v14, s46, s47", "v_mul_hi_i32_i24_sdwa v14, s46, s47"),
+        ("v_mul_hi_i32_i24_sdwa v15, s46, sext(s47) dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE",
+         "v_mul_hi_i32_i24_sdwa v15, s46, sext(s47) dst_sel:WORD_1 dst_unused:UNUSED_PAD"),
+    ),
+    "co_ci": (
+        ("v_add_co_ci_u32_sdwa v12, vcc_lo, sext(s44), v19, vcc_lo",
+         "v_sub_co_ci_u32_sdwa v12, vcc_lo, sext(s44), v19, vcc_lo"),
+        ("v_sub_co_ci_u32_sdwa v13, vcc_lo, s47, v18, vcc_lo",
+         "v_subrev_co_ci_u32_sdwa v13, vcc_lo, s47, v18, vcc_lo"),
+        ("v_subrev_co_ci_u32_sdwa v14, vcc_lo, sext(s44), v20, vcc_lo dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE",
+         "v_sub_co_ci_u32_sdwa v14, vcc_lo, sext(s44), v20, vcc_lo dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE"),
+        ("v_subrev_co_ci_u32_sdwa v14, vcc_lo, sext(s44), v20, vcc_lo dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE",
+         "v_subrev_co_ci_u32_sdwa v14, vcc_lo, sext(s44), v20, vcc_lo dst_sel:WORD_1 dst_unused:UNUSED_PAD"),
+    ),
+}
+
+
+def sdwa_int_extra_reference(group, row):
+    """Independent Python reference words for SDWA_INT_EXTRA_PROGRAMS."""
+    a, b, c, d = row
+    sel_u32 = lambda w, off, wid, sx: (
+        ((w >> off) & ((1 << wid) - 1)) | ((~((1 << wid) - 1) & 0xffffffff) if (sx and ((w >> (off + wid - 1)) & 1)) else 0)
+    ) & 0xffffffff
+    bfrev = lambda x: int(f"{x & 0xffffffff:032b}"[::-1], 2)
+    ffbl = lambda x: 0xffffffff if (x & 0xffffffff) == 0 else ((x & 0xffffffff) & -(x & 0xffffffff)).bit_length() - 1
+    ffbh_u = lambda x: 0xffffffff if (x & 0xffffffff) == 0 else 32 - (x & 0xffffffff).bit_length()
+    def ffbh_i(x):
+        x &= 0xffffffff
+        if x in (0, 0xffffffff):
+            return 0xffffffff
+        target = ~x & 0xffffffff if x & 0x80000000 else x
+        return 32 - target.bit_length()
+    def sat_pk(x):
+        lo = (x & 0xffff) - 0x10000 if x & 0x8000 else (x & 0xffff)
+        hi = ((x >> 16) & 0xffff) - 0x10000 if x & 0x80000000 else ((x >> 16) & 0xffff)
+        return min(max(lo, 0), 255) | (min(max(hi, 0), 255) << 8)
+    s24 = lambda x: (x & 0xffffff) - 0x1000000 if x & 0x800000 else (x & 0xffffff)
+    if group == "bitscan_satpk":
+        ch0 = bfrev(sel_u32(a, 16, 16, False))
+        ch1 = (ffbl(sel_u32(b, 8, 8, True)) & 0xffff) | ((ffbh_u(sel_u32(c, 0, 16, False)) & 0xffff) << 16)
+        ch2 = ffbh_i(sel_u32(a, 0, 8, True))
+        ch3 = (sat_pk(d) & 0xffff) | ((sat_pk(sel_u32(b, 16, 8, True)) & 0xffff) << 16)
+        return (ch0, ch1, ch2, ch3)
+    if group == "mul24":
+        ch0 = ((sel_u32(a, 16, 16, False) & 0xffffff) * (b & 0xffffff)) & 0xffffffff
+        ch1 = (s24(sel_u32(a, 0, 16, True)) * s24(sel_u32(b, 24, 8, True))) & 0xffffffff
+        ch2 = (((c & 0xffffff) * (d & 0xffffff)) >> 32) & 0xffff
+        ch3_hi = ((s24(c) * s24(sel_u32(d, 16, 16, True))) >> 32) & 0xffff
+        return (ch0, ch1, ch2, (ch3_hi << 16) | 0xcafe)
+    # co_ci:
+    ci = 1 if a < b else 0
+    s0_0, s1_0 = sel_u32(a, 0, 8, True), sel_u32(c, 0, 16, False)
+    sum0 = s0_0 + s1_0 + ci
+    ch0, ci = sum0 & 0xffffffff, 1 if sum0 >> 32 else 0
+    s0_1, s1_1 = sel_u32(d, 16, 16, False), sel_u32(b, 16, 16, False)
+    diff1 = s0_1 - s1_1 - ci
+    ch1, ci = diff1 & 0xffff, 1 if diff1 < 0 else 0
+    s0_2, s1_2 = sel_u32(a, 8, 8, True), sel_u32(d, 0, 8, False)
+    diff2 = s1_2 - s0_2 - ci
+    ch2, ci = ((diff2 & 0xffff) << 16) | 0x1337, 1 if diff2 < 0 else 0
+    return (ch0, ch1, ch2, ci)
+
+
+def check_sdwa_int_extra_controls():
+    """Static lowering and refusal controls for the 12 extended integer SDWA forms."""
+    for name, body in SDWA_INT_EXTRA_PROGRAMS.items():
+        prog = uncompressed_export(body)
+        hlsl = translate_int(prog)
+        if name == "bitscan_satpk":
+            assert "reversebits(" in hlsl and "firstbitlow(" in hlsl
+            assert "dpp_ffbh_u32(" in hlsl and "dpp_ffbh_i32(" in hlsl
+        elif name == "mul24":
+            for helper in ("mul24_u32(", "mul24_i32(", "mul24_hi_u32(", "mul24_hi_i32("):
+                assert helper in hlsl, (helper, hlsl)
+        for old, new in SDWA_INT_EXTRA_MUTATIONS[name]:
+            mutated = [line.replace(old, new) for line in prog]
+            assert mutated != prog, (name, old)
+            assert translate_int(mutated) != hlsl, (name, old, new)
+    sdwa1 = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"
+    sdwa2 = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"
+    cmp_vcc = ["v_mov_b32_e32 v18, s45", "v_cmp_lt_u32_e32 vcc_lo, s44, v18"]
+    # Refusals for SDWA_INT_EXTRA and co_ci SDWA: UNUSED_SEXT, untracked UNUSED_PRESERVE, float modifiers,
+    # clamp/omod, inline constants, unbalanced sext, wrong arity, untracked/mismatched carry mask, and scheduling.
+    for prefix, bad, message in (
+        (["v_mov_b32_e32 v18, s45"], "v_bfrev_b32_sdwa v12, v18 dst_sel:DWORD dst_unused:UNUSED_SEXT src0_sel:DWORD",
+         "UNUSED_SEXT is not lowered"),
+        (["v_mov_b32_e32 v18, s45"], "v_mul_i32_i24_sdwa v20, s44, v18 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:DWORD",
+         "UNUSED_PRESERVE needs a tracked numeric destination"),
+        (["v_mov_b32_e32 v18, s45"], f"v_bfrev_b32_sdwa v12, -v18 {sdwa1}", "Unsupported SDWA integer operands"),
+        (["v_mov_b32_e32 v18, s45"], f"v_mul_u32_u24_sdwa v12, s44, |v18| {sdwa2}", "Unsupported SDWA integer operands"),
+        (["v_mov_b32_e32 v18, s45"], f"v_sat_pk_u8_i16_sdwa v12, v18 clamp {sdwa1}", "Unsupported SDWA integer operands"),
+        (["v_mov_b32_e32 v18, s45"], f"v_mul_i32_i24_sdwa v12, 1, v18 {sdwa2}", "Unsupported SDWA integer operands"),
+        (["v_mov_b32_e32 v18, s45"], f"v_bfrev_b32_sdwa v12, sext(v18 {sdwa1}", "Unbalanced sext()"),
+        (["v_mov_b32_e32 v18, s45"], f"v_bfrev_b32_sdwa v12, s44, v18 {sdwa2}", "takes 1 source(s)"),
+        (["v_mov_b32_e32 v18, s45"], f"v_mul_u32_u24_sdwa v12, v18 {sdwa1}", "takes 2 source(s)"),
+        (["v_mov_b32_e32 v18, s45"], f"v_mul_u32_u24_sdwa v256, s44, v18 {sdwa2}", "Invalid integer operation"),
+        (["v_mov_b32_e32 v18, s45"], f"v_add_co_ci_u32_sdwa v12, vcc_lo, s44, v18, vcc_lo {sdwa2}",
+         "Carry mask is not a tracked condition"),
+        (cmp_vcc, f"v_add_co_ci_u32_sdwa v12, vcc_lo, v18, v18, vcc {sdwa2}", "Invalid carry-in operation"),
+        (cmp_vcc, f"v_add_co_ci_u32_sdwa v12, vcc_lo, s44, s46, vcc_lo {sdwa2}",
+         "SDWA carry-in reads at most one distinct SGPR source"),
+        (cmp_vcc, f"v_sub_co_ci_u32_sdwa v12, s52, s44, v18, s52 {sdwa2}", "Unsupported SDWA carry-in operands"),
+        (cmp_vcc, "v_subrev_co_ci_u32_sdwa v12, vcc_lo, s44, v18, vcc_lo dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:DWORD src1_sel:DWORD",
+         "UNUSED_SEXT is not lowered"),
+        (cmp_vcc, "v_add_co_ci_u32_sdwa v20, vcc_lo, s44, v18, vcc_lo dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:DWORD",
+         "UNUSED_PRESERVE needs a tracked numeric destination"),
+        (cmp_vcc, f"v_add_co_ci_u32_sdwa v12, vcc_lo, -s44, v18, vcc_lo {sdwa2}", "Unsupported SDWA carry-in operands"),
+        (cmp_vcc, f"v_add_co_ci_u32_sdwa v12, vcc_lo, sext(s44, v18, vcc_lo {sdwa2}", "Unbalanced sext()"),
+        (cmp_vcc, f"v_add_co_ci_u32_sdwa v12, vcc_lo, s44, v18, vcc_lo clamp {sdwa2}", "Unsupported SDWA carry-in operands"),
+        (cmp_vcc, f"v_add_co_ci_u32_sdwa v256, vcc_lo, s44, v18, vcc_lo {sdwa2}", "Invalid carry-in operation"),
+    ):
+        expect_value_error(translate_int, uncompressed_export([*prefix, bad]), message)
+    # Scheduling: pending scalar load, outstanding sample, and non-entry EXEC mask must refuse.
+    base = uncompressed_export([])
+    load = next(i for i, line in enumerate(base) if line.startswith("s_buffer_load_dwordx4"))
+    expect_value_error(translate_int, base[:load + 1] + [f"v_bfrev_b32_sdwa v24, s44 {sdwa1}"] + base[load + 1:],
+                       "Constant read before load completion")
+    sample = next(i for i, line in enumerate(base) if line.startswith("image_sample"))
+    expect_value_error(translate_int, base[:sample + 1] + [f"v_bfrev_b32_sdwa v12, s44 {sdwa1}"] + base[sample + 1:],
+                       "Write overlaps an outstanding sample")
+    expect_value_error(translate_int, base[:sample + 1] + [f"v_bfrev_b32_sdwa v24, v12 {sdwa1}"] + base[sample + 1:],
+                       "Sample used before vmcnt wait")
+    masked = base.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate_int, base[:masked] + [f"v_bfrev_b32_sdwa v24, s44 {sdwa1}"] + base[masked:],
+                       "Invalid integer operation")
+
+
+def check_sdwa_int_extra_draw(directory, compiler, renderer, backend):
+    check_sdwa_int_extra_controls()
+    for name, body in SDWA_INT_EXTRA_PROGRAMS.items():
+        prog = uncompressed_export(body)
+        src_path = directory / f"sdwa_int_extra_{name}.hlsl"
+        cso_path = directory / f"sdwa_int_extra_{name}.cso"
+        src_path.write_text(translate_int(prog), encoding="ascii")
+        compile_shader(compiler, src_path, cso_path)
+        cases = []
+        for idx, row in enumerate(SDWA_INT_EXTRA_ROWS[name]):
+            expected = sdwa_int_extra_reference(name, row)
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *row)
+            case_path = directory / f"sdwa_int_extra_{name}_{idx}.case"
+            case_path.write_bytes(bytes(constants) + struct.pack("<4I", *expected) * 64 + b"\x01")
+            cases.append((case_path, "pass"))
+        run_pixel_batch(renderer, backend, cso_path, cases)
+        case_paths = [p for p, _ in cases]
+        for old, new in SDWA_INT_EXTRA_MUTATIONS[name]:
+            mutated = [line.replace(old, new) for line in prog]
+            assert mutated != prog, (name, old)
+            src_path.write_text(translate_int(mutated), encoding="ascii")
+            compile_shader(compiler, src_path, cso_path)
+            statuses, _ = run_pixel_batch_statuses(renderer, backend, cso_path, case_paths)
+            print(f"sdwa_int_extra {name} mutation {old!r} -> {new!r}: statuses {statuses}")
+            if "mismatch" not in statuses:
+                raise AssertionError(f"sdwa_int_extra {name} mutation {old!r} -> {new!r} escaped detection")
+    return 0
+
+
 # Quad-local DPP16 and DPP8 integer/bitwise/shift/bit-scan/saturate fixture covering 24 VOP1/VOP2 DPP forms.
 # Derives integer quad lane ID {0, 1, 2, 3} from interpolated uv.x/uv.y (v8/v9), verifies quad
 # swizzles across lanes, folds all 23 ops into a 32-bit accumulator, and exports all 4 bytes as
@@ -13406,7 +13641,7 @@ def check_sdwa_integer_lowering():
         expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]), message)
     must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", good.replace("v18", "v106")]))
     # Operations outside the table keep their refusal in the SDWA spelling.
-    for bad in (f"v_bfi_b32_sdwa v12, s44, v18 {sdwa}", f"v_mul_u32_u24_sdwa v12, s44, v18 {sdwa}",
+    for bad in (f"v_bfi_b32_sdwa v12, s44, v18 {sdwa}", f"v_mul_lo_u32_sdwa v12, s44, v18 {sdwa}",
                 f"v_add_nc_i32_sdwa v12, s44, v18 {sdwa}", f"v_min3_u32_sdwa v12, s44, v18 {sdwa}"):
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
 
@@ -13590,7 +13825,7 @@ def check_sat_pack_u8_lowering():
         "v_sat_pk_u8_i16_e64 v12, -v18",
         "v_sat_pk_u8_i16_e32 v12, v18, s44",
         "v_sat_pk_u8_i16_e32 v12, 0x100000000",
-        "v_sat_pk_u8_i16_sdwa v12, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+        "v_sat_pk_u8_i16_sdwa v12, v18 clamp dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
     ):
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", invalid]))
 
@@ -14430,7 +14665,7 @@ def check_carry_in_lowering():
                     f"{op}_e64 v12, s[64:65], v18, s44, s60", f"{op}_e64 v12, s61, v18, s44, s[62:63]",
                     f"{op}_e64 v12, s61, v18, s44, s58", f"{op}_e64 v12, s61, v18, s44, s61",
                     f"{op}_dpp v12, vcc_lo, v18, v18, vcc_lo row_shl:1 row_mask:0xf bank_mask:0xf",
-                    f"{op}_sdwa v12, vcc_lo, v18, v18, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD "
+                    f"{op}_sdwa v12, vcc_lo, v18, v18, vcc_lo dst_sel:DWORD dst_unused:UNUSED_SEXT "
                     "src0_sel:DWORD src1_sel:DWORD"):
             must_reject(translate_int, uncompressed_export([*setup, bad]))
     # A carry-in that is no lane mask at all: vcc before anything writes it, and an SGPR holding a constant.
@@ -19327,7 +19562,7 @@ def _check_controls_inline(directory):
         "v_mul_u32_u24_e64 v23, s47, s44 clamp",
         "v_mul_hi_i32_i24_e64 v25, s46, s47 clamp",
         "v_mul_hi_u32_u24_e64 v27, s47, s44 clamp",
-        "v_mul_i32_i24_sdwa v21, s46, s47 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
+        "v_mul_i32_i24_sdwa v21, s46, s47 clamp dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD",
         "v_mul_i32_i24_e64 v21, s46",
         "v_mul_u32_u24_e32 v256, s45, v29",
         "v_mul_hi_u32_u24_e64 v27, s47, 0x100000000",
@@ -19350,6 +19585,7 @@ _CONTROL_SUBCHECKS = (
     "check_dpp_cvt_refusals",
     "check_dpp_f16_contract_controls",
     "check_sdwa_f16_controls",
+    "check_sdwa_int_extra_controls",
     "check_smem_pointer_controls",
     "check_masked_controls",
     "check_masked_mov_close_controls",
@@ -20001,6 +20237,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(DPP_F16_CVT_I16_LANES), translate_f16))
     fixtures.extend((uncompressed_export(body), translate_f16) for body in SDWA_F16_PROGRAMS.values())
     fixtures.append((uncompressed_export(SDWA_F16_CVT_F32_BODY), translate_f16))
+    fixtures.extend((uncompressed_export(body), translate_int) for body in SDWA_INT_EXTRA_PROGRAMS.values())
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((vop1_nop_program(), translate))
@@ -26747,7 +26984,7 @@ def main():
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg", "draw-sopp-round-mode",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-sdwa-movrel", "draw-smovrel", "draw-dpp-f16", "draw-sdwa-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-sdwa-movrel", "draw-smovrel", "draw-dpp-f16", "draw-sdwa-f16", "draw-sdwa-int-extra", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
@@ -26810,7 +27047,8 @@ def main():
                         "draw-sopp-round-mode": check_sopp_round_mode_draw,
                         "draw-smem-pointers": check_smem_pointer_draw,
                         "draw-dpp-f16": check_dpp_f16_draw,
-                        "draw-sdwa-f16": check_sdwa_f16_draw}[mode]
+                        "draw-sdwa-f16": check_sdwa_f16_draw,
+                        "draw-sdwa-int-extra": check_sdwa_int_extra_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
