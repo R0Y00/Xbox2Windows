@@ -155,6 +155,24 @@ x2w_startup::CopyRefusal check_roles_and_sync(Wrapper* self, const CopyEndpoint&
     return x2w_startup::CopyRefusal::none;
 }
 
+// A covered range in a copied placement is useful only if the recorded copy read an authoritative source.
+bool copy_source_authoritative(Wrapper* self, const CopyEndpoint& from, u64 offset, u64 bytes)
+{
+    if (!from.wrapper || !InterlockedCompareExchange(&from.wrapper->own().refs, 0, 0)) return false;
+    const auto* info = resource_info(from.wrapper);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) return false;
+    x2w_startup::ComPtr<ID3D12Device> device;
+    if (FAILED(from.resource->GetDevice(IID_PPV_ARGS(device.GetAddressOf()))) || device.Get() != device_of(self->own().list_device))
+        return false;
+    if (!from.wrapper->own().title_memory) return true;
+    if (!info->placement_device || info->placement_device != self->own().list_device) return false;
+    const auto address = reinterpret_cast<u64>(from.wrapper->own().title_memory);
+    if (offset > UINT64_MAX - address) return false;
+    const auto placed = placed_buffer_range(self->own().list_device, address + offset, bytes);
+    if (placed.reject || placed.owner != from.wrapper) return false;
+    return placed.alias || list_copied_gpu_range(self, from.resource, offset, bytes);
+}
+
 // List slot 15, CopyBufferRegion(destination, destination offset, source, source offset, bytes).
 void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 destination_offset, u64 source, u64 source_offset,
                                        u64 bytes)
@@ -168,13 +186,21 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     auto refusal = x2w_startup::check_copy_buffer_region(to.resource ? &to_desc : nullptr, destination_offset,
                                                          from.resource ? &from_desc : nullptr, source_offset, bytes,
                                                          to.resource == from.resource);
-    if (refusal == x2w_startup::CopyRefusal::none) refusal = check_roles_and_sync(self, to, from, true);
+    if (refusal == x2w_startup::CopyRefusal::none) refusal = check_endpoint_roles(to, from);
+    const bool authoritative = refusal == x2w_startup::CopyRefusal::none && indirect_copy_ranges() &&
+        copy_source_authoritative(self, from, source_offset, bytes);
+    if (refusal == x2w_startup::CopyRefusal::none && !authoritative && !sync_title_source(self, from))
+        refusal = x2w_startup::CopyRefusal::title_backed_source;
     if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("CopyBufferRegion", refusal);
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
-    mark_gpu_written(self, to);
+    if (indirect_copy_ranges()) {
+        const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;
+        note_copy_gpu_range(self, to.resource, destination_offset, bytes, authoritative && info &&
+            info->placement == Placement::copied_buffer && info->placement_device == self->own().list_device);
+    }
     InterlockedIncrement(&list_buffer_copies);
 }
 
@@ -194,7 +220,9 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to.resource, from.resource);
-    mark_gpu_written(self, to);
+    if (to_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        note_copy_gpu_range(self, to.resource, 0, to_desc.Width, false);
+    else mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
 }
 

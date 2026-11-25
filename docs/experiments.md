@@ -31,6 +31,25 @@ The table's nonzero offset and stride select the second colour, the short view r
 non-aliased placement is refused. A raw descriptor over a recording-owned upload page reads the
 same colour and refuses a view that crosses its allocation.
 
+### Same-recording GPU copies used by an indirect draw
+
+`X2W_TRANSLATED_INDIRECT_COPY_RANGES=1` enables a bounded handoff from slot 15
+`CopyBufferRegion` to the translated indirect draw. The latter still requires
+`X2W_TRANSLATED_INDIRECT_DRAW=1`. A copied placed buffer qualifies only when one
+validated GPU copy in the current recording completely supplied the requested view.
+The source is a same-device desktop resource with no title shadow, a unique alias,
+or an already covered range. Later overlapping copies invalidate earlier coverage.
+The recording discards this proof at Close, so another recording needs its own writer.
+
+The source-built fixture reproduces a 68-byte request shape with source offset `0xbfffa0`.
+Its compute writer fills the source with contrasting colours. The consumer reads red
+from the second DWORD in the destination while the title-side green sentinel stays
+unchanged. The disabled feature, a new recording using the same destination, a copy
+of only 64 bytes, and an unproven overlapping write all leave the target clear.
+
+Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
+`ctest --preset release -j1 --no-tests=error -R '^startup_indirect_copy_provenance_' -V`.
+
 ### Packed pixel position in a source-built shader
 
 Run `ctest --preset dev --no-tests=error -R '^startup_packed_screen_position_(hardware|warp)$' -V`.

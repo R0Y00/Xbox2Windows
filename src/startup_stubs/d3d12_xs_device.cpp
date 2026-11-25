@@ -1943,6 +1943,8 @@ std::size_t readable_window(u64 address, std::size_t wanted)
 
 // Per-list state while recording.
 struct Pass {
+    struct CopyRange { ID3D12Resource* resource; u64 offset, bytes; };
+    std::vector<CopyRange> copied_gpu_ranges; // exact CopyBufferRegion destinations on this recording
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
     ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
@@ -2003,6 +2005,38 @@ Pass& pass_of(Wrapper* self)
 {
     if (!self->own().pass) self->own().pass = new Pass;
     return *static_cast<Pass*>(self->own().pass);
+}
+
+bool indirect_copy_ranges()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_COPY_RANGES");
+    return enabled;
+}
+
+bool list_copied_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u64 bytes)
+{
+    if (!indirect_copy_ranges()) return false;
+    const auto& ranges = pass_of(self).copied_gpu_ranges;
+    return std::any_of(ranges.begin(), ranges.end(), [&](const Pass::CopyRange& range) {
+        return range.resource == resource && offset >= range.offset && bytes <= range.bytes &&
+            offset - range.offset <= range.bytes - bytes;
+    });
+}
+
+void note_copy_gpu_range(Wrapper* self, ID3D12Resource* resource, u64 offset, u64 bytes, bool authoritative)
+{
+    if (!indirect_copy_ranges()) return;
+    auto& ranges = pass_of(self).copied_gpu_ranges;
+    ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [&](const Pass::CopyRange& range) {
+        if (range.resource != resource) return false;
+        return range.offset <= offset ? offset - range.offset < range.bytes : range.offset - offset < bytes;
+    }), ranges.end());
+    if (authoritative && ranges.size() < 64) {
+        try { ranges.push_back({resource, offset, bytes}); }
+        catch (const std::bad_alloc&) { return; }
+        static LONG reports;
+        if (first_calls(reports, 16)) log("x2w-render recorded GPU buffer copy range: offset 0x%llx, %llu bytes", offset, bytes);
+    }
 }
 // Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)

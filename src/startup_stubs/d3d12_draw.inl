@@ -1446,10 +1446,11 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             return {};
         }
         const auto placed = placed_buffer_range(device, address, bytes);
-        if (placed.reject || !placed.alias || (owner && owner != placed.owner)) return {};
+        if (placed.reject || !placed.owner || (owner && owner != placed.owner)) return {};
         owner = placed.owner;
-        native = placed.alias;
+        native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
+        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes))) return {};
     } else if (owner && !owner->own().title_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
         D3D12_HEAP_PROPERTIES props{};

@@ -31,6 +31,7 @@ constexpr Words initial{0xa5a5a5a5, 0, 0, 0, 0, 0, 0x5a5a5a5a};
 constexpr std::array<std::uint16_t, 10> indices{99, 99, 99, 0, 1, 2, 3, 4, 5, 99};
 constexpr std::array<std::uint32_t, 10> wide_indices{99, 99, 99, 0, 1, 2, 3, 4, 5, 99};
 constexpr UINT argument_offset = sizeof(std::uint32_t);
+constexpr UINT64 replay_copy_offset = 0xbfffa0, replay_copy_bytes = 0x44;
 
 constexpr char shader[] = R"(
 RWByteAddressBuffer data : register(u0);
@@ -61,6 +62,17 @@ void write_two_triangles() {
 void write_buffer_colour() {
     data.Store(16, 0xff00ff00u);
     data.Store(32, 0xff0000ffu);
+}
+
+[numthreads(1, 1, 1)]
+void write_replay_colour() {
+    data.Store(0, 0xff00ff00u);
+    data.Store(4, 0xff00ff00u);
+    data.Store4(0xbfffa0, uint4(0xff00ff00u, 0xff0000ffu, 0, 0));
+    data.Store4(0xbfffb0, uint4(0, 0, 0, 0));
+    data.Store4(0xbfffc0, uint4(0, 0, 0, 0));
+    data.Store4(0xbfffd0, uint4(0, 0, 0, 0));
+    data.Store(0xbfffe0, 0);
 }
 
 [numthreads(1, 1, 1)]
@@ -316,32 +328,39 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
 }
 
 enum class Refusal { none, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
-                     insufficient_table_range, copied_table_buffer, upload_range_crossing };
+                     insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy };
 enum class DrawKind { indexed, vertices, mesh };
+
+ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
+{
+    const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+        D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+    using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*,
+        UINT, const void*, void*, UINT, const void*, REFIID, void**);
+    ComPtr<ID3D12Resource> result;
+    check(slot<Create>(guest, 127)(guest, &props, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr,
+        0, nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(result.GetAddressOf())), "create GPU table buffer");
+    return result;
+}
 
 struct TranslatedDrawFixture {
     TranslatedDrawFixture(ID3D12Device* guest, std::uint32_t colour, ID3D12Device* desktop = nullptr,
-                          bool short_view = false, bool copied = false)
+                          bool short_view = false, bool copied = false, bool replay = false)
         : wrong_root(create_root(guest, {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE})),
           backing(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
     {
         if (!backing) throw std::bad_alloc();
         if (desktop && !copied) {
-            const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
-            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
-                D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
-            using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*,
-                UINT, const void*, void*, UINT, const void*, REFIID, void**);
-            check(slot<Create>(guest, 127)(guest, &props, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr,
-                0, nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(sampled.GetAddressOf())), "create GPU table buffer");
+            sampled = make_gpu_table_buffer(guest, 64);
         } else {
             const D3D12_RESOURCE_DESC desc = copied ?
-                D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, replay ? replay_copy_bytes : 64u, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
                                     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS} :
                 D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, format, {1, 0},
                                     D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
             auto* address = static_cast<unsigned char*>(backing.get()) + (copied ? 16 : 0);
-            std::memcpy(address + (copied ? 32 : 0), &colour, sizeof(colour));
+            std::memcpy(address + (replay ? 4 : copied ? 32 : 0), &colour, sizeof(colour));
             using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
             check(slot<Place>(guest, 133)(guest, address, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                 __uuidof(ID3D12Resource), reinterpret_cast<void**>(sampled.GetAddressOf())), "place sampled resource");
@@ -363,9 +382,9 @@ struct TranslatedDrawFixture {
         if (desktop) {
             srv.Format = DXGI_FORMAT_UNKNOWN;
             srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            srv.Buffer.FirstElement = 1;
-            srv.Buffer.NumElements = short_view ? 1 : 2;
-            srv.Buffer.StructureByteStride = 16;
+            srv.Buffer.FirstElement = replay ? 0 : 1;
+            srv.Buffer.NumElements = replay ? static_cast<UINT>(replay_copy_bytes / 4) : short_view ? 1 : 2;
+            srv.Buffer.StructureByteStride = replay ? 4 : 16;
         } else {
             srv.Format = format;
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -389,6 +408,14 @@ struct TranslatedDrawFixture {
     UINT64 gpu = 0;
 };
 
+struct ReplayCopy {
+    ID3D12Resource* producer;
+    ID3D12Resource* native;
+    ID3D12PipelineState* writer;
+    UINT64 bytes;
+    bool uncertified_overwrite = false;
+};
+
 constexpr UINT command_stride(DrawKind kind)
 {
     switch (kind) {
@@ -409,7 +436,7 @@ bool supports_mesh(ID3D12Device* device)
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
-         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false)
+         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr)
 {
     const bool indexed = kind == DrawKind::indexed;
     const bool mesh = kind == DrawKind::mesh;
@@ -482,6 +509,18 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     list->CopyBufferRegion(arg_readback.Get(), 0, arguments.native.Get(), 0, sizeof(initial));
     // The wrapper owns the subsequent COMMON -> INDIRECT_ARGUMENT transition.
     transition(list, arguments.native.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (replay) {
+        transition(list, replay->native, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list->SetPipelineState(replay->writer);
+        list->SetComputeRootSignature(writer_root);
+        list->SetComputeRootUnorderedAccessView(0, replay->native->GetGPUVirtualAddress());
+        list->Dispatch(1, 1, 1);
+        transition(list, replay->native, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        using Copy = void (WINAPI*)(IUnknown*, IUnknown*, UINT64, IUnknown*, UINT64, UINT64);
+        slot<Copy>(wrapped, 15)(wrapped, translated->sampled.Get(), 0, replay->producer, replay_copy_offset, replay->bytes);
+        if (replay->uncertified_overwrite)
+            slot<Copy>(wrapped, 15)(wrapped, translated->sampled.Get(), 0, replay->native, 0, 4);
+    }
     if (translated && translated->gpu_buffer && translated->buffer_writer) {
         auto* table_resource = translated->gpu_buffer.Get();
         transition(list, table_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -637,7 +676,9 @@ std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
-    const bool translated = argc == 3 && std::strcmp(argv[2], "translated") == 0;
+    const bool copy_on = argc == 3 && std::strcmp(argv[2], "copy-provenance") == 0;
+    const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
+    const bool translated = copy_on || copy_off || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if (translated || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -712,6 +753,8 @@ int main(int argc, char** argv) try
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set fixture cache");
         check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", "1") ? S_OK : E_FAIL, "enable fixture path");
+        check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_COPY_RANGES", copy_on ? "1" : "0") ? S_OK : E_FAIL,
+              "set copy-range provenance control");
         const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER table{};
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -768,6 +811,29 @@ int main(int argc, char** argv) try
                 DrawKind::vertices, false, Refusal::none, "translated table with deferred guest root", &full_buffer);
         } else {
             std::puts("deferred guest root capability unavailable");
+        }
+        if (ok && (copy_on || copy_off)) {
+            const TranslatedDrawFixture copied(guest.Get(), green, device.Get(), false, true, true);
+            const auto source = make_gpu_table_buffer(guest.Get(), replay_copy_offset + replay_copy_bytes);
+            const auto native = native_object<ID3D12Resource>(device.Get(), guest.Get(), source.Get());
+            const auto replay_writer = writer_pipeline(device.Get(), writer.Get(), "write_replay_colour");
+            const ReplayCopy complete{source.Get(), native.Get(), replay_writer.Get(), replay_copy_bytes};
+            const ReplayCopy partial{source.Get(), native.Get(), replay_writer.Get(), replay_copy_bytes - 4};
+            const ReplayCopy overwritten{source.Get(), native.Get(), replay_writer.Get(), replay_copy_bytes, true};
+            const auto draw = [&](const ReplayCopy* copy, Refusal refusal, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(), buffer_pso.Get(), signature.Get(),
+                    DrawKind::vertices, false, refusal, label, &copied, false, copy);
+            };
+            ok = draw(&complete, copy_on ? Refusal::none : Refusal::unproven_copy, "complete 68-byte GPU copy") &&
+                 draw(nullptr, Refusal::unproven_copy, "new recording cannot reuse the previous GPU copy proof") &&
+                 draw(&partial, Refusal::unproven_copy, "64-byte copy cannot authorize the 68-byte view") &&
+                 draw(&overwritten, Refusal::unproven_copy, "untracked overlap invalidates the prior copy range");
+            std::uint32_t title_word = 0;
+            std::memcpy(&title_word, static_cast<unsigned char*>(copied.backing.get()) + 20, sizeof(title_word));
+            if (title_word != green) {
+                std::fprintf(stderr, "title-side green sentinel changed to %08x\n", title_word);
+                return 1;
+            }
         }
         if (ok) std::filesystem::remove_all(cache);
         return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
