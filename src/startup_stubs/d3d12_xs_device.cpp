@@ -2410,6 +2410,7 @@ struct IndirectIndexView {
     D3D12_INDEX_BUFFER_VIEW view{};
     ID3D12Resource* resource = nullptr;
     u64 offset = 0;
+    bool upload = false;
 };
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument,
                                      u64 offset, const IndirectIndexView& indices);
@@ -2509,19 +2510,30 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             view.BufferLocation % alignment || view.SizeInBytes % alignment)
             return refuse("invalid index view");
         const auto indices = placed_buffer_range(device, view.BufferLocation, view.SizeInBytes);
-        if (indices.reject || !indices.owner || !indices.owner->own().real)
-            return refuse("index view is outside a unique placed buffer");
-        const auto* index_info = resource_info(indices.owner);
-        if (!index_info || index_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
-            return refuse("index buffer does not use COMMON state tracking");
-        auto* index = static_cast<ID3D12Resource*>(indices.owner->own().real);
-        const auto index_base = reinterpret_cast<u64>(indices.owner->own().title_memory);
-        const auto index_offset = view.BufferLocation - index_base;
-        const auto native_base = index->GetGPUVirtualAddress();
-        if (!native_base || index_offset > ~u64{} - native_base || (native_base + index_offset) % alignment)
-            return refuse("index view has no aligned desktop address");
-        view.BufferLocation = native_base + index_offset;
-        index_view = {view, index, index_offset};
+        if (indices.reject) return refuse("index view crosses or overlaps placed buffers");
+        if (indices.owner && indices.owner->own().real) {
+            const auto* index_info = resource_info(indices.owner);
+            if (!index_info || index_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+                return refuse("index buffer does not use COMMON state tracking");
+            auto* index = static_cast<ID3D12Resource*>(indices.owner->own().real);
+            const auto index_base = reinterpret_cast<u64>(indices.owner->own().title_memory);
+            const auto index_offset = view.BufferLocation - index_base;
+            const auto native_base = index->GetGPUVirtualAddress();
+            if (!native_base || index_offset > ~u64{} - native_base || (native_base + index_offset) % alignment)
+                return refuse("index view has no aligned desktop address");
+            view.BufferLocation = native_base + index_offset;
+            index_view = {view, index, index_offset};
+        } else {
+            const auto upload = translated && !indices.owner
+                ? list_upload_range(self, view.BufferLocation, view.SizeInBytes) : x2w_upload::Allocation{};
+            if (!upload.resource) return refuse("index view has no unique placed or current recording upload buffer");
+            // The compute validator reads 32-bit words, including for R16_UINT. Do not
+            // load an adjacent recording upload allocation when extracting a half-word.
+            if ((upload.offset | view.SizeInBytes) & 3)
+                return refuse("upload index view is not dword-aligned and dword-sized");
+            view.BufferLocation = upload.gpu;
+            index_view = {view, upload.resource, upload.offset, true};
+        }
     }
     if (translated) {
         const char* failure = draw_translated_indirect(self, static_cast<ID3D12CommandSignature*>(sig->own().real), resource,

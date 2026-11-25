@@ -1558,7 +1558,8 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
     const auto argument_previous = before(draw.argument);
     const auto index_previous = before(indices);
     require_state(self, draw.argument, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (indices != draw.argument) require_state(self, indices, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (indices != draw.argument && !draw.indices.upload)
+        require_state(self, indices, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     require_state(self, scratch.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const UINT bounds[]{static_cast<UINT>(draw.offset), static_cast<UINT>(argument_desc.Width), static_cast<UINT>(draw.indices.offset),
         draw.indices.view.SizeInBytes, static_cast<UINT>(index_desc.Width), draw.indices.view.Format == DXGI_FORMAT_R16_UINT ? 2u : 4u,
@@ -1574,7 +1575,8 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
     if (draw.argument != indices && argument_previous != D3D12_RESOURCE_STATE_COMMON)
         require_state(self, draw.argument, argument_previous);
     constexpr auto shader_reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    require_state(self, indices, (index_previous & shader_reads) | D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    if (!draw.indices.upload)
+        require_state(self, indices, (index_previous & shader_reads) | D3D12_RESOURCE_STATE_INDEX_BUFFER);
     return scratch.Get();
 }
 

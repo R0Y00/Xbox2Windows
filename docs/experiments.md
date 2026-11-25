@@ -85,6 +85,21 @@ The table's nonzero offset and stride select the second colour, the short view r
 non-aliased placement is refused. A raw descriptor over a recording-owned upload page reads the
 same colour and refuses a view that crosses its allocation.
 
+### Index views backed by a recording upload
+
+Under `X2W_TRANSLATED_INDIRECT_DRAW=1`, a translated indexed draw can bind
+an index view fully contained in one slot 148 allocation on that recording.
+The GPU validator and input assembler both use the upload resource in
+`GENERIC_READ`. The caller must finish writing before submission and keep
+these contents stable through execution. The index view's offset and size
+are DWORD-aligned so the validator's packed R16 reads stay within the view.
+The check covers both formats, a late CPU write, a range crossing its logical
+allocation, another recording, and readable storage without a registered
+GPU backing.
+
+Run `cmake --build --preset release --target startup_indirect_draw_indexed`
+and `ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed_upload_(warp|hardware)$' -V`.
+
 ### Same-recording GPU copies used by an indirect draw
 
 `X2W_TRANSLATED_INDIRECT_COPY_RANGES=1` enables a bounded handoff from slot 15

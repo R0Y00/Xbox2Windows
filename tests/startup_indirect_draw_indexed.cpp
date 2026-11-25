@@ -359,7 +359,7 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
-enum class Refusal { none, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
+enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag };
 enum class DrawKind { indexed, vertices, mesh };
@@ -469,7 +469,7 @@ bool supports_mesh(ID3D12Device* device)
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
-         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr)
+         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr, bool upload_index = false)
 {
     const bool indexed = kind == DrawKind::indexed;
     const bool translated_indexed = translated && indexed;
@@ -482,7 +482,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     if (!indexed) initial_words[1 + command_stride(kind) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
     const PlacedBuffer arguments(device, guest, sizeof(initial_words), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     std::optional<PlacedBuffer> index_buffer;
-    if (indexed) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
+    if (indexed && !upload_index) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
     const auto upload = make_buffer(device, sizeof(initial_words) + index_bytes, D3D12_HEAP_TYPE_UPLOAD,
                                     D3D12_RESOURCE_STATE_GENERIC_READ);
     const auto arg_readback = make_buffer(device, sizeof(initial), D3D12_HEAP_TYPE_READBACK,
@@ -609,9 +609,48 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                                          draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
         slot<Index>(wrapped, 47)(wrapped, &view);
     }
+    ComPtr<ID3D12CommandAllocator> foreign_allocator;
+    ComPtr<IUnknown> foreign_list;
+    std::array<std::uint32_t, 4> unregistered{};
+    void* late_index_write = nullptr;
+    if (upload_index) {
+        using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
+        const UINT element_size = draw_right ? sizeof(std::uint32_t) : sizeof(std::uint16_t);
+        const UINT size = 4 * element_size;
+        auto* owner = wrapped;
+        if (refusal == Refusal::index_upload_foreign) {
+            check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&foreign_allocator)),
+                "create another recording allocator");
+            foreign_list = begin_guest_list(guest, foreign_allocator.Get());
+            owner = foreign_list.Get();
+        }
+        const UINT subview_offset = refusal == Refusal::index_upload_unaligned ? 2 : 4;
+        const UINT allocation_size = subview_offset + size - (refusal == Refusal::index_upload_cross ? 2 : 0);
+        auto* allocation = refusal == Refusal::index_unregistered ? reinterpret_cast<char*>(unregistered.data())
+            : static_cast<char*>(slot<Allocate>(owner, 148)(owner, allocation_size, 16));
+        if (!allocation) return false;
+        // An invalid index is deliberately visible while ExecuteIndirect records.
+        // The current recording upload is GPU-readable and the caller finalizes
+        // the contents before submission.
+        if (refusal == Refusal::none) {
+            std::memset(allocation + subview_offset, 0xff, size);
+            late_index_write = allocation + subview_offset;
+        }
+        const D3D12_INDEX_BUFFER_VIEW view{reinterpret_cast<UINT64>(allocation + subview_offset), size,
+            draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+        slot<Index>(wrapped, 47)(wrapped, &view);
+    }
     const UINT64 offset = refusal == Refusal::short_argument
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), offset, nullptr, 0);
+    if (late_index_write) {
+        constexpr std::uint16_t narrow_upload[]{99, 0, 1, 2};
+        constexpr std::uint32_t wide_upload[]{99, 0, 1, 2};
+        if (draw_right) std::memcpy(late_index_write, wide_upload, sizeof(wide_upload));
+        else std::memcpy(late_index_write, narrow_upload, sizeof(narrow_upload));
+    }
+    if (foreign_list) check(slot<HRESULT (WINAPI*)(IUnknown*)>(foreign_list.Get(), 9)(foreign_list.Get()),
+        "close other recording");
     const HRESULT closed = slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped);
     if (FAILED(closed)) {
         ComPtr<ID3D12InfoQueue> messages;
@@ -744,7 +783,8 @@ int main(int argc, char** argv) try
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
     const bool copy_on = argc == 3 && std::strcmp(argv[2], "copy-provenance") == 0;
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
-    const bool translated_indexed = argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0;
+    const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
+    const bool translated_indexed = upload_index || argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0;
     const bool translated = copy_on || copy_off || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
@@ -909,8 +949,19 @@ int main(int argc, char** argv) try
             const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
             const auto verify = [&](ID3D12PipelineState* producer, bool green, Refusal refusal, const char* label) {
                 return run(device.Get(), guest.Get(), writer.Get(), producer, title_root.Get(), pso.Get(), signature.Get(),
-                    kind, green, refusal, label, green ? &green_binding : &red_binding);
+                    kind, green, refusal, label, green ? &green_binding : &red_binding, false, nullptr, upload_index);
             };
+            if (upload_index) {
+                const bool ok =
+                    verify(left.Get(), false, Refusal::none, "R16 eight-byte current recording index span with late write") &&
+                    verify(right.Get(), true, Refusal::none, "R32 current recording index span with offset and base") &&
+                    verify(left.Get(), false, Refusal::index_upload_cross, "index view crosses logical upload span") &&
+                    verify(left.Get(), false, Refusal::index_upload_foreign, "index view owned by a different list recording") &&
+                    verify(left.Get(), false, Refusal::index_upload_unaligned, "R16 index upload starts at a half-word offset") &&
+                    verify(left.Get(), false, Refusal::index_unregistered, "readable CPU memory without recording ownership refused");
+                if (ok) std::filesystem::remove_all(cache);
+                return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+            }
             const bool ok = verify(left.Get(), false, Refusal::none, "translated indexed R16, base zero") &&
                 verify(right.Get(), true, Refusal::none, "translated indexed R32, base 3, new argument and IB offsets") &&
                 verify(invalid.Get(), true, Refusal::indexed_base_overrun, "GPU rejects vertex index past the bound stream") &&
