@@ -11180,15 +11180,17 @@ process default task queue in the public API, which is not modeled, so it is
 refused with `E_NOTIMPL` before any block or provider state is touched, as is
 any other queue. A started operation completes before the call returns, but its
 callback fires only when `XTaskQueueDispatch` runs the completion port, once,
-oldest first. Until then `XGameSaveInitializeProviderResult` returns
-`E_PENDING` without consuming anything (this restricted implementation refuses
-early retrieval rather than losing the queued callback); after the callback the
-provider is handed over exactly once (a second claim returns `E_INVALIDARG`).
+oldest first. While a callback is still queued, `XGameSaveInitializeProviderResult`
+returns `E_PENDING` without consuming anything. The result can be claimed once
+the operation completes with no callback, or once dispatch starts delivery of
+the callback. A second claim returns `E_INVALIDARG`.
 Reusing a block whose result is unclaimed returns `E_ILLEGAL_STATE_CHANGE`
-(0x8000000D). `XTaskQueueCloseHandle` on a queue with a start in flight or a
-callback still waiting returns `E_ILLEGAL_STATE_CHANGE` and keeps the queue.
-`XTaskQueueDispatch` ignores its timeout argument: nothing is ever waiting on
-work, so a finite wait returns `false` at once when no callback is queued. The
+(0x8000000D). `XTaskQueueCloseHandle` has a void ABI. If a start is in flight or a
+callback is still queued, the shim logs `E_ILLEGAL_STATE_CHANGE` and leaves the
+queue open for the caller to close after delivery.
+`XTaskQueueDispatch` polls when the timeout is zero and otherwise waits for a
+completion, expiration or successful queue closure. The work port has no work
+items in this profile. The
 shim keeps its state in a side table keyed by the block address and reads only
 the leading queue, context and callback fields. `XAsyncGetStatus`,
 `XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.

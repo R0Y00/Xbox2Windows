@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <thread>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -440,18 +441,22 @@ bool manual_queue(const Api& api, XUserHandle user)
     mutant_block.callback(&mutant_block);
     ok = expect(mutant.calls == 1, "control: an early callback is visible to the probe") && ok;
 
-    // Finite wait: the timeout is ignored, an empty port returns false at once and a
-    // queued callback runs once.
     const ULONGLONG started = GetTickCount64();
-    ok = expect(!api.queue_dispatch(queue, port_completion, 5000) && GetTickCount64() - started < 2500,
-                "finite wait on an empty port returns false without waiting") && ok;
+    ok = expect(!api.queue_dispatch(queue, port_completion, 75) && GetTickCount64() - started >= 45,
+                "finite wait on an empty port expires without dispatch") && ok;
     CallbackProbe timed;
     XAsyncBlock timed_block = make_block(&timed, record_completion);
     timed_block.queue = queue;
-    ok = expect_hr(api.initialize_async(user, configuration_id, false, &timed_block), S_OK,
-                   "start for finite wait") && ok;
-    ok = expect(api.queue_dispatch(queue, port_completion, 5000) && timed.calls == 1,
-                "finite wait dispatches the queued callback once") && ok;
+    HRESULT start_status = E_FAIL;
+    std::thread producer([&] {
+        Sleep(40);
+        start_status = api.initialize_async(user, configuration_id, false, &timed_block);
+    });
+    const bool dispatched = api.queue_dispatch(queue, port_completion, 2000);
+    producer.join();
+    ok = expect_hr(start_status, S_OK, "start while dispatch is waiting") && ok;
+    ok = expect(dispatched && timed.calls == 1, "waiting dispatch receives later completion once") && ok;
+    ok = expect(!api.queue_dispatch(queue, port_completion, 0), "zero timeout finds no second callback") && ok;
     XGameSaveProviderHandle timed_provider = nullptr;
     api.initialize_result(&timed_block, &timed_provider);
     if (timed_provider) api.close_provider(timed_provider);

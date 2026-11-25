@@ -91,6 +91,7 @@ using XUserHandle = xgameruntime_shim::XUserHandleStorage*;
 // it does not own is never dereferenced.
 struct XTaskQueueHandleStorage {
     bool live = false;
+    std::uint64_t generation = 0;
 };
 using XTaskQueueHandle = XTaskQueueHandleStorage*;
 using XGameSaveProviderHandle = xgameruntime_shim::XGameSaveProviderStorage*;
@@ -423,6 +424,7 @@ struct RuntimeState {
 };
 
 RuntimeState runtime_state;
+CONDITION_VARIABLE task_queue_changed = CONDITION_VARIABLE_INIT;
 
 template <typename T, std::size_t N>
 T* find_live(std::array<T, N>& slots, const void* pointer) noexcept
@@ -906,6 +908,7 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
     if (defer) {
         reserved->callback_pending = true;
         reserved->order = runtime_state.next_async_order++;
+        WakeAllConditionVariable(&task_queue_changed);
     }
     ReleaseSRWLockExclusive(&runtime_state.lock);
     if (!defer && callback) callback(async_block);
@@ -949,6 +952,7 @@ HRESULT task_queue_create(XTaskQueueDispatchMode work_mode, XTaskQueueDispatchMo
     for (auto& slot : runtime_state.task_queues) {
         if (!slot.live) {
             slot.live = true;
+            ++slot.generation;
             *queue = &slot;
             ReleaseSRWLockExclusive(&runtime_state.lock);
             return S_OK;
@@ -958,36 +962,47 @@ HRESULT task_queue_create(XTaskQueueDispatchMode work_mode, XTaskQueueDispatchMo
     return E_OUTOFMEMORY;
 }
 
-// Runs at most one waiting completion callback, oldest first, on the calling
-// thread, and reports whether it ran one. The work port never holds anything.
-// timeoutInMs is accepted and ignored on purpose: every operation completes
-// before its start call returns, so there is nothing to wait for and a finite
-// or infinite wait returns false at once when no callback is queued.
-bool task_queue_dispatch(XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t) noexcept
+// Dispatch one completion on the calling thread. The work port has no work
+// items in this profile but still honors the wait.
+bool task_queue_dispatch(XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t timeout_ms) noexcept
 {
-    if (port != XTaskQueuePort_Completion) return false;
+    if (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion) return false;
+    const ULONGLONG started = GetTickCount64();
     AcquireSRWLockExclusive(&runtime_state.lock);
-    if (!find_live_task_queue(queue)) {
+    XTaskQueueHandle live = find_live_task_queue(queue);
+    if (!live) {
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return false;
     }
-    ProviderAsyncSlot* next = nullptr;
-    for (auto& slot : runtime_state.provider_asyncs) {
-        if (slot.live && slot.callback_pending && slot.queue == queue &&
-            (!next || slot.order < next->order)) {
-            next = &slot;
+    const auto generation = live->generation;
+    while (live->live && live->generation == generation) {
+        ProviderAsyncSlot* next = nullptr;
+        if (port == XTaskQueuePort_Completion) {
+            for (auto& slot : runtime_state.provider_asyncs) {
+                if (slot.live && slot.callback_pending && slot.queue == queue &&
+                    (!next || slot.order < next->order)) {
+                    next = &slot;
+                }
+            }
         }
+        if (next) {
+            next->callback_pending = false;
+            XAsyncBlock* const block = const_cast<XAsyncBlock*>(next->block);
+            XAsyncCompletionRoutine* const callback = block->callback;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            if (callback) callback(block);
+            return true;
+        }
+        DWORD remaining = INFINITE;
+        if (timeout_ms != INFINITE) {
+            const ULONGLONG elapsed = GetTickCount64() - started;
+            if (elapsed >= timeout_ms) break;
+            remaining = static_cast<DWORD>(timeout_ms - elapsed);
+        }
+        if (!SleepConditionVariableSRW(&task_queue_changed, &runtime_state.lock, remaining, 0)) break;
     }
-    if (!next) {
-        ReleaseSRWLockExclusive(&runtime_state.lock);
-        return false;
-    }
-    next->callback_pending = false;
-    XAsyncBlock* const block = const_cast<XAsyncBlock*>(next->block);
-    XAsyncCompletionRoutine* const callback = block->callback;
     ReleaseSRWLockExclusive(&runtime_state.lock);
-    if (callback) callback(block);
-    return true;
+    return false;
 }
 
 // A queue with a start in flight (slot reserved, not yet completed) or a callback
@@ -1003,7 +1018,10 @@ HRESULT task_queue_close_handle(XTaskQueueHandle queue) noexcept
                 result = e_illegal_state_change;
             }
         }
-        if (result == S_OK) queue->live = false;
+        if (result == S_OK) {
+            queue->live = false;
+            WakeAllConditionVariable(&task_queue_changed);
+        }
     }
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return result;
