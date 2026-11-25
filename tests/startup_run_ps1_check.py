@@ -24,22 +24,33 @@ HEAD_LINES = 5  # run.ps1 prints this many lines of "<LogDir>.out"
 # prints seven lines and exits with the code under test.
 STUB = """\
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 Path(__file__).with_name("argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
 # Under -Translate, wait until the watcher stub has started so run.ps1 cannot stop it before then.
-deadline = time.time() + 30
-while Path(__file__).with_name("translate.flag").exists() and not Path(__file__).with_name("watch.json").exists() \\
-        and time.time() < deadline:
+watch = Path(__file__).with_name("watch.json")
+deadline = time.monotonic() + 30
+while Path(__file__).with_name("translate.flag").exists() and not watch.exists() \\
+        and time.monotonic() < deadline:
     time.sleep(0.05)
+if {early_exit}:
+    # The watcher has published its PID. Wait for the OS to confirm it is gone before returning.
+    pid = json.loads(watch.read_text(encoding="utf-8"))[0]
+    pid_column = f'"{{pid}}"'.encode("ascii")
+    while pid_column in subprocess.check_output(["tasklist", "/FI", f"PID eq {{pid}}", "/FO", "CSV", "/NH"]):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("early-exit watcher did not exit")
+        time.sleep(0.05)
 for n in range(1, 8):
     print("stub debugger line", n)
 sys.exit({code})
 """
 # Stands in for tools/startup/gfx2hlsl.py under -Translate: starts a child process, as the parallel
-# workers are, records its own and the child's process ids and its arguments, then waits to be stopped.
+# workers are, records the PIDs and arguments, then waits to be stopped. The early-exit case
+# publishes just the watcher's PID and arguments and returns without spawning a child.
 WATCH_STUB = """\
 import json
 import os
@@ -48,9 +59,13 @@ import sys
 import time
 from pathlib import Path
 
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-Path(__file__).with_name("watch.json").write_text(json.dumps([os.getpid(), child.pid] + sys.argv[1:]), encoding="utf-8")
-time.sleep(120)
+child = None if {early_exit} else subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+record = Path(__file__).with_name("watch.json")
+temp = record.with_suffix(".tmp")
+temp.write_text(json.dumps([os.getpid(), child.pid if child else None] + sys.argv[1:]), encoding="utf-8")
+temp.replace(record)
+if child:
+    time.sleep(120)
 """
 STOP = "taskkill.exe /T /F /PID $translator.Id"
 CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
@@ -80,18 +95,20 @@ def alive(pid):
     return f'"{pid}"' in out.stdout
 
 
-def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False):
+def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
+             early_exit=False):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
     `translate` exercises -Render -Translate and requires the watcher to stop with its child.
+    With `early_exit` the watcher exits before the debugger finishes.
     """
     root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"
     startup.mkdir(parents=True)
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
-    (startup / "debug_launch.py").write_text(STUB.format(code=code), encoding="utf-8")
-    (startup / "gfx2hlsl.py").write_text(WATCH_STUB, encoding="utf-8")
+    (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit), encoding="utf-8")
+    (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(early_exit=early_exit), encoding="utf-8")
     (root / "bld").mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
         (root / "bld" / f"{dll}.dll").write_bytes(b"")
@@ -153,7 +170,7 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             found.append(f"-Translate: the translator received {started}, expected --watch {root / 'cache'}")
         else:
             for pid, what in ((started[0], "translator"), (started[1], "translator's child process")):
-                if alive(pid):
+                if pid is not None and alive(pid):
                     subprocess.run(["taskkill", "/T", "/PID", str(pid), "/F"], capture_output=True)
                     found.append(f"-Translate: the {what} was still running after run.ps1 exited")
     elif watch.is_file():
@@ -177,7 +194,10 @@ def run_problems(shell, script, work, first_only):
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
     if found and first_only:
         return found
-    return found + run_case(shell, script, 7, work, translate=True)
+    found += run_case(shell, script, 7, work, translate=True)
+    for code in (0, 7):
+        found += run_case(shell, script, code, work, translate=True, early_exit=True)
+    return found
 
 
 def text_problems(script):
