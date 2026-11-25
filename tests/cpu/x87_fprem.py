@@ -455,8 +455,23 @@ def is_nan(raw):
 
 
 def check(harness_path, native_path, lifted_path, *control_paths):
+    check_light()
+    expected = build_expected()
+    check_lifted(harness_path, lifted_path, expected)
+    check_native(harness_path, native_path, expected)
+    check_controls(harness_path, expected, control_paths)
+
+
+def check_light():
     print(f"the model agreed with {check_model()} remainders worked by hand")
-    expected = [(name, data, run(name, data)) for name, data in cases()]
+    check_rejections()
+
+
+def build_expected():
+    return [(name, data, run(name, data)) for name, data in cases()]
+
+
+def check_lifted(harness_path, lifted_path, expected):
     lifted = CheckedRunner(harness_path, lifted_path)
     statuses = dict.fromkeys(STATUS.values(), 0)
     bad = 0
@@ -473,6 +488,9 @@ def check(harness_path, native_path, lifted_path, *control_paths):
     print(f"{len(expected)} cases over {len(SEQUENCES)} exports matched the model in the checked translation (status, "
           "output block and guards, and *result, which only status 0 writes)")
     print("translated statuses: " + ", ".join(f"{name} {statuses[code]}" for name, code in STATUS.items()))
+
+
+def check_native(harness_path, native_path, expected):
     native = base.Runner(harness_path, native_path)
     compared = partial_records = nan_results = looped = skipped = 0
     for name, data, model in expected:
@@ -509,6 +527,9 @@ def check(harness_path, native_path, lifted_path, *control_paths):
           f"was a NaN in the {nan_results} single-step cases with a NaN model result, and the loops reduced partially "
           f"and iterated in {looped} cases; {skipped} loop cases with a NaN result ran only translated")
     print(f"processor: {platform.processor()}")
+
+
+def check_controls(harness_path, expected, control_paths):
     for path in control_paths:
         control = Path(path).stem.rsplit("_", 1)[-1]
         run_control = CheckedRunner(harness_path, path)
@@ -516,7 +537,6 @@ def check(harness_path, native_path, lifted_path, *control_paths):
         print(f"control {control}: {bad}/{len(expected)} mismatches")
         if not bad:
             raise AssertionError(f"control {control} matched every case")
-    check_rejections()
 
 
 def check_rejections():
@@ -574,5 +594,13 @@ if __name__ == "__main__":
         emit(Path(first), Path(second), *rest)
     elif mode == "check":
         check(first, second, *rest)
+    elif mode == "check-light":  # the hand-worked model and the rejections; no fixture needed
+        check_light()
+    elif mode == "check-lifted":
+        check_lifted(first, second, build_expected())
+    elif mode == "check-native":
+        check_native(first, second, build_expected())
+    elif mode == "check-controls":  # args: harness, unused, then the control DLLs
+        check_controls(first, build_expected(), rest)
     else:
         raise ValueError(mode)

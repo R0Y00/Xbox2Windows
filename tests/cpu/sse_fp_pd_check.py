@@ -481,9 +481,17 @@ def check_rejections(original_path):
 
 
 if __name__ == "__main__":
-    native_dll, lifted_dll, altered_dll, harness_dll = sys.argv[1:5]
-    check_differential(native_dll, lifted_dll, altered_dll)
-    check_modes(native_dll, lifted_dll, harness_dll)
-    check_cmp_differential(native_dll, lifted_dll, altered_dll)
-    check_cmp_modes(native_dll, lifted_dll, harness_dll)
-    check_rejections(native_dll)
+    native_dll, lifted_dll, altered_dll, harness_dll, *selected = sys.argv[1:]
+    # CTest runs the parts as separate cases; no part runs them all in the original order.
+    parts = {
+        "differential": lambda: check_differential(native_dll, lifted_dll, altered_dll),
+        "modes": lambda: check_modes(native_dll, lifted_dll, harness_dll),
+        "cmp_differential": lambda: check_cmp_differential(native_dll, lifted_dll, altered_dll),
+        "cmp_modes": lambda: check_cmp_modes(native_dll, lifted_dll, harness_dll),
+        "rejections": lambda: check_rejections(native_dll),
+    }
+    unknown = [name for name in selected if name not in parts]
+    if unknown:
+        raise ValueError(f"unknown part {unknown}; choose from {sorted(parts)}")
+    for name in selected or parts:
+        parts[name]()

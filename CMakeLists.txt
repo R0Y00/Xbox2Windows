@@ -3804,6 +3804,20 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_SOURCE_DIR}/tests/cpu/${script}.py" "$<TARGET_FILE:${image}>" ${pairs}
             DEPENDS ${image} tests/cpu/${script}.py tools/emit_variants.py ${ARGN} VERBATIM)
     endfunction()
+    # A long check is split into parallel CTest cases <test>_<part>. The original <test> keeps its name (the
+    # form-coverage source header and the docs name it), runs the cheap remainder, and requires every part
+    # through a CTest fixture, so it is "not run" (not covered) unless every part passed.
+    function(x2w_add_check_part test part)
+        add_test(NAME ${test}_${part} COMMAND ${ARGN})
+        set_tests_properties(${test}_${part} PROPERTIES FIXTURES_SETUP ${test}_${part})
+    endfunction()
+    function(x2w_require_check_parts test)
+        set(required)
+        foreach(part IN LISTS ARGN)
+            list(APPEND required ${test}_${part})
+        endforeach()
+        set_tests_properties(${test} PROPERTIES FIXTURES_REQUIRED "${required}")
+    endfunction()
     function(cpu_translation image translator entry)
         cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA;HOST_CPU"
             "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;IMPORT_ARGUMENTS;RETURN_BYTES;NAME;RANGES;SECOND_PROVIDER;SECOND_SYMBOL;SECOND_LINK_NAME;SECOND_IMPORT_ARGUMENTS;SECOND_RETURN_BYTES" "STACK_OUTPUT" ${ARGN})
@@ -5040,12 +5054,23 @@ if(EXISTS "${INTAKE_PYTHON}")
         cpu_translation(cpu_sse_fp_pd_${variant} cpu_sse_fp_aot "${cpu_sse_fp_pd_exports}")
     endforeach()
     target_compile_definitions(cpu_sse_fp_pd_altered PRIVATE ALTER_IMM)
+    # The five checks of sse_fp_pd_check.py run as separate cases; cpu_aot_sse_fp_pd runs the rejections
+    # and requires the other four.
+    foreach(part IN ITEMS differential modes cmp_differential cmp_modes)
+        x2w_add_check_part(cpu_aot_sse_fp_pd ${part} "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_pd_check.py"
+            "$<TARGET_FILE:cpu_sse_fp_pd_original>"
+            "$<TARGET_FILE:cpu_sse_fp_pd_original_lifted>"
+            "$<TARGET_FILE:cpu_sse_fp_pd_altered_lifted>"
+            "$<TARGET_FILE:cpu_sse_fp_harness>" ${part})
+    endforeach()
     add_test(NAME cpu_aot_sse_fp_pd COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_pd_check.py"
         "$<TARGET_FILE:cpu_sse_fp_pd_original>"
         "$<TARGET_FILE:cpu_sse_fp_pd_original_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_pd_altered_lifted>"
-        "$<TARGET_FILE:cpu_sse_fp_harness>")
+        "$<TARGET_FILE:cpu_sse_fp_harness>" rejections)
+    x2w_require_check_parts(cpu_aot_sse_fp_pd differential modes cmp_differential cmp_modes)
     # cpu_sse_fp_pd_logic_checks
     set(cpu_sse_fp_pd_logic_exports
         "op_andpd,op_andpd_mem,op_andpd_mem_disp,op_andpd_self,"
@@ -5723,9 +5748,15 @@ if(EXISTS "${INTAKE_PYTHON}")
                 tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
         add_library(cpu_xchg_${variant} SHARED "${xchg_fixture}")
     endforeach()
+    x2w_add_check_part(cpu_aot_xchg native "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
+        check-native "$<TARGET_FILE:cpu_xchg>")
+    x2w_add_check_part(cpu_aot_xchg lifted "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
+        check-lifted "$<TARGET_FILE:cpu_xchg_lifted>")
+    x2w_add_check_part(cpu_aot_xchg controls "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
+        check-controls "$<TARGET_FILE:cpu_xchg_plain>" "$<TARGET_FILE:cpu_xchg_oneway>")
     add_test(NAME cpu_aot_xchg COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
-        check "$<TARGET_FILE:cpu_xchg>" "$<TARGET_FILE:cpu_xchg_lifted>"
-        "$<TARGET_FILE:cpu_xchg_plain>" "$<TARGET_FILE:cpu_xchg_oneway>")
+        check-rejections)
+    x2w_require_check_parts(cpu_aot_xchg native lifted controls)
     cpu_asm_fixture(cpu_address_size address_size)
     set(address_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_address_size_lifted.cpp")
     add_custom_command(OUTPUT "${address_fixture}"
@@ -6800,9 +6831,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             list(APPEND x87_scale_control_files "$<TARGET_FILE:cpu_x87_scale_${variant}>")
         endif()
     endforeach()
+    x2w_add_check_part(cpu_aot_x87_scale native "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_scale.py"
+        check-native "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_scale>")
+    x2w_add_check_part(cpu_aot_x87_scale lifted "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_scale.py"
+        check-lifted "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_scale_lifted>")
+    x2w_add_check_part(cpu_aot_x87_scale controls "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_scale.py"
+        check-controls "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_scale>" ${x87_scale_control_files})
     add_test(NAME cpu_aot_x87_scale COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_scale.py"
-        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_scale>"
-        "$<TARGET_FILE:cpu_x87_scale_lifted>" ${x87_scale_control_files})
+        check-rejections)
+    x2w_require_check_parts(cpu_aot_x87_scale native lifted controls)
     cpu_asm_fixture(cpu_x87_fcmov x87_fcmov)
     # The lifted DLL and eight mutated controls that the check requires to mismatch.
     set(x87_fcmov_control_files "")
@@ -6887,9 +6924,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             list(APPEND x87_fprem_control_files "$<TARGET_FILE:cpu_x87_fprem_${variant}>")
         endif()
     endforeach()
+    x2w_add_check_part(cpu_aot_x87_fprem lifted "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fprem.py"
+        check-lifted "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fprem_lifted>")
+    x2w_add_check_part(cpu_aot_x87_fprem native "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fprem.py"
+        check-native "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fprem>")
+    x2w_add_check_part(cpu_aot_x87_fprem controls "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fprem.py"
+        check-controls "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fprem>" ${x87_fprem_control_files})
     add_test(NAME cpu_aot_x87_fprem COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fprem.py"
-        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fprem>"
-        "$<TARGET_FILE:cpu_x87_fprem_lifted>" ${x87_fprem_control_files})
+        check-light)
+    x2w_require_check_parts(cpu_aot_x87_fprem lifted native controls)
     cpu_asm_fixture(cpu_x87_fldcw x87_fldcw)
     # The checked translation and seventeen mutated controls that the check requires to mismatch.
     set(x87_fldcw_control_files "")
