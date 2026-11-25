@@ -249,7 +249,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
         const std::size_t result_word = initial.size() - 2;
         const bool runs = rejection == Rejection::none || rejection == Rejection::no_count_buffer;
         const std::uint32_t executed = !runs ? 0 : rejection == Rejection::no_count_buffer ? max_commands
-                                                                                       : std::min(expected[1], max_commands);
+                                                                                       : (std::min)(expected[1], max_commands);
         for (std::uint32_t i = 0; i < executed; ++i)
             for (std::uint32_t z = 0; z < expected[4 + 3 * i]; ++z)
                 for (std::uint32_t y = 0; y < expected[3 + 3 * i]; ++y)
