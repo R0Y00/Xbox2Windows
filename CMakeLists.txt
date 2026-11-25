@@ -1346,6 +1346,26 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
 endforeach()
 
+# X2W_D3D12_RETIRE_REASONS=1 names why released resources still hold their desktop object (needs RELEASE_RETIRED and
+# BUDGET). `off` (no RETIRE_REASONS) and `no-retire` (no RELEASE_RETIRED) are negative controls: the line must stay empty.
+add_executable(startup_resource_retire_reasons tests/startup_resource_retire_reasons.cpp)
+target_include_directories(startup_resource_retire_reasons PRIVATE src)
+target_compile_features(startup_resource_retire_reasons PRIVATE cxx_std_17)
+target_link_libraries(startup_resource_retire_reasons PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    set(reasons_base "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+    add_test(NAME startup_resource_retire_reasons_${backend} COMMAND startup_resource_retire_reasons ${backend})
+    set_tests_properties(startup_resource_retire_reasons_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${reasons_base};X2W_D3D12_RELEASE_RETIRED=1;X2W_D3D12_RETIRE_REASONS=1")
+    add_test(NAME startup_resource_retire_reasons_off_${backend} COMMAND startup_resource_retire_reasons ${backend} off)
+    set_tests_properties(startup_resource_retire_reasons_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${reasons_base};X2W_D3D12_RELEASE_RETIRED=1")
+    add_test(NAME startup_resource_retire_reasons_no_retire_${backend} COMMAND startup_resource_retire_reasons ${backend} no-retire)
+    set_tests_properties(startup_resource_retire_reasons_no_retire_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${reasons_base};X2W_D3D12_RETIRE_REASONS=1")
+endforeach()
+
+
 add_executable(startup_resource_retire_title tests/startup_resource_retire_title.cpp)
 target_include_directories(startup_resource_retire_title PRIVATE src)
 target_compile_features(startup_resource_retire_title PRIVATE cxx_std_17)
@@ -1360,6 +1380,28 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_resource_retire_title_off_${backend} COMMAND startup_resource_retire_title ${backend} off)
     set_tests_properties(startup_resource_retire_title_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_RESOURCE_INDEX_CHECK=1;X2W_D3D12_DEBUG=0")
+endforeach()
+
+# X2W_D3D12_RELEASE_RETIRED_VIEWS=1 frees a released class texture that only tracked slot-18 descriptor slots keep alive by
+# replacing those slots with null descriptors. `keep` is the negative control (views switch off, or retire switch off).
+add_executable(startup_resource_retire_views tests/startup_resource_retire_views.cpp)
+target_include_directories(startup_resource_retire_views PRIVATE src)
+target_compile_features(startup_resource_retire_views PRIVATE cxx_std_17)
+target_link_libraries(startup_resource_retire_views PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    foreach(debug IN ITEMS 0 1)
+        set(retire_views_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=${debug}")
+        add_test(NAME startup_resource_retire_views_${backend}_debug${debug} COMMAND startup_resource_retire_views ${backend})
+        set_tests_properties(startup_resource_retire_views_${backend}_debug${debug} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${retire_views_env};X2W_D3D12_RELEASE_RETIRED=1;X2W_D3D12_RELEASE_RETIRED_VIEWS=1")
+    endforeach()
+    set(retire_views_keep "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+    add_test(NAME startup_resource_retire_views_keep_${backend} COMMAND startup_resource_retire_views ${backend} keep)
+    set_tests_properties(startup_resource_retire_views_keep_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${retire_views_keep};X2W_D3D12_RELEASE_RETIRED=1")
+    add_test(NAME startup_resource_retire_views_noretire_${backend} COMMAND startup_resource_retire_views ${backend} keep)
+    set_tests_properties(startup_resource_retire_views_noretire_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${retire_views_keep};X2W_D3D12_RELEASE_RETIRED_VIEWS=1")
 endforeach()
 
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
@@ -1834,6 +1876,7 @@ endforeach()
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_store.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
+target_sources(offscreen_check PRIVATE tests/startup_entry_words.cpp)
 # The storage root handed to the executable ends in a separator and is never cut off
 # (src/startup_stubs/storage_root.h); the mutated run is the negative control.
 add_executable(startup_storage_root_check tests/startup_storage_root_check.cpp)
@@ -3212,6 +3255,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: signed and unsigned three-source integer min, max and median.
     add_test(NAME startup_gfx2hlsl_int_med3_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_int_med3_check.py")
+    # v_med3_f32 with a NaN source is the minimum of the three (ISA p. 343): the preamble's med3_32 tests the
+    # encoding, the integer medians are unchanged, and the old branchless helper must be rejected.
+    add_test(NAME startup_gfx2hlsl_f32_med3_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_med3_check.py")
+    # The same four words drawn on WARP and the card, the NaN among them from the entry constants; the
+    # branchless lowering must mismatch on that lane.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_f32_med3_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_med3_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_f32_med3_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     # Startup shader translator: s_cselect_b32 into the wave32 lane masks vcc_lo and exec_lo.
     add_test(NAME startup_gfx2hlsl_cselect_mask_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cselect_mask_check.py")
@@ -3726,6 +3781,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
+    find_program(STARTUP_POWERSHELL NAMES powershell pwsh REQUIRED)
+    add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")
+    set_tests_properties(startup_stage_package PROPERTIES TIMEOUT 120)
     add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
         "$<TARGET_FILE:startup_debug_calls>")
@@ -9993,6 +10052,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/bink_descriptors_aot_check.py")
     add_test(NAME range_manifest_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/range_manifest_check.py")
+    add_test(NAME pe_resource_inventory_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/resource_inventory_cli_check.py")
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "

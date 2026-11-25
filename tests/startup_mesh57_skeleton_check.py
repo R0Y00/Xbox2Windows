@@ -82,10 +82,30 @@ def masked_vertex_red():
     return mesh[:at] + ['bf880004'] + mesh[at:]  # s_cbranch_execz skips both vertex exports
 
 
+# s_mov_b32 s40, 0.5; v_cmp_ge_f32_e64 vcc_lo, s40, 1.0
+VCC_COMPARE = 'bea803f0 d406006a 0001e428'
+
+
 BRANCH_CASES = (
     # v_mov v7, 0; s_cmp_eq_i32 0, <constant>; s_cbranch_scc1 .join; v_mov v7, 1.0
     ('SCC branch taken', vertex_red('7e0e0280 bf008080 bf850001 7e0e02f2'), lambda lane: 0),
     ('SCC branch not taken', vertex_red('7e0e0280 bf008180 bf850001 7e0e02f2'), lambda lane: 255),
+    # v_mov v7, 0; set s40 and VCC as above; s_cbranch_vccz .join; v_mov v7, 1.0
+    ('VCC-zero branch taken', vertex_red('7e0e0280 ' + VCC_COMPARE + ' bf860001 7e0e02f2'), lambda lane: 0),
+    # s_mov_b32 s40, 1.0 changes the compare result to true.
+    ('VCC-zero branch not taken', vertex_red('7e0e0280 bea803f2 d406006a 0001e428 bf860001 7e0e02f2'),
+     lambda lane: 255),
+    # The same false compare falls through for s_cbranch_vccnz.
+    ('VCC-nonzero branch not taken', vertex_red('7e0e0280 ' + VCC_COMPARE + ' bf870001 7e0e02f2'),
+     lambda lane: 255),
+    # s_mov_b32 s40, 1.0 makes s_cbranch_vccnz take .join.
+    ('VCC-nonzero branch taken', vertex_red('7e0e0280 bea803f2 d406006a 0001e428 bf870001 7e0e02f2'),
+     lambda lane: 0),
+    # s_cmp_eq_i32 0, 0; s_cbranch_scc1 .join skips a second uniform compare.
+    # .join: s_cbranch_vccz .done skips v_mov v7, 1.0 using the earlier compare.
+    ('VCC-zero branch after a join',
+     vertex_red('7e0e0280 ' + VCC_COMPARE + ' bf008080 bf850002 d406006a 0001e028 bf860001 7e0e02f2'),
+     lambda lane: 0),
     # v7 starts at 0.5. The then arm writes 1.0 for tid < 6, the else arm writes 0.0 for the remaining lanes.
     # v_cmp_gt_u32 vcc, 6, v0; s_and_saveexec_b64 s[20:21], vcc; s_cbranch_execz .empty
     # v_mov v7, 1.0; s_branch .else; .empty: s_nop; .else: s_andn2_b64 exec, s[20:21], exec
@@ -149,14 +169,52 @@ REFUSALS = (
      'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
     ('a branch over the group-index exchange', MESH[:1] + [branch(0xbf82, 1, GROUP_END + 1)] + MESH[1:],
      'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
+    # s_branch .post_count replaces s_waitcnt lgkmcnt(0) between the exchanges.
+    ('a branch over the count exchange',
+     mutate('bf8cc07f', branch(0xbf82, MESH.index('bf8cc07f'), POST_COUNT)),
+     'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
     ('an indirect branch', mutate('bf8c3f70', 'be802014'),
      'slot 57 mesh: indirect control flow (s_setpc_b64) is not covered'),
-    # s_cbranch_vccz .join replaces the post-count SCC branch and keeps its forward target.
-    ('a forward VCC-zero branch', mutate('bf850001', 'bf860001', mesh=BRANCH_CASES[0][1]),
+    # s_call_b64 s[20:21], 2 replaces s_waitcnt vmcnt(0) and targets the parameter export.
+    ('a call after the count exchange', mutate('bf8c3f70', 'bb140002'),
+     'slot 57 mesh: indirect control flow (s_call_b64) is not covered'),
+    # s_swappc_b64 s[20:21], s[22:23] replaces s_waitcnt vmcnt(0).
+    ('a PC swap after the count exchange', mutate('bf8c3f70', 'be942116'),
+     'slot 57 mesh: indirect control flow (s_swappc_b64) is not covered'),
+    # s_cbranch_execnz .join replaces s_cbranch_scc1 .join and keeps its forward target.
+    ('an EXEC-nonzero branch after the count exchange', mutate('bf850001', 'bf890001', mesh=BRANCH_CASES[0][1]),
+     'slot 57 mesh: s_cbranch_execnz on a wave-wide condition is not covered'),
+    # v_cmp_ge_f32_e64 vcc_lo, v0, 1.0; s_cbranch_vccz .join; v_mov v7, 1.0
+    ('a VCC-zero branch after a VGPR compare',
+     vertex_red('7e0e0280 d406006a 0001e500 bf860001 7e0e02f2'),
      'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
-    # s_cbranch_vccnz .join replaces the post-count SCC branch and keeps its forward target.
-    ('a forward VCC-nonzero branch', mutate('bf850001', 'bf870001', mesh=BRANCH_CASES[0][1]),
+    # v_cmp_gt_u32_e32 vcc_lo, 6, v0 replaces VCC before s_cbranch_vccnz .join.
+    ('a VCC-nonzero branch after an intervening VCC write',
+     vertex_red('7e0e0280 ' + VCC_COMPARE + ' 7d880086 bf870001 7e0e02f2'),
      'slot 57 mesh: s_cbranch_vccnz on a wave-wide condition is not covered'),
+    # s_mov_b32 s40, 0.5; s_cmp_eq_i32 0, 0; s_cbranch_scc1 .join skips s_mov_b32 s40, 1.0; .join: the compare
+    # reads s40, written before the join, which Stage's uniform_source does not prove; s_cbranch_vccz skips s_nop.
+    ('a VCC compare on an SGPR written before a join',
+     MESH[:POST_COUNT] + ['bea803f0', 'bf008080', 'bf850001', 'bea803f2'] + VCC_COMPARE.split()[1:]
+     + ['bf860001', 'bf800000'] + MESH[POST_COUNT:],
+     'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
+    # v_cmp_gt_u32 vcc, 6, v0; s_and_saveexec_b64 s[20:21], vcc narrows EXEC; the uniform compare then writes VCC
+    # only for the narrowed lanes; s_mov_b64 exec, -1 restores the full mask before s_cbranch_vccz skips s_nop.
+    ('a VCC compare under a narrowed EXEC before the branch',
+     MESH[:POST_COUNT] + ['7d880086', 'be94246a'] + VCC_COMPARE.split() + ['befe04c1', 'bf860001', 'bf800000']
+     + MESH[POST_COUNT:],
+     'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
+    # Set uniform VCC, then keep the v_cmpx_gt_i32 that narrows EXEC before s_cbranch_vccz skips s_nop.
+    ('a VCC-zero branch under narrowed EXEC',
+     MESH[:POST_COUNT] + VCC_COMPARE.split() + [MESH[POST_COUNT], 'bf860001', 'bf800000'] + MESH[POST_COUNT + 1:],
+     'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
+    # s_cbranch_vccnz .join replaces the SCC branch without defining VCC.
+    ('a VCC-nonzero branch without a compare', mutate('bf850001', 'bf870001', mesh=BRANCH_CASES[0][1]),
+     'slot 57 mesh: s_cbranch_vccnz on a wave-wide condition is not covered'),
+    # s_cbranch_scc1 .join can skip all three dwords that set s40 and VCC.
+    ('a VCC-zero branch after a join missing a VCC definition on one path',
+     vertex_red('7e0e0280 bf008080 bf850003 ' + VCC_COMPARE + ' bf860001 7e0e02f2'),
+     'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
     # s_endpgm before the vertex count compare, with the original final s_endpgm still present.
     ('an early program end', MESH[:POST_COUNT] + ['bf810000'] + MESH[POST_COUNT:],
      'slot 57 mesh: an early s_endpgm is not covered'),

@@ -322,6 +322,7 @@ jobs:
             tests/startup_gfx2hlsl_getpc_refusal_check.py \
             tests/startup_gfx2hlsl_image_arity_check.py \
             tests/startup_compute_lds_dual_atomics_check.py \
+            tests/startup_gfx2hlsl_desc_ptr_prop_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows

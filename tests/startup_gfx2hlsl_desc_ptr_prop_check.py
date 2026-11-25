@@ -94,6 +94,14 @@ check('a register addend on a pointer is refused', isinstance(s, str) and 'non-l
 s = run(ROOT, ADVANCE + [('s_load_dwordx4', 's[4:7], s[20:21], s2')])
 check('a register offset through an advanced pointer is still refused', isinstance(s, str), str(s))
 
+# The untracked-offset mark of a branchy program must be refused here too, never a TypeError.
+s = stage({8: ('ptr', ('root', 1), 'added'), 9: ('ptrhi', ('root', 1))})
+try:
+    s.descriptor('s[8:9]')
+    check('an untracked-offset pointer used whole as a descriptor is refused', False, 'accepted')
+except G.Unsupported:
+    check('an untracked-offset pointer used whole as a descriptor is refused', True)
+
 s = run(ROOT, ADVANCE)
 try:
     s.descriptor('s[20:21]')

@@ -1327,7 +1327,11 @@ def mesh_run(ins, at, what, patterns, env):
     return at + len(patterns)
 
 
-def mesh_skeleton(ins):
+MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
+VCC_KEYS = {'vcc', 'vcc_hi'}
+
+
+def mesh_skeleton(ins, vcc_branches):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -1395,7 +1399,7 @@ def mesh_skeleton(ins):
                 raise Unsupported('slot 57 mesh: a branch enters or crosses a group-memory exchange')
             if target <= off:
                 raise Unsupported('slot 57 mesh: a loop outside the group-memory exchanges is not covered')
-            if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz'):
+            if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz') + MESH_VCC_BRANCHES:
                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
             edges[i] = dest
 
@@ -1430,6 +1434,9 @@ def mesh_skeleton(ins):
     thread = base = None   # VGPR of the thread index, SGPR holding wave << 6
     thread_high = None    # second instruction of a proven adjacent v_mbcnt pair
     scc_stale = False
+    # Possible last full-EXEC compare offsets. An empty set means some path lacks such a definition.
+    # The exchanges preserve VCC. Stage.translate checks the sources against its SGPR facts at each definition.
+    vcc_compares = frozenset()
     exports = []
     incoming = {}
     falls = True
@@ -1438,7 +1445,7 @@ def mesh_skeleton(ins):
         if index in targets:
             paths = incoming[index]
             if falls:
-                paths.append((stale, pending, mask, wave_known, thread, base, scc_stale))
+                paths.append((stale, pending, mask, wave_known, thread, base, scc_stale, vcc_compares))
             stale = set().union(*(p[0] for p in paths))
             pending = set().union(*(p[1] for p in paths))
             mask = paths[0][2]
@@ -1449,6 +1456,8 @@ def mesh_skeleton(ins):
             wave_known = all(p[3] for p in paths)
             thread, base = (paths[0][k] if all(p[k] == paths[0][k] for p in paths) else None for k in (4, 5))
             scc_stale = any(p[6] for p in paths)
+            definitions = [p[7] for p in paths]
+            vcc_compares = frozenset().union(*definitions) if all(definitions) else frozenset()
             falls = True
         if not falls:
             raise Unsupported('slot 57 mesh: unreachable code after a branch is not covered')
@@ -1487,8 +1496,12 @@ def mesh_skeleton(ins):
         if index in edges:
             if scc_stale and reads_scc(name, asm):
                 raise Unsupported('slot 57 mesh: an unmodelled SCC is read by a branch')
+            if name in MESH_VCC_BRANCHES:
+                if mask is not None or not vcc_compares:
+                    raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
+                vcc_branches[off] = vcc_compares
             incoming.setdefault(edges[index], []).append(
-                (stale.copy(), pending.copy(), mask, wave_known, thread, base, scc_stale))
+                (stale.copy(), pending.copy(), mask, wave_known, thread, base, scc_stale, vcc_compares))
             out.append(ins[index])
             falls = name != 's_branch'
             continue
@@ -1525,6 +1538,11 @@ def mesh_skeleton(ins):
             raise Unsupported('slot 57 mesh: SCC of the count exchange is read')
         if name.startswith(('s_cmp', 's_bitcmp')):
             scc_stale = False
+        if scalar_effects(name, asm)[2] & VCC_KEYS:
+            vcc_compares = frozenset({off}) if (
+                mask is None and base_name.startswith('v_cmp_') and name.endswith(('_e32', '_e64'))
+                and len(ops) == 3 and ops[0] in ('vcc', 'vcc_lo')
+            ) else frozenset()
         # Saveexec uses a fresh VCC from an adjacent compare. Only the matching complement can read the
         # saved mask. Hardware SCC (whether any bit is set) is not represented by a per-lane boolean.
         if asm == 's_mov_b64 exec, -1':
@@ -1623,7 +1641,8 @@ class Stage:
         else:
             self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
         if kind == 'ms':
-            self.ins = mesh_skeleton(self.ins)
+            self.mesh_vcc_branches = {}
+            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches)
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -1949,7 +1968,7 @@ class Stage:
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
             if len(s) > 2 and s[2]:
-                raise Unsupported('descriptor operand %s is a pointer with offset %#x' % (tok, s[2]))
+                raise Unsupported('descriptor operand %s is a pointer with offset %s' % (tok, hex(s[2]) if isinstance(s[2], int) else s[2]))
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
@@ -2288,6 +2307,8 @@ class Stage:
 
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
+        vcc_branches = getattr(self, 'mesh_vcc_branches', {})
+        vcc_compares = set().union(*vcc_branches.values())
         try:
             self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
         except Unsupported as reason:
@@ -2348,6 +2369,7 @@ class Stage:
 
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
+            uniform_vcc_compares = set()
             self.lines = []
             self.blocks = []          # (offset, [lines], terminator)
             self.sym = dict(init_sym)
@@ -2496,9 +2518,18 @@ class Stage:
                     if off in refused:
                         raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
+                    if off in vcc_compares and all(
+                        not mesh_vregs([tok]) and self.uniform_source(tok)
+                        for tok in parse(asm)[1][1:]
+                    ):
+                        uniform_vcc_compares.add(off)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
                         cond_uniform = cond in ('scc0', 'scc1') and self.scc_uniform
+                        if off in vcc_branches:
+                            if not vcc_branches[off] <= uniform_vcc_compares:
+                                raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
+                            cond_uniform = True
                         if not cond_uniform:
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
@@ -2576,7 +2607,8 @@ class Stage:
                 continue
             seen.add((off, stale))
             size, name, asm = instructions[off]
-            if stale and off not in self.calculated_pc and reads_scc(name, asm):
+            if (stale and off not in self.calculated_pc and off not in getattr(self, 'ptr_addc_pcs', ())
+                    and reads_scc(name, asm)):
                 yield stale, name
             if off in effects:
                 stale = effects[off] if effects[off] != 'emitted' else None
@@ -3199,6 +3231,8 @@ class Stage:
             return False
         self.sym[d] = ('ptrhi', mark[2])
         getattr(self, 'ptr_open_pairs', set()).discard(d - 1)
+        # This s_addc_u32 is the only reader of the low add's elided carry; any other SCC reader stays refused.
+        self.__dict__.setdefault('ptr_addc_pcs', set()).add(self.pc)
         return True
 
     # scalar ALU with descriptor-word bookkeeping
@@ -4627,7 +4661,7 @@ class Stage:
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
             axes = 3 if three else 2
             packed_2d = how == 'load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
-            packed_d16 = how == 'load' and 'd16' in mods
+            packed_d16 = how in ('load', 'load_mip') and 'd16' in mods
             allowed = ('unorm', 'glc', 'slc', 'dlc')
             if packed_2d:
                 allowed += ('a16',)
@@ -4639,14 +4673,15 @@ class Stage:
             if unsupported or wrong_address or not dmask:
                 raise Unsupported('image_%s address or modifiers: %s' % (how, ' '.join(mods)))
             if packed_d16:
+                op_name = 'image_' + how
                 expected_dst = (bin(dmask).count('1') + 1) // 2
                 if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != expected_dst or dst[2] > 255:
-                    raise Unsupported('image_load d16 destination %s for dmask %#x' % (ops[0], dmask))
+                    raise Unsupported('%s d16 destination %s for dmask %#x' % (op_name, ops[0], dmask))
                 res = self.pipe.resources[desc_key]
                 if res['index'] in self.pipe.srv_formats:
                     fmt = self.pipe.srv_formats[res['index']]
                     if fmt not in D16_EXACT_SRV_FORMATS:
-                        raise Unsupported('image_load d16 unsupported SRV format %d' % fmt)
+                        raise Unsupported('%s d16 unsupported SRV format %d' % (op_name, fmt))
             if packed_2d:
                 packed = self.u(cs[0])
                 address = ['%s & 0xffffu' % packed, '%s >> 16' % packed]
@@ -4725,7 +4760,7 @@ class Stage:
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)
-        if how == 'load' and 'd16' in mods:
+        if how in ('load', 'load_mip') and 'd16' in mods:
             res = self.pipe.resources[desc_key]
             res['d16_exact'] = True
             mode_arg = 'ud%d' % self.pipe.ud(('d16unorm16', res['index']))
@@ -6214,7 +6249,7 @@ VEC_F = {
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'fract32({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
-    'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
+    'v_med3_f32': (3, 'med3_32({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
@@ -6407,8 +6442,8 @@ SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 UINT_RTVS = frozenset((3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62))
 SINT_RTVS = frozenset((4, 8, 14, 18, 32, 38, 43, 52, 59, 64))
 FLOAT32_RTVS = frozenset((2, 6, 16, 41))
-# DXGI_FORMAT values independently verified exact for D16 image_load, matching d16_srv_mode()
-# in src/startup_stubs/d16_image_format.h (#2023): 32-bit float and 8-bit UNORM views (exact via
+# DXGI_FORMAT values independently verified exact for D16 image_load and image_load_mip, matching
+# d16_srv_mode() in src/startup_stubs/d16_image_format.h (#2023): 32-bit float and 8-bit UNORM views (exact via
 # pack16_rne) plus 16-bit UNORM views (exact via pack16_unorm16).
 D16_FLOAT_EXACT_SRV_FORMATS = frozenset((2, 6, 16, 21, 28, 41, 49, 61, 65, 87, 88))
 D16_UNORM16_SRV_FORMATS = frozenset((11, 35, 56))
@@ -6578,7 +6613,14 @@ class Pipeline:
                '    float f = frac(value);',
                '    return asuint(f) == 0x3f800000u ? asfloat(0x3f7fffffu) : f;',
                '}',
-               'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # v_med3_f32 with a NaN source is the minimum of the three (ISA "343 V_MED3_F32"), so the test is
+               # on the encoding: a float isnan() may be folded away by the compiler. D3D min() returns the
+               # other operand, so min(min(a, b), c) over a NaN source is the smallest of the non-NaN ones.
+               # Same body as med3_32 in tools/pixel_aot.py.
+               'float med3_32(float a, float b, float c) {',
+               '    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);',
+               '    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));',
+               '}',
                # High half of an unsigned 32x32 product, by halfword products so it fits 32-bit HLSL.
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
@@ -7009,7 +7051,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-16'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-17'))))
     return fnv(layout, key) if layout else key
 
 
@@ -7018,7 +7060,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-16cs')
+    key = fnv(b'x2w-startup-shader-17cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key

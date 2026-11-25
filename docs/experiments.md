@@ -315,6 +315,20 @@ cmake --build --preset dev --target startup_storage_root_check startup_stub_game
 ctest --preset dev --no-tests=error -R '^startup_storage_root' -V
 ```
 
+## Startup package staging
+
+`tools/startup/stage_package.ps1` copies one executable and its adjacent DLLs into a fresh
+run directory. Package archives and subdirectories stay at the data root. The tool refuses
+destinations in the package, ancestors of the package, nonempty destinations and destination
+paths through reparse points. It does not resolve dependencies or establish executable compatibility.
+`startup_stage_package` checks staging from a changed PowerShell location, exact DLL extensions
+and DLL selection beside a nested executable. It also checks preservation of package data and
+refusal of overwrites, overlapping paths, junctions and invalid executable inputs.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_stage_package$' -V
+```
+
 ## Typed startup colour exports
 
 The [startup draw fixture](startup-runtime.md) uses a source-built gfx1013 pixel shader
@@ -9462,6 +9476,13 @@ and unproven wave masks remain unsupported. Use
 Append `draw <dxc> <offscreen_check> <warp|hardware>` for CPU-reference readback
 of the SCC paths and lane-masked if/else.
 
+A forward `s_cbranch_vccz` or `s_cbranch_vccnz` can also branch on the
+lane's VCC bit when EXEC is full and every incoming path last wrote VCC with
+a full-EXEC `v_cmp_*` from wave-uniform SGPRs or constants. A compare with a
+VGPR source, a different VCC write, or a narrowed EXEC at the branch
+invalidates the proof. The CPU-reference draws cover both outcomes for each
+branch polarity and a VCC-zero branch after a join.
+
 Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
 slot 57 creation. The descriptor must name a registered root, have an empty
 VS slot and have a readable 16-byte to 64-KiB MS span. The PS span must be
@@ -14105,9 +14126,9 @@ cmake --build --preset dev --target offscreen_check d3d12_xs_shim
 ctest --preset dev --no-tests=error -R '^startup_image_sample_a16_(controls|warp|hardware)$' -V
 ```
 
-## Startup translator: level-zero D16 image loads
+## Startup translator: D16 image loads
 
-For level-zero `image_load` with `d16` on 2D (including `a16` and NSA), 3D and 2D-array resources, `tools/startup/gfx2hlsl.py` narrows each enabled `dmask` component of the `Load` result to IEEE binary16 and packs the halves pairwise into `ceil(popcount(dmask) / 2)` consecutive VGPRs (low half first, high half second). HLSL `f32tof16` truncates toward zero on WARP (lowering 31,740 of the 65,536 `DXGI_FORMAT_R16_UNORM` depth values by 1 ULP relative to RDNA hardware), while narrowing an intermediate binary32 `Load` value still double-rounds `R16_UNORM` at `0xffaf` (`0x3bfe` instead of `0x3bfd`) and `0xffef` (`0x3c00` instead of `0x3bff`). `gfx2hlsl.py` therefore emits both an integer binary32-to-binary16 round-to-nearest-even helper (`pack16_rne`, quieting NaNs while preserving sign) and an exact `UNORM16` helper (`pack16_unorm16`, recovering `u = uint(saturate(v) * 65535.0 + 0.5)` and rounding `u / 65535` directly to binary16), selected per SRV via `udsrc <ud> d16unorm16 <index>`, and writes `d16srv <index> exact` to `<key>.txt`. Before drawing, `src/startup_stubs/d3d12_draw.inl` (`src/startup_stubs/d16_image_format.h`) validates the bound view's effective `DXGI_FORMAT` against the 14 independently GPU-verified exact formats (five 32-bit float views, six 8-bit `UNORM` views, and three 16-bit `UNORM` views), setting `d16unorm16` to `1` for `R16*_UNORM` and `0` for the exact binary32/`UNORM8` formats while refusing integer (`UINT`/`SINT`), typeless, depth-stencil-only, `SNORM16`, `R24_UNORM`, `SRGB`, block-compressed, packed-target stand-in, console extension, null-resource and unbound views. When `popcount(dmask)` is odd (`1` or `3`), bits `31:16` of the final destination VGPR are hardware-undefined on RDNA 2; `gfx2hlsl.py` tracks those registers across expressions and basic blocks and refuses whole-word reads unless consumed through a low-16-bit operation (`v_cvt_f32_f16`, `v_cvt_f32_ubyte0`/`1`, `SDWA` `BYTE_0`/`BYTE_1`/`WORD_0`, `v_and_b32` with constant mask `<= 0xffff`, `v_cmp_class_f16`/`v_cmpx_class_f16`, or `v_fma_mix*` half operands). Pipelines without `image_load` `d16` omit all helpers and `d16srv` lines; `image_load_mip` with `d16`, sampler MIMG forms with `d16`, 1D and cube dimensions, 3D or 2D-array `a16`, `tfe`, `lwe`, `r128`, set reserved MIMG bits, an empty `dmask`, and mismatched register counts remain refused.
+For `image_load` and `image_load_mip` with `d16` on 2D (including NSA, and `a16` on level-zero `image_load`), 3D and 2D-array resources, `tools/startup/gfx2hlsl.py` narrows each enabled `dmask` component of the `Load` result to IEEE binary16 and packs the halves pairwise into `ceil(popcount(dmask) / 2)` consecutive VGPRs (low half first, high half second). HLSL `f32tof16` truncates toward zero on WARP (lowering 31,740 of the 65,536 `DXGI_FORMAT_R16_UNORM` depth values by 1 ULP relative to RDNA hardware), while narrowing an intermediate binary32 `Load` value still double-rounds `R16_UNORM` at `0xffaf` (`0x3bfe` instead of `0x3bfd`) and `0xffef` (`0x3c00` instead of `0x3bff`). `gfx2hlsl.py` therefore emits both an integer binary32-to-binary16 round-to-nearest-even helper (`pack16_rne`, quieting NaNs while preserving sign) and an exact `UNORM16` helper (`pack16_unorm16`, recovering `u = uint(saturate(v) * 65535.0 + 0.5)` and rounding `u / 65535` directly to binary16), selected per SRV via `udsrc <ud> d16unorm16 <index>`, and writes `d16srv <index> exact` to `<key>.txt`. Before drawing, `src/startup_stubs/d3d12_draw.inl` (`src/startup_stubs/d16_image_format.h`) validates the bound view's effective `DXGI_FORMAT` against the 14 independently GPU-verified exact formats (five 32-bit float views, six 8-bit `UNORM` views, and three 16-bit `UNORM` views), setting `d16unorm16` to `1` for `R16*_UNORM` and `0` for the exact binary32/`UNORM8` formats while refusing integer (`UINT`/`SINT`), typeless, depth-stencil-only, `SNORM16`, `R24_UNORM`, `SRGB`, block-compressed, packed-target stand-in, console extension, null-resource and unbound views. When `popcount(dmask)` is odd (`1` or `3`), bits `31:16` of the final destination VGPR are hardware-undefined on RDNA 2; `gfx2hlsl.py` tracks those registers across expressions and basic blocks and refuses whole-word reads unless consumed through a low-16-bit operation (`v_cvt_f32_f16`, `v_cvt_f32_ubyte0`/`1`, `SDWA` `BYTE_0`/`BYTE_1`/`WORD_0`, `v_and_b32` with constant mask `<= 0xffff`, `v_cmp_class_f16`/`v_cmpx_class_f16`, or `v_fma_mix*` half operands). Pipelines without D16 image loads omit all helpers and `d16srv` lines; sampler MIMG forms with `d16`, 1D and cube dimensions, `image_load_mip` or 3D / 2D-array `a16`, `tfe`, `lwe`, `r128`, set reserved MIMG bits, an empty `dmask`, and mismatched register counts remain refused.
 
 Verified on commit base `009153b7` on Windows 11 26H2 (build `26300.9974`) across Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.9818`) and AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`), D3D12 debug layer enabled (`debug_errors=0 debug_warnings=0`): exhaustive GPU probes across all 65,536 `DXGI_FORMAT_R16_UNORM` texels (DXC `cs_6_2` and FXC `cs_5_0`) and all 256 `DXGI_FORMAT_R8_UNORM` texels match RDNA 2 hardware `d16` loads with 0 mismatches (`65,536 / 65,536` and `256 / 256`, including `0xffaf -> 0x3bfd` and `0xffef -> 0x3bff`). In `offscreen_check --startup-image-load-d16` (DXC `ps_6_0` and FXC `ps_5_1`), fixtures A and B match all 128 output words (32 pixels) on `8x2` `R16_UNORM` and `8x2` `R32G32B32A32_FLOAT` textures, remain invariant when `0xdead0000` is injected into bits `31:16` of the odd-`dmask` registers, and reject eight mutated HLSL controls (truncation toward zero, binary32 `double_round` on `0xffaf`/`0xffef`, unpacked 32-bit `U(t.x)`, swapped low/high halves, dropped `<< 16` shift, dropped `a16` coordinate unpack, ignored NSA register list, and unmasked odd-`dmask` upper half). Through `d3d12_xs.dll` (`startup_d16_srv_{warp,hardware}`), `R16_UNORM` (`0xffef -> 0x3bff`), `R32_FLOAT` (`0x3f7ff000 -> 0x3c00`) and `R16_TYPELESS` viewed as `R16_UNORM` (`0xaaaa -> 0x3955`) dispatch the exact per-SRV mode on one PSO while `R16_UINT`, `R16_SNORM`, null-resource and unwritten views are refused and malformed `d16srv` manifests are rejected.
 
@@ -15393,6 +15414,68 @@ On Intel UHD Graphics (TGL GT1) with Mesa 26.2.7, DXC 1.10.2605.37 and SPIRV-Too
 python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device Intel
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device llvmpipe
+## v_med3_f32 with a NaN source
+
+The RDNA 2 ISA defines `V_MED3_F32` (p. "343 V_MED3_F32") as a NaN branch first:
+
+```
+if (isNan(S0.f) || isNan(S1.f) || isNan(S2.f))
+   D.f = V_MIN3_F32(S0.f, S1.f, S2.f);
+else if (V_MAX3_F32(S0.f, S1.f, S2.f) == S0.f)
+   D.f = V_MAX_F32(S1.f, S2.f);
+...
+```
+
+A NaN source therefore makes the result the smallest of the three. `tools/startup/gfx2hlsl.py` lowered
+`v_med3_f32` to `max(min(a, b), min(max(a, b), c))`, which returns the larger of the non-NaN sources instead.
+Drawn with `med3(a, 2.0, 1.0)` on a Radeon RX 9070 XT (driver `32.0.32029.2010`):
+
+| `a` | emitted form | ISA rule |
+|---|---|---|
+| NaN (`0x7fc00000`) | 2.0 | **1.0** |
+| 3.0 | 2.0 | 2.0 |
+| 1.5 | 1.5 | 1.5 |
+| 0.5 | 1.0 | 1.0 |
+
+The only divergence is the NaN source. The table now points `v_med3_f32` at `med3_32`, whose body is the one
+`tools/pixel_aot.py` already uses:
+
+```hlsl
+float med3_32(float a, float b, float c) {
+    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);
+    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));
+}
+```
+
+The NaN test is on the encoding rather than on `isnan()`, because some desktop compilers fold float NaN
+tests, and `min(min(a, b), c)` over operands whose sources D3D's `min()` keeps gives the smallest non-NaN
+source. The integer medians (`v_med3_u32`, `v_med3_i32`) are untouched: they compare words and have no NaN.
+
+What the measurement establishes and what it does not: the emitted form rendered 2.0 on the card for a NaN
+operand, and the ISA rule is the lower of the non-NaN sources. That the hardware instruction itself computes
+`V_MIN3_F32` on a NaN source is **not** established here: HLSL cannot emit `v_med3_f32` (the compiler does not
+select it from the median pattern), so the fixture compares the translated text against the ISA rule, not
+against the instruction. Reading the instruction directly needs a captured shader or the ISA simulator.
+
+`tests/startup_gfx2hlsl_f32_med3_check.py` holds the controls and the draw. The controls read the emitted
+HLSL: the preamble carries `med3_32` with the `0x7f800000u` threshold and the `asuint(x) & 0x7fffffffu` test,
+the binary32 table points at it, both the bare and the `_e64` spellings lower to it, and the integer medians
+keep their own lowering. Four mutations are rejected: the branchless helper, a `>=` threshold, an `isnan(`
+test and a table pointing back at a helper without the branch. The `decode` mode builds
+`v_med3_f32 v12, v1, v2, v3` as `0c0057d501050e04` and proves it with `tools/disasm_rdna2.py`.
+
+The draw is a source-built gfx1013 pair whose pixel stage moves the four entry constants s8..s11 into
+s44..s47 and applies `v_med3_f32 v(12+lane), v1, v2, v3` with `v2 = 2.0` and `v3 = 1.0`. The inputs arrive as
+root 32-bit constants written per draw by `offscreen_check --startup-entry-words`, not as literals: a literal
+would be folded at compile time and the lowering under test would never run. The four inputs are
+`0x7fc00000`, `0x40400000`, `0x3fc00000` and `0x3f000000`; the expected words are `0x3f800000`,
+`0x40000000`, `0x3fc00000` and `0x3f800000`. The control that counts restores the branchless helper in the
+same pair and requires a mismatch on the NaN lane alone: `0x40000000` where the ISA asks `0x3f800000`, the
+other three lanes unchanged. A negative control that passes is reported as a failure, not accepted.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_med3' -V
 ```
 
 ## Vulkan draw of the core translated pixel shaders
