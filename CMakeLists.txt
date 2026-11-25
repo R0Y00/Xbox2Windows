@@ -1942,6 +1942,16 @@ set_tests_properties(startup_pipeline_state_offset_control PROPERTIES WILL_FAIL 
 # Mesh-pipeline layout (+0x004 == 6, fields 0x54 later): a mesh block read at the vertex offsets must fail.
 add_test(NAME startup_pipeline_state_mesh_shift_control COMMAND startup_pipeline_state_check --mutate mesh-shift)
 set_tests_properties(startup_pipeline_state_mesh_shift_control PROPERTIES WILL_FAIL TRUE)
+# PA_SU_SC_MODE_CNTL value -> D3D12 cull, winding and fill (src/startup_stubs/rasterizer_state_decode.h, #1999 B).
+# Device-free; each control reads one field wrongly and must fail.
+add_executable(startup_rasterizer_decode_check tests/startup_rasterizer_decode_check.cpp)
+target_include_directories(startup_rasterizer_decode_check PRIVATE src)
+target_compile_features(startup_rasterizer_decode_check PRIVATE cxx_std_17)
+add_test(NAME startup_rasterizer_decode COMMAND startup_rasterizer_decode_check)
+foreach(mutation IN ITEMS face cull fill)
+    add_test(NAME startup_rasterizer_decode_${mutation}_control COMMAND startup_rasterizer_decode_check --mutate ${mutation})
+    set_tests_properties(startup_rasterizer_decode_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # X2W_DEPTH_STATE (src/startup_stubs/depth_state_apply.h): off takes nothing from the block, on takes a decodable one.
 add_executable(startup_depth_state_check tests/startup_depth_state_check.cpp)
 target_include_directories(startup_depth_state_check PRIVATE src)
