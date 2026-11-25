@@ -324,6 +324,7 @@ jobs:
             tests/compute_desc_numeric_check.py \
             tests/compute_alu_lane_gaps_check.py \
             tests/startup_ngg_slice_check.py \
+            tests/startup_gfx2hlsl_ngg_passthrough_check.py \
             tests/startup_gfx2hlsl_handler_arity_check.py \
             tests/startup_gfx2hlsl_getpc_refusal_check.py \
             tests/startup_gfx2hlsl_image_arity_check.py \

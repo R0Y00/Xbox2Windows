@@ -145,6 +145,7 @@ REFUSED = [
      'non-identity primitive export'),
     ('primitive export after a branch', (PRIM,), 'non-identity primitive export', True),
     ('unknown message', ('s_sendmsg 0x2',), 's_sendmsg'),
+    ('allocation message with stream bits', ('s_sendmsg 0x109',), 's_sendmsg'),
     ('LDS write in a pixel shader', ('ds_write_b32 v1, v2 offset:16',), 'ds_write_b32',
      False, 'ps'),
     ('LDS after a branch', (*LANE, 'ds_write_b32 v1, v2 offset:16'), 'requires a straight-line vertex shader', True),

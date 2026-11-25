@@ -5468,7 +5468,7 @@ class Stage:
             message = int(ops[0], 0) if len(ops) == 1 and not mods else None
         except ValueError:
             message = None
-        if message is None or message & 0xffff != self.GS_ALLOC_REQ:
+        if message != self.GS_ALLOC_REQ:
             raise Unsupported('s_sendmsg %s' % ' '.join(ops + mods))
         return None
 
@@ -5684,10 +5684,7 @@ class Stage:
     def op_v_mov_b32(self, ops, mods):
         if len(ops) != 2:
             raise Unsupported('v_mov_b32 with %d operands, expected 2' % len(ops))
-        src, dst = reg_range(ops[1]), reg_range(ops[0])[1]
-        self.set_v(dst, self.u(ops[1]))
-        if src and src[0] == 'v' and src[1] == src[2] and src[1] in self.__dict__.setdefault('lane_v', {0}):
-            self.lane_v.add(dst)
+        self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_swap_b32(self, ops, mods):
         # VOP1 only (llvm-mc rejects the e64, DPP and SDWA spellings for gfx1013). Both registers exchange
