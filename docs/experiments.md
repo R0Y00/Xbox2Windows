@@ -15684,12 +15684,13 @@ Refused with a named reason: `image_sample_c_d` (it would need `SampleCmpGrad`, 
 
 The guest sampler LOD range is kept: a constant sampler carries MIN_LOD and MAX_LOD to the static sampler through the same `smpl` line as `image_sample`, `_l` and `_lz` (sampler words `(0, 0, 0x04000000, 0)` stay capped at mip 0), with the same refusals for a LOD bias and for MIN_LOD above MAX_LOD. A mip filter of 0 keeps the ordinary sampler, and a heap sampler is not validated and is logged once per module.
 
-Verified: the Python translation checks only (address order, refusals, the LOD cap, fixture words against `llvm-mc`). A D3D12 readback of `SampleGrad` against a CPU reference is not part of this change and is unverified.
+Verified: the Python translation checks (address order, refusals, the LOD cap, fixture words against `llvm-mc`) and a D3D12 draw on WARP and hardware (`tests/startup_image_sample_d_draw_check.py`): four `SampleGrad` probes on a three-mip, two-slice fixture read back against a CPU reference, with a MAX_LOD 0 sampler and an implicit `Sample` as negative controls.
 
 ```bash
 ./out/pe-env/bin/python -B tests/startup_image_sample_d_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_d_check.py binary <llvm-mc>
 ctest --preset dev --no-tests=error -R "^startup_image_sample_d" -V
+ctest --preset dev --no-tests=error -R "^startup_image_sample_d_draw_(warp|hardware)$" -V
 ```
 
 ### Startup 24-bit multiplies, v_xnor_b32 and the funnel shifts
