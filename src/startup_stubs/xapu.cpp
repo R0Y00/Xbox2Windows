@@ -13,8 +13,9 @@
 //   XApuConnect(input*, output*, handle*) -> HRESULT (the handle is later passed to the others)
 //   XApuGetResultCount(handle, 0) -> count
 //   XApuDequeueResult(handle, result*) -> HRESULT; zeroes 0x58 bytes and writes the queued
-//     command's 32-bit type at +0 (observed commands/results: 1=open, 2=close, 3=packet,
-//     5=stop) and slot index at +4; decoded output byte count at +0x34 stays 0 without decode.
+//     command's 32-bit type at +0 and slot index at +4; decoded output byte count at +0x34 stays 0
+//     without decode. Observed command/result types are 1 (open), 2 (close), 3 (packet), and
+//     5 (stop); other values such as 4 are echoed verbatim rather than rejected.
 //   XApuEnqueueCommand(handle, command*, ...) -> HRESULT; reads 32-bit type at +0 and slot at +4.
 //   XApuDisconnect(handle)
 namespace {
@@ -26,6 +27,7 @@ constexpr long hr_out_of_memory = static_cast<long>(0x8007000E); // E_OUTOFMEMOR
 constexpr long hr_pending_results = static_cast<long>(0x8AC81001); // XAPU_E_PENDING_RESULTS
 constexpr std::size_t command_header_size = 8;
 constexpr std::size_t result_size = 0x58;
+constexpr std::size_t max_queue_entries = 16384;  // 128 KiB cap per connection for undrained commands
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
 
@@ -50,9 +52,10 @@ bool timer_active = false;
 
 bool push_result(Connection& conn, QueueEntry entry) noexcept
 {
+    if (conn.count >= max_queue_entries) return false;
     if (conn.count == conn.capacity) {
-        if (conn.capacity > (static_cast<std::size_t>(-1) / 2)) return false;
-        const std::size_t next_cap = conn.capacity ? conn.capacity * 2 : 64;
+        const std::size_t doubled = conn.capacity ? conn.capacity * 2 : 64;
+        const std::size_t next_cap = doubled > max_queue_entries ? max_queue_entries : doubled;
         auto* next = new (std::nothrow) QueueEntry[next_cap];
         if (!next) return false;
         for (std::size_t i = 0; i < conn.count; ++i) {

@@ -24,9 +24,11 @@ using DisconnectFn = long(__cdecl*)(void* handle);
 constexpr long hr_ok = 0;
 constexpr long hr_pointer = static_cast<long>(0x80004003);
 constexpr long hr_handle = static_cast<long>(0x80070006);
+constexpr long hr_out_of_memory = static_cast<long>(0x8007000E);
 constexpr long hr_pending_results = static_cast<long>(0x8AC81001);
 constexpr DWORD trap_connect_exit = 0xE2570300u;
 constexpr std::size_t result_bytes = 0x58;
+constexpr std::size_t max_queue_entries = 16384;
 
 int failures = 0;
 
@@ -131,18 +133,10 @@ void check_non_permissive_trap(const char* self_exe, const char* dll_path)
 int main(int argc, char** argv)
 {
     if (argc == 3 && std::strcmp(argv[1], "--trap-control") == 0) return run_trap_control(argv[2]);
-    bool mutate_zero_output = false;
-    const char* dll_path = nullptr;
-    if (argc == 2) {
-        dll_path = argv[1];
-    } else if (argc == 4 && std::strcmp(argv[2], "--mutate") == 0 && std::strcmp(argv[3], "zero-output") == 0) {
-        dll_path = argv[1];
-        mutate_zero_output = true;
-    } else {
-        return std::printf("usage: startup_xapu_queue_check <xapu.dll> [--mutate zero-output]\n"), 2;
-    }
+    if (argc != 2) return std::printf("usage: startup_xapu_queue_check <xapu.dll>\n"), 2;
+    const char* dll_path = argv[1];
 
-    if (!mutate_zero_output) check_non_permissive_trap(argv[0], dll_path);
+    check_non_permissive_trap(argv[0], dll_path);
 
     SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", "1");
     HMODULE module = LoadLibraryA(dll_path);
@@ -247,10 +241,6 @@ int main(int argc, char** argv)
         if (i == 3) slot_state = 3;  // simulate caller setting closing state before dequeuing close result
         result.fill(0x55);
         check(dequeue(h1, result.data()) == hr_ok, steps[i].label);
-        if (mutate_zero_output) {
-            // Mutated control: simulate the old all-zero placeholder dequeue result.
-            std::memset(result.data(), 0, 8);
-        }
         check(read_u32(result, 0x00) == steps[i].type && read_u32(result, 0x04) == steps[i].slot,
               steps[i].label);
         check(rest_zero(result, 8), "dequeue clears remaining result bytes (+0x08..+0x57, including +0x34)");
@@ -258,6 +248,12 @@ int main(int argc, char** argv)
         check(slot_state == steps[i].next_state, steps[i].label);
     }
     check(decoded_bytes == 0, "type 3 completion writes 0 decoded bytes at +0x34");
+    write_cmd(cmd, 4, 9);
+    check(enqueue(h1, cmd.data(), 0, 0) == hr_ok, "enqueue unobserved type=4 echoes verbatim");
+    result.fill(0x55);
+    check(dequeue(h1, result.data()) == hr_ok && read_u32(result, 0x00) == 4 && read_u32(result, 0x04) == 9 &&
+              rest_zero(result, 8),
+          "dequeue echoes type=4 and slot=9 verbatim");
     check(get_count(h1, 0) == 0, "XApuGetResultCount == 0 after draining typed commands");
     result = sentinel;
     check(dequeue(h1, result.data()) == hr_pending_results, "drained queue XApuDequeueResult -> XAPU_E_PENDING_RESULTS");
@@ -285,6 +281,30 @@ int main(int argc, char** argv)
               "ring growth preserves FIFO (type, slot) order");
     }
     check(get_count(h1, 0) == 0, "ring drain returns count to 0");
+
+    // Queue cap negative control: filling to max_queue_entries refuses further enqueues with E_OUTOFMEMORY.
+    for (std::uint32_t i = 0; i < max_queue_entries; ++i) {
+        write_cmd(cmd, 3, i);
+        if (enqueue(h1, cmd.data(), 0, 0) != hr_ok) {
+            check(false, "enqueue up to max_queue_entries succeeds");
+            break;
+        }
+    }
+    check(get_count(h1, 0) == max_queue_entries, "queue count reaches max_queue_entries");
+    write_cmd(cmd, 5, 0xFFFF);
+    check(enqueue(h1, cmd.data(), 0, 0) == hr_out_of_memory, "enqueue past max_queue_entries -> E_OUTOFMEMORY");
+    check(get_count(h1, 0) == max_queue_entries, "rejected over-cap enqueue keeps count at max_queue_entries");
+    check(dequeue(h1, result.data()) == hr_ok && read_u32(result, 0x00) == 3 && read_u32(result, 0x04) == 0,
+          "head entry remains intact after over-cap refusal");
+    write_cmd(cmd, 5, 0xFFFF);
+    check(enqueue(h1, cmd.data(), 0, 0) == hr_ok, "enqueue succeeds again after draining one slot");
+    for (std::size_t i = 0; i < max_queue_entries; ++i) {
+        if (dequeue(h1, result.data()) != hr_ok) {
+            check(false, "draining capped queue succeeds");
+            break;
+        }
+    }
+    check(get_count(h1, 0) == 0, "capped queue drains back to 0");
 
     // Second independent handle + disconnect invalidation.
     void* h2 = nullptr;

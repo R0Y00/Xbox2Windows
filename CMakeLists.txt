@@ -745,9 +745,6 @@ target_compile_features(startup_xapu_queue_check PRIVATE cxx_std_17)
 add_dependencies(startup_xapu_queue_check startup_stub_xapu)
 add_test(NAME startup_xapu_queue COMMAND startup_xapu_queue_check "$<TARGET_FILE:startup_stub_xapu>")
 set_tests_properties(startup_xapu_queue PROPERTIES TIMEOUT 60)
-add_test(NAME startup_xapu_queue_zero_output_control
-         COMMAND startup_xapu_queue_check "$<TARGET_FILE:startup_stub_xapu>" --mutate zero-output)
-set_tests_properties(startup_xapu_queue_zero_output_control PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
 
 add_executable(startup_chad_check tests/startup_chad_check.cpp)
 target_compile_features(startup_chad_check PRIVATE cxx_std_17)

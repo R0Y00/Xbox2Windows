@@ -1858,18 +1858,19 @@ With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConn
 and `XApuDisconnect`, refuses null or unreadable command headers (`E_POINTER`), null outputs
 (`E_POINTER`), and unknown or disconnected handles (`E_HANDLE`), and records one `(type, slot)`
 entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
-index at `+0x04`) in a per-connection FIFO ring buffer. `XApuGetResultCount` reports the queued
-entry count, and `XApuDequeueResult` zeroes the `0x58`-byte result buffer and writes the retired
-command's type at `+0x00` and slot index at `+0x04` (keeping decoded bytes at `+0x34` zero because
-no audio/XMA decoder runs here). An empty queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and
-preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
+index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
+connection; additional enqueues return `E_OUTOFMEMORY` without dropping queued entries).
+`XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` zeroes the
+`0x58`-byte result buffer and writes the retired command's type at `+0x00` and slot index at
+`+0x04` (keeping decoded bytes at `+0x34` zero because no audio/XMA decoder runs here). An empty
+queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
 
-The remaining payload bytes outside `+0x00` and `+0x04` stay zero because only the open (`1`),
-close (`2`), packet (`3`), and stop (`5`) queue transitions and the `+0x34` byte count consumed
-after command `3` are established here. Handles are never reused, and each connection's queue buffer
-is released on `XApuDisconnect`. Default non-permissive mode still traps on every export, and
-`startup_xapu_queue_zero_output_control` checks that an all-zero placeholder result leaves the
-caller's slot state stalled (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue' -V`).
+Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
+observed callers; the queue intentionally echoes any 32-bit type value at `+0x00` verbatim
+(including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
+outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
+released on `XApuDisconnect`. Default non-permissive mode still traps on every export
+(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
