@@ -22,6 +22,11 @@ VGPR_OPERAND = re.compile(r"\bv(?:(\d+)\b|\[(\d+):(\d+)\])")
 LDS_BYTES = 1 << 16
 
 
+def branch_target(offset, operand):
+    """Byte offset a branch at `offset` jumps to. LLVM 15 prints the SIMM16 unsigned (s_branch 65535 is -1)."""
+    return offset + 4 + 4 * (((int(operand) & 0xFFFF) ^ 0x8000) - 0x8000)
+
+
 def span(token):
     m = re.fullmatch(r"[sv]\[(\d+):(\d+)\]", token)
     if not m or int(m[2]) < int(m[1]):
@@ -288,7 +293,7 @@ class Wave:
         end = target
         last = decoded[target - 1][1] if target - 1 >= pc else ""
         if last.startswith("s_branch "):
-            join_offset = decoded[target - 1][0] + 4 + 4 * int(last.split()[1])
+            join_offset = branch_target(decoded[target - 1][0], last.split()[1])
             if join_offset not in jumps or jumps[join_offset] <= target:
                 raise ValueError("Expected a forward mesh branch")
             end, join = target - 1, jumps[join_offset]
@@ -727,7 +732,7 @@ class Wave:
             elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
                 pc = self.join_arms(
                     decoded, expressions, jumps, pc, offset,
-                    offset + 4 + 4 * int(tail), self.scc,
+                    branch_target(offset, tail), self.scc,
                 )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
@@ -744,7 +749,7 @@ class Wave:
                     "s_cbranch_execz": not self.exec,
                     "s_cbranch_vccnz": bool(self.vcc),
                 }[op]
-                target = jumps[offset + 4 + 4 * int(tail)]
+                target = jumps[branch_target(offset, tail)]
                 if target < pc:
                     raise ValueError("Expected a forward mesh branch")
                 if take:
