@@ -423,17 +423,27 @@ def controls():
 
     # 3. Refusal controls (binary VOP3A decoded via G.decode() + Stage.one assembly/arity/unlowered).
     for op, code in OPCODES.items():
-        # clamp, omod, op_sel, abs, neg (both on VGPR and on inline integer 1) in synthetic VOP3A bytes.
-        bad_encodings = [
+        # clamp, omod and op_sel are refused through the printed modifier text; ABS (VOP3A w0[10:8]) and NEG
+        # (w1[31:29]) are refused by check_encoding() itself, one bit per source. Every source is listed for
+        # both modifiers and for both VGPR and inline-integer sources, and the refusal is read back from
+        # decode() instead of only from G.Pipeline(): with a narrowed mask the instruction is still refused
+        # later, by Stage.one() on the printed |v1| or -1 text, so a Pipeline() raise alone cannot show
+        # which guard fired.
+        modifiers = [
             ('clamp', vop3a(code, 12, 256, 260, 264, clamp=1)),
             ('omod=mul:2', vop3a(code, 12, 256, 260, 264, omod=1)),
             ('omod=mul:4', vop3a(code, 12, 256, 260, 264, omod=2)),
             ('omod=div:2', vop3a(code, 12, 256, 260, 264, omod=3)),
             ('op_sel=[1,0,0]', vop3a(code, 12, 256, 260, 264, op_sel=1)),
             ('op_sel=[0,0,0,1]', vop3a(code, 12, 256, 260, 264, op_sel=8)),
-            ('abs src0', vop3a(code, 12, 256, 260, 264, abs_bits=1)),
-            ('abs src1', vop3a(code, 12, 256, 260, 264, abs_bits=2)),
-            ('abs src2', vop3a(code, 12, 256, 260, 264, abs_bits=4)),
+        ]
+        abs_neg = [
+            ('abs src0 VGPR', vop3a(code, 12, 256, 260, 264, abs_bits=1)),
+            ('abs src1 VGPR', vop3a(code, 12, 256, 260, 264, abs_bits=2)),
+            ('abs src2 VGPR', vop3a(code, 12, 256, 260, 264, abs_bits=4)),
+            ('abs src0 inline 1', vop3a(code, 12, 129, 260, 264, abs_bits=1)),
+            ('abs src1 inline 1', vop3a(code, 12, 256, 129, 264, abs_bits=2)),
+            ('abs src2 inline 1', vop3a(code, 12, 256, 260, 129, abs_bits=4)),
             ('neg src0 VGPR', vop3a(code, 12, 256, 260, 264, neg=1)),
             ('neg src1 VGPR', vop3a(code, 12, 256, 260, 264, neg=2)),
             ('neg src2 VGPR', vop3a(code, 12, 256, 260, 264, neg=4)),
@@ -441,14 +451,18 @@ def controls():
             ('neg src1 inline 1', vop3a(code, 12, 256, 129, 264, neg=2)),
             ('neg src2 inline 1', vop3a(code, 12, 256, 260, 129, neg=4)),
         ]
-        for label, bad_word in bad_encodings:
+        for label, bad_word in modifiers + abs_neg:
             try:
                 G.Pipeline(vs_words([(0, 0, 0)] * 4), PRE_WORDS + bad_word + POST_WORDS, root_blob())
             except G.Unsupported:
                 pass
             else:
                 raise AssertionError('%s: accepted binary VOP3A with %s' % (op, label))
-        check('%s: binary VOP3A refuses clamp, omod, op_sel, abs, and neg (VGPR & inline)' % op, True)
+        for label, bad_word in abs_neg:
+            reasons = []
+            G.decode(bad_word, reasons)
+            check('%s: encoding guard refuses %s' % (op, label),
+                  [reason for reason, where in reasons] == ['%s with neg/abs' % op])
 
         # Direct Stage.one refusals: modifiers, abs/neg, arity.
         check('%s: Stage refuses modifiers, abs/neg, and wrong operand counts' % op, all(refused(asm) for asm in (
