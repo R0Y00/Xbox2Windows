@@ -139,7 +139,7 @@ def main():
                             ('load then store', load + encode_mubuf(STORE_OPS['dwordx3']))):
             result, name = request(folder, LOAD_DESCRIPTOR + DEFINE_V + body + EXPORT_POSITION)
             check('%s on one descriptor is refused' % label,
-                  result.startswith('unsupported') and 'load and a store' in fail_reason(name), '%s %s' % (result, fail_reason(name)))
+                  result.startswith('unsupported') and 'both read and stored to' in fail_reason(name), '%s %s' % (result, fail_reason(name)))
 
         # 7. A pixel-stage store is refused.
         ps = LOAD_DESCRIPTOR + DEFINE_V + encode_mubuf(STORE_OPS['dwordx3']) + PS
