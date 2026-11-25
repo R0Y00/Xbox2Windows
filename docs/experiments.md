@@ -104,6 +104,42 @@ The table's nonzero offset and stride select the second colour, the short view r
 non-aliased placement is refused. A raw descriptor over a recording-owned upload page reads the
 same colour and refuses a view that crosses its allocation.
 
+### Index views backed by a recording upload
+
+Under `X2W_TRANSLATED_INDIRECT_DRAW=1`, a translated indexed draw can bind
+an index view fully contained in one slot 148 allocation on that recording.
+The GPU validator and input assembler both use the upload resource in
+`GENERIC_READ`. The caller must finish writing before submission and keep
+these contents stable through execution. The index view's offset and size
+are DWORD-aligned so the validator's packed R16 reads stay within the view.
+The check covers both formats, a late CPU write, a range crossing its logical
+allocation, another recording, and readable storage without a registered
+GPU backing.
+
+Run `cmake --build --preset release --target startup_indirect_draw_indexed`
+and `ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed_upload_(warp|hardware)$' -V`.
+
+### Existing-heap geometry input aliases for translated indexed draws
+
+`X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS=1` lets a translated indexed draw bind
+an unregistered index view or vertex stream zero through a 64 KiB desktop
+buffer on a private memory allocation whose external heap was already
+opened by slot 133. Each span must fit entirely in a committed page. A page
+with a registered GPU alias is refused. Views on one page share one desktop
+resource. The startup device keeps up to 64 page aliases. The application
+keeps the underlying allocation live for the device's lifetime and keeps
+input bytes and alias ownership stable through execution. Recording uploads
+and uniquely registered placed resources keep their existing paths.
+
+The runner creates a reference resource on the second page and binds an
+eight-byte R16 index view and a separate vertex stream on the first page.
+An R32 case supplies a nonzero base vertex. Without a proven heap, with a
+different GPU alias on the first page, across a page boundary, or with the
+configuration disabled, the target stays clear.
+
+Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
+`ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed_alias(_off)?_(warp|hardware)$' -V`.
+
 ### Same-recording GPU copies used by an indirect draw
 
 `X2W_TRANSLATED_INDIRECT_COPY_RANGES=1` enables a bounded handoff from slot 15
@@ -236,19 +272,21 @@ ctest --preset dev --no-tests=error -R '^startup_r8_uint_(warp|hardware)$' -V
 
 ### Every vertex-fetch buffer format
 
-The `gfx2hlsl` table for `tbuffer_load_format_*` has ten formats (plus `16_16_SNORM`, added afterwards and described at the end of this section): `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` runs all ten the way the check above does. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for `8_UINT`). It shares no code with the translator's table.
+The original `tbuffer_load_format_*` fixture covered ten formats: `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. The fixture also covers `16_16_SNORM`, `16_16_16_16_FLOAT` and `8_8_8_8_UINT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` exercises each format with the same vertex-fetch fixture. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for integer formats). It shares no code with the translator's table. The `16_16_SNORM` check below also exercises the signed endpoints and detects an unsigned decode.
 
 - **Element alignment.** Formats with fields narrower than a dword use strides and offsets that put elements at more than one byte alignment (stride 3 offset 2, stride 5 offset 3, stride 6 offset 2, stride 10 offset 10), so fields that cross a dword go through `ldu()`. The 32-bit formats keep 4-byte aligned elements, which their aligned `Load()` needs.
 - **How components are compared.** UNORM components are compared as `round(v * (2^bits - 1))`, so the result does not depend on how many ulps the division is off. All other components are compared bit for bit. The chosen binary16 and binary32 values are all normal.
-- **Negative controls.** 25 wrong references must fail at their first differing word: swapped channels, fields read one field higher, a missing W read as 0, and UNORM over `2^bits`, for each format where they change a word. Seven mutated translations must also fail: the second byte of `8_8_8_8_UNORM` taken from the third, its fourth byte read as 1.0, an aligned load instead of `ldu()` for `8_8_UNORM`, the high half of `16_16_UNORM` over 65536, the low binary16 half read from the high half, the missing W of `32_32_32_FLOAT` read as 0, and the W of `32_32_32_32_FLOAT` read from the third word.
+- **Negative controls for the original ten formats.** 25 wrong references must fail at their first differing word: swapped channels, fields read one field higher, a missing W read as 0, and UNORM over `2^bits`, for each format where they change a word. Seven mutated translations must also fail: the second byte of `8_8_8_8_UNORM` taken from the third, its fourth byte read as 1.0, an aligned load instead of `ldu()` for `8_8_UNORM`, the high half of `16_16_UNORM` over 65536, the low binary16 half read from the high half, the missing W of `32_32_32_FLOAT` read as 0, and the W of `32_32_32_32_FLOAT` read from the third word.
 
-All ten formats matched on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). The translation-side controls run without a device as `startup_vertex_fetch_formats_controls`.
+The original ten formats matched on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). The translation-side controls run without a device as `startup_vertex_fetch_formats_controls`.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|warp|hardware)$' -V
 ```
 
 `BUF_FMT_16_16_SNORM` (format 24, DXGI `R16G16_SNORM` 37) sign-extends each half, divides by 32767 and clamps to -1.0, so -32768 and -32767 both give -1.0 (the Direct3D and Vulkan SNORM rule, as in LLVM 15 and Mesa `ac_formats`). The device run compares `round(v * 32767)` against the same byte decode, with a wrong reference that reads the halves unsigned and a mutated translation that does the same. The pattern the harness writes to t0 holds no 0x8000, so `startup_vertex_fetch_formats_controls` also evaluates the emitted expressions on 0x8000, 0x8001, 0x7fff, 0x0000, 0xffff and 0x4000 in each half, and four wrong forms (unsigned read, no clamp, divisor 32768, one half for both) must fail that check. The D3D12 draw has not been run on Linux.
+
+`BUF_FMT_8_8_8_8_UINT` (gfx10 format 60, DXGI `R8G8B8A8_UINT` 30) reads four unsigned bytes into X, Y, Z and W in increasing address order. With stride 5 and byte offset 3, the 16-vertex fixture visits all four dword alignments. On WARP, all 64 component words matched the byte reference. Swapping channels in the reference or normalizing the green byte in the generated shader each triggered a mismatch.
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks
 
@@ -3360,6 +3398,25 @@ reference fails the trace check while every pixel still matches.
 ctest --preset dev --no-tests=error -R "^mesh_descriptor_swap_" -V
 ```
 
+A uniform branch on a constant-buffer word can pick the descriptor table that
+a later `s_buffer_load` reads (a per-material view, or a null descriptor in one
+arm). `tools/mesh_entry_aot.py` runs both arms of the if/else, which may hold
+only scalar ALU and loads and must leave EXEC, VCC and M0 unchanged, and merges
+each scalar register as a select on the predicate. After the join only
+`s_buffer_load_*` may read the selected descriptor, from the two constant
+tables or a zero (null) descriptor, which reads as 0.0. It refuses nested
+joins, geometry tables or vector/export/barrier instructions in an arm, a
+register defined in one arm only, and scalar ALU on the joined registers.
+`tests/mesh_join_descriptor_check.py` checks the lowering and these refusals
+in pure Python and, with `<dxc> <renderer> <adapter>`, draws both arms and the
+null arm on D3D12 against the mesh export trace and a pixel reference.
+The Linux run covers only the Python part; the D3D12 draw runs on Windows.
+
+```sh
+python3 -B tests/mesh_join_descriptor_check.py
+ctest --preset dev --no-tests=error -R "^mesh_join_descriptor_" -V
+```
+
 A local 1,028-byte entry (197 instructions) read three distinct vertex
 positions and produced visible geometry with controlled indices, transforms and
 vertex data. The two sets of positions cover 1,024 and 276 of the 1,024 pixel
@@ -3395,6 +3452,8 @@ ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_unary_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_skipped_scalar_" -V
+python3 -B tests/mesh_entry_check.py exec-restore
+ctest --preset dev --no-tests=error -R "^mesh_entry_exec_restore_" -V
 ```
 
 A scalar register that is written only inside a range skipped by
@@ -3409,6 +3468,24 @@ checks both waves and six refusal controls; `mesh_entry_skipped_scalar_draw_*`
 draws a program whose wave 1 skips the write and whose wave 0 adds the value
 to the depth, and compares the export trace to an off-by-one depth and to the
 program without the add.
+
+Restoring EXEC after a per-lane range (#1998 item C) is not limited to
+`s_mov_b64 exec, <pair>`. The lowerer reads and writes the two 32-bit halves
+`exec_lo` and `exec_hi` (a 64-bit write to one half is refused), and models
+`s_orn2_b64`, `s_not_b64` and the saveexec family `s_and`, `s_andn2`, `s_or`,
+`s_orn2` and `s_xor` `_saveexec_b64`, which keep the old mask in the
+destination pair. A copy may be moved between registers, and a restore may be
+joined from two arms of a wave-uniform branch (`s_cmp_eq_u32 s8, 0`). The
+`exec-restore` mode builds such a program and requires the same HLSL as the
+plain copy-and-restore program. Refused, each with a control: restoring from a
+mask saved after the flip (lane 1 lost), from a register never written, with
+one half missing, with a 64-bit write to a half, with an unmodeled saveexec
+(`s_nand_saveexec_b64`), with an unmodeled branch, and with a backward branch.
+`mesh_entry_exec_restore_draw_*` draws the same program through WARP; a depth
+one unit in the last place off must report `Mesh export trace mismatch`. The
+draw is written for Windows and has not been run on Linux. The dynamic lowerer
+shares the model; `mesh_dynamic_aot_check.py` repeats the restore forms and
+refusals there.
 
 The allocation is not limited to one triangle. `MSG_GS_ALLOC_REQ` may declare
 any vertex and primitive counts within the PSV0 output bounds, and each of the
@@ -4083,6 +4160,61 @@ LLVM and LLD 15 build the code object and verify one instruction of each
 kind in its disassembly. The CPU witnesses and mutations pass independently.
 Native readback remains pending, including the raw miss and disabled-slot
 words. The probe leaves translator behavior and form coverage unchanged.
+
+### gfx1013 2D explicit-LOD image gathers
+
+The gfx1013 compute profile accepts one `image_gather4_l` with
+`--gather-mips <count>` on the `R32G32B32A32_FLOAT` SRV that `image_load_mip`
+uses: `--image-descriptor` names the eight-word descriptor bound to `t0` and
+the output is the raw `u0`. The caller binds matching native and desktop 2D
+views and declares their visible mip count (1 to 16). The four sampler words
+must be constant SGPRs and match the gather profile of the pixel tool (see
+gfx1030 2D image gathers): normalized coordinates, clamp-to-edge in X and Y,
+bilinear XY and point mip filtering, zero LOD bias, minimum LOD zero and
+maximum LOD at or above the last visible mip. The LOD must be a statically
+known integral binary32 value inside the view, so point mip filtering selects
+that view-relative mip on both sides. A fractional, unknown or out-of-view LOD
+is refused.
+
+One-hot DMASK selects a source component. The four destination VGPRs receive
+that component from the 2×2 footprint, in `(0,1), (1,1), (1,0), (0,0)` order
+in increasing texture coordinates, through four desktop `Load` calls at the
+selected mip. U, V and LOD come from three consecutive VGPRs. Coordinates must
+select the same half-texel footprint under native texture-coordinate precision
+and desktop floating-point arithmetic. An invocation whose U or V is NaN or
+infinite publishes no store, because no native result is established for it.
+Wait for the descriptor with `lgkmcnt(0)` and for the result with `vmcnt(0)`.
+The profile refuses every other gather form by name (`image_gather4`, `_lz`,
+`_b`, `_cl`, `_c*` and `_o`), cube, array, 1D and 3D dimensions, NSA, `unorm`,
+A16, D16 and cache modifiers, a gather under a lane guard and a second gather.
+The pixel tool's `_l` form is the gfx1030 counterpart; the compute form here
+targets gfx1013. See the MIMG address and sampler tables in the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+The fixture builds U and V as `0.1875 × id − 0.15` for an 8×8 group, so the
+footprints cover both clamped edges and every coordinate stays at least 1/64
+texel away from a tap boundary at each used mip. Five cases gather red, green,
+blue and alpha at LOD 0, 1 and 2 of a full three-mip view, and at LOD 0 and 1
+of a view with `MostDetailedMip = 1`. A sixth case sets U to NaN and expects
+every word untouched. Each readback compares 320 words with an independent CPU
+model: 256 gathered words and 64 sentinels per valid case. Four GPU mutants
+must fail at the first word their own model predicts: a gather at the wrong
+mip, the first and last taps exchanged, the view case bound to the full
+resource, and the NaN case without its finite guard. Translation controls cover
+each refusal above and the binding, sampler and LOD rules. The LLVM 15 job
+assembles and disassembles the six programs and compares the synthetic
+container CLI with the text lowering. Texel values are normal binary32
+numbers; NaN payloads, denormals and coordinates within 1/256 texel of a tap
+boundary are not tested.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_gather4_l_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_gather4_l_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
 
 ### gfx1030 2D image loads
 
@@ -8478,6 +8610,29 @@ of console shader programs and support for other console mesh paths are tracked 
 [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
 [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 
+Slot 86 publishes complete Xbox mesh containers under a separate cache key. The
+key frames the original MS, the optional PS, the creation root signature and the
+pipeline-state stream with its pointers cleared. The shim writes `.m86` last,
+after `.ps86`, `.root` and `.stream86`. An empty `.ps86` records a stream
+without a pixel shader. Use the cache tool with a desktop pair independently
+validated for that exact source and root. The ready marker records both output
+shader hashes so an incomplete or mixed update cannot reach PSO creation.
+
+```powershell
+python -B tools/startup/mesh86_cache.py <cache> <key> --mesh <desktop-ms.cso> --pixel <desktop-ps.cso>
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_cache_' -V
+```
+
+The executable subset uses the original root and PSO state. It accepts root
+constants captured on the list, single-sample color attachments in exact format
+order and a matching depth view when the stream declares one. A mesh stream
+without a pixel stage requires zero color attachments, a writable matching
+depth view and a physical adapter. The depth-only fixture removed the device
+on WARP when dispatched, so the shim refuses it there. Untracked descriptor
+tables, heap indexing, root descriptors,
+stencil state and depth bounds are refused. A shader accepted individually can still
+fail PSO creation or lack a consumable root binding.
+
 The fixture writes its group counts at byte offset four on the GPU and checks
 all eight pixels and the surrounding argument words. One group paints the
 left half. Two groups paint both halves. An omitted writer, a short argument
@@ -8499,9 +8654,18 @@ The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
 
+Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
+slot 57 creation. The descriptor must name a registered root, have an empty
+VS slot and have a readable 16-byte to 64-KiB MS span. The PS span must be
+absent or fit the same bounds. With the pipeline IID, this shape returns
+`E_NOTIMPL` and clears the output. It lets callers that handle this result
+choose another pipeline creation path. The default returns the existing
+placeholder. Other fixed descriptors keep that result under the switch, and
+an unsupported IID still returns `E_NOINTERFACE`.
+
 ```powershell
 cmake --build --preset release --target startup_indirect_draw_indexed
-ctest --preset release --no-tests=error -R '^startup_indirect_mesh_request_' -V
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(request|create_result)_' -V
 .\out\pe-env\Scripts\python.exe -B tests/startup_gfx2hlsl_watch_check.py
 ```
 
@@ -8714,6 +8878,14 @@ The run also probes the boundaries the fallback relies on, and reports three fin
 The negative controls each remove one guarantee and must fail every case that it protects. On both adapters, `--mutate skip-refresh` uses the `bind` copy point and makes copy and fallback case a read A, failing 4 of 4 cases. `--mutate skip-copy-back` leaves P in the alias for copy and fallback cases b and d2, failing 8 of 8. `--mutate reuse-early` drops the fence checks on slots and the ring. Sharing case c then gives Y X's slots and the held read returns C, and the copy paths take X's ring slot and read E, failing 6 of 6.
 
 Run `cmake --build --preset dev --target unified_buffer_paths_check` and `ctest --preset dev --no-tests=error -R '^unified_buffer_paths_' -V`. Set `XBOX2WINDOWS_ADAPTER` to select a hardware adapter and `X2W_TEST_DEBUG_LAYER=1` to enable the debug layer. The hardware case skips (77) without an `ID3D12Device3` adapter or without sharing support. The controls run on WARP as `WILL_FAIL` tests and skip if a targeted case could not run. Unsynchronized concurrent CPU and GPU writes are outside the contract and not exercised. Textures, render targets and acceleration structures are outside this slice.
+
+#### A lease for committed XMem section pages (#1914)
+
+The in-process lease API requires version 1 and the exact output structure size. It clears a correctly sized output before checking the request. It checks the mirrored and CPU mappings under the XMem lock, accepts only committed pages backed by consecutive slots of one section, and duplicates the section handle within the caller's process. The caller maps the selected span with `MapViewOfFile` and opens that view with `OpenExistingHeapFromAddress`. The returned byte offset identifies the requested start inside the placed buffer. The lease holds the slots until the caller releases it after its last GPU fence. Freeing the original title grant is allowed after unmapping. Its slots stay out of the reuse pool until the lease retires.
+
+The fixture maps two pages from the shim's `SEC_RESERVE` pool and copies a 4 KiB span across their boundary. A GPU write appears in both title views. A second copy sees the original pages' late CPU updates after the title frees and remaps the same virtual addresses. Readback compares all 4,096 bytes and checks the replacement pages retain their own data. A later allocation gets the retired slot and sees zeroes. The checks also refuse holes, reversed section order, a CPU address passed to the mirrored address API, an invalid output size and a repeated release.
+
+Run `cmake --build --preset release --target xmem_section_lease_check` and `ctest --preset release --no-tests=error -R '^xmem_section_lease_' -V`. The tests report a capability skip (77) when the D3D12 device lacks existing heap support.
 
 #### Xbox frame events and token wait semantics (#874)
 
@@ -12763,13 +12935,26 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_add_sub_co_controls$' 
 
 ## Startup translator: biased image sampling
 
-`tools/startup/gfx2hlsl.py` lowers the gfx1013 `image_sample_b` form in a pixel stage to `tex.SampleBias(smp, uv, bias)` for 2D, 2D-array and 3D textures. The RDNA 2 ISA (section 8.2.4, Table 43: "_B LOD BIAS, 1: lod bias, Add this BIAS to the LOD computed"; section 8.2.5: the address is `{ offset } { bias } { z-compare } { derivative } { body }` and the bias is "One Dword float") puts the bias in the FIRST address register, so `v[0:2]` is bias, u, v and the NSA list `[v3, v1, v2]` takes the bias from `v3`. LLVM 15 agrees: `IntrinsicsAMDGPU.td` gives `AMDGPUSample_b` the extra argument `llvm_anyfloat_ty "bias"` and `MIMGInstructions.td` the gfx10 opcode `0x25`. `llvm-mc` (LLVM 15, gfx1013) assembles the contiguous 2D, 2D-array, 3D and NSA forms, and the check compares every fixture against it. HLSL `SampleBias` adds the bias to the implicit mip level and documents the range -16.0 to 15.99; the ISA text states no hardware clamp, so a bias outside that range is an unverified difference. The form is refused outside a pixel stage, after the exec mask was modified and after a branch (there the plain sample is lowered to level 0, which would drop the bias), and so are `image_sample_b_cl`, `image_sample_c_b*`, `image_sample_b_o`, `image_gather4_b`, 1D, cube and multisample dimensions, an empty `dmask`, the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers, set reserved MIMG bits, and a constant sampler whose LOD bias fields (word 2 bits 19:0, s6.8 and s2.4, scaled by `T#.perf_modulation` in the ISA) are not zero or whose mip filter is 0 (mipmapping disabled), or whose MIN_LOD is above its MAX_LOD. The guest clamp is kept: MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 `src/amd/registers/gfx10-rsrc.json`, `SQ_IMG_SAMP_WORD1`; `radeonsi/si_state.c` lines 5169-5170 encode them with `S_FIXED(x, 8)`), and the sampler of an `image_sample_b` is written as an `smpl` manifest line that the runtime decodes to `MinLOD = MIN_LOD / 256` and `MaxLOD = MAX_LOD / 256` (`src/startup_stubs/translated_sampler_bindings.h`); `smp` and `smpc` lines of every other sample form still leave MinLOD at 0 and MaxLOD unbounded. A sampler read from the sampler heap, including the default-sampler shortcut for a run-time heap load, or built from a register is refused for `image_sample_b`, because its LOD limits and bias cannot be shown to be irrelevant.
+`tools/startup/gfx2hlsl.py` lowers the gfx1013 `image_sample_b` form in a pixel stage to `tex.SampleBias(smp, uv, bias)` for 2D, 2D-array and 3D textures. The RDNA 2 ISA (section 8.2.4, Table 43: "_B LOD BIAS, 1: lod bias, Add this BIAS to the LOD computed"; section 8.2.5: the address is `{ offset } { bias } { z-compare } { derivative } { body }` and the bias is "One Dword float") puts the bias in the FIRST address register, so `v[0:2]` is bias, u, v and the NSA list `[v3, v1, v2]` takes the bias from `v3`. LLVM 15 agrees: `IntrinsicsAMDGPU.td` gives `AMDGPUSample_b` the extra argument `llvm_anyfloat_ty "bias"` and `MIMGInstructions.td` the gfx10 opcode `0x25`. `llvm-mc` (LLVM 15, gfx1013) assembles the contiguous 2D, 2D-array, 3D and NSA forms, and the check compares every fixture against it. HLSL `SampleBias` adds the bias to the implicit mip level and documents the range -16.0 to 15.99; the ISA text states no hardware clamp, so a bias outside that range is an unverified difference. The form is refused outside a pixel stage, after the exec mask was modified and after a branch (there the plain sample is lowered to level 0, which would drop the bias), and so are `image_sample_b_cl`, `image_sample_c_b*`, `image_sample_b_o`, `image_gather4_b`, 1D, cube and multisample dimensions, an empty `dmask`, the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers, set reserved MIMG bits, and a constant sampler whose LOD bias fields (word 2 bits 19:0, s6.8 and s2.4, scaled by `T#.perf_modulation` in the ISA) are not zero or whose mip filter is 0 (mipmapping disabled), or whose MIN_LOD is above its MAX_LOD. The guest clamp is kept: MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 `src/amd/registers/gfx10-rsrc.json`, `SQ_IMG_SAMP_WORD1`; `radeonsi/si_state.c` lines 5169-5170 encode them with `S_FIXED(x, 8)`), and the sampler of an `image_sample_b` is written as an `smpl` manifest line that the runtime decodes to `MinLOD = MIN_LOD / 256` and `MaxLOD = MAX_LOD / 256` (`src/startup_stubs/translated_sampler_bindings.h`); `smp` and `smpc` lines still leave MinLOD at 0 and MaxLOD unbounded (the next section moves `image_sample`, `_l` and `_lz` with a constant sampler to `smpl`). A sampler read from the sampler heap, including the default-sampler shortcut for a run-time heap load, or built from a register is refused for `image_sample_b`, because its LOD limits and bias cannot be shown to be irrelevant.
 
-`tests/startup_image_sample_b_check.py` translates source-built fixtures and, with `draw`, draws the 2D array through `offscreen_check --startup-image-2d-array-mips` (4x4, two slices, three mips whose cells all differ, point sampler with mip filter point; MAX_LOD 2 for the bias cases). Constant coordinates have no derivatives, so the draw rewrites only the `u` initialiser of the translated HLSL to `0.75 + 0.5 * (SV_Position.x - 0.5)`, an implicit LOD of 1 at the sampled pixel; the `SampleBias` call is untouched. Bias -1, 0 and +1 read mip 0, 1 and 2 on WARP with DXC and FXC. Negative controls: the same program with `image_sample` reads mip 1 for every case, and edited calls (bias replaced by 0, bias negated, bias and `u` exchanged, `Sample` for `SampleBias`) each read another cell. The sampler limits are discriminated by cases whose limit lies below a mip that exists: MAX_LOD 1 with bias +1 stays on mip 1 (unclamped: mip 2), MAX_LOD 0 with bias +1 stays on mip 0, MIN_LOD 2 with bias -1 reads mip 2 (unclamped: mip 0) and MIN_LOD 1 = MAX_LOD 1 with bias -1 reads mip 1; the MAX_LOD 2 bias cases cannot tell, because mip 2 is the last level. Each limit case is drawn again with an `smp` line instead of `smpl` (limits not carried) and must read the unclamped mip. `startup_sampler_comparison` checks the decoded MinLOD and MaxLOD. Replacing the bias by 0 or exchanging the bias with the first coordinate in `gfx2hlsl.py`, dropping the MaxLOD assignment in the runtime decoder, accepting a heap sampler, and the previous `gfx2hlsl.py`, each make a check fail. Not covered: a physical-adapter run (`startup_image_sample_b_hardware` is registered), a plain 2D or 3D draw (those forms are checked on the generated HLSL), fractional bias with a linear mip filter, bias outside -16 to 15.99, a fractional MIN_LOD or MAX_LOD (only whole mips are drawn; the 4.8 decode is checked without a device), a non-zero descriptor LOD bias (refused, not carried) and the limits of the other sample forms, which are still not carried.
+`tests/startup_image_sample_b_check.py` translates source-built fixtures and, with `draw`, draws the 2D array through `offscreen_check --startup-image-2d-array-mips` (4x4, two slices, three mips whose cells all differ, point sampler with mip filter point; MAX_LOD 2 for the bias cases). Constant coordinates have no derivatives, so the draw rewrites only the `u` initialiser of the translated HLSL to `0.75 + 0.5 * (SV_Position.x - 0.5)`, an implicit LOD of 1 at the sampled pixel; the `SampleBias` call is untouched. Bias -1, 0 and +1 read mip 0, 1 and 2 on WARP with DXC and FXC. Negative controls: the same program with `image_sample` reads mip 1 for every case, and edited calls (bias replaced by 0, bias negated, bias and `u` exchanged, `Sample` for `SampleBias`) each read another cell. The sampler limits are discriminated by cases whose limit lies below a mip that exists: MAX_LOD 1 with bias +1 stays on mip 1 (unclamped: mip 2), MAX_LOD 0 with bias +1 stays on mip 0, MIN_LOD 2 with bias -1 reads mip 2 (unclamped: mip 0) and MIN_LOD 1 = MAX_LOD 1 with bias -1 reads mip 1; the MAX_LOD 2 bias cases cannot tell, because mip 2 is the last level. Each limit case is drawn again with an `smp` line instead of `smpl` (limits not carried) and must read the unclamped mip. `startup_sampler_comparison` checks the decoded MinLOD and MaxLOD. Replacing the bias by 0 or exchanging the bias with the first coordinate in `gfx2hlsl.py`, dropping the MaxLOD assignment in the runtime decoder, accepting a heap sampler, and the previous `gfx2hlsl.py`, each make a check fail. Not covered: a physical-adapter run (`startup_image_sample_b_hardware` is registered), a plain 2D or 3D draw (those forms are checked on the generated HLSL), fractional bias with a linear mip filter, bias outside -16 to 15.99, a fractional MIN_LOD or MAX_LOD (only whole mips are drawn; the 4.8 decode is checked without a device), a non-zero descriptor LOD bias (refused, not carried) and the limits of the other sample forms (see the next section).
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^startup_image_sample_b' -V
+```
+
+## Startup translator: constant-sampler LOD limits for image_sample, _l and _lz
+
+The guest sampler's MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) clamp the LOD of every sample form. `tools/startup/gfx2hlsl.py` now carries them for `image_sample`, `image_sample_l` and `image_sample_lz` when the sampler is a constant, through the `smpl` manifest line and `decode_sampler` that `image_sample_b` introduced (#2051); the slice is #2177, split from the run-time heap case (#2221). The three forms share one validation with `image_sample_b`: a descriptor LOD bias (word 2 bits 19:0) and MIN_LOD above MAX_LOD are refused, with the form's own name in the message. Behavior change: a constant sampler with either of those fields set used to translate for these forms (limits ignored) and is now refused. A mip filter of 0 (mipmapping disabled) is not refused for these forms, unlike `image_sample_b` where the bias would count: such a sampler keeps its ordinary `smp` line and its previous behavior. Refusing it would drop every pipeline with an all-zero inline sampler (seven existing check scripts build one); `image_sample_lz` and `_l` with level 0 would be harmless anyway. The one-argument switch is `mip_filter_none_ok` in `Stage.lod_sampler_words`. Also changed: a constant sampler with a non-zero MAX_LOD now clamps the level (it was unbounded before), which is the intended fix.
+
+Not changed: a sampler read through the sampler heap (table or default-sampler shortcut) keeps the ordinary static or heap sampler and is not validated; `translate_to` and `translate_compute` write one line per module to stderr (`<key>: image_sample, image_sample_l through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)`). A sampler that is neither heap nor constant is refused as before. `image_sample_c` keeps its MAX_LOD rule.
+
+`tests/startup_image_sample_lod_check.py` draws each form on its own (`startup_image_sample_lod_warp`, `startup_image_sample_lod_hardware`) against the 4x4, two-slice, three-mip array, point sampler with mip filter point, where all six cells differ. Each form's control is the same program through the ordinary `smp` line, which must read a different mip: `image_sample_l` with explicit level 2 and MAX_LOD 1 reads mip 1 (`smp`: mip 2); `image_sample` with MIN_LOD 2 above the implicit level 1 reads mip 2 (`smp`: mip 1); `image_sample_lz` with MIN_LOD 1 reads mip 1 (`smp`: mip 0). The implicit level 1 comes from the technique of the bias check: only the `u` initialiser of the translated HLSL is replaced by `0.75 + 0.5 * (SV_Position.x - 0.5)`, the `Sample` call is untouched. Refusal controls per form: bias, secondary bias and MIN_LOD 3 above MAX_LOD 2; accepted controls per form: mip filter 0 (`smp` line) and a heap sampler (table and default-sampler shortcut, logged once). The three `image_sample_b` discriminators are unchanged. Not covered: a fractional MIN_LOD or MAX_LOD, a linear mip filter, 1D, 3D and packed `a16` draws, the run-time heap sampler's LOD fields (#2221), and compute stages.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_image_sample_lod' -V
 ```
 
 ## Startup translator: packed 2D image-load coordinates
@@ -12886,6 +13071,28 @@ in X, Y and Z, point XY and mip filtering, and `MIP_POINT_PRECLAMP` set.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hardware)?$' -V
+```
+
+### Compute mip-zero gather
+
+The startup compute translator accepts `image_gather4_lz` on a 2D texture with
+the same constant sampler and one-hot component selection as the pixel form.
+The eight image descriptor words must come from one intact descriptor at a
+fixed table offset. The compute manifest records the texture SRV, sampler and
+raw output UAV. The fixture binds these on the standalone D3D12 compute runner.
+Runtime binding of translated slot-67 pipelines is tracked in #2274.
+
+One gfx1013 thread gathers at (0.5, 0.5) and stores four words. Each texel's
+bits encode its mip, position and channel. The reference checks the four center
+texels and all 316 untouched words. The fixture reads green with the view
+starting at resource mip 0 and each RGBA component with the view starting at
+mip 1. The controls drop the gather, select red in place of green, bind mip 0
+in place of mip 1, or swap the first and last taps. The reference predicts
+4, 4, 4 and 2 mismatching words respectively.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_gather_lz(_warp|_hardware)?$' -V
 ```
 
 ## Startup translator: fixed-mip 2D comparison gathers
@@ -13029,6 +13236,21 @@ though newer LLVM can fill unused VOP3 fields differently in other forms.
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
+```
+
+## Startup translator: statically proven calculated branches
+
+The startup translator resolves an exact `s_getpc_b64`, `s_add_u32`,
+`s_addc_u32`, `s_setpc_b64` PC-relative sequence only when every
+incoming path establishes the same instruction-boundary target.
+Address-derived register or SCC escapes, conflicting definitions and
+unproven bypass paths are refused. The source-built gfx1013 fixture selects
+arithmetic result 8 instead of the decoy 14; direct branches retain their
+existing behavior. This is a static translation proof, not GPU readback.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_calculated_target_check.py
+python3 -B tests/startup_gfx2hlsl_calculated_target_check.py binary llvm-mc-15
 ```
 
 ## Compute stage in the startup translator

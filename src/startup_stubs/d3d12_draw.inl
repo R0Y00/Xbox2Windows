@@ -1579,7 +1579,8 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
     const auto argument_previous = before(draw.argument);
     const auto index_previous = before(indices);
     require_state(self, draw.argument, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (indices != draw.argument) require_state(self, indices, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (indices != draw.argument && !draw.indices.upload)
+        require_state(self, indices, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     require_state(self, scratch.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const UINT bounds[]{static_cast<UINT>(draw.offset), static_cast<UINT>(argument_desc.Width), static_cast<UINT>(draw.indices.offset),
         draw.indices.view.SizeInBytes, static_cast<UINT>(index_desc.Width), draw.indices.view.Format == DXGI_FORMAT_R16_UINT ? 2u : 4u,
@@ -1595,7 +1596,8 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
     if (draw.argument != indices && argument_previous != D3D12_RESOURCE_STATE_COMMON)
         require_state(self, draw.argument, argument_previous);
     constexpr auto shader_reads = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    require_state(self, indices, (index_previous & shader_reads) | D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    if (!draw.indices.upload)
+        require_state(self, indices, (index_previous & shader_reads) | D3D12_RESOURCE_STATE_INDEX_BUFFER);
     return scratch.Get();
 }
 
@@ -1608,7 +1610,7 @@ struct IndirectBufferView {
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
-IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words)
+IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false)
 {
     constexpr u64 limit = 16u << 20;
     u64 address = 0, offset = 0, bytes = 0;
@@ -1661,7 +1663,12 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             return {};
         }
         const auto placed = placed_buffer_range(device, address, bytes);
-        if (placed.reject || !placed.owner || (owner && owner != placed.owner)) return {};
+        if (placed.reject || (owner && owner != placed.owner)) return {};
+        if (!placed.owner) {
+            const auto alias = allow_address_alias && !list_upload_range(self, address, 1).resource
+                ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
+            return {alias.resource, alias.offset, bytes, stride};
+        }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
@@ -1901,7 +1908,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     vb.BufferLocation <= 0xffffffffffffull) {
                     const std::uint32_t stream[]{static_cast<UINT>(vb.BufferLocation),
                         static_cast<UINT>(vb.BufferLocation >> 32) | vb.StrideInBytes << 16, vb.SizeInBytes / vb.StrideInBytes, 0};
-                    view = indirect_table_buffer(self, stream);
+                    view = indirect_table_buffer(self, stream, true);
                     indexed_vertices = vb.SizeInBytes / vb.StrideInBytes;
                 }
             } else if (entry_ok) {
@@ -2189,7 +2196,12 @@ void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, co
         log("x2w-render root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)",
             parameter >= 16 || offset >= 8 ? "dropped" : "truncated", parameter, offset, count);
     if (parameter >= 16 || offset >= 8 || !count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
-    for (UINT i = 0; i < count && offset + i < 8; ++i) pass_of(self).constants[parameter][offset + i] = data[i];
+    Pass& pass = pass_of(self);
+    for (UINT i = 0; i < count && offset + i < 8; ++i) pass.constants[parameter][offset + i] = data[i];
+    if (pass.root && parameter < pass.root->size() &&
+        (*pass.root)[parameter].type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+        count <= 8 - offset && offset + count <= (*pass.root)[parameter].constants_count)
+        pass.constant_words_bound[parameter] |= static_cast<unsigned char>(((1u << count) - 1) << offset);
 }
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)

@@ -104,6 +104,38 @@ def check_skipped_scalars(decoded):
     lower(masked_off, 2, MESH_LIMITS)
 
 
+RESTORE = "s_mov_b64 exec, s[22:23]"
+# A restore through a moved copy, the 32-bit halves, an OR saveexec and a complemented OR (#1998 item C).
+RESTORE_FORMS = (
+    ["s_mov_b64 s[42:43], s[22:23]", "s_mov_b64 exec, s[42:43]"],
+    ["s_mov_b32 exec_lo, s22", "s_mov_b32 exec_hi, s23"],
+    ["s_or_saveexec_b64 s[48:49], s[22:23]"],
+    ["s_not_b64 s[44:45], s[22:23]", "s_orn2_b64 exec, exec, s[44:45]"],
+)
+
+
+def with_restore(decoded, lines, only=None):
+    # Replace the restores (all, or the one at pc `only`) with `lines`. Later pcs move; no branch crosses a restore.
+    result, shift = [], 0
+    for pc, text in decoded:
+        if text == RESTORE and only in (None, pc):
+            result += [(pc + shift + 4 * i, line) for i, line in enumerate(lines)]
+            shift += 4 * (len(lines) - 1)
+        else:
+            result.append((pc + shift, text))
+    return result
+
+
+def check_exec_restore(decoded):
+    reference = lower(decoded, 2, MESH_LIMITS)
+    for lines in RESTORE_FORMS:
+        assert lower(with_restore(decoded, lines), 2, MESH_LIMITS) == reference, lines
+    # The mask saved by a saveexec is the one before it, so restoring from it loses lanes, and a half that is not restored leaves lanes off: both refused.
+    lost = ["s_or_saveexec_b64 s[48:49], s[22:23]", "s_mov_b64 exec, s[48:49]"]
+    for lines in (lost, RESTORE_FORMS[1][1:], ["s_mov_b64 exec, s[52:53]"]):
+        expect_refusal(with_restore(decoded, lines), 2, "")
+
+
 def check():
     check_retired_wave()
     decoded = decode(CODE)
@@ -144,6 +176,7 @@ def check():
         expect_refusal(decoded, 2, "exceeds 1 input cases")
 
     check_skipped_scalars(decoded)
+    check_exec_restore(decoded)
 
     hlsl = lower(decoded, 2, MESH_LIMITS)
     assert hlsl.count("SetMeshOutputCounts(") == 1
