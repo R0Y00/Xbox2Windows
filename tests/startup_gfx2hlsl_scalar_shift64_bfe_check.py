@@ -234,7 +234,7 @@ def runtime_blocks():
         text = block[0]
         assert text.count('s%d = ' % DST) == 1 and ('s%d = ' % (DST + 1) in text) == wide, text
         assert text.index('s%d' % AMT) < text.index('s%d = ' % DST), text      # sources first
-        assert 'scc = ' in text, text
+        assert 'scc = ' in text and stage.scc_effect == 'emitted', text
         assert all(r not in stage.sym for r in (DST, DST + 1)), stage.sym
         assert ({DST, DST + 1} if wide else {DST}) <= stage.used_s, stage.used_s
 
@@ -297,12 +297,14 @@ def refusals():
 
     for op in OPCODES:
         refuse(op, M.M0, SRC, AMT, 'm0 destination')
+        refuse(op, DST, SRC, M.M0, 'm0 shift or field selector')
         refuse(op, 106, SRC, AMT, 'vcc destination')
     for op in WIDE_RESULT:
         refuse(op, DST + 1, SRC, AMT, 'odd destination pair')
         refuse(op, DST, SRC + 1, AMT, 'odd source pair')
     for op in ('s_lshr_b64', 's_bfe_u64'):
         refuse(op, DST, SRC, AMT, 'lane mask in the high source word', masks={SRC + 1})
+    refuse('s_bfe_i32', DST, M.M0, AMT, 'm0 source data')
     refuse('s_lshl_b64', DST, SRC, 106, 'vcc as the shift amount')
     refuse('s_lshl_b64', DST, SRC, 126, 'exec as the shift amount')
 
