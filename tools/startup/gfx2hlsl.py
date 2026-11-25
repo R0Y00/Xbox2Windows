@@ -1902,6 +1902,14 @@ class Stage:
             return 's', r[1]
         raise Unsupported('v_add_co_ci_u32 %s %s: expected vcc or an SGPR mask' % (what, tok))
 
+    def numeric_addend(self, tok):
+        """A numeric source of the carry add; lane-mask registers are refused (u() gives their 0/1 lane bit)."""
+        r = reg_range(tok)
+        if tok.startswith(('vcc', 'exec')) or (r and r[0] == 's' and (r[1] in (106, 107, 126, 127) or
+                                                                       any(n in self.masks for n in range(r[1], r[2] + 1)))):
+            raise Unsupported('v_add_co_ci_u32 numeric source %s: a lane mask is not a 32-bit word' % tok)
+        return self.u(tok)
+
     def op_v_add_co_ci_u32(self, ops, mods):
         # d = a + b + carry_in; the carry out is bit 0 of the destination mask (one lane).
         if mods:
@@ -1916,7 +1924,7 @@ class Stage:
         if in_kind == 's' and in_n not in self.masks:
             raise Unsupported('v_add_co_ci_u32 carry in s%d is not a known mask' % in_n)
         carry_in = self.u(ops[4]) if in_kind == 'vcc' else self.S(in_n)
-        a, b = self.u(ops[2]), self.u(ops[3])
+        a, b = self.numeric_addend(ops[2]), self.numeric_addend(ops[3])
         d = regs[1]
         self.uniform_v.discard(d)
         self.used_v.add(d)

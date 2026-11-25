@@ -126,6 +126,18 @@ except G.Unsupported:
     refused = True
 check('carry in from an unknown register is refused', refused)
 
+# 6. A lane-mask register (vcc, exec, a known mask SGPR) as a numeric addend is refused (its 0/1 lane bit is not the word).
+for label, code, masks in (('vcc_lo as src0', encode_e32(5, 106, 3), ()),
+                           ('vcc_lo as src1', encode_e64(5, 106, VGPR + 2, 106, 106), ()),
+                           ('exec_lo as src0', encode_e32(5, 126, 3), ()),
+                           ('known mask SGPR as src1', encode_e64(7, 20, VGPR + 4, 22, 22), (22,))):
+    try:
+        translate(code, masks=masks)
+        refused = False
+    except G.Unsupported:
+        refused = True
+    check('lane mask addend refused: ' + label, refused)
+
 if failures:
     print('FAIL')
     for text in failures:
