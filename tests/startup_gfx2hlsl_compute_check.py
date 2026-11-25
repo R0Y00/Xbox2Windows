@@ -464,6 +464,24 @@ SPLICE = {
     's_and_b32 s18, s18, 0xc000ffff': '12ff1287ffff00c0',
     's_and_b32 s17, 0xc000ffff, s17': 'ff111187ffff00c0',
     's_and_b32 s21, s21, 0xc000ffff': '15ff1587ffff00c0',
+    's_bfe_u32 s21, s17, 0xe0010': '11ff959310000e00',
+    's_bfe_u32 s21, s29, 0xe0010': '1dff959310000e00',
+    's_max_u32 s21, s21, 1': '15819584',
+    's_max_u32 s21, s21, 2': '15829584',
+    's_bfe_u32 s21, s17, 0xe0011': '11ff959311000e00',
+    's_mul_i32 s18, s18, s21': '12151293',
+    's_mul_i32 s18, s18, 4': '12841293',
+    's_and_b32 s19, s19, 0xcfffffff': '13ff1387ffffffcf',
+    's_or_b32 s19, s19, 0x30000000': '13ff138800000030',
+    's_or_b32 s19, s19, 0x20000000': '13ff138800000020',
+    's_load_dwordx8 s[24:31], s[10:11], 0x0': '05060cf4000000fa',
+    's_load_dwordx8 s[24:31], s[10:11], 0x20': '05060cf4200000fa',
+    's_add_u32 s10, s10, 32': '0aa00a80',
+    's_mov_b32 s11, 1': '81038bbe',
+    's_waitcnt lgkmcnt(0)': '7fc08cbf',
+    's_mov_b32 s19, s31': '1f0393be',
+    's_mov_b32 s17, s29': '1d0391be',
+    's_cbranch_scc1 2': '020085bf',
 }
 
 
@@ -475,6 +493,15 @@ def splice(*lines, at=STORE_A):
 STRIDE_CLEAR = 's_and_b32 s17, s17, 0xc000ffff'
 CASES['I'] = (SOURCE_A.replace('buffer_store_dword', STRIDE_CLEAR + '\nbuffer_store_dword'), splice(STRIDE_CLEAR),
               *CASES['A'][2:])
+
+# Case I-raw converts the structured UAV descriptor to the same byte range before the store.
+STRIDE_EXTRACT = 's_bfe_u32 s21, s17, 0xe0010'
+SCALE_RECORDS = 's_mul_i32 s18, s18, s21'
+OOB_CLEAR = 's_and_b32 s19, s19, 0xcfffffff'
+OOB_RAW = 's_or_b32 s19, s19, 0x30000000'
+RAW_CONVERSION = (STRIDE_EXTRACT, STRIDE_CLEAR, SCALE_RECORDS, OOB_CLEAR, OOB_RAW)
+CASES['I-raw'] = (SOURCE_A.replace('buffer_store_dword', '\n'.join((*RAW_CONVERSION, 'buffer_store_dword'))),
+                  splice(*RAW_CONVERSION), *CASES['A'][2:])
 
 # Replace the nonzero stride constant in s5 with the first active lane of a
 # fresh 24-thread group. Ignoring FF1 leaves a different word at every i > 0.
@@ -514,7 +541,7 @@ def formatted_input():
 
 
 def expected(name):
-    if name == 'I':
+    if name in ('I', 'I-raw'):
         return expected('A')
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
@@ -946,6 +973,40 @@ def check_controls():
     assert 's20 = scc ?' in translate('A', code=splice(clear, 's_cmp_lt_u32 s7, 4', 's_cselect_b32 s20, 1, 0',
                                                        'v_mov_b32 v5, s20')).hlsl_cs()
     for lines in ((clear, clear), (clear, 's_or_b32 s17, s17, 0x40000'), ('s_or_b32 s17, s17, 0x40000', clear)):
+        refused('buffer store through a modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
+    raw = translate('I-raw')
+    plain = translate('A')
+    assert raw.hlsl_cs() == plain.hlsl_cs()
+    assert raw.manifest() == plain.manifest()
+    assert translate('A', code=splice(STRIDE_EXTRACT, clear, SCALE_RECORDS, OOB_RAW)).hlsl_cs() == raw.hlsl_cs()
+    # Captured programs clamp the extracted stride to at least 1 before scaling NUM_RECORDS.
+    clamped = (STRIDE_EXTRACT, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])
+    assert translate('A', code=splice(*clamped)).hlsl_cs() == raw.hlsl_cs()
+    refused('buffer store through a modified descriptor', lambda: translate(
+        'A', code=splice(STRIDE_EXTRACT, 's_max_u32 s21, s21, 2', *RAW_CONVERSION[1:])).hlsl_cs())
+    reload = ('s_load_dwordx8 s[24:31], s[10:11], 0x0', 's_waitcnt lgkmcnt(0)')
+    other = ('s_load_dwordx8 s[24:31], s[10:11], 0x20', 's_waitcnt lgkmcnt(0)')  # the next two descriptors
+    # A second load through the same untouched pointer pair reads the same words, so a word taken from it is the
+    # same value. After s_add_u32 s10, s10, 32 the pointer symbol hides the addend, so that load is told apart.
+    for lines in ((*reload, 's_mov_b32 s19, s31', *RAW_CONVERSION),
+                  (*reload, STRIDE_EXTRACT, 's_mov_b32 s17, s29', clear, SCALE_RECORDS, OOB_RAW)):
+        assert translate('A', code=splice(*lines)).hlsl_cs() == raw.hlsl_cs()
+    moved = ('s_add_u32 s10, s10, 32', *reload)
+    rehigh = ('s_mov_b32 s11, 1', *reload)  # another high address word: another descriptor
+    for lines in (
+        (*rehigh, 's_bfe_u32 s21, s29, 0xe0010', clear, SCALE_RECORDS, OOB_RAW),
+        (*moved, 's_mov_b32 s19, s31', *RAW_CONVERSION),
+        (*moved, 's_bfe_u32 s21, s29, 0xe0010', clear, SCALE_RECORDS, OOB_RAW),
+        (*RAW_CONVERSION[:-1], 's_or_b32 s19, s19, 0x20000000'),
+        (STRIDE_EXTRACT, clear, OOB_RAW),
+        (STRIDE_EXTRACT, SCALE_RECORDS, OOB_RAW),
+        (clear, 's_mul_i32 s18, s18, 4', OOB_RAW),
+        (*other, 's_mov_b32 s19, s31', *RAW_CONVERSION),
+        (*other, STRIDE_EXTRACT, 's_mov_b32 s17, s29', clear, SCALE_RECORDS, OOB_RAW),
+        (*other, 's_bfe_u32 s21, s29, 0xe0010', clear, SCALE_RECORDS, OOB_RAW),  # another descriptor's stride
+        ('s_bfe_u32 s21, s17, 0xe0011', clear, SCALE_RECORDS, OOB_RAW),  # not the stride field (bits 30:17)
+        (*RAW_CONVERSION[:-1], 's_cmp_lt_u32 s7, 4', 's_cbranch_scc1 2', OOB_RAW),
+    ):
         refused('buffer store through a modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
     # The modification is recorded for the descriptor the word belongs to (byte 16 of the x8 load), not for the
     # load's first descriptor: loads through the read descriptor at byte 0 are unaffected.

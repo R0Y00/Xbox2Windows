@@ -56,7 +56,7 @@ def check(directory, consumer, backend):
     if actual != expected:
         raise AssertionError(f"actual {actual.hex()} expected {expected.hex()}")
     check_refusal_lines(trap_log.read_text(errors="replace"))
-    print(f"{backend}: buffer memory SRV (raw base, raw interior, structured, refused unaligned, refused acceleration structure view) exact")
+    print(f"{backend}: buffer memory SRV (raw base, raw interior, unplaced buffer, structured, refused unaligned, refused acceleration structure view) exact")
     return 0
 
 

@@ -453,9 +453,9 @@ int draw_formatted_view(void* guest, void* list)
 int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
     static std::array<std::uint8_t, 65536 + 256> raw_buf0{};
-    static std::array<std::uint8_t, 65536 + 256> raw_buf1{};
+    static auto* const buf1 = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     auto* const buf0 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf0.data()) + 0xffff) & ~Word{0xffff});
-    auto* const buf1 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf1.data()) + 0xffff) & ~Word{0xffff});
     std::memset(buf0, 0, 256);
     std::memset(buf1, 0, 256);
     buf0[0] = 17;
@@ -469,11 +469,10 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    void* placed[2]{};
+    void* placed = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf0), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[0]))))) return 47;
-    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf1), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[1]))))) return 47;
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    // buf1 is intentionally not placed in slot 133 to verify unplaced buffer backing in device slot 70.
 
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;
