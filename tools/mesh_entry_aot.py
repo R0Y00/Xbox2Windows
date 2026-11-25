@@ -96,9 +96,19 @@ SUPPORTED_SCALAR_OPS = frozenset(
         "s_mov_b32", "s_mov_b64", "s_movk_i32", "s_cselect_b32", "s_cselect_b64",
         "s_bfe_u32", "s_lshl_b32", "s_lshr_b32", "s_add_i32", "s_add_u32",
         "s_sub_u32", "s_mul_i32", "s_and_b32", "s_and_b64", "s_or_b32",
-        "s_or_b64", "s_xor_b64", "s_andn2_b64",
+        "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_not_b64",
     )
 )
+
+# Lane-mask updates that keep the previous exec in the destination pair. The complemented forms negate the
+# old exec, not the source: ANDN2 is SRC0 & ~EXEC and ORN2 is SRC0 | ~EXEC.
+SAVEEXEC = {
+    "s_and_saveexec_b64": lambda old, a: old & a,
+    "s_andn2_saveexec_b64": lambda old, a: a & ~old,
+    "s_or_saveexec_b64": lambda old, a: old | a,
+    "s_orn2_saveexec_b64": lambda old, a: a | ~old,
+    "s_xor_saveexec_b64": lambda old, a: old ^ a,
+}
 
 
 class Wave:
@@ -151,12 +161,16 @@ class Wave:
             if i in self.pending:
                 raise ValueError("Scalar load used before wait")
             # A register no instruction ever writes is a bad operand, not a skipped write.
-            value = self.s.get(i, UNDEF) if i in self.written else self.s[i]
+            if i not in self.written and i not in self.s:
+                raise ValueError(f"Scalar register s{i} used before it is written")
+            value = self.s.get(i, UNDEF)
             if value is UNDEF and not allow_undef:
                 raise ValueError(UNDEFINED_SCALAR)
             return value
         if t == "exec":
             return self.exec
+        if t in ("exec_lo", "exec_hi"):
+            return self.exec >> (32 if t == "exec_hi" else 0) & U32
         if t == "vcc":
             if self.vcc is None:
                 raise ValueError("Undefined wave predicate")
@@ -170,6 +184,12 @@ class Wave:
             raise ValueError(UNDEFINED_SCALAR)
         if dest == "exec":
             self.exec = value & WAVE
+        elif dest in ("exec_lo", "exec_hi"):
+            # A 32-bit write replaces one half of the 64-bit lane mask and keeps the other.
+            if wide:
+                raise ValueError("Unsupported scalar destination")
+            shift = 32 if dest == "exec_hi" else 0
+            self.exec = self.exec & ~(U32 << shift) | (value & U32) << shift
         elif dest == "vcc":
             self.vcc = value & WAVE
         elif dest == "m0":
@@ -364,10 +384,12 @@ class Wave:
                 raise ValueError(f"Unsupported scalar compare {op}")
             self.scc = relation[op]
             return
-        if op == "s_and_saveexec_b64":
+        if op in SAVEEXEC:
             a = self.scalar(src[0])
+            if type(a) is not int:
+                raise ValueError("Scalar ALU requires concrete operands")
             old = self.exec
-            self.exec &= a
+            self.exec = SAVEEXEC[op](old, a) & WAVE
             self.put(d, old, True)
             self.scc = self.exec != 0
             return
@@ -417,6 +439,10 @@ class Wave:
             v = a ^ b
         elif op == "s_andn2_b64":
             v = a & ~b
+        elif op == "s_orn2_b64":
+            v = a | ~b
+        elif op == "s_not_b64":
+            v = ~a
         else:
             raise ValueError(f"Unsupported scalar instruction {op}")
         wide = op.endswith("_b64")
@@ -737,6 +763,8 @@ class Wave:
                     and self.vcc is None
                 ):
                     raise ValueError("Undefined branch predicate")
+                if op not in ("s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_execz", "s_cbranch_vccnz"):
+                    raise ValueError(f"Unsupported mesh branch {op}")
                 take = {
                     "s_branch": True,
                     "s_cbranch_scc0": not self.scc,

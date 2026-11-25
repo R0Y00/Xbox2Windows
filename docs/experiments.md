@@ -119,6 +119,27 @@ GPU backing.
 Run `cmake --build --preset release --target startup_indirect_draw_indexed`
 and `ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed_upload_(warp|hardware)$' -V`.
 
+### Existing-heap geometry input aliases for translated indexed draws
+
+`X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS=1` lets a translated indexed draw bind
+an unregistered index view or vertex stream zero through a 64 KiB desktop
+buffer on a private memory allocation whose external heap was already
+opened by slot 133. Each span must fit entirely in a committed page. A page
+with a registered GPU alias is refused. Views on one page share one desktop
+resource. The startup device keeps up to 64 page aliases. The application
+keeps the underlying allocation live for the device's lifetime and keeps
+input bytes and alias ownership stable through execution. Recording uploads
+and uniquely registered placed resources keep their existing paths.
+
+The runner creates a reference resource on the second page and binds an
+eight-byte R16 index view and a separate vertex stream on the first page.
+An R32 case supplies a nonzero base vertex. Without a proven heap, with a
+different GPU alias on the first page, across a page boundary, or with the
+configuration disabled, the target stays clear.
+
+Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
+`ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed_alias(_off)?_(warp|hardware)$' -V`.
+
 ### Same-recording GPU copies used by an indirect draw
 
 `X2W_TRANSLATED_INDIRECT_COPY_RANGES=1` enables a bounded handoff from slot 15
@@ -3431,6 +3452,8 @@ ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_unary_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_skipped_scalar_" -V
+python3 -B tests/mesh_entry_check.py exec-restore
+ctest --preset dev --no-tests=error -R "^mesh_entry_exec_restore_" -V
 ```
 
 A scalar register that is written only inside a range skipped by
@@ -3445,6 +3468,24 @@ checks both waves and six refusal controls; `mesh_entry_skipped_scalar_draw_*`
 draws a program whose wave 1 skips the write and whose wave 0 adds the value
 to the depth, and compares the export trace to an off-by-one depth and to the
 program without the add.
+
+Restoring EXEC after a per-lane range (#1998 item C) is not limited to
+`s_mov_b64 exec, <pair>`. The lowerer reads and writes the two 32-bit halves
+`exec_lo` and `exec_hi` (a 64-bit write to one half is refused), and models
+`s_orn2_b64`, `s_not_b64` and the saveexec family `s_and`, `s_andn2`, `s_or`,
+`s_orn2` and `s_xor` `_saveexec_b64`, which keep the old mask in the
+destination pair. A copy may be moved between registers, and a restore may be
+joined from two arms of a wave-uniform branch (`s_cmp_eq_u32 s8, 0`). The
+`exec-restore` mode builds such a program and requires the same HLSL as the
+plain copy-and-restore program. Refused, each with a control: restoring from a
+mask saved after the flip (lane 1 lost), from a register never written, with
+one half missing, with a 64-bit write to a half, with an unmodeled saveexec
+(`s_nand_saveexec_b64`), with an unmodeled branch, and with a backward branch.
+`mesh_entry_exec_restore_draw_*` draws the same program through WARP; a depth
+one unit in the last place off must report `Mesh export trace mismatch`. The
+draw is written for Windows and has not been run on Linux. The dynamic lowerer
+shares the model; `mesh_dynamic_aot_check.py` repeats the restore forms and
+refusals there.
 
 The allocation is not limited to one triangle. `MSG_GS_ALLOC_REQ` may declare
 any vertex and primitive counts within the PSV0 output bounds, and each of the
@@ -8618,9 +8659,18 @@ The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
 
+Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
+slot 57 creation. The descriptor must name a registered root, have an empty
+VS slot and have a readable 16-byte to 64-KiB MS span. The PS span must be
+absent or fit the same bounds. With the pipeline IID, this shape returns
+`E_NOTIMPL` and clears the output. It lets callers that handle this result
+choose another pipeline creation path. The default returns the existing
+placeholder. Other fixed descriptors keep that result under the switch, and
+an unsupported IID still returns `E_NOINTERFACE`.
+
 ```powershell
 cmake --build --preset release --target startup_indirect_draw_indexed
-ctest --preset release --no-tests=error -R '^startup_indirect_mesh_request_' -V
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(request|create_result)_' -V
 .\out\pe-env\Scripts\python.exe -B tests/startup_gfx2hlsl_watch_check.py
 ```
 
@@ -13026,6 +13076,28 @@ in X, Y and Z, point XY and mip filtering, and `MIP_POINT_PRECLAMP` set.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hardware)?$' -V
+```
+
+### Compute mip-zero gather
+
+The startup compute translator accepts `image_gather4_lz` on a 2D texture with
+the same constant sampler and one-hot component selection as the pixel form.
+The eight image descriptor words must come from one intact descriptor at a
+fixed table offset. The compute manifest records the texture SRV, sampler and
+raw output UAV. The fixture binds these on the standalone D3D12 compute runner.
+Runtime binding of translated slot-67 pipelines is tracked in #2274.
+
+One gfx1013 thread gathers at (0.5, 0.5) and stores four words. Each texel's
+bits encode its mip, position and channel. The reference checks the four center
+texels and all 316 untouched words. The fixture reads green with the view
+starting at resource mip 0 and each RGBA component with the view starting at
+mip 1. The controls drop the gather, select red in place of green, bind mip 0
+in place of mip 1, or swap the first and last taps. The reference predicts
+4, 4, 4 and 2 mismatching words respectively.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_gather_lz(_warp|_hardware)?$' -V
 ```
 
 ## Startup translator: fixed-mip 2D comparison gathers
