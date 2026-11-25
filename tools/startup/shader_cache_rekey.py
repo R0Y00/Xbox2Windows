@@ -22,6 +22,7 @@ number of hashing processes (default: the processor count, at most 61 on Windows
 import os
 import re
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gfx2hlsl as g  # noqa: E402
@@ -86,28 +87,37 @@ def publish(path, data, stats):
     if os.path.exists(path):
         stats['kept'] += 1
         return
-    tmp = path + '.tmp'
-    try:
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    name = os.path.basename(target)
+    with tempfile.TemporaryDirectory(prefix='.%s.' % name, dir=parent) as tmp_dir:
+        tmp = os.path.join(tmp_dir, name)
         with open(tmp, 'wb') as file:
             file.write(data)
         os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        raise
     stats['written'] += 1
 
 
-def rekey(src, dst, jobs=None, out=sys.stdout):
+def rekey(src, dst, jobs=None, out=None):
     """Re-key the requests of src into dst; return the exit code."""
+    if out is None:
+        out = sys.stdout
     if not os.path.isdir(src):
         print('error: %s is not a directory' % src, file=sys.stderr)
+        return 2
+    if os.path.exists(dst) and not os.path.isdir(dst):
+        print('error: %s is not a directory' % dst, file=sys.stderr)
         return 2
     if os.path.exists(dst) and os.path.samefile(src, dst):
         print('error: the new request dir must not be the old cache', file=sys.stderr)
         return 2
     found = {'g': [], 'c': [], 'rtv': [], 'm57': 0, 'm86': 0}
-    for name in sorted(os.listdir(src)):
+    try:
+        entries = sorted(os.listdir(src))
+    except OSError as error:
+        print('error: cannot list %s: %s' % (src, error), file=sys.stderr)
+        return 1
+    for name in entries:
         m = REQUEST.fullmatch(name)
         if not m:
             continue
@@ -148,28 +158,37 @@ def rekey(src, dst, jobs=None, out=sys.stdout):
             print('  ' + line, file=sys.stderr)
         return 1
 
-    os.makedirs(dst, exist_ok=True)
+    try:
+        os.makedirs(dst, exist_ok=True)
+    except OSError as error:
+        print('error: cannot create %s: %s' % (dst, error), file=sys.stderr)
+        return 1
     stats = {'written': 0, 'kept': 0}
-    for kind, label in (('g', 'graphics'), ('c', 'compute')):
-        done = set()
-        for old, key in sorted(new[kind].items()):
-            if key in done:  # requests of the same pipeline from several revisions
-                continue
-            done.add(key)
-            # Read again, not checked against the hashing pass: nothing may write the old cache meanwhile.
-            for ext, data in read_parts(src, kind, old).items():
-                publish(request_name(dst, key, ext), data, stats)
-        current = sum(old == key for old, key in new[kind].items())
-        print('%s: %d requests, %d already current -> %d keys' % (label, len(new[kind]), current, len(done)), file=out)
-    for key, text in sorted(rtv.items()):
-        publish(request_name(dst, key, '.rtv'), text.encode('ascii'), stats)
+    try:
+        for kind, label in (('g', 'graphics'), ('c', 'compute')):
+            done = set()
+            for old, key in sorted(new[kind].items()):
+                if key in done:  # requests of the same pipeline from several revisions
+                    continue
+                done.add(key)
+                # Read again, not checked against the hashing pass: nothing may write the old cache meanwhile.
+                for ext, data in read_parts(src, kind, old).items():
+                    publish(request_name(dst, key, ext), data, stats)
+            current = sum(old == key for old, key in new[kind].items())
+            print('%s: %d requests, %d already current -> %d keys' % (label, len(new[kind]), current, len(done)), file=out)
+        for key, text in sorted(rtv.items()):
+            publish(request_name(dst, key, '.rtv'), text.encode('ascii'), stats)
+    except OSError as error:
+        print('error: failed writing %s: %s' % (dst, error), file=sys.stderr)
+        return 1
     print('rtv variants: %d requests -> %d keys' % (len(found['rtv']), len(rtv)), file=out)
     print('not re-keyed (own key strings): m57 %d, m86 %d' % (found['m57'], found['m86']), file=out)
     print('files: %d written, %d already present in %s' % (stats['written'], stats['kept'], dst), file=out)
     return 0
 
 
-def main(argv):
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 2 or argv[0].startswith('-'):
         print(__doc__.split('\n\n')[1], file=sys.stderr)
         return 2
@@ -177,4 +196,4 @@ def main(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    raise SystemExit(main())

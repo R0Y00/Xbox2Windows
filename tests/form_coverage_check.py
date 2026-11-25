@@ -392,7 +392,7 @@ def check_shader_records():
     sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
     rejected_forms = {
         "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "v_cvt_pkrtz_f16_f32_sdwa",
+        "v_rcp_f16_sdwa",
         "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
@@ -516,7 +516,7 @@ def check_shader_records():
         for group in ("DPP16", "DPP8")
         for form in ("v_cvt_flr_i32_f32_dpp", "v_cvt_rpi_i32_f32_dpp", "v_cvt_pkrtz_f16_f32_dpp")
     }
-    cvt_f32_excluded = {"v_cvt_flr_i32_f32_sdwa", "v_cvt_rpi_i32_f32_sdwa"}
+    cvt_f32_excluded = {"v_cvt_norm_i16_f16_sdwa", "v_cvt_norm_u16_f16_sdwa"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert cvt_f32_int | cvt_dpp_forms <= reference, name
@@ -1570,6 +1570,91 @@ def check_sdwa_int_extra_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_f16_exact_extra_forms():
+    """The 25 exact binary16 min, max, fract, frexp_mant, and frexp_exp_i16 forms (VOP1/VOP2, VOP3,
+    DPP16, DPP8, SDWA) count as covered once the translator accepts their fixtures."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in pixel.F16_EXACT_EXTRA_PROGRAMS.values():
+            pixel.translate_f16(pixel.uncompressed_export(body))
+        forms = {
+            ("VOP2", "v_min_f16"), ("VOP2", "v_max_f16"),
+            ("VOP1", "v_fract_f16"), ("VOP1", "v_frexp_mant_f16"), ("VOP1", "v_frexp_exp_i16_f16"),
+            ("VOP3", "v_min_f16_e64"), ("VOP3", "v_max_f16_e64"),
+            ("VOP3", "v_fract_f16_e64"), ("VOP3", "v_frexp_mant_f16_e64"), ("VOP3", "v_frexp_exp_i16_f16_e64"),
+            *{
+                (group, f"{op}_dpp")
+                for group in ("DPP16", "DPP8")
+                for op in ("v_min_f16", "v_max_f16", "v_fract_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16")
+            },
+            *{
+                ("SDWA", f"{op}_sdwa")
+                for op in ("v_min_f16", "v_max_f16", "v_fract_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16")
+            },
+        }
+        assert len(forms) == 25
+        neighbours = {
+            ("VOP1", "v_rcp_f16"), ("VOP3", "v_rcp_f16_e64"),
+            ("DPP16", "v_rcp_f16_dpp"), ("DPP8", "v_rcp_f16_dpp"), ("SDWA", "v_rcp_f16_sdwa"),
+            ("DPP16", "v_cvt_norm_i16_f16_dpp"), ("DPP8", "v_cvt_norm_i16_f16_dpp"),
+            ("SDWA", "v_cvt_norm_i16_f16_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        stripped = pixel.ACCEPTED - {"v_frexp_mant_f16_dpp"}
+        assert not {("DPP16", "v_frexp_mant_f16_dpp"), ("DPP8", "v_frexp_mant_f16_dpp")} & fc.gfx_forms(
+            stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
+def check_sdwa_cvt_forms():
+    """The 13 SDWA conversion, frexp_exp, and packed-RTZ forms count as covered once the translator
+    accepts their fixtures; unlowered SDWA neighbours stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in pixel.SDWA_CVT_PROGRAMS.values():
+            pixel.translate_int(pixel.uncompressed_export(body))
+        pixel.translate(pixel.sdwa_pkrtz_program())
+        ops = (
+            "v_cvt_i32_f32_sdwa", "v_cvt_u32_f32_sdwa", "v_cvt_flr_i32_f32_sdwa",
+            "v_cvt_rpi_i32_f32_sdwa", "v_frexp_exp_i32_f32_sdwa",
+            "v_cvt_f32_i32_sdwa", "v_cvt_f32_u32_sdwa",
+            "v_cvt_f32_ubyte0_sdwa", "v_cvt_f32_ubyte1_sdwa",
+            "v_cvt_f32_ubyte2_sdwa", "v_cvt_f32_ubyte3_sdwa",
+            "v_cvt_off_f32_i4_sdwa", "v_cvt_pkrtz_f16_f32_sdwa",
+        )
+        forms = {("SDWA", op) for op in ops}
+        assert len(forms) == 13
+        neighbours = {
+            ("SDWA", "v_cndmask_b32_sdwa"), ("SDWA", "v_rcp_f16_sdwa"),
+            ("SDWA", "v_sqrt_f16_sdwa"), ("SDWA", "v_cvt_norm_i16_f16_sdwa"),
+            ("SDWA", "v_cvt_norm_u16_f16_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        stripped = pixel.ACCEPTED - {"v_cvt_pkrtz_f16_f32_sdwa"}
+        assert ("SDWA", "v_cvt_pkrtz_f16_f32_sdwa") not in fc.gfx_forms(stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1594,6 +1679,8 @@ if __name__ == "__main__":
     check_dpp_f16_cvt_fmac_ldexp_forms()
     check_sdwa_f16_forms()
     check_sdwa_int_extra_forms()
+    check_f16_exact_extra_forms()
+    check_sdwa_cvt_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sdwa_cmp_coverage()
