@@ -1992,13 +1992,14 @@ and `XApuDisconnect`, refuses null or unreadable command headers (`E_POINTER`), 
 entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
 index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
 connection; additional enqueues return `E_OUTOFMEMORY` without dropping queued entries).
-`XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` zeroes the
-`0x58`-byte result buffer and writes the retired command's type at `+0x00` and slot index at
-`+0x04` (keeping decoded bytes at `+0x34` zero because no audio/XMA decoder runs here). An empty
+`XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` retires one entry
+and zeroes the `0x58`-byte result buffer. The experimental `X2W_XAPU_TYPED_COMPLETIONS=1`
+also writes the command type at `+0x00` and slot index at `+0x04`. Decoded bytes at `+0x34`
+remain zero in both modes. An empty
 queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
 
 Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
-observed callers; the queue intentionally echoes any 32-bit type value at `+0x00` verbatim
+observed callers. The experimental mode echoes any 32-bit type value at `+0x00` verbatim
 (including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
 outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export

@@ -12,10 +12,8 @@
 // stand in for the audio command queue; otherwise they trap. Call shapes observed:
 //   XApuConnect(input*, output*, handle*) -> HRESULT (the handle is later passed to the others)
 //   XApuGetResultCount(handle, 0) -> count
-//   XApuDequeueResult(handle, result*) -> HRESULT; zeroes 0x58 bytes and writes the queued
-//     command's 32-bit type at +0 and slot index at +4; decoded output byte count at +0x34 stays 0
-//     without decode. Observed command/result types are 1 (open), 2 (close), 3 (packet), and
-//     5 (stop); other values such as 4 are echoed verbatim rather than rejected.
+//   XApuDequeueResult(handle, result*) -> HRESULT; zeroes 0x58 bytes. With the experimental
+//     X2W_XAPU_TYPED_COMPLETIONS=1, also echoes the command type at +0 and slot at +4.
 //   XApuEnqueueCommand(handle, command*, ...) -> HRESULT; reads 32-bit type at +0 and slot at +4.
 //   XApuDisconnect(handle)
 namespace {
@@ -175,8 +173,10 @@ extern "C" __declspec(noinline) long XApuDequeueResult(u64 rcx, u64 rdx, u64 r8,
     if (hr == hr_ok) {
         auto* out = reinterpret_cast<unsigned char*>(rdx);
         std::memset(out, 0, result_size);
-        std::memcpy(out, &entry.type, sizeof(entry.type));
-        std::memcpy(out + 4, &entry.slot, sizeof(entry.slot));
+        if (x2w_local::env_on("X2W_XAPU_TYPED_COMPLETIONS")) {
+            std::memcpy(out, &entry.type, sizeof(entry.type));
+            std::memcpy(out + 4, &entry.slot, sizeof(entry.slot));
+        }
     }
     static LONG calls;
     if (x2w_local::first_calls(calls, 2))

@@ -139,6 +139,7 @@ int main(int argc, char** argv)
     check_non_permissive_trap(argv[0], dll_path);
 
     SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", "1");
+    SetEnvironmentVariableA("X2W_XAPU_TYPED_COMPLETIONS", nullptr);
     HMODULE module = LoadLibraryA(dll_path);
     if (!module) return std::printf("FAIL: cannot load %s\n", dll_path), 2;
 
@@ -195,6 +196,18 @@ int main(int argc, char** argv)
     }
     check(get_count(h1, 0) == 0, "rejected command headers do not enqueue entries");
 
+    write_cmd(cmd, 1, 7);
+    check(enqueue(h1, cmd.data(), 0, 0) == hr_ok, "default: enqueue an open command with nonzero type and slot");
+    check(get_count(h1, 0) == 1, "default: open command enters the queue");
+    result = sentinel;
+    check(dequeue(h1, result.data()) == hr_ok && all_zero(result),
+          "default: retire the open command without publishing a typed completion");
+    check(get_count(h1, 0) == 0, "default: zeroed result still consumes the queued command");
+    result = sentinel;
+    check(dequeue(h1, result.data()) == hr_pending_results && result == sentinel,
+          "default: empty dequeue leaves its result untouched");
+
+    check(SetEnvironmentVariableA("X2W_XAPU_TYPED_COMPLETIONS", "1") != FALSE, "enable experimental typed completions");
     // Zero command yields all-zero 0x58-byte result; typed commands echo (+0x00 type, +0x04 slot) in FIFO order.
     write_cmd(cmd, 0, 0);
     check(enqueue(h1, cmd.data(), 0x11, 0x22) == hr_ok, "enqueue zero command on h1");
