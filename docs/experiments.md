@@ -14789,3 +14789,25 @@ that names one value (a pointer only if no add touched it), is read at run time 
 read before its next write when a path brings a symbol with no run-time value or no definition at all. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
 `join_symbols_folded_*` tests run the old OUTSIDE statement and must give 3, not 11. Controls are pure Python plus
 a pixel dispatch on WARP and hardware; `binary` reassembles the fixture words with LLVM 15.
+
+## Startup translator: a short operand list is refused, never a translator crash
+
+The batch translator records any non-`Unsupported` exception from a handler as
+`translator crash in <op>: <ExcType>`, which its refusal census reads as a translator defect rather than as an
+instruction it does not lower; the single-shader path does not catch it at all. Handlers that keep their
+operands in method bodies instead of a table therefore need an explicit count check before the first `ops[...]`
+read, or text the ISA cannot produce reaches the census as a defect.
+
+Three families have been closed this way, one pull request per family, each with a control that removes the
+check and requires the old exception to come back:
+
+| family | entry point | short form before | refusal now |
+| --- | --- | --- | --- |
+| buffer loads and stores | `buffer_address` | `translator crash: IndexError` | `<op> with N operands, expected 4` |
+| image instructions | `image()` | `translator crash: IndexError` | `<op> with N operands, expected at least 3`, `image instruction without dim:` |
+| single-body VOP handlers | the handler body | `translator crash: IndexError` | `<op> with N operands, expected 2`, `… 3 or 4` |
+| scalar ALU (`SCA`) | `Stage.scalar` | `translator crash: IndexError` | `<op> with N operands, expected 2` |
+
+The checks are `tests/startup_gfx2hlsl_handler_arity_check.py`, `…_image_arity_check.py`,
+`…_operand_count_check.py` and `…_scalar_arity_check.py`. They run on Linux and Windows without D3D12 or game
+data, because a refusal is observable at the `Stage` entry point.
