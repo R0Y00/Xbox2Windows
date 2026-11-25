@@ -154,12 +154,11 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     sampler = manifest_sampler(pipe)
     capped = manifest_sampler(pipeline(build_program(CAPPED_WORDS)[1]))
     hlsl = pipe.hlsl_ps()
-    implicit = hlsl.replace('.SampleGrad(', '.Sample(')
-    assert implicit != hlsl
     # Sample takes (sampler, uv) only: drop the two gradient arguments of each call.
-    implicit = re.sub(r'\.Sample\(([^,]+), ([^,]+(?:\([^)]*\))?), float\d\([^)]*\), float\d\([^)]*\)\)',
-                      r'.Sample(\1, \2)', implicit)
-    assert '.Sample(' in implicit and 'float2(' in implicit
+    gradient = r'float2\(F\(v\d+\), F\(v\d+\)\)'
+    implicit, changed = re.subn(rf', {gradient}, {gradient}(?=\);)', '', hlsl)
+    assert changed == hlsl.count('.SampleGrad(') == 4
+    implicit = implicit.replace('.SampleGrad(', '.Sample(')
     want = ','.join(f32_hex(float(r)) for r in reference())
     mip0 = ','.join(f32_hex(float(r)) for r in reference(0))
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
