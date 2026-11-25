@@ -3681,6 +3681,12 @@ exporting vertices 0–63. Wave 1 passes one more barrier and writes vertices
 it the position of vertex 2 collapses the triangle and changes 528 pixels.
 The CPU check also runs the waves in both host evaluation orders.
 
+The static and runtime mesh lowerers read a concrete `src_scc` as the word
+0 or 1. The fixture compares the triangle allocation word, then compares that
+SCC with 1 for equality or 0 for inequality before taking the branch. Both
+forms preserve the triangle and quad outputs. Reading an undefined SCC or
+one that still depends on a constant-buffer value produces a refusal.
+
 [`tools/mesh_dynamic_aot.py`](../tools/mesh_dynamic_aot.py) emits one desktop
 mesh shader for a two-wave64 triangle entry. It splits runtime input cases
 at scalar equality tests and reruns the existing wave model for each case.

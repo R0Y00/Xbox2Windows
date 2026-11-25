@@ -29,6 +29,43 @@ def expect_refusal(decoded, geometry_word_count, text, limits=MESH_LIMITS):
         raise AssertionError(f"Expected refusal: {text}")
 
 
+def check_scc_operand():
+    # Preserve the geometry comparison's truth value before its conditional branch.
+    # LLVM gfx1013 wave64: s_cmp_eq_u32 src_scc, 1 / s_cmp_lg_u32 0, src_scc.
+    body = decode(CODE)
+    offset = next(pc for pc, op in body if op.startswith("s_cbranch_scc0 "))
+    expected = enumerate_variants(body, 2, MESH_LIMITS)
+    for instruction in ("fd8106bf", "80fd07bf"):
+        program = decode(CODE[:offset] + bytes.fromhex(instruction) + CODE[offset:])
+        assert enumerate_variants(program, 2, MESH_LIMITS) == expected
+        for geometry in ([0x1003, SECOND], [0x2004, SECOND]):
+            assert lower_static(program, geometry, MESH_LIMITS) == lower_static(body, geometry, MESH_LIMITS)
+
+    # The first instruction cannot read an undefined SCC.
+    undefined = decode(bytes.fromhex("fd8106bf") + CODE)
+    for lowerer, inputs in ((lower_static, [0x1003, SECOND]), (lower, 2)):
+        try:
+            lowerer(undefined, inputs, MESH_LIMITS)
+        except ValueError as error:
+            assert "Undefined scalar predicate in src_scc" in str(error), error
+        else:
+            raise AssertionError("Accepted src_scc before a predicate was defined")
+    wave = Wave(0, [])
+    for addend, carry in (("0", 0), ("1", 1)):
+        wave.scalar_op("s_add_u32", ["s6", "0xffffffff", addend])
+        wave.scalar_op("s_mov_b32", ["s7", "src_scc"])
+        assert wave.scalar("s7") == carry
+    # A constant-buffer comparison has no concrete result at translation time.
+    wave.s[7] = "pointData[0].x"
+    wave.scalar_op("s_cmp_eq_u32", ["s7", "0"])
+    try:
+        wave.scalar_op("s_cmp_eq_u32", ["src_scc", "1"])
+    except ValueError as error:
+        assert "Dynamic scalar predicate in src_scc" in str(error), error
+    else:
+        raise AssertionError("Treated a dynamic SCC as a concrete word")
+
+
 def check_retired_wave():
     body = decode(CODE)
     decoded = decode(RETIRED_PREFIX + CODE)
@@ -137,6 +174,7 @@ def check_exec_restore(decoded):
 
 
 def check():
+    check_scc_operand()
     check_retired_wave()
     decoded = decode(CODE)
     variants = enumerate_variants(decoded, 2, MESH_LIMITS)
