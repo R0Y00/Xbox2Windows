@@ -7,7 +7,9 @@ entry, then publishes a supported 1-mip R8 texture and draws column 1 from it.
 Expected: the BC1 refusal is counted and named as the only refused shape, and its line is logged past
 the limit; the column 0 null is counted for the pipeline and its entry words are all zero; the R8
 texture produces no refusal and its texels reach column 1. With --control the refused call is
-replaced by the supported R8 publish, so this check must fail.
+replaced by the supported R8 publish: the control returns 0 only when the check then stops at exactly
+CONTROL_MISMATCH (column 0 samples the R8 texel instead of a null view), 77 on a capability skip, and
+1 for any other outcome, including a pass.
 """
 import os
 from pathlib import Path
@@ -32,6 +34,7 @@ WRITES = r"x2w-d3d12 memory SRV writes \(slot 70\): calls 1, distinct entries 1 
 WRITTEN = (r"x2w-d3d12 memory SRV written 1: dest=0x[0-9a-f]+ address=0x[0-9a-f]+ "
            r"res\{dim=3 fmt=61 size=2x2x1 mips=1 layout=0x0 flags=0x0 align=0 samples=1/0\} "
            r"view\{dim=4 fmt=61 map=0x1688 mostmip=0 mips=1 plane=0 clamp=0\}")
+CONTROL_MISMATCH = "column 0 row 0: 100000ff, expected a null view (000000ff)"
 ENTRY = r"x2w-draw token texture null: pipeline ([0-9a-f]{16}) srv 0 entry 0x[0-9a-f]+ words" + " 00000000" * 8
 
 
@@ -97,7 +100,24 @@ def check(directory, consumer, backend, control=False):
     return 0
 
 
+def check_control(directory, consumer, backend):
+    try:
+        result = check(directory, consumer, backend, control=True)
+    except AssertionError as mismatch:
+        if str(mismatch) == CONTROL_MISMATCH:
+            print(f"{backend} control: stopped at the expected mismatch: {mismatch}")
+            return 0
+        print(f"{backend} control: unexpected mismatch: {mismatch}")
+        return 1
+    if result == 77:
+        return 77
+    print(f"{backend} control: the check passed with the supported texture in place of the refused one")
+    return 1
+
+
 if __name__ == "__main__":
     arguments = [a for a in sys.argv[1:] if a != "--control"]
     with tempfile.TemporaryDirectory() as temporary:
-        sys.exit(check(Path(temporary), *arguments, control="--control" in sys.argv[1:]))
+        if "--control" in sys.argv[1:]:
+            sys.exit(check_control(Path(temporary), *arguments))
+        sys.exit(check(Path(temporary), *arguments))

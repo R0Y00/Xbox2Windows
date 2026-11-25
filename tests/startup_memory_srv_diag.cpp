@@ -5,7 +5,7 @@
 // shape. It leaves the descriptor-table entry untouched, so the draw in column 0 samples an entry of
 // zeros and binds a null view ("token"). A supported 1-mip R8 texture then fills the entry, and the
 // draw in column 1 samples it. With X2W_TEST_MEMORY_SRV_DIAG_CONTROL the refused call is replaced by
-// that supported R8 publish: the check must then fail.
+// that supported R8 publish: the control passes only on the mismatch that causes in column 0.
 #include <d3d12.h>
 
 #include <array>

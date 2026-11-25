@@ -72,8 +72,8 @@ int main()
     check("forced report does not hide the next change", lines(srv, false).size() == report.size() && lines(srv, true).size() == 1);
 
     TokenNullCensus tokens;
-    check("first pipeline is detailed", tokens.note(0x0e614191cdfbaf54ull));
-    check("its repeat is not", !tokens.note(0x0e614191cdfbaf54ull));
+    check("first pipeline is detailed", tokens.note(0x1000000000000001ull));
+    check("its repeat is not", !tokens.note(0x1000000000000001ull));
     check("second pipeline is detailed", tokens.note(2));
     check("third pipeline is detailed", tokens.note(3));
     for (std::uint64_t p = 10; p < 10 + TokenNullCensus::max_pipelines; ++p) {
@@ -83,7 +83,7 @@ int main()
     }
     const auto token_report = lines(tokens, true);
     check("token report", token_report.size() == 1 && token_report[0].rfind(
-          "x2w-draw token texture nulls: total 20 in 16 pipelines; 0e614191cdfbaf54=2 0000000000000002=1 0000000000000003=1 ", 0) == 0 &&
+          "x2w-draw token texture nulls: total 20 in 16 pipelines; 1000000000000001=2 0000000000000002=1 0000000000000003=1 ", 0) == 0 &&
           token_report[0].size() > 10 && token_report[0].compare(token_report[0].size() - 8, 8, " other=3") == 0);
     check("unchanged token report is skipped", lines(tokens, true).empty());
 
@@ -99,8 +99,8 @@ int main()
 
     char line[256];
     const std::uint32_t words[8] = {0, 0, 0, 0, 0, 0, 0, 0x12345678};
-    report_token_entry(line, sizeof(line), 0x0e614191cdfbaf54ull, 1, 0x7ff000, words);
-    check("entry line", !std::strcmp(line, "x2w-draw token texture null: pipeline 0e614191cdfbaf54 srv 1 entry 0x7ff000 words "
+    report_token_entry(line, sizeof(line), 0x1000000000000001ull, 1, 0x7ff000, words);
+    check("entry line", !std::strcmp(line, "x2w-draw token texture null: pipeline 1000000000000001 srv 1 entry 0x7ff000 words "
                                            "00000000 00000000 00000000 00000000 00000000 00000000 00000000 12345678"));
     std::printf("memory SRV census: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
