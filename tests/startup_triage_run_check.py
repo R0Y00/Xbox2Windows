@@ -561,6 +561,50 @@ def check_indirect_outcomes(failures: list[str]) -> None:
             failures.append("a malformed snapshot produced an indirect summary")
 
 
+def check_gpu_memory_budget(failures: list[str]) -> None:
+    def sample(local, texture):
+        return (
+            f'x2w-budget local={local} nonlocal=2/8 placed=10000/2+20000/3 texture={texture} '
+            'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0'
+        )
+
+    high_usage = sample("2500/3000", "100/5+40/2")
+    high_ratio = sample("1800/1000", "150/7+50/3")
+    high_retained = sample("n/a", "250/8+900/40").replace("nonlocal=2/8", "nonlocal=n/a")
+    malformed = (
+        sample("4000/1", "500/7+950/4").replace(" unmeasured=0", ""),
+        sample("9000/1", "900/1+999/1").replace(" buffer=1/1+0/0", r" buffer=C:\Users\alice"),
+        sample("9000/1", "900/1+999/1") + " path=secret.exe",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        log = root / "stderr.txt"
+        samples = (high_usage, high_ratio, sample("2100/1800", "170/8+80/4"), high_retained,
+                   sample("5000/0", "300/9+10/3"), sample("1000/1000", "90/6+20/1"), *malformed)
+        log.write_text("\n".join(samples), encoding="utf-8")
+        (root / "trap.log").write_text(high_ratio + "\n", encoding="utf-8")
+        report = triage_run.triage_run(root)
+        for snippet in (
+            "### GPU Memory Budget",
+            "Complete samples: `6`",
+            "Samples above local budget: `2` of `4`",
+            "| Highest local usage-to-budget ratio | 1800 | 1000 | 150 | 50 | 3 |",
+            "| Most retained texture bytes | n/a | n/a | 250 | 900 | 40 |",
+        ):
+            if snippet not in report:
+                failures.append(f"missing memory budget line: {snippet!r}")
+        for private in ("alice", "secret.exe"):
+            if private in report:
+                failures.append(f"memory budget copied private text: {private!r}")
+        log.write_text("\n".join(malformed), encoding="utf-8")
+        if "### GPU Memory Budget" in triage_run.triage_run(log):
+            failures.append("incomplete or malformed budget rows produced a section")
+        log.write_text(high_retained, encoding="utf-8")
+        report = triage_run.triage_run(log)
+        if "Highest local usage-to-budget ratio" in report or "Most retained texture bytes" not in report:
+            failures.append("an unavailable DXGI budget hid the retained-texture sample or produced a ratio")
+
+
 def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
@@ -571,6 +615,7 @@ def main() -> int:
     check_cli_invocation(failures)
     check_slot133_outcomes(failures)
     check_indirect_outcomes(failures)
+    check_gpu_memory_budget(failures)
     check_run_endpoint(failures)
     check_every_shader_reason_entry_is_reachable(failures)
     for item in failures:

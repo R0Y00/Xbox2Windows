@@ -998,6 +998,14 @@ when scanning multiple runs. The section appears only after a complete census li
 forwarded `dispatchmesh` calls alongside a graphics-pipeline refusal count. Forwarded counts describe
 the runtime's forwarding path. GPU completion and image readback require separate evidence.
 
+The GPU Memory Budget section uses complete `x2w-budget` heartbeat lines from
+`X2W_D3D12_BUDGET=1`. It counts samples above the local DXGI budget and prints
+the sample with the highest usage-to-budget ratio, plus the sample with the most
+retained texture bytes. Each row keeps the usage, budget and texture counters
+from that same heartbeat. Samples with an unavailable or zero local budget
+still contribute texture counts. The over-budget count describes observations
+in the supplied logs.
+
 The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
 memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not
 the last one), the highest heartbeat second, the counts of the last `failed requests by cause` heartbeat line (the
