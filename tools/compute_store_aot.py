@@ -339,17 +339,21 @@ DESCRIPTOR_LEGACY_FIXED = DESCRIPTOR_IDENTITY_SEL
 # raw VGPR bits for raw32 and the 16-bit integer forms. A d16 opcode converts each half to
 # binary32 first. 16-bit UINT/SINT with d16 is not a defined conversion, so those stores
 # are skipped rather than guessed. Codes absent from this table are refused the same way.
+# AMD format names list the fields from the most significant bit: Mesa's gfx10_format_table.py reverses
+# them ("Keep the bit sizes in little-endian order"), and radeonsi and radv map R10G10B10A2 (x in bits
+# 9:0, w in bits 31:30) to 2_10_10_10. So unorm10 is BUF_FMT_2_10_10_10_UNORM (50, legacy DFMT 9), and
+# BUF_FMT_10_10_10_2_UNORM (44, legacy DFMT 8), whose x is the 2-bit field in bits 1:0, is not handled.
 DESCRIPTOR_STORE_FORMATS = {
     20: ("raw32", 1), 22: ("raw32", 1),
     62: ("raw32", 2), 64: ("raw32", 2),
     72: ("raw32", 3), 74: ("raw32", 3),
     75: ("raw32", 4), 77: ("raw32", 4),
-    56: ("unorm8", 4), 23: ("unorm16x2", 2), 44: ("unorm10", 4),
+    56: ("unorm8", 4), 23: ("unorm16x2", 2), 50: ("unorm10", 4),
     29: ("f16x2", 2), 71: ("f16x4", 4),
     7: ("unorm16", 1), 8: ("snorm16", 1),
     11: ("uint16", 1), 12: ("sint16", 1), 13: ("f16", 1),
 }
-# Legacy (DFMT << 3) | NFMT for the same packers. DFMT: 16=2, 32=4, 16_16=5, 10_10_10_2=8,
+# Legacy (DFMT << 3) | NFMT for the same packers. DFMT: 16=2, 32=4, 16_16=5, 2_10_10_10=9,
 # 8_8_8_8=10, 32_32=11, 16_16_16_16=12, 32_32_32=13, 32_32_32_32=14.
 # NFMT: UNORM=0, SNORM=1, UINT=4, SINT=5, FLOAT=7.
 def _legacy_field(dfmt, nfmt):
@@ -361,7 +365,7 @@ LEGACY_DESCRIPTOR_FORMATS = {
     _legacy_field(11, 4): 62, _legacy_field(11, 7): 64,
     _legacy_field(13, 4): 72, _legacy_field(13, 7): 74,
     _legacy_field(14, 4): 75, _legacy_field(14, 7): 77,
-    _legacy_field(10, 0): 56, _legacy_field(5, 0): 23, _legacy_field(8, 0): 44,
+    _legacy_field(10, 0): 56, _legacy_field(5, 0): 23, _legacy_field(9, 0): 50,
     _legacy_field(5, 7): 29, _legacy_field(12, 7): 71,
     _legacy_field(2, 0): 7, _legacy_field(2, 1): 8,
     _legacy_field(2, 4): 11, _legacy_field(2, 5): 12, _legacy_field(2, 7): 13,

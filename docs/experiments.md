@@ -4993,11 +4993,11 @@ The compute store profile lowers `buffer_store_format_x`, `_xy`, `_xyz` and `_xy
 
 FORMAT is bits 18:12. The remaining bits must be the GFX10 identity value `0x01000FAC` (RESOURCE_LEVEL set, DST_SEL XYZW, index stride, ADD_TID, OOB and type clear) or the legacy identity value `0x00000FAC`. Legacy programs store DFMT in bits 18:15 and NFMT in bits 14:12. Any other fixed bits skip the store.
 
-The handled GFX10 formats are 32-bit UINT and FLOAT for one to four channels, `16_16_FLOAT`, `16_16_16_16_FLOAT`, `8_8_8_8_UNORM`, `16_16_UNORM`, `10_10_10_2_UNORM`, and the single-channel 16-bit UNORM, SNORM, UINT, SINT and FLOAT forms. The opcode width has to match the format. A d16 opcode converts each packed binary16 half with `f16tof32` before that packing. d16 combined with 16-bit UINT or SINT does not store. Every other format does not store. UNORM and SNORM follow the Direct3D float conversion (scale, add or subtract 0.5, then drop the fraction). The fixture includes one exact binary32 unorm8 tie, where that rule yields 3 and ties-to-even would yield 2. The RDNA buffer-format unit's tie break is unverified: the ISA text checked here does not state it, and LLVM's AMDGPU packed conversions are ties-to-even on a different unit. The profile does not write raw dwords in place of an unknown format.
+The handled GFX10 formats are 32-bit UINT and FLOAT for one to four channels, `16_16_FLOAT`, `16_16_16_16_FLOAT`, `8_8_8_8_UNORM`, `16_16_UNORM`, `2_10_10_10_UNORM`, and the single-channel 16-bit UNORM, SNORM, UINT, SINT and FLOAT forms. The opcode width has to match the format. A d16 opcode converts each packed binary16 half with `f16tof32` before that packing. d16 combined with 16-bit UINT or SINT does not store. Every other format does not store. UNORM and SNORM follow the Direct3D float conversion (scale, add or subtract 0.5, then drop the fraction). The fixture includes one exact binary32 unorm8 tie, where that rule yields 3 and ties-to-even would yield 2. The RDNA buffer-format unit's tie break is unverified: the ISA text checked here does not state it, and LLVM's AMDGPU packed conversions are ties-to-even on a different unit. The profile does not write raw dwords in place of an unknown format.
 
 A 32-bit result is a raw UAV store of one to four dwords. Packed UNORM and FLOAT16 results occupy one or two dwords. A single 16-bit channel clears its half of the containing dword with `InterlockedAnd` and inserts it with `InterlockedOr`. The reservation is four bytes per channel, so `d16_xyzw` reserves sixteen bytes rather than the two data VGPRs. Overlapping reservations are refused. The address stays 2-byte aligned, the element stays inside the stride, and the indexed layout keeps a single writer for each dword.
 
-The gfx1013 fixture uses a group of 4 and a 112-byte record. One dispatch writes all eight opcodes, thirteen formats, a legacy `32_32_32_FLOAT` xyz store and a legacy `16_16_FLOAT` xy store. WARP and the hardware adapter compare all 320 words for one group and for two. Replacing the first format with `BUF_FMT_8_SNORM`, or binding `16_UINT` to the `d16_x` store, leaves that element at the sentinel. Changing the 32-bit payload must fail at word 14. LLVM 15 assembles the fixture and `lower` of the disassembly matches `lower` of the source. The Windows LLVM 15.0.7 installer has no `llvm-mc.exe`; that round trip uses the same package's clang integrated assembler and `LLVM-C.dll`.
+The gfx1013 fixture uses a group of 4 and a 112-byte record. One dispatch writes all eight opcodes, thirteen formats, a legacy `32_32_32_FLOAT` xyz store and a legacy `16_16_FLOAT` xy store. WARP and the hardware adapter compare all 320 words for one group and for two. Replacing the first format with `BUF_FMT_8_SNORM`, the `2_10_10_10_UNORM` store's format with `10_10_10_2_UNORM`, or binding `16_UINT` to the `d16_x` store, leaves that element at the sentinel. Changing the 32-bit payload must fail at word 14. LLVM 15 assembles the fixture and `lower` of the disassembly matches `lower` of the source. The Windows LLVM 15.0.7 installer has no `llvm-mc.exe`; that round trip uses the same package's clang integrated assembler and `LLVM-C.dll`.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -5007,6 +5007,12 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_descriptor_store_form
 ```sh
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
+
+#### 2_10_10_10 and 10_10_10_2
+
+AMD format names list the fields from the most significant bit. Mesa's `gfx10_format_table.py` reverses each name into little-endian channel sizes, and radeonsi and radv map R10G10B10A2 (x in bits 9:0, w in bits 31:30) to `2_10_10_10`. So the 10-bit-x layout is `BUF_FMT_2_10_10_10_UNORM` (gfx10 code 50, legacy DFMT 9). `BUF_FMT_10_10_10_2_UNORM` (code 44, legacy DFMT 8) has a 2-bit x in bits 1:0 and 10-bit y, z and w.
+
+The descriptor-format stores and loads first used the 10-bit-x packer for code 44 and legacy DFMT 8, which would have read and written the wrong fields. They now use it for code 50 and legacy DFMT 9 only, and refuse code 44 and legacy DFMT 8. A store with that format is skipped, and a load with it is invalid, so nothing is published. The store and load fixtures use code 50, and each adds a GPU run with code 44 that must leave its output at the sentinel.
 
 ### Descriptor-format buffer loads
 
@@ -5024,7 +5030,7 @@ The caller-format gfx1030 path and the static raw reads are unchanged.
 
 The fixed bits and the format set are those of the descriptor-format stores. The fixed bits must be the GFX10 identity `0x01000FAC` or the legacy identity `0x00000FAC`. The formats are:
 - 32-bit UINT and FLOAT, one to four channels;
-- `8_8_8_8_UNORM`, `16_16_UNORM` and `10_10_10_2_UNORM`;
+- `8_8_8_8_UNORM`, `16_16_UNORM` and `2_10_10_10_UNORM`;
 - `16_16_FLOAT` and `16_16_16_16_FLOAT`;
 - 16-bit UNORM, SNORM, UINT, SINT and FLOAT.
 
@@ -5053,11 +5059,12 @@ A `--compute-store-case` file may now end with 320 t0 words; without them, t0 ke
 
 Threads 4 to 7 are pseudo-random. The expected words come from a Python model that rounds with `Fraction`. WARP and the hardware adapter compare all 320 words for one group and for two.
 
-Four more runs each make one load invalid, and each must leave all 320 words at the sentinel:
+Five more runs each make one load invalid, and each must leave all 320 words at the sentinel:
 - `8_SNORM`;
 - an `xyz` opcode on `32_32_32_32_UINT`;
 - an `xy` opcode on `32_FLOAT`;
-- a non-identity `DST_SEL`.
+- a non-identity `DST_SEL`;
+- `10_10_10_2_UNORM` in place of `2_10_10_10_UNORM`.
 
 References that publish placeholder words must fail on those runs: zeros for the invalid load, and the D3D (0, 0, 0, 1) fill for the `xy` opcode on `32_FLOAT`.
 
