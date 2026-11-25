@@ -991,6 +991,13 @@ text is grouped as `other (text omitted)` and never copied; raw snippets stay in
 outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
 (or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
 
+The `ExecuteIndirect` table reports the highest sampled cumulative count for each outcome and
+command-signature kind in the `x2w-render indirect:` census. A repeated snapshot does not increase
+any count. Each cell can come from a different sample, so avoid summing the cells as one run's total
+when scanning multiple runs. The section appears only after a complete census line and can show zero
+forwarded `dispatchmesh` calls alongside a graphics-pipeline refusal count. Forwarded counts describe
+the runtime's forwarding path. GPU completion and image readback require separate evidence.
+
 The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
 memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not
 the last one), the highest heartbeat second, the counts of the last `failed requests by cause` heartbeat line (the
