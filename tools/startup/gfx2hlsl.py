@@ -953,11 +953,21 @@ class Stage:
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
             self.low16_only_v.discard(n)
 
+    def note_v_write(self, *regs):
+        """Count writes per VGPR: the NGG pass-through checks use it to prove a register is unchanged."""
+        counts = self.__dict__.setdefault('v_writes', {})
+        for n in regs:
+            counts[n] = counts.get(n, 0) + 1
+
+    def v_version(self, n):
+        return self.__dict__.get('v_writes', {}).get(n, 0)
+
     def set_v(self, n, expr, *, low16_only=False):
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
         if self.byte_float_v:
             self.byte_float_v.discard(n)
+        self.note_v_write(n)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
         self.last_v = (n, expr)
@@ -2724,6 +2734,61 @@ class Stage:
     def op_v_mbcnt_hi_u32_b32(self, ops, mods):
         self.op_v_mbcnt_lo_u32_b32(ops, mods, high=True)
 
+    # ---- NGG vertex pass-through ---------------------------------------------------------------
+    # A pass-through NGG vertex shader asks for its allocation (s_sendmsg GS_ALLOC_REQ), parks per-lane values in LDS,
+    # synchronises (s_barrier), reads them back and exports the position, the parameters and the primitive word. D3D
+    # assembles the primitives itself, so the allocation request and the barrier have no effect here, and an LDS slot
+    # that the same lane writes and reads back is the register it was written from. Anything else stays refused: a
+    # slot read before it is written, a slot that another write or a register change made stale, an address proven
+    # the same for every lane (the lanes would share one slot) and any other LDS form.
+    GS_ALLOC_REQ = 9
+
+    def ngg_stage(self, what):
+        if self.kind != 'vs' or self.has_branches or not self.exec_known:
+            raise Unsupported('%s requires a straight-line vertex shader with entry EXEC' % what)
+
+    def op_s_sendmsg(self, ops, mods):
+        self.ngg_stage('s_sendmsg')
+        try:
+            message = int(ops[0], 0) if len(ops) == 1 and not mods else None
+        except ValueError:
+            message = None
+        if message is None or message & 0xffff != self.GS_ALLOC_REQ:
+            raise Unsupported('s_sendmsg %s' % ' '.join(ops + mods))
+        return None
+
+    def op_s_barrier(self, ops, mods):
+        self.ngg_stage('s_barrier')
+        return None
+
+    def lds_slot(self, ops, mods, count):
+        if len(ops) != count or len(mods) != 1 or not re.fullmatch(r'offset:\d+', mods[0]):
+            raise Unsupported('LDS access %s needs one VGPR address and an offset' % ' '.join(ops + mods))
+        regs = [reg_range(o) for o in ops]
+        if any(not r or r[0] != 'v' or r[1] != r[2] for r in regs):
+            raise Unsupported('LDS access %s needs single VGPR operands' % ' '.join(ops + mods))
+        return [r[1] for r in regs], int(mods[0][7:])
+
+    def op_ds_write_b32(self, ops, mods):
+        self.ngg_stage('ds_write_b32')
+        (addr, data), offset = self.lds_slot(ops, mods, 2)
+        if addr in getattr(self, 'uniform_v', ()):
+            raise Unsupported('ds_write_b32 address v%d is the same for every lane' % addr)
+        slots = self.__dict__.setdefault('lds', {})
+        slots[(addr, offset)] = (self.v_version(addr), data, self.v_version(data))
+        self.used_v.update((addr, data))
+        return None
+
+    def op_ds_read_b32(self, ops, mods):
+        self.ngg_stage('ds_read_b32')
+        (dst, addr), offset = self.lds_slot(ops, mods, 2)
+        slot = self.__dict__.get('lds', {}).get((addr, offset))
+        if slot is None or slot[0] != self.v_version(addr) or slot[2] != self.v_version(slot[1]):
+            raise Unsupported('ds_read_b32 v%d reads an LDS slot this lane did not write unchanged' % dst)
+        self.used_v.add(addr)
+        self.set_v(dst, 'v%d' % slot[1])
+        return None
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
@@ -2836,6 +2901,7 @@ class Stage:
         moved = {src: exprs.pop(dst, None), dst: exprs.pop(src, None)}
         exprs.update({reg: e for reg, e in moved.items() if e is not None and reg in self.uniform_v})
         self.used_v.update((dst, src))
+        self.note_v_write(dst, src)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def op_v_cndmask_b32(self, ops, mods):
@@ -3104,6 +3170,7 @@ class Stage:
         self.clear_low16(dst[1])
         self.clear_low16(dst[2])
         self.used_v.update((dst[1], dst[2]))
+        self.note_v_write(dst[1], dst[2])
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def carry_out_op(self, ops, mods, kind):
@@ -3366,6 +3433,12 @@ class Stage:
                 raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
             self.exports['depth'] = True
             self.emit('o.depth = %s;' % self.f(vals[0]))
+            return None
+        if target in ('prim', 'target_20'):
+            # Hardware pass-through connectivity: the entry VGPR0 word, exported unchanged and alone.
+            if (self.kind != 'vs' or self.has_branches or not self.exec_known or 'compr' in flags
+                    or len(vals) != 4 or vals[0] != 'v0' or vals[1:] != ['off', 'off', 'off'] or self.v_version(0)):
+                raise Unsupported('non-identity primitive export %s' % asm)
             return None
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):

@@ -3322,6 +3322,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_recompute_check.py")
     add_test(NAME startup_gfx2hlsl_calculated_target COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_calculated_target_check.py")
+    # Startup shader translator: NGG vertex pass-through, LDS round trip dropped (#1723).
+    add_test(NAME startup_gfx2hlsl_ngg_passthrough COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_ngg_passthrough_check.py")
     # Startup shader translator: read-only census of every refusal site (--refusals).
     add_test(NAME startup_gfx2hlsl_refusals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_refusals_check.py")
