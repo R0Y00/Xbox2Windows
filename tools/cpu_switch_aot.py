@@ -29,14 +29,14 @@ parity conditions use the producer operand width, including narrow arithmetic.
 Instructions that leave the flags unchanged (moves, LEA, NOT, BSWAP, SETcc, CMOVcc, and
 CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
 
-SHL, SHR and SAR produce flags only with an immediate count whose masked value
-(five bits, six for a 64-bit operand) is 1 to the operand width minus 1. A count
-of 0 leaves the flags of an earlier instruction, which a shift by CL may do, and
-CF is undefined for SHL and SHR by the operand width or more, so those are
-refused, and SAR by such a count with them. CF is the last bit
-shifted out and ZF, SF and PF come from the result. OF is defined only for a
-count of 1 (MSB of the result XOR CF for SHL, MSB of the operand for SHR, 0 for
-SAR), so O, NO, L, GE, LE and G are refused after a larger count.
+SHL, SAL (its /6 encoding alias), SHR and SAR produce flags only with an immediate
+count whose masked value (five bits, six for a 64-bit operand) is 1 to the operand
+width minus 1. A count of 0 leaves the flags of an earlier instruction, which a
+shift by CL may do, and CF is undefined for SHL, SAL and SHR by the operand width
+or more, so those are refused, and SAR by such a count with them. CF is the last
+bit shifted out and ZF, SF and PF come from the result. OF is defined only for a
+count of 1 (MSB of the result XOR CF for SHL and SAL, MSB of the operand for SHR,
+0 for SAR), so O, NO, L, GE, LE and G are refused after a larger count.
 
 BT, BTS, BTR and BTC take a 16-, 32- or 64-bit register or memory bit base and
 a register or immediate bit offset. Register bases and immediate offsets use
@@ -222,7 +222,7 @@ HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, FlowControl.INDIRECT_CALL)
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
-SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
+SHIFTS = {M.SHL: "<<", M.SAL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
 # Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
 BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
@@ -1349,12 +1349,12 @@ class Lifter:
                 value = f"{a} {SHIFTS[mnemonic]} {count}"
             if sets_flags:
                 # CF is the last bit shifted out. OF, defined only for a count of 1, is the MSB of the
-                # result XOR CF for SHL, the MSB of the operand for SHR and 0 for SAR.
+                # result XOR CF for SHL/SAL, the MSB of the operand for SHR and 0 for SAR.
                 self.flags = True
                 bits, n, wide = width * 8, shift_count(ins), f"static_cast<std::uint64_t>({source})"
-                carry = f"(({wide} >> {bits - n if mnemonic == M.SHL else n - 1}) & 1u)"
+                carry = f"(({wide} >> {bits - n if mnemonic in (M.SHL, M.SAL) else n - 1}) & 1u)"
                 overflow = "0u"
-                if n == 1 and mnemonic == M.SHL:
+                if n == 1 and mnemonic in (M.SHL, M.SAL):
                     overflow = f"((({wide} >> {bits - 1}) ^ ({wide} >> {bits - 2})) & 1u)"
                 elif n == 1 and mnemonic == M.SHR:
                     overflow = f"(({wide} >> {bits - 1}) & 1u)"
