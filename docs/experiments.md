@@ -5604,7 +5604,7 @@ source is a VGPR, an SGPR that holds a known word, an integer inline constant or
 is data only. The `_e32` and `_e64` spellings, source modifiers (`-v`, `|v|`, `neg()`), `clamp`, a register range
 and a third source stop the lowering at the instruction. A source that is not a known word and a destination past
 `v255` are refused with `Unverified ALU operand`. `v_mbcnt_lo/hi_u32_b32` keep their own lane-mask lowering, and
-`s_bcnt1_i32_b32` stays limited to `exec_lo`.
+`s_bcnt1_i32_b32` counts `exec_lo` or a known scalar word (see below).
 
 The fixture replaces the `umin` of the read-compute-write fixture with four `v_bcnt_u32_b32`, hand-edited in LLVM 15
 spelling: `out = bcnt(-16) + bcnt(0x2c5a96e1) + bcnt(gid) + bcnt(p) + key`, where `p` is the product above and
@@ -5679,6 +5679,21 @@ Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bcnt_exec_(warp|
 
 ```sh
 python -B tests/compute_alu_bcnt64_check.py
+```
+
+#### Scalar bit count of a general word, `v_mbcnt` over `exec_lo` and wave32 `vcc_hi`
+
+Part of #2022 (item G). Three small forms of the compute store profile:
+
+- `s_bcnt1_i32_b32 sD, S` with any known scalar word `S` (a loaded constant, a move or ALU result, an inline constant, a literal, wave32 `vcc_hi`) is `D = CountOneBits(S)` (RDNA2 ISA SOP1; LLVM `S_BCNT1_I32_B32`, `ctpop`). A known word folds; a run-time word becomes `countbits(...)`. `SCC` is unread. `exec`, `exec_hi`, `vcc_lo` and an unknown register stay refused with `Unsupported active lane count source`; `exec_lo` keeps its wave and group-size rules.
+- `v_mbcnt_lo_u32_b32 vD, exec_lo, base` outside a guarded region uses an all-ones mask: every lane below the current one is active in a full wave, so D is the lane index within the wave plus `base`. Inside a guarded region `exec` is the lane compare and the form is refused (`Active lane mask inside guarded region`). `v_mbcnt_hi` over a 32-bit wave adds nothing, as before.
+- `s_mov_b32 vcc_hi, K` followed by a known-word read of `vcc_hi`. Wave32 VCC is `vcc_lo` alone and every lowered write of VCC (compare, carry, saveexec) touches only that half, so `vcc_hi` keeps the moved word. It needs `--wave-size 32`; it is written only by `s_mov_b32`; any other write is refused, as is a read before the move.
+
+The fixtures are source-built (LLVM 15 spelling): a guarded read-compute program with a run-time word, a `vcc_hi` mask and `v_mbcnt` over a scalar mask, and an unguarded 64-thread program with `exec_lo` as the mask. The readback compares every word with an independent CPU reference built from the instruction definitions. References for a mask that includes the current lane, a mask that ignores the lane, a dropped `vcc_hi` mask and a zero-bit count must fail, and so must mutated HLSL (zero mask, dropped count, unmasked lane).
+
+```sh
+python -B tests/compute_alu_lane_gaps_check.py controls
+ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_lane_gaps_(warp|hardware)$' -V
 ```
 
 #### First active lane of a full wave

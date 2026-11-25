@@ -268,6 +268,7 @@ jobs:
             tests/compute_heap_view_check.py \
             tests/compute_heap_store_check.py \
             tests/compute_desc_numeric_check.py \
+            tests/compute_alu_lane_gaps_check.py controls \
             tests/startup_ngg_slice_check.py \
             tests/startup_gfx2hlsl_handler_arity_check.py \
             tests/run_checks_parallel_check.py
