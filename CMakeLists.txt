@@ -555,6 +555,17 @@ add_test(NAME startup_present_signature_held_source_warp COMMAND startup_present
 set_tests_properties(startup_present_signature_held_source_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_test(NAME startup_present_signature_unheld_source_control_warp COMMAND startup_present_signature unheld_control)
 set_tests_properties(startup_present_signature_unheld_source_control_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+if(EXISTS "${INTAKE_PYTHON}")
+    add_executable(startup_present_producer tests/startup_present_producer.cpp)
+    target_compile_features(startup_present_producer PRIVATE cxx_std_17)
+    target_link_libraries(startup_present_producer PRIVATE d3d12_xs_shim d3d12 dxgi)
+    foreach(backend IN ITEMS warp hardware)
+        add_test(NAME startup_present_producer_${backend} COMMAND "${INTAKE_PYTHON}" -B
+                 "${CMAKE_SOURCE_DIR}/tests/startup_present_producer_check.py" "${backend}" "$<TARGET_FILE:startup_present_producer>")
+        set_tests_properties(startup_present_producer_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+    endforeach()
+endif()
 add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)
 target_compile_features(startup_placement_alloc PRIVATE cxx_std_17)
 target_include_directories(startup_placement_alloc PRIVATE src)

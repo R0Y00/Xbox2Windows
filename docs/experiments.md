@@ -1,5 +1,37 @@
 # Experiment notes and reproduction commands
 
+## Present color producer trace
+
+Set `X2W_RED_PRODUCER_AUTO=3700,12` and `X2W_PRESENT_SIGNATURE_EVERY=1` to sample the
+title-selected RGBA8 presentation texture. `X2W_RED_PRODUCER_RGB=255,0,255` selects a
+specific RGB triplet. The default match is `255,0,0`. A transition to the match at or
+after present 3700 arms the next 12 frames after the sample is published. The log also
+reports up to 64 earlier recording identities for the known presentation targets.
+Use `X2W_RED_PRODUCER_FRAMES=4100,4110` for an explicit frame window.
+
+The producer rows report one RGBA8 texel before and after a clear or supported
+graphics draw to a known present target. They include the submitting queue and
+operation order. Present samples use the same texel, and attachment rows identify
+the bound render targets and depth view. A queue fence guards the readbacks.
+Recording history gives candidate commands. Attribution requires a completed
+producer read and a matching presentation resource. The trace covers direct-list
+graphics writes to previously seen single-sample present targets. Compute writes,
+alias writes and resources upstream of those targets require separate evidence.
+The diagnostic retains up to eight present resources and 512 paired readbacks in
+an opted-in process.
+
+`startup_present_producer` uses a 16×16 source-built texture and known clears. It
+checks exact colors on both sides of each clear, compared to subsequent presents,
+then resubmits the closed recording and reverses the writes. The automatic cases
+check red and magenta, ignore an early exact match and a later near match, and
+refuse an out-of-range RGB component. Run the WARP and hardware checks separately
+when reporting adapter results.
+
+```powershell
+cmake --build --preset dev --target startup_present_producer
+ctest --preset dev --no-tests=error -R '^startup_present_producer_(warp|hardware)$' -V
+```
+
 ### Packed pixel position in a source-built shader
 
 Run `ctest --preset dev --no-tests=error -R '^startup_packed_screen_position_(hardware|warp)$' -V`.
