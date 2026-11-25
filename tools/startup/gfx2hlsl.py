@@ -956,8 +956,10 @@ class Stage:
     def note_v_write(self, *regs):
         """Count writes per VGPR: the NGG pass-through checks use it to prove a register is unchanged."""
         counts = self.__dict__.setdefault('v_writes', {})
+        lanes = self.__dict__.setdefault('lane_v', {0})
         for n in regs:
             counts[n] = counts.get(n, 0) + 1
+            lanes.discard(n)
 
     def v_version(self, n):
         return self.__dict__.get('v_writes', {}).get(n, 0)
@@ -2739,8 +2741,8 @@ class Stage:
     # synchronises (s_barrier), reads them back and exports the position, the parameters and the primitive word. D3D
     # assembles the primitives itself, so the allocation request and the barrier have no effect here, and an LDS slot
     # that the same lane writes and reads back is the register it was written from. Anything else stays refused: a
-    # slot read before it is written, a slot that another write or a register change made stale, an address proven
-    # the same for every lane (the lanes would share one slot) and any other LDS form.
+    # slot read before it is written, a slot that another write or a register change made stale, an address not proven
+    # different for every lane (v0 at entry, or a plain copy of it; lanes could share one slot) and any other LDS form.
     GS_ALLOC_REQ = 9
 
     def ngg_stage(self, what):
@@ -2762,6 +2764,8 @@ class Stage:
         return None
 
     def lds_slot(self, ops, mods, count):
+        if mods == []:
+            mods = ['offset:0']   # the decoder omits a zero immediate offset
         if len(ops) != count or len(mods) != 1 or not re.fullmatch(r'offset:\d+', mods[0]):
             raise Unsupported('LDS access %s needs one VGPR address and an offset' % ' '.join(ops + mods))
         regs = [reg_range(o) for o in ops]
@@ -2772,9 +2776,12 @@ class Stage:
     def op_ds_write_b32(self, ops, mods):
         self.ngg_stage('ds_write_b32')
         (addr, data), offset = self.lds_slot(ops, mods, 2)
-        if addr in getattr(self, 'uniform_v', ()):
-            raise Unsupported('ds_write_b32 address v%d is the same for every lane' % addr)
+        if addr not in self.__dict__.setdefault('lane_v', {0}):
+            raise Unsupported('ds_write_b32 address v%d is not proven different for every lane' % addr)
         slots = self.__dict__.setdefault('lds', {})
+        # Another address register may hold the same word, and a 4-byte write overlaps a neighbour closer than 4.
+        for key in [k for k in slots if k[0] != addr or abs(k[1] - offset) < 4]:
+            del slots[key]
         slots[(addr, offset)] = (self.v_version(addr), data, self.v_version(data))
         self.used_v.update((addr, data))
         return None
@@ -2876,7 +2883,10 @@ class Stage:
         self.set_s(dst[1], 'sp%d_%d' % (n, lane), sym=sym, uniform=uniform)
 
     def op_v_mov_b32(self, ops, mods):
-        self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
+        src, dst = reg_range(ops[1]), reg_range(ops[0])[1]
+        self.set_v(dst, self.u(ops[1]))
+        if src and src[0] == 'v' and src[1] == src[2] and src[1] in self.__dict__.setdefault('lane_v', {0}):
+            self.lane_v.add(dst)
 
     def op_v_swap_b32(self, ops, mods):
         # VOP1 only (llvm-mc rejects the e64, DPP and SDWA spellings for gfx1013). Both registers exchange

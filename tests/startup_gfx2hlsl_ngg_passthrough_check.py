@@ -29,6 +29,7 @@ class Pipe:
 
 
 ALLOC = 's_sendmsg 0x9'
+LANE = 'v_mov_b32_e32 v1, v0'
 BARRIER = 's_barrier 0x0'
 PRIM = 'exp target_20 v0, off, off, off done'
 POS = 'exp pos0 v4, v5, v6, v7 done'
@@ -57,12 +58,15 @@ ROUND_TRIP = ('v_mov_b32_e32 v1, v0', 'ds_write_b32 v1, v2 offset:16', BARRIER, 
 got = run(ALLOC, *ROUND_TRIP, PRIM)
 check('round trip becomes a register copy', got == ['v1 = v0;', 'v3 = v2;'], repr(got))
 
-got = run(ALLOC, 'ds_write_b32 v1, v2 offset:16', BARRIER, 'ds_read_b32 v3, v1 offset:16', POS, PRIM)
+got = run(ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', BARRIER, 'ds_read_b32 v3, v1 offset:16', POS, PRIM)
 check('position export survives the pass-through', got[-1] == 'o.pos = float4(F(v4), F(v5), F(v6), F(v7));', repr(got))
 
-got = run(ALLOC, 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v1, v8 offset:20', BARRIER,
+got = run(ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v1, v8 offset:20', BARRIER,
           'ds_read_b32 v3, v1 offset:20', 'ds_read_b32 v9, v1 offset:16', PRIM)
-check('slots are kept apart by offset', got == ['v3 = v8;', 'v9 = v2;'], repr(got))
+check('slots are kept apart by offset', got == ['v1 = v0;', 'v3 = v8;', 'v9 = v2;'], repr(got))
+
+got = run(ALLOC, 'ds_write_b32 v0, v2', BARRIER, 'ds_read_b32 v3, v0', PRIM)
+check('omitted DS offset means zero', got == ['v3 = v2;'], repr(got))
 
 # Controls that must stay refused.
 REFUSED = [
@@ -74,13 +78,24 @@ REFUSED = [
     ('compressed primitive export', (ALLOC, 'exp target_20 v0, off, off, off compr done'),
      'non-identity primitive export'),
     ('primitive export after a branch', (PRIM,), 'non-identity primitive export', True),
-    ('slot read without a write', (ALLOC, 'ds_read_b32 v3, v1 offset:16'), 'did not write'),
-    ('other offset read', (ALLOC, 'ds_write_b32 v1, v2 offset:16', 'ds_read_b32 v3, v1 offset:20'), 'did not write'),
+    ('slot read without a write', (ALLOC, LANE, 'ds_read_b32 v3, v1 offset:16'), 'did not write'),
+    ('other offset read', (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'ds_read_b32 v3, v1 offset:20'),
+     'did not write'),
+    ('address masked to one word for all lanes',
+     (ALLOC, 'v_and_b32_e32 v1, 0, v0', 'ds_write_b32 v1, v0 offset:16', 'ds_read_b32 v3, v1 offset:16'),
+     'not proven different'),
+    ('address never derived from the lane word', (ALLOC, 'ds_write_b32 v7, v2 offset:16'), 'not proven different'),
+    ('aliasing write through a copied address',
+     (ALLOC, LANE, 'v_mov_b32_e32 v4, v1', 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v4, v8 offset:16',
+      'ds_read_b32 v3, v1 offset:16'), 'did not write'),
+    ('overlapping write at a nearby offset',
+     (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'ds_write_b32 v1, v8 offset:18', 'ds_read_b32 v3, v1 offset:16'),
+     'did not write'),
     ('address changed after the write',
-     (ALLOC, 'ds_write_b32 v1, v2 offset:16', 'v_add_nc_u32_e32 v1, 1, v1', 'ds_read_b32 v3, v1 offset:16'),
+     (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'v_add_nc_u32_e32 v1, 1, v1', 'ds_read_b32 v3, v1 offset:16'),
      'did not write'),
     ('data changed after the write',
-     (ALLOC, 'ds_write_b32 v1, v2 offset:16', 'v_mov_b32_e32 v2, 0', 'ds_read_b32 v3, v1 offset:16'),
+     (ALLOC, LANE, 'ds_write_b32 v1, v2 offset:16', 'v_mov_b32_e32 v2, 0', 'ds_read_b32 v3, v1 offset:16'),
      'did not write'),
     ('unknown message', ('s_sendmsg 0x2',), 's_sendmsg'),
     ('LDS write in a pixel shader', ('ds_write_b32 v1, v2 offset:16',), 'straight-line vertex shader', False, 'ps'),

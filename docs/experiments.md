@@ -3960,6 +3960,17 @@ python3 -B tests/startup_ngg_slice_check.py
 python3 -B tests/startup_ngg_slice_check.py binary llvm-mc-15
 ```
 
+### NGG vertex pass-through lowering
+
+`tools/startup/gfx2hlsl.py` translates the straight-line NGG pass-through vertex profile (#1723). `s_sendmsg` message 9 (`GS_ALLOC_REQ`) and `s_barrier` are dropped, because D3D assembles the primitives itself. An LDS round trip is forwarded as a register copy: `ds_write_b32 vA, vD offset:N` followed by `ds_read_b32 vR, vA offset:N` becomes `vR = vD`. An omitted DS offset means 0. The primitive export (`exp prim` / `target_20`) is accepted only as the unchanged entry `v0` word with the other channels off.
+
+Refused: any branch or non-vertex stage, other `s_sendmsg` messages, a read without a matching write, a slot made stale by a change to the address or data register, and a write through a different address register or at an offset closer than 4 bytes (it could alias the slot). The address register must be proven different for every lane: the entry `v0` or a plain `v_mov_b32` copy of it. Any other computed address is refused, since lanes could share one LDS word.
+
+```sh
+python3 -B tests/startup_gfx2hlsl_ngg_passthrough_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ngg_passthrough$' -V
+```
+
 ## Compute UAV stores from a native container
 
 `tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The store profile translates one or more non-overlapping raw UAV stores of one to four known 32-bit constant words per invocation, including constants loaded via `s_mov_b32`, `s_movk_i32`, and `v_mov_b32` register copies, along with `s_clause` hints and combined `lgkmcnt(0)`/`vmcnt(0)` waits. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.
