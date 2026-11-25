@@ -142,6 +142,54 @@ def check_mutants_change_the_result(code):
         assert wrong, name
 
 
+class StubWave:
+    """A wave that only reports the LDS traffic of its barrier intervals."""
+
+    def __init__(self, intervals):
+        self.intervals = intervals
+        self.staged, self.reads = {}, set()
+
+    def steps(self, decoded, expressions):
+        for staged, reads in self.intervals:
+            self.staged, self.reads = dict(staged), set(reads)
+            yield
+
+
+def check_interval_hazards():
+    """A store and a read of one dword in one interval are refused for either wave order."""
+    store, read = ({0: 7}, ()), ({}, (0,))
+    for first, second in ((store, read), (read, store)):
+        for barrier_ends_interval in (True, False):
+            tail = [({}, ())] if barrier_ends_interval else []
+            waves = [StubWave([first] + tail), StubWave([second] + tail)]
+            try:
+                run_group(waves, [], {})
+            except ValueError as error:
+                assert "without a barrier" in str(error), error
+            else:
+                raise AssertionError((first, second, barrier_ends_interval))
+    # Disjoint dwords stay accepted.
+    run_group([StubWave([({0: 7}, ())]), StubWave([({}, (4,))])], [], {})
+
+
+def check_pending_lds_destination():
+    """A vector load or ALU write to a register with an unwaited LDS read is refused."""
+    buffer_load = "buffer_load_dword v1, v5, s[32:35], 0 offen"
+    for line in (buffer_load, "v_mov_b32_e32 v1, 0"):
+        wave = Wave(0, [0] * 4)
+        wave.lds = {0: 9}
+        wave.exec = 1
+        for j in range(4):
+            wave.s[32 + j] = (32, j)
+        wave.lds_op("ds_read_b32", "v1, v5")
+        try:
+            list(wave.steps([(0, line)], {}))
+        except ValueError as error:
+            assert "ending" in str(error) or "overwrites" in str(error), error
+        else:
+            raise AssertionError(line)
+
+
 def reassemble(assembler, objcopy, library):
     with tempfile.TemporaryDirectory() as directory:
         obj, raw = (Path(directory) / name for name in ("fixture.o", "fixture.bin"))
@@ -166,4 +214,6 @@ if __name__ == "__main__":
     check_allocation(CODE)
     check_refusals(CODE)
     check_mutants_change_the_result(CODE)
+    check_interval_hazards()
+    check_pending_lds_destination()
     print("Group-wide any-lane branch matched the CPU model; mutants and refusals held")
