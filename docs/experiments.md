@@ -295,6 +295,32 @@ cmake --build --preset dev --target startup_stub_consumer startup_stub_acphal st
 ctest --preset dev --no-tests=error -R '^startup_stubs$' --output-on-failure
 ```
 
+## Metadata-backed compressed portions (experimental)
+
+`X2W_DSTORAGE_CHUNK_WINDOWS=1` enables bounded RDS5 BCPack and zlib portion decoding in the startup
+storage stand-in. A validated boundary table must identify exactly one chunk matching the
+format, compressed size and requested 64 KiB source-window offset. The complete chunk is
+decoded and checked before any requested output bytes are published. Metadata and stored reads
+are capped at 1 MiB; decoded chunks at 16 MiB. Non-RDS5 inputs, ambiguous matches, malformed extents, corrupt streams
+and out-of-range windows retain the failure path. The window-offset convention remains an
+experimental runtime contract; this is not a general archive or DirectStorage implementation.
+
+`startup_chunk_windows` builds a 128 KiB BC1 stream by reinterleaving the existing source-authored
+synthetic lane fragments. It compares the first and second 64 KiB outputs with a full decode,
+requires direct short-output decoding to fail, and checks refusal and unchanged outputs for
+bad offsets, wrong sizes and codecs, invalid data, excessive counts and ambiguous matches.
+A second fixture uses 4 MiB of CPython-zlib output, verifies its checksum before publishing
+first, interior and final windows, and rejects an extent beyond the 16 MiB budget.
+The zlib queue probe also checks 8 KiB outputs at the first and continuation offsets.
+Both run through the DirectStorage stand-in and check exact output and guard bytes; disabling
+the option makes the same bounded requests fail with unchanged destinations. The heartbeat's
+`metadata-windows` count records successful writes by this path.
+
+```powershell
+cmake --build --preset dev --target startup_chunk_window_check startup_stub_xcrdapi
+ctest --preset dev --no-tests=error -R '^startup_chunk_windows$' -V
+```
+
 ## UTF-8 persistent storage root
 
 The runtime proxy reads `X2W_STORAGE_PATH` with `GetEnvironmentVariableW` and converts it to
