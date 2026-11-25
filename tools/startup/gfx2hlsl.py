@@ -3858,7 +3858,8 @@ class Stage:
         are copied as bits, like pixel_aot's lowering of the same instruction: no binary16 denormal flush and no
         NaN quieting is modelled (an assumption, not measured). Register sources only: an inline float constant
         on a binary16 operand is a binary16 value, not the binary32 word u() would give. A destination op_sel bit
-        and clamp are refused."""
+        and clamp are refused, and so is any modifier other than the one op_sel:[a,b,c] spelling the decoder
+        prints."""
         sel = [0, 0, 0]
         for m in mods:
             match = re.fullmatch(r'op_sel:\[([01]),([01]),([01])\]', m)
@@ -3877,6 +3878,8 @@ class Stage:
             reg = reg_range(tok)
             if not reg or reg[1] != reg[2] or reg[0] not in ('v', 's'):
                 raise Unsupported('v_pack_b32_f16 source %s' % ops[1 + i])
+            # The high half needs the whole word; the low half reads only bits 15:0, so a register whose high half
+            # is undefined (after an odd-count d16 load) stays readable here.
             half = '(%s >> 16)' % self.u(tok) if sel[i] else '(%s & 0xffffu)' % self.u(tok, low16_only=True)
             if absolute:
                 half = '(%s & 0x7fffu)' % half
