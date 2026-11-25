@@ -424,6 +424,26 @@ inside the range, an empty view alone) and reads the counters through the `x2w_d
 then copies a view into an empty slot, clears the copy red and reads the target back. It does not draw. The export reads
 the same counters the totals line prints.
 
+Command-list slots 15 (`CopyBufferRegion`), 17 (`CopyResource`) and 19 (`ResolveSubresource`), unshifted like slots 12 to 25,
+copy whole resources in render mode (`src/startup_stubs/list_copy.inl`; the checks are in `list_copy.h`). Each argument is
+mapped to its desktop resource, the pair is moved to the copy or resolve states for the call and back to COMMON at Close
+(an upload buffer stays readable and a readback buffer stays a copy destination), and the call is forwarded. A call the
+desktop would reject is counted, logged (first six) and not forwarded, with the reason: `unresolved`, `same_resource`,
+`not_buffer`, `not_texture`, `dimension_mismatch`, `size_mismatch`, `format_mismatch`, `sample_mismatch`,
+`bad_subresource`, `source_not_multisampled`, `destination_multisampled`, `bad_format`, `zero_size` or
+`range_overflow`, `heap_direction` (an upload buffer as a destination, a readback buffer as a source),
+`initial_state` (a placed buffer that does not start in COMMON) or `title_backed_source` (a title-backed default-heap
+buffer or an upload buffer, which have no desktop copy the list can refresh without rewriting bytes an earlier submission may
+still read). A source the title maps at its own memory must be current: a texture takes the draw path's upload and is refused
+when that upload cannot stage it (unreadable or unsupported memory), and an aliased placed buffer is already current. A copy or resolve destination with title memory is marked GPU-written when its list is submitted (on its own list at once), so a later draw does not
+upload the stale title memory over the result; a list discarded by Reset or a failed Close marks nothing. CopyResource accepts formats of one DXGI family (colour, depth, 8/16/32-bit
+and block-compressed). A resolve format is exact against a fully typed endpoint and only family-compatible with a
+typeless one; a typeless resolve format (or an unknown one over typeless endpoints) resolves as the family's typed
+choice: half float for `R16G16B16A16`, normalised for the 8-bit and 10-bit families. Calls on a closed list are ignored.
+These slots have not been seen in a title log yet. `CopyTextureRegion` (16) and `CopyTiles` (18) are not handled.
+`ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,
+resolves and reads back through the `x2w_d3d12_list_copy_stats` export.
+
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
@@ -1015,6 +1035,8 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 |---|---|
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
+| `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
+| `X2W_XMEM_LAZY_STARTUP=1` | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks placed by `X2W_XMEM_STARTUP_BELOW_40` stay committed up front. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
@@ -1860,15 +1882,21 @@ releases the request. This affects scheduling and preserves the existing audio
 routing and sample format.
 
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
-and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
-handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
-`XApuGetResultCount` and `XApuDequeueResult` can retire commands. A successful dequeue zeroes the
-`0x58`-byte result buffer. An empty queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves
-the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
+and `XApuDisconnect`, refuses null or unreadable command headers (`E_POINTER`), null outputs
+(`E_POINTER`), and unknown or disconnected handles (`E_HANDLE`), and records one `(type, slot)`
+entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
+index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
+connection; additional enqueues return `E_OUTOFMEMORY` without dropping queued entries).
+`XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` zeroes the
+`0x58`-byte result buffer and writes the retired command's type at `+0x00` and slot index at
+`+0x04` (keeping decoded bytes at `+0x34` zero because no audio/XMA decoder runs here). An empty
+queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
 
-The all-zero result is a placeholder: its type field (`+0`) is not a measured
-completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
-not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
+Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
+observed callers; the queue intentionally echoes any 32-bit type value at `+0x00` verbatim
+(including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
+outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
+released on `XApuDisconnect`. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
@@ -1895,8 +1923,9 @@ peak 0); and starvation (drain to padding 0, hold 300 ms, resume, consumption re
 code 77 means no usable render endpoint (or an unsupported mix format). It prints the endpoint,
 format and Windows build. A skip is neither a pass nor a failure. Every wait is bounded.
 
-Not established: the layout of the console audio command queue (`xapu.cpp` is not decoded
-here), what is audible (no capture-path check), and any hardware or driver glitch count.
+Not established: `XApuEnqueueCommand`/`XApuDequeueResult` payload fields beyond `(+0x00, +0x04, +0x34)`,
+the 16-byte second output argument of `XApuConnect`, what is audible (no capture-path check), and any
+hardware or driver glitch count.
 
 ## APU heap stand-in
 
@@ -2017,7 +2046,9 @@ committed, is zeroed on reuse, and is chosen before a fresh slot. The experiment
 export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
 calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
 injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages
-can be mapped on retry. Caller-owned placeholders must already match the requested view size. The
+can be mapped on retry. With the experimental `X2W_XMEM_LAZY_COMMIT=1`, a fresh slot waits for its first
+CPU access instead of its mapping (see [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch)).
+Caller-owned placeholders must already match the requested view size. The
 heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see

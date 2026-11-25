@@ -24,6 +24,7 @@ struct Backing {
     ULONG_PTR views = 0;
     ULONG64 offset = 0;  // the page is one 64 KiB slot of a shared section (see section_for)
     std::size_t slab = 0;  // index of that section among the slabs
+    bool committed = true;  // false while a lazily mapped slot is untouched (X2W_XMEM_LAZY_COMMIT)
 };
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
@@ -99,11 +100,147 @@ bool commit_slot(HANDLE slab, ULONG64 offset, bool zero)
     return ok;
 }
 
-HANDLE section_for(ULONG_PTR page)
+// Experimental (X2W_XMEM_LAZY_COMMIT=1, #1199): a fresh slot is not committed when its page is mapped. The first
+// CPU access faults and lazy_commit_fault commits that slot. Writers that do not fault -- kernel-mode I/O into
+// mapped pages, GPU placement, stand-in writes behind a commit-state check -- call x2w_xmem_commit_range first.
+// Reused slots and x2w_xmem_write_physical still commit before use.
+bool lazy_commit_requested()
+{
+    static const bool on = x2w_local::env_on("X2W_XMEM_LAZY_COMMIT");
+    return on;
+}
+
+// Set when xmem.dll loads, once the fault handler is installed. Without the handler a lazy page could never be
+// committed, so the switch then acts as off: pages and blocks are committed up front.
+bool lazy_handler_installed = false;
+
+bool lazy_commit()
+{
+    return lazy_handler_installed && lazy_commit_requested();
+}
+
+// Experimental (X2W_XMEM_LAZY_STARTUP=1 with X2W_XMEM_LAZY_COMMIT=1, #1199): the large startup blocks
+// XMemVirtualAlloc commits for the title (commit_startup_block, 32 MiB and up) are only reserved. The fault
+// handler commits them 256 KiB at a time on first touch. x2w_xmem_commit_range commits the chunks behind a range
+// for writers that cannot fault, and x2w_xmem_commit_block commits a whole block before the GPU uses it.
+bool lazy_startup()
+{
+    static const bool on = x2w_local::env_on("X2W_XMEM_LAZY_STARTUP");
+    return on && lazy_commit();
+}
+
+constexpr SIZE_T lazy_chunk = SIZE_T{256} << 10;
+constexpr SIZE_T lazy_block_min = SIZE_T{32} << 20;
+
+// The reserved startup blocks that are still committed lazily: base -> bytes.
+struct LazyBlocks {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::map<ULONG_PTR, SIZE_T> blocks;
+};
+LazyBlocks lazy_blocks;
+volatile LONG lazy_block_releases = 0;  // lazy blocks the title has released (keys the fault handler's retry)
+
+// The lazy block holding address, as base and size; false when there is none. The caller holds lazy_blocks.lock
+// until it has committed what it found, so that a release (virtual_free_lazy) cannot run in between and leave it
+// committing addresses that no longer belong to the block.
+bool lazy_block_at(ULONG_PTR address, ULONG_PTR& base, SIZE_T& bytes)
+{
+    auto it = lazy_blocks.blocks.upper_bound(address);
+    const bool inside = it != lazy_blocks.blocks.begin() && (--it, address - it->first < it->second);
+    if (inside) {
+        base = it->first;
+        bytes = it->second;
+    }
+    return inside;
+}
+
+// Commits the whole chunks of a lazy block that [from, to) touches; false with the system error if that fails.
+bool commit_block_chunks(ULONG_PTR base, SIZE_T bytes, ULONG_PTR from, ULONG_PTR to)
+{
+    const SIZE_T first = (from - base) & ~(lazy_chunk - 1);
+    SIZE_T last = to - base < bytes ? to - base : bytes;  // offsets in the block; to is exclusive
+    last = (last + lazy_chunk - 1) & ~(lazy_chunk - 1);
+    if (last > bytes) last = bytes;
+    return VirtualAlloc(reinterpret_cast<void*>(base + first), last - first, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+}
+
+// Commits a lazily mapped slot under memory.mutex; false with the system error if the commit fails.
+bool commit_backing(Backing& backing)
+{
+    if (backing.committed) return true;
+    if (!commit_slot(backing.section, backing.offset, false)) return false;
+    backing.committed = true;
+    return true;
+}
+
+// The backing behind a mapped address (CPU view, or its GPU-view mirror), under memory.mutex.
+Backing* backing_at(ULONG_PTR address)
+{
+    if (memory.mirror_bytes && address - memory.mirror_gpu < memory.mirror_bytes)
+        address = address - memory.mirror_gpu + memory.mirror_cpu;  // the GPU view shows the same section
+    const auto view = memory.views.find(address & ~(ULONG_PTR{page_bytes} - 1));
+    if (view == memory.views.end()) return nullptr;
+    const auto backing = memory.backings.find(view->second);
+    return backing == memory.backings.end() ? nullptr : &backing->second;
+}
+
+LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
+{
+    const EXCEPTION_RECORD* record = e->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR address = record->ExceptionInformation[1];
+    if (lazy_startup()) {
+        ULONG_PTR base = 0;
+        SIZE_T bytes = 0;
+        MEMORY_BASIC_INFORMATION info{};
+        AcquireSRWLockShared(&lazy_blocks.lock);
+        const bool lazy = lazy_block_at(address, base, bytes) &&
+                          VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) && info.State == MEM_RESERVE;
+        const bool committed = lazy && commit_block_chunks(base, bytes, address, address + 1);
+        ReleaseSRWLockShared(&lazy_blocks.lock);
+        if (lazy) return committed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+        // Another thread committed this chunk (or the whole block, which then leaves the list) between the fault
+        // and the query: committed read-write memory cannot fault, so retry once. The retry is keyed on the chunk
+        // and on the release count, so a fault that stays is passed on, while a new block later placed at the same
+        // addresses can still be raced once (separate from the slot path's retry below).
+        thread_local ULONG_PTR retried_chunk = 0;
+        thread_local LONG retried_releases = 0;
+        const ULONG_PTR chunk = address & ~(ULONG_PTR{lazy_chunk} - 1);
+        const LONG releases = lazy_block_releases;
+        if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) && info.Type == MEM_PRIVATE &&
+            info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE &&
+            !(retried_chunk == chunk && retried_releases == releases)) {
+            retried_chunk = chunk;
+            retried_releases = releases;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    // A thread that raced another one to the same slot finds it committed: retry once, then pass the fault on.
+    thread_local ULONG_PTR retried = 0;
+    const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
+    const std::lock_guard guard(memory.mutex);
+    Backing* backing = backing_at(address);
+    if (!backing) return EXCEPTION_CONTINUE_SEARCH;
+    if (backing->committed) {
+        if (retried == page) return EXCEPTION_CONTINUE_SEARCH;
+        retried = page;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (!commit_backing(*backing)) return EXCEPTION_CONTINUE_SEARCH;
+    retried = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+HANDLE section_for(ULONG_PTR page, bool need_commit = true)
 {
     const auto existing = memory.backings.find(page);
-    if (existing != memory.backings.end())
+    if (existing != memory.backings.end()) {
+        if (need_commit && !commit_backing(existing->second)) return nullptr;
         return existing->second.section;
+    }
+    // A fresh slot (never used) of a SEC_RESERVE slab reads as zero once committed, so it can wait for its first
+    // touch. A reused slot is committed and zeroed now, as before.
+    const bool defer = !need_commit && lazy_commit();
     x2w_xmem::SlabSlots<HANDLE>::Slot slot;
     if (memory.slots.lowest_free(slot)) {
         if (!commit_slot(slot.slab, slot.offset, true)) return nullptr;
@@ -113,10 +250,11 @@ HANDLE section_for(ULONG_PTR page)
     }
     const ULONG64 slab_bytes = memory.slots.slab_bytes();
     bool first_slot_committed = false;
-    const auto make_slab = [slab_bytes, &first_slot_committed](HANDLE& slab) {
+    const auto make_slab = [slab_bytes, &first_slot_committed, defer](HANDLE& slab) {
         slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                   static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
         if (!slab) return false;
+        if (defer) return true;
         first_slot_committed = commit_slot(slab, 0, false);
         if (!first_slot_committed) {
             const DWORD error = GetLastError();
@@ -126,14 +264,14 @@ HANDLE section_for(ULONG_PTR page)
         return first_slot_committed;
     };
     if (!memory.slots.take_fresh(make_slab, [](HANDLE slab) { CloseHandle(slab); }, slot)) return nullptr;
-    if (!first_slot_committed && !commit_slot(slot.slab, slot.offset, false)) {
+    if (!defer && !first_slot_committed && !commit_slot(slot.slab, slot.offset, false)) {
         const DWORD error = GetLastError();
         memory.slots.unwind_fresh(slot);
         SetLastError(error);
         return nullptr;
     }
     try {
-        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index});
+        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index, !defer});
     } catch (...) {
         memory.slots.unwind_fresh(slot);
         throw;
@@ -504,7 +642,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
         // multi-gigabyte batch then takes a few views instead of one per 64 KiB page.
         if (tokens) {
             for (const auto& [address, page] : batch) {
-                if (!section_for(page)) {
+                if (!section_for(page, false)) {  // committed on first touch with X2W_XMEM_LAZY_COMMIT
                     if (failure) failure->record("section-backing", address, page, GetLastError());
                     return FALSE;
                 }
@@ -875,6 +1013,148 @@ extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in
     return TRUE;
 }
 
+// Experimental export (X2W_XMEM_LAZY_COMMIT): commits the lazily mapped slots behind [address, address + bytes)
+// before a writer that cannot fault one in uses the range: kernel-mode I/O into mapped pages fails with
+// STATUS_ACCESS_VIOLATION instead of faulting, and the GPU reads and writes placed resources without the CPU.
+// GPU-view addresses resolve to the same slots. TRUE without the switch or when nothing in the range is lazy;
+// FALSE with the system error when a commit fails.
+extern "C" BOOL WINAPI x2w_xmem_commit_range(const void* address, SIZE_T bytes)
+{
+    if (!lazy_commit() || !address || !bytes) return TRUE;
+    const auto start = reinterpret_cast<ULONG_PTR>(address);
+    const ULONG_PTR end = bytes > ~ULONG_PTR{0} - start ? ~ULONG_PTR{0} : start + bytes;
+    ULONG_PTR from = start;  // the part of the range past any lazy startup blocks it starts in
+    if (lazy_startup()) {
+        ULONG_PTR base = 0;
+        SIZE_T block_bytes = 0;
+        bool committed = true;
+        AcquireSRWLockShared(&lazy_blocks.lock);
+        for (; from < end && lazy_block_at(from, base, block_bytes); from = base + block_bytes) {
+            committed = commit_block_chunks(base, block_bytes, from, end);
+            if (!committed) break;
+        }
+        ReleaseSRWLockShared(&lazy_blocks.lock);  // keeps the commit's error
+        if (!committed) return FALSE;
+        if (from >= end) return TRUE;  // the range lies in lazy startup blocks
+    }
+    const std::lock_guard guard(memory.mutex);
+    for (ULONG_PTR page = from & ~(ULONG_PTR{page_bytes} - 1); page < end; page += page_bytes) {
+        Backing* backing = backing_at(page);
+        if (backing && !commit_backing(*backing)) return FALSE;
+        if (page > ~ULONG_PTR{0} - page_bytes) break;
+    }
+    return TRUE;
+}
+
+// Experimental export (X2W_XMEM_LAZY_STARTUP): commits the whole lazy startup block holding address and stops
+// committing it lazily. A GPU heap opened on the block covers the committed run from its base and is reused for
+// later resources in the block, so the block is committed whole before the first one is placed. TRUE without the
+// switch or when the address is in no lazy block; FALSE with the system error when the commit fails.
+extern "C" BOOL WINAPI x2w_xmem_commit_block(const void* address)
+{
+    if (!lazy_startup()) return TRUE;
+    ULONG_PTR base = 0;
+    SIZE_T bytes = 0;
+    AcquireSRWLockExclusive(&lazy_blocks.lock);
+    const bool lazy = lazy_block_at(reinterpret_cast<ULONG_PTR>(address), base, bytes);
+    const bool committed = !lazy || VirtualAlloc(reinterpret_cast<void*>(base), bytes, MEM_COMMIT, PAGE_READWRITE);
+    if (lazy && committed) lazy_blocks.blocks.erase(base);
+    ReleaseSRWLockExclusive(&lazy_blocks.lock);  // keeps the commit's error
+    return committed;
+}
+
+namespace {
+// The title reads files straight into mapped physical pages; a kernel-mode write into an uncommitted slot fails
+// with STATUS_ACCESS_VIOLATION (no fault), so with X2W_XMEM_LAZY_COMMIT the main module's ReadFile import commits
+// the buffer first.
+using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+ReadFileFn real_read_file;
+
+BOOL WINAPI read_file_committed(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped)
+{
+    if (buffer && bytes && !x2w_xmem_commit_range(buffer, bytes)) return FALSE;
+    return real_read_file(file, buffer, bytes, read, overlapped);
+}
+
+// The title releases its startup blocks through its VirtualFree import: with X2W_XMEM_LAZY_STARTUP a released
+// block leaves the lazy list, so a later allocation at the same addresses is never committed as part of it. The
+// release runs under the list lock, so no commit of the block is in flight, and the block leaves the list only if
+// the release succeeded: a refused release (a nonzero size, for instance) leaves it reserved and still lazy.
+using VirtualFreeFn = BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD);
+VirtualFreeFn real_virtual_free;
+
+BOOL WINAPI virtual_free_lazy(LPVOID address, SIZE_T bytes, DWORD type)
+{
+    if (!(type & MEM_RELEASE)) return real_virtual_free(address, bytes, type);
+    AcquireSRWLockExclusive(&lazy_blocks.lock);
+    const BOOL released = real_virtual_free(address, bytes, type);
+    const DWORD error = GetLastError();
+    if (released && lazy_blocks.blocks.erase(reinterpret_cast<ULONG_PTR>(address)))
+        InterlockedIncrement(&lazy_block_releases);
+    ReleaseSRWLockExclusive(&lazy_blocks.lock);
+    SetLastError(error);
+    return released;
+}
+
+// Points the main module's imports of name at replacement; returns how many import slots were changed.
+int patch_main_import(const char* name, const void* replacement) noexcept
+{
+    auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    if (!base) return 0;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    int patched = 0;
+    for (auto* imp = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); dir.Size && imp->Name; ++imp) {
+        const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
+            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), name) != 0) continue;
+            DWORD old = 0;
+            if (!VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), PAGE_READWRITE, &old)) continue;
+            slots->u1.Function = reinterpret_cast<ULONGLONG>(replacement);
+            VirtualProtect(&slots->u1.Function, sizeof(slots->u1.Function), old, &old);
+            ++patched;
+        }
+    }
+    return patched;
+}
+
+// Test build only (tests/xmem_lazy_imports_check.cpp): X2W_XMEM_TEST_LAZY_HANDLER_FAILURE=1 refuses the handler.
+bool add_lazy_handler()
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    if (x2w_local::env_on("X2W_XMEM_TEST_LAZY_HANDLER_FAILURE")) return false;
+#endif
+    return AddVectoredExceptionHandler(1, lazy_commit_fault) != nullptr;
+}
+
+// With the switch, install the fault handler and the ReadFile wrapper when xmem.dll loads, before the title runs.
+// The module is pinned: the handler must outlive any unload. If the handler cannot be installed, lazy commit stays
+// off and nothing is wrapped.
+const bool lazy_commit_installed = [] {
+    if (!lazy_commit_requested()) return false;
+    HMODULE self = nullptr;
+    lazy_handler_installed = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                                 reinterpret_cast<LPCWSTR>(&lazy_commit_fault), &self) &&
+                             add_lazy_handler();
+    if (!lazy_handler_installed) {
+        x2w_local::logf("x2w-xmem lazy commit (X2W_XMEM_LAZY_COMMIT): fault handler failed, pages committed when mapped");
+        return false;
+    }
+    real_read_file = reinterpret_cast<ReadFileFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReadFile"));
+    const int reads = real_read_file ? patch_main_import("ReadFile", reinterpret_cast<const void*>(&read_file_committed)) : 0;
+    x2w_local::logf("x2w-xmem lazy commit (X2W_XMEM_LAZY_COMMIT): fault handler on, %d ReadFile import(s) wrapped", reads);
+    if (lazy_startup()) {
+        real_virtual_free = reinterpret_cast<VirtualFreeFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualFree"));
+        const int frees = real_virtual_free ? patch_main_import("VirtualFree", reinterpret_cast<const void*>(&virtual_free_lazy)) : 0;
+        x2w_local::logf("x2w-xmem lazy startup blocks (X2W_XMEM_LAZY_STARTUP): %d VirtualFree import(s) wrapped", frees);
+    }
+    return true;
+}();
+}  // namespace
+
 // Experimental export: writes bytes into physical pages named by the title's
 // page tokens (page number << 4, as XMemMapPhysicalPages takes them), starting offset bytes into the
 // first page. DirectStorage requests can name such pages as their destination.
@@ -1025,19 +1305,42 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    if (!large_pages) return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    MEM_ADDRESS_REQUIREMENTS requirements{};
-    requirements.Alignment = SIZE_T{2} << 20;
-    // supported already limits attribute 0x283 to protection 0x2004 or 0x2404.
-    const bool below_40 = attributes == 0x283 && x2w_local::env_on("X2W_XMEM_STARTUP_BELOW_40");
-    if (below_40 && !startup_below_40_mutant("no_limit"))
-        requirements.HighestEndingAddress = reinterpret_cast<void*>(startup_low_limit - 1);
-    MEM_EXTENDED_PARAMETER parameter{};
-    parameter.Type = MemExtendedParameterAddressRequirements;
-    parameter.Pointer = &requirements;
-    void* const block = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
-                                      &parameter, 1);
-    return below_40 ? keep_startup_block_below_40(block, bytes, attributes, protection) : block;
+    const bool below_40 = large_pages && attributes == 0x283 && x2w_local::env_on("X2W_XMEM_STARTUP_BELOW_40");
+    // X2W_XMEM_LAZY_STARTUP: a large block is reserved and committed on first touch (lazy_startup).
+    const bool lazy = lazy_startup() && bytes >= lazy_block_min && !below_40;
+    const DWORD type = lazy ? MEM_RESERVE : MEM_RESERVE | MEM_COMMIT;
+    void* block = nullptr;
+    if (!large_pages) {
+        block = VirtualAlloc(nullptr, bytes, type, PAGE_READWRITE);
+    } else {
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.Alignment = SIZE_T{2} << 20;
+        // supported already limits attribute 0x283 to protection 0x2004 or 0x2404.
+        if (below_40 && !startup_below_40_mutant("no_limit"))
+            requirements.HighestEndingAddress = reinterpret_cast<void*>(startup_low_limit - 1);
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        block = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, type, PAGE_READWRITE, &parameter, 1);
+        if (below_40) return keep_startup_block_below_40(block, bytes, attributes, protection);
+    }
+    if (block && lazy) {
+        bool listed = false;
+        AcquireSRWLockExclusive(&lazy_blocks.lock);
+        try {
+            lazy_blocks.blocks[reinterpret_cast<ULONG_PTR>(block)] = bytes;
+            listed = true;
+        } catch (const std::bad_alloc&) {
+        }
+        ReleaseSRWLockExclusive(&lazy_blocks.lock);
+        if (!listed && !VirtualAlloc(block, bytes, MEM_COMMIT, PAGE_READWRITE)) {  // not listed: commit it now
+            const DWORD error = GetLastError();
+            VirtualFree(block, 0, MEM_RELEASE);
+            SetLastError(error);
+            return nullptr;
+        }
+    }
+    return block;
 }
 
 // The startup commit profile above, and the reserve-only desktop profile from the source-built

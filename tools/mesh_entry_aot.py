@@ -344,6 +344,10 @@ class Wave:
             raise ValueError("Pending scalar destination")
         self.s[scalar_reg] = self.spill_slots[slot]
 
+    def image_op(self, op, tail, expressions):
+        # Only the runtime lowerer's opt-in sampler heap path samples images.
+        raise ValueError(f"Unsupported mesh instruction {op}")
+
     def vector_op(self, op, args, expressions):
         d, *src = args
         live = [i for i in range(64) if self.exec & (1 << i)]
@@ -620,6 +624,8 @@ class Wave:
                         self.attributes[i] = [self.lane_value(t, lane) for t in operands]
                     else:
                         raise ValueError("Unsupported live export")
+            elif op.startswith("image_"):
+                self.image_op(op, tail, expressions)
             elif op.startswith("s_"):
                 self.scalar_op(op, args)
             elif op.startswith("v_"):
