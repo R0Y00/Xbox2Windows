@@ -1564,8 +1564,12 @@ class Stage:
             r = reg_range(tok)
             if tok == '0':
                 text = '0.0'
+            elif re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
+                word = (int(tok, 16) >> (16 if is_hi else 0)) & 0xffff
+                text = 'f16tof32(0x%04xu)' % word
+            elif tok == '0.5' and not is_hi:
+                text = '0.5'
             elif r and r[1] == r[2]:
-                # ponytail: binary16 literals and inline floats stay refused; their half encoding is unverified.
                 text = 'f16tof32(%s%s)' % (self.u(tok), ' >> 16' if is_hi else '')
             else:
                 raise Unsupported('binary16 fma_mix source %s' % tok)
