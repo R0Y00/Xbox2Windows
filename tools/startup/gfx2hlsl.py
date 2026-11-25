@@ -2196,6 +2196,12 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
             return self.scalar(base, ops)
+        if base == 's_getpc_b64':
+            # RDNA 2 GETPC returns the address of its successor: the shader's load address plus a known byte
+            # offset, which is not an integer this model can emit. It is elided only when the program also
+            # calculates a branch target, which calculated_pc_proof() proves and records. Reaching here means no
+            # such proof was found, so name the reason instead of reporting the mnemonic alone.
+            raise Unsupported('%s: the shader load address is only elided for a program that also calculates a branch target' % base)
         raise Unsupported(base)
 
     # VOP1/VOP2 with DPP16 quad broadcast (#2125 item A): quad_perm:[k,k,k,k] makes every lane read SRC0 from
