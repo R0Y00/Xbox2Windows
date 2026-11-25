@@ -142,6 +142,23 @@ s = run(ROOT, [('s_add_u32', 's20, s8, 0xfffff'), ('s_addc_u32', 's21, s9, 0')] 
 check('complete pair with a large low-word add is folded',
       not isinstance(s, str) and any('Load(%d)' % (0xfffff + 0x10) in line for line in s.lines), str(s))
 
+# The high word is bound to the accumulated offset: the original word never stands in for an advanced one.
+s = run(ROOT, ADVANCE + [('s_mov_b32', 's21, s9')] + LOAD)
+check('completed high word overwritten by the original one is refused', isinstance(s, str), str(s))
+
+SECOND = [('s_add_u32', 's22, s20, 0x20')]
+s = run(ROOT, ADVANCE + SECOND + [('s_addc_u32', 's23, s9, 0'), ('s_load_dwordx4', 's[4:7], s[22:23], 0x10')])
+check('second advance with the original high word is refused', isinstance(s, str), str(s))
+
+s = run(ROOT, ADVANCE + SECOND + [('s_addc_u32', 's23, s21, 0'), ('s_load_dwordx4', 's[4:7], s[22:23], 0x10')])
+check('second advance with the completed high word of the first pair is folded',
+      not isinstance(s, str) and any('Load(%d)' % (0x40 + 0x20 + 0x10) in line for line in s.lines), str(s))
+
+s = run(ROOT, [('s_add_u32', 's8, s8, 0x20'), ('s_addc_u32', 's9, s9, 0'), ('s_add_u32', 's8, s8, 0x20'),
+               ('s_addc_u32', 's9, s9, 0'), ('s_load_dwordx4', 's[4:7], s[8:9], 0')])
+check('in-place advance twice with each completed high word is folded',
+      not isinstance(s, str) and any('Load(64)' in line for line in s.lines), str(s))
+
 # Real entry state: a table pointer is one 32-bit register with no high word, so it advances with
 # the low add alone and its neighbour register stays untouched.
 def entry(params, kind='vs'):

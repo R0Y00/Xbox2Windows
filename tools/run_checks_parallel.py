@@ -16,6 +16,7 @@ check only.
 import argparse
 import concurrent.futures
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -23,13 +24,34 @@ import time
 SKIP_EXIT_CODE = 77
 
 
+def _validate_script_path(raw_path: str) -> str:
+    if not raw_path or not raw_path.strip():
+        raise ValueError("script path must not be empty")
+    path = Path(raw_path)
+    if not path.exists():
+        raise FileNotFoundError(f"script path does not exist: {raw_path}")
+    if path.is_dir():
+        raise IsADirectoryError(f"script path is a directory: {raw_path}")
+    if not path.is_file():
+        raise ValueError(f"script path is not a regular file: {raw_path}")
+    return raw_path
+
+
 def run_one(check):
     command, extra_env = check
+    if not command:
+        raise ValueError("check command must not be empty")
     env = {**os.environ, **extra_env} if extra_env else None
     start = time.monotonic()
-    proc = subprocess.run([sys.executable, "-B", *command], env=env,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True, errors="replace")
+    try:
+        proc = subprocess.run([sys.executable, "-B", *command], env=env,
+                              stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = str(exc)
+        msg = f"{type(exc).__name__}: {detail}\n" if detail else f"{type(exc).__name__}\n"
+        return command[0], 1, msg, time.monotonic() - start
     return command[0], proc.returncode, proc.stdout, time.monotonic() - start
 
 
@@ -59,12 +81,18 @@ def run_checks(checks, jobs=None):
     return 0
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("scripts", nargs="+")
     args = parser.parse_args(argv)
-    return run_checks([([script], None) for script in args.scripts], jobs=args.jobs)
+    try:
+        scripts = [_validate_script_path(script) for script in args.scripts]
+        return run_checks([([script], None) for script in scripts], jobs=args.jobs)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        detail = str(exc)
+        msg = f"{detail}\n" if detail else f"{type(exc).__name__}\n"
+        parser.exit(1, msg)
 
 
 if __name__ == "__main__":

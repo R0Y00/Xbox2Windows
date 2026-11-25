@@ -225,6 +225,8 @@ WRONG = (("UNORM divided by 2^n", ("unorm divisor",)), ("UNORM truncated", ("uno
          ("SNORM without the clamp", ("snorm unclamped",)), ("SINT16 zero-extended", ("sint zero-extended",)),
          ("FLOAT16 halves swapped", ("swap halves",)), ("FLOAT16 denormals flushed", ("flush halves",)),
          ("legacy format ignored", ("legacy ignored",)), ("neighbouring element", ("neighbour element",)))
+# Independent launches (the mutation ones also compile a mutated source); the Win2025 slots have 11 vCPUs.
+LAUNCH_THREADS = 6
 FIXED = f"{aot.DESCRIPTOR_LEGACY_FIXED:#x}u"
 # label, old, new, and the run it must fail: None for the valid two-group run, else an INVALID index.
 MUTATIONS = (
@@ -377,7 +379,7 @@ def draw(directory, compiler, renderer, backend):
         else:
             add("mutation", label, 2, unwritten, invalid_formats(run_index), mutated=mutated)
 
-    with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
+    with ThreadPoolExecutor(max_workers=min(LAUNCH_THREADS, os.cpu_count() or 1)) as pool:
         results = list(pool.map(lambda item: run(*item), enumerate(jobs)))
     for (check, label, extra, _data, _mutated), result in zip(jobs, results):
         if check == "pass":

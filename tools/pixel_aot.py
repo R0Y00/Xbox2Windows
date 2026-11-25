@@ -1032,6 +1032,44 @@ uint class64(uint lo, uint hi) {
         "    return asuint(int(exp) - 126);\n"
         "}"
     ),
+    "f16_min_bits": (
+        "uint f16_min_bits(uint a, uint b) {\n"
+        "    int sa = (a & 0x8000u) != 0u ? -int(a & 0x7fffu) : int(a & 0x7fffu);\n"
+        "    int sb = (b & 0x8000u) != 0u ? -int(b & 0x7fffu) : int(b & 0x7fffu);\n"
+        "    return sa < sb ? (a & 0xffffu) : (b & 0xffffu);\n"
+        "}"
+    ),
+    "f16_max_bits": (
+        "uint f16_max_bits(uint a, uint b) {\n"
+        "    int sa = (a & 0x8000u) != 0u ? -int(a & 0x7fffu) : int(a & 0x7fffu);\n"
+        "    int sb = (b & 0x8000u) != 0u ? -int(b & 0x7fffu) : int(b & 0x7fffu);\n"
+        "    return sa > sb ? (a & 0xffffu) : (b & 0xffffu);\n"
+        "}"
+    ),
+    "frexp_mant_f16": (
+        "uint frexp_mant_f16(uint bits) {\n"
+        "    uint h = bits & 0xffffu;\n"
+        "    uint exp = (h >> 10u) & 0x1fu;\n"
+        "    uint mant = h & 0x3ffu;\n"
+        "    if (exp == 0x1fu || (exp == 0u && mant == 0u)) return h;\n"
+        "    uint sign = h & 0x8000u;\n"
+        "    if (exp == 0u) {\n"
+        "        uint shift = 10u - firstbithigh(mant);\n"
+        "        mant = (mant << shift) & 0x3ffu;\n"
+        "    }\n"
+        "    return sign | 0x3800u | mant;\n"
+        "}"
+    ),
+    "frexp_exp_i16_f16": (
+        "uint frexp_exp_i16_f16(uint bits) {\n"
+        "    uint h = bits & 0xffffu;\n"
+        "    uint exp = (h >> 10u) & 0x1fu;\n"
+        "    uint mant = h & 0x3ffu;\n"
+        "    if (exp == 0x1fu || (exp == 0u && mant == 0u)) return 0u;\n"
+        "    if (exp == 0u) return asuint(int(firstbithigh(mant)) - 23) & 0xffffu;\n"
+        "    return asuint(int(exp) - 14) & 0xffffu;\n"
+        "}"
+    ),
     "dpp_dot4c_i32_i8": (
         "uint dpp_dot4c_i32_i8(uint a, uint b, uint acc) {\n"
         "    int s0 = (asint(a << 24) >> 24) * (asint(b << 24) >> 24);\n"
@@ -1827,6 +1865,66 @@ def f16_ldexp_result(bits, exponent):
     if count < 0x400:  # subnormal, or rounded to zero keeping the sign of the operand
         return sign | count
     return sign | ((top + 15) << 10) | (count - 0x400)
+
+
+def f16_minmax_result(name, b0, b1):
+    """Exact binary16 result bits of v_min_f16 or v_max_f16 on two finite operands.
+
+    Refuses opposite-signed zeros (+0.0 vs -0.0) so the lowering never relies on an unverified
+    tie-breaking sign rule; every other finite pair has a unique exact bit-order minimum/maximum.
+    """
+    if ((b0 >> 10) & 0x1f) == 0x1f or ((b1 >> 10) & 0x1f) == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: v_{name}_f16")
+    if (b0 ^ b1) == 0x8000 and (b0 & 0x7fff) == 0:
+        raise ValueError(f"binary16 {name} of opposite-signed zeros is not lowered")
+    s0 = -(b0 & 0x7fff) if b0 & 0x8000 else (b0 & 0x7fff)
+    s1 = -(b1 & 0x7fff) if b1 & 0x8000 else (b1 & 0x7fff)
+    return (b0 if s0 < s1 else b1) if name == "min" else (b0 if s0 > s1 else b1)
+
+
+def f16_fract_result(bits):
+    """Exact binary16 result bits of v_fract_f16 (x - floor(x)) on a finite operand.
+
+    Refuses tiny negative values (-2^-11 < x < 0, bit patterns 0x8001..0x93ff) where 1 + x is not
+    representable on the binary16 grid and hardware clamping to 0x3bff vs rounding to 1.0 differs.
+    For every other finite binary16 value, x - floor(x) is exact in binary16.
+    """
+    if ((bits >> 10) & 0x1f) == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    if 0x8001 <= bits < 0x9400:
+        raise ValueError(f"binary16 fract rounds to 1.0 on tiny negative input: {bits:#06x}")
+    if bits in (0x0000, 0x8000):
+        return 0x0000
+    value = struct.unpack("<e", struct.pack("<H", bits))[0]
+    return struct.unpack("<H", struct.pack("<e", value - math.floor(value)))[0]
+
+
+def f16_frexp_mant_result(bits):
+    """Exact binary16 significand bits of v_frexp_mant_f16 on a finite operand."""
+    h = bits & 0xffff
+    exp, mant = (h >> 10) & 0x1f, h & 0x3ff
+    if exp == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    if exp == 0 and mant == 0:
+        return h
+    sign = h & 0x8000
+    if exp == 0:
+        shift = 10 - (mant.bit_length() - 1)
+        mant = (mant << shift) & 0x3ff
+    return sign | 0x3800 | mant
+
+
+def f16_frexp_exp_result(bits):
+    """Exact low 16 bits (signed i16) of v_frexp_exp_i16_f16 on a finite operand."""
+    h = bits & 0xffff
+    exp, mant = (h >> 10) & 0x1f, h & 0x3ff
+    if exp == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    if exp == 0 and mant == 0:
+        return 0
+    if exp == 0:
+        return ((mant.bit_length() - 1) - 23) & 0xffff
+    return (exp - 14) & 0xffff
 
 
 def pk_fmac_f16_source(token, scalar, vector, pending, sample_dest, known_ssa_bits):
@@ -3029,6 +3127,24 @@ SDWA_CO_CI_OPERANDS = re.compile(
     r" dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
     r" dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE)"
     r" src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD) src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
+# SDWA binary32-to-int32 conversions and frexp_exp (float src0 with src0_sel:DWORD -> int32 result).
+SDWA_CVT_F32_TO_INT = {
+    "cvt_i32_f32": "cvt_i32_f32",
+    "cvt_u32_f32": "cvt_u32_f32",
+    "cvt_flr_i32_f32": "cvt_flr_i32_f32",
+    "cvt_rpi_i32_f32": "cvt_rpi_i32_f32",
+    "frexp_exp_i32_f32": "dpp_frexp_exp_i32_f32",
+}
+# SDWA integer-to-binary32 conversions (integer src0 with optional sext() and any src0_sel, optional clamp).
+SDWA_CVT_INT_TO_F32 = {
+    "cvt_f32_i32": "float(asint({0}))",
+    "cvt_f32_u32": "float({0})",
+    "cvt_f32_ubyte0": "float(({0} >> 0u) & 0xffu)",
+    "cvt_f32_ubyte1": "float(({0} >> 8u) & 0xffu)",
+    "cvt_f32_ubyte2": "float(({0} >> 16u) & 0xffu)",
+    "cvt_f32_ubyte3": "float(({0} >> 24u) & 0xffu)",
+    "cvt_off_f32_i4": "(float(asint({0} << 28u) >> 28) * 0.0625f)",
+}
 SDWA_F16_SRC = re.compile(r"(-?)(?:abs\(([vs]\d+)\)|\|([vs]\d+)\||([vs]\d+))")
 SDWA_F16_UNARY_OPERANDS = re.compile(
     r"(v\d+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"
@@ -3396,6 +3512,26 @@ def inline_calls(instructions):
                   *((call_offset + 4 + offset - target, text) for offset, text in instructions[start:end]),
                   *((offset + size, text) for offset, text in instructions[c + 1:start])])
 
+INTEGER_TEMPORARY = re.compile(r"\b(?:salu|alu)[0-9]+\b")
+
+
+def discard_dead_integer_temporaries(lines, candidates):
+    """Remove only emitter-marked, single-assignment locals after validation."""
+    live = set()
+    retained = []
+    first = next(iter(candidates))  # Emit sites mark candidates in line order.
+    # Locals are declared before their uses. Scan backwards from the roots
+    # (all unmarked lines), so skipped declarations do not root their inputs.
+    for index in range(len(lines) - 1, first - 1, -1):
+        name = candidates.get(index)
+        if name is not None and name not in live:
+            continue
+        line = lines[index]
+        retained.append(line)
+        live.update(INTEGER_TEMPORARY.findall(line))
+    retained.reverse()
+    return lines[:first] + retained
+
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
@@ -3471,6 +3607,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
     lines = [PREAMBLE] if sampler is None else [SAMPLED_RESOURCES, PREAMBLE]
+    dead_integer_candidates = {}
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
@@ -4546,6 +4683,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif op == "flbit_i32":
                 helpers.add("dpp_ffbh_i32")
             values = [scalar_u32(t, scalar, pending) for t in tokens]
+            if mask == "entry" and op in ("xor_b32", "lshl_b32"):
+                dead_integer_candidates[len(lines)] = f"salu{i}"
             lines.append(f"    uint salu{i} = {template.format(*values)};")
             if carry:
                 scc = f"({carry.format(*values, r=f'salu{i}')})"
@@ -5439,6 +5578,101 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = asfloat({placed});")
             scalar["vcc"] = ("condition", f"cmp{i}", 0, 1)
             vector[dst] = f"alu{i}"
+        elif m := match(rf"v_({'|'.join(SDWA_CVT_F32_TO_INT)})_sdwa (v\d+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # SDWA binary32-to-int32 conversions and frexp_exp: whole-dword float register source with
+            # optional bit-31 abs/neg modifiers, reusing the e64/DPP IEEE-754 bit helpers and SDWA dest placement.
+            op, dst, src0, dst_sel, unused, sel0 = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid conversion SDWA operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if unused == "UNUSED_SEXT":
+                raise ValueError("UNUSED_SEXT is not lowered")
+            if sel0 != "DWORD":
+                raise ValueError(f"v_{op}_sdwa requires src0_sel:DWORD, got {sel0}")
+            if src0.startswith("sext("):
+                raise ValueError(f"Unsupported float SDWA source modifier: {src0}")
+            sm = SDWA_F16_SRC.fullmatch(src0)
+            if not sm:
+                raise ValueError(f"Unsupported float SDWA operand: {src0}")
+            neg, abs_fn, abs_bars, plain = sm.groups()
+            reg = abs_fn or abs_bars or plain
+            if not 0 <= int(reg[1:]) <= (255 if reg[0] == "v" else 105):
+                raise ValueError(f"Register out of range: {reg}")
+            val = fp_operand(reg, scalar, vector, pending, sample_dest)
+            bits = f"asuint({val})"
+            if abs_fn or abs_bars:
+                bits = f"({bits} & 0x7fffffffu)"
+            if neg:
+                bits = f"({bits} ^ 0x80000000u)"
+            helper = SDWA_CVT_F32_TO_INT[op]
+            helpers.add(helper)
+            placed = sdwa_dest(f"{helper}({bits})", dst_sel, unused, vector.get(dst))
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({placed});")
+        elif m := match(rf"v_({'|'.join(SDWA_CVT_INT_TO_F32)})_sdwa (v\d+), ([^,\s]+)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # SDWA integer-to-binary32 conversions (i32, u32, ubyte0..3, off_i4): integer register source
+            # with optional sext() and any SDWA selection, optional clamp, and SDWA destination placement.
+            op, dst, src0, clamp, dst_sel, unused, sel0 = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid conversion SDWA operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if unused == "UNUSED_SEXT":
+                raise ValueError("UNUSED_SEXT is not lowered")
+            if src0.startswith(("-", "|", "abs(")):
+                raise ValueError(f"Source modifiers are not allowed on {src0}")
+            sm = re.fullmatch(SDWA_INT_SOURCE, src0)
+            if not sm or bool(sm.group(1)) != bool(sm.group(3)):
+                raise ValueError(f"Unsupported SDWA integer operand: {src0}")
+            is_sext, reg = bool(sm.group(1)), sm.group(2)
+            if not 0 <= int(reg[1:]) <= (255 if reg[0] == "v" else 105):
+                raise ValueError(f"Register out of range: {reg}")
+            selected = sdwa_source(int_operand(reg, scalar, vector, pending, sample_dest, signed=False), sel0, is_sext)
+            lines.append(f"    uint sc{i} = {selected};")
+            expr = SDWA_CVT_INT_TO_F32[op].format(f"sc{i}")
+            if clamp:
+                expr = f"saturate({expr})"
+            if dst_sel != "DWORD":
+                expr = f"asfloat({sdwa_dest(f'asuint({expr})', dst_sel, unused, vector.get(dst) if unused == 'UNUSED_PRESERVE' else None)})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
+        elif m := match(r"v_cvt_pkrtz_f16_f32_sdwa (v\d+), ([^,\s]+), ([^,\s]+) dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD) src1_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+            # SDWA compressed-export pack: whole-dword binary32 float register sources with optional bit-31
+            # abs/neg modifiers and whole-dword destination, producing the same (lo, hi) compressed-export pair
+            # as v_cvt_pkrtz_f16_f32_e32 and v_cvt_pkrtz_f16_f32_dpp.
+            dst, src0, src1, dst_sel, unused, sel0, sel1 = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid pack SDWA operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if unused == "UNUSED_SEXT":
+                raise ValueError("UNUSED_SEXT is not lowered")
+            if dst_sel != "DWORD":
+                raise ValueError(f"v_cvt_pkrtz_f16_f32_sdwa requires dst_sel:DWORD, got {dst_sel}")
+            if sel0 != "DWORD" or sel1 != "DWORD":
+                raise ValueError("v_cvt_pkrtz_f16_f32_sdwa requires whole-dword sources")
+            pair_bits = []
+            for tok in (src0, src1):
+                if tok.startswith("sext("):
+                    raise ValueError(f"Unsupported float SDWA source modifier: {tok}")
+                sm = SDWA_F16_SRC.fullmatch(tok)
+                if not sm:
+                    raise ValueError(f"Unsupported float SDWA operand: {tok}")
+                neg, abs_fn, abs_bars, plain = sm.groups()
+                reg = abs_fn or abs_bars or plain
+                if not 0 <= int(reg[1:]) <= (255 if reg[0] == "v" else 105):
+                    raise ValueError(f"Register out of range: {reg}")
+                val = fp_operand(reg, scalar, vector, pending, sample_dest)
+                bits = f"asuint({val})"
+                if abs_fn or abs_bars:
+                    bits = f"({bits} & 0x7fffffffu)"
+                if neg:
+                    bits = f"({bits} ^ 0x80000000u)"
+                pair_bits.append(bits)
+            lines.append(f"    precise float alu{i}_lo = asfloat({pair_bits[0]});")
+            lines.append(f"    precise float alu{i}_hi = asfloat({pair_bits[1]});")
+            vector[dst] = (f"alu{i}_lo", f"alu{i}_hi")
         elif m := match(r"v_cvt_f16_f32_sdwa (.+)"):
             # SDWA binary32-to-binary16 conversion under the declared entry profile (half_denorm="preserve"
             # and HW_REG_MODE RNE). Takes a whole-dword register source (so f32 denormal mode never touches
@@ -5550,6 +5784,72 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float hs{i} = {VOP1_F16_ROUND[name].format(f'widen16(hf{i}_0)')};")
             emit_sdwa_f16_dest(lines, i, dst, f"narrow16(hs{i})", dst_sel, unused, vector,
                                known_ssa_bits, known_half, tag="half16", known_result=result)
+        elif m := match(r"v_(min|max)_f16_sdwa (.+)"):
+            # SDWA binary16 min/max under the static finite-proof contract (opposite-signed zeros refused).
+            name, rest = m.groups()
+            parsed = SDWA_F16_BINARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_{name}_f16_sdwa {rest}")
+            dst, src0, src1, dst_sel, unused, sel0, sel1 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            s1_bits, b1 = half16_sdwa_source(
+                src1, sel1, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_minmax_result(name, b0, b1)
+            helper = f"f16_{name}_bits"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    uint hf{i}_1 = {s1_bits};")
+            emit_sdwa_f16_dest(lines, i, dst, f"{helper}(hf{i}_0, hf{i}_1)", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16", known_result=result)
+        elif m := match(r"v_fract_f16_sdwa (.+)"):
+            # SDWA binary16 fractional part (x - floor(x)) on exact finite inputs (tiny negatives refused).
+            rest = m.group(1)
+            parsed = SDWA_F16_UNARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_fract_f16_sdwa {rest}")
+            dst, src0, dst_sel, unused, sel0 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_fract_result(b0)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0) - floor(widen16(hf{i}_0));")
+            emit_sdwa_f16_dest(lines, i, dst, f"narrow16(hs{i})", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16", known_result=result)
+        elif m := match(r"v_frexp_(mant|exp_i16)_f16_sdwa (.+)"):
+            # SDWA binary16 frexp significand (half16) and signed exponent (low16).
+            kind, rest = m.groups()
+            parsed = SDWA_F16_UNARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_frexp_{kind}_f16_sdwa {rest}")
+            dst, src0, dst_sel, unused, sel0 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            is_mant = kind == "mant"
+            result = f16_frexp_mant_result(b0) if is_mant else f16_frexp_exp_result(b0)
+            helper = "frexp_mant_f16" if is_mant else "frexp_exp_i16_f16"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            emit_sdwa_f16_dest(lines, i, dst, f"{helper}(hf{i}_0)", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="half16" if is_mant else "low16", known_result=result)
         elif m := match(r"v_cvt_f16_(i16|u16)_sdwa (.+)"):
             # SDWA 16-bit integer to binary16 conversion (round to nearest even): integer src0 with
             # optional sext() and any SDWA selection. Runtime i16 is always finite; u16 requires a
@@ -5673,6 +5973,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             helpers.update(INTEGER_HELPERS.get(op, ()))
             helpers.update(SAD_HELPERS.get(op, ()))
             vector[dst] = f"alu{i}"
+            if op == "xor_b32":
+                dead_integer_candidates[len(lines)] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             enc, dst, value, classes = m.groups()
@@ -5712,6 +6014,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
             expression = {"add": f"{a} + {b}", "sub": f"{a} - {b}", "subrev": f"{b} - {a}"}[op]
             vector[dst] = f"alu{i}"
+            if line.startswith("v_add_nc_u32"):
+                dead_integer_candidates[len(lines)] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_(add|sub|subrev)_co_u32 (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+)"):
             # 32-bit add or subtract that also writes the unsigned carry or borrow of each lane to a lane
@@ -6568,6 +6872,89 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
             vector[dst] = ("half16", f"alu{i}")
             known_half[f"alu{i}"] = result
+        elif m := match(r"v_(min|max)_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 min/max under the static finite-proof contract.
+            name, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 2)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            s1_val, b1, abs1, neg1 = half16_dpp_source(
+                tokens[1], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            result = f16_minmax_result(name, b0, b1)
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            s1_bits = f"(asuint({s1_val}) & 0xffffu)"
+            if abs1:
+                s1_bits = f"({s1_bits} & 0x7fffu)"
+            if neg1:
+                s1_bits = f"({s1_bits} ^ 0x8000u)"
+            helper = f"f16_{name}_bits"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    uint hf{i}_1 = {s1_bits};")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(hf{i}_0, hf{i}_1));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
+        elif m := match(r"v_fract_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 fractional part under the exact finite-proof contract.
+            dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            result = f16_fract_result(b0)
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0) - floor(widen16(hf{i}_0));")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
+        elif m := match(r"v_frexp_(mant|exp_i16)_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 frexp significand (half16) and signed exponent (low16).
+            kind, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            is_mant = kind == "mant"
+            result = f16_frexp_mant_result(b0) if is_mant else f16_frexp_exp_result(b0)
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            helper = "frexp_mant_f16" if is_mant else "frexp_exp_i16_f16"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(hf{i}_0));")
+            if is_mant:
+                vector[dst] = ("half16", f"alu{i}")
+                known_half[f"alu{i}"] = result
+            else:
+                vector[dst] = ("low16", f"alu{i}")
         elif m := match(r"v_(fmac|ldexp)_f16_dpp (v\d+), (.+)"):
             # Quad-local DPP16/DPP8 binary16 fused multiply-accumulate (D = S0_swizzled * S1 + D)
             # and exponent scaling (D = S0_swizzled * 2^S1) under the static finite-proof contract
@@ -7117,6 +7504,70 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
             vector[dst] = ("half16", f"alu{i}")
             known_half[f"alu{i}"] = result
+        elif m := match(r"v_(min|max)_f16(_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # Plain e32/e64 binary16 min/max under the static finite-proof contract (opposite-signed zeros refused).
+            name, encoding, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 arithmetic operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if encoding != "_e64" and not re.fullmatch(r"v\d+", tokens[1]):
+                raise ValueError("Binary16 e32 src1 must be a VGPR")
+            words, proven = zip(*(half16_arith_source(tok, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+                                  for tok in tokens))
+            result = f16_minmax_result(name, *proven)
+            helper = f"f16_{name}_bits"
+            helpers.add(helper)
+            for k, word in enumerate(words):
+                lines.append(f"    uint hf{i}_{k} = ({word}) & 0xffffu;")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(hf{i}_0, hf{i}_1));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
+        elif m := match(r"v_fract_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Plain e32/e64 binary16 fractional part (x - floor(x)) under the exact finite-proof contract.
+            encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 rounding operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_fract_result(proven)
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0) - floor(widen16(hf{i}_0));")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
+        elif m := match(r"v_frexp_(mant|exp_i16)_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Plain e32/e64 binary16 frexp significand (half16) and signed exponent (low16).
+            kind, encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 rounding operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            is_mant = kind == "mant"
+            result = f16_frexp_mant_result(proven) if is_mant else f16_frexp_exp_result(proven)
+            helper = "frexp_mant_f16" if is_mant else "frexp_exp_i16_f16"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(hf{i}_0));")
+            if is_mant:
+                vector[dst] = ("half16", f"alu{i}")
+                known_half[f"alu{i}"] = result
+            else:
+                vector[dst] = ("low16", f"alu{i}")
         elif m := match(r"v_cvt_f16_(i16|u16)(_e32|_e64)? (v\d+), ([^,\s]+)"):
             # Integer to binary16 (issue #839): LLVM 15.0.7 VOP1Instructions.td L432-433 selects sint_to_fp and uint_to_fp,
             # round to nearest even. The source is the low 16 bits through the audited reader int16_operand (sign-
@@ -7417,6 +7868,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Expected one gather for the declared view")
     if not ended or sampled_textures != set(bindings.values()):
         raise ValueError("Unexpected sample count or missing color export")
+    if dead_integer_candidates:
+        lines = discard_dead_integer_temporaries(lines, dead_integer_candidates)
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
         if "div_fmas32" in helpers:
