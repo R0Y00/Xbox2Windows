@@ -178,6 +178,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_watch_check.py
 ./out/pe-env/bin/python -B tests/startup_translator_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sload_const_offset_check.py
 ./out/pe-env/bin/python -B tests/startup_archive_requests_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_refusals_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_request_offline_check.py
@@ -206,6 +207,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_root_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
 ./out/pe-env/bin/python -B tests/startup_buffer_address_check.py
+./out/pe-env/bin/python -B tests/startup_buffer_format_word3_table_check.py
 ./out/pe-env/bin/python -B tests/startup_smem_address_check.py
 ./out/pe-env/bin/python -B tests/startup_stream_fetch_check.py
 ./out/pe-env/bin/python -B tests/startup_stream_interface_check.py
@@ -220,6 +222,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ./out/pe-env/bin/python -B tests/mesh_clip_cull_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
+./out/pe-env/bin/python -B tests/mesh_entry_check.py flat-scratch
 ./out/pe-env/bin/python -B tests/mesh_heap_sampler_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
 ./out/pe-env/bin/python -B tests/mesh_join_descriptor_check.py

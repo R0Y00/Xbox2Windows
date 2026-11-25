@@ -204,8 +204,10 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-14`. Older translations evaluate `s_brev_b32` of a
+The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
 constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
+rounding mode.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
@@ -2342,6 +2344,16 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset dev --no-tests=error -R "^startup_(depth_state|slot57_depth)" -V`). Not covered:
   raster bias, depth bounds, back-face-only state, the title's own `OMSetStencilRef` order, clears
   (#1806), and any pipeline layout other than the measured one.
+- Rasterizer state (#1999, item B) has a decoder for the register value only:
+  `src/startup_stubs/rasterizer_state_decode.h` turns a `PA_SU_SC_MODE_CNTL` value into the cull mode,
+  front-face winding and fill mode of a `D3D12_RASTERIZER_DESC`, with the field positions of the amdgpu
+  `gc_10_3_0_sh_mask.h` header and Mesa's `gfx10.json`. Where a slot 57 pipeline keeps that word is not
+  part of it and is left open until independently established. It refuses both faces culled, point or
+  mixed polygon modes, polygon offset, last-vertex provoking and disabled perspective correction. The
+  caller's `flip_winding` inverts the FACE convention, which is not established against the D3D12
+  viewport. A device-free check covers each cull mode, winding and fill form and the refusals; its
+  `_face_control`, `_cull_control` and `_fill_control` runs read one field wrongly and must fail
+  (`ctest --preset dev --no-tests=error -R "^startup_rasterizer_decode" -V`). Not used by draws yet.
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 

@@ -240,6 +240,7 @@ jobs:
             tests/startup_gfx2hlsl_watch_check.py \
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
+            tests/startup_gfx2hlsl_sload_const_offset_check.py \
             tests/startup_archive_requests_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_compute_request_offline_check.py \
@@ -288,6 +289,7 @@ jobs:
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
+            tests/startup_buffer_format_word3_table_check.py \
             tests/startup_smem_address_check.py \
             tests/startup_stream_fetch_check.py \
             tests/startup_stream_interface_check.py \

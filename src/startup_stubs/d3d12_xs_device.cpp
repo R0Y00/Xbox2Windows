@@ -43,6 +43,7 @@
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/per_reason_refusal_census.h"
+#include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/list_copy.h"
@@ -3733,7 +3734,15 @@ void* __stdcall resource_get_desc(void* a, void* b)
 {
     void* result = nullptr;
     Wrapper* self = receiver(a, b, &result, "Resource::GetDesc(no receiver)");
+    if (!self || !self->own().real || !result) return result;
     *static_cast<D3D12_RESOURCE_DESC*>(result) = static_cast<ID3D12Resource*>(self->own().real)->GetDesc();
+    static LONG logged;
+    if (first_calls(logged, 4)) {
+        const auto& d = *static_cast<const D3D12_RESOURCE_DESC*>(result);
+        log("x2w-d3d12 Resource::GetDesc res=%p dim=%d fmt=%d size=%llux%ux%u mips=%u layout=0x%x flags=0x%x",
+            static_cast<void*>(self), d.Dimension, d.Format, static_cast<unsigned long long>(d.Width),
+            d.Height, d.DepthOrArraySize, d.MipLevels, d.Layout, d.Flags);
+    }
     return result;
 }
 
@@ -5381,11 +5390,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
-            "textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
+            "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
@@ -5626,10 +5635,10 @@ void build_tables()
     // Resource: Map, Unmap, GetDesc, GetGPUVirtualAddress, Write/ReadFromSubresource, GetHeapProperties.
     tables[resource_kind][8] = reinterpret_cast<void*>(&resource_map);
     tables[resource_kind][9] = reinterpret_cast<void*>(&resource_unmap);
+    tables[resource_kind][10] = reinterpret_cast<void*>(&resource_get_desc);
     tables[resource_kind][11] = reinterpret_cast<void*>(&resource_gpu_address);
-    // Desktop Resource 10 (GetDesc), 12-14, Heap 8 and DescriptorHeap 8 (GetDesc, struct returns) are
+    // Desktop Resource 12-14, Heap 8 and DescriptorHeap 8 (GetDesc, struct returns) are
     // not installed until a call site confirms them: the queue's slot 18 showed what a wrong one does.
-    (void)&resource_get_desc;
     (void)&heap_get_desc;
     (void)&descriptor_heap_get_desc;
     tables[descriptor_heap_kind][9] = reinterpret_cast<void*>(&descriptor_heap_cpu_start);

@@ -295,7 +295,7 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
                                     bool needs_start, bool table_buffer = false, bool indexed = false, bool rect = false)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
-    constexpr char revision[] = "x2w-startup-shader-14";
+    constexpr char revision[] = "x2w-startup-shader-15";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
     static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000204};
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
@@ -1785,24 +1785,47 @@ int main(int argc, char** argv) try
         return ok ? 0 : 1;
     }
     if (mesh && GetEnvironmentVariableA("X2W_MESH_REQUEST_FIXTURE", nullptr, 0)) {
-        const auto cache = std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
+        wchar_t exchange[MAX_PATH]{};
+        const DWORD exchange_size = GetEnvironmentVariableW(L"X2W_TEST_MESH57_EXCHANGE", exchange, MAX_PATH);
+        if (exchange_size >= MAX_PATH) return 1;
+        const auto cache = exchange_size ? std::filesystem::path(exchange) / "requests" :
+            std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set mesh fixture cache");
+        const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants = {0, 0, 2};
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {1, &srv};
+        const D3D12_ROOT_SIGNATURE_DESC source_root{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const auto& desc = exchange_size ? source_root : graphics_desc;
         ComPtr<ID3DBlob> root_blob;
-        const auto root = create_root(guest.Get(), graphics_desc, &root_blob);
-        const auto different_root = create_root(guest.Get(), graphics_desc);
+        const auto root = create_root(guest.Get(), desc, &root_blob);
+        const auto different_root = create_root(guest.Get(), desc);
         // Distinct, source-owned bounded spans. The request publisher must preserve their stage roles and lengths.
-        const std::array<UINT, 4> ms{0xbfa00003, 0xbf900009, 0xbf810000, 0};
-        const std::array<UINT, 2> ps{0xbfa00003, 0xbf810000};
+        const std::array<UINT, 4> default_ms{0xbfa00003, 0xbf900009, 0xbf810000, 0};
+        const std::array<UINT, 2> default_ps{0xbfa00003, 0xbf810000};
+        const auto read_stage = [&](const wchar_t* name) {
+            std::ifstream file(std::filesystem::path(exchange) / name, std::ios::binary);
+            return std::vector<char>(std::istreambuf_iterator<char>(file), {});
+        };
+        const auto source_ms = exchange_size ? read_stage(L"ms.bin") : std::vector<char>{};
+        const auto source_ps = exchange_size ? read_stage(L"ps.bin") : std::vector<char>{};
+        if (exchange_size && (source_ms.empty() || source_ps.empty())) return 1;
+        const void* ms = exchange_size ? static_cast<const void*>(source_ms.data()) : default_ms.data();
+        const void* ps = exchange_size ? static_cast<const void*>(source_ps.data()) : default_ps.data();
+        const auto ms_size = exchange_size ? source_ms.size() : sizeof(default_ms);
+        const auto ps_size = exchange_size ? source_ps.size() : sizeof(default_ps);
         const auto make_pso = [&](bool with_pixel, bool with_vertex, bool incomplete_pixel) {
             std::array<UINT64, 0x300 / sizeof(UINT64)> fields{};
             fields[0] = reinterpret_cast<UINT64>(root.Get());
-            fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps.data()) : 0;
-            fields[6] = with_pixel && !incomplete_pixel ? sizeof(ps) : 0;
-            fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps.data()) : 0;
-            fields[10] = with_vertex ? sizeof(ps) : 0;
-            fields[13] = reinterpret_cast<UINT64>(ms.data());
-            fields[14] = sizeof(ms);
+            fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps) : 0;
+            fields[6] = with_pixel && !incomplete_pixel ? ps_size : 0;
+            fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps) : 0;
+            fields[10] = with_vertex ? ps_size : 0;
+            fields[13] = reinterpret_cast<UINT64>(ms);
+            fields[14] = ms_size;
             using Create = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
             ComPtr<IUnknown> pso;
             check(slot<Create>(guest.Get(), 57)(guest.Get(), fields.data(), __uuidof(ID3D12PipelineState),
@@ -1841,13 +1864,13 @@ int main(int argc, char** argv) try
             auto path = file.path();
             if (path.extension() != ".m57") continue;
             ++requests;
-            if (!matches(path, ms.data(), sizeof(ms)) ||
+            if (!matches(path, ms, ms_size) ||
                 !matches(path.replace_extension(".root"), root_blob->GetBufferPointer(), root_blob->GetBufferSize())) return 1;
-            if (matches(path.replace_extension(".ps57"), ps.data(), sizeof(ps))) ++with_ps;
+            if (matches(path.replace_extension(".ps57"), ps, ps_size)) ++with_ps;
             else if (!matches(path, nullptr, 0)) return 1;
         }
         if (requests != 2 || with_ps != 1 || files != 6) return 1;
-        std::filesystem::remove_all(cache);
+        if (!exchange_size) std::filesystem::remove_all(cache);
         std::puts("slot 57 MS+PS and MS-only requests preserved stages and the matching root");
         return 0;
     }
