@@ -25,7 +25,7 @@ ROOT = b'RTS0 synthetic root'
 DESC = struct.pack('<12Q', 0, 0, 24, 0, 20, 0, len(CODE), 0, len(DATA), 0, 0, 11)
 STATE_A = struct.pack('<3Q', 1, 0x2c, 0xfff0000000000003)
 STATE_B = struct.pack('<5I', 0x1234abcd, 0xffff0000, 0, 0, 0)
-KEY = 0x9e674214a4ef3b73  # compute_key of the parts above
+KEY = 0xcd0547493ef7bdaa  # compute_key of the parts above
 
 
 def framed_key():
