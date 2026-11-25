@@ -23,6 +23,12 @@ class Unsupported(Exception):
 
 PREFETCH = bytes.fromhex('0300a0bf')
 
+# DPP16 quad pair broadcasts: quad_perm -> (axis of the pair, sign of the fine derivative, quad coordinate parity of
+# the lane that takes the other lane's word). The lanes of a quad are the pixels 0 1 / 2 3, row by row.
+DPP_PAIR = {(1, 1, 3, 3): ('x', '+', 0), (0, 0, 2, 2): ('x', '-', 1),
+            (2, 3, 2, 3): ('y', '+', 0), (0, 1, 0, 1): ('y', '-', 1)}
+DPP_SCRATCH = 256
+
 # SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
 # selection is zero-extended, or sign-extended under sext(); a destination selection writes the low
 # bits of the result into that field, UNUSED_PAD zeroes the others and UNUSED_PRESERVE keeps them.
@@ -671,6 +677,51 @@ class Stage:
             self.uniform_v.add(dst)
         return term
 
+    def dpp(self, base, asm, ops, mods):
+        """A DPP16 spelling whose SRC0 is a quad pair broadcast (#2125 item C).
+
+        RDNA 2 ISA section 12.19 (DPP16): lane i of a quad reads SRC0 of lane quad_perm[i] of the same quad. A pair
+        broadcast ([1,1,3,3], [0,0,2,2], [2,3,2,3], [0,1,0,1]) moves one lane of every horizontal or vertical pair
+        into the other and leaves the first lane alone. The model has one lane, so the other lane's word is rebuilt
+        from the quad's fine derivative of each 16-bit half (ddx_fine / ddy_fine over exactly representable floats:
+        the difference of the pair, added to or subtracted from this lane's half). That needs all four lanes of the
+        quad to run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and
+        the full entry mask. Every other control (other permutations, row_*, wave_*, a partial row or bank mask,
+        fi, a vertex stage) is refused by name, since the single lane cannot read a neighbour."""
+        perms = [m for m in mods if m.startswith('quad_perm:')]
+        rest = [m for m in mods if not m.startswith('quad_perm:')]
+        if len(perms) != 1:
+            raise Unsupported('%s_dpp with %s' % (base, ' '.join(mods)))
+        for m in rest:
+            if m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
+                raise Unsupported('%s_dpp with %s' % (base, m))
+        # With all four lanes active no source lane is disabled, so bound_ctrl has nothing to replace.
+        perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
+        axis = DPP_PAIR.get(perm)
+        if axis is None:
+            raise Unsupported('%s_dpp with %s' % (base, perms[0]))
+        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
+                getattr(self, 'fetched', False)):
+            raise Unsupported('%s_dpp %s outside straight-line pixel code with the full entry mask' % (base, perms[0]))
+        if len(ops) < 2:
+            raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
+        # The permuted word goes to a scratch register (v256, beyond the 256 hardware registers), so a second source
+        # naming the same register, or a destination that is the source, still reads the right lane.
+        src = re.fullmatch(r'([-|]*)v(\d+)(\|?)', ops[1])
+        if not src:
+            raise Unsupported('%s_dpp source %s' % (base, ops[1]))
+        word = 'v%s' % src.group(2)
+        coord, sign, parity = axis
+        derive = 'ddx_fine' if coord == 'x' else 'ddy_fine'
+        self.used_v.add(DPP_SCRATCH)
+        self.uniform_v.discard(DPP_SCRATCH)
+        self.emit('{ float x2w_lo = float(%s & 0xffffu), x2w_hi = float(%s >> 16u);'
+                  ' float x2w_dlo = %s(x2w_lo), x2w_dhi = %s(x2w_hi);'
+                  ' v%d = (uint(i.pos.%s) & 1u) == %du ? (uint(x2w_lo %s x2w_dlo) | (uint(x2w_hi %s x2w_dhi) << 16u)) : %s; }'
+                  % (word, word, derive, derive, DPP_SCRATCH, coord, parity, sign, sign, word))
+        ops = [ops[0], '%sv%d%s' % (src.group(1), DPP_SCRATCH, src.group(3))] + ops[2:]
+        return self.lower(base, asm, ops, [])
+
     def lower(self, base, asm, ops, mods):
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
@@ -701,6 +752,8 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        if base.endswith('_dpp'):
+            return self.dpp(base[:-len('_dpp')], asm, ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
             return handler(ops, mods)
