@@ -56,6 +56,7 @@ jobs:
               (["tests/mesh_dynamic_geometry_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_two_exits_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_heap_sampler_check.py", *COMMON_LLVM], {}),
+              (["tests/mesh_clip_cull_check.py", *COMMON_LLVM], {}),
               (["tests/rdna2_tools_check.py"], {"LLVM_LIB": "libLLVM-15.so.1", "LLVM_MC": "llvm-mc-15", "LLVM_OBJCOPY": "llvm-objcopy-15"}),
               (["tests/ffx_dispatch_aot_check.py", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/spirv_window/sampler.py", *SPIRV], {}),
@@ -173,6 +174,7 @@ jobs:
             tests/dxil_retarget_check.py \
             tests/rdna2_tools_check.py \
             tests/mesh_heap_sampler_check.py \
+            tests/mesh_clip_cull_check.py \
             tests/mesh_dynamic_geometry_check.py \
             tests/mesh_dynamic_aot_check.py \
             tests/mesh_lane_spill_check.py \

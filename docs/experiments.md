@@ -3707,6 +3707,63 @@ program whose constant path loads through the register instead. The fixture
 decodes `MIN_LOD` and `MAX_LOD` from sampler word 1 itself; the stand-in's
 `decode_sampler` does not read them yet.
 
+### Clip and cull distances in bounded mesh
+
+Which position export carries clip and cull distances is pipeline state, not
+part of the export: `PA_CL_VS_OUT_CNTL` enables each distance component as clip
+(`CLIP_DIST_ENA_0..7`) or cull (`CULL_DIST_ENA_0..7`) and each four-component
+vector (`VS_OUT_CCDIST0/1_VEC_ENA`). Both mesh lowerers take that word as an
+explicit input, `--pa-cl-vs-out-cntl <word>` (Python: `vs_out_cntl=`), decoded by
+`tools/mesh_clip_cull.py`. Both references are pinned to Mesa commit
+`03ecd8b0` (tag `mesa-24.0.0`): the field layout is the
+[gfx10 register table](https://gitlab.freedesktop.org/mesa/mesa/-/blob/03ecd8b0a517e528d790a3d252194f7b898d0e8f/src/amd/registers/gfx10.json#L13456-13487),
+and the export order is
+[`ac_nir_export_position`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/03ecd8b0a517e528d790a3d252194f7b898d0e8f/src/amd/common/ac_nir.c#L254-396):
+`pos0`, the misc vector when enabled, then each enabled CCDIST vector, numbered
+without gaps, with `done` on the last position export. That numbering has not
+been checked on console hardware. Without a word the output is unchanged.
+Reading the word from the slot 57 state is a separate piece.
+
+The misc vector is refused, so the first enabled CCDIST vector is `pos1` and the
+second `pos2`. The output vertex declares only the enabled components, as
+`SV_ClipDistance<n>` / `SV_CullDistance<n>` with n the CCDIST vector; a component
+with both enables is declared as both. Refused by name: a distance export without
+a word, the misc vector and every `USE_VTX_*` bit, unknown bits, a vector enable
+without components or components without their vector enable, more than eight
+components, a distance export the word does not enable, an enabled export or
+component that is missing, duplicate or reordered exports, `done` on another
+export than the last, and the compute fallback.
+
+`tests/mesh_clip_cull.s` exports clip distances 0 and 1 in `pos1` and cull distance
+4 in `pos2` (word `0x00c01003`). Geometry word 1 selects one of two draws, so
+clipping and culling are tested separately. In the clip draw, two partly visible
+triangles lose the pixels left of one clip plane and above the other. In the
+cull draw, a triangle whose cull distance is negative on all three vertices
+disappears, and its neighbour, with positive cull distances, stays. Disabled
+components hold -1.0 or 2.0, so declaring one would change the image. The
+expected images come from an exact model of clipping and culling that does not
+use the translator.
+
+```sh
+python -B tests/mesh_clip_cull_check.py
+python -B tests/mesh_clip_cull_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_clip_cull_" -V
+```
+
+The CPU mode checks both lowerers, the refusals (including every unsupported
+state word above), and removes each guard in turn. The draw mode renders both
+draws with the static and the runtime translation, then five translator mutants
+on each draw, which must change the readback by exactly the number of pixels the
+model predicts, zero included: clip and cull swapped, CCDIST0 and CCDIST1 swapped
+and clip distance 1 dropped (seen by the clip draw), cull distance 4 dropped
+(seen by the cull draw), and the word ignored (every exported component a clip
+distance, seen by both). The good draws have no triangle with mixed cull distance
+signs: on an RTX 3070 such a triangle lost the pixels where the interpolated cull
+distance is negative, while WARP kept it whole. A calibration draw measures which
+behaviour the adapter has, and the control predictions follow it. With per-pixel
+cull, clip and cull distances draw alike, so the clip and cull swap changes no
+pixel on such an adapter; WARP shows it.
+
 ### Constant-lane scalar spills in bounded mesh
 
 The bounded mesh translator models two wave64s and follows each wave's concrete
