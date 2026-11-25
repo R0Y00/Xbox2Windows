@@ -51,7 +51,7 @@ int main()
     const auto both = x2w_startup::decode_statics(mixed);
     expect(both.size() == 2, "two samplers", int(both.size()));
     if (both.size() == 2) {
-        expect(both[0].ShaderRegister == 0 && both[0].Filter == 0x0 && both[0].ComparisonFunc == D3D12_COMPARISON_FUNC_ALWAYS,
+        expect(both[0].ShaderRegister == 0 && both[0].Filter == 0x0 && both[0].ComparisonFunc == D3D12_COMPARISON_FUNC_NEVER,
                "ordinary sampler at register 0", both[0].Filter, both[0].ComparisonFunc);
         expect(both[1].ShaderRegister == 1 && both[1].Filter == 0x80 && both[1].ComparisonFunc == D3D12_COMPARISON_FUNC_LESS,
                "comparison sampler at register 1", both[1].Filter, both[1].ComparisonFunc);
