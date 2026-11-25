@@ -2089,7 +2089,9 @@ These are measured on one executable; treat them as hypotheses for others.
   clip. `RASTERIZER1` stores depth bias as a float; a value that is not an integer in the desktop range
   refuses the pipeline. Run `ctest --preset release --no-tests=error -R "^startup_stream_rasterizer_"`
   to check all 32 pixels for front and back culling, with each front-face winding and both stream
-  subobject types.
+  subobject types. On a multi-GPU system, set `XBOX2WINDOWS_ADAPTER` to a case-insensitive substring of
+  the adapter description to select hardware for the startup stream, rasterizer and depth fixtures.
+  An unmatched hardware selector fails the test. The WARP fixtures always select the software adapter.
   The ignore control expects the no-cull readback and fails. Stream depth-stencil state is already
   applied on this path. Geometry, hull, domain and compute stages remain open.
 - Translated draws use the bound typed RTV formats to request colour-export variants. The
