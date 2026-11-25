@@ -2448,3 +2448,25 @@ only the resolve path with valid addresses on a device, so it does not cover the
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_buffer_.*_control$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`
+
+## Command list CopyTextureRegion (list slot 16)
+
+Command list slot 16, `CopyTextureRegion`, maps each location's resource to its desktop resource, checks the
+call, and forwards it only when the desktop would accept it. A refused call is counted and logged
+(`x2w-d3d12 CopyTextureRegion refused: <reason>`), not forwarded. Capability, measured on the portable
+check only:
+
+- Argument checks (`src/startup_stubs/list_copy_texture.h`): footprint on both sides, empty or inverted box,
+  source and destination bounds, row pitch (multiple of 256), offset (multiple of 512), footprint end inside
+  the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
+  sample-count mismatch, block alignment.
+- Upload and readback footprint buffers keep their fixed heap states and get no barrier; an upload buffer as
+  destination or a readback buffer as source is refused (`bad_heap`).
+- A source or destination texture is brought up to date from its guest backing (`upload_texture`) before the
+  copy, so a later first sample does not replace the copied texels. A copied (non-aliased) source buffer is
+  refused (`stale_source`).
+- Two subresources of one resource are refused (`same_resource`): resource states are tracked per resource.
+
+Not verified: the Windows forwarding path (barriers, lazy-upload ordering) on a desktop device. Reproduce the
+portable check and its negative control with
+`ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
