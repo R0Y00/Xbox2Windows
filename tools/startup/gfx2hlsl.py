@@ -577,6 +577,7 @@ class Stage:
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
         if tok in ('vcc_lo', 'vcc'):
+            self.read_vcc()
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
             return 'exec'
@@ -660,8 +661,66 @@ class Stage:
         except ValueError:
             return None
 
+    def read_vcc(self):
+        if getattr(self, 'has_branches', False):
+            self.vcc_events.setdefault(self.pc, []).append(('read_vcc', None))
+        elif getattr(self, 'vcc_lost', False):
+            raise Unsupported('vcc read after a descriptor load into s106/s107')
+
     def emit(self, text):
+        if 'vcc' in text:
+            assignment = re.match(r'vcc = (.*);$', text)
+            rhs = assignment.group(1) if assignment else text
+            if re.search(r'\bvcc\b', rhs):
+                self.read_vcc()
+            if assignment:
+                if getattr(self, 'has_branches', False):
+                    self.vcc_events.setdefault(self.pc, []).append(('write_vcc', None))
+                if getattr(self, 'vcc_lost', False):
+                    # The scalar symbols are provisional across branches, checked after translation.
+                    self.vcc_lost = False
+                    self.vcc_descriptor_overwritten = True
+                    if not getattr(self, 'has_branches', False):
+                        self.sym.pop(106, None)
+                        self.sym.pop(107, None)
         self.lines.append(text)
+
+    def check_vcc_paths(self):
+        """An overlapping descriptor must reach its use on every path, and VCC must be numeric at a mask read."""
+        if not self.has_branches or not any(event == 'load_descriptor' for events in self.vcc_events.values()
+                                           for event, _ in events):
+            return
+        offsets = [off for off, _, _ in self.blocks]
+        index = {off: i for i, off in enumerate(offsets)}
+        by_block = [[] for _ in offsets]
+        block = 0
+        for off, events in sorted(self.vcc_events.items()):
+            while block + 1 < len(offsets) and offsets[block + 1] <= off:
+                block += 1
+            by_block[block].extend(events)
+        todo = [(0, None)]
+        seen = set()
+        while todo:
+            block, state = todo.pop()
+            if (block, state) in seen:
+                continue
+            seen.add((block, state))
+            for event, value in by_block[block]:
+                if event == 'read_vcc' and state is not None:
+                    raise Unsupported('vcc read after a descriptor load into s106/s107')
+                if event == 'read_descriptor':
+                    if state is None or any(state[reg] != symbol for reg, symbol in value):
+                        raise Unsupported('descriptor operand overlaps s106/s107 without a matching load on every path')
+                if event == 'load_descriptor':
+                    state = value
+                elif event == 'write_vcc':
+                    state = None
+            term = self.blocks[block][2]
+            if term and term[0] in ('jump', 'branch'):
+                if term[-1] in index:
+                    todo.append((index[term[-1]], state))
+            if (not term or term[0] == 'branch') and block + 1 < len(offsets):
+                todo.append((block + 1, state))
 
     def clear_low16(self, n):
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
@@ -758,6 +817,12 @@ class Stage:
         """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
         r = reg_range(tok)
         s = self.sym.get(r[1]) if r else None
+        if r and r[0] == 's' and r[1] <= 107 and r[2] >= 106:
+            if getattr(self, 'has_branches', False):
+                expected = tuple((i - 106, self.sym.get(i)) for i in range(max(106, r[1]), min(107, r[2]) + 1))
+                self.vcc_events.setdefault(self.pc, []).append(('read_descriptor', expected))
+            elif getattr(self, 'vcc_descriptor_overwritten', False):
+                raise Unsupported('descriptor operand %s overlaps a redefined vcc' % tok)
         if s and s[0] == 'desc':
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
@@ -804,6 +869,7 @@ class Stage:
         self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
         self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
         self.has_branches = bool(targets)
+        self.vcc_events = {}
         self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
         self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
         start = 0
@@ -847,6 +913,12 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
         self.pinned_low16_v.update(self.low16_only_v)
+        try:
+            self.check_vcc_paths()
+        except Unsupported as reason:
+            if refusals is None:
+                raise
+            refusals.append((str(reason), self.kind))
         leak = self.pinned_low16_v & self.whole_read_v
         if leak:
             reason = 'whole-word read of v%d after odd d16 image_load' % min(leak)
@@ -1010,6 +1082,8 @@ class Stage:
         if base == 's_branch':
             return ('jump', int(ops[0].split('_')[1], 16))
         if base.startswith('s_cbranch_'):
+            if base[10:].startswith('vcc'):
+                self.read_vcc()
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
             return ('branch', cond, int(ops[0].split('_')[1], 16))
@@ -1560,7 +1634,11 @@ class Stage:
         if len(ops) != 3:
             raise Unsupported('s_load with %d operands' % len(ops))
         dst, base = reg_range(ops[0]), reg_range(ops[1])
-        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
+        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[1] > 105 or dst[2] > 107:
+            raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
+        # s106/s107 are vcc: only a descriptor load, which emits no code, may end there (s[104:107]).
+        into_vcc = dst[2] > 105
+        if into_vcc and (dst[1] > 104 or dst[2] != 107):
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if not base or base[0] != 's' or base[2] - base[1] != 1 or base[2] > 105:
             raise Unsupported('s_load base %s' % ops[1])
@@ -1579,13 +1657,23 @@ class Stage:
             if imm is not None:
                 raise Unsupported('SMEM literal offset %s with offset:%#x' % (ops[2], imm))
             if p[1][0] == 'root':
+                if into_vcc:
+                    raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
                 buf = self.pipe.resource((p[1], None), 'buf')
                 for i in range(count):
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
                 return
             for i in range(count):
                 self.sym[dst[1] + i] = ('desc', p[1], off, i)
+            if into_vcc:
+                self.vcc_lost = True
+                self.vcc_descriptor_overwritten = False
+                if getattr(self, 'has_branches', False):
+                    value = tuple(self.sym.get(i) for i in (106, 107))
+                    self.vcc_events.setdefault(self.pc, []).append(('load_descriptor', value))
             return
+        if into_vcc:
+            raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if p[1] == ('smpheap',):
             if self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
