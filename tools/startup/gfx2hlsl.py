@@ -2750,7 +2750,7 @@ class Stage:
 
     def pk_int(self, ops, mods, combine, signed):
         low, high, _, _ = self.pk_lanes(ops, mods, 2)
-        wrap = (lambda x: 'int(((%s) << 16)) >> 16' % x) if signed else (lambda x: x)
+        wrap = (lambda x: '(int(((%s) << 16)) >> 16)' % x) if signed else (lambda x: x)
         results = ['((%s) & 0xffffu)' % combine(wrap(lane[0]), wrap(lane[1])) for lane in (low, high)]
         self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % tuple(results))
 

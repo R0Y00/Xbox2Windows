@@ -12,6 +12,7 @@ The instruction bytes are constructed here from the layout the checked-in decode
   w1: [8:0] src0, [17:9] src1, [26:18] src2, [28:27] op_sel_hi[1:0], [31:29] neg_lo
 """
 import os
+from pathlib import Path
 import re
 import struct
 import sys
@@ -118,7 +119,7 @@ _, hlsl = translate(encode('v_pk_sub_u16', 0, (V1, V2)))
 check('pk_sub_u16', hlsl == 'v0 = (((v1 & 0xffffu) - (v2 & 0xffffu)) & 0xffffu) | '
       '((((v1 >> 16) - (v2 >> 16)) & 0xffffu) << 16);', hlsl)
 _, hlsl = translate(encode('v_pk_max_i16', 0, (V1, V2)))
-check('pk_max_i16 sign extends', hlsl.count('>> 16') >= 4 and 'int((((v1 & 0xffffu)) << 16)) >> 16' in hlsl, hlsl)
+check('pk_max_i16 sign extends', hlsl.count('>> 16') >= 4 and '(int((((v1 & 0xffffu)) << 16)) >> 16)' in hlsl, hlsl)
 for name in ('v_pk_add_i16', 'v_pk_add_u16', 'v_pk_sub_i16', 'v_pk_max_u16', 'v_pk_min_i16', 'v_pk_min_u16'):
     check(name + ' lowers', not refused(encode(name, 0, (V1, V2))))
 
@@ -134,6 +135,33 @@ _, hlsl = translate(encode('v_dot4_u32_u8', 0, (V1, V2, V3)))
 check('dot4_u32_u8', normal(hlsl) == normal(
     'v0 = ((v1 >> 0) & 0xffu) * ((v2 >> 0) & 0xffu) + ((v1 >> 8) & 0xffu) * ((v2 >> 8) & 0xffu) + '
     '((v1 >> 16) & 0xffu) * ((v2 >> 16) & 0xffu) + ((v1 >> 24) & 0xffu) * ((v2 >> 24) & 0xffu) + v3;'), hlsl)
+
+# The signed 16-bit forms must also compute the right values (operator precedence of the sign extension).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from startup_gfx2hlsl_bit_alu_check import Expr  # noqa: E402
+
+
+def s16(x):
+    return x - 0x10000 if x & 0x8000 else x
+
+
+SIGNED_REFERENCE = {'v_pk_add_i16': lambda a, b: a + b, 'v_pk_sub_i16': lambda a, b: a - b,
+                    }
+PACKED = [0x00010001, 0x7fff8000, 0x8000ffff, 0x12345678, 0xfffe0002, 0x80007fff, 0, 0xffffffff]
+for name, ref in SIGNED_REFERENCE.items():
+    _, hlsl = translate(encode(name, 0, (V1, V2)))
+    expr = Expr(hlsl[len('v0 = '):-1])
+    bad = None
+    for a in PACKED:
+        for b in PACKED:
+            want = sum(((ref(s16(a >> sh & 0xffff), s16(b >> sh & 0xffff)) & 0xffff) << sh) for sh in (0, 16))
+            got = expr.run({'v1': a, 'v2': b})[0]
+            if got != want:
+                bad = (hex(a), hex(b), hex(got), hex(want))
+                break
+        if bad:
+            break
+    check(name + ' values', bad is None, str(bad))
 
 # What is not modelled stays a refusal.
 check('int op refuses neg_lo', refused(encode('v_pk_add_u16', 0, (V1, V2), neg_lo=(1, 0, 0))))
