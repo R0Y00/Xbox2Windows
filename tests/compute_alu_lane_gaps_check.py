@@ -232,7 +232,7 @@ def mutate(directory, compiler, source, case, cmd, cso, mutations):
 
 
 if __name__ == "__main__":
-    mode, *args = sys.argv[1:]
+    mode, *args = sys.argv[1:] or ["controls"]
     controls()
     if mode == "controls":
         sys.exit(0)

@@ -197,7 +197,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_heap_view_check.py
 ./out/pe-env/bin/python -B tests/compute_heap_store_check.py
 ./out/pe-env/bin/python -B tests/compute_desc_numeric_check.py controls
-./out/pe-env/bin/python -B tests/compute_alu_lane_gaps_check.py controls
+./out/pe-env/bin/python -B tests/compute_alu_lane_gaps_check.py
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
