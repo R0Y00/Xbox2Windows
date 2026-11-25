@@ -8832,7 +8832,12 @@ pages and ranges before recording the draw and again before submission.
 Both leases remain pinned until the consumer fence completes.
 
 The source-built fixture uses the root word for colour and the dispatch group
-count for horizontal coverage. On Windows 11 build 26200.9974, RTX 4060 Laptop
+count for horizontal coverage. A compute dispatch initializes the argument
+record to `{0,1,1,0}`. After a UAV barrier, a second dispatch atomically
+increments X twice. A queue copy publishes its first 12 bytes. Omitting
+the increments leaves X at zero and all eight pixels clear, with both
+producer waits enabled and both guard words intact.
+On Windows 11 build 26200.9974, RTX 4060 Laptop
 (32.0.16.1656) and WARP both returned eight red pixels. Omitting only the SRV
 wait gave eight green pixels. Omitting only the argument wait gave four red
 pixels and four clear pixels. Replacing the argument page between recording

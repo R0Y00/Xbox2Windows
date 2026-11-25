@@ -15,6 +15,7 @@ struct MeshLeaseWriter {
     HMODULE xmem;
     const UINT64 record_bytes;
     const UINT64 record_offset;
+    const UINT expected_group_x;
     Allocate alloc;
     Map map;
     Free free_pages;
@@ -39,9 +40,9 @@ struct MeshLeaseWriter {
 
     MeshLeaseWriter(ID3D12Device* d, ID3D12Device* g, const wchar_t* dll,
                     ID3D12RootSignature* writer_root = nullptr, ID3D12PipelineState* writer = nullptr,
-                    MeshLeaseWriter* mirror_owner = nullptr)
+                    MeshLeaseWriter* mirror_owner = nullptr, ID3D12PipelineState* append = nullptr)
         : device(d), guest(g), xmem(LoadLibraryW(dll)), record_bytes(writer ? sizeof(old_groups) : sizeof(red)),
-          record_offset(mirror_owner ? 0x80 : word_offset),
+          record_offset(mirror_owner ? 0x80 : word_offset), expected_group_x(mirror_owner && !append ? 0 : new_groups[0]),
           alloc(function<Allocate>("XMemAllocatePhysicalPages")),
           map(function<Map>("XMemMapPhysicalPagesScatter")), free_pages(function<Free>("XMemFreePhysicalPages")),
           pin(function<Pin>("x2w_xmem_lease_section")), unpin(function<Unpin>("x2w_xmem_release_section"))
@@ -95,6 +96,14 @@ struct MeshLeaseWriter {
             list->SetComputeRootSignature(writer_root);
             list->SetComputeRootUnorderedAccessView(0, writer_source->GetGPUVirtualAddress());
             list->Dispatch(1, 1, 1);
+            if (append) {
+                D3D12_RESOURCE_BARRIER between_dispatches{};
+                between_dispatches.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                between_dispatches.UAV.pResource = writer_source.Get();
+                list->ResourceBarrier(1, &between_dispatches);
+                list->SetPipelineState(append);
+                list->Dispatch(1, 1, 1);
+            }
             transition(list.Get(), writer_source.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         } else {
             writer_source = make_buffer(device, sizeof(red), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -105,8 +114,9 @@ struct MeshLeaseWriter {
             writer_source->Unmap(0, nullptr);
         }
         using Copy = void (WINAPI*)(IUnknown*, IUnknown*, UINT64, IUnknown*, UINT64, UINT64);
+        const UINT64 source_offset = writer && !mirror_owner ? argument_offset : 0;
         slot<Copy>(recording.Get(), 15)(recording.Get(), placed.Get(), record_offset, writer_source.Get(),
-                                        writer ? argument_offset : 0, record_bytes);
+                                        source_offset, record_bytes);
         check(slot<HRESULT (WINAPI*)(IUnknown*)>(recording.Get(), 9)(recording.Get()), "close slot 15 writer");
         queue = create_queue(type);
         gate = create_fence();
@@ -168,14 +178,14 @@ struct MeshLeaseWriter {
         check(device->GetDeviceRemovedReason(), "slot 15 GPU completion");
         if (record_bytes == sizeof(new_groups)) {
             UINT observed[5]{};
-            const UINT expected[]{leading_guard, new_groups[0], new_groups[1], new_groups[2], trailing_guard};
+            const UINT expected[]{leading_guard, expected_group_x, new_groups[1], new_groups[2], trailing_guard};
             std::memcpy(observed, cpu + record_offset - sizeof(UINT), sizeof(observed));
             for (std::size_t i = 0; i < std::size(expected); ++i) {
                 if (observed[i] != expected[i])
                     std::fprintf(stderr, "XMem mesh argument/guard %zu: got %08x, expected %08x\n", i, observed[i], expected[i]);
                 check(observed[i] == expected[i] ? S_OK : E_FAIL, "check the compute-written XMem record and guards");
             }
-            std::puts("XMem DispatchMesh record and guards: {2,1,1} with both guards intact");
+            std::printf("XMem DispatchMesh record and guards: {%u,1,1} with both guards intact\n", expected_group_x);
             return;
         }
         UINT actual{};
@@ -321,11 +331,12 @@ bool check_mesh_indirect_xmem(ID3D12Device* device, ID3D12Device* guest, const w
 
 bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar_t* xmem,
                           ID3D12InfoQueue* info, const std::wstring& log_path,
-                          ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
+                          ID3D12RootSignature* writer_root, ID3D12PipelineState* initialize, ID3D12PipelineState* append,
                           ID3D12RootSignature* root, IUnknown* pipeline, ID3D12CommandSignature* signature)
 {
+    const bool init_only = !append;
     MeshLeaseWriter colour(device, guest, xmem);
-    MeshLeaseWriter arguments(device, guest, xmem, writer_root, writer, &colour);
+    MeshLeaseWriter arguments(device, guest, xmem, writer_root, initialize, &colour, append);
     check(colour.published_page.first != arguments.published_page.first ? S_OK : E_FAIL,
           "combined mesh writers use different physical pages");
     const auto queue = colour.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -365,10 +376,12 @@ bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar
 
     const bool skip_srv = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT", nullptr, 0) != 0;
     const bool skip_arguments = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT", nullptr, 0) != 0;
-    check(!(skip_srv && skip_arguments) ? S_OK : E_FAIL, "select one combined mesh wait control");
+    check(static_cast<int>(skip_srv) + static_cast<int>(skip_arguments) + static_cast<int>(init_only) <= 1 ? S_OK : E_FAIL,
+          "select one combined mesh control");
     const bool control = skip_srv || skip_arguments;
-    auto consume = draw(skip_srv ? green : red, skip_srv ? green : skip_arguments ? black : red);
-    const char* label = skip_srv ? "combined mesh stale SRV: two green halves" :
+    auto consume = init_only ? refused : draw(skip_srv ? green : red, skip_srv ? green : skip_arguments ? black : red);
+    const char* label = init_only ? "combined mesh initialized arguments: zero groups" :
+                        skip_srv ? "combined mesh stale SRV: two green halves" :
                         skip_arguments ? "combined mesh stale arguments: left red, right clear" :
                                          "combined mesh fresh inputs: two red halves";
     colour.start();
@@ -392,7 +405,7 @@ bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar
     colour.finish();
     arguments.finish();
 
-    if (!control) {
+    if (!control && !init_only) {
         auto remapped = refused;
         ULONG_PTR replacement{}, count = 1;
         check(colour.alloc(0x280, &count, &replacement) && count == 1 ? S_OK : E_FAIL,
@@ -420,7 +433,7 @@ bool check_mesh_dual_xmem(ID3D12Device* device, ID3D12Device* guest, const wchar
     log.close();
     DeleteFileW(log_path.c_str());
     check(lines.find("mesh XMem read has no submitted writer for the required size") != std::string::npos &&
-          (control || lines.find("mesh XMem submit refused: writer or live page identity changed") != std::string::npos)
+          (control || init_only || lines.find("mesh XMem submit refused: writer or live page identity changed") != std::string::npos)
           ? S_OK : E_FAIL, "check combined mesh missing-writer and remapped-argument refusals");
     check_lease_debug(info);
     return true;

@@ -127,6 +127,17 @@ void write_two_mesh_groups() {
 }
 
 [numthreads(1, 1, 1)]
+void initialize_mesh_record() {
+    data.Store4(0, uint4(0, 1, 1, 0));
+}
+
+[numthreads(2, 1, 1)]
+void append_mesh_groups() {
+    uint previous;
+    data.InterlockedAdd(0, 1u, previous);
+}
+
+[numthreads(1, 1, 1)]
 void write_one_rect() {
     data.Store4(4, uint4(3, 1, 0, 0));
 }
@@ -1481,9 +1492,12 @@ int main(int argc, char** argv) try
             guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
             {}, depth_only ? 0 : lease_fixture ? 1 : 3, depth_only);
         if (dual_lease) {
-            const auto work = writer_pipeline(device.Get(), writer.Get(), "write_two_mesh_groups");
+            const bool init_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_INIT_ONLY", nullptr, 0) != 0;
+            const auto initialize = writer_pipeline(device.Get(), writer.Get(), "initialize_mesh_record");
+            ComPtr<ID3D12PipelineState> append;
+            if (!init_only) append = writer_pipeline(device.Get(), writer.Get(), "append_mesh_groups");
             return check_mesh_dual_xmem(device.Get(), guest.Get(), lease_xmem, info.Get(), log_path,
-                                        writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
+                                        writer.Get(), initialize.Get(), append.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
         }
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
         if (lease_fixture) {

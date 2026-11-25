@@ -36,16 +36,19 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None):
     if lease_xmem:
         environment['X2W_MESH86_FIXTURE_XMEM'] = str(lease_xmem)
         for flag in ('X2W_TEST_MESH_XMEM_SKIP_WAIT', 'X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT',
-                     'X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT', 'X2W_MESH86_FIXTURE_DUAL', 'X2W_MESH_INDIRECT_XMEM'):
+                     'X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT', 'X2W_MESH86_FIXTURE_DUAL',
+                     'X2W_MESH86_FIXTURE_INIT_ONLY', 'X2W_MESH_INDIRECT_XMEM'):
             environment.pop(flag, None)
         if mode == 'skip-wait':
             environment['X2W_TEST_MESH_XMEM_SKIP_WAIT'] = '1'
-        elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument'):
+        elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument', 'dual-init-only'):
             environment.update(X2W_MESH86_FIXTURE_DUAL='1', X2W_MESH_INDIRECT_XMEM='1')
             if mode == 'dual-skip-srv':
                 environment['X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT'] = '1'
             elif mode == 'dual-skip-argument':
                 environment['X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT'] = '1'
+            elif mode == 'dual-init-only':
+                environment['X2W_MESH86_FIXTURE_INIT_ONLY'] = '1'
     cmd = [fixture, backend, 'mesh']
     capture = subprocess.run(cmd, env=environment)
     if capture.returncode:
