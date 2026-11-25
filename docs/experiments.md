@@ -3991,6 +3991,61 @@ kind in its disassembly. The CPU witnesses and mutations pass independently.
 Native readback remains pending, including the raw miss and disabled-slot
 words. The probe leaves translator behavior and form coverage unchanged.
 
+### gfx1013 2D explicit-LOD image gathers
+
+The gfx1013 compute profile accepts one `image_gather4_l` with
+`--gather-mips <count>` on the `R32G32B32A32_FLOAT` SRV that `image_load_mip`
+uses: `--image-descriptor` names the eight-word descriptor bound to `t0` and
+the output is the raw `u0`. The caller binds matching native and desktop 2D
+views and declares their visible mip count (1 to 16). The four sampler words
+must be constant SGPRs and match the gather profile of the pixel tool (see
+gfx1030 2D image gathers): normalized coordinates, clamp-to-edge in X and Y,
+bilinear XY and point mip filtering, zero LOD bias, minimum LOD zero and
+maximum LOD at or above the last visible mip. The LOD must be a statically
+known integral binary32 value inside the view, so point mip filtering selects
+that view-relative mip on both sides. A fractional, unknown or out-of-view LOD
+is refused.
+
+One-hot DMASK selects a source component. The four destination VGPRs receive
+that component from the 2×2 footprint, in `(0,1), (1,1), (1,0), (0,0)` order
+in increasing texture coordinates, through four desktop `Load` calls at the
+selected mip. U, V and LOD come from three consecutive VGPRs. Coordinates must
+select the same half-texel footprint under native texture-coordinate precision
+and desktop floating-point arithmetic. An invocation whose U or V is NaN or
+infinite publishes no store, because no native result is established for it.
+Wait for the descriptor with `lgkmcnt(0)` and for the result with `vmcnt(0)`.
+The profile refuses every other gather form by name (`image_gather4`, `_lz`,
+`_b`, `_cl`, `_c*` and `_o`), cube, array, 1D and 3D dimensions, NSA, `unorm`,
+A16, D16 and cache modifiers, a gather under a lane guard and a second gather.
+The pixel tool's `_l` form is the gfx1030 counterpart; the compute form here
+targets gfx1013. See the MIMG address and sampler tables in the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+The fixture builds U and V as `0.1875 × id − 0.15` for an 8×8 group, so the
+footprints cover both clamped edges and every coordinate stays at least 1/64
+texel away from a tap boundary at each used mip. Five cases gather red, green,
+blue and alpha at LOD 0, 1 and 2 of a full three-mip view, and at LOD 0 and 1
+of a view with `MostDetailedMip = 1`. A sixth case sets U to NaN and expects
+every word untouched. Each readback compares 320 words with an independent CPU
+model: 256 gathered words and 64 sentinels per valid case. Four GPU mutants
+must fail at the first word their own model predicts: a gather at the wrong
+mip, the first and last taps exchanged, the view case bound to the full
+resource, and the NaN case without its finite guard. Translation controls cover
+each refusal above and the binding, sampler and LOD rules. The LLVM 15 job
+assembles and disassembles the six programs and compares the synthetic
+container CLI with the text lowering. Texel values are normal binary32
+numbers; NaN payloads, denormals and coordinates within 1/256 texel of a tap
+boundary are not tested.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_gather4_l_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_gather4_l_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
 ### gfx1030 2D image loads
 
 The `gfx1030` compute store profile lowers the typed MIMG form
