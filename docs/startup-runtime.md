@@ -1980,8 +1980,11 @@ These are measured on one executable; treat them as hypotheses for others.
   Uncompressed `R32G32B32A32`, `R32G32` and `R32` UINT and SINT outputs use integer shader
   signatures (`startup_mrt_*` reads back every stored word on WARP and hardware). `R32G32_FLOAT` and
   `R32_FLOAT` use the same bit-preserving path as `R32G32B32A32_FLOAT`, covering a NaN payload and a
-  negative denormal. Integer formats with 8- or 16-bit channels are refused at translation with
-  `unverified UINT/SINT RTV format <n>`.
+  negative denormal. Uncompressed exports to `R8G8B8A8_UINT` and `R8G8B8A8_SINT` use unsigned
+  and signed integer shader outputs. The output merger clamps each channel to 0–255 or −128–127
+  respectively. With export words `ffffffff ffffff7f 00000080 00000100`, the stored bytes are
+  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The other 8- and 16-bit integer views
+  still return `unverified UINT/SINT RTV format <n>`.
   Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
   undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain

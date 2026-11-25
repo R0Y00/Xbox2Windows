@@ -4468,10 +4468,10 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 D16_FLOAT_EXACT_SRV_FORMATS = frozenset((2, 6, 16, 21, 28, 41, 49, 61, 65, 87, 88))
 D16_UNORM16_SRV_FORMATS = frozenset((11, 35, 56))
 D16_EXACT_SRV_FORMATS = D16_FLOAT_EXACT_SRV_FORMATS | D16_UNORM16_SRV_FORMATS
-# The formats whose channels are all 32 bits wide: the export words are the stored words, so one integer
-# signature serves them. Narrower integer formats stay refused until a readback shows how they truncate.
-VERIFIED_UINT_RTVS = frozenset((3, 17, 42))   # R32G32B32A32, R32G32, R32
-VERIFIED_SINT_RTVS = frozenset((4, 18, 43))
+# Uncompressed exports keep their 32-bit shader values. RGBA8 integer RTVs clamp each
+# channel to the destination range in the output merger.
+VERIFIED_UINT_RTVS = frozenset((3, 17, 30, 42))
+VERIFIED_SINT_RTVS = frozenset((4, 18, 32, 43))
 
 
 class Pipeline:
