@@ -6355,7 +6355,7 @@ cannot read a neighbour. In a pixel stage, `quad_perm:[1,1,3,3]`, `[0,0,2,2]`, `
 the lane that takes the other lane's word adds or subtracts the fine derivative of each 16-bit half of its register
 (`ddx_fine` for a horizontal pair, `ddy_fine` for a vertical one; integers below 2^17 are exact in float32), selected
 by the parity of `SV_Position`. The permuted word lives in a scratch register, so `v_add_nc_u32_dpp v3, v1, v1`
-adds the permuted word to the pixel's own. Straight-line pixel code with the full entry mask is required, as the quad
+adds the permuted word to the pixel's own. Straight-line pixel code after `s_wqm_b64 exec, exec` on the entry mask is required (an entry mask or a restored exact mask may leave a neighbour inactive, which native DPP16 treats differently), as the quad
 must run together with its helper lanes. Everything else stays refused by name. `startup_gfx2hlsl_dpp_pair` models a
 quad on the CPU for the emitted text and checks the refusals; `startup_gfx2hlsl_dpp_pair_{warp,hardware}` draw 16 x 16
 pixels per pattern, each pixel carrying a different 32-bit word, and compare every word with a reference written from

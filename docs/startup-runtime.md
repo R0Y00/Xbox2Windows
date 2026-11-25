@@ -1087,7 +1087,7 @@ These are measured on one executable; treat them as hypotheses for others.
   first source is a VGPR. The other lane of the pair is rebuilt from `ddx_fine` or `ddy_fine` of each 16-bit half of
   the word, which are exact in float32, and the result goes through a scratch register so a second source naming the
   same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
-  shader with helper lanes: vertex stages, branches and a changed EXEC are refused, and so are the identity, quad
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, and so are the identity, quad
   swap and quad broadcast permutations, `row_*`, `wave_*`, partial masks and `fi`. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
   draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,

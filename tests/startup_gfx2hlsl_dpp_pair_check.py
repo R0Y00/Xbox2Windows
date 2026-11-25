@@ -77,11 +77,13 @@ def vop2_dpp(op, vdst, src0, vsrc1, ctrl, bank=0xf, row=0xf):
 
 V_MOV_B32, V_ADD_NC_U32 = 1, 0x25
 MUL_WORDS = struct.pack('<II', (0x0b << 25) | (1 << 17) | 255, MULTIPLIER)  # v_mul_u32_u24 v1, 0x9b5d, v0
+WQM_WORDS = struct.pack('<I', 0xbefe0a7e)                                   # s_wqm_b64 exec, exec
 EXPORT_WORDS = struct.pack('<III', 0xf800180f, 0x00010302, 0xbf810000)    # exp mrt0 v2, v3, v1, v0 done vm; s_endpgm
 
 
 def ps_source(perm):
-    return ('v_mul_u32_u24_e32 v1, 0x9b5d, v0\n'
+    return ('s_wqm_b64 exec, exec\n'
+            'v_mul_u32_u24_e32 v1, 0x9b5d, v0\n'
             'v_mov_b32_dpp v2, v1 %s %s\n'
             'v_add_nc_u32_dpp v3, v1, v1 %s %s\n'
             'exp mrt0 v2, v3, v1, v0 done vm\n'
@@ -89,7 +91,7 @@ def ps_source(perm):
 
 
 def ps_words(perm):
-    return (MUL_WORDS + vop1_dpp(V_MOV_B32, 2, 1, control(perm)) + vop2_dpp(V_ADD_NC_U32, 3, 1, 1, control(perm))
+    return (WQM_WORDS + MUL_WORDS + vop1_dpp(V_MOV_B32, 2, 1, control(perm)) + vop2_dpp(V_ADD_NC_U32, 3, 1, 1, control(perm))
             + EXPORT_WORDS)
 
 
@@ -181,10 +183,11 @@ def simulate(text):
 class Probe(G.Stage):
     """A Stage with no pipeline: enough state for decoded instructions to be translated."""
 
-    def __init__(self, kind='ps', exec_known=True, has_branches=False):
+    def __init__(self, kind='ps', exec_known=True, has_branches=False, whole_quad=True):
         self.lines, self.sym = [], {}
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
         self.kind, self.exec_known, self.has_branches = kind, exec_known, has_branches
+        self.whole_quad = whole_quad
 
 
 def refused(asm, **kwargs):
@@ -195,6 +198,34 @@ def refused(asm, **kwargs):
     except G.Unsupported as reason:
         return str(reason)
     return None
+
+
+def translate(words):
+    try:
+        return G.Pipeline(VS_WORDS, words, root_blob(), ps_hw_inputs=PACKED).hlsl_ps(), None
+    except G.Unsupported as reason:
+        return None, str(reason)
+
+
+def pipeline_controls():
+    """Whole-quad proof and used-register bookkeeping, seen through a whole pixel program."""
+    ctrl = control((1, 1, 3, 3))
+    dpp = vop1_dpp(V_MOV_B32, 2, 1, ctrl)
+    text, reason = translate(MUL_WORDS + dpp + EXPORT_WORDS)
+    check('refuses DPP without s_wqm exec, exec (entry mask may leave a neighbour inactive)',
+          text is None and reason is not None and 'whole-quad' in reason, str(reason))
+    save, restore = struct.pack('<I', 0xbe84047e), struct.pack('<I', 0xbefe0404)  # s_mov_b64 s[4:5], exec / exec, s[4:5]
+    text, reason = translate(save + WQM_WORDS + restore + MUL_WORDS + dpp + EXPORT_WORDS)
+    check('refuses DPP after an exact entry mask is restored over the WQM mask',
+          text is None and reason is not None and 'whole-quad' in reason, str(reason))
+    text, reason = translate(save + WQM_WORDS + MUL_WORDS + dpp + EXPORT_WORDS)
+    check('accepts DPP after s_wqm with a saved copy still unrestored', text is not None, str(reason))
+    # DPP is the only reader of v0: v0 must still be declared and initialized from the packed position input.
+    only = struct.pack('<III', 0xf800180f, 0x02020202, 0xbf810000)  # exp mrt0 v2, v2, v2, v2 done vm; s_endpgm
+    text, reason = translate(WQM_WORDS + vop1_dpp(V_MOV_B32, 2, 0, ctrl) + only)
+    check('a DPP-only source VGPR is declared', text is not None and 'v0' in text.split('x2w_lo', 1)[0], str(reason))
+    check('a DPP-only source VGPR is initialized before the lowering',
+          text is not None and 'uint v0' in text and text.index('uint v0') < text.index('x2w_lo'), str(text)[:300])
 
 
 def controls():
@@ -235,9 +266,11 @@ def controls():
             ('a vertex stage', accepted, {'kind': 'vs'}),
             ('a program with branches', accepted, {'has_branches': True}),
             ('an unknown entry mask', accepted, {'exec_known': False}),
+            ('an entry mask not proven whole-quad', accepted, {'whole_quad': False}),
             ('a scalar source', 'v_mov_b32_dpp v2, s1 quad_perm:[1,1,3,3] row_mask:0xf bank_mask:0xf', {})):
         reason = refused(asm, **kwargs)
         check('refuses %s' % label, reason is not None, 'translated')
+    pipeline_controls()
     wave = refused('v_mov_b32_dpp v2, v1 wave_shl:1 row_mask:0xf bank_mask:0xf')
     check('the refusal names the control', wave is not None and 'wave_shl:1' in wave, str(wave))
 

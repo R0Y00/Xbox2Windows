@@ -368,6 +368,7 @@ class Stage:
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
+        self.whole_quad = False   # s_wqm exec, exec ran on the entry mask and no exact mask was restored since
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
@@ -686,7 +687,7 @@ class Stage:
         from the quad's fine derivative of each 16-bit half (ddx_fine / ddy_fine over exactly representable floats:
         the difference of the pair, added to or subtracted from this lane's half). That needs all four lanes of the
         quad to run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and
-        the full entry mask. Every other control (other permutations, row_*, wave_*, a partial row or bank mask,
+        a whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every other control (other permutations, row_*, wave_*, a partial row or bank mask,
         fi, a vertex stage) is refused by name, since the single lane cannot read a neighbour."""
         perms = [m for m in mods if m.startswith('quad_perm:')]
         rest = [m for m in mods if not m.startswith('quad_perm:')]
@@ -701,8 +702,9 @@ class Stage:
         if axis is None:
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
         if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
-                getattr(self, 'fetched', False)):
-            raise Unsupported('%s_dpp %s outside straight-line pixel code with the full entry mask' % (base, perms[0]))
+                not getattr(self, 'whole_quad', False) or getattr(self, 'fetched', False)):
+            raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
+                              % (base, perms[0]))
         if len(ops) < 2:
             raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
         # The permuted word goes to a scratch register (v256, beyond the 256 hardware registers), so a second source
@@ -710,7 +712,7 @@ class Stage:
         src = re.fullmatch(r'([-|]*)v(\d+)(\|?)', ops[1])
         if not src:
             raise Unsupported('%s_dpp source %s' % (base, ops[1]))
-        word = 'v%s' % src.group(2)
+        word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
         coord, sign, parity = axis
         derive = 'ddx_fine' if coord == 'x' else 'ddy_fine'
         self.used_v.add(DPP_SCRATCH)
@@ -734,6 +736,8 @@ class Stage:
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
         if base in ('s_wqm_b32', 's_wqm_b64'):
+            if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
+                self.whole_quad = True  # every quad that has an active lane has all four lanes active
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -939,6 +943,7 @@ class Stage:
                 copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
                     # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
+                    self.whole_quad = False
                     if hasattr(self, 'uniform_v'):
                         self.uniform_v.clear()
                     return None
