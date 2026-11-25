@@ -15,6 +15,7 @@ under src/amd/addrlib at the revision tools/fetch_addrlib.py pins (Mesa 25.1.0, 
 and src/core/addrlib2.cpp, each with the notice "Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All
 rights reserved. SPDX-License-Identifier: MIT". No addrlib code is included.
 """
+import os
 from pathlib import Path
 import struct
 import sys
@@ -234,8 +235,12 @@ def check_gate(directory, consumer, backend, ring):
             "float4 main(float4 p : SV_Position) : SV_Target {\n"
             "  return t.Load(int3(uint(p.x) % 2048, uint(p.y) % 2048, 0));\n}\n")
     trap_log = directory / "trap.log"
-    modes = {"X2W_TEST_CONSOLE_GATE": "1", "X2W_TRAP_LOG": str(trap_log),
-             "X2W_TEST_ADDRESS_UPLOAD_RING": "1" if ring else ""}
+    modes = {"X2W_TEST_CONSOLE_GATE": "1", "X2W_TRAP_LOG": str(trap_log)}
+    if ring:
+        modes["X2W_TEST_ADDRESS_UPLOAD_RING"] = "1"
+    else:
+        # The Windows switch checks for presence, including an empty value.
+        os.environ.pop("X2W_TEST_ADDRESS_UPLOAD_RING", None)
     actual = draw_texture(directory, consumer, backend, hlsl, modes)
     if actual is None:
         return 77
