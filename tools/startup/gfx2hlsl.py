@@ -1469,42 +1469,20 @@ class Stage:
         self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
 
     def uniform_vgpr(self, name, tok):
-        """VGPR number of tok when every lane holds the same proven value, else Unsupported."""
-        src = reg_range(tok)
-        if (self.has_branches or not self.exec_known or not src or src[0] != 'v' or src[1] != src[2]
-                or src[1] not in self.uniform_v):
-            raise Unsupported('%s requires a proven uniform source' % name)
-        return src[1]
+        """Refuse: a cross-lane read cannot be proven safe, because the model proves uniformity over the
+        active lanes only and EXEC may be sparse. The selected source lane can be inactive, where the
+        guest reads a stale value (v_readlane_b32) or keeps the old destination (v_permlanex16_b32)."""
+        raise Unsupported('%s requires every selected source lane to be proven active' % name)
 
     def op_v_readlane_b32(self, ops, mods):
-        # The model runs one lane of unknown index, so reading any lane equals reading this one only when
-        # the VGPR is proven uniform. The lane select (SGPR or inline constant) then does not change the value.
         if mods or len(ops) != 3:
             raise Unsupported('v_readlane_b32 with %d operands and modifiers %s' % (len(ops), mods))
-        dst, sel = reg_range(ops[0]), reg_range(ops[2])
-        if not dst or dst[0] != 's' or dst[1] != dst[2] or (sel and (sel[0] != 's' or sel[1] != sel[2])):
-            raise Unsupported('v_readlane_b32 operands %s, %s: expected a single SGPR and a scalar lane select' % (ops[0], ops[2]))
-        src = self.uniform_vgpr('v_readlane_b32', ops[1])
-        self.u(ops[2])
-        self.set_s(dst[1], 'v%d' % src)
+        self.uniform_vgpr('v_readlane_b32', ops[1])
 
     def op_v_permlanex16_b32(self, ops, mods):
-        # Lane i reads lane sel of the other row of 16. For a proven uniform VGPR every lane holds the
-        # same word, so the result is that word. The fetch-inactive and bound_ctrl flags change what an
-        # inactive source lane yields, which the one-lane model cannot see: they are refused.
         if mods or len(ops) != 4:
             raise Unsupported('v_permlanex16_b32 with %d operands and modifiers %s' % (len(ops), mods))
-        dst = reg_range(ops[0])
-        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
-            raise Unsupported('v_permlanex16_b32 destination %s: expected a single VGPR' % ops[0])
-        for tok in ops[2:]:
-            sel = reg_range(tok)
-            if sel and (sel[0] != 's' or sel[1] != sel[2]):
-                raise Unsupported('v_permlanex16_b32 lane select %s: expected a scalar register' % tok)
-            self.u(tok)
-        src = self.uniform_vgpr('v_permlanex16_b32', ops[1])
-        self.set_v(dst[1], 'v%d' % src)
-        self.uniform_v.add(dst[1])
+        self.uniform_vgpr('v_permlanex16_b32', ops[1])
 
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
