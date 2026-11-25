@@ -2406,6 +2406,13 @@ enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline
        indirect_outcomes };
 volatile LONG64 indirect_calls[indirect_outcomes][5];
 
+struct IndirectAddressAlias {
+    ID3D12Resource* resource = nullptr;
+    u64 offset = 0;
+};
+
+IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 bytes);
+
 struct IndirectIndexView {
     D3D12_INDEX_BUFFER_VIEW view{};
     ID3D12Resource* resource = nullptr;
@@ -2526,13 +2533,23 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         } else {
             const auto upload = translated && !indices.owner
                 ? list_upload_range(self, view.BufferLocation, view.SizeInBytes) : x2w_upload::Allocation{};
-            if (!upload.resource) return refuse("index view has no unique placed or current recording upload buffer");
             // The compute validator reads 32-bit words, including for R16_UINT. Do not
             // load an adjacent recording upload allocation when extracting a half-word.
-            if ((upload.offset | view.SizeInBytes) & 3)
-                return refuse("upload index view is not dword-aligned and dword-sized");
-            view.BufferLocation = upload.gpu;
-            index_view = {view, upload.resource, upload.offset, true};
+            if (upload.resource) {
+                if ((upload.offset | view.SizeInBytes) & 3)
+                    return refuse("upload index view is not dword-aligned and dword-sized");
+                view.BufferLocation = upload.gpu;
+                index_view = {view, upload.resource, upload.offset, true};
+            } else {
+                const auto alias = translated && !indices.owner && !list_upload_range(self, view.BufferLocation, 1).resource
+                    ? indirect_address_alias(self->own().list_device, view.BufferLocation, view.SizeInBytes) : IndirectAddressAlias{};
+                if (!alias.resource) return refuse("index view has no proven desktop buffer range");
+                const auto gpu = alias.resource->GetGPUVirtualAddress();
+                if (!gpu || ((alias.offset | view.SizeInBytes) & 3))
+                    return refuse("aliased index view is not dword-aligned and dword-sized");
+                view.BufferLocation = gpu + alias.offset;
+                index_view = {view, alias.resource, alias.offset};
+            }
         }
     }
     if (translated) {
@@ -3536,6 +3553,51 @@ struct ExistingHeap {
     x2w_budget::Ticket* budget;
 };
 std::vector<std::pair<void*, ExistingHeap>> existing_heaps;
+
+IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 bytes)
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS");
+    if (!enabled || !device || device != the_device || !address || !bytes || bytes > UINT64_MAX - address)
+        return {};
+    constexpr u64 page_bytes = 65536;
+    const u64 page = address & ~(page_bytes - 1);
+    const u64 offset = address - page;
+    if (bytes > page_bytes - offset) return {};
+    x2w_startup::PlacedBufferRange memory{};
+    if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page), page_bytes, memory) ||
+        !memory.covered || memory.type != MEM_PRIVATE) return {};
+    const auto nearby = placed_buffer_range(device, page, page_bytes, true);
+    if (nearby.reject || nearby.owner) return {};
+
+    // Reuse the existing allocation heap opened by slot 133. It is already held
+    // for the startup device's lifetime. The caller keeps this address allocation
+    // live through the GPU work and must not activate an overlapping placed alias.
+    std::lock_guard lock(placed_mutex);
+    const auto known = std::find_if(existing_heaps.begin(), existing_heaps.end(),
+        [&](const auto& entry) { return entry.first == memory.base; });
+    if (known == existing_heaps.end()) return {};
+    auto* heap = known->second.real;
+    struct Page { ID3D12Heap* heap; u64 page; x2w_startup::ComPtr<ID3D12Resource> resource; };
+    static std::array<Page, 64> pages{};
+    auto it = std::find_if(pages.begin(), pages.end(), [&](const Page& entry) { return entry.heap == heap && entry.page == page; });
+    if (it != pages.end()) return {it->resource.Get(), offset};
+    it = std::find_if(pages.begin(), pages.end(), [](const Page& entry) { return !entry.heap; });
+    if (it == pages.end()) return {};
+    x2w_startup::ComPtr<ID3D12Device> owner;
+    auto* desktop = device_of(device);
+    if (FAILED(heap->GetDevice(IID_PPV_ARGS(&owner))) || owner.Get() != desktop) return {};
+    const auto base = reinterpret_cast<u64>(memory.base);
+    if (base > page || (page - base) % page_bytes) return {};
+    const u64 heap_size = heap->GetDesc().SizeInBytes;
+    if (page - base > heap_size || page_bytes > heap_size - (page - base)) return {};
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, page_bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+        {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER};
+    if (FAILED(desktop->CreatePlacedResource(heap, page - base, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&it->resource)))) return {};
+    it->heap = heap;
+    it->page = page;
+    return {it->resource.Get(), offset};
+}
 volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_queries;  // five-second totals
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,

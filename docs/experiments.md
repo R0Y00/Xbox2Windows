@@ -100,6 +100,27 @@ GPU backing.
 Run `cmake --build --preset release --target startup_indirect_draw_indexed`
 and `ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed_upload_(warp|hardware)$' -V`.
 
+### Existing-heap geometry input aliases for translated indexed draws
+
+`X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS=1` lets a translated indexed draw bind
+an unregistered index view or vertex stream zero through a 64 KiB desktop
+buffer on a private memory allocation whose external heap was already
+opened by slot 133. Each span must fit entirely in a committed page. A page
+with a registered GPU alias is refused. Views on one page share one desktop
+resource. The startup device keeps up to 64 page aliases. The application
+keeps the underlying allocation live for the device's lifetime and keeps
+input bytes and alias ownership stable through execution. Recording uploads
+and uniquely registered placed resources keep their existing paths.
+
+The runner creates a reference resource on the second page and binds an
+eight-byte R16 index view and a separate vertex stream on the first page.
+An R32 case supplies a nonzero base vertex. Without a proven heap, with a
+different GPU alias on the first page, across a page boundary, or with the
+configuration disabled, the target stays clear.
+
+Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
+`ctest --preset release --no-tests=error -R '^startup_indirect_translated_indexed_alias(_off)?_(warp|hardware)$' -V`.
+
 ### Same-recording GPU copies used by an indirect draw
 
 `X2W_TRANSLATED_INDIRECT_COPY_RANGES=1` enables a bounded handoff from slot 15

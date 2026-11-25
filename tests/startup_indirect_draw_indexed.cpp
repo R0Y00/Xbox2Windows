@@ -359,7 +359,8 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
-enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
+enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered,
+                     alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag };
 enum class DrawKind { indexed, vertices, mesh };
@@ -469,7 +470,7 @@ bool supports_mesh(ID3D12Device* device)
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
-         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr, bool upload_index = false)
+         const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr, bool upload_index = false, bool alias_index = false)
 {
     const bool indexed = kind == DrawKind::indexed;
     const bool translated_indexed = translated && indexed;
@@ -482,7 +483,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     if (!indexed) initial_words[1 + command_stride(kind) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
     const PlacedBuffer arguments(device, guest, sizeof(initial_words), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     std::optional<PlacedBuffer> index_buffer;
-    if (indexed && !upload_index) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
+    if (indexed && !upload_index && !alias_index) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
     const auto upload = make_buffer(device, sizeof(initial_words) + index_bytes, D3D12_HEAP_TYPE_UPLOAD,
                                     D3D12_RESOURCE_STATE_GENERIC_READ);
     const auto arg_readback = make_buffer(device, sizeof(initial), D3D12_HEAP_TYPE_READBACK,
@@ -512,6 +513,27 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     auto* wrapped = wrapped_list.Get();
     const auto native_list = native_object<ID3D12GraphicsCommandList>(device, guest, wrapped);
     auto* list = native_list.Get();
+    constexpr UINT64 alias_page_bytes = 65536, alias_ib_offset = 0x224, alias_vb_offset = 0x490;
+    static std::vector<std::unique_ptr<void, FreeMemory>> alias_owners;
+    char* alias_cpu = nullptr;
+    ComPtr<IUnknown> alias_seed, alias_overlap;
+    if (alias_index) {
+        void* base = VirtualAlloc(nullptr, 2 * alias_page_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!base) return false;
+        alias_owners.emplace_back(base);
+        alias_cpu = static_cast<char*>(base);
+        const auto place = [&](UINT64 offset, IUnknown** result) {
+            using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 16, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            return slot<Place>(guest, 133)(guest, alias_cpu + offset, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                __uuidof(ID3D12Resource), reinterpret_cast<void**>(result));
+        };
+        if (refusal != Refusal::alias_no_heap)
+            check(place(alias_page_bytes, alias_seed.GetAddressOf()), "create reference placed alias in second page");
+        if (refusal == Refusal::alias_overlaps)
+            check(place(0, alias_overlap.GetAddressOf()), "create overlapping alias on first page");
+    }
     if (upload_table) {
         using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
         void* allocation = slot<Allocate>(wrapped, 148)(wrapped, 32, 16);
@@ -595,7 +617,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
         using VertexBuffer = void (WINAPI*)(IUnknown*, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW*);
         constexpr std::uint32_t vertex_values[]{0, 1, 2, 3, 4, 5};
-        void* allocation = slot<Allocate>(wrapped, 148)(wrapped, sizeof(vertex_values), 16);
+        void* allocation = alias_cpu ? alias_cpu + alias_vb_offset : slot<Allocate>(wrapped, 148)(wrapped, sizeof(vertex_values), 16);
         if (!allocation) return false;
         std::memcpy(allocation, vertex_values, sizeof(vertex_values));
         const UINT bytes = sizeof(vertex_values) + (refusal == Refusal::indexed_vertex_range ? 4 : 0);
@@ -613,6 +635,17 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     ComPtr<IUnknown> foreign_list;
     std::array<std::uint32_t, 4> unregistered{};
     void* late_index_write = nullptr;
+    if (alias_index) {
+        constexpr std::uint16_t narrow_alias[]{99, 0, 1, 2};
+        constexpr std::uint32_t wide_alias[]{99, 0, 1, 2};
+        const UINT size = draw_right ? sizeof(wide_alias) : sizeof(narrow_alias);
+        const UINT64 at = refusal == Refusal::alias_cross_page ? alias_page_bytes - 4 : alias_ib_offset;
+        if (draw_right) std::memcpy(alias_cpu + at, wide_alias, size);
+        else std::memcpy(alias_cpu + at, narrow_alias, size);
+        const D3D12_INDEX_BUFFER_VIEW view{reinterpret_cast<UINT64>(alias_cpu + at), size,
+            draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+        slot<Index>(wrapped, 47)(wrapped, &view);
+    }
     if (upload_index) {
         using Allocate = void* (WINAPI*)(IUnknown*, UINT64, UINT64);
         const UINT element_size = draw_right ? sizeof(std::uint32_t) : sizeof(std::uint16_t);
@@ -784,7 +817,9 @@ int main(int argc, char** argv) try
     const bool copy_on = argc == 3 && std::strcmp(argv[2], "copy-provenance") == 0;
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
-    const bool translated_indexed = upload_index || argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0;
+    const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
+    const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
+    const bool translated_indexed = alias_index || upload_index || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
     const bool translated = copy_on || copy_off || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
@@ -926,6 +961,9 @@ int main(int argc, char** argv) try
         const auto cache = std::filesystem::current_path() / ("indirect-translated-" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set fixture cache");
+        if (alias_index)
+            check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS", alias_disabled ? "0" : "1"),
+                "set existing heap alias control");
         check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_DRAW", "1") ? S_OK : E_FAIL, "enable fixture path");
         check(SetEnvironmentVariableA("X2W_TRANSLATED_INDIRECT_COPY_RANGES", copy_on ? "1" : "0") ? S_OK : E_FAIL,
               "set copy-range provenance control");
@@ -949,8 +987,19 @@ int main(int argc, char** argv) try
             const TranslatedDrawFixture red_binding(guest.Get(), red), green_binding(guest.Get(), green);
             const auto verify = [&](ID3D12PipelineState* producer, bool green, Refusal refusal, const char* label) {
                 return run(device.Get(), guest.Get(), writer.Get(), producer, title_root.Get(), pso.Get(), signature.Get(),
-                    kind, green, refusal, label, green ? &green_binding : &red_binding, false, nullptr, upload_index);
+                    kind, green, refusal, label, green ? &green_binding : &red_binding, false, nullptr, upload_index, alias_index);
             };
+            if (alias_index) {
+                const bool ok = alias_disabled
+                    ? verify(left.Get(), false, Refusal::alias_off, "unregistered spans refused when alias route is off")
+                    : verify(left.Get(), false, Refusal::alias_no_heap, "unproven external heap refused") &&
+                      verify(left.Get(), false, Refusal::alias_overlaps, "first page overlaps an existing GPU alias") &&
+                      verify(left.Get(), false, Refusal::alias_cross_page, "raw index view crosses its imported page") &&
+                      verify(left.Get(), false, Refusal::none, "R16 eight-byte index and VB0 from one unregistered GPU-aliased page") &&
+                      verify(right.Get(), true, Refusal::none, "R32 with base 3 and both inputs on one GPU-aliased page");
+                if (ok) std::filesystem::remove_all(cache);
+                return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+            }
             if (upload_index) {
                 const bool ok =
                     verify(left.Get(), false, Refusal::none, "R16 eight-byte current recording index span with late write") &&
