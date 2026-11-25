@@ -949,9 +949,41 @@ EXEC_REFUSED = (
 )
 
 
+# The complemented saveexec forms negate the old exec, not the source: ANDN2 is SRC0 & ~EXEC, ORN2 is SRC0 | ~EXEC.
+# With exec 7 (wave 0) and source 2, ANDN2 leaves no lane (the swapped form would leave lanes 0 and 2). A write under
+# the new mask must match the same masks built from ordinary scalar instructions, and differ from PROGRAM.
+COMPLEMENT_FORMS = {
+    "s_andn2_saveexec_b64 s[46:47], s[44:45]": ["s_mov_b64 s[46:47], exec", "s_andn2_b64 exec, s[44:45], exec"],
+    "s_orn2_saveexec_b64 s[46:47], s[44:45]": [
+        "s_mov_b64 s[46:47], exec", "s_not_b64 s[48:49], exec", "s_or_b64 exec, s[44:45], s[48:49]",
+    ],
+}
+
+
+def complement_program(mask_lines):
+    program = PROGRAM.copy()
+    at = program.index("v_mov_b32_e32 v4, 0x3f800000") + 1
+    program[at:at] = ["s_mov_b64 s[44:45], 2", *mask_lines, "v_mov_b32_e32 v4, 0x40000000", "s_mov_b64 exec, s[46:47]"]
+    return program
+
+
+def complement_checks():
+    reference = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
+    for form, scalar in COMPLEMENT_FORMS.items():
+        saved = lower(enumerate_pcs(complement_program([form])), [0x1003], (3, 1))
+        plain = lower(enumerate_pcs(complement_program(scalar)), [0x1003], (3, 1))
+        assert saved == plain, form
+    # ANDN2 leaves no lane under mask 7, so its write never lands.
+    andn2 = lower(enumerate_pcs(complement_program(list(COMPLEMENT_FORMS)[:1])), [0x1003], (3, 1))
+    assert andn2 == reference
+    orn2 = lower(enumerate_pcs(complement_program(list(COMPLEMENT_FORMS)[1:])), [0x1003], (3, 1))
+    assert orn2 != reference
+
+
 def exec_restore_checks():
     reference = lower(enumerate_pcs(PROGRAM), [0x1003], (3, 1))
     assert lower(enumerate_pcs(exec_restore_program()), [0x1003], (3, 1)) == reference
+    complement_checks()
     for change in EXEC_REFUSED:
         try:
             lower(enumerate_pcs(exec_restore_program(change)), [0x1003], (3, 1))

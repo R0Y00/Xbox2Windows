@@ -75,12 +75,13 @@ SUPPORTED_SCALAR_OPS = frozenset(
     )
 )
 
-# Lane-mask updates that keep the previous exec in the destination pair. The source is the second operand.
+# Lane-mask updates that keep the previous exec in the destination pair. The complemented forms negate the
+# old exec, not the source: ANDN2 is SRC0 & ~EXEC and ORN2 is SRC0 | ~EXEC.
 SAVEEXEC = {
     "s_and_saveexec_b64": lambda old, a: old & a,
-    "s_andn2_saveexec_b64": lambda old, a: old & ~a,
+    "s_andn2_saveexec_b64": lambda old, a: a & ~old,
     "s_or_saveexec_b64": lambda old, a: old | a,
-    "s_orn2_saveexec_b64": lambda old, a: old | ~a,
+    "s_orn2_saveexec_b64": lambda old, a: a | ~old,
     "s_xor_saveexec_b64": lambda old, a: old ^ a,
 }
 
@@ -134,7 +135,7 @@ class Wave:
                 raise ValueError("Scalar load used before wait")
             # A register no instruction ever writes is a bad operand, not a skipped write.
             if i not in self.written and i not in self.s:
-                raise ValueError("Scalar register used before it is written")
+                raise ValueError(f"Scalar register s{i} used before it is written")
             value = self.s.get(i, UNDEF)
             if value is UNDEF and not allow_undef:
                 raise ValueError(UNDEFINED_SCALAR)
