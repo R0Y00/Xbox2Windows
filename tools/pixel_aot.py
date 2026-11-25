@@ -307,8 +307,18 @@ def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
     return f", int2({x}, {y})"
 
 
-def comparison_sampler_state(words):
+# Word 2 bits 28-30 (value >> 28): MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT. At an explicit level zero
+# with anisotropy refused and no partially resident texture, none of them changes the result.
+LEVEL_ZERO_IGNORED_W2 = 0x7
+
+
+def comparison_sampler_state(words, level_zero=False):
     """Decode the sampler descriptor fields that change an image_sample_c_lz result on a 2D texture.
+
+    level_zero=True is for a caller that samples explicitly at level zero (the startup translator's c_lz form):
+    word 2 bits 28-30 are then accepted, because MIP_POINT_PRECLAMP only acts on mip selection, ANISO_OVERRIDE
+    only on anisotropic filtering (refused above) and BLEND_ZERO_PRT only on partially resident textures.
+    Bit 31 stays refused. The default keeps the strict check the pixel AOT path is verified against.
 
     Field positions are those of SQ_IMG_SAMP_WORD0..3 (registers 0x8F30..0x8F3C in Mesa
     src/amd/registers/gfx10-rsrc.json; enum values in the Linux navi10_enum.h). Not read, because the accepted profile makes them irrelevant: CLAMP_Z,
@@ -344,7 +354,7 @@ def comparison_sampler_state(words):
     mag, minify, mip = (w2 >> 20) & 3, (w2 >> 22) & 3, (w2 >> 26) & 3
     if mag != minify or mag not in COMPARISON_FILTERS:
         raise ValueError("Comparison sampling requires one point or bilinear XY filter")
-    if mip == 3 or w2 >> 28:
+    if mip == 3 or (w2 >> 28) & ~(LEVEL_ZERO_IGNORED_W2 if level_zero else 0):
         raise ValueError("Unsupported mip filter or word 2 bits 28-31")
     if (w3 >> 12) & 0x3ffff:
         raise ValueError("Comparison sampling with word 3 bits 12-29 (UPGRADED_DEPTH on GFX8) is not supported")
@@ -623,6 +633,8 @@ OPERANDLESS_HINTS = ("s_icache_inv", "s_ttracedata", "s_wakeup")
 # reads the one-bit TRAPSTS.MEM_VIOL field and compares the whole register with zero). The entry value of MODE is only
 # assumed, so the read is accepted once the program has itself written the field, and the result is that known value.
 HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
+# s_round_mode immediates that keep binary32 at nearest even (MODE[1:0] = 0), mapped to the MODE[3:2] value they write.
+ROUND_MODE_ACCEPTED = {"0x0": 0, "0xc": 3}
 # Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
 # mode: the widening is exact and the pack always truncates.
 HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
@@ -2579,7 +2591,11 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
     if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         use_abs = True
         token = m.group(1) or m.group(2)
-    if is_f16:
+    if re.fullmatch(r"-\d+", token) and -16 <= int(token) <= -1:
+        raise ValueError(f"Ambiguous mixed-precision inline constant {token}")
+    if token == "-0":
+        expr = "asfloat(0x80000000u)"
+    elif is_f16:
         if token in INLINE_F16:
             word = f"{INLINE_F16[token]}u"
         elif re.fullmatch(r"[vs]\d+", token):
@@ -2616,6 +2632,7 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
 
 
 def parse_fma_mix(rest):
+    """Parse LLVM selectors: op_sel_hi enables f16 and op_sel picks its high half."""
     parts_ = rest.split(", ")
     if len(parts_) != 3:
         raise ValueError("Invalid mixed-precision operand count")
@@ -2637,7 +2654,7 @@ def parse_fma_mix(rest):
             raise ValueError(f"Unsupported mixed-precision modifier {mod}")
     op_sel = opts.get("op_sel", [0, 0, 0])
     op_sel_hi = opts.get("op_sel_hi", [0, 0, 0])
-    if any(hi and not f16 for f16, hi in zip(op_sel, op_sel_hi)):
+    if any(hi and not f16 for hi, f16 in zip(op_sel, op_sel_hi)):
         raise ValueError("High-half selection requires an f16 operand")
     return operands, op_sel, op_sel_hi, clamp
 
@@ -3052,6 +3069,85 @@ class TrackedScalar(dict):
         super().__setitem__(key, value)
 
 
+S_CALL = re.compile(r"s_call_b64 (s\[\d+:\d+\]), (-?0x[0-9a-f]+|-?\d+)")
+S_BRANCH = re.compile(r"s_(?:branch|cbranch_\w+) (-?0x[0-9a-f]+|-?\d+)")
+S_CALL_CONTROL = ("s_branch", "s_cbranch", "s_call", "s_swappc", "s_getpc", "s_subvector", "s_rfe")
+
+
+def names_sgpr(line, pair):
+    """True when line names an SGPR of pair (as a number list) alone or inside a range."""
+    for m in re.finditer(r"\bs(\d+)\b|\bs\[(\d+):(\d+)\]", line):
+        low, high = (int(m[1]),) * 2 if m[1] is not None else (int(m[2]), int(m[3]))
+        if low <= pair[-1] and pair[0] <= high:
+            return True
+    return False
+
+
+def inline_calls(instructions):
+    """Inline the one forward s_call_b64 of a program (proposal R0Y00/Xbox2Windows#1786, first slice).
+
+    The callee is a straight-line block behind the program's s_endpgm that ends in the last instruction, an
+    s_setpc_b64 of the saved pair. The call stays as a marker and the callee body, without the s_setpc_b64, follows it
+    with offsets that keep the sizes of the instructions, so everything after the call moves by the body size. A branch
+    that crosses the call or lands in the callee is refused, since its displacement would change. A program without
+    s_call_b64 is returned as it is."""
+    texts = [e[1] if isinstance(e, tuple) and len(e) == 2 else e for e in instructions]
+    calls = [k for k, text in enumerate(texts) if isinstance(text, str) and text.split(None, 1)[:1] == ["s_call_b64"]]
+    if not calls:
+        return instructions
+    if (not all(isinstance(e, tuple) and len(e) == 2 and type(e[0]) is int and isinstance(e[1], str)
+                for e in instructions)
+            or any(b[0] <= a[0] or a[0] % 4 for a, b in zip(instructions, instructions[1:]))):
+        raise ValueError("s_call_b64 requires strictly increasing instruction offsets")
+    c, count = calls[0], len(instructions)
+    call_offset = instructions[c][0]
+    if not (m := S_CALL.fullmatch(texts[c])):
+        raise ValueError(f"Unsupported s_call_b64 form: {texts[c]}")
+    pair = sgpr_pair(m[1])
+    imm = int(m[2], 0)
+    if not -0x8000 <= imm <= 0x7fff:
+        raise ValueError("s_call_b64 displacement out of range")
+    target = call_offset + 4 + 4 * imm
+    if target <= call_offset:
+        raise ValueError("Backward or recursive s_call_b64")
+    start = next((k for k, e in enumerate(instructions) if e[0] == target), None)
+    if start is None:
+        raise ValueError("s_call_b64 targets no instruction boundary of the program")
+    if texts[start - 1] != "s_endpgm":
+        raise ValueError("The s_call_b64 callee must follow the program's s_endpgm")
+    for k in range(start, count):
+        op = texts[k].split()[0]
+        if op == "s_setpc_b64":
+            if texts[k] != f"s_setpc_b64 s[{pair[0][1:]}:{pair[1][1:]}]":
+                raise ValueError(f"Unsupported indirect s_setpc_b64: {texts[k]}")
+            end = k
+            break
+        if op == "s_endpgm":
+            raise ValueError("The s_call_b64 callee reaches s_endpgm without s_setpc_b64")
+        if op.startswith(S_CALL_CONTROL):
+            raise ValueError(f"The s_call_b64 callee is not straight-line: {texts[k]}")
+    else:
+        raise ValueError("The s_call_b64 callee has no s_setpc_b64")
+    if end != count - 1:
+        raise ValueError("Code follows the s_call_b64 callee")
+    if len(calls) != 1:
+        raise ValueError("Only one s_call_b64 per program is supported")
+    for k in range(start - 1):
+        if texts[k].startswith(("s_branch", "s_cbranch")):
+            offset = instructions[k][0]
+            if not (b := S_BRANCH.fullmatch(texts[k])):
+                raise ValueError(f"Unsupported branch next to s_call_b64: {texts[k]}")
+            landing = offset + 4 + 4 * int(b[1], 0)
+            if landing >= target:
+                raise ValueError("Branch into the s_call_b64 callee")
+            if (offset < call_offset < landing) or (landing <= call_offset < offset):
+                raise ValueError("Branch across s_call_b64")
+    size = instructions[end][0] - target
+    return tuple([*instructions[:c + 1],
+                  *((call_offset + 4 + offset - target, text) for offset, text in instructions[start:end]),
+                  *((offset + size, text) for offset, text in instructions[c + 1:start])])
+
+
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
           title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None, half_denorm=None,
@@ -3077,8 +3173,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     must supply normalized whole-pair instructions and apply the returned mask in the PSO.
     Uncompressed partial exports use the same opt-in for floating-point and integer targets.
     wave_size names the guest execution width (32 or 64). Low-only execution mask operations
-    (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore) require a validated
-    guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
+    (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore, and the wave32 masked region:
+    s_and_saveexec_b32, its s_mov_b32/s_or_b32 exec_lo close and its s_andn2_b32 exec_lo else) require a
+    validated guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
     of guest profile declarations.
     half_denorm declares the binary16 denormal state at shader entry (MODE[7:6]). Only "preserve" is accepted; None
     means unknown, and the plain binary16 VOP2 arithmetic forms are then refused. The caller takes it from validated
@@ -3214,10 +3311,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     free_coordinates = False  # a sample took a coordinate that is not attr0.x/y
     interpolated = False
     region = None
+    call_pair = None  # SGPR numbers of the opaque s_call_b64 return address, once the call was lowered
     seen_skip = False
     has_scratch = False
     scratch_written = set()
-    instructions = tuple(instructions)
+    instructions = inline_calls(tuple(instructions))
     if any(isinstance(element, tuple) for element in instructions):
         offset_index = {}
         previous_offset = -1
@@ -3315,6 +3413,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         def match(pattern):
             return re.fullmatch(pattern, line)
 
+        if call_pair is not None and names_sgpr(line, call_pair):
+            raise ValueError(f"The s_call_b64 return address is opaque: {line}")
         if ended:
             raise ValueError("Instruction follows program end")
         if ds_needs_wait:
@@ -3334,9 +3434,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                           exported, ended, mask, attribute_input, interpolated,
                           dict(quad_values), samples, False)
         elif region is not None:
-            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]", line):
+            # A region accepts only the close and else spellings of its own width: s_and_saveexec_b64 and v_cmpx
+            # regions the wave64 forms, s_and_saveexec_b32 regions the wave32 forms on exec_lo.
+            if region["width"] == 64 and re.fullmatch(
+                    r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]"
+                    r"|s_andn2_b64 exec, s\[\d+:\d+\], exec", line):
                 pass
-            elif re.fullmatch(r"s_andn2_b64 exec, s\[\d+:\d+\], exec", line):
+            elif region["width"] == 32 and re.fullmatch(
+                    r"s_or_b32 exec_lo, exec_lo, s\d+|s_mov_b32 exec_lo, s\d+|s_andn2_b32 exec_lo, s\d+, exec_lo", line):
                 pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["arm_start"] + 1 and region["skip"] is None):
@@ -3428,6 +3533,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError(f"Unsupported binary16 rounding mode: {line}")
             half_rounding = HALF_ROUNDING[value]
             mode_rounding = int(value)
+            continue
+        # s_round_mode (SOPP) writes all of MODE[3:0]: bits 1:0 are the binary32 rounding (FP_ROUND_MODE_SP) and bits
+        # 3:2 the binary16 and binary64 rounding. Binary32 is lowered as round to nearest even only, so the immediate
+        # must leave bits 1:0 at 0; bits 3:2 then act exactly as s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2) of the
+        # same value. LLVM 15 prints the SIMM16 in hex (0x0, 0xc), and only those two spellings are accepted.
+        if line == "s_round_mode" or line.startswith("s_round_mode "):
+            if not (m := match(r"s_round_mode (0x[0-9a-f]+)")):
+                raise ValueError(f"Malformed s_round_mode operand: {line}")
+            if m[1] not in ROUND_MODE_ACCEPTED:
+                raise ValueError(f"Unsupported rounding mode: {line}")
+            mode_rounding = ROUND_MODE_ACCEPTED[m[1]]
+            half_rounding = HALF_ROUNDING[str(mode_rounding)]
             continue
         # The register forms. The source SGPR is read, so it must be bound, resolved and defined on every path; the
         # shared check at the end of the loop is skipped by `continue`, hence the explicit test here. Neither form can
@@ -3615,6 +3732,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             mask = "entry"
             wqm_width = None
             scc = None
+        elif region is not None and region["width"] == 32 and (m := match(r"s_mov_b32 exec_lo, (s\d+)")):
+            # The MOV close of a wave32 region: exec_lo is the whole EXEC of a wave32 guest. As for s_mov_b64, SCC
+            # is left alone, and it is already untracked after s_and_saveexec_b32.
+            close_region(i, [m[1]])
+            region = None
         elif m := match(r"s_mov_b32 (?:exec|exec_lo), (s\d+)"):
             if not guest_wave32:
                 raise ValueError("32-bit execution mask restore requires a validated wave32 guest profile")
@@ -3623,6 +3745,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported execution mask")
             mask = "entry"
             wqm_width = None
+            scc = None
+        elif line.startswith("s_and_saveexec_b32 "):
+            # The wave32 masked-if: exec_lo is the whole EXEC of a wave32 guest, so saving it into one SGPR and
+            # ANDing it with a single-register lane condition opens the same per-lane region as
+            # s_and_saveexec_b64. Only a validated wave32 profile admits it; the compare that wrote the condition
+            # is tracked the same way in both profiles. A save into the condition register itself is refused,
+            # since the order of that read and write is not modelled.
+            if not guest_wave32:
+                raise ValueError("32-bit execution mask save requires a validated wave32 guest profile")
+            if not (m := match(r"s_and_saveexec_b32 (s\d+), (vcc_lo|s\d+)")):
+                raise ValueError("Unsupported execution mask save")
+            save = [sgpr_name(m[1])]
+            regs = lane_mask(m[2])
+            condition = scalar.get(regs[0])
+            if (m[1] == m[2] or region is not None or mask != "entry" or pending.intersection(save)
+                    or not isinstance(condition, tuple) or condition[0] != "condition"
+                    or [scalar.get(r) for r in regs] != [(*condition[:2], 0, 1)]):
+                raise ValueError("Unsupported execution mask save")
+            scalar[save[0]] = ("exec_saved",)
+            region = {"save": save, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i,
+                      "else": None, "then": {}, "else_written": {}, "else_undefined": set(), "skipped": False,
+                      "scalar_written": set(), "scc_written": False, "opener": "saveexec", "width": 32,
+                      "arm_outstanding": (set(pending), dict(sample_dest))}
+            vector.masked = True
+            scalar.masked = True
             scc = None
         elif m := match(r"s_and_saveexec_b64 (s\[\d+:\d+\]), (vcc|s\[\d+:\d+\])"):
             # A masked-if from a known full entry mask: the source must hold a tracked
@@ -3638,7 +3785,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
-                      "scalar_written": set(), "scc_written": False, "opener": "saveexec",
+                      "scalar_written": set(), "scc_written": False, "opener": "saveexec", "width": 64,
                       "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
@@ -3709,10 +3856,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
-                      "scalar_written": set(), "scc_written": False, "opener": "cmpx",
+                      "scalar_written": set(), "scc_written": False, "opener": "cmpx", "width": 64,
                       "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
+        elif m := S_CALL.fullmatch(line):
+            # The inlined call (inline_calls): the pair receives the address after the call, an opaque value that
+            # only the removed s_setpc_b64 consumed. Neither the callee nor the code after it may name either word.
+            lo, hi = sgpr_pair(m[1])
+            if lo in pending or hi in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            scalar[lo] = scalar[hi] = ("call_return",)
+            call_pair = [int(lo[1:]), int(hi[1:])]
         elif m := match(r"s_cbranch_scc([01]) (-?0x[0-9a-f]+|-?\d+)"):
             # A forward branch on a tracked scalar compare (issue #1413). SCC is a wave value, so the whole wave
             # skips the block or runs it. The block's vector writes merge with a select on the condition under
@@ -3743,7 +3898,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": None, "cond": scc if m[1] == "0" else f"(!{scc})", "written": {}, "skip": None,
                       "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False, "scalar_written": set(), "scc_written": False,
-                      "opener": "scc", "end": end - 1 if join is not None else end, "join": join}
+                      "opener": "scc", "width": None, "end": end - 1 if join is not None else end, "join": join}
             vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save, or right after the else transition
@@ -3760,22 +3915,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if restore is None or restore <= i:
                 raise ValueError("Execution skip targets no instruction boundary")
             target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
-            rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
-            if rm is None:
-                rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
-            if rm is None and region["else"] is None:
-                rm = re.fullmatch(r"s_andn2_b64 exec, s\[(\d+):(\d+)\], exec", target)
-            if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
-                raise ValueError("Execution skip does not target the matching restore")
+            if region["width"] == 32:
+                # The wave32 close and else name one SGPR; it is compared as written, so any other register
+                # (also one out of range) is a mismatch.
+                rm = re.fullmatch(r"s_or_b32 exec_lo, exec_lo, (s\d+)|s_mov_b32 exec_lo, (s\d+)", target)
+                if rm is None and region["else"] is None:
+                    rm = re.fullmatch(r"s_andn2_b32 exec_lo, (s\d+), exec_lo", target)
+                if rm is None or [next(g for g in rm.groups() if g)] != region["save"]:
+                    raise ValueError("Execution skip does not target the matching restore")
+            else:
+                rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
+                if rm is None:
+                    rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
+                if rm is None and region["else"] is None:
+                    rm = re.fullmatch(r"s_andn2_b64 exec, s\[(\d+):(\d+)\], exec", target)
+                if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
+                    raise ValueError("Execution skip does not target the matching restore")
             region["skip"] = restore
             region["skipped"] = True
             seen_skip = True
-        elif region is not None and (m := match(r"s_andn2_b64 exec, (s\[\d+:\d+\]), exec")):
+        elif region is not None and (m := match(r"s_andn2_b64 exec, (s\[\d+:\d+\]), exec"
+                                                r"|s_andn2_b32 exec_lo, (s\d+), exec_lo")):
             # The else transition (issue #1315): EXEC becomes saved & ~EXEC, the saved lanes whose condition is
             # false. The else arm starts from the pre-region vector state; a register first defined by the then
             # arm is undefined there. A then-arm skip must land exactly here. s_andn2_b64 writes SCC from the new
-            # EXEC, which is untracked.
-            if (sgpr_pair(m[1]) != region["save"] or region["else"] is not None
+            # EXEC, which is untracked. The wave32 spelling (an s_and_saveexec_b32 region; the in-region filter
+            # admits each spelling only in a region of its width) names the one saved SGPR.
+            if ((sgpr_pair(m[1]) if m[1] else [m[2]]) != region["save"] or region["else"] is not None
                     or (region["skip"] is not None and region["skip"] != i)):
                 raise ValueError("Unexpected execution mask else transition")
             region["then"] = {dst: dict.get(vector, dst) for dst in region["written"]}
@@ -3799,6 +3965,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             close_region(i, sgpr_pair(m[1]))
             region = None
             # s_or_b64 writes SCC from the restored mask, a wave property the per-lane model cannot compute.
+            scc = None
+        elif region is not None and region["width"] == 32 and (m := match(r"s_or_b32 exec_lo, exec_lo, (s\d+)")):
+            close_region(i, [m[1]])
+            region = None
+            # s_or_b32 writes SCC from the restored mask, as s_or_b64 does.
             scc = None
         elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()
@@ -6077,7 +6248,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding sample")
             tokens, op_sel, op_sel_hi, clamp = parse_fma_mix(rest)
             args = [fma_mix_operand(t, f16, hi, scalar, vector, pending, sample_dest)
-                    for t, f16, hi in zip(tokens, op_sel, op_sel_hi)]
+                    for t, f16, hi in zip(tokens, op_sel_hi, op_sel)]
             expr = f"mad({args[0]}, {args[1]}, {args[2]})"
             if clamp:
                 expr = f"saturate({expr})"

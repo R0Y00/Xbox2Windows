@@ -1,4 +1,4 @@
-"""Check straight-line v_readfirstlane_b32 lowering without shader machine code."""
+"""Check v_readfirstlane_b32 lowering in straight-line code and entry blocks, without shader machine code."""
 import os
 import sys
 
@@ -54,6 +54,13 @@ ACCEPTED = [
      ['v7 = uint(int(F(s2)));']),
     ('fixed buffer word', ('v_cvt_i32_f32_e32 v7, s3',),
      ['v7 = uint(int(F(s3)));']),
+    ('unsigned to float conversion', ('v_cvt_f32_u32_e32 v7, s2',),
+     ['v7 = U(float(s2));']),
+    # The unsigned-division reciprocal estimate, the shape that reaches the read in compiled shaders.
+    ('division reciprocal chain', ('v_cvt_f32_u32_e32 v7, s2', 'v_rcp_f32_e32 v7, v7',
+                                   'v_mul_f32_e32 v7, 0x4f7ffffe, v7', 'v_cvt_u32_f32_e32 v7, v7'),
+     ['v7 = U(float(s2));', 'v7 = U(1.0 / F(v7));', 'v7 = U(F(0x4f7ffffeu) * F(v7));',
+      'v7 = uint(max(F(v7), 0.0));']),
     ('byte conversion', ('v_cvt_f32_ubyte0_e32 v7, s2',),
      ['v7 = U(float(s2 & 255));']),
     ('multiply', ('v_mul_f32_e64 v7, s2, 2.0',),
@@ -123,8 +130,41 @@ REFUSED = [
     ('interpolant overwrite', ('v_mov_b32_e32 v7, s2', 'v_interp_mov_f32 v7, p0, attr0.x', READ)),
     ('interpolation p1 overwrite', (MOVE, 'v_interp_p1_f32_e32 v7, v0, attr0.x', READ)),
     ('VGPR buffer address', (MOVE, 'buffer_load_dword v7, v0, s[4:7], 0 offen', READ)),
-    ('branch after read', ('v_mov_b32_e32 v7, s2', READ, 's_branch label_000C', 's_endpgm')),
+    # The unsigned-to-float conversion proves nothing from a lane-varying source, across an exec
+    # write or an overwrite, or from a definition in another block.
+    ('unsigned to float conversion of an entry VGPR', ('v_cvt_f32_u32_e32 v7, v0', READ)),
+    ('unsigned to float conversion of a mask', (COMPARE, 'v_cvt_f32_u32_e32 v7, s2', READ)),
+    ('exec write inside the chain', ('v_cvt_f32_u32_e32 v7, s3', 's_and_saveexec_b32 s8, s2',
+                                     'v_rcp_f32_e32 v7, v7', READ)),
+    ('overwrite inside the chain', ('v_cvt_f32_u32_e32 v7, s3', 'v_add_f32_e64 v7, v0, 1.0',
+                                    'v_rcp_f32_e32 v7, v7', READ)),
+    ('definition in another block', ('v_cvt_f32_u32_e32 v7, s3', 's_cbranch_scc0 label_0008',
+                                     'v_rcp_f32_e32 v7, v7', READ, 's_endpgm')),
+    # A program with branches proves only before its first branch target or terminator (the entry block).
+    ('read at the first branch target', (MOVE, 's_cbranch_scc0 label_000C', 's_nop 0', READ, 's_endpgm')),
+    ('read after the first terminator', (MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')),
+    ('entry block re-entered by a loop', (MOVE, READ, 's_mov_b32 s2, vcc_lo', 's_cbranch_scc0 label_0000',
+                                          's_endpgm')),
+    ('exec write in the entry block', (MOVE, 's_and_saveexec_b32 s8, s2', READ, 's_branch label_0010',
+                                       's_endpgm')),
+    ('mask in the entry block', (COMPARE, MOVE, READ, 's_branch label_0010', 's_endpgm')),
+    # A branch target ends the entry block even before any terminator: a later branch can come back to it.
+    ('read in a loop whose header is in the entry block',
+     (MOVE, READ, 'v_mov_b32_e32 v7, v0', 's_cbranch_scc0 label_0004', 's_endpgm')),
+    ('read at a backward branch target', (MOVE, 's_nop 0', READ, 'v_mov_b32_e32 v7, v0', 's_branch label_0008',
+                                          's_endpgm')),
+    ('read after s_endpgm in a branch-free program', (MOVE, 's_endpgm', READ)),
 ]
+# The entry block of a program with branches: every path reaches it through the same instructions, so a read
+# there is proven like straight-line code, up to the instruction just before the first branch target.
+for label, instructions in (('branch after read', (MOVE, READ, 's_branch label_000C', 's_endpgm')),
+                            ('read before the first branch target',
+                             (MOVE, READ, 's_nop 0', 's_cbranch_scc0 label_0008', 's_endpgm'))):
+    got = run(*instructions)
+    check(f'{label} accepted', got[:2] == ['v7 = s2;', 's9 = v7;'], repr(got))
+got = run('v_cvt_f32_u32_e32 v7, s3', 'v_rcp_f32_e32 v7, v7', READ, 's_cbranch_scc0 label_0010', 's_endpgm')
+check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7 = U(1.0 / F(v7));', 's9 = v7;'],
+      repr(got))
 # Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
 EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
 for label, instructions in REFUSED:

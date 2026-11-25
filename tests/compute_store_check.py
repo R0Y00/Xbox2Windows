@@ -366,8 +366,13 @@ def controls():
     f32_controls()
     scalar_alu_controls()
     salu_i32_controls()
+    mac_f32_controls()
+    dot_u_controls()
+    add_co_controls()
+    sub_co_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    bfe_controls()
     vadd_nc_i32_controls()
     cvt_u32_f32_controls()
     ff1_exec_controls()
@@ -1116,7 +1121,7 @@ def alu_controls():
         (unsupported + "v_mul_hi_u32_e32", (("v_lshrrev_b32_e32", "v_mul_hi_u32_e32"),)),
         (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
         (unsupported + "v_mul_i32_i24_e32", ((mad, "v_mul_i32_i24_e32 v1, v2, v1"),)),
-        (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
+        (unsupported + "v_sub_co_u32", ((mad, "v_sub_co_u32 v1, vcc_lo, v2, v0 clamp"),)),
         # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
         (unsupported + "v_min_u16_e32", (("v_min_u32_e32", "v_min_u16_e32"),)),
         (unsupported + "v_mad_u32_u16", ((mad, "v_mad_u32_u16 v1, v2, v1, v0"),)),
@@ -1252,7 +1257,7 @@ def f32_controls():
         # Fused multiply-add has no binary32 form in DXIL, so both stay refused, as do the other binary32 forms.
         (unsupported + "v_fmac_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_fmac_f32_e32 v6, v2, v5"),)),
         (unsupported + "v_fma_f32", (("v_mul_f32_e32 v6, v2, v6", "v_fma_f32 v6, v2, v6, v5"),)),
-        (unsupported + "v_mac_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_mac_f32_e32 v6, v2, v5"),)),
+        (unsupported + "v_mad_f32", (("v_mul_f32_e32 v6, v2, v6", "v_mad_f32 v6, v2, v6, v5"),)),
         (unsupported + "v_max_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_max_f32_e32 v6, v2, v6"),)),
         (unsupported + "v_mul_legacy_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_mul_legacy_f32_e32 v6, v2, v6"),)),
         # The VOP3 spelling, output and input modifiers, an SGPR as the second source and a register range.
@@ -1509,6 +1514,11 @@ def mbcnt_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"mbcnt: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in MBCNT if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -1614,6 +1624,11 @@ def bcnt_exec_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"bcnt_exec: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in BCNT_EXEC if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -1766,6 +1781,11 @@ def writelane_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"writelane: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in WRITELANE if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -1868,6 +1888,11 @@ def ff1_exec_draw(directory, compiler, renderer, backend):
     bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
     if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
         raise AssertionError("ff1_exec: mutation escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in FF1_EXEC if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -2194,6 +2219,11 @@ def cvt_u32_f32_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"cvt_u32_f32: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in CVT_U32_F32 if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -2321,6 +2351,201 @@ def vadd_nc_i32_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"vadd_nc_i32: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in VADD_NC_I32 if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
+BFE = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0x8000f5a3",
+    "s_mov_b32 s5, 0x140014",
+    "s_bfe_u32 s16, s4, 0x80008",
+    "s_bfe_i32 s17, s4, 0x80008",
+    "s_bfe_i32 s18, s4, 0xff80ffe8",
+    "s_bfe_u32 s19, s4, s5",
+    "s_bfe_i32 s20, s4, s5",
+    "s_bfe_i32 s21, -1, 0x200000",
+    "s_bfe_u32 s22, s20, 0xff80ffe0",
+    "s_bfe_u32 s23, s4, 0x100010",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, s16, v3",
+    "v_add_nc_u32_e32 v5, s17, v3",
+    "v_xor_b32_e32 v6, s19, v3",
+    "v_xor_b32_e32 v6, s20, v6",
+    "v_add_nc_u32_e32 v7, s18, v3",
+    "v_add_nc_u32_e32 v7, s21, v7",
+    "v_add_nc_u32_e32 v7, s22, v7",
+    "v_add_nc_u32_e32 v7, s23, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[4:7], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+BFE_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16, wave_size=32)
+
+
+def bfe_model(src, ctrl, *, signed, zero_on_width0=True, sign_extend_past_32=True):
+    """Independent Python model of RDNA2 s_bfe_u32 / s_bfe_i32."""
+    src &= 0xffffffff
+    offset = ctrl & 0x1f
+    width = (ctrl >> 16) & 0x7f
+    if width == 0:
+        return 0 if zero_on_width0 else src
+    if offset + width <= 32:
+        field = (src >> offset) & ((1 << width) - 1)
+        if signed and (field & (1 << (width - 1))):
+            field |= (~0 << width) & 0xffffffff
+        return field
+    field = src >> offset
+    if signed and sign_extend_past_32 and (src & 0x80000000):
+        field |= (~0 << (32 - offset)) & 0xffffffff
+    return field
+
+
+def bfe_words(*, signed_u32=False, signed_i32=True, zero_on_width0=True, sign_extend_past_32=True):
+    """Independent reference for one BFE group: 64 threads storing 4 words each."""
+    words = [SENTINEL] * 320
+    s4 = 0x8000f5a3
+    s5 = 0x00140014
+    s16 = bfe_model(s4, 0x00080008, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s17 = bfe_model(s4, 0x00080008, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s18 = bfe_model(s4, 0xff80ffe8, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s19 = bfe_model(s4, s5, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s20 = bfe_model(s4, s5, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s21 = bfe_model(0xffffffff, 0x00200000, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s22 = bfe_model(s20, 0xff80ffe0, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s23 = bfe_model(s4, 0x00100010, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    for flat in range(64):
+        words[4 * flat + 0] = (s16 + flat) & 0xffffffff
+        words[4 * flat + 1] = (s17 + flat) & 0xffffffff
+        words[4 * flat + 2] = (s19 ^ s20 ^ flat) & 0xffffffff
+        words[4 * flat + 3] = (s18 + s21 + s22 + s23 + flat) & 0xffffffff
+    return words
+
+
+def bfe_controls():
+    """s_bfe_u32 / s_bfe_i32: exact HLSL, per-helper emission, and one refusal per unsupported form."""
+    hlsl = aot.lower(BFE, 64, **BFE_BINDING)
+    lines = hlsl.splitlines()
+    assert "uint s_bfe_u32(uint src, uint ctrl) {" in lines, lines
+    assert "uint s_bfe_i32(uint src, uint ctrl) {" in lines, lines
+    store_line = [line for line in lines if "outputData.Store4(" in line]
+    assert store_line == [
+        "    outputData.Store4(tid.x * 16u + 0u, uint4("
+        "(s_bfe_u32(0x8000f5a3u, 0x00080008u) + tid.x), "
+        "(s_bfe_i32(0x8000f5a3u, 0x00080008u) + tid.x), "
+        "(s_bfe_i32(0x8000f5a3u, 0x00140014u) ^ (s_bfe_u32(0x8000f5a3u, 0x00140014u) ^ tid.x)), "
+        "(s_bfe_u32(0x8000f5a3u, 0x00100010u) + (s_bfe_u32(s_bfe_i32(0x8000f5a3u, 0x00140014u), 0xff80ffe0u) + "
+        "(s_bfe_i32(0xffffffffu, 0x00200000u) + (s_bfe_i32(0x8000f5a3u, 0xff80ffe8u) + tid.x))))));"
+    ], store_line
+    # Helpers are emitted only when referenced.
+    only_u32 = aot.lower(variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_u32 s21, s20, 0x00080004")),
+                         32, **READ_BINDING)
+    assert "uint s_bfe_u32(" in only_u32 and "uint s_bfe_i32(" not in only_u32
+    only_i32 = aot.lower(variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_i32 s21, s20, 0x00080004")),
+                         32, **READ_BINDING)
+    assert "uint s_bfe_i32(" in only_i32 and "uint s_bfe_u32(" not in only_i32
+    # Refusals: unknown/pending sources, invalid destinations, unsupported spellings/modifiers, SCC/address/guard.
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified scalar ALU operand"
+    for message, changes in (
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s30, 0x80008"),)),
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s4, s30"),)),
+        (operand, (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, s12, 0x80008"),)),
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s106, s4, 0x80008"),)),
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s4, 0x1ffffffff"),)),
+        (unsupported + "s_bfe_u64", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u64 s[16:17], s[4:5], 0x80008"),)),
+        (unsupported + "s_bfe_i64", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i64 s[16:17], s[4:5], 0x80008"),)),
+        (unsupported + "s_bfe_u32", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, v0, 0x80008"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, s4, 1.0"),)),
+        (unsupported + "s_bfe_u32", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s4, exec_lo"),)),
+        (unsupported + "s_bfe_u32", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32_e64 s16, s4, 0x80008"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, s4, 0x80008 clamp"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, -s4, 0x80008"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, abs(s4), 0x80008"),)),
+        (unsupported + "s_cbranch_scc0 0", (("s_endpgm", "s_cbranch_scc0 0\ns_endpgm"),)),
+    ):
+        rejects(message, aot.lower, variant(BFE, *changes), 64, **BFE_BINDING)
+    # Pending constant load as source or destination.
+    pending_load = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "s_load_dwordx4 s[16:19], s[8:9], 0x10",
+        "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dword s23, s[16:19], 0x0",
+        "s_bfe_u32 s24, s23, 0x00080008",
+        "s_endpgm",
+    ]
+    rejects(operand, aot.lower, pending_load, 64, **(BFE_BINDING | dict(constant_descriptor=16)))
+    rejects(operand, aot.lower, variant(pending_load, ("s24, s23", "s23, s10")), 64,
+            **(BFE_BINDING | dict(constant_descriptor=16)))
+    # Result used as store address or guard compare, and expression limit.
+    rejects("Unsupported store address", aot.lower,
+            variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_u32 s21, s20, 0x00080004"),
+                    ("v1, v0, s[8:11]", "v1, v21, s[8:11]"),
+                    ("v_min_u32_e32 v1, s21, v1", "v_min_u32_e32 v1, s21, v1\nv_mov_b32_e32 v21, s21")),
+            32, **READ_BINDING)
+    rejects("Unverified lane guard compare", aot.lower,
+            variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_i32 s21, s20, 0x00080004"),
+                    ("v_min_u32_e32 v1, s21, v1", "v_min_u32_e32 v1, s21, v1\nv_cmp_gt_u32_e32 vcc_lo, s21, v1")),
+            32, **READ_BINDING)
+    rejects("ALU expression too large", aot.lower,
+            variant(BFE, ("s_bfe_u32 s16, s4, 0x80008",
+                          "s_bfe_u32 s16, s4, 0x80008" + "\ns_bfe_u32 s16, s16, s16" * 6)),
+            64, **BFE_BINDING)
+
+
+def bfe_binary(directory, assembler, objcopy, library):
+    """The assembled BFE program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, BFE), library, offsets=True))
+    assert [line for line in decoded if line.startswith("s_bfe_")] == [
+        line for line in BFE if line.startswith("s_bfe_")], decoded
+    assert aot.lower(decoded, 64, **BFE_BINDING) == aot.lower(BFE, 64, **BFE_BINDING)
+
+
+def bfe_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("bfe.hlsl", "bfe.cso", "bfe.case")]
+    source = aot.lower(BFE, 64, **BFE_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = bfe_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("s_bfe_i32 treated as unsigned", bfe_words(signed_i32=False), 1),
+            ("width 0 not returning 0", bfe_words(zero_on_width0=False), 3),
+            ("offset+width > 32 not sign-extending", bfe_words(sign_extend_past_32=False), 2),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"bfe: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("width 0 returns src", source.replace("if (width == 0u) return 0u;", "if (width == 0u) return src;")),
+            ("s_bfe_i32 uses unsigned right shift", source.replace("asuint(asint(src) >> offset)", "(src >> offset)"))):
+        if mutated == source:
+            raise AssertionError(f"bfe: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"bfe: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in BFE if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -2534,6 +2759,602 @@ def salu_i32_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"salu_i32: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in SALU_I32 if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
+ADD_CO = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_co_u32 v10, vcc_lo, -16, v3",
+    "v_add_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+    "v_add_co_u32 v12, s4, 0xffffffe0, v3",
+    "v_add_co_ci_u32_e64 v13, s5, -1, 0, s4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+ADD_CO_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16, wave_size=32)
+
+
+def add_co_words(*, drop_vcc_carry=False, invert_vcc_carry=False, drop_sgpr_carry=False):
+    """Independent Python model for ADD_CO: 64-bit unsigned add with carry-out/carry-in."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        lo0 = (0xfffffff0 + flat) & 0xffffffff
+        c0 = 1 if (0xfffffff0 + flat) >= (1 << 32) else 0
+        if drop_vcc_carry:
+            c0 = 0
+        elif invert_vcc_carry:
+            c0 = 1 - c0
+        hi0 = (0x100 + flat + c0) & 0xffffffff
+        lo1 = (0xffffffe0 + flat) & 0xffffffff
+        c1 = 0 if drop_sgpr_carry else (1 if (0xffffffe0 + flat) >= (1 << 32) else 0)
+        hi1 = (0xffffffff + 0 + c1) & 0xffffffff
+        words[4 * flat:4 * flat + 4] = [lo0, hi0, lo1, hi1]
+    return words
+
+
+def add_co_controls():
+    """Exact HLSL and refusals for v_add_co_u32 and v_add_co_ci_u32."""
+    lines = aot.lower(ADD_CO, 64, **ADD_CO_BINDING).splitlines()
+    sum0 = "(0xfffffff0u + tid.x)"
+    c0 = f"({sum0} < 0xfffffff0u ? 1u : 0u)"
+    hi0 = f"((0x00000100u + tid.x) + {c0})"
+    sum1 = "(0xffffffe0u + tid.x)"
+    c1 = f"({sum1} < 0xffffffe0u ? 1u : 0u)"
+    hi1 = f"((0xffffffffu + 0x00000000u) + {c1})"
+    expected_store = f"    outputData.Store4(tid.x * 16u + 0u, uint4({sum0}, {hi0}, {sum1}, {hi1}));"
+    assert lines[3] == expected_store, lines
+    # Group <= 32 works without wave_size=32.
+    single = variant(ADD_CO, ("s10, 6", "s10, 5"))
+    assert "outputData.Store4" in aot.lower(single, 32, **dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16))
+    # Group > 32 without wave_size=32 is refused.
+    rejects("Carry-out add requires wave_size=32", aot.lower,
+            ADD_CO, 64, table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+    # Unknown or pending source, invalid destination, unverified carry destination/input.
+    rejects("Unverified ALU operand", aot.lower,
+            variant(ADD_CO, ("-16, v3", "-16, v40")), 64, **ADD_CO_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(ADD_CO, ("-16, v3", "s12, v3")), 64, **ADD_CO_BINDING)
+    rejects("Invalid vector destination", aot.lower,
+            variant(ADD_CO, ("v10, vcc_lo", "v256, vcc_lo")), 64, **ADD_CO_BINDING)
+    rejects("Unverified carry destination", aot.lower,
+            variant(ADD_CO, ("v12, s4", "v12, s106")), 64, **ADD_CO_BINDING)
+    rejects("Unverified carry destination", aot.lower,
+            variant(ADD_CO, ("v12, s4", "v12, s12")), 64, **ADD_CO_BINDING)
+    rejects("Unverified carry-in operand", aot.lower,
+            variant(ADD_CO, ("0, s4", "0, s30")), 64, **ADD_CO_BINDING)
+    rejects("Unverified carry-in operand", aot.lower,
+            variant(ADD_CO, ("0, s4", "0, s12")), 64, **ADD_CO_BINDING)
+    # Carry SGPR must be refused by any reader other than _ci: s_* ALU, v_* ALU, v_cndmask, and s_and_saveexec_b32.
+    rejects("Unverified scalar ALU operand", aot.lower,
+            variant(ADD_CO, ("v_add_co_ci_u32_e64 v13, s5, -1, 0, s4", "s_add_u32 s6, s4, 1\nv_mov_b32_e32 v13, s6")),
+            64, **ADD_CO_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(ADD_CO, ("v_add_co_ci_u32_e64 v13, s5, -1, 0, s4", "v_add_nc_u32_e32 v13, s4, v3")),
+            64, **ADD_CO_BINDING)
+    rejects("Unverified lane mask", aot.lower,
+            variant(single, ("v_add_co_ci_u32_e64 v13, s5, -1, 0, s4", "v_cndmask_b32_e64 v13, 0, 1, s4")),
+            32, table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+    rejects("Unverified or repeated lane guard", aot.lower,
+            variant(ADD_CO, ("v_add_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+                             "s_and_saveexec_b32 s2, vcc_lo\ns_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v11, 0")),
+            64, **ADD_CO_BINDING)
+    # Modifiers and unsupported spellings are refused.
+    for bad_line in ("v_add_co_u32 v10, vcc_lo, -16, v3 clamp",
+                     "v_add_co_u32 v10, vcc_lo, -v3, 1",
+                     "v_add_co_u32 v10, vcc_lo, |v3|, 1",
+                     "v_add_co_u32_e64 v10, vcc_lo, -16, v3",
+                     "v_add_co_ci_u32_e64 v13, s5, -1, 0, s4 mul:2"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(ADD_CO, ("v_add_co_u32 v10, vcc_lo, -16, v3", bad_line)), 64, **ADD_CO_BINDING)
+
+
+def add_co_binary(directory, assembler, objcopy, library):
+    """The assembled ADD_CO program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, ADD_CO), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_add_co_")] == [
+        line for line in ADD_CO if line.startswith("v_add_co_")], decoded
+    assert aot.lower(decoded, 64, **ADD_CO_BINDING) == aot.lower(ADD_CO, 64, **ADD_CO_BINDING)
+
+
+def add_co_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("add_co.hlsl", "add_co.cso", "add_co.case")]
+    source = aot.lower(ADD_CO, 64, **ADD_CO_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = add_co_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("vcc carry dropped", add_co_words(drop_vcc_carry=True), 65),
+            ("vcc carry inverted", add_co_words(invert_vcc_carry=True), 1),
+            ("sgpr carry-in ignored", add_co_words(drop_sgpr_carry=True), 131),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"add_co: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("vcc carry comparison flipped", source.replace("< 0xfffffff0u ? 1u : 0u", "> 0xfffffff0u ? 1u : 0u")),
+            ("sgpr carry-in zeroed", source.replace("< 0xffffffe0u ? 1u : 0u", "< 0xffffffe0u ? 0u : 0u"))):
+        if mutated == source:
+            raise AssertionError(f"add_co: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"add_co: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in ADD_CO if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
+SUB_CO = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_sub_co_u32 v10, vcc_lo, 16, v3",
+    "v_sub_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+    "v_subrev_co_u32 v12, s4, 32, v3",
+    "v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+SUB_CO_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16, wave_size=32)
+
+
+def sub_co_words(*, drop_vcc_borrow=False, swap_subrev=False, drop_sgpr_borrow=False):
+    """Independent Python model for SUB_CO: 64-bit unsigned subtract with borrow-out/borrow-in."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        lo0 = (16 - flat) & 0xffffffff
+        b0 = 0 if drop_vcc_borrow else (1 if 16 < flat else 0)
+        hi0 = (0x100 - flat - b0) & 0xffffffff
+        if swap_subrev:
+            lo1 = (32 - flat) & 0xffffffff
+            b1 = 0 if drop_sgpr_borrow else (1 if 32 < flat else 0)
+            hi1 = (0 - 10 - b1) & 0xffffffff
+        else:
+            lo1 = (flat - 32) & 0xffffffff
+            b1 = 0 if drop_sgpr_borrow else (1 if flat < 32 else 0)
+            hi1 = (10 - 0 - b1) & 0xffffffff
+        words[4 * flat:4 * flat + 4] = [lo0, hi0, lo1, hi1]
+    return words
+
+
+def sub_co_controls():
+    """Exact HLSL and refusals for v_sub_co_u32, v_subrev_co_u32, and *_ci."""
+    lines = aot.lower(SUB_CO, 64, **SUB_CO_BINDING).splitlines()
+    diff0 = "(0x00000010u - tid.x)"
+    b0 = "(0x00000010u < tid.x ? 1u : 0u)"
+    hi0 = f"((0x00000100u - tid.x) - {b0})"
+    diff1 = "(tid.x - 0x00000020u)"
+    b1 = "(tid.x < 0x00000020u ? 1u : 0u)"
+    hi1 = f"((0x0000000au - 0x00000000u) - {b1})"
+    expected_store = f"    outputData.Store4(tid.x * 16u + 0u, uint4({diff0}, {hi0}, {diff1}, {hi1}));"
+    assert lines[3] == expected_store, lines
+    # Also check v_sub_co_ci_u32_e64 and v_subrev_co_ci_u32_e32 spellings.
+    e64_sub = variant(SUB_CO, ("v_sub_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+                               "v_sub_co_ci_u32_e64 v11, s6, 0x100, v3, vcc_lo"))
+    assert aot.lower(e64_sub, 64, **SUB_CO_BINDING).splitlines()[3] == expected_store
+    e32_rev = variant(SUB_CO, ("v_subrev_co_u32 v12, s4, 32, v3", "v_subrev_co_u32 v12, vcc_lo, 32, v3"),
+                      ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "v_subrev_co_ci_u32_e32 v13, vcc_lo, 0, v3, vcc_lo"))
+    assert "((tid.x - 0x00000000u) - (tid.x < 0x00000020u ? 1u : 0u))" in aot.lower(e32_rev, 64, **SUB_CO_BINDING)
+    # VCC contains one value. Overwriting it with a carry cannot retain the previous borrow, or vice versa.
+    add_overwrites_borrow = variant(
+        SUB_CO,
+        ("v_sub_co_ci_u32_e32 v11", "v_add_co_u32 v8, vcc_lo, -16, v3\nv_sub_co_ci_u32_e32 v11"),
+    )
+    rejects("Unverified borrow-in operand", aot.lower, add_overwrites_borrow, 64, **SUB_CO_BINDING)
+    borrow_overwrites_carry = variant(
+        ADD_CO,
+        ("v_add_co_ci_u32_e32 v11", "v_sub_co_u32 v8, vcc_lo, 16, v3\nv_add_co_ci_u32_e32 v11"),
+    )
+    rejects("Unverified carry-in operand", aot.lower, borrow_overwrites_carry, 64, **ADD_CO_BINDING)
+    # Group <= 32 works without wave_size=32; > 32 requires wave_size=32.
+    single = variant(SUB_CO, ("s10, 6", "s10, 5"))
+    assert "outputData.Store4" in aot.lower(single, 32, **dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16))
+    rejects("Borrow-out subtract requires wave_size=32", aot.lower,
+            SUB_CO, 64, table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+    # Unknown or pending source, invalid destination, unverified borrow destination/input.
+    rejects("Unverified ALU operand", aot.lower,
+            variant(SUB_CO, ("16, v3", "16, v40")), 64, **SUB_CO_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(SUB_CO, ("16, v3", "s12, v3")), 64, **SUB_CO_BINDING)
+    rejects("Invalid vector destination", aot.lower,
+            variant(SUB_CO, ("v10, vcc_lo", "v256, vcc_lo")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow destination", aot.lower,
+            variant(SUB_CO, ("v12, s4", "v12, s106")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow destination", aot.lower,
+            variant(SUB_CO, ("v12, s4", "v12, s12")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow-in operand", aot.lower,
+            variant(SUB_CO, ("10, s4", "10, s30")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow-in operand", aot.lower,
+            variant(SUB_CO, ("10, s4", "10, s12")), 64, **SUB_CO_BINDING)
+    # Borrow SGPR must be refused by any reader other than _ci: s_* ALU, v_* ALU, v_cndmask, and s_and_saveexec_b32.
+    rejects("Unverified scalar ALU operand", aot.lower,
+            variant(SUB_CO, ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "s_add_u32 s6, s4, 1\nv_mov_b32_e32 v13, s6")),
+            64, **SUB_CO_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(SUB_CO, ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "v_add_nc_u32_e32 v13, s4, v3")),
+            64, **SUB_CO_BINDING)
+    rejects("Unverified lane mask", aot.lower,
+            variant(single, ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "v_cndmask_b32_e64 v13, 0, 1, s4")),
+            32, table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+    rejects("Unverified or repeated lane guard", aot.lower,
+            variant(SUB_CO, ("v_sub_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+                             "s_and_saveexec_b32 s2, vcc_lo\ns_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v11, 0")),
+            64, **SUB_CO_BINDING)
+    # Modifiers and unsupported spellings are refused.
+    for bad_line in ("v_sub_co_u32 v10, vcc_lo, 16, v3 clamp",
+                     "v_sub_co_u32 v10, vcc_lo, -v3, 1",
+                     "v_sub_co_u32 v10, vcc_lo, |v3|, 1",
+                     "v_sub_co_u32_e64 v10, vcc_lo, 16, v3",
+                     "v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4 mul:2"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(SUB_CO, ("v_sub_co_u32 v10, vcc_lo, 16, v3", bad_line)), 64, **SUB_CO_BINDING)
+
+
+def sub_co_binary(directory, assembler, objcopy, library):
+    """The assembled SUB_CO program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, SUB_CO), library, offsets=True))
+    assert [line for line in decoded if line.startswith(("v_sub_co_", "v_subrev_co_"))] == [
+        line for line in SUB_CO if line.startswith(("v_sub_co_", "v_subrev_co_"))], decoded
+    assert aot.lower(decoded, 64, **SUB_CO_BINDING) == aot.lower(SUB_CO, 64, **SUB_CO_BINDING)
+
+
+def sub_co_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("sub_co.hlsl", "sub_co.cso", "sub_co.case")]
+    source = aot.lower(SUB_CO, 64, **SUB_CO_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = sub_co_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("vcc borrow dropped", sub_co_words(drop_vcc_borrow=True), 69),
+            ("subrev operand order swapped", sub_co_words(swap_subrev=True), 2),
+            ("sgpr borrow-in ignored", sub_co_words(drop_sgpr_borrow=True), 3),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"sub_co: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("vcc borrow comparison flipped", source.replace("0x00000010u < tid.x ? 1u : 0u", "0x00000010u > tid.x ? 1u : 0u")),
+            ("sgpr borrow-in zeroed", source.replace("tid.x < 0x00000020u ? 1u : 0u", "tid.x < 0x00000020u ? 0u : 0u"))):
+        if mutated == source:
+            raise AssertionError(f"sub_co: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"sub_co: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in SUB_CO if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
+DOT_U = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s16, 0x80010002",
+    "s_mov_b32 s17, 0x80000010",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, 0x1ffe0, v3",
+    "v_mov_b32_e32 v5, 0xffff0003",
+    "v_dot2_u32_u16 v10, 0xffff0002, v5, v4",
+    "v_dot2_u32_u16 v11, s16, 0x40005, v4",
+    "v_mov_b32_e32 v6, 0xfe030405",
+    "v_dot4_u32_u8 v12, 0xff800201, v6, v4",
+    "v_mov_b32_e32 v7, 0xffffffe0",
+    "v_dot4_u32_u8 v13, s17, 0x1020304, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+DOT_U_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+
+
+def _py_dot2_u32_u16(a, b, c, *, signed=False, sat=False):
+    if signed:
+        s16 = lambda x: x - 0x10000 if x & 0x8000 else x
+        total = s16(a & 0xffff) * s16(b & 0xffff) + s16((a >> 16) & 0xffff) * s16((b >> 16) & 0xffff) + c
+    else:
+        total = (a & 0xffff) * (b & 0xffff) + ((a >> 16) & 0xffff) * ((b >> 16) & 0xffff) + c
+    if sat:
+        return min(total, 0xffffffff)
+    return total & 0xffffffff
+
+
+def _py_dot4_u32_u8(a, b, c, *, signed=False):
+    s8 = lambda x: x - 0x100 if x & 0x80 else x
+    total = c
+    for k in range(4):
+        ak = (a >> (8 * k)) & 0xff
+        bk = (b >> (8 * k)) & 0xff
+        total += (s8(ak) * s8(bk)) if signed else (ak * bk)
+    return total & 0xffffffff
+
+
+def dot_u_words(*, signed_dot2=False, signed_dot4=False, sat_dot2=False):
+    """Independent Python model for DOT_U."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        v4 = (0x0001ffe0 + flat) & 0xffffffff
+        w0 = _py_dot2_u32_u16(0xffff0002, 0xffff0003, v4, signed=signed_dot2, sat=sat_dot2)
+        w1 = _py_dot2_u32_u16(0x80010002, 0x00040005, v4, signed=signed_dot2, sat=sat_dot2)
+        w2 = _py_dot4_u32_u8(0xff800201, 0xfe030405, v4, signed=signed_dot4)
+        w3 = _py_dot4_u32_u8(0x80000010, 0x01020304, 0xffffffe0, signed=signed_dot4)
+        words[4 * flat:4 * flat + 4] = [w0, w1, w2, w3]
+    return words
+
+
+def dot_u_controls():
+    """Exact HLSL and refusals for v_dot2_u32_u16 and v_dot4_u32_u8."""
+    hlsl = aot.lower(DOT_U, 64, **DOT_U_BINDING)
+    assert "uint dot2_u32_u16(uint a, uint b, uint c)" in hlsl
+    assert "uint dot4_u32_u8(uint a, uint b, uint c)" in hlsl
+    expected_store = (
+        "    outputData.Store4(tid.x * 16u + 0u, uint4("
+        "dot2_u32_u16(0xffff0002u, 0xffff0003u, (0x0001ffe0u + tid.x)), "
+        "dot2_u32_u16(0x80010002u, 0x00040005u, (0x0001ffe0u + tid.x)), "
+        "dot4_u32_u8(0xff800201u, 0xfe030405u, (0x0001ffe0u + tid.x)), "
+        "dot4_u32_u8(0x80000010u, 0x01020304u, 0xffffffe0u)));"
+    )
+    assert hlsl.splitlines()[-2] == expected_store, hlsl.splitlines()[-5:]
+    # Per-helper emission: only the referenced helper is emitted.
+    dot2_only = aot.lower(variant(DOT_U,
+                                  ("v_dot4_u32_u8 v12, 0xff800201, v6, v4", "v_mov_b32_e32 v12, 0"),
+                                  ("v_dot4_u32_u8 v13, s17, 0x1020304, v7", "v_mov_b32_e32 v13, 0")),
+                          64, **DOT_U_BINDING)
+    assert "dot2_u32_u16(" in dot2_only and "dot4_u32_u8(" not in dot2_only
+    # Unknown/pending sources and invalid destination.
+    rejects("Unverified ALU operand", aot.lower,
+            variant(DOT_U, ("v5, v4", "v40, v4")), 64, **DOT_U_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(DOT_U, ("v5, v4", "v5, s12")), 64, **DOT_U_BINDING)
+    rejects("Invalid vector destination", aot.lower,
+            variant(DOT_U, ("v10, 0xffff0002", "v256, 0xffff0002")), 64, **DOT_U_BINDING)
+    # clamp, op_sel, neg, omod, and other spellings are refused.
+    for bad_line in (
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 clamp",
+            "v_dot4_u32_u8 v12, 0xff800201, v6, v4 clamp",
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 op_sel:[1,0,0] op_sel_hi:[0,1,0]",
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 neg_lo:[1,0,0]",
+            "v_dot2_u32_u16 v10, -v4, v5, v4",
+            "v_dot4_u32_u8 v12, |v4|, v6, v4",
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 mul:2",
+            "v_dot2_i32_i16 v10, 0xffff0002, v5, v4"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(DOT_U, ("v_dot2_u32_u16 v10, 0xffff0002, v5, v4", bad_line)),
+                64, **DOT_U_BINDING)
+
+
+def dot_u_binary(directory, assembler, objcopy, library):
+    """The assembled DOT_U program decodes on gfx1030 and lowers to the same HLSL."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, DOT_U, cpu="gfx1030"),
+                                       library, offsets=True, cpu=b"gfx1030"))
+    assert [line for line in decoded if line.startswith("v_dot")] == [
+        line for line in DOT_U if line.startswith("v_dot")], decoded
+    assert aot.lower(decoded, 64, **DOT_U_BINDING) == aot.lower(DOT_U, 64, **DOT_U_BINDING)
+
+
+def dot_u_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("dot_u.hlsl", "dot_u.cso", "dot_u.case")]
+    source = aot.lower(DOT_U, 64, **DOT_U_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = dot_u_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("dot2 treated as signed i16", dot_u_words(signed_dot2=True), 0),
+            ("dot4 treated as signed i8", dot_u_words(signed_dot4=True), 2),
+            ("dot2 saturated instead of wrapped", dot_u_words(sat_dot2=True), 100),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"dot_u: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("dot2 drops high-half product", source.replace("+ (a >> 16) * (b >> 16)", "")),
+            ("dot4 drops byte-3 product", source.replace("+ (a >> 24) * (b >> 24)", ""))):
+        if mutated == source:
+            raise AssertionError(f"dot_u: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"dot_u: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in DOT_U if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
+MAC_F32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s16, 0x40400000",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, 0x40000001, v3",
+    "v_mov_b32_e32 v5, 0x45800800",
+    "v_mov_b32_e32 v10, 0xcb801000",
+    "v_mac_f32_e32 v10, 0x45800800, v5",
+    "v_mov_b32_e32 v11, 0xbf800002",
+    "v_mac_f32_e64 v11, v4, 0x3f800001",
+    "v_mov_b32_e32 v12, 0xc0400000",
+    "v_mac_f32_e32 v12, s16, v4",
+    "v_mov_b32_e32 v13, 0x3f400000",
+    "v_mac_f32_e64 v13, -2.0, 0x3fc00000",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+MAC_F32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+
+
+def _py_mac_f32(a_bits, b_bits, c_bits, *, fused=False, sub_acc=False):
+    from fractions import Fraction
+    to_f = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]
+    to_u = lambda f: struct.unpack("<I", struct.pack("<f", f))[0]
+    a, b, c = to_f(a_bits), to_f(b_bits), to_f(c_bits)
+    if fused:
+        acc = Fraction(c)
+        return to_u(float(Fraction(a) * Fraction(b) - acc if sub_acc else Fraction(a) * Fraction(b) + acc))
+    prod = to_f(to_u(a * b))
+    return to_u(prod - c if sub_acc else prod + c)
+
+
+def mac_f32_words(*, fused=False, sub_acc=False, zero_d3=False):
+    """Independent Python model for MAC_F32."""
+    words = [SENTINEL] * 320
+    w0 = _py_mac_f32(0x45800800, 0x45800800, 0xcb801000, fused=fused)
+    w3 = _py_mac_f32(0xc0000000, 0x3fc00000, 0 if zero_d3 else 0x3f400000, fused=fused)
+    for flat in range(64):
+        v4 = 0x40000001 + flat
+        w1 = _py_mac_f32(v4, 0x3f800001, 0xbf800002, fused=fused)
+        w2 = _py_mac_f32(0x40400000, v4, 0xc0400000, fused=fused, sub_acc=sub_acc)
+        words[4 * flat:4 * flat + 4] = [w0, w1, w2, w3]
+    return words
+
+
+def mac_f32_controls():
+    """Exact HLSL and refusals for v_mac_f32_e32 and v_mac_f32_e64."""
+    hlsl = aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
+    assert "uint f32_mac(uint a, uint b, uint c)" in hlsl
+    expected_store = (
+        "    outputData.Store4(tid.x * 16u + 0u, uint4("
+        "f32_mac(0x45800800u, 0x45800800u, 0xcb801000u), "
+        "f32_mac((0x40000001u + tid.x), 0x3f800001u, 0xbf800002u), "
+        "f32_mac(0x40400000u, (0x40000001u + tid.x), 0xc0400000u), "
+        "f32_mac(0xc0000000u, 0x3fc00000u, 0x3f400000u)));"
+    )
+    assert hlsl.splitlines()[-2] == expected_store, hlsl.splitlines()[-5:]
+    # f32 profile literal refusals: NaN, Inf, denormal constants.
+    for bad_const in ("0x7fc00000", "0x7f800000", "0x00000001"):
+        rejects("Unverified float operand", aot.lower,
+                variant(MAC_F32, ("0x3fc00000", bad_const)), 64, **MAC_F32_BINDING)
+    # Unknown/pending sources, uninitialized accumulator D, and invalid destination.
+    rejects("Unverified float operand", aot.lower,
+            variant(MAC_F32, ("v4, 0x3f800001", "v40, 0x3f800001")), 64, **MAC_F32_BINDING)
+    rejects("Unverified float operand", aot.lower,
+            variant(MAC_F32, ("s16, v4", "s12, v4")), 64, **MAC_F32_BINDING)
+    rejects("Unverified float operand", aot.lower,
+            variant(MAC_F32, ("v_mov_b32_e32 v13, 0x3f400000", "v_mov_b32_e32 v14, 0x3f400000")),
+            64, **MAC_F32_BINDING)
+    rejects("Invalid vector destination", aot.lower,
+            variant(MAC_F32, ("v13, -2.0", "v256, -2.0")), 64, **MAC_F32_BINDING)
+    # Modifiers, e32 SGPR src1, and bare spelling are refused.
+    for bad_line in (
+            "v_mac_f32_e32 v10, -0x45800800, v5",
+            "v_mac_f32_e64 v13, |-2.0|, 0x3fc00000",
+            "v_mac_f32_e64 v13, -2.0, 0x3fc00000 clamp",
+            "v_mac_f32_e64 v13, -2.0, 0x3fc00000 mul:2",
+            "v_mac_f32_e32 v10, v5, s16",
+            "v_mac_f32 v10, 0x45800800, v5"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(MAC_F32, ("v_mac_f32_e32 v10, 0x45800800, v5", bad_line)),
+                64, **MAC_F32_BINDING)
+
+
+def mac_f32_binary(directory, assembler, objcopy, library):
+    """The assembled MAC_F32 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, MAC_F32), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_mac_f32")] == [
+        line for line in MAC_F32 if line.startswith("v_mac_f32")], decoded
+    assert aot.lower(decoded, 64, **MAC_F32_BINDING) == aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
+
+
+def mac_f32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("mac_f32.hlsl", "mac_f32.cso", "mac_f32.case")]
+    source = aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = mac_f32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("fused FMA instead of unfused MAC", mac_f32_words(fused=True), 0),
+            ("product minus accumulator", mac_f32_words(sub_acc=True), 2),
+            ("accumulator zeroed", mac_f32_words(zero_d3=True), 3),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"mac_f32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    mutations = [
+        ("p - asfloat(c) instead of p + asfloat(c)", source.replace("p + asfloat(c)", "p - asfloat(c)")),
+        ("accumulator dropped", source.replace("p + asfloat(c)", "p")),
+    ]
+    if backend == "hardware":
+        mutations.append((
+            "fused mad() instead of unfused multiply+add",
+            source.replace("precise float p = asfloat(a) * asfloat(b); precise float r = p + asfloat(c);",
+                           "precise float r = mad(asfloat(a), asfloat(b), asfloat(c));"),
+        ))
+    for label, mutated in mutations:
+        if mutated == source:
+            raise AssertionError(f"mac_f32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"mac_f32: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in MAC_F32 if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -4723,8 +5544,13 @@ def binary(directory, assembler, objcopy, library):
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     salu_i32_binary(directory, assembler, objcopy, library)
+    mac_f32_binary(directory, assembler, objcopy, library)
+    dot_u_binary(directory, assembler, objcopy, library)
+    add_co_binary(directory, assembler, objcopy, library)
+    sub_co_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    bfe_binary(directory, assembler, objcopy, library)
     vadd_nc_i32_binary(directory, assembler, objcopy, library)
     cvt_u32_f32_binary(directory, assembler, objcopy, library)
     ff1_exec_binary(directory, assembler, objcopy, library)
@@ -8045,7 +8871,12 @@ if __name__ == "__main__":
                  "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
                  "draw-salu_i32": salu_i32_draw,
+                 "draw-mac-f32": mac_f32_draw,
+                 "draw-dot-u": dot_u_draw,
+                 "draw-add-co": add_co_draw,
+                 "draw-sub-co": sub_co_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
+                 "draw-bfe": bfe_draw,
                  "draw-vadd_nc_i32": vadd_nc_i32_draw,
                  "draw-ff1-exec": ff1_exec_draw,
                  "draw-ff1-scalar": ff1_scalar_draw,
