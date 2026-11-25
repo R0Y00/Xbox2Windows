@@ -60,12 +60,11 @@ std::vector<StrippedBlob> stripped_blobs;
 
 class RetriedBlob final : public ID3DBlob {
 public:
-    // The blob to hand out for inner: a registered wrapper, or inner itself (no bits recorded) when the
-    // wrapper or its record cannot be allocated.
+    // Take ownership only after the wrapper and its provenance record have both been allocated.
     static ID3DBlob* wrap(ID3DBlob* inner, std::uint32_t bits) noexcept
     {
         RetriedBlob* wrapper = new (std::nothrow) RetriedBlob(inner);
-        if (!wrapper) return inner;
+        if (!wrapper) return nullptr;
         bool registered = true;
         AcquireSRWLockExclusive(&stripped_lock);
         try {
@@ -77,7 +76,7 @@ public:
         if (registered) return wrapper;
         wrapper->inner_ = nullptr;  // inner stays with the caller
         delete wrapper;
-        return inner;
+        return nullptr;
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
     {
@@ -132,22 +131,28 @@ HRESULT serialize_for_runtime(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, I
     const HRESULT hr = D3D12SerializeVersionedRootSignature(desc, blob, error_blob);
     if (hr != E_INVALIDARG || !desc || !blob) return hr;
     if (desc->Version != D3D_ROOT_SIGNATURE_VERSION_1_0 && desc->Version != D3D_ROOT_SIGNATURE_VERSION_1_1) return hr;
-    // Flags sits at the same offset in both versions (see the static_asserts above).
-    const auto flags = static_cast<std::uint32_t>(desc->Desc_1_1.Flags);
+    const bool version_1_0 = desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0;
+    const auto flags = static_cast<std::uint32_t>(version_1_0 ? desc->Desc_1_0.Flags : desc->Desc_1_1.Flags);
     if (!(flags & heap_indexing_flags) || !permissive_switch()) return hr;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *desc;
-    copy.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags & ~heap_indexing_flags);
+    auto& retry_flags = version_1_0 ? copy.Desc_1_0.Flags : copy.Desc_1_1.Flags;
+    retry_flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags & ~heap_indexing_flags);
+    ID3DBlob* retry_blob = nullptr;
     ID3DBlob* retry_error = nullptr;
-    const HRESULT retry = D3D12SerializeVersionedRootSignature(&copy, blob, &retry_error);
-    if (FAILED(retry)) {
-        if (retry_error) retry_error->Release();
+    const HRESULT retry = D3D12SerializeVersionedRootSignature(&copy, &retry_blob, &retry_error);
+    if (retry_error) retry_error->Release();
+    if (FAILED(retry) || !retry_blob) {
+        if (retry_blob) retry_blob->Release();
         return hr;  // something else is wrong: keep the first answer and its error blob
     }
-    if (retry_error) retry_error->Release();
-    if (*blob) *blob = RetriedBlob::wrap(*blob, flags & heap_indexing_flags);
+    *blob = RetriedBlob::wrap(retry_blob, flags & heap_indexing_flags);
     if (error_blob && *error_blob) {
         (*error_blob)->Release();
         *error_blob = nullptr;
+    }
+    if (!*blob) {
+        retry_blob->Release();
+        return E_OUTOFMEMORY;
     }
     static LONG logged;
     if (InterlockedIncrement(&logged) == 1)
