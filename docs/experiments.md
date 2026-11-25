@@ -5782,11 +5782,11 @@ The view must be live and describe format 75 (`BUF_FMT_32_32_32_32_UINT`) with i
 
 Run `ctest --preset dev -R '^compute_(heap_store_controls|store_aot_heap_view_store_(warp|hardware))$' --output-on-failure`. The fixture checks all 320 readback words across twelve cases. These include distinct live ranges, one texel ending exactly at the u0 limit, and a partial texel that must leave the sentinel intact. Eight mutations exercise the base, stride, record count, format, lifetime, output extent and slot limit. Removing the per-index extent check lets the next thread write past the last complete texel.
 
-### Packed D16 heap-view stores to FLOAT4
+### Packed D16 heap-view stores to FLOAT4 and FLOAT1
 
-With the same `--heap-store-view` binding, gfx1013 `buffer_store_format_d16_xyzw` reads X/Y from the low/high halves of the first VGPR and Z/W from the second. A live identity `BUF_FMT_32_32_32_32_FLOAT` view (format 77) receives four binary32 words. Two source VGPRs still require 16 writable bytes in the destination. An ordinary UINT4 record selected by this opcode leaves the sentinel region untouched. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [HLSL half-to-float conversion](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/f16tof32)
+With the same `--heap-store-view` binding, gfx1013 `buffer_store_format_d16_xyzw` reads X/Y from the low/high halves of the first VGPR and Z/W from the second. A live identity `BUF_FMT_32_32_32_32_FLOAT` view (format 77) receives four binary32 words. Two source VGPRs still require 16 writable bytes in the destination. `buffer_store_format_d16_x` takes one source VGPR, converts its low 16 bits (`& 0xffffu`) via `f16tof32`, and writes one 4-byte binary32 word into a live identity `BUF_FMT_32_FLOAT` view (format 22, `0x01016fac`), enforcing 4-byte offset/stride/base alignment and `(bytes - view.x - offset - 4u) / stride` bounds without a raw UAV read-modify-write. Ordinary UINT views or mismatched four-channel/single-channel FLOAT views leave the sentinel region untouched, and `d16_xy` / `d16_xyz` remain refused under `--heap-store-view`. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [HLSL half-to-float conversion](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/f16tof32)
 
-The heap-store CTest selection above runs both programs. The D16 fixture checks twelve cases with 320 words each. Its reference includes consecutive half values starting at 1, a negative value, the smallest positive half subnormal and negative zero. Eleven compiled shader mutations check addressing, view selection and conversion, including using the low X half for Y, taking W from the wrong VGPR and writing packed values directly.
+The heap-store CTest selection above runs all three programs (`UINT4`, `D16-to-FLOAT4`, and `D16_X-to-FLOAT1`). Each D16 fixture checks 320 words across its heap-view cases (with `D16_X` additionally checking four binary16 payload patterns with poisoned high halves: `1.0`..`1.00293`, `-2.0`.., minimum positive subnormal + `+0.0`, and `-0.0` + negative subnormals, plus `UINT1` and `FLOAT4` mismatch rejections and untouched adjacent sentinel dwords). Eleven compiled shader mutations check addressing, view selection, and half-float extraction, including swapping high for low bits, checking the wrong format word, and writing packed values directly.
 
 ### Heap-view buffer loads
 
@@ -8784,6 +8784,38 @@ fixture repeats the readback with a mesh program under tag 24 and checks that
 a pixel program under the same tag leaves the target clear. The amplified
 fixture passes a group index through an amplification payload and checks the
 same pixels. Adapters without mesh shader support report a capability skip.
+
+With `X2W_MESH_INDIRECT_XMEM=1`, the desktop mesh path can consume one
+12-byte indirect record from a mirrored XMem placement. A COMPUTE list uses
+slot 15 to copy the record from a default-heap UAV buffer into the XMem lease.
+Submission publishes the exact range with a completion fence. The runtime
+checks the live physical page and byte range at slot 61 and again at submission.
+A different queue waits on the writer's fence before executing and retains
+the lease through its own completion fence. This uses the page lease from
+[#2280](https://github.com/R0Y00/Xbox2Windows/pull/2280) and the queue handoff
+from [#2303](https://github.com/R0Y00/Xbox2Windows/pull/2303).
+
+The source-built check reuses the desktop mesh pipeline and compute shader
+from [#1916](https://github.com/R0Y00/Xbox2Windows/pull/1916). The shader writes
+two groups into a scratch UAV. The mirrored XMem record starts with one group.
+With the wait, the DIRECT consumer paints eight pixels. Omitting the wait
+while the COMPUTE queue is held back paints four. Without a submitted writer,
+from a different page in the same placement, or at a different byte offset,
+the runtime refuses the record and all eight pixels stay clear. The CPU view
+shows the three group counts and unchanged guard words after the writer fence.
+A second gated consumer paints eight pixels after the guest mappings are
+removed. XMem can reuse the original slot once that consumer completes.
+
+Release on Windows 10 build 19045.6456 with app-local WARP 1.0.22 and Agility
+SDK 1.620.2 passed both cases with zero D3D12 debug warnings or errors. The
+physical GPU cases returned 77 because the available GTX 1080 Ti lacks mesh
+shader support. The producer behind the application calls in
+[#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412) remains open.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed xmem_shim
+ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_xmem_arguments' -V
+```
 
 A decoded indirect mesh command can publish a fixed slot 57 pipeline as a
 separate translation request. The descriptor must have a mesh program, an
@@ -13461,6 +13493,35 @@ R/G, swapping the packed registers and dropping the EXEC guard produce 64, 32,
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
+```
+
+### Explicit-LOD 2D gather
+
+The startup pixel and compute translators lower gfx1013 `image_gather4_l` on a
+2D texture with three contiguous address registers (`u`, `v`, explicit `lod`),
+one-hot component `dmask`, and a constant sampler matching the 2D gather profile
+(`CLAMP_LAST_TEXEL` in X/Y, `CLAMP_Z` ignored, bilinear or point XY, point mip
+filtering, zero `MIN_LOD`, zero bias, and zero `MIP_POINT_PRECLAMP`). Compute
+stages enforce the same fixed-table eight-word unmodified image descriptor check
+as `image_gather4_lz`.
+
+Because Direct3D 12 SM 5.1/6.0 `Gather` always reads view mip zero, the lowering
+emits `gather_2d_lod(...)`, which checks finite `uv` and `lod` bitwise, queries
+visible view dimensions via `GetDimensions`, clamps `lod` to `[0, MAX_LOD]` and
+rounds to `[0, levels - 1]`, and loads the four `(0,1), (1,1), (1,0), (0,0)`
+bilinear taps clamped to the selected mip bounds. Non-finite inputs evaluate to
+zeros without aborting other instructions or lanes.
+
+Source-built `gfx1013` compute and pixel fixtures check all four channels,
+overlapping destination/address registers, descriptor provenance and table
+alignment, refusal controls, DXC `cs_6_0` compute readbacks across explicit,
+fractional, negative, sampler-clamped, view-relative (`MostDetailedMip = 1`),
+and per-lane dynamic LODs, DXC `ps_6_0` / FXC `ps_5_1` pixel draws, and
+predicted failure counts under negative mutations.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_hardware)?$' -V
 ```
 
 ## Startup translator: fixed-mip 2D comparison gathers

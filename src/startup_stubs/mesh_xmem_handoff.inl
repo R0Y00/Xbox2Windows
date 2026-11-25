@@ -7,6 +7,17 @@ bool mesh_xmem_handoff()
     return enabled;
 }
 
+bool mesh_xmem_indirect()
+{
+    static const bool enabled = x2w_local::env_on("X2W_MESH_INDIRECT_XMEM");
+    return enabled;
+}
+
+bool mesh_xmem_tracking()
+{
+    return mesh_xmem_handoff() || mesh_xmem_indirect();
+}
+
 struct MeshXMemLease {
     using Release = BOOL (WINAPI*)(UINT, ULONG64);
     X2WXMemSectionLease lease{};
@@ -14,7 +25,7 @@ struct MeshXMemLease {
     X2WXMemMatchSection match{};
     Wrapper* owner{};
     Wrapper* device{};
-    u64 offset{}, address{};
+    u64 offset{}, address{}, bytes{};
     void* view{};
     x2w_startup::ComPtr<ID3D12Heap> heap;
     x2w_startup::ComPtr<ID3D12Resource> buffer;
@@ -34,7 +45,7 @@ struct MeshXMemLease {
 
     bool matches(u64 candidate) const
     {
-        return match(x2w_xmem_section_lease_version, lease.id, lease.first_byte, candidate, sizeof(UINT));
+        return match(x2w_xmem_section_lease_version, lease.id, lease.first_byte, candidate, bytes);
     }
 };
 
@@ -98,7 +109,7 @@ void watch_mesh_xmem_completion(ID3D12Fence* fence)
 
 void drop_mesh_lease_owner(Wrapper* w)
 {
-    if (!mesh_xmem_handoff()) return;
+    if (!mesh_xmem_tracking()) return;
     const std::lock_guard lock(mesh_xmem_mutex);
     if (published_mesh_lease && published_mesh_lease->owner == w)
         published_mesh_lease.reset();
@@ -107,13 +118,14 @@ void drop_mesh_lease_owner(Wrapper* w)
 
 void discard_mesh_lease_recording(ID3D12CommandList* list)
 {
-    if (!mesh_xmem_handoff()) return;
+    if (!mesh_xmem_tracking()) return;
     const std::lock_guard lock(mesh_xmem_mutex);
     mesh_xmem_recordings.erase(list);
     reap_mesh_xmem_flights();
 }
 
-std::shared_ptr<MeshXMemLease> open_mesh_xmem_lease(Wrapper* device, Wrapper* owner, u64 offset, u64 address)
+std::shared_ptr<MeshXMemLease> open_mesh_xmem_lease(Wrapper* device, Wrapper* owner,
+                                                   u64 offset, u64 address, u64 bytes)
 {
     using Pin = BOOL (WINAPI*)(UINT, ULONG_PTR, SIZE_T, X2WXMemSectionLease*, SIZE_T);
     HMODULE xmem = nullptr;
@@ -139,10 +151,11 @@ std::shared_ptr<MeshXMemLease> open_mesh_xmem_lease(Wrapper* device, Wrapper* ow
     result->device = device;
     result->address = address;
     result->offset = offset;
+    result->bytes = bytes;
     result->release = release;
     result->match = match;
     auto& lease = result->lease;
-    if (!pin(x2w_xmem_section_lease_version, address, sizeof(UINT), &lease, sizeof(lease))) return {};
+    if (!pin(x2w_xmem_section_lease_version, address, bytes, &lease, sizeof(lease))) return {};
     result->view = MapViewOfFile(lease.section, FILE_MAP_WRITE, static_cast<DWORD>(lease.section_offset >> 32),
                                  static_cast<DWORD>(lease.section_offset), static_cast<SIZE_T>(lease.window_bytes));
     CloseHandle(lease.section);
@@ -165,7 +178,7 @@ std::shared_ptr<MeshXMemLease> open_mesh_xmem_lease(Wrapper* device, Wrapper* ow
 void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
                           ID3D12Resource* source = nullptr, u64 source_offset = 0)
 {
-    if (!mesh_xmem_handoff() || !owner || !owner->own().title_memory) return;
+    if (!mesh_xmem_tracking() || !owner || !owner->own().title_memory) return;
     const auto* info = resource_info(owner);
     if (!info || info->placement != Placement::copied_buffer ||
         info->placement_device != list->own().list_device || info->console.Flags != D3D12_RESOURCE_FLAG_NONE)
@@ -177,8 +190,8 @@ void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
         auto& recorded = mesh_xmem_recordings[desktop_list];
         recorded.writes.push_back({owner, offset, bytes, false});
         const u64 base = reinterpret_cast<u64>(owner->own().title_memory);
-        if (!source || bytes != sizeof(UINT) || offset > UINT64_MAX - base || recorded.reader ||
-            (base + offset) % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return;
+        const u64 alignment = bytes == sizeof(UINT) ? D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT : sizeof(UINT);
+        if (!source || offset > UINT64_MAX - base || recorded.reader || (base + offset) % alignment) return;
         x2w_startup::ComPtr<ID3D12Device> source_device;
         if (FAILED(source->GetDevice(IID_PPV_ARGS(&source_device))) ||
             source_device.Get() != device_of(list->own().list_device)) return;
@@ -187,12 +200,12 @@ void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
         if (placed.reject || placed.owner != owner) return;
         auto lease = active_mesh_lease.lock();
         if (!lease) {
-            lease = open_mesh_xmem_lease(list->own().list_device, owner, offset, address);
+            lease = open_mesh_xmem_lease(list->own().list_device, owner, offset, address, bytes);
             if (!lease) return;
             active_mesh_lease = lease;
         }
-        if (lease->untracked || lease->owner != owner || lease->offset != offset || !lease->matches(address))
-            return;
+        if (lease->untracked || lease->owner != owner || lease->offset != offset || lease->bytes != bytes ||
+            !lease->matches(address)) return;
         auto& states = pass_of(list).states;
         // Reserve before recording a barrier so a failed allocation cannot
         // leave an untracked transition on the desktop list.
@@ -208,39 +221,54 @@ void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
     }
 }
 
-const char* bind_mesh_xmem_srv(Wrapper* list, UINT parameter, u64 address)
+const char* record_mesh_xmem_read(Wrapper* list, u64 address, u64 bytes, D3D12_RESOURCE_STATES state,
+                                  ID3D12Resource*& resource, u64& offset)
 {
     const std::lock_guard lock(mesh_xmem_mutex);
-    auto lease = published_mesh_lease;
-    if (mesh_xmem_tracking_failed || !lease || lease->device != list->own().list_device)
-        return "cached mesh SRV has no submitted XMem writer";
-    if (!address || address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
-        return "cached mesh SRV address is missing or misaligned";
-    const auto placed = placed_buffer_range(list->own().list_device, address, sizeof(UINT));
+    const auto lease = published_mesh_lease;
+    if (mesh_xmem_tracking_failed || !lease || lease->device != list->own().list_device || lease->bytes != bytes)
+        return "mesh XMem read has no submitted writer for the required size";
+    const u64 alignment = bytes == sizeof(UINT) ? D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT : sizeof(UINT);
+    if (!address || address % alignment)
+        return "mesh XMem read address is missing or misaligned";
+    const auto placed = placed_buffer_range(list->own().list_device, address, bytes);
     if (!lease->matches(address) || placed.reject || placed.owner != lease->owner)
-        return "cached mesh SRV does not match the writer's leased page and byte range";
+        return "mesh XMem read does not match the writer's leased page and byte range";
     auto* desktop_list = static_cast<ID3D12GraphicsCommandList*>(list->own().real);
     try {
         auto& recorded = mesh_xmem_recordings[desktop_list];
         if (recorded.writer || (recorded.reader && (recorded.reader != lease || recorded.reader_address != address)))
-            return "cached mesh SRV requires a separate recording from its writer";
+            return "mesh XMem read requires a separate recording from its writer";
         for (const auto& write : recorded.writes)
-            if (write.owner == lease->owner && write.offset < lease->offset + sizeof(UINT) &&
+            if (write.owner == lease->owner && write.offset < lease->offset + bytes &&
                 lease->offset < write.offset + write.bytes)
-                return "cached mesh SRV overlaps a write in the same recording";
+                return "mesh XMem read overlaps a write in the same recording";
         pass_of(list).states.reserve(pass_of(list).states.size() + 1);
-        require_state(list, lease->buffer.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        desktop_list->SetGraphicsRootShaderResourceView(parameter,
-            lease->buffer->GetGPUVirtualAddress() + lease->lease.first_byte);
+        require_state(list, lease->buffer.Get(), state);
         recorded.reader = lease;
         recorded.reader_address = address;
+        resource = lease->buffer.Get();
+        offset = lease->lease.first_byte;
         static LONG reports;
         if (first_calls(reports, 16))
-            log("x2w-render mesh XMem root bind: lease %llu section page +0x%llx byte +0x%llx",
-                lease->lease.id, lease->lease.section_offset, lease->lease.first_byte);
+            log("x2w-render mesh XMem %s: lease %llu section page +0x%llx byte +0x%llx, %llu bytes",
+                state == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT ? "indirect bind" : "root bind",
+                lease->lease.id, lease->lease.section_offset, lease->lease.first_byte, bytes);
     } catch (const std::bad_alloc&) {
-        return "cached mesh SRV recording allocation failed";
+        return "mesh XMem read recording allocation failed";
     }
+    return nullptr;
+}
+
+const char* bind_mesh_xmem_srv(Wrapper* list, UINT parameter, u64 address)
+{
+    ID3D12Resource* resource{};
+    u64 offset{};
+    if (const char* failure = record_mesh_xmem_read(list, address, sizeof(UINT),
+                                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, resource, offset))
+        return failure;
+    auto* desktop_list = static_cast<ID3D12GraphicsCommandList*>(list->own().real);
+    desktop_list->SetGraphicsRootShaderResourceView(parameter, resource->GetGPUVirtualAddress() + offset);
     return nullptr;
 }
 
@@ -272,7 +300,7 @@ void execute_mesh_xmem_recording(ID3D12CommandQueue* queue, ID3D12CommandList* l
     const auto lease = work.reader ? work.reader : work.writer;
     if (lease) {
         const u64 address = work.reader ? work.reader_address : lease->address;
-        const auto placed = placed_buffer_range(lease->device, address, sizeof(UINT));
+        const auto placed = placed_buffer_range(lease->device, address, lease->bytes);
         if (mesh_xmem_tracking_failed || lease->untracked || placed.reject || placed.owner != lease->owner ||
             !lease->matches(address) || (work.reader && published_mesh_lease != lease)) {
             log("x2w-render mesh XMem submit refused: writer or live page identity changed");
@@ -326,10 +354,10 @@ void execute_mesh_xmem_recording(ID3D12CommandQueue* queue, ID3D12CommandList* l
             published_mesh_lease = lease;
             static LONG reports;
             if (first_calls(reports, 16))
-                log("x2w-render mesh XMem writer: lease %llu section page +0x%llx byte +0x%llx",
-                    lease->lease.id, lease->lease.section_offset, lease->lease.first_byte);
+                log("x2w-render mesh XMem writer: lease %llu section page +0x%llx byte +0x%llx, %llu bytes",
+                    lease->lease.id, lease->lease.section_offset, lease->lease.first_byte, lease->bytes);
         } else if (published_mesh_lease && write.owner == published_mesh_lease->owner &&
-                   write.offset < published_mesh_lease->offset + sizeof(UINT) &&
+                   write.offset < published_mesh_lease->offset + published_mesh_lease->bytes &&
                    published_mesh_lease->offset < write.offset + write.bytes) {
             published_mesh_lease.reset();
         }

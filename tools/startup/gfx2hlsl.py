@@ -2526,6 +2526,92 @@ class Stage:
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
         return None
 
+    def scalar_const(self, tok):
+        """Value of a 32-bit scalar source that is known at translation time, else None."""
+        r = reg_range(tok)
+        if r:
+            return self.is_const(r[1]) if r[0] == 's' and r[1] == r[2] else None
+        try:
+            return int(tok, 0) & 0xffffffff
+        except ValueError:
+            return None
+
+    def scalar_wide_op(self, name, ops, mods, wide_src, wide_dst, helper, signed=None):
+        """SOP2 shifts and bitfield extracts with a 64-bit source and/or result.
+
+        D = f(S0, S1) with S1 a 32-bit word; SCC = (D != 0). Every source is read before any destination
+        register is written, so an overlapping destination cannot feed a half-written value back."""
+        if mods or len(ops) != 3:
+            raise Unsupported('%s with %d operands and modifiers %s' % (name, len(ops), mods))
+        dst = reg_range(ops[0])
+        width = 1 + wide_dst
+        if (not dst or dst[0] != 's' or dst[2] != dst[1] + wide_dst or dst[2] > 105
+                or (wide_dst and dst[1] % 2)):
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        s1 = reg_range(ops[2])
+        if ('m0' in ops[1:] or any(self.is_lane_mask(t) for t in ops[1:])
+                or any(r[0] == 's' and any(w in self.masks for w in range(r[1], r[2] + 1))
+                       for r in map(reg_range, ops[1:]) if r) or ops[2] in FLOATS or ops[1] in FLOATS
+                or (s1 and (s1[0] != 's' or s1[1] != s1[2] or s1[1] > 105))):
+            raise Unsupported('%s source %s' % (name, ', '.join(ops[1:])))
+        if wide_src:
+            r0 = reg_range(ops[1])
+            if r0 and r0[0] != 's':
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            low, high = self.i64_words(ops[1])
+            known = [self.scalar_const('s%d' % r0[1]), self.scalar_const('s%d' % r0[2])] if r0 else [
+                int(low[:-1]), int(high[:-1])]
+        else:
+            low, high = self.u(ops[1]), None
+            known = [self.scalar_const(ops[1])]
+        amount = self.u(ops[2])
+        amount_known = self.scalar_const(ops[2])
+        d = dst[1]
+        self.masks.difference_update(range(d, d + width))
+        if None not in known and amount_known is not None:
+            x = known[0] | (known[1] << 32 if wide_src else 0)
+            value = scalar_wide_fold(helper, x, amount_known, signed)
+            for i in range(width):
+                word = (value >> (32 * i)) & 0xffffffff
+                self.set_s(d + i, '0x%08xu' % word, ('const', word))
+            self.set_scc('true' if value else 'false')
+            return None
+        uniform = (self.tracks_uniformity()
+                   and self.scalar_expr_uniform('%s %s %s' % (low, high or '', amount)))
+        sg = '' if signed is None else ', %du' % (1 if signed else 0)
+        if wide_dst:
+            call = '%s(%s, %s, %s%s)' % (helper, low, high if wide_src else '0u', amount, sg)
+            self.emit('{ uint2 t = %s; s%d = t.x; s%d = t.y; scc = (t.x | t.y) != 0u; }' % (call, d, d + 1))
+        else:
+            self.emit('{ uint t = %s(%s, %s%s); s%d = t; scc = t != 0u; }' % (helper, low, amount, sg, d))
+        for r in range(d, d + width):
+            self.sym.pop(r, None)
+            self.used_s.add(r)
+            if self.tracks_uniformity():
+                (self.varying_s.discard if uniform else self.varying_s.add)(r)
+        self.scc_effect = 'emitted'
+        if self.tracks_uniformity():
+            self.scc_uniform = uniform
+        return None
+
+    def op_s_lshl_b64(self, ops, mods):
+        return self.scalar_wide_op('s_lshl_b64', ops, mods, True, True, 'shl64')
+
+    def op_s_lshr_b64(self, ops, mods):
+        return self.scalar_wide_op('s_lshr_b64', ops, mods, True, True, 'shr64u')
+
+    def op_s_ashr_i64(self, ops, mods):
+        return self.scalar_wide_op('s_ashr_i64', ops, mods, True, True, 'shr64i')
+
+    def op_s_bfe_i32(self, ops, mods):
+        return self.scalar_wide_op('s_bfe_i32', ops, mods, False, False, 'bfe32', True)
+
+    def op_s_bfe_u64(self, ops, mods):
+        return self.scalar_wide_op('s_bfe_u64', ops, mods, True, True, 'bfe64', False)
+
+    def op_s_bfe_i64(self, ops, mods):
+        return self.scalar_wide_op('s_bfe_i64', ops, mods, True, True, 'bfe64', True)
+
     def op_s_load_dwordx8(self, ops, mods):
         self.op_s_load_dwordx4(ops, mods, 8)
 
@@ -3148,8 +3234,7 @@ class Stage:
         body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
-    def op_image_gather4_lz(self, ops, mods):
-        name = 'image_gather4_lz'
+    def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
         for modifier in mods:
@@ -3157,30 +3242,49 @@ class Stage:
                 raise Unsupported('%s modifier %s' % (name, modifier))
         if [m for m in mods if m.startswith('dim:')] != ['dim:SQ_RSRC_IMG_2D']:
             raise Unsupported('%s requires a 2D texture' % name)
-        channels = {'dmask:0x1': 'Red', 'dmask:0x2': 'Green', 'dmask:0x4': 'Blue', 'dmask:0x8': 'Alpha'}
+        channels = {'dmask:0x1': ('Red', 0), 'dmask:0x2': ('Green', 1), 'dmask:0x4': ('Blue', 2), 'dmask:0x8': ('Alpha', 3)}
         masks = [m for m in mods if m.startswith('dmask:')]
         if len(masks) != 1 or masks[0] not in channels:
             raise Unsupported('%s requires a one-hot dmask' % name)
         dst, addr, sampler = (reg_range(ops[i]) for i in (0, 1, 3))
         if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
             raise Unsupported('%s requires four destination registers' % name)
-        if not addr or addr[0] != 'v' or addr[2] - addr[1] != 1 or addr[2] > 255:
-            raise Unsupported('%s requires two contiguous address registers' % name)
+        if not addr or addr[0] != 'v' or addr[2] - addr[1] + 1 != addr_count or addr[2] > 255:
+            raise Unsupported('%s requires %s' % (name, addr_label))
         words = self.const_words(ops[3]) if sampler and sampler[0] == 's' and sampler[2] - sampler[1] == 3 else None
         if words is None:
             raise Unsupported('%s requires a constant sampler' % name)
         from pixel_aot import check_gather_sampler
+        profiled = gather_2d_profile_words(words)
+        if not mip_preclamp and (words[2] & (1 << 28)):
+            profiled = (profiled[0], profiled[1], profiled[2] | (1 << 28), profiled[3])
         try:
-            # Both the guest _lz and D3D Gather select mip zero of the bound view.
-            # Validate the sampler for that level even when the view has more mips.
-            check_gather_sampler(gather_2d_profile_words(words), 1, comparison=False)
+            # _lz reads mip zero of the bound view; _l checks all other sampler fields against
+            # the 2D gather profile and enforces words[1] MAX_LOD plus view mip bounds in HLSL.
+            check_gather_sampler(profiled, 1, comparison=False)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
         key = self.fixed_table_image(ops[2], name) if self.kind == 'cs' else self.descriptor(ops[2])
         tex = self.pipe.resource(key, 'tex2d')
+        return dst, addr, words, channels[masks[0]], tex
+
+    def op_image_gather4_lz(self, ops, mods):
+        dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
+            'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True)
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
-        self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channels[masks[0]], smp, u, v))
+        self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channel_name, smp, u, v))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
+    def op_image_gather4_l(self, ops, mods):
+        """image_gather4_l on a 2D texture with explicit LOD and a validated constant sampler."""
+        dst, addr, words, (_, channel_index), tex = self.gather_2d_setup(
+            'image_gather4_l', ops, mods, 3, 'three contiguous address registers', mip_preclamp=False)
+        self.pipe.uses_gather_2d_lod = True
+        max_lod = ((words[1] >> 12) & 0xfff) / 256.0
+        u, v, lod = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
+        self.emit('t = gather_2d_lod(%s, float2(%s, %s), %s, %d, %sf);' % (tex, u, v, lod, channel_index, repr(max_lod)))
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
@@ -4198,6 +4302,24 @@ for _bit in (0, 1):
     setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
 
 
+def scalar_wide_fold(helper, x, amount, signed):
+    """Translation-time value of one SOP2 shift or bitfield extract (the helper name picks the operation)."""
+    m64 = 0xffffffffffffffff
+    if helper == 'shl64':
+        return (x << (amount & 63)) & m64
+    if helper == 'shr64u':
+        return x >> (amount & 63)
+    if helper == 'shr64i':
+        return ((x - (1 << 64) if x >> 63 else x) >> (amount & 63)) & m64
+    bits = 32 if helper == 'bfe32' else 64
+    off = amount & (bits - 1)
+    wd = min((amount >> 16) & 127, bits - off)  # bits past the source MSB do not exist
+    field = (x >> off) & ((1 << wd) - 1)
+    if signed and 0 < wd < bits and field >> (wd - 1) & 1:
+        field |= ((1 << bits) - 1) ^ ((1 << wd) - 1)
+    return 0 if signed and wd == 0 else field
+
+
 def parse_root(blob):
     if not blob or blob[:4] != b'DXBC':
         raise Unsupported('root signature blob missing')
@@ -4258,6 +4380,7 @@ VERIFIED_SINT_RTVS = frozenset((4, 18, 43))
 
 class Pipeline:
     uses_pack16_rne = False
+    uses_gather_2d_lod = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
@@ -4288,6 +4411,7 @@ class Pipeline:
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.uses_pack16_rne = False
+        self.uses_gather_2d_lod = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -4421,6 +4545,14 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
+               'uint2 bfe64(uint lo, uint hi, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 64u - (s1 & 63u)); uint2 e = shr64u(lo, hi, s1);'
+               ' e = uint2(e.x & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u)),'
+               ' e.y & (w >= 64u ? 0xffffffffu : (w > 32u ? ((1u << ((w - 32u) & 31u)) - 1u) : 0u)));'
+               ' uint sh = (64u - w) & 63u; uint2 t = shl64(e.x, e.y, sh);'
+               ' return sg != 0u ? shr64i(t.x, t.y, sh) : e; }',
+               'uint bfe32(uint x, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 32u - (s1 & 31u));'
+               ' uint e = (x >> (s1 & 31u)) & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u));'
+               ' uint sh = (32u - w) & 31u; return sg != 0u ? asuint(asint(e << sh) >> sh) : e; }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
@@ -4465,6 +4597,30 @@ class Pipeline:
                 '}',
                 'uint pack16_d16(float value, uint unorm16) {',
                 '    return unorm16 != 0u ? pack16_unorm16(value) : pack16_rne(value);',
+                '}',
+            ))
+        if self.uses_gather_2d_lod:
+            out.extend((
+                'float4 gather_2d_lod(Texture2D<float4> tex, float2 uv, float lod, uint component, float max_lod) {',
+                '    float4 result = float4(0.0f, 0.0f, 0.0f, 0.0f);',
+                '    if ((asuint(uv.x) & 0x7f800000u) != 0x7f800000u &&',
+                '        (asuint(uv.y) & 0x7f800000u) != 0x7f800000u &&',
+                '        (asuint(lod) & 0x7f800000u) != 0x7f800000u) {',
+                '        uint width, height, levels;',
+                '        tex.GetDimensions(0u, width, height, levels);',
+                '        if (levels != 0u) {',
+                '            uint mip = min(uint(floor(clamp(lod, 0.0f, max_lod) + 0.5f)), levels - 1u);',
+                '            tex.GetDimensions(mip, width, height, levels);',
+                '            int2 edge = int2(width, height) - 1;',
+                '            precise float2 scaled = uv * float2(width, height) - 0.5f;',
+                '            int2 origin = int2(floor(clamp(scaled, float2(-1.0f, -1.0f), float2(width, height))));',
+                '            result = float4(tex.Load(int3(clamp(origin + int2(0, 1), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin + int2(1, 1), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin + int2(1, 0), int2(0, 0), edge), int(mip)))[component],',
+                '                            tex.Load(int3(clamp(origin,              int2(0, 0), edge), int(mip)))[component]);',
+                '        }',
+                '    }',
+                '    return result;',
                 '}',
             ))
         return out
@@ -4597,6 +4753,7 @@ class ComputePipeline(Pipeline):
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
+        self.uses_gather_2d_lod = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: anything but a stride clear
         self.lod_unvalidated = set()
