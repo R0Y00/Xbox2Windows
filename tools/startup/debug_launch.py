@@ -685,7 +685,9 @@ def main():
             live_threads.add(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
-            gate.forget(tid)
+            addr = gate.forget(tid)
+            if addr in breakpoints:
+                write(addr, b"\xcc")
         elif code == EXIT_PROCESS:
             exit_code = struct.unpack_from("<I", event, 16)[0]
             log(f"{time.time() - start:7.3f} exit {exit_code:#010x}")

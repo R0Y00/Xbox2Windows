@@ -21,6 +21,8 @@ class StepGate:
         overlap = addr in self.stepping.values()
         if overlap:
             self.dropped += 1
+        for _ in range(self._held.pop(tid, 0)):  # a gate-held thread that hit the hook must run to step
+            self._resume(tid)
         self.stepping[tid] = addr
         for other in sorted(self._live()):
             if other not in self.stepping and self._suspend(other):
@@ -40,6 +42,6 @@ class StepGate:
         return None if addr in self.stepping.values() else addr
 
     def forget(self, tid):
-        """The thread exited; it can no longer be resumed or stepped."""
-        self.stepping.pop(tid, None)
+        """The thread exited. Returns the address to patch again when it was the last stepper, else None."""
         self._held.pop(tid, None)
+        return self.finish(tid)

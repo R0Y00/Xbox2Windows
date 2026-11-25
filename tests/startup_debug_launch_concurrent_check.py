@@ -63,6 +63,21 @@ class StepGateTest(unittest.TestCase):
         self.assertEqual(self.gate.dropped, 1)
         self.assertEqual({t: c for t, c in self.machine.suspended.items() if c}, {})
 
+    def test_queued_hit_runs_to_step(self):
+        self.hit(1)
+        self.gate.begin(2, 0x1000)  # thread 2 was gate-suspended, then its queued hit arrives
+        self.assertEqual(self.machine.suspended[2], 0)
+        self.end(1)
+        self.end(2)
+        self.assertEqual({t: c for t, c in self.machine.suspended.items() if c}, {})
+
+    def test_last_stepper_exit_releases_held_threads(self):
+        self.hit(1)
+        self.machine.live.discard(1)
+        addr = self.gate.forget(1)
+        self.assertEqual(addr, 0x1000)
+        self.assertEqual({t: c for t, c in self.machine.suspended.items() if c}, {})
+
     def test_exited_thread_is_not_resumed(self):
         self.hit(1)
         self.machine.live.discard(3)
