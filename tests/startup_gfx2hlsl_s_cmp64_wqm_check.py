@@ -104,6 +104,20 @@ for text in ('s_cmp_eq_u64 exec, 0', 's_cmp_lg_u64 vcc, s[4:5]', 's_bitcmp1_b64 
         failures.append(text)
         print('ACCEPTED %s' % text)
     assert not stage.lines, (text, stage.lines)
+# A projected lane mask in EITHER word of a source pair is refused (the high word used to slip through).
+for mask_reg in (4, 5):
+    for text in ('s_bitcmp1_b64 s[4:5], 33', 's_bitcmp0_b64 s[4:5], 1', 's_cmp_eq_u64 s[4:5], 0',
+                 's_cmp_lg_u64 s[6:7], s[4:5]', 's_quadmask_b64 s[10:11], s[4:5]'):
+        stage = Probe()
+        stage.masks = {mask_reg}
+        try:
+            stage.one(text.split(' ', 1)[0], text)
+        except G.Unsupported:
+            pass
+        else:
+            failures.append('%s masks=%d' % (text, mask_reg))
+            print('ACCEPTED %s with mask s%d' % (text, mask_reg))
+
 stage = Probe()
 stage.one('s_wqm_b64', 's_wqm_b64 exec, exec')
 assert not stage.lines, stage.lines

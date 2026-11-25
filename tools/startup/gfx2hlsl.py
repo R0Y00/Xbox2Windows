@@ -2420,6 +2420,8 @@ def _word_pair(self, tok, base):
     if reg:
         if reg[0] != 's' or reg[2] != reg[1] + 1 or reg[1] % 2 or reg[2] > 105:
             raise Unsupported('%s operand %s' % (base, tok))
+        if reg[1] in self.masks or reg[2] in self.masks:
+            raise Unsupported("%s on a projected lane mask in %s" % (base, tok))
         return self.S(reg[1]), self.S(reg[2])
     try:
         value = int(tok, 0)
