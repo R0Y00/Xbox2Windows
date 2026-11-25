@@ -7690,7 +7690,7 @@ def check_int16_vop3_controls():
     for line in ("v_add_nc_u16 v24, v18, v19 op_sel:[0,0,1]", "v_add_nc_u16 v24, v18, v19 clamp",
                  "v_add_nc_u16_dpp v24, v18, v19 quad_perm:[0,1,2,3]",
                  "v_add_nc_u16_sdwa v24, v18, v19 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
-                 "v_min_f16_e64 v24, v18, v19"):
+                 "v_rcp_f16_e64 v24, v18"):
         refuse(line, "Unsupported instruction")
     refuse("v_add_nc_u16 v24, v18, -v19", "Unsupported 16-bit integer operand")
     refuse("v_add_nc_u16 v24, v18, 1.0", "Unsupported 16-bit integer operand")
@@ -10463,11 +10463,11 @@ def check_dpp_f16_contract_controls():
         (f"v_cvt_f16_f32_dpp v256, v20 {identity}", "Invalid f16 DPP operation"),
         (f"v_cvt_norm_i16_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
         (f"v_rcp_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
-        (f"v_min_f16_dpp v23, v20, v20 {identity}", "Unsupported instruction"),
-        (f"v_max_f16_dpp v23, v20, v20 {identity}", "Unsupported instruction"),
+        (f"v_exp_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+        (f"v_log_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
         (f"v_sin_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
         (f"v_cos_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
-        (f"v_fract_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+        (f"v_sqrt_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
     ):
         expect_value_error(translate_f16, uncompressed_export(["v_mov_b32_e32 v20, s44", bad]), message)
     # Positive and negative controls for binary16 arithmetic & rounding DPP16/DPP8.
@@ -11017,9 +11017,9 @@ def check_sdwa_f16_controls():
         (proven_pair, f"v_floor_f16_sdwa v24, v20 mul:2 {sdwa1}WORD_0", "Unsupported binary16 SDWA operands"),
         (proven_pair, f"v_cvt_f16_f32_sdwa v24, v20 clamp {sdwa1}DWORD", "Unsupported binary16 SDWA operands"),
         (proven_pair, f"v_add_f16_sdwa v256, v20, v21 {sdwa2}", "Invalid binary16 SDWA operation"),
-        (proven_pair, f"v_min_f16_sdwa v24, v20, v21 {sdwa2}", "Unsupported instruction"),
-        (proven_pair, f"v_max_f16_sdwa v24, v20, v21 {sdwa2}", "Unsupported instruction"),
-        (proven_pair, f"v_fract_f16_sdwa v24, v20 {sdwa1}WORD_0", "Unsupported instruction"),
+        (proven_pair, f"v_exp_f16_sdwa v24, v20 {sdwa1}WORD_0", "Unsupported instruction"),
+        (proven_pair, f"v_log_f16_sdwa v24, v20 {sdwa1}WORD_0", "Unsupported instruction"),
+        (proven_pair, f"v_sqrt_f16_sdwa v24, v20 {sdwa1}WORD_0", "Unsupported instruction"),
         (proven_pair, f"v_rcp_f16_sdwa v24, v20 {sdwa1}WORD_0", "Unsupported instruction"),
         (proven_pair, f"v_cvt_norm_i16_f16_sdwa v24, v20 {sdwa1}WORD_0", "Unsupported instruction"),
         (proven_pair, f"v_cvt_pkrtz_f16_f32_sdwa v24, v20, v21 {sdwa2}", "Unsupported instruction"),
@@ -11346,6 +11346,247 @@ def check_sdwa_int_extra_draw(directory, compiler, renderer, backend):
             print(f"sdwa_int_extra {name} mutation {old!r} -> {new!r}: statuses {statuses}")
             if "mismatch" not in statuses:
                 raise AssertionError(f"sdwa_int_extra {name} mutation {old!r} -> {new!r} escaped detection")
+    return 0
+
+
+# Exact binary16 min, max, fract, frexp_mant, and frexp_exp_i16 fixtures covering 25 forms across
+# VOP1/VOP2 (e32), VOP3 (e64), DPP16, DPP8, and SDWA under the static finite-proof contract (#839).
+F16_EXACT_EXTRA_PROGRAMS = {
+    "plain_e32": [
+        "v_mov_b32_e32 v20, 0xbe00",  # -1.5
+        "v_mov_b32_e32 v21, 0x3e00",  # 1.5
+        "v_mov_b32_e32 v22, 0x0001",  # +2^-24 (smallest positive subnormal)
+        "v_mov_b32_e32 v23, 0x8300",  # -3*2^-16 = -0.75 * 2^-14 (negative subnormal)
+        "v_mov_b32_e32 v24, 0xc100",  # -2.5
+        "v_min_f16_e32 v25, v20, v21",
+        "v_max_f16_e32 v26, 0, v22",
+        "v_mov_b32_sdwa v12, v25 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v12, v26 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_fract_f16_e32 v27, v24",
+        "v_fract_f16_e32 v28, v22",
+        "v_mov_b32_sdwa v13, v27 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v28 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_frexp_mant_f16_e32 v29, v23",
+        "v_frexp_exp_i16_f16_e32 v30, v23",
+        "v_mov_b32_sdwa v14, v29 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v30 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_frexp_mant_f16_e32 v31, v22",
+        "v_frexp_exp_i16_f16_e32 v32, v22",
+        "v_mov_b32_sdwa v15, v31 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v32 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+    ],
+    "plain_e64": [
+        "s_mov_b32 s60, 0x4200",      # 3.0
+        "s_mov_b32 s61, 0xbf00",      # -1.75
+        "v_mov_b32_e32 v20, 0x3b00",  # 0.875
+        "v_mov_b32_e32 v21, 0x0400",  # 2^-14 (smallest normal)
+        "v_mov_b32_e32 v22, 0x8000",  # -0.0
+        "v_min_f16_e64 v25, v20, 0.5",
+        "v_max_f16_e64 v26, s61, -2.0",
+        "v_mov_b32_sdwa v12, v25 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v12, v26 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_fract_f16_e64 v27, s61",
+        "v_fract_f16_e64 v28, v22",
+        "v_mov_b32_sdwa v13, v27 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v28 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_frexp_mant_f16_e64 v29, s60",
+        "v_frexp_exp_i16_f16_e64 v30, s60",
+        "v_mov_b32_sdwa v14, v29 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v30 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_frexp_mant_f16_e64 v31, v21",
+        "v_frexp_exp_i16_f16_e64 v32, v21",
+        "v_mov_b32_sdwa v15, v31 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v32 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+    ],
+    "dpp16": [
+        "v_mov_b32_e32 v20, 0xbe00",  # -1.5
+        "v_mov_b32_e32 v21, 0x4100",  # 2.5
+        "v_mov_b32_e32 v22, 0x8300",  # -3*2^-16
+        "v_mov_b32_e32 v23, 0x0002",  # 2*2^-24
+        "v_min_f16_dpp v25, |v20|, v21 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_max_f16_dpp v26, -v21, v20 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+        "v_mov_b32_sdwa v12, v25 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v12, v26 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_fract_f16_dpp v27, -v21 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+        "v_fract_f16_dpp v28, v23 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_mov_b32_sdwa v13, v27 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v28 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_frexp_mant_f16_dpp v29, |v22| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+        "v_mov_b32_sdwa v14, v29 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_frexp_exp_i16_f16_dpp v30, -v22 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+        "v_mov_b32_sdwa v15, v30 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ],
+    "dpp8": [
+        "v_mov_b32_e32 v20, 0xc000",  # -2.0
+        "v_mov_b32_e32 v21, 0x3e00",  # 1.5
+        "v_mov_b32_e32 v22, 0x4280",  # 3.25
+        "v_mov_b32_e32 v23, 0x0001",  # 2^-24
+        "v_min_f16_dpp v25, v20, v21 dpp8:[1,2,3,0,5,6,7,4]",
+        "v_max_f16_dpp v26, v20, v21 dpp8:[1,2,3,0,5,6,7,4]",
+        "v_mov_b32_sdwa v12, v25 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v12, v26 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "v_fract_f16_dpp v27, v22 dpp8:[1,2,3,0,5,6,7,4]",
+        "v_mov_b32_sdwa v13, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_frexp_mant_f16_dpp v28, v22 dpp8:[1,2,3,0,5,6,7,4]",
+        "v_mov_b32_sdwa v14, v28 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_frexp_exp_i16_f16_dpp v29, v23 dpp8:[1,2,3,0,5,6,7,4]",
+        "v_mov_b32_sdwa v15, v29 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ],
+    "sdwa": [
+        "v_mov_b32_e32 v20, 0xbe003e00",  # WORD_0=1.5, WORD_1=-1.5
+        "v_mov_b32_e32 v21, 0x00014280",  # WORD_0=3.25, WORD_1=2^-24
+        "s_mov_b32 s60, 0x8300c100",      # WORD_0=-2.5, WORD_1=-3*2^-16
+        "v_min_f16_sdwa v12, v20, s60 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_max_f16_sdwa v12, -v20, v21 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0",
+        "v_fract_f16_sdwa v13, s60 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_fract_f16_sdwa v13, v21 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+        "v_frexp_mant_f16_sdwa v24, s60 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1",
+        "v_mov_b32_sdwa v14, v24 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_frexp_exp_i16_f16_sdwa v14, s60 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+        "v_frexp_mant_f16_sdwa v15, |v21| dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1",
+        "v_frexp_exp_i16_f16_sdwa v25, v21 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1",
+        "v_mov_b32_sdwa v15, v25 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+    ],
+}
+F16_EXACT_EXTRA_EXPECTED = {
+    "plain_e32": (0x0001be00, 0x00013800, 0xfff2ba00, 0xffe93800),
+    "plain_e64": (0xbf003800, 0x00003400, 0x00023a00, 0xfff33800),
+    "dpp16": (0xbe003e00, 0x00023800, 0x00003a00, 0x0000fff2),
+    "dpp8": (0x3e00c000, 0x00003400, 0x00003a80, 0x0000ffe9),
+    "sdwa": (0x4280c100, 0x00013800, 0xfff2ba00, 0xffe93800),
+}
+F16_EXACT_EXTRA_MUTATIONS = {
+    "plain_e32": (
+        ("v_min_f16_e32 v25, v20, v21", "v_max_f16_e32 v25, v20, v21"),
+        ("v_max_f16_e32 v26, 0, v22", "v_min_f16_e32 v26, 0, v22"),
+        ("v_fract_f16_e32 v27, v24", "v_floor_f16_e32 v27, v24"),
+        ("v_frexp_mant_f16_e32 v29, v23", "v_frexp_mant_f16_e32 v29, v22"),
+    ),
+    "plain_e64": (
+        ("v_min_f16_e64 v25, v20, 0.5", "v_max_f16_e64 v25, v20, 0.5"),
+        ("v_max_f16_e64 v26, s61, -2.0", "v_min_f16_e64 v26, s61, -2.0"),
+        ("v_fract_f16_e64 v27, s61", "v_trunc_f16_e64 v27, s61"),
+        ("v_frexp_exp_i16_f16_e64 v30, s60", "v_frexp_exp_i16_f16_e64 v30, v21"),
+    ),
+    "dpp16": (
+        ("v_min_f16_dpp v25, |v20|, v21", "v_min_f16_dpp v25, v20, v21"),
+        ("v_max_f16_dpp v26, -v21, v20", "v_max_f16_dpp v26, v21, v20"),
+        ("v_fract_f16_dpp v27, -v21", "v_floor_f16_dpp v27, -v21"),
+        ("v_frexp_mant_f16_dpp v29, |v22|", "v_frexp_mant_f16_dpp v29, v22"),
+    ),
+    "dpp8": (
+        ("v_min_f16_dpp v25, v20, v21", "v_max_f16_dpp v25, v20, v21"),
+        ("v_fract_f16_dpp v27, v22", "v_trunc_f16_dpp v27, v22"),
+        ("v_frexp_mant_f16_dpp v28, v22", "v_frexp_mant_f16_dpp v28, v23"),
+        ("v_frexp_exp_i16_f16_dpp v29, v23", "v_frexp_exp_i16_f16_dpp v29, v22"),
+    ),
+    "sdwa": (
+        ("v_min_f16_sdwa v12, v20, s60", "v_max_f16_sdwa v12, v20, s60"),
+        ("v_max_f16_sdwa v12, -v20, v21 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE",
+         "v_max_f16_sdwa v12, -v20, v21 dst_sel:WORD_1 dst_unused:UNUSED_PAD"),
+        ("v_fract_f16_sdwa v13, s60", "v_floor_f16_sdwa v13, s60"),
+        ("v_frexp_exp_i16_f16_sdwa v14, s60 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE",
+         "v_frexp_exp_i16_f16_sdwa v14, s60 dst_sel:WORD_1 dst_unused:UNUSED_PAD"),
+    ),
+}
+
+
+def check_f16_exact_extra_controls():
+    """Positive and negative controls for all 25 exact binary16 min/max/fract/frexp forms."""
+    identity = "quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"
+    sdwa1 = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0"
+    sdwa2 = "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0"
+    for name, body in F16_EXACT_EXTRA_PROGRAMS.items():
+        prog = uncompressed_export(body)
+        hlsl = translate_f16(prog)
+        for helper in ("f16_min_bits(", "f16_max_bits(", "frexp_mant_f16(", "frexp_exp_i16_f16("):
+            assert helper in hlsl, (name, helper)
+        for old, new in F16_EXACT_EXTRA_MUTATIONS[name]:
+            mutated = [line.replace(old, new) for line in prog]
+            assert mutated != prog, (name, old)
+            assert translate_f16(mutated) != hlsl, (name, old, new)
+    # Bare and _e32 spellings lower identically.
+    pair = ["v_mov_b32_e32 v20, 0x3e00", "v_mov_b32_e32 v21, 0xc000"]
+    for bare, e32 in (
+        ("v_min_f16 v24, v20, v21", "v_min_f16_e32 v24, v20, v21"),
+        ("v_max_f16 v24, v20, v21", "v_max_f16_e32 v24, v20, v21"),
+        ("v_fract_f16 v24, v20", "v_fract_f16_e32 v24, v20"),
+        ("v_frexp_mant_f16 v24, v20", "v_frexp_mant_f16_e32 v24, v20"),
+        ("v_frexp_exp_i16_f16 v24, v20", "v_frexp_exp_i16_f16_e32 v24, v20"),
+    ):
+        assert translate_f16(uncompressed_export([*pair, bare])) == translate_f16(uncompressed_export([*pair, e32]))
+    # Entry profile (half_denorm="preserve") and HALF_RTZ controls across all 5 ops and encodings.
+    for inst, op in (
+        ("v_min_f16_e32 v24, v20, v21", "v_min_f16_e32"),
+        ("v_max_f16_e64 v24, v20, 1.0", "v_max_f16_e64"),
+        ("v_fract_f16_e32 v24, v20", "v_fract_f16_e32"),
+        ("v_frexp_mant_f16_e64 v24, v20", "v_frexp_mant_f16_e64"),
+        ("v_frexp_exp_i16_f16_e32 v24, v20", "v_frexp_exp_i16_f16_e32"),
+        (f"v_min_f16_dpp v24, v20, v21 {identity}", "v_min_f16_dpp"),
+        (f"v_fract_f16_dpp v24, v20 {identity}", "v_fract_f16_dpp"),
+        (f"v_frexp_exp_i16_f16_dpp v24, v20 {identity}", "v_frexp_exp_i16_f16_dpp"),
+        (f"v_max_f16_sdwa v24, v20, v21 {sdwa2}", "v_max_f16_sdwa"),
+        (f"v_frexp_mant_f16_sdwa v24, v20 {sdwa1}", "v_frexp_mant_f16_sdwa"),
+    ):
+        prog = uncompressed_export([*pair, inst, f"v_mov_b32_sdwa v12, v24 {sdwa1}"])
+        expect_value_error(translate_int, prog, "binary16 denormal mode unknown at entry")
+        expect_value_error(translate_f16, [HALF_RTZ, *prog], f"under round toward zero: {op}")
+    # Chaining: frexp_mant -> half16 reader, frexp_exp_i16 -> low16 reader (v_cvt_f16_i16); cross-tag refused.
+    translate_f16(uncompressed_export([*pair, "v_frexp_mant_f16_e32 v24, v20", "v_add_f16_e32 v25, v24, v21"]))
+    translate_f16(uncompressed_export([*pair, "v_frexp_exp_i16_f16_e32 v24, v20", "v_cvt_f16_i16_e32 v25, v24"]))
+    # Refusals: opposite-signed zeros on min/max, tiny negative on fract, unproven/non-finite, e32 SGPR src1,
+    # DPP8 modifiers, SDWA UNUSED_SEXT/sext/BYTE src, low16 vs half16 tag separation.
+    for prefix, bad, message in (
+        (["v_mov_b32_e32 v20, 0x0000", "v_mov_b32_e32 v21, 0x8000"], "v_min_f16_e32 v24, v20, v21",
+         "binary16 min of opposite-signed zeros is not lowered"),
+        (["v_mov_b32_e32 v20, 0x8000", "v_mov_b32_e32 v21, 0x0000"], f"v_max_f16_dpp v24, v20, v21 {identity}",
+         "binary16 max of opposite-signed zeros is not lowered"),
+        (["v_mov_b32_e32 v20, 0x0000"], f"v_min_f16_sdwa v24, v20, -v20 {sdwa2}",
+         "binary16 min of opposite-signed zeros is not lowered"),
+        (["v_mov_b32_e32 v20, 0x8001"], "v_fract_f16_e32 v24, v20", "binary16 fract rounds to 1.0 on tiny negative input"),
+        (["v_mov_b32_e32 v20, 0x93ff"], f"v_fract_f16_dpp v24, v20 {identity}", "binary16 fract rounds to 1.0 on tiny negative input"),
+        (["v_mov_b32_e32 v20, 0x0001"], f"v_fract_f16_sdwa v24, -v20 {sdwa1}", "binary16 fract rounds to 1.0 on tiny negative input"),
+        ([], "v_min_f16_e64 v24, s44, 1.0", "binary16 operand lacks a finite proof: s44"),
+        (["v_mov_b32_e32 v20, 0x7c00"], "v_frexp_mant_f16_e32 v24, v20", "binary16 operand is not finite: v20"),
+        (["v_mov_b32_e32 v20, 0x7e00"], f"v_frexp_exp_i16_f16_sdwa v24, v20 {sdwa1}", "binary16 operand is not finite: v20"),
+        (pair, "v_min_f16_e32 v24, v20, 1.0", "Binary16 e32 src1 must be a VGPR"),
+        (pair, "v_max_f16_dpp v24, -v20, v21 dpp8:[1,2,3,0,5,6,7,4]", "Source modifiers are not allowed on -v20"),
+        (pair, "v_fract_f16_dpp v24, |v20| dpp8:[1,2,3,0,5,6,7,4]", "Source modifiers are not allowed on |v20|"),
+        (pair, f"v_frexp_mant_f16_sdwa v24, sext(v20) {sdwa1}", "Unsupported binary16 SDWA source modifier: sext(v20)"),
+        (pair, "v_min_f16_sdwa v24, v20, v21 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0 src1_sel:WORD_0",
+         "UNUSED_SEXT is not lowered"),
+        ([*pair, "v_frexp_exp_i16_f16_e32 v24, v20"], "v_cvt_f32_f16_e32 v12, v24", "Expected a numeric register"),
+        ([*pair, "v_frexp_mant_f16_e32 v24, v20"], "v_cvt_f16_i16_e32 v25, v24", "Expected a numeric register"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export([*prefix, bad]), message)
+    # Boundary acceptance: -2^-11 (0x9400) is exact in fract (-2^-11 -> 1 - 2^-11 = 0x3bff).
+    translate_f16(uncompressed_export(["v_mov_b32_e32 v20, 0x9400", "v_fract_f16_e32 v24, v20"]))
+
+
+def check_f16_exact_extra_draw(directory, compiler, renderer, backend):
+    check_f16_exact_extra_controls()
+    for name, body in F16_EXACT_EXTRA_PROGRAMS.items():
+        prog = uncompressed_export(body)
+        expected = F16_EXACT_EXTRA_EXPECTED[name]
+        src_path = directory / f"f16_exact_extra_{name}.hlsl"
+        cso_path = directory / f"f16_exact_extra_{name}.cso"
+        pass_case = directory / f"f16_exact_extra_{name}_pass.case"
+        pass_case.write_bytes(bytes(256) + struct.pack("<4I", *expected) * 64 + b"\x01")
+        src_path.write_text(translate_f16(prog), encoding="ascii")
+        compile_shader(compiler, src_path, cso_path)
+        run_pixel_batch(renderer, backend, cso_path, [(pass_case, "pass")])
+        # Binary32 -denorm ftz must preserve binary16 subnormals and -0.0.
+        compile_shader(compiler, src_path, cso_path, mode="ftz")
+        run_pixel_batch(renderer, backend, cso_path, [(pass_case, "pass")])
+        for old, new in F16_EXACT_EXTRA_MUTATIONS[name]:
+            mutated = [line.replace(old, new) for line in prog]
+            assert mutated != prog, (name, old)
+            src_path.write_text(translate_f16(mutated), encoding="ascii")
+            compile_shader(compiler, src_path, cso_path)
+            statuses, _ = run_pixel_batch_statuses(renderer, backend, cso_path, [pass_case])
+            print(f"f16_exact_extra {name} mutation {old!r} -> {new!r}: statuses {statuses}")
+            if "mismatch" not in statuses:
+                raise AssertionError(f"f16_exact_extra {name} mutation {old!r} -> {new!r} escaped detection")
     return 0
 
 
@@ -15870,10 +16111,10 @@ def check_f16_arith_controls(*, run_reference=True):
         refuse(line, "Binary16 e32 src1 must be a VGPR")
     # Forms the lowering does not accept fall through to the generic refusal, and so do the neighbouring binary16 ops.
     for line in ("v_add_f16_e64 v24, v18, v19 clamp", "v_mul_f16_e64 v24, v18, v19 mul:2", "v_mul_f16_e64 v24, v18, v19 div:2",
-                 "v_add_f16_e64 v24, v18, v19 op_sel:[0,1]", "v_min_f16_dpp v24, v18, v19 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
-                 "v_min_f16_sdwa v24, v18, v19 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
-                 "v_add_f16 v24, v18, v19, v19", "v_add_f16 v24, v18", "v_min_f16_e64 v24, v18, v19",
-                 "v_max_f16_e32 v24, v18, v19"):
+                 "v_add_f16_e64 v24, v18, v19 op_sel:[0,1]", "v_rcp_f16_dpp v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                 "v_rcp_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_add_f16 v24, v18, v19, v19", "v_add_f16 v24, v18", "v_sqrt_f16_e64 v24, v18",
+                 "v_exp_f16_e32 v24, v18"):
         refuse(line, "Unsupported instruction")
 
     # Scheduling around the load and the samples: a pending SGPR, an outstanding sample, a non-entry mask.
@@ -16699,10 +16940,10 @@ def check_f16_round_controls():
     for line in ("v_floor_f16_e64 v24, v18 clamp", "v_ceil_f16_e64 v24, v18 clamp", "v_trunc_f16_e64 v24, v18 mul:2",
                  "v_rndne_f16_e64 v24, v18 div:2", "v_rndne_f16_e64 v24, v18 mul:4", "v_floor_f16_e64 v24, v18 op_sel:[0,1]",
                  "v_floor_f16_e64 v24, -v18 clamp", "v_floor_f16_e32 v24, v18 clamp",
-                 "v_fract_f16_dpp v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
-                 "v_fract_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
-                 "v_floor_f16 v24, v18, v19", "v_floor_f16 v24", "v_fract_f16_e32 v24, v18", "v_rcp_f16_e32 v24, v18",
-                 "v_sqrt_f16_e64 v24, v18", "v_fract_f16_e64 v24, v18"):
+                 "v_rcp_f16_dpp v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                 "v_rcp_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_floor_f16 v24, v18, v19", "v_floor_f16 v24", "v_log_f16_e32 v24, v18", "v_rcp_f16_e32 v24, v18",
+                 "v_sqrt_f16_e64 v24, v18", "v_exp_f16_e64 v24, v18"):
         refuse(line, "Unsupported instruction")
 
     # Scheduling around the load and the samples: a pending SGPR, an outstanding sample, a non-entry mask.
@@ -18395,7 +18636,7 @@ def _check_controls_inline(directory):
     for expected in ("= ceil(alu", "= round(alu", "= round(params[1].x);", "= ceil((-params[1].y));"):
         assert expected in source, expected
     # Neighbouring forms: other widths, output modifiers, a second source and the IEEE-flag reciprocal.
-    for old, new in (("v_ceil_f32_e32 v12, v18", "v_fract_f16_e32 v12, v18"),
+    for old, new in (("v_ceil_f32_e32 v12, v18", "v_rcp_f16_e32 v12, v18"),
                      ("v_ceil_f32_e32 v12, v18", "v_ceil_f64_e32 v[12:13], v[18:19]"),
                      ("v_rndne_f32_e32 v13, v19", "v_rcp_f16_e32 v13, v19"),
                      ("v_rndne_f32_e32 v13, v19", "v_rndne_f32_e32 v13, v19, v18"),
@@ -19586,6 +19827,7 @@ _CONTROL_SUBCHECKS = (
     "check_dpp_f16_contract_controls",
     "check_sdwa_f16_controls",
     "check_sdwa_int_extra_controls",
+    "check_f16_exact_extra_controls",
     "check_smem_pointer_controls",
     "check_masked_controls",
     "check_masked_mov_close_controls",
@@ -20238,6 +20480,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(body), translate_f16) for body in SDWA_F16_PROGRAMS.values())
     fixtures.append((uncompressed_export(SDWA_F16_CVT_F32_BODY), translate_f16))
     fixtures.extend((uncompressed_export(body), translate_int) for body in SDWA_INT_EXTRA_PROGRAMS.values())
+    fixtures.extend((uncompressed_export(body), translate_f16) for body in F16_EXACT_EXTRA_PROGRAMS.values())
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((vop1_nop_program(), translate))
@@ -26984,7 +27227,7 @@ def main():
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg", "draw-sopp-round-mode",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-sdwa-movrel", "draw-smovrel", "draw-dpp-f16", "draw-sdwa-f16", "draw-sdwa-int-extra", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-sdwa-movrel", "draw-smovrel", "draw-dpp-f16", "draw-sdwa-f16", "draw-sdwa-int-extra", "draw-f16-exact-extra", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
@@ -27048,7 +27291,8 @@ def main():
                         "draw-smem-pointers": check_smem_pointer_draw,
                         "draw-dpp-f16": check_dpp_f16_draw,
                         "draw-sdwa-f16": check_sdwa_f16_draw,
-                        "draw-sdwa-int-extra": check_sdwa_int_extra_draw}[mode]
+                        "draw-sdwa-int-extra": check_sdwa_int_extra_draw,
+                        "draw-f16-exact-extra": check_f16_exact_extra_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
