@@ -1992,10 +1992,19 @@ class Stage:
         if not dst or dst[0] != 's':
             raise Unsupported('saveexec destination %s' % ops[0])
         d = dst[1]
-        src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
+        src_reg = reg_range(ops[1])
+        src = ops[1] if not src_reg else 's%d' % src_reg[1]
+        # S0 is read at issue, before D is written (RDNA 2 ISA SOP1 S_AND_SAVEEXEC: D = EXEC; EXEC = S0 & EXEC).
+        # With D == S0 (s_and_saveexec_b64 s[6:7], s[6:7]) writing D first would make the new exec exec & exec, so
+        # S0 is copied to the scratch word w before D is written.
+        if src_reg and src_reg[0] == 's' and src_reg[1] == d:
+            self.emit('w = %s;' % self.u(src))
+            value = 'w'
+        else:
+            value = self.u(src)
         self.set_s(d, 'exec')
         self.masks.add(d)
-        self.set_exec_scc(text.format(self.u(src)))
+        self.set_exec_scc(text.format(value))
 
     op_s_and_saveexec_b32 = op_s_and_saveexec_b64
 
