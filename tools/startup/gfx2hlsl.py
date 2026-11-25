@@ -1703,6 +1703,12 @@ class Stage:
         """
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
+        # FORMAT and DST_SEL are read from the table word, so word 3 must still be the loaded one.
+        r = reg_range(ops[2])
+        first = self.sym.get(r[1])
+        if not r or r[2] - r[1] != 3 or not first or first[0] != 'desc' or any(
+                self.sym.get(r[1] + i) != ('desc', first[1], first[2], first[3] + i) for i in range(4)):
+            raise Unsupported('formatted buffer load through a descriptor whose words were rewritten')
         word3 = 'ud%d' % self.pipe.ud(('descword3', self.pipe.resources[self.descriptor(ops[2])]['index']))
         self.emit('a = %s;' % address)
         self.emit('{ uint c0 = 0, c1 = 0, c2 = 0, c3 = 0, one = U(1.0);')

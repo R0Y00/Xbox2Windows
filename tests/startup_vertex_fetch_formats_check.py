@@ -323,6 +323,16 @@ def controls():
         pass
     else:
         raise AssertionError('buffer_load_format_xyzw must stay refused')
+    # A shader that rewrites descriptor word 3 (s_mov_b32 s19, 0x50fac) after the load must not be translated
+    # with the table word: the formatted load is refused.
+    try:
+        gfx2hlsl.Pipeline(struct.pack('<8I', 0xf4080400, 0xfa000010, 0xbe9303ff, 0x50fac, 0xe0002000 | 2 << 18, 0x80040400,
+                                      0xf80008cf, 0x07060504) + struct.pack('<I', 0xbf810000),
+                          struct.pack('<3I', 0xf800180f, 0, 0xbf810000), root_blob(flags=0))
+    except gfx2hlsl.Unsupported as error:
+        assert 'rewritten' in str(error), error
+    else:
+        raise AssertionError('formatted load through a rewritten descriptor word 3 must be refused')
     source = pipeline_mubuf(0).hlsl_vs()
     for label, old, new in DESC_MUTATIONS:
         assert old in source, label
