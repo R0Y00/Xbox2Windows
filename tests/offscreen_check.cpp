@@ -430,6 +430,11 @@ bool validate_check_pixel_args(int, char** argv)
     return format == "rgba" || format == "bgra";
 }
 
+bool validate_pixel_pairs_args(int argc, char**)
+{
+    return (argc - 3) % 2 == 0;
+}
+
 bool validate_mesh_entry_args(int argc, char** argv)
 {
     if (argc == 6) return true;
@@ -457,14 +462,18 @@ bool validate_compute_mesh_texture_fallback_args(int argc, char** argv)
 template<class AfterDraw>
 OperationResult run_pixel_batch(const OperationContext& ctx, AfterDraw after_draw)
 {
+    const bool pairs = std::string_view(ctx.argv[2]) == "--check-pixel-pairs";
+    const int stride = pairs ? 2 : 1;
     bool failed = false;
-    for (int i = 4; i < ctx.argc; ++i) {
+    for (int i = 4, index = 0; i < ctx.argc; i += stride, ++index) {
+        const char* shader = ctx.argv[pairs ? i - 1 : 3];
         const char* status = "pass";
-        std::fprintf(stderr, "case=%d path=%s\n", i - 4, ctx.argv[i]);
+        std::fprintf(stderr, "case=%d path=%s\n", index, ctx.argv[i]);
+        if (pairs) std::fprintf(stderr, "shader=%s\n", shader);
         try {
             check(ctx.device->GetDeviceRemovedReason(), "Pixel batch device");
-            check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[i]);
-            after_draw(i - 4);
+            check_translated_pixel(ctx.device, shader, false, ctx.argv[i]);
+            after_draw(index);
         } catch (const PixelMismatch& e) {
             std::fprintf(stderr, "%s\n", e.what());
             status = "mismatch";
@@ -475,7 +484,7 @@ OperationResult run_pixel_batch(const OperationContext& ctx, AfterDraw after_dra
         if (report_debug_errors(ctx.messages) || FAILED(ctx.device->GetDeviceRemovedReason()))
             status = "error";
         if (ctx.messages) ctx.messages->ClearStoredMessages();
-        std::printf("case=%d status=%s\n", i - 4, status);
+        std::printf("case=%d status=%s\n", index, status);
         failed |= std::string_view(status) != "pass";
     }
     return failed ? OperationResult{OutcomeKind::fail, nullptr} : OperationResult{OutcomeKind::pass, nullptr};
@@ -1561,6 +1570,7 @@ constexpr CapabilityGate kGateSm66MinLod{
 // remain inside the handlers and report OutcomeKind::skip.
 const OperationSpec kOperations[] = {
     {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_pixel_batch},
+    {"--check-pixel-pairs", 5, kUnboundedArgc, validate_pixel_pairs_args, kNoGate, run_check_pixel_batch},
     {"--pixel-batch-debug-control", 7, 7, nullptr, kNoGate, run_pixel_batch_debug_control},
     {"--pixel-batch-removal-control", 7, 7, nullptr, kNoGate, run_pixel_batch_removal_control},
     {"--compute-root", 3, 3, nullptr, kNoGate, run_compute_root},
@@ -1923,6 +1933,9 @@ int run_self_test()
         return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-ballot")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--check-pixel-pairs", "a.cso", "a.case", "b.cso"},
+                   CliAction::usage_error, "Unknown GPU operation or invalid arguments: --check-pixel-pairs"))
+        return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,

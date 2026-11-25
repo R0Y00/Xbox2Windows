@@ -271,17 +271,14 @@ static std::uint64_t op_minsd_q(std::uint64_t a, std::uint64_t b) {
     return static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_castpd_si128(_mm_min_sd(x, y))));
 }
 
-// SQRTSD keeps the NaN payload (quieted) and yields the real-indefinite QNaN
-// for negative nonzero inputs, matching the host instruction.
+// SQRTSD runs on the processor, on a run-time operand: it keeps the NaN payload (quieted), yields the
+// real-indefinite QNaN for negative nonzero inputs and rounds as the MXCSR says. Under MXCSR.DAZ it reads a
+// denormal operand as a zero of its sign, so a negative denormal gives -0 (a C sign test and std::sqrt give
+// the real indefinite).
 static std::uint64_t op_sqrtsd_q(std::uint64_t b) {
-    const double v = q_as_double(b);
-    if (v != v) {
-        return b | 0x0008000000000000ull;
-    }
-    if (v < 0.0) {
-        return 0xfff8000000000000ull;
-    }
-    return double_as_q(std::sqrt(v));
+    volatile std::uint64_t vb = b;
+    const __m128d x = _mm_castsi128_pd(_mm_cvtsi64_si128(static_cast<long long>(vb)));
+    return static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_castpd_si128(_mm_sqrt_sd(x, x))));
 }
 
 // MXCSR rounding under the default round-to-nearest-even mode. NaN, infinity

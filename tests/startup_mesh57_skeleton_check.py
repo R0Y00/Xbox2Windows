@@ -3,6 +3,7 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
 word and both waves pass a barrier; later the same lane stores the primitive and vertex counts, both waves pass
@@ -14,6 +15,7 @@ Without arguments: the fixture translates through the slot 57 request path, and 
 refused with its own message. `binary` compares the embedded words with llvm-mc. `draw` compiles the request
 path's output (ms_6_5, ps_6_0), draws it and compares the read-back target with a CPU rasteriser written here;
 a reference with one wrong pixel must fail.
+The exchange mode uses the runtime-published request and the same pixel comparison.
 """
 import os
 from pathlib import Path
@@ -54,10 +56,58 @@ def root():
     return b'DXBC' + bytes(16) + struct.pack('<4I', 1, 44 + len(rts0), 1, 36) + b'RTS0' + struct.pack('<I', len(rts0)) + rts0
 
 
-def mutate(old, new, nth=0):
+def mutate(old, new, nth=0, *, mesh=MESH):
     """The fixture with the nth word equal to old replaced."""
-    at = [i for i, word in enumerate(MESH) if word == old][nth]
-    return MESH[:at] + [new] + MESH[at + 1:]
+    at = [i for i, word in enumerate(mesh) if word == old][nth]
+    return mesh[:at] + [new] + mesh[at + 1:]
+
+
+def branch(op, source, target):
+    """Encode a SOPP branch using dword indices, relative to the next instruction."""
+    return '%08x' % (op << 16 | ((target - source - 1) & 0xffff))
+
+
+def vertex_red(words):
+    """Run words after the count exchange and use the resulting v7 as vertex red."""
+    wait = MESH.index('bf8c3f70')
+    mesh = MESH[:wait + 1] + ['7e280307'] + MESH[wait + 1:]  # v_mov_b32 v20, v7
+    at = mesh.index('7d28000e')
+    return mesh[:at] + words.split() + mesh[at:]
+
+
+def masked_vertex_red():
+    mesh = vertex_red('7e0e02f0 7d880086 be94246a bf880002 7e0e02f2 bf820001 bf800000 '
+                      '8afe7e14 7e0e0280 befe04c1')
+    at = mesh.index('f80008cf')
+    return mesh[:at] + ['bf880004'] + mesh[at:]  # s_cbranch_execz skips both vertex exports
+
+
+BRANCH_CASES = (
+    # v_mov v7, 0; s_cmp_eq_i32 0, <constant>; s_cbranch_scc1 .join; v_mov v7, 1.0
+    ('SCC branch taken', vertex_red('7e0e0280 bf008080 bf850001 7e0e02f2'), lambda lane: 0),
+    ('SCC branch not taken', vertex_red('7e0e0280 bf008180 bf850001 7e0e02f2'), lambda lane: 255),
+    # v7 starts at 0.5. The then arm writes 1.0 for tid < 6, the else arm writes 0.0 for the remaining lanes.
+    # v_cmp_gt_u32 vcc, 6, v0; s_and_saveexec_b64 s[20:21], vcc; s_cbranch_execz .empty
+    # v_mov v7, 1.0; s_branch .else; .empty: s_nop; .else: s_andn2_b64 exec, s[20:21], exec
+    # v_mov v7, 0; s_mov_b64 exec, -1
+    ('lane-masked if/else', masked_vertex_red(), lambda lane: 255 if lane < 6 else 0),
+)
+
+COUNT = [i for i, word in enumerate(MESH) if word == 'bf8a0000'][2]
+POST_COUNT = MESH.index('7d28000e')
+GROUP_END = MESH.index('05000006') + 1
+PRIMITIVE_EXPORT = MESH.index('f8000941')
+
+
+def joined_vertex_masks():
+    pos = MESH.index('f80008cf')
+    # Move the vertex narrowing after the loads so the join cannot make any export operands stale.
+    return MESH[:POST_COUNT] + MESH[POST_COUNT + 1:pos] + [
+        '7d28000e',  # v_cmpx_gt_i32 s14, v0
+        'bf008080',  # s_cmp_eq_i32 0, 0
+        'bf850001',  # s_cbranch_scc1 .pos (first incoming mask is the vertex count)
+        'befe04c1',  # s_mov_b64 exec, -1 (fallthrough reaches .pos with all lanes)
+    ] + MESH[pos:]
 
 
 def request(directory, mesh, pixel=PIXEL):
@@ -91,8 +141,51 @@ REFUSALS = (
      'slot 57 mesh count exchange: a branch leaves the accepted shape'),
     ('a barrier after the count exchange', mutate('bf8c3f70', 'bf8a0000'),
      'slot 57 mesh: s_barrier outside the group-memory exchanges'),
-    ('a branch after the count exchange', mutate('bf8c3f70', 'bf820000'),
-     'slot 57 mesh: a branch outside the group-memory exchanges is not covered'),
+    ('a loop after the count exchange',
+     mutate('bf8c3f70', branch(0xbf82, MESH.index('bf8c3f70'), POST_COUNT)),
+     'slot 57 mesh: a loop outside the group-memory exchanges is not covered'),
+    ('a branch into the count exchange',
+     MESH[:COUNT] + [branch(0xbf82, COUNT, COUNT + 2)] + MESH[COUNT:],
+     'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
+    ('a branch over the group-index exchange', MESH[:1] + [branch(0xbf82, 1, GROUP_END + 1)] + MESH[1:],
+     'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
+    ('an indirect branch', mutate('bf8c3f70', 'be802014'),
+     'slot 57 mesh: indirect control flow (s_setpc_b64) is not covered'),
+    # s_cbranch_vccz .join replaces the post-count SCC branch and keeps its forward target.
+    ('a forward VCC-zero branch', mutate('bf850001', 'bf860001', mesh=BRANCH_CASES[0][1]),
+     'slot 57 mesh: s_cbranch_vccz on a wave-wide condition is not covered'),
+    # s_cbranch_vccnz .join replaces the post-count SCC branch and keeps its forward target.
+    ('a forward VCC-nonzero branch', mutate('bf850001', 'bf870001', mesh=BRANCH_CASES[0][1]),
+     'slot 57 mesh: s_cbranch_vccnz on a wave-wide condition is not covered'),
+    # s_endpgm before the vertex count compare, with the original final s_endpgm still present.
+    ('an early program end', MESH[:POST_COUNT] + ['bf810000'] + MESH[POST_COUNT:],
+     'slot 57 mesh: an early s_endpgm is not covered'),
+    # s_or_b64 exec, exec, s[20:21] replaces the full EXEC reset after the else arm.
+    ('a saved EXEC read after the masked if/else', mutate('befe04c1', '89fe7e14', 3, mesh=masked_vertex_red()),
+     'slot 57 mesh: an unproven use of a saved EXEC mask is not covered'),
+    # s_branch .join leaves the fallthrough v_mov without an incoming edge.
+    ('untargeted code after an unconditional forward branch',
+     mutate('bf850001', 'bf820001', mesh=BRANCH_CASES[0][1]),
+     'slot 57 mesh: unreachable code after a branch is not covered'),
+    ('a VGPR defined on only one incoming path', vertex_red('bf008080 bf850001 7e0e02f2'),
+     'slot 57 mesh: v7 is read where it is not defined for every lane (an entry value, or left different per wave '
+     'by an exchange)'),
+    ('a branch that skips the position EXEC narrowing',
+     MESH[:POST_COUNT] + 'bf008080 bf850001'.split() + MESH[POST_COUNT:],
+     'slot 57 mesh: export pos0 is not under exec = -1 narrowed by its output count > thread index'),
+    ('a position export after joining different EXEC masks', joined_vertex_masks(),
+     'slot 57 mesh: export pos0 is not under exec = -1 narrowed by its output count > thread index'),
+    # s_mov_b32 s40, 1 replaces the then-arm v_mov inside the s_cbranch_execz range.
+    ('an EXEC-zero branch that skips a scalar write', mutate('7e0e02f2', 'bea80381', mesh=masked_vertex_red()),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    # s_cmp_eq_i32 0, 0; s_cbranch_scc1 .end (over the two-dword primitive export).
+    ('a uniform branch that skips the primitive export',
+     MESH[:PRIMITIVE_EXPORT] + ['bf008080', 'bf850002'] + MESH[PRIMITIVE_EXPORT:],
+     'slot 57 mesh: a branch bypasses an export'),
+    # .empty: s_mov_b32 s40, 1 replaces the s_nop between the EXEC-zero target and .else.
+    ('a branch in an EXEC-zero range that jumps past a scalar write at the target',
+     mutate('bf800000', 'bea80381', mesh=masked_vertex_red()),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
     ('a position export under the primitive count', mutate('7d28000e', '7d28000d'),
      'slot 57 mesh: export pos0 is not under exec = -1 narrowed by its output count > thread index'),
     # v_mov_b32 v7, v1: v1 holds the stored count in wave 0 and the read one elsewhere.
@@ -124,6 +217,10 @@ def controls():
         names = sorted(p.name[16:] for p in Path(tmp).iterdir() if not p.name.startswith('req_'))
         expect('published files', names, ['.ms57.hlsl', '.ms57.txt', '.ps57.hlsl'])
         expect('a translated request is not pending', G.pending_keys(tmp, False), [])
+        manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+        expect('paired manifest stage information',
+               [line for line in manifest if line.startswith(('params ', 'targets ', 'ps '))],
+               ['params 1', 'targets 0'])
         text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
         body = [line.strip() for line in text[text.index('void main('):].splitlines()]
         want = ['if (tid == 0u) { lds[0] = s13; lds[1] = s14; }', 'GroupMemoryBarrierWithGroupSync();',
@@ -136,6 +233,16 @@ def controls():
         expect('group memory is the two count words', re.findall(r'groupshared[^;]*;', text), ['groupshared uint lds[2];'])
         expect('outputs follow the allocation',
                all(body.index(line) > body.index(want[-1]) for line in body if 'verts[tid]' in line or 'tris[tid]' in line), True)
+    prefix = MESH[:1] + 'bf008080 bf850001 bf800000 bf800000'.split() + MESH[1:]
+    for what, mesh, _ in BRANCH_CASES + (('SCC branch before the group-index exchange', prefix, None),):
+        with tempfile.TemporaryDirectory() as tmp:
+            key, result = request(tmp, mesh)
+            expect(what + ' translates', result, 'ok')
+            if result == 'ok':
+                text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+                expect(what + ' uses forward block dispatch', ('if (pc ==' in text, '[loop]' in text), (True, False))
+                expect(what + ' guards the position export', bool(re.search(
+                    r'if \(exec & 1\) \{[^\n]*o\.pos = [^\n]*mesh_vertex = true;', text)), True)
     for what, mesh, reason in REFUSALS:
         with tempfile.TemporaryDirectory() as tmp:
             key, result = request(tmp, mesh)
@@ -143,11 +250,38 @@ def controls():
             expect(what + ': only the refusal is published',
                    sorted(p.name for p in Path(tmp).iterdir() if not p.name.startswith('req_')), ['%016x.fail' % key])
     with tempfile.TemporaryDirectory() as tmp:
-        ms, blob = code(MESH), root()
-        key = G.mesh57_key(ms, b'', blob)
-        for ext, data in (('.root', blob), ('.ps57', b''), ('.m57', ms)):
-            (Path(tmp) / ('req_%016x%s' % (key, ext))).write_bytes(data)
-        expect('no pixel stage', G.translate_request(tmp, key), 'unsupported: slot 57 mesh without a pixel stage is not covered')
+        key, result = request(tmp, MESH, [])
+        expect('the fixture translates without a pixel stage', result, 'ok')
+        if result == 'ok':
+            names = sorted(p.name[16:] for p in Path(tmp).iterdir() if not p.name.startswith('req_'))
+            expect('mesh-only source and manifest', names, ['.ms57.hlsl', '.ms57.txt'])
+            manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+            expect('mesh-only manifest stage information',
+                   [line for line in manifest if line.startswith(('params ', 'targets ', 'ps '))],
+                   ['params 0', 'ps none'])
+            text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('mesh-only vertex fields', re.findall(r'struct VSOut \{([^}]*)\}', text), ['\n    float4 pos : SV_Position;\n'])
+            expect('mesh-only shader omits parameter writes', re.findall(r'\bo\.[fh]?param\d+', text), [])
+            expect('mesh-only shader writes position and indices', 'o.pos =' in text and 'tris[tid] =' in text, True)
+            expect('mesh-only manifest is enough in source-only mode', G.pending_keys(tmp, False), [])
+            paired, result = request(tmp, MESH)
+            expect('paired request for polling translates', result, 'ok')
+            paired_text = (Path(tmp) / ('%016x.ms57.hlsl' % paired)).read_text()
+            expect('mesh-only shader keeps every mesh_vertex mark of the pair',
+                   text.count('mesh_vertex = true'), paired_text.count('mesh_vertex = true'))
+            # The poller needs a complete container envelope, without compiling a shader here.
+            part = struct.pack('<4sI4s', b'DXIL', 4, b'test')
+            bytecode = struct.pack('<4s16sHHIII', b'DXBC', bytes(16), 1, 0, 36 + len(part), 1, 36) + part
+            os.environ.pop('X2W_FXC')
+            mesh_bytecode = Path(tmp) / ('%016x.ms57.cso' % key)
+            mesh_bytecode.write_bytes(bytecode)
+            (Path(tmp) / ('%016x.ms57.cso' % paired)).write_bytes(bytecode)
+            expect('only the pair missing its pixel bytecode is pending', G.pending_keys(tmp, False), [paired])
+            mesh_bytecode.write_bytes(bytecode[:-1])
+            expect('mesh-only result with truncated bytecode is pending', G.pending_keys(tmp, False), sorted([key, paired]))
+            mesh_bytecode.unlink()
+            expect('mesh-only result missing mesh bytecode is pending', G.pending_keys(tmp, False), sorted([key, paired]))
+            os.environ['X2W_FXC'] = ''
     # exp null off, off, off, off done vm; s_endpgm: a pixel stage without a colour output.
     with tempfile.TemporaryDirectory() as tmp:
         expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1],
@@ -232,17 +366,58 @@ def rasterise(points, colours, indices, verts, prims):
     return image
 
 
-def draw(dxc, renderer, adapter):
+def publish_request(directory, publisher, adapter):
+    ms, ps = code(MESH), code(PIXEL)
+    (directory / 'ms.bin').write_bytes(ms)
+    (directory / 'ps.bin').write_bytes(ps)
+    env = dict(os.environ, X2W_MESH_REQUEST_FIXTURE='1', X2W_TEST_MESH57_EXCHANGE=str(directory))
+    result = subprocess.run([publisher, adapter, 'mesh'], env=env, capture_output=True, text=True)
+    print(result.stdout, end='')
+    if result.returncode:
+        if result.returncode != 77:
+            print(result.stderr, end='')
+        return result.returncode, None
+    cache = directory / 'requests'
+    pair = [path for path in cache.glob('req_*.ps57') if path.stat().st_size]
+    expect('one published mesh and pixel request', len(pair), 1)
+    if len(pair) != 1:
+        return 1, None
+    root_blob = pair[0].with_suffix('.root').read_bytes()
+    key = G.mesh57_key(ms, ps, root_blob)
+    expect('published key matches the offline reader', pair[0].stem, f'req_{key:016x}')
+    expect('published mesh matches the fixture', pair[0].with_suffix('.m57').read_bytes(), ms)
+    expect('published pixel matches the fixture', pair[0].read_bytes(), ps)
+    if FAILED:
+        return 1, None
+    return 0, (cache, key, root_blob)
+
+
+def draw(dxc, renderer, adapter, publisher=None):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, MESH, [])
+        expect('the fixture compiles without a pixel stage', result, 'ok')
+        names = sorted(p.name[16:] for p in Path(tmp).iterdir() if not p.name.startswith('req_'))
+        expect('mesh-only compiled files', names, ['.ms57.cso', '.ms57.hlsl', '.ms57.txt'])
+        expect('complete mesh-only bytecode was published',
+               G.has_complete_mesh57_bytecode(Path(tmp) / ('%016x.ms57.cso' % key)), True)
     points, colours, indices = geometry()
     with tempfile.TemporaryDirectory() as tmp:
-        key, result = request(tmp, MESH)
+        if publisher:
+            status, published = publish_request(Path(tmp), publisher, adapter)
+            if status:
+                return status
+            cache, key, root_blob = published
+            result = G.translate_request(str(cache), key)
+        else:
+            cache, root_blob = Path(tmp), root()
+            key, result = request(tmp, MESH)
         expect('the fixture translates and compiles', result, 'ok')
         if result != 'ok':
             return 0
-        name = str(Path(tmp) / ('%016x' % key))
-        uds = G.MeshPipeline(code(MESH), code(PIXEL), root()).uds
+        name = str(cache / ('%016x' % key))
+        uds = G.MeshPipeline(code(MESH), code(PIXEL), root_blob).uds
         # (vertex count, primitive count, thread of vertex slot 0, flags of the first primitive words): all, fewer
         # primitives, fewer vertices (indices clamp), no vertex; every thread, with the triangles on vertices
         # 112..123 (wave 1, lanes 48..59), each named by eight primitives and the other 96 primitives on vertex 0
@@ -250,6 +425,8 @@ def draw(dxc, renderer, adapter):
         # Each case is one process and one device, which takes seconds on a hardware adapter.
         cases = ((12, 4, 0, ()), (12, 1, 0, ()), (7, 4, 0, ()), (0, 4, 0, ()),
                  (128, 128, 112, (1 << 31, 1 << 9 | 1 << 19 | 1 << 29)))
+        if publisher:
+            cases = cases[:1]
         for case in cases:
             verts, prims, first, flags = case
             named = [tuple(first + i for i in triangle) for triangle in indices]
@@ -282,6 +459,25 @@ def draw(dxc, renderer, adapter):
                 expect('a reference with one wrong pixel fails',
                        (r.returncode, 'pixels=1024 mismatches=1' in r.stdout, 'Draw reference mismatch' in r.stderr),
                        (1, True, True))
+        for what, mesh, red in BRANCH_CASES:
+            key, result = request(tmp, mesh)
+            expect(what + ' translates and compiles', result, 'ok')
+            if result != 'ok':
+                continue
+            name = str(Path(tmp) / ('%016x' % key))
+            words = [a | b << 10 | c << 20 for a, b, c in indices]
+            struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), 4)
+            struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 1)), 12)
+            recoloured = [(red(lane), *colour[1:]) for lane, colour in enumerate(colours)]
+            image = rasterise(points, recoloured, indices, 12, 4)
+            path.write_bytes(bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+                             + b''.join(bytes(pixel) for pixel in image))
+            r = subprocess.run([renderer, adapter, '--mesh-indexed', name + '.ms57.cso', name + '.ps57.cso', str(path)],
+                               capture_output=True, text=True)
+            if r.returncode == 77:
+                print(r.stdout + r.stderr)
+                return 77
+            expect('draw of ' + what, (r.returncode, 'pixels=1024 mismatches=0' in r.stdout), (0, True))
     return 0
 
 
@@ -290,6 +486,8 @@ def main(argv):
     if argv[1:2] == ['binary'] and len(argv) == 3:
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
+        status = draw(*argv[2:])
+    elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
     elif len(argv) == 1:
         controls()
