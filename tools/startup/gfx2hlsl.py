@@ -3914,7 +3914,7 @@ class Stage:
             # The 'added' mark (an add whose offset is not tracked, as in a program with branches): no byte offset.
             raise Unsupported('s_load through s%d: the pointer was advanced by an untracked offset' % base[1])
         base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
-        if (base_off or len(p) > 2) and p[1][0] in PTR64_SOURCES:
+        if p[1][0] in PTR64_SOURCES:
             # An advanced 64-bit pointer needs its high word completed by the matching s_addc_u32;
             # a table pointer is 32 bits wide and has no high word.
             if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[1] + 1) != ptr_high_symbol(p[1], base_off):
