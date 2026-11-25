@@ -61,11 +61,22 @@ def main():
         check('off pair adds no reads', len(halves) == 2, text)
         check('live pair is still read', halves[0] == 'v0', text)
 
-    stage, text = translate('v_mov_b32', 'v_mov_b32 v3, vcc_hi')
-    check('v_mov_b32 from vcc_hi translates', stage is not None, text)
     if stage is not None:
-        check('vcc_hi reads zero', re.search(r'v3 = 0x00000000u;', text) is not None
-              or re.search(r'v3 = 0u;', text) is not None, text)
+        # The disabled B/A channels are not written: the pipeline write mask (manifest 'wmask') keeps R and G only.
+        check('off pair is left out of the write mask', stage.write_masks == {'mrt0': 0x3}, repr(stage.write_masks))
+
+    stage, text = translate('v_mov_b32', 'v_mov_b32 v3, vcc_hi')
+    check('vcc_hi read without a validated wave32 mode is refused', stage is None
+          and 'wave32' in text, text)
+
+    class Wave32(Probe):
+        wave32 = True
+
+    stage = Wave32()
+    stage.one('v_mov_b32', 'v_mov_b32 v3, vcc_hi')
+    text = '\n'.join(stage.lines)
+    check('vcc_hi reads zero in a validated wave32 stage', re.search(r'v3 = 0u;', text) is not None
+          or re.search(r'v3 = 0x00000000u;', text) is not None, text)
 
     if failures:
         print('FAIL')
