@@ -7159,10 +7159,17 @@ class Pipeline:
         # one is enabled). Without hardware inputs the model assumes the center pair alone: v0, v1.
         self.persp_center_vgpr = 0
         if ps_hw_inputs is not None:
+            # SPI_PS_INPUT_ADDR allocates the entry VGPRs in bit order; SPI_PS_INPUT_ENA chooses which of the
+            # allocated inputs are loaded. Every enabled input is also allocated (LLVM AMDGPUAsmPrinter
+            # getSIProgramInfo: "all enabled inputs are tagged in InputAddr as well"; SIISelLowering
+            # processPSInputArgs marks an input allocated, then enabled only when it is used).
             ena, addr = ps_hw_inputs
-            if ena != addr or not 0 <= ena <= 0xffff:
+            if not (0 <= ena <= 0xffff and 0 <= addr <= 0xffff):
                 raise Unsupported('unverified pixel input enable/address combination')
-            self.persp_center_vgpr = (2 if addr & 1 else 0) if addr & 2 else None
+            if ena & ~addr:
+                raise Unsupported('contradictory pixel input enable/address masks: an enabled input is not allocated')
+            # Layout from the address mask; an input allocated but not enabled holds no loaded value.
+            self.persp_center_vgpr = (2 if addr & 1 else 0) if ena & 2 else None
             if ena & (1 << 15):
                 # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
                 # line stipple through sample coverage each occupy one VGPR.
@@ -8003,14 +8010,15 @@ def has_complete_mesh57_bytecode(path):
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
-                 ps_attr_map=None):
+                 ps_attr_map=None, ps_hw_inputs=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
+                        ps_hw_inputs=ps_hw_inputs)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -8144,6 +8152,39 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
     return kinds, root, formats, request, fetch, decoded, attr_map
 
 
+def request_ps_inputs(out_dir, key, request=''):
+    """The pixel input masks (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR) of one graphics request, or None.
+
+    They come from req_<base>.psin, the separately captured stream description of exactly that pipeline: one
+    ASCII line 'psin1 <key> ena=<mask> addr=<mask>', the key as 16 hex digits and the masks as 0x-prefixed
+    16-bit values. An RTV variant uses its source pipeline's description. The key must name the request and
+    equal pipeline_key() of the stage blobs, root signature and input layout stored with it, so the masks of
+    another pipeline (a copied or stale description) are refused, never applied. No file means no captured
+    description: the translation keeps its model without hardware inputs."""
+    base = int(request.split()[1]) if request else key
+    name = os.path.join(out_dir, 'req_%016x' % base)
+    if not os.path.isfile(name + '.psin'):
+        return None
+    with open(name + '.psin', 'rb') as file:
+        line = file.read(128)
+    fields = line.decode('ascii', 'replace').split()
+    if not re.fullmatch(rb'psin1 [0-9a-f]{16}(?: (?:ena|addr)=0x[0-9a-f]{1,4}){0,2}\n?', line):
+        raise Unsupported('invalid pixel input description')
+    masks = dict(field.split('=') for field in fields[2:])
+    if len(masks) != len(fields) - 2:
+        raise Unsupported('invalid pixel input description')
+    if int(fields[1], 16) != base:
+        raise Unsupported('pixel input description names another pipeline')
+    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+    layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
+    if pipeline_key(a, b, root, layout) != base:
+        raise Unsupported('pixel input description names another pipeline')
+    for field, label in (('ena', 'enable'), ('addr', 'address')):
+        if field not in masks:
+            raise Unsupported('pixel input %s mask missing from the stream description' % label)
+    return int(masks['ena'], 16), int(masks['addr'], 16)
+
+
 def mesh57_key(ms, ps, root):
     value = fnv(b'x2w-startup-mesh-57-2')
     for part in (ms, ps, root):
@@ -8221,6 +8262,7 @@ def translate_request(out_dir, key):
             return 'unsupported: %s' % reason
     try:
         kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
+        ps_inputs = request_ps_inputs(out_dir, key, request)
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
@@ -8228,7 +8270,7 @@ def translate_request(out_dir, key):
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
     return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch,
-                        ps_attr_map=attr_map)
+                        ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
 
 
 REFUSALS_CAVEAT = ('Counts after the first refusal are approximate. Skipped instructions leave later state '
@@ -8279,7 +8321,8 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, _, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        kinds, root, formats, request, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        ps_inputs = request_ps_inputs(out_dir, key, request)
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
         return refusals
@@ -8299,7 +8342,7 @@ def request_refusals(out_dir, key, pair_info=None):
         if set(kinds) != {'vs', 'ps'}:
             raise Unsupported('stages %s' % sorted(kinds))
         pipe = Pipeline(kinds['vs'], kinds['ps'], root, rtv_formats=formats, vs_fetch=fetch,
-                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map)
+                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
         op = 'hlsl_vs'
         pipe.hlsl_vs()
         op = 'hlsl_ps'

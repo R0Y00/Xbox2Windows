@@ -285,6 +285,7 @@ jobs:
             tests/startup_run_sh_check.py \
             tests/startup_flat_param_check.py \
             tests/startup_ps_input_scan_check.py \
+            tests/startup_packed_position_provenance_check.py \
             tests/startup_build_rev_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_gfx2hlsl_interp_f16_check.py             tests/startup_gfx2hlsl_interp_p2_hi_check.py \
