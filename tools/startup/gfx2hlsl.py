@@ -1434,7 +1434,20 @@ class Stage:
         straight-line block (no branch in it, none into it) when it cannot set the bit of a lane whose bit is clear
         (exec_stays_clear): such a lane's bit is clear on entry, so the wave leaves it clear and its exec at the
         join is the model's. A live definition, another exec write, a refused effect, a branch leaving the block
-        or a backward s_cbranch_execz is refused."""
+        or a backward s_cbranch_execz is refused.
+
+        One live definition is accepted: the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
+        or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
+        exec_lo`, `s_and_b32 M, X, exec_lo` in either operand order). Every write of M in the block yields a value
+        whose bit is 0 for any lane whose exec bit is clear there: exec can only be narrowed in the block
+        (exec_stays_clear has accepted each exec write), and a copy of exec, or X & exec, has that bit clear. M is 0
+        at the branch on every path (nothing branches or lands between the zeroing and the branch). So for a lane
+        the model skips, the wave's M has that lane's bit 0 whether the wave ran the block or not, which is the
+        model's M (0); a lane that runs the block runs it in the model too. This holds only while M is read per
+        lane. A whole-mask read (s_cbranch_vccz/vccnz, s_cmp, a plain copy, a data operand) sees the other lanes'
+        bits, which the one-lane model does not have, so any such read of M reachable after the join, before M is
+        rewritten, keeps the refusal. The reads accepted are the lane select of v_cndmask, the carry-in of v_addc /
+        v_subb / v_add_co_ci style ops, and s_and_saveexec / s_and_b32 with exec."""
         offsets = [ins[0] for ins in self.ins]
         index = {off: i for i, off in enumerate(offsets)}
         effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
@@ -1472,6 +1485,8 @@ class Stage:
             # in it and no branch into it. Elsewhere an exec write is refused.
             straight = not any(self.ins[k][2].startswith(('s_cbranch', 's_branch')) for k in range(b + 1, t)) and \
                 not any(index.get(target) in range(b + 1, t) for target in targets)
+            cand = {k for i in range(b + 1, t) for k in (effects[i][2] - EXEC_KEYS) & live if re.fullmatch(r'vcc|s\d+', k)}
+            ok_masks = {k for k in cand if straight and self.phi_mask_ok(k, b, t, effects, succ, targets, index)}
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
@@ -1483,12 +1498,73 @@ class Stage:
                     reason = 'branch out of the block'
                 elif may & EXEC_KEYS and not (straight and exec_stays_clear(inner, inner_asm, saved)):
                     reason = 'exec write'
-                elif (may - EXEC_KEYS) & live:
-                    reason = 'definition of %s, live where the block joins' % ', '.join(sorted((may - EXEC_KEYS) & live))
+                elif (may - EXEC_KEYS - ok_masks) & live:
+                    reason = 'definition of %s, live where the block joins' % ', '.join(
+                        sorted((may - EXEC_KEYS - ok_masks) & live))
                 saved = exec_copies_after(inner, inner_asm, saved, may)
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def phi_mask_ok(self, key, b, t, effects, succ, targets, index):
+        """True when lane mask `key` ('vcc' for vcc_lo, or 'sN'), live at the join t of the s_cbranch_execz at b, is
+        the zeroed-then-set-from-exec shape execz_refusals accepts (see its docstring): every write of it in the
+        block is a 32-bit move of exec_lo or an s_and with exec_lo into it alone, the last write before the branch
+        is `s_mov_b32 M, 0` with no branch and no branch target after it up to the branch, and after the join it is
+        only read per lane. The caller has checked that the block is straight-line."""
+        name = 'vcc_lo' if key == 'vcc' else key
+        for i in range(b + 1, t):
+            if key not in effects[i][2]:
+                continue
+            _, ops, _ = parse(self.ins[i][3])
+            base = re.sub(r'_e(32|64)$', '', self.ins[i][2])
+            if not ops or ops[0] != name:
+                return False
+            if base == 's_mov_b32' and ops[1:] == ['exec_lo']:
+                continue
+            if base == 's_and_b32' and len(ops) == 3 and 'exec_lo' in ops[1:]:
+                continue
+            return False
+        # The zeroing: the last instruction before the branch that may write M.
+        z = next((k for k in range(b - 1, -1, -1) if key in effects[k][2]), None)
+        if z is None:
+            return False
+        _, ops, _ = parse(self.ins[z][3])
+        if self.ins[z][2] != 's_mov_b32' or ops != [name, '0']:
+            return False
+        if any(self.ins[k][2].startswith(('s_cbranch', 's_branch', 's_setpc')) for k in range(z + 1, b)) or \
+                any(index.get(x) in range(z + 1, b + 1) for x in targets):
+            return False
+        # After the join, until M is rewritten, every read must be per lane.
+        seen, todo = set(), [t]
+        while todo:
+            i = todo.pop()
+            if i in seen:
+                continue
+            seen.add(i)
+            reads, writes, _ = effects[i]
+            if key in reads and not self.per_lane_read(i, key):
+                return False
+            if key not in writes:
+                todo.extend(succ[i])
+        return True
+
+    def per_lane_read(self, i, key):
+        """True when instruction i reads mask `key` only as a lane select or carry, or into exec (s_and_saveexec,
+        s_and with exec): the lane's own bit is all it uses."""
+        _, _, name, asm = self.ins[i]
+        base = re.sub(r'_e(32|64)$', '', name)
+        _, ops, _ = parse(asm)
+        if base.startswith(('v_cndmask', 'v_addc', 'v_subb', 'v_add_co_ci', 'v_sub_co_ci', 'v_subrev_co_ci')):
+            # the mask is the last operand and appears nowhere else (not as a data word, not as the destination)
+            return len(ops) >= 4 and key in scalar_tokens(ops[-1]) and \
+                all(key not in scalar_tokens(op) for op in ops[:-1])
+        if base == 's_and_saveexec_b32':
+            return len(ops) == 2 and key in scalar_tokens(ops[1]) and key not in scalar_tokens(ops[0])
+        if base == 's_and_b32':
+            return len(ops) == 3 and key not in scalar_tokens(ops[0]) and any(
+                is_exec(scalar_tokens(op)) for op in ops[1:])
+        return False
 
     # ---- instruction translation -------------------------------------------------------------
     def joined_registers(self, with_cfg=False):
