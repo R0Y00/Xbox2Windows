@@ -138,9 +138,18 @@ def check_binary(llvm_mc):
     print('fixture words match llvm-mc')
 
 
+def tilt(source):
+    """Make u advance by one level-0 texel per pixel (0.25 of the 4x4 fixture), so the implicit level is exactly 0
+    and the bias alone picks the mip. With constant coordinates the derivatives are zero, the implicit level is
+    minus infinity and any bias is clamped back to level 0, so this needs a real gradient. The pixel's own u stays 0.75."""
+    plain = 'float3(F(v1), F(v2), F(v3))'
+    assert source.count(plain) == 1, source
+    return source.replace(plain, 'float3(F(v1) + (i.pos.x - 0.5) * 0.25, F(v2), F(v3))')
+
+
 def check_draw(dxc, renderer, adapter, fxc=None):
-    """GPU readback against a CPU reference. The coordinates are constants, so the derivatives are zero and the
-    implicit level is exactly the bias: bias n must read mip n of the slice the root constant names."""
+    """GPU readback against a CPU reference. The coordinates are constants, so tilt() gives the implicit level 0
+    and the level is exactly the bias: bias n must read mip n of the slice the root constant names."""
     operation = '--startup-image-2d-array-mips'
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
 
@@ -160,7 +169,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             for bias in (0.0, 1.0, 2.0):
                 text = G.Pipeline(VS_WORDS, bias_words(bias), draw_root_blob()).hlsl_ps()
                 assert 'SampleBias(' in text, text
-                shader = compile_hlsl(compiler, kind, text, 'ps_bias%d_%s' % (bias, kind), ps_profile, directory)
+                shader = compile_hlsl(compiler, kind, tilt(text), 'ps_bias%d_%s' % (bias, kind), ps_profile, directory)
                 for slice_index in (0, 1):
                     expected = expected_cell(slice_index, int(bias))
                     run = draw(vs, shader, slice_index, expected)
@@ -178,7 +187,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                                              r'\1.SampleBias(\2, float3(\3, \4, \5), \4)', call), 0)):
                     source = text.replace(call, mutated)
                     assert source != text, label
-                    mutant = compile_hlsl(compiler, kind, source, 'ps_bias_mutant_%s' % kind, ps_profile, directory)
+                    mutant = compile_hlsl(compiler, kind, tilt(source), 'ps_bias_mutant_%s' % kind, ps_profile, directory)
                     run = draw(vs, mutant, 1, expected_cell(1, int(bias)))
                     actual = expected_cell(1, actual_mip)
                     if run.returncode == 0 or 'actual=%s' % actual not in run.stderr:
