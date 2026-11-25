@@ -189,7 +189,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-9`, so translations paired by number are not reused.
+The shader cache revision is `x2w-startup-shader-10`. It also invalidates older translations that
+could read a stale SCC after an operation on a descriptor word.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.

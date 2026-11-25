@@ -13450,6 +13450,10 @@ the scalar offset and the immediate, through a descriptor at a fixed root-table 
 - a descriptor word that was moved, overwritten or modified;
 - a descriptor that is also loaded.
 
+A scalar ALU operation on symbolic descriptor data can also change SCC. The translator refuses an SCC read
+if a path from that operation reaches the read before an emitted SCC write. A fresh comparison on every path
+allows the read, including at a branch target. The compute controls exercise conditional moves, selects and branches.
+
 As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
 handling of out-of-range stores, are assumptions, not measurements.
 The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
