@@ -1663,7 +1663,11 @@ These are measured on one executable; treat them as hypotheses for others.
 - Translated draws use the bound typed RTV formats to request colour-export variants. The
   manifest's `targets` line lists exported slots. A separate `rtv1` line identifies the base
   shader and the ordered RTV formats, and the draw rejects a variant with a mismatched line.
-  Uncompressed `R32_UINT` and `R32_SINT` outputs use integer shader signatures.
+  Uncompressed `R32G32B32A32`, `R32G32` and `R32` UINT and SINT outputs use integer shader
+  signatures (`startup_mrt_*` reads back every stored word on WARP and hardware). `R32G32_FLOAT` and
+  `R32_FLOAT` use the same bit-preserving path as `R32G32B32A32_FLOAT`, covering a NaN payload and a
+  negative denormal. Integer formats with 8- or 16-bit channels are refused at translation with
+  `unverified UINT/SINT RTV format <n>`.
   Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
   undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
