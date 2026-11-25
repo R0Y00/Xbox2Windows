@@ -3086,12 +3086,14 @@ def _mul24_hi(signed):
             return 'asint({%d} & 0xfffu)' % n
         wrap = 'asuint(%s)'
     else:
+        # Same signed shift pair as the signed form, whose FXC build keeps the product (a pure unsigned shift pair
+        # was folded to zero by FXC 10.0.26100); the mask turns the arithmetic shift into the zero-extended field.
         def top(n):
-            return '(({%d} << 8) >> 20)' % n
+            return '(asint({%d} << 8) >> 20 & 0xfff)' % n
 
         def low(n):
-            return '({%d} & 0xfffu)' % n
-        wrap = '%s'
+            return 'asint({%d} & 0xfffu)' % n
+        wrap = 'asuint(%s)'
     hh = '(%s * %s)' % (top(0), top(1))
     mid = '(%s * %s + %s * %s)' % (top(0), low(1), low(0), top(1))
     t = '(%s + ((%s * %s) >> 12))' % (mid, low(0), low(1))

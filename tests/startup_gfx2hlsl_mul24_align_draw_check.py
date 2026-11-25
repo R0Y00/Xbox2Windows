@@ -65,6 +65,7 @@ def check_binary(llvm_mc):
 
 def check_draw(dxc, renderer, adapter, fxc=None):
     compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
+    failures = []
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:
@@ -79,9 +80,13 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     expected = words_text(reference(*x) for x in chunk)
                     run = draw(renderer, adapter, vs, ps, expected)
                     if run.returncode:
-                        raise AssertionError('%s %s inputs %s\n%s\n%s' % (kind, op, chunk, run.stdout, run.stderr))
+                        # Keep going so one compiler's failure does not hide the other compiler's result.
+                        failures.append('%s %s inputs %s\n%s\n%s' % (kind, op, chunk, run.stdout, run.stderr))
+                        break
                     print('%s %s %s: %s' % (kind, op, [tuple('%x' % v for v in x[:source_count(op)]) for x in chunk],
                                             expected), flush=True)
+    if failures:
+        raise AssertionError('\n'.join(failures))
 
 
 def main():
