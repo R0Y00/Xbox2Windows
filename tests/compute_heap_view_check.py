@@ -55,7 +55,7 @@ XY_VIEWS = (
 )
 XYZW_VIEWS = (
     view("8_8_8_8_UNORM, whole range", 56, 0, 16, 8),
-    view("32_32_32_32_UINT, index past num_records", 77, 128, 32, 5),
+    view("32_32_32_32_UINT, index past num_records", 75, 128, 32, 5),
     view("16_16_16_16_FLOAT legacy word, stride 16", 71, 400, 16, 8, legacy=True),
     view("two-channel format under an xyzw opcode", 23, 0, 16, 8),
     view("view not live (never written)", 56, 0, 16, 8, state=0),
