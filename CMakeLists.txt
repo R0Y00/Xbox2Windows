@@ -1717,6 +1717,9 @@ target_compile_features(startup_pipeline_state_check PRIVATE cxx_std_17)
 add_test(NAME startup_pipeline_state COMMAND startup_pipeline_state_check)
 add_test(NAME startup_pipeline_state_offset_control COMMAND startup_pipeline_state_check --mutate offset)
 set_tests_properties(startup_pipeline_state_offset_control PROPERTIES WILL_FAIL TRUE)
+# Mesh-pipeline layout (+0x004 == 6, fields 0x54 later): a mesh block read at the vertex offsets must fail.
+add_test(NAME startup_pipeline_state_mesh_shift_control COMMAND startup_pipeline_state_check --mutate mesh-shift)
+set_tests_properties(startup_pipeline_state_mesh_shift_control PROPERTIES WILL_FAIL TRUE)
 # X2W_DEPTH_STATE (src/startup_stubs/depth_state_apply.h): off takes nothing from the block, on takes a decodable one.
 add_executable(startup_depth_state_check tests/startup_depth_state_check.cpp)
 target_include_directories(startup_depth_state_check PRIVATE src)
