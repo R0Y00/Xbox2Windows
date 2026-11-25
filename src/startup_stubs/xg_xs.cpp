@@ -461,7 +461,7 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         slots[5] = reinterpret_cast<void*>(&bc64_offset);
         slots[6] = reinterpret_cast<void*>(&bc64_element);
         slots[8] = reinterpret_cast<void*>(&bc64_copy<true>);
-        slots[9] = reinterpret_cast<void*>(&bc64_copy<false>);
+        slots[9] = reinterpret_cast<void*>(&bc64_copy_from);
         slots[10] = reinterpret_cast<void*>(&bc64_tiling);
         return slots;
     }();

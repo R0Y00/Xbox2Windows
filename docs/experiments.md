@@ -13102,6 +13102,12 @@ ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_ad
 
 The fixture checks the XG layout, tile spans, block offsets, copy in and out, and preserved row/tile padding. It binds the resulting buffer as a six-level address SRV. Each backend reads back 6,144 pixels sampled across the six mips and 6,144 pixels from a control draw region forced to mip zero. For both formats the control changes 5,120 pixels. The hardware run used an RTX 4060 Laptop GPU (32.0.16.1656), alongside Microsoft WARP (10.0.26100.9818) on Windows 11 build 26200.9974 with the debug layer off.
 
+On Scarlett, slot 9 takes an extra `UINT` between the subresource and the tiled source pointer.
+The BC-chain stand-in supports the zero value used by DirectXTex. The six-mip check calls it
+with zero slice pitch and the array check supplies the pitch explicitly. Slot 8 takes the tiled
+destination, plane, subresource, linear source and two pitches.
+[DirectXTex copy out](https://github.com/microsoft/DirectXTex/blob/a8e5dbf42909aeeb9fcf9c2ae399ae3c06737379/Auxiliary/DirectXTexXboxDetile.cpp#L229-L238) · [DirectXTex copy in](https://github.com/microsoft/DirectXTex/blob/a8e5dbf42909aeeb9fcf9c2ae399ae3c06737379/Auxiliary/DirectXTexXboxTile.cpp#L357-L363)
+
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```
