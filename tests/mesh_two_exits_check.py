@@ -81,12 +81,16 @@ def verify(directory, kind, tool, objcopy, library):
     rejects("Unverified multi-exit program", extract, code + code[-4:])
     allocation, = [pc for pc, op in decoded if op == "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"]
     rejects("missing mesh allocation", extract, replace(allocation, nop))
+    # Keep the real allocation and replace the later, reachable barrier with
+    # s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP). Only the allocation may fall through.
+    barrier, = [pc for pc, op in decoded if op == "s_barrier"]
+    rejects("Unverified multi-exit control flow: s_sendmsg", extract, replace(barrier, bytes.fromhex("030090bf")))
     rejects("Unverified multi-exit program", extract, code, llvm=None)
     rejects("Unverified multi-exit program", extract, code, features=b"+wavefrontsize32")
     compute = parts(mesh_container(code, stage=5))[b"DXIL"]
     rejects("Unverified multi-exit control flow: s_sendmsg", container_code, compute,
             stage=5, llvm=library, features=MESH_WAVE64)
-    print(f"{len(code)} bytes: both CLIs and the profile audit match the single-exit mesh; six refusals checked")
+    print(f"{len(code)} bytes: both CLIs and the profile audit match the single-exit mesh; refusal checks passed")
     return outputs
 
 
