@@ -12,7 +12,8 @@
 //   4. the same with a typeless half-float pair and a typeless format argument   half float 1.0 in red
 //   5. an upload buffer copied to a buffer, then 64 bytes at another offset into a third   exact bytes
 //   6. refused and counted, forwarded to nothing: a CopyResource between different sizes, a null source,
-//      a resolve from a one-sample source, a buffer range that runs past its end
+//      a resolve from a one-sample source, a buffer range that runs past its end, a copy into an upload
+//      buffer and a copy out of a readback buffer
 //   7. after Close, the same calls change no counter
 //
 // The desktop device must not be removed and the debug layer must store no errors.
@@ -291,6 +292,10 @@ int main(int argc, char** argv)
     if (!step("6c ResolveSubresource from one sample", {0, 0, 0, 1}, seen)) return 17;
     invoke(list, 15, arg(buffer_y.Get()), 0, arg(buffer_x.Get()), 200, 100);
     if (!step("6d CopyBufferRegion past the end", {0, 0, 0, 1}, seen)) return 18;
+    invoke(list, 15, arg(upload_u.Get()), 0, arg(buffer_x.Get()), 0, 16);
+    if (!step("6e CopyBufferRegion into an upload buffer", {0, 0, 0, 1}, seen)) return 28;
+    invoke(list, 15, arg(buffer_y.Get()), 0, arg(probe.readback.Get()), 0, 16);
+    if (!step("6f CopyBufferRegion out of a readback buffer", {0, 0, 0, 1}, seen)) return 29;
 
     invoke(list, 9);
     if (!probe.submit(list)) return 19;

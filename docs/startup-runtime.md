@@ -426,7 +426,14 @@ mapped to its desktop resource, the pair is moved to the copy or resolve states 
 desktop would reject is counted, logged (first six) and not forwarded, with the reason: `unresolved`, `same_resource`,
 `not_buffer`, `not_texture`, `dimension_mismatch`, `size_mismatch`, `format_mismatch`, `sample_mismatch`,
 `bad_subresource`, `source_not_multisampled`, `destination_multisampled`, `bad_format`, `zero_size` or
-`range_overflow`. A typeless resolve format (or an unknown one over a typeless source) resolves as the family's typed
+`range_overflow`, `heap_direction` (an upload buffer as a destination, a readback buffer as a source),
+`initial_state` (a placed buffer that does not start in COMMON) or `title_backed_source` (a title-backed default-heap
+buffer, which has no desktop copy to refresh). A source the title maps at its own memory is brought up to date first: a
+texture takes the draw path's upload, an upload buffer is copied through a desktop mapping, and an aliased placed buffer
+is already current. A copy or resolve destination with title memory is marked GPU-written, so a later draw does not
+upload the stale title memory over the result. CopyResource accepts formats of one DXGI family (colour, depth, 8/16/32-bit
+and block-compressed). A resolve format is exact against a fully typed endpoint and only family-compatible with a
+typeless one; a typeless resolve format (or an unknown one over typeless endpoints) resolves as the family's typed
 choice: half float for `R16G16B16A16`, normalised for the 8-bit and 10-bit families. Calls on a closed list are ignored.
 These slots have not been seen in a title log yet. `CopyTextureRegion` (16) and `CopyTiles` (18) are not handled.
 `ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,

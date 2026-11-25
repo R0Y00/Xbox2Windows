@@ -9,16 +9,23 @@
 
 LONG list_buffer_copies, list_resource_copies, list_resolves, list_copies_refused;
 
-// The desktop resource behind a copy argument; null for a null value, or a wrapper that is not a resource.
+// One copy argument: the desktop resource, and its wrapper when the title passed one.
+struct CopyEndpoint {
+    ID3D12Resource* resource = nullptr;
+    Wrapper* wrapper = nullptr;
+};
+
+// The desktop resource behind a copy argument; empty for a null value, or a wrapper that is not a resource.
 // A value that is no wrapper is taken as a desktop resource, as the view slots do.
-ID3D12Resource* copy_endpoint(u64 value)
+CopyEndpoint copy_endpoint(u64 value)
 {
-    if (!value) return nullptr;
-    if (const Wrapper* w = as_wrapper(reinterpret_cast<const void*>(value))) {
-        if (w->own().kind != resource_kind) return nullptr;
-        return static_cast<ID3D12Resource*>(w->own().real);
+    if (!value) return {};
+    if (Wrapper* w = as_wrapper(reinterpret_cast<const void*>(value))) {
+        if (w->own().kind != resource_kind) return {};
+        return {static_cast<ID3D12Resource*>(w->own().real), w};
     }
-    return x2w_local::readable(reinterpret_cast<const void*>(value), sizeof(void*)) ? reinterpret_cast<ID3D12Resource*>(value) : nullptr;
+    return {x2w_local::readable(reinterpret_cast<const void*>(value), sizeof(void*)) ? reinterpret_cast<ID3D12Resource*>(value) : nullptr,
+            nullptr};
 }
 
 void refuse_copy(const char* what, x2w_startup::CopyRefusal reason)
@@ -28,16 +35,85 @@ void refuse_copy(const char* what, x2w_startup::CopyRefusal reason)
     if (first_calls(logged, 6)) log("x2w-d3d12 %s skipped: %s", what, x2w_startup::copy_refusal_name(reason));
 }
 
+// Upload and readback buffers keep the one state their heap allows, so a copy may use them in one direction only:
+// an upload buffer as a source, a readback buffer as a destination. True for a heap that rests in COMMON.
+bool fixed_heap(ID3D12Resource* resource, D3D12_HEAP_TYPE& type)
+{
+    D3D12_HEAP_PROPERTIES heap{};
+    D3D12_HEAP_FLAGS flags{};
+    type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(resource->GetHeapProperties(&heap, &flags))) return false;
+    type = heap.Type;
+    return heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK;
+}
+
+// The first refusal for a pair of endpoints that the descriptions did not catch: a heap used in the wrong
+// direction, or a placed buffer that does not start in COMMON (the state tracker starts every resource there).
+x2w_startup::CopyRefusal check_endpoint_roles(const CopyEndpoint& to, const CopyEndpoint& from)
+{
+    D3D12_HEAP_TYPE type;
+    if (fixed_heap(to.resource, type) && type == D3D12_HEAP_TYPE_UPLOAD) return x2w_startup::CopyRefusal::heap_direction;
+    if (fixed_heap(from.resource, type) && type == D3D12_HEAP_TYPE_READBACK) return x2w_startup::CopyRefusal::heap_direction;
+    for (const CopyEndpoint& endpoint : {to, from}) {
+        if (!endpoint.wrapper) continue;
+        const auto* info = resource_info(endpoint.wrapper);
+        if (info && info->initial_state != D3D12_RESOURCE_STATE_COMMON) return x2w_startup::CopyRefusal::initial_state;
+    }
+    return x2w_startup::CopyRefusal::none;
+}
+
 // The state a copy needs from `resource`: an upload buffer stays readable and a readback buffer stays a
 // copy destination, because desktop allows no other state for them.
 void require_copy_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
-    D3D12_HEAP_PROPERTIES heap{};
-    D3D12_HEAP_FLAGS flags{};
-    if (SUCCEEDED(resource->GetHeapProperties(&heap, &flags)) &&
-        (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK))
-        return;
+    D3D12_HEAP_TYPE type;
+    if (fixed_heap(resource, type)) return;
     require_state(self, resource, state);
+}
+
+// A resource the title maps at its own memory has a desktop resource that map and unmap never touch. Before
+// that resource is copied from, bring it up to date: a texture takes the draw path's upload, an upload buffer
+// takes the bytes through a desktop mapping, and a placed buffer aliasing the memory is already current.
+// False for a title-backed default-heap buffer, which has no desktop copy the list can refresh.
+bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
+{
+    if (!source.wrapper || !source.wrapper->own().title_memory) return true;
+    const D3D12_RESOURCE_DESC desc = source.resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        upload_texture(self, source.wrapper, source.resource);
+        return true;
+    }
+    const auto* info = resource_info(source.wrapper);
+    if (info && info->placement == Placement::aliased_buffer) return true;
+    D3D12_HEAP_TYPE type;
+    if (!fixed_heap(source.resource, type) || type != D3D12_HEAP_TYPE_UPLOAD) return false;
+    const u64 memory = reinterpret_cast<u64>(source.wrapper->own().title_memory);
+    if (readable_window(memory, static_cast<std::size_t>(desc.Width)) < desc.Width) return false;
+    void* mapped = nullptr;
+    const D3D12_RANGE none{0, 0};
+    if (FAILED(source.resource->Map(0, &none, &mapped)) || !mapped) return false;
+    std::memcpy(mapped, reinterpret_cast<const void*>(memory), static_cast<std::size_t>(desc.Width));
+    source.resource->Unmap(0, nullptr);
+    return true;
+}
+
+// A copy or resolve destination now holds what the GPU wrote. A title-backed texture would otherwise be
+// uploaded over it from its stale memory the first time a draw samples it.
+void mark_gpu_written(const CopyEndpoint& destination)
+{
+    if (!destination.wrapper || !destination.wrapper->own().title_memory) return;
+    TextureUpload& state = texture_uploads()[destination.resource];
+    state.gpu_written = true;
+    state.done = true;
+}
+
+// Refusal shared by the three handlers once the descriptions passed, or none.
+x2w_startup::CopyRefusal check_roles_and_sync(Wrapper* self, const CopyEndpoint& to, const CopyEndpoint& from, bool sync)
+{
+    const auto roles = check_endpoint_roles(to, from);
+    if (roles != x2w_startup::CopyRefusal::none) return roles;
+    if (sync && !sync_title_source(self, from)) return x2w_startup::CopyRefusal::title_backed_source;
+    return x2w_startup::CopyRefusal::none;
 }
 
 // List slot 15, CopyBufferRegion(destination, destination offset, source, source offset, bytes).
@@ -45,17 +121,21 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
                                        u64 bytes)
 {
     if (!self->own().list_open) return;
-    ID3D12Resource* const to = copy_endpoint(destination);
-    ID3D12Resource* const from = copy_endpoint(source);
+    const CopyEndpoint to = copy_endpoint(destination);
+    const CopyEndpoint from = copy_endpoint(source);
     D3D12_RESOURCE_DESC to_desc{}, from_desc{};
-    if (to) to_desc = to->GetDesc();
-    if (from) from_desc = from->GetDesc();
-    const auto refusal = x2w_startup::check_copy_buffer_region(to ? &to_desc : nullptr, destination_offset,
-                                                               from ? &from_desc : nullptr, source_offset, bytes, to == from);
+    if (to.resource) to_desc = to.resource->GetDesc();
+    if (from.resource) from_desc = from.resource->GetDesc();
+    auto refusal = x2w_startup::check_copy_buffer_region(to.resource ? &to_desc : nullptr, destination_offset,
+                                                         from.resource ? &from_desc : nullptr, source_offset, bytes,
+                                                         to.resource == from.resource);
+    if (refusal == x2w_startup::CopyRefusal::none) refusal = check_roles_and_sync(self, to, from, true);
     if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("CopyBufferRegion", refusal);
-    require_copy_state(self, from, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    require_copy_state(self, to, D3D12_RESOURCE_STATE_COPY_DEST);
-    static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyBufferRegion(to, destination_offset, from, source_offset, bytes);
+    require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
+    static_cast<ID3D12GraphicsCommandList*>(self->own().real)
+        ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
+    mark_gpu_written(to);
     InterlockedIncrement(&list_buffer_copies);
 }
 
@@ -63,37 +143,45 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
 void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
 {
     if (!self->own().list_open) return;
-    ID3D12Resource* const to = copy_endpoint(destination);
-    ID3D12Resource* const from = copy_endpoint(source);
+    const CopyEndpoint to = copy_endpoint(destination);
+    const CopyEndpoint from = copy_endpoint(source);
     D3D12_RESOURCE_DESC to_desc{}, from_desc{};
-    if (to) to_desc = to->GetDesc();
-    if (from) from_desc = from->GetDesc();
-    const auto refusal = x2w_startup::check_copy_resource(to ? &to_desc : nullptr, from ? &from_desc : nullptr, to == from);
+    if (to.resource) to_desc = to.resource->GetDesc();
+    if (from.resource) from_desc = from.resource->GetDesc();
+    auto refusal = x2w_startup::check_copy_resource(to.resource ? &to_desc : nullptr, from.resource ? &from_desc : nullptr,
+                                                    to.resource == from.resource);
+    if (refusal == x2w_startup::CopyRefusal::none) refusal = check_roles_and_sync(self, to, from, true);
     if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("CopyResource", refusal);
-    require_copy_state(self, from, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    require_copy_state(self, to, D3D12_RESOURCE_STATE_COPY_DEST);
-    static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to, from);
+    require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
+    static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to.resource, from.resource);
+    mark_gpu_written(to);
     InterlockedIncrement(&list_resource_copies);
 }
 
 // List slot 19, ResolveSubresource(destination, destination subresource, source, source subresource, format).
 // The format is a console value, mapped like a resource format; a typeless one resolves as its typed choice.
+// The source is multisampled, which no title memory can back, so it needs no synchronisation.
 void __stdcall list_resolve_subresource(Wrapper* self, u64 destination, UINT destination_subresource, u64 source,
                                         UINT source_subresource, UINT format)
 {
     if (!self->own().list_open) return;
-    ID3D12Resource* const to = copy_endpoint(destination);
-    ID3D12Resource* const from = copy_endpoint(source);
+    const CopyEndpoint to = copy_endpoint(destination);
+    const CopyEndpoint from = copy_endpoint(source);
     D3D12_RESOURCE_DESC to_desc{}, from_desc{};
-    if (to) to_desc = to->GetDesc();
-    if (from) from_desc = from->GetDesc();
-    const auto plan = x2w_startup::plan_resolve(to ? &to_desc : nullptr, destination_subresource, from ? &from_desc : nullptr,
-                                                source_subresource, desktop_format(static_cast<DXGI_FORMAT>(format)), to == from);
-    if (plan.refusal != x2w_startup::CopyRefusal::none) return refuse_copy("ResolveSubresource", plan.refusal);
-    require_copy_state(self, from, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    require_copy_state(self, to, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    if (to.resource) to_desc = to.resource->GetDesc();
+    if (from.resource) from_desc = from.resource->GetDesc();
+    const auto plan = x2w_startup::plan_resolve(to.resource ? &to_desc : nullptr, destination_subresource,
+                                                from.resource ? &from_desc : nullptr, source_subresource,
+                                                desktop_format(static_cast<DXGI_FORMAT>(format)), to.resource == from.resource);
+    auto refusal = plan.refusal;
+    if (refusal == x2w_startup::CopyRefusal::none) refusal = check_roles_and_sync(self, to, from, false);
+    if (refusal != x2w_startup::CopyRefusal::none) return refuse_copy("ResolveSubresource", refusal);
+    require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_RESOLVE_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
-        ->ResolveSubresource(to, destination_subresource, from, source_subresource, plan.format);
+        ->ResolveSubresource(to.resource, destination_subresource, from.resource, source_subresource, plan.format);
+    mark_gpu_written(to);
     InterlockedIncrement(&list_resolves);
 }
 

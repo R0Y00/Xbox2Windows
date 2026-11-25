@@ -127,7 +127,33 @@ int main(int argc, char** argv)
     const auto mip_source = texture(2, 2, DXGI_FORMAT_R8G8B8A8_UNORM, 4);
     check("resolve a smaller mip", plan_resolve(&mips_target, 1, &mip_source, 0, DXGI_FORMAT_R8G8B8A8_UNORM, false).refusal == CopyRefusal::none);
 
-    check("names", std::strcmp(copy_refusal_name(CopyRefusal::range_overflow), "range_overflow") == 0 &&
+    // The resolve format follows a fully typed endpoint exactly; a typeless endpoint takes any member of its family.
+    const auto srgb_target = texture(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    const auto typeless_msaa = texture(4, 4, DXGI_FORMAT_R8G8B8A8_TYPELESS, 4);
+    const ResolvePlan typed_target = plan_resolve(&srgb_target, 0, &typeless_msaa, 0, DXGI_FORMAT_UNKNOWN, false);
+    check("resolve unknown over a typed destination", typed_target.refusal == CopyRefusal::none &&
+                                                          typed_target.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    check("resolve format against a typed destination", plan_resolve(&srgb_target, 0, &typeless_msaa, 0, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                                     false).refusal == CopyRefusal::format_mismatch);
+    const auto srgb_msaa = texture(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4);
+    check("resolve typed endpoints that differ", plan_resolve(&rgba, 0, &srgb_msaa, 0, DXGI_FORMAT_UNKNOWN, false).refusal ==
+                                                     CopyRefusal::format_mismatch);
+
+    // Families beyond the colour formats the resolve choice covers.
+    const auto bc7_typeless = texture(8, 8, DXGI_FORMAT_BC7_TYPELESS), bc7 = texture(8, 8, DXGI_FORMAT_BC7_UNORM),
+               bc1 = texture(8, 8, DXGI_FORMAT_BC1_UNORM), r16_typeless = texture(4, 4, DXGI_FORMAT_R16_TYPELESS),
+               r16 = texture(4, 4, DXGI_FORMAT_R16_UNORM), r8 = texture(4, 4, DXGI_FORMAT_R8_UNORM),
+               r8_typeless = texture(4, 4, DXGI_FORMAT_R8_TYPELESS);
+    check("copy BC7 typeless to typed", check_copy_resource(&bc7, &bc7_typeless, false) == CopyRefusal::none);
+    check("copy BC7 to BC1", check_copy_resource(&bc7, &bc1, false) == CopyRefusal::format_mismatch);
+    check("copy R16 typeless to typed", check_copy_resource(&r16, &r16_typeless, false) == CopyRefusal::none);
+    check("copy R8 typeless to typed", check_copy_resource(&r8, &r8_typeless, false) == CopyRefusal::none);
+    check("copy R8 to R16", check_copy_resource(&r8, &r16, false) == CopyRefusal::format_mismatch);
+
+    check("names", std::strcmp(copy_refusal_name(CopyRefusal::heap_direction), "heap_direction") == 0 &&
+                       std::strcmp(copy_refusal_name(CopyRefusal::initial_state), "initial_state") == 0 &&
+                       std::strcmp(copy_refusal_name(CopyRefusal::title_backed_source), "title_backed_source") == 0 &&
+                       std::strcmp(copy_refusal_name(CopyRefusal::range_overflow), "range_overflow") == 0 &&
                        std::strcmp(copy_refusal_name(CopyRefusal::none), "none") == 0);
 
     if (failures) return 1;
