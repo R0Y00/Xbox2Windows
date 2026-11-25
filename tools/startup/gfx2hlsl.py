@@ -2586,6 +2586,11 @@ class Stage:
                 c0, c1 = self.const_u32(ops[1]), self.const_u32(ops[2])
                 args = [self.u(ops[1], low16_only=c1 is not None and (c1 & 0xffff0000) == 0),
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
+            elif base == 'v_mad_u32_u16':
+                # S0 and S1 read only bits [15:0]; S2 reads all 32 bits.
+                args = [self.u(ops[1], low16_only=True),
+                        self.u(ops[2], low16_only=True),
+                        self.u(ops[3])]
             else:
                 args = [self.u(o) for o in ops[1:1 + arity]]
             if base in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32'):
@@ -5425,6 +5430,7 @@ VEC_U = {
     'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_mad_i32_i24': (3, 'asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8) + {2}'),
+    'v_mad_u32_u16': (3, '({0} & 0xffffu) * ({1} & 0xffffu) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_xor3_b32': (3, '{0} ^ {1} ^ {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
     'v_xad_u32': (3, '({0} ^ {1}) + {2}'), 'v_bfi_b32': (3, '({0} & {1}) | (~{0} & {2})'),
