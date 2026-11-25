@@ -34,11 +34,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends llvm-15 spirv-tools spirv-cross
           python3 -B - <<'PY'
-          import concurrent.futures
-          import os
-          import subprocess
+          import runpy
           import sys
-          import time
 
           COMMON_LLVM = ["binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"]
           SPIRV = ["spirv-as", "spirv-val", "spirv-cross"]
@@ -74,6 +71,7 @@ jobs:
               (["tests/compute_mimg_image_uav_load_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/compute_mimg_float_store_d16_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/compute_image_atomics_gfx1013_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
+              (["tests/compute_gather4_l_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/mesh_indexed_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_multi_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_descriptor_swap_check.py", *COMMON_LLVM], {}),
@@ -86,6 +84,7 @@ jobs:
               (["tests/startup_gfx2hlsl_cvt_pk_u8_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_b_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_sample_lod_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_c_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
@@ -102,6 +101,7 @@ jobs:
               (["tests/startup_gfx2hlsl_sgpr_spill_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_compute_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_calculated_target_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "binary", "llvm-mc-15"], {}),
@@ -119,35 +119,8 @@ jobs:
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_ngg_slice_check.py", "binary", "llvm-mc-15"], {}),
           ]
-
-          def run_one(item):
-              cmd, extra_env = item
-              env = {**os.environ, **extra_env} if extra_env else None
-              start = time.monotonic()
-              proc = subprocess.run(
-                  [sys.executable, "-B", *cmd],
-                  env=env,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True,
-                  errors="replace",
-              )
-              return cmd[0], proc.returncode, proc.stdout, time.monotonic() - start
-
-          failed = []
-          with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-              for script, code, output, secs in pool.map(run_one, CHECKS):
-                  print(f"::group::{script} ({'ok' if code == 0 else f'exit {code}'}, {secs:.1f}s)", flush=True)
-                  sys.stdout.write(output)
-                  if output and not output.endswith("\n"):
-                      sys.stdout.write("\n")
-                  print("::endgroup::", flush=True)
-                  if code != 0:
-                      failed.append(f"{script} (exit {code})")
-          if failed:
-              print("FAILED: " + ", ".join(failed), flush=True)
-              sys.exit(1)
-          print(f"all {len(CHECKS)} pixel-binary checks passed", flush=True)
+          sys.exit(runpy.run_path("tools/run_checks_parallel.py",
+                                  run_name="run_checks_parallel")["run_checks"](CHECKS))
           PY
   python-linux:
     name: Run platform-independent Python checks on Linux
@@ -202,6 +175,7 @@ jobs:
             tests/mesh_dynamic_geometry_check.py \
             tests/mesh_dynamic_aot_check.py \
             tests/mesh_lane_spill_check.py \
+            tests/mesh_join_descriptor_check.py \
             tests/pso_readiness_check.py \
             tests/xmem_attribute_scan_check.py \
             tests/xgameruntime_table_check.py \
@@ -214,6 +188,7 @@ jobs:
             tests/startup_sampler_heap_check.py \
             tests/startup_image_sample_l_check.py \
             tests/startup_image_sample_b_check.py \
+            tests/startup_image_sample_lod_check.py \
             tests/startup_image_gather_lz_check.py \
             tests/startup_image_gather_c_lz_check.py \
             tests/startup_image_sample_c_check.py \
@@ -240,6 +215,7 @@ jobs:
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_gfx2hlsl_readfirstlane_recompute_check.py \
+            tests/startup_gfx2hlsl_calculated_target_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \

@@ -474,10 +474,12 @@ def controls():
                        ('array min1 max1', 'smpl 0 0x0 0x100100 0x4000000 0x0')):
         manifest = stage(name).manifest()
         assert line in manifest.splitlines() and 'smp 0 ' not in manifest, (name, manifest)
-    # Negative control: the same words through an ordinary sample have no smpl line (their limits stay unbounded).
+    # Since #2177 an ordinary image_sample with a constant sampler carries the same limits (tests/startup_image_sample_lod_check.py
+    # draws it). Control: the same words through image_sample are the same smpl line, and with mip filter 0 the
+    # sampler stays an ordinary smp line (the ordinary forms leave that sampler as it was).
     other = G.Pipeline(VS_WORDS, bytes.fromhex(WORDS['array nobias']), root_blob())
     other.hlsl_ps()
-    assert 'smp 0 0x0 0x200000 0x4000000 0x0' in other.manifest().splitlines() and 'smpl' not in other.manifest()
+    assert 'smpl 0 0x0 0x200000 0x4000000 0x0' in other.manifest().splitlines() and 'smp ' not in other.manifest()
     refused('array min3 max2', 'image_sample_b with sampler MIN_LOD 0x300 above MAX_LOD 0x200')
     refused('mip filter none', 'image_sample_b with mipmapping disabled')
     refused('sampler from root constant', 'image_sample_b with a sampler that is not constant')

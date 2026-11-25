@@ -34,6 +34,8 @@ constexpr UINT texture_atomic_mask = texture_atomic_uint_flag | texture_atomic_s
                                      texture_atomic_uint_minmax_flag | texture_atomic_exchange_flag |
                                      texture_atomic_cas_flag;
 constexpr UINT texture_rgba32_float_flag = 1u << 30;
+// Image-load cases only: bind the t0 SRV from resource mip 1 (MostDetailedMip = 1).
+constexpr UINT texture_view_mip1_flag = 1u << 31;
 // Texture-store cases use only scalar X group counts of 1 or 2, leaving bits 21 and 22
 // free below the format and view selectors.
 constexpr UINT texture_uav_load_flag = 1u << 21;
@@ -129,7 +131,7 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
 static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                          ID3D12Resource* input, ID3D12Resource* output,
                                          ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1, UINT output_mip = 0,
-                                         UINT input_register = srvs - 1)
+                                         UINT input_register = srvs - 1, UINT texture_first_mip = 0)
 {
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     desc.NumDescriptors = uavs + srvs;
@@ -164,7 +166,16 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     for (UINT i = 0; i < srvs; ++i, cpu.ptr += stride) {
         // A texture SRV at t0 selects its own format; every other slot stays a raw buffer or null.
-        if (texture && i == 0)
+        if (texture && i == 0 && texture_first_mip) {
+            // A view that starts below the base level, so view-relative mip numbers differ from the resource's.
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = texture->GetDesc().Format;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Texture2D.MostDetailedMip = texture_first_mip;
+            view.Texture2D.MipLevels = static_cast<UINT>(-1);
+            device->CreateShaderResourceView(texture, &view, cpu);
+        } else if (texture && i == 0)
             device->CreateShaderResourceView(texture, nullptr, cpu);
         else
             device->CreateShaderResourceView(!texture && i == input_register ? input : nullptr, &srv, cpu);
@@ -199,7 +210,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
                         const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
                         DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr,
-                        bool dpp_case = false, bool sized_views = false)
+                        bool dpp_case = false, bool sized_views = false, UINT texture_first_mip = 0)
 {
     if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
@@ -231,7 +242,8 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         auto* image = rendered_texture ? rendered_texture : texture.Get();
         // A sized-view case binds both raw buffers at u0 and t0, so GetDimensions reports the view's byte size.
         heap = sized_views ? bind_tables(device, list.Get(), input.Get(), output.Get(), nullptr, 0, 0, 0)
-                           : bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1);
+                           : bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1,
+                                         0, srvs - 1, texture_first_mip);
     } else {
         list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
@@ -364,7 +376,9 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
     source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
     const bool rgba8 = (store.groups & texture_rgba8_flag) != 0;
-    store.groups &= ~texture_rgba8_flag;
+    const bool rgba32_float = (store.groups & texture_rgba32_float_flag) != 0;
+    const bool view_mip1 = (store.groups & texture_view_mip1_flag) != 0;
+    store.groups &= ~(texture_rgba8_flag | texture_rgba32_float_flag | texture_view_mip1_flag);
     const UINT base_words = texture_width * texture_height * (rgba8 ? 1 : texture_channels);
     std::vector<UINT> texels(base_words);
     source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
@@ -375,10 +389,13 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
         source.read(reinterpret_cast<char*>(texels.data() + base_words), extra_words * sizeof(UINT));
     }
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
-        store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5)
+        store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5 || (rgba8 && rgba32_float) ||
+        (view_mip1 && texels.size() == base_words))
         throw std::runtime_error("Invalid compute image load reference");
-    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
-    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format);
+    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
+        : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
+    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format,
+                nullptr, false, false, view_mip1 ? 1 : 0);
 }
 
 static ComPtr<ID3D12Resource> render_msaa_texture(ID3D12Device* device, D3D12_SHADER_BYTECODE vs,

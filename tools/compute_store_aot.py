@@ -6,7 +6,7 @@ import re
 import struct
 from pathlib import Path
 
-from pixel_aot import INTEGER, container_code, disassemble
+from pixel_aot import INTEGER, check_gather_sampler, container_code, disassemble
 from resource_inventory import parts
 
 
@@ -205,6 +205,24 @@ ALU_EXPRESSION_LIMIT = 1024
 IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4)}
 RGBA32_FLOAT = "R32G32B32A32_FLOAT"
 RGBA16_FLOAT = "R16G16B16A16_FLOAT"
+# image_gather4_l on the gfx1013 RGBA32 FLOAT SRV, with the sampler profile of pixel_aot.check_gather_sampler
+# (normalized coordinates, clamp to the last texel, point mip, no LOD bias). RDNA 2 MIMG gathers return one DMASK
+# component of the 2x2 bilinear footprint at the selected mip, in (0,1), (1,1), (1,0), (0,0) order in increasing
+# coordinates; Direct3D Gather uses the same order. The mip and both extents are relative to the bound view.
+# Clamping the scaled coordinate to [-1, size] before floor() selects the same edge texels and keeps the
+# float-to-int conversion in range. The caller keeps coordinates off tap boundaries (see experiments.md).
+GATHER_HLSL = """uint4 image_gather_2d(float2 uv, uint mip, uint component) {
+    uint width, height, levels;
+    imageData.GetDimensions(mip, width, height, levels);
+    int2 edge = int2(width, height) - 1;
+    precise float2 scaled = uv * float2(width, height) - 0.5f;
+    int2 origin = int2(floor(clamp(scaled, -1.0f, float2(width, height))));
+    return uint4(asuint(imageData.Load(int3(clamp(origin + int2(0, 1), 0, edge), mip))[component]),
+                 asuint(imageData.Load(int3(clamp(origin + int2(1, 1), 0, edge), mip))[component]),
+                 asuint(imageData.Load(int3(clamp(origin + int2(1, 0), 0, edge), mip))[component]),
+                 asuint(imageData.Load(int3(clamp(origin, 0, edge), mip))[component]));
+}
+"""
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
@@ -711,7 +729,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
           image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
           lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
           descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None, heap_view=None,
-          heap_store_view=None):
+          heap_store_view=None, gather_mips=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
@@ -748,6 +766,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     and selects signed min/max. R32_FLOAT declares a native atomic image carried as raw words
     in a desktop R32_UINT UAV. The caller guarantees finite-normal binary32 in the accessed texels
     and operand VGPRs by setting image_float_domain="finite-normal".
+    gather_mips declares the visible mip count of matching gfx1013 RGBA32 FLOAT native and desktop 2D views at t0
+    for one image_gather4_l (see GATHER_HLSL).
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -829,6 +849,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             raise ValueError("Invalid or overlapping image SRV descriptor (the UAV must be distinct)")
         descriptor_bindings[image_srv_descriptor] = ("image_srv", 0)
         descriptor_bindings[image_srv_descriptor + 16] = ("image_srv", 1)
+    if gather_mips is not None and (type(gather_mips) is not int or not 1 <= gather_mips <= 16
+                                    or not rgba32_float_image or image_output or image_descriptor is None):
+        raise ValueError("Gather requires a gfx1013 RGBA32 FLOAT image SRV at t0 with 1 to 16 visible mips")
+    gather_steps = []
     group_regs = {axis: reg for axis, reg in enumerate((group_reg, group_reg_y, group_reg_z)) if reg is not None}
     if (any(not 0 <= reg <= 105 or reg == table_reg for reg in group_regs.values())
             or len(set(group_regs.values())) != len(group_regs)):
@@ -1344,7 +1368,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
-        elif m := re.fullmatch(r"v_mov_b32(?:_e32|_e64)? v(\d+), (s\d+|v\d+|-?\d+|0x[0-9a-f]+)", line):
+        elif m := re.fullmatch(r"v_mov_b32(?:_e32|_e64)? v(\d+), (s\d+|v\d+|-?\d+|0x[0-9a-f]+|-?\d+\.\d+)", line):
             dst, src = int(m[1]), m[2]
             if dst > 255:
                 raise ValueError("Invalid vector destination")
@@ -1360,6 +1384,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if n > 255 or not is_word(val):
                     raise ValueError("Unresolved vector move source")
                 vector[dst] = val
+            elif "." in src:
+                # LLVM prints an inline float constant of a b32 move as a float (1.0 for 0x3f800000).
+                if src not in FLOAT_INLINE:
+                    raise ValueError("Invalid literal move")
+                vector[dst] = FLOAT_INLINE[src]
             else:
                 value = int(src, 0)
                 if not -(1 << 31) <= value <= 0xffffffff:
@@ -2382,6 +2411,48 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 elif signed:
                     value = f"asint({value})"
                 stores.append(f"    Interlocked{MUBUF_ATOMIC_METHODS[op]}({destination}, {value});")
+        elif m := re.match(r"image_gather4(\w*) ", line):
+            if m[1] != "_l":
+                raise ValueError(f"Unsupported gather form image_gather4{m[1]}: only 2D image_gather4_l is lowered")
+            m = re.fullmatch(r"image_gather4_l v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], "
+                             r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D", line)
+            if m is None:
+                raise ValueError("Unsupported image_gather4_l form: requires a 2D view, contiguous VGPRs "
+                                 "and no other modifier")
+            if gather_mips is None or guard_span is not None:
+                raise ValueError("image_gather4_l requires an unguarded lane and a declared gather view")
+            dst_first, dst_last, addr_first, addr_last, base, high, state_first, state_last = map(int, m.groups()[:8])
+            component = {"1": 0, "2": 1, "4": 2, "8": 3}.get(m[9])
+            if component is None:
+                raise ValueError("image_gather4_l requires a one-hot DMASK")
+            # RDNA 2 MIMG: four result VGPRs and U, V, LOD in consecutive address VGPRs.
+            if dst_last != dst_first + 3 or dst_last > 255 or addr_last != addr_first + 2 or addr_last > 255:
+                raise ValueError("Invalid image_gather4_l register range")
+            if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
+                raise ValueError("Unresolved image descriptor")
+            if tuple(scalar.get(base + index) for index in range(8)) != tuple(
+                    (("image", index // 4), index % 4) for index in range(8)):
+                raise ValueError("Unverified image descriptor")
+            words = [scalar.get(reg) if reg not in pending else None for reg in range(state_first, state_last + 1)]
+            if (state_last != state_first + 3 or state_first % 4 or state_last > 105
+                    or not all(isinstance(word, int) for word in words)):
+                raise ValueError("image_gather4_l requires a constant sampler")
+            check_gather_sampler(words, gather_mips, comparison=False)
+            u, v, lod = (vector.get(reg) for reg in range(addr_first, addr_last + 1))
+            if not (is_word(u) and is_word(v)):
+                raise ValueError("Unverified image coordinates")
+            # Point mip filtering of an integral LOD selects that view mip on both sides; anything else is refused.
+            level = struct.unpack("<f", struct.pack("<I", lod))[0] if isinstance(lod, int) else None
+            if level is None or not level.is_integer() or not 0 <= level < gather_mips:
+                raise ValueError("image_gather4_l requires a known integer LOD inside the view")
+            name = f"image_gather_{image_step_count}"
+            image_step_count += 1
+            staged_steps.append((None, f"    float2 {name}_uv = asfloat(uint2({hlsl_word(u)}, {hlsl_word(v)}));\n"
+                                       f"    uint4 {name} = image_gather_2d({name}_uv, {int(level)}u, {component}u);"))
+            gather_steps.append(name)
+            for index, reg in enumerate(range(dst_first, dst_last + 1)):
+                vector.pop(reg, None)
+                loading[reg] = ("alu", f"{name}.{'xyzw'[index]}")
         elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
@@ -2778,6 +2849,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         # format leaves the whole dispatch unwritten rather than publishing a placeholder result.
         valid = " && ".join(f"format_valid_{index}" for index in range(format_load_index))
         staged_steps.append((None, f"    if (!({valid})) return;"))
+    if gather_mips is not None and len(gather_steps) != 1:
+        raise ValueError("Expected one image_gather4_l for the declared gather view")
+    if gather_steps:
+        # A NaN or infinite coordinate has no established native result: publish nothing for that invocation.
+        finite = " && ".join(f"all(isfinite({name}_uv))" for name in gather_steps)
+        staged_steps.append((None, f"    if (!({finite})) return;"))
     if not stores:
         raise ValueError("Expected at least one observable store")
     if guard is not None and guard["label"] is not None and not guard["at_label"]:
@@ -2828,6 +2905,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     for name, view in (("uav_bytes", "outputData"), ("srv_bytes", "inputData")):
         if f"{name}(" in body:
             descriptor_hlsl += f"uint {name}() {{ uint n; {view}.GetDimensions(n); return n; }}\n"
+    if gather_steps:
+        descriptor_hlsl += GATHER_HLSL
     return (f"{cbuffer}{uav} outputData : register(u0);\n{descriptor_hlsl}"
             f"[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
@@ -2888,6 +2967,8 @@ def main():
                         help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
     parser.add_argument("--wave-size", type=int, choices=(32,),
                         help="Caller's statement that the program runs as wave32, for lane indices in larger groups")
+    parser.add_argument("--gather-mips", type=int,
+                        help="Visible mip count of the matching native and desktop RGBA32 FLOAT 2D gather views")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")
@@ -2912,7 +2993,8 @@ def main():
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
                    descriptor_format_constant=args.descriptor_format_constant,
                    rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant,
-                   heap_view=tuple(args.heap_view) if args.heap_view else None, heap_store_view=args.heap_store_view)
+                   heap_view=tuple(args.heap_view) if args.heap_view else None, heap_store_view=args.heap_store_view,
+                   gather_mips=args.gather_mips)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
