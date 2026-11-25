@@ -34,11 +34,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends llvm-15 spirv-tools spirv-cross
           python3 -B - <<'PY'
-          import concurrent.futures
-          import os
-          import subprocess
+          import runpy
           import sys
-          import time
 
           COMMON_LLVM = ["binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"]
           SPIRV = ["spirv-as", "spirv-val", "spirv-cross"]
@@ -119,35 +116,8 @@ jobs:
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_ngg_slice_check.py", "binary", "llvm-mc-15"], {}),
           ]
-
-          def run_one(item):
-              cmd, extra_env = item
-              env = {**os.environ, **extra_env} if extra_env else None
-              start = time.monotonic()
-              proc = subprocess.run(
-                  [sys.executable, "-B", *cmd],
-                  env=env,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True,
-                  errors="replace",
-              )
-              return cmd[0], proc.returncode, proc.stdout, time.monotonic() - start
-
-          failed = []
-          with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-              for script, code, output, secs in pool.map(run_one, CHECKS):
-                  print(f"::group::{script} ({'ok' if code == 0 else f'exit {code}'}, {secs:.1f}s)", flush=True)
-                  sys.stdout.write(output)
-                  if output and not output.endswith("\n"):
-                      sys.stdout.write("\n")
-                  print("::endgroup::", flush=True)
-                  if code != 0:
-                      failed.append(f"{script} (exit {code})")
-          if failed:
-              print("FAILED: " + ", ".join(failed), flush=True)
-              sys.exit(1)
-          print(f"all {len(CHECKS)} pixel-binary checks passed", flush=True)
+          sys.exit(runpy.run_path("tools/run_checks_parallel.py",
+                                  run_name="run_checks_parallel")["run_checks"](CHECKS))
           PY
   python-linux:
     name: Run platform-independent Python checks on Linux
