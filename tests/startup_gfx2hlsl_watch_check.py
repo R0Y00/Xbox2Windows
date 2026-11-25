@@ -12,6 +12,7 @@ back to the processor count.
 """
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,37 @@ with tempfile.TemporaryDirectory() as tmp:
     touch(d / ('%016x.txt' % 9))
     expect('watch pass', scan(d, True), [1, 5, 6, 9])
     expect('one-shot pass', scan(d, False), [1, 4, 5, 6, 9])
+
+def mesh57_fixture(ms, ps, expected, tamper=False):
+    root = (b'DXBC' + bytes(24) + struct.pack('<II', 1, 36) + b'RTS0' +
+            struct.pack('<I6I', 24, 1, 0, 24, 0, 24, 0))
+    key = gfx2hlsl.mesh57_key(ms, ps, root)
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        source = d / ('req_%016x' % key)
+        touch(source.with_suffix('.root'), root)
+        touch(source.with_suffix('.ps57'), ps)
+        expect('mesh request needs a ready marker', scan(d, False), [])
+        touch(source.with_suffix('.m57'), ms + (bytes(4) if tamper else b''))
+        expect('mesh ready marker is watched', scan(d, False), [key])
+        expect('mesh requests stay out of VS/PS enumeration', list(gfx2hlsl.request_keys(d)), [])
+        expect('mesh reader: ' + expected, gfx2hlsl.translate_request(d, key), 'unsupported: ' + expected)
+        expect('mesh failure is read once per watch pass', scan(d, True), [])
+        expect('no vertex or mesh bytecode is published', list(d.glob('*.cso')), [])
+
+
+# RDNA2 synthetic descriptor programs: allocate geometry, export position and primitive, and terminate.
+position = (0xf80008cf, 0x03020100)
+primitive = (0xf8000941, 0)
+endpgm = 0xbf810000
+mesh = struct.pack('<6I', 0xbf900009, *position, *primitive, endpgm)
+pixel = struct.pack('<3I', 0xf800080f, 0x03020100, endpgm)
+vertex = struct.pack('<3I', *position, endpgm)
+mesh57_fixture(mesh, pixel, 'slot 57 mesh code emission is unavailable')
+mesh57_fixture(mesh, b'', 'slot 57 mesh code emission is unavailable')
+mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
+mesh57_fixture(mesh, vertex, 'slot 57 pixel stage has an incompatible export or termination')
+mesh57_fixture(mesh, pixel, 'slot 57 mesh request key mismatch', tamper=True)
 
 # Parallel --pending must give the same results as one worker. Sixteen RTV variants each name a
 # different missing base request, so each failure names its own base and a result reported against
