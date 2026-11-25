@@ -2216,6 +2216,8 @@ enum { indirect_forwarded, indirect_graphics_pipeline, indirect_compute_pipeline
        indirect_outcomes };
 volatile LONG64 indirect_calls[indirect_outcomes][5];
 
+const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset);
+
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
@@ -2247,14 +2249,16 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
+    const bool translated = command == IndirectCommand::draw && pass.pipeline && !pass.pipeline->own().real &&
+        pass.graphics_root && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
     u64 bytes = sig->own().indirect_bytes;
     if (graphics && (count != 1 || count_buffer)) return refuse("indirect graphics requires one command and no count buffer");
     if (graphics) {
         if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
-        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
-            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh) {
+        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || (!translated && (!pass.indirect_graphics.root ||
+            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh))) {
             // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
             // nothing is drawn.
             if (pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
@@ -2265,7 +2269,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                           indirect_graphics_pipeline);
         }
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
-            pass.target_formats[0] != pass.indirect_graphics.target_format ||
+            (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
             return refuse("indirect graphics requires one matching target, viewport and scissor");
         if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
@@ -2296,6 +2300,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
         return refuse("argument buffer does not use COMMON state tracking");
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
+    if (translated) {
+        const char* failure = draw_translated_indirect(self, static_cast<ID3D12CommandSignature*>(sig->own().real), resource, offset);
+        if (failure) return refuse(failure, indirect_graphics_pipeline);
+        InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
+        return;
+    }
     auto argument_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     if (indexed) {
         auto view = pass.ib;
