@@ -57,6 +57,7 @@ jobs:
               (["tests/depth_mask_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_entry_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_dynamic_geometry_check.py", *COMMON_LLVM], {}),
+              (["tests/mesh_two_exits_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_heap_sampler_check.py", *COMMON_LLVM], {}),
               (["tests/rdna2_tools_check.py"], {"LLVM_LIB": "libLLVM-15.so.1", "LLVM_MC": "llvm-mc-15", "LLVM_OBJCOPY": "llvm-objcopy-15"}),
               (["tests/ffx_dispatch_aot_check.py", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
@@ -86,6 +87,7 @@ jobs:
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_b_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_image_gather_c_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_load_mip_check.py", "--llvm-mc", "llvm-mc-15"], {}),
@@ -213,6 +215,7 @@ jobs:
             tests/startup_image_sample_l_check.py \
             tests/startup_image_sample_b_check.py \
             tests/startup_image_gather_lz_check.py \
+            tests/startup_image_gather_c_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
             tests/startup_image_load_mip_check.py \
