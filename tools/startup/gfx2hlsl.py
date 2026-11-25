@@ -899,8 +899,10 @@ class Stage:
         for n in list(range(4)) + list(range(root_end, user)):
             self.sym[n] = ('unknown user sgpr',)
         self.entry = []
+        self.entry_uniform_s = set()
         for axis, n in sorted(groups.items()):
             self.used_s.add(n)
+            self.entry_uniform_s.add(n)
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
         for i in range(threads):
             self.used_v.add(i)
@@ -1095,8 +1097,18 @@ class Stage:
                 uniform = self.scalar_expr_uniform(expr)
             if uniform:
                 self.varying_s.discard(n)
+                if hasattr(self, 'defined_uniform_s'):
+                    self.defined_uniform_s.add(n)
+                if hasattr(self, '_uniform_written'):
+                    self._uniform_written.add(n)
             else:
                 self.varying_s.add(n)
+                if hasattr(self, 'defined_uniform_s'):
+                    self.defined_uniform_s.discard(n)
+                if hasattr(self, '_uniform_written'):
+                    self._uniform_written.discard(n)
+                if hasattr(self, 'bad_sgprs'):
+                    self.bad_sgprs.add(n)
             # Invariant: since_join gains an SGPR only here, when set_s proves it uniform; forget_writes drops any SGPR
             # an instruction writes first, so a write through an unmodelled path never keeps a stale mark.
             if getattr(self, 'since_join', None) is not None:
@@ -1146,17 +1158,22 @@ class Stage:
         return None if any(w is None for w in words) else words
 
     # ---- instruction translation -------------------------------------------------------------
-    def joined_registers(self):
+    def joined_registers(self, with_cfg=False):
         """{branch target: registers whose program-order symbol may not hold on every path into it}.
 
         Program order carries the state after every instruction above the target into it. That state holds on every
         path only for a register whose writes above the target are all in blocks that dominate it (in dominance
         order), and which no block that reaches it from at or below it writes (a loop body, or a later block that
         branches back). Computed over the basic blocks, so a path that leaves a loop's textual range and comes back
-        counts."""
+        counts.
+
+        With ``with_cfg=True``, returns ``(joined, forward_splits, div_targets)`` where ``forward_splits`` keeps only
+        writes on non-dominating forward arms between a target's dominators and the target (excluding loop back edges)
+        and ``div_targets`` maps each ``s_cbranch_*`` offset to ``(writes, affected_targets)`` inside its divergent
+        CFG region (between the branch and its immediate post-dominator, or over the loop range for a backward edge)."""
         ins = self.ins
         if not ins:
-            return {}
+            return ({}, {}, {}) if with_cfg else {}
         index = {off: i for i, (off, *_) in enumerate(ins)}
         calculated = getattr(self, 'calculated_pc', {})  # unit probes build a Stage without translate()
         branch = lambda name: name.startswith('s_cbranch') or name in ('s_branch', 's_setpc_b64')
@@ -1168,6 +1185,7 @@ class Stage:
                 leaders.add(ins[i + 1][0])
         starts = sorted(index[o] for o in leaders if o in index)
         bounds = list(zip(starts, starts[1:] + [len(ins)]))
+        off_of = [ins[lo][0] for lo, _ in bounds]
         block_of = {}
         for b, (lo, hi) in enumerate(bounds):
             for i in range(lo, hi):
@@ -1193,8 +1211,9 @@ class Stage:
                 new = ({b} | set.intersection(*(dom[p] for p in pred[b]))) if pred[b] else {b}
                 if new != dom[b]:
                     dom[b], changed = new, True
-        joined = {}
-        for target in leaders - {0} | ({0} if any(0 in s for s in succ) else set()):
+        all_targets = leaders - {0} | ({0} if any(0 in s for s in succ) else set())
+        joined, forward_splits = {}, {}
+        for target in all_targets:
             if target not in index:
                 continue
             t = block_of[index[target]]
@@ -1212,10 +1231,61 @@ class Stage:
                 if b in reach and b >= t:
                     regs |= writes[b]  # a loop body or a later block that comes back
             # Writes in dominating blocks hold on every path only if their textual order is their execution order.
-            if any(not (a in dom[c]) for a, c in zip(above_dominators, above_dominators[1:])):
+            non_chain = any(not (a in dom[c]) for a, c in zip(above_dominators, above_dominators[1:]))
+            if non_chain:
                 regs |= set().union(*(writes[b] for b in above_dominators))
             joined[target] = regs
-        return joined
+            if with_cfg:
+                above_set = dom[t] - {t}
+                split_blks, stodo = set(), [p for p in pred[t] if p < t and p not in above_set]
+                while stodo:
+                    b = stodo.pop()
+                    if b not in split_blks:
+                        split_blks.add(b)
+                        stodo += [p for p in pred[b] if p < t and p not in above_set]
+                fwd = set().union(*(writes[b] for b in split_blks)) if split_blks else set()
+                if non_chain:
+                    fwd |= set().union(*(writes[b] for b in above_dominators))
+                forward_splits[target] = fwd
+        if not with_cfg:
+            return joined
+        pdom = [set(range(len(bounds))) if succ[b] else {b} for b in range(len(bounds))]
+        changed = True
+        while changed:
+            changed = False
+            for b in range(len(bounds) - 1, -1, -1):
+                if not succ[b]:
+                    continue
+                new = {b} | set.intersection(*(pdom[s] for s in succ[b]))
+                if new != pdom[b]:
+                    pdom[b], changed = new, True
+        div_targets = {}
+        for b, (lo, hi) in enumerate(bounds):
+            off, _n, name, asm = ins[hi - 1]
+            if not name.startswith('s_cbranch'):
+                continue
+            tgt = target_of(off, name, asm)
+            if tgt is None:
+                continue
+            if tgt <= off:
+                t_blk = block_of[index[tgt]] if tgt in index else b
+                loop_blks = range(min(t_blk, b), b + 1)
+                regs = set().union(*(writes[w] for w in loop_blks))
+                affected = {off_of[w] for w in loop_blks} & all_targets
+            else:
+                stop = pdom[b] - {b}
+                ipd = max(stop, key=lambda x: len(pdom[x])) if stop else None
+                div, dtodo = set(), list(succ[b])
+                while dtodo:
+                    w = dtodo.pop()
+                    if w == ipd or w in div:
+                        continue
+                    div.add(w)
+                    dtodo += succ[w]
+                regs = set().union(*(writes[w] for w in div)) if div else set()
+                affected = ({off_of[w] for w in div} | ({off_of[ipd]} if ipd is not None else set())) & all_targets
+            div_targets[off] = (regs, affected)
+        return joined, forward_splits, div_targets
 
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
@@ -1239,127 +1309,207 @@ class Stage:
                 if name == 's_cbranch_execz' and self.kind == 'cs':
                     skipped.append((off, target))
         join_writes = self.join_writes(branches)
-        scc_effects = {}
-        self.blocks = []          # (offset, [lines], terminator)
-        self.uniform_v = set()
-        self.varying_s = set()
-        self.scc_uniform = True
-        self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
-        self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
-        self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
-        self.has_branches = bool(targets)
-        self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
-        self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
-        joined = self.joined_registers()
-        forced = getattr(self, 'force_joined', {})  # unit probes build a Stage without __init__
-        entry_ud = {reg: sym for reg, sym in self.sym.items() if sym[0] == 'ud'}  # never assigned at run time
-        materialize = {}  # entry register -> its root-constant source, assigned at entry because a join reads it
-        incoming = {}     # forward target -> (the joined registers' symbols, those written) at each branch to it
-        kept = {}         # target -> joined register -> the symbol every path known so far brings (kept there)
-        self.back_force = {}  # target -> register -> 'run' | 'refuse': a back edge disagrees with what was kept
-        # SGPRs written on the path being translated. A path that never wrote a register brings no value to a join
-        # (reading it there would read whatever the hardware left), so it does not constrain the meet. Every SGPR up
-        # to the last one the entry state names counts as written (hardware-initialized), and for graphics stages all
-        # user SGPRs s0-s15 too, so an entry value is never taken for an unwritten register.
-        # (unit probes build a Stage without __init__, so kind and used_s may be missing)
-        entry = [r for r in set(self.sym) | set(getattr(self, 'used_s', ())) if isinstance(r, int)]
-        written = set(range(max(entry + [-1 if getattr(self, 'kind', None) == 'cs' else 15]) + 1)) | {'m0'}
+        joined, forward_splits, div_targets = self.joined_registers(with_cfg=True)
+        init_sym = dict(self.sym)
+        init_exec_known = getattr(self, 'exec_known', True)
+        init_wqm_exec = getattr(self, 'wqm_exec', False)
+        init_masks = set(getattr(self, 'masks', ()))
+        init_attrs = dict(getattr(self, 'attrs', {}))
+        init_used_s = set(getattr(self, 'used_s', ()))
+        init_used_v = set(getattr(self, 'used_v', ()))
+        init_entry_uniform = set(getattr(self, 'entry_uniform_s', ())) | {
+            k for k, v in init_sym.items()
+            if isinstance(k, int) and v and (
+                (v[0] == 'const' and len(v) == 2) or v[0] in ('ud', 'fixed_buffer_word')
+            )
+        }
+        entry_ud = {reg: sym for reg, sym in init_sym.items() if sym[0] == 'ud'}
+        local_forced = {t: dict(regs) for t, regs in getattr(self, 'force_joined', {}).items()}
+        force_unproven = set()
+        force_at = {}
+        first_refusal = len(refusals) if refusals is not None else 0
         every_sgpr = set(range(106)) | {'m0'}
-        start = 0
-        falls = True      # the instruction above falls through (the entry path reaches the first one)
-        for off, n, name, asm in self.ins:
-            if off in targets and off != start:
-                self.pinned_low16_v.update(self.low16_only_v)
-                self.blocks.append((start, self.lines, None))
-                self.lines, start = [], off
-            if off in targets:
-                # A branch target joins paths, and the symbol tracked in program order holds on all of them only for
-                # a register outside the joined set. A joined register keeps its symbol when every path into the
-                # target brings an equal one that names one value (back edges are checked once the loop body is
-                # translated, see back_force). Otherwise it is read at run time from here on, which every constant
-                # allows (each is assigned when set; entry root constants are assigned at entry); one that holds, on
-                # some path, a symbol with no run-time value (a descriptor word, a pointer, an unplaced entry
-                # register) gets a symbol that refuses any read before the next write.
-                kept[off] = {}
-                here = joined.get(off, set())
-                arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
-                    incoming.get(off, [])
-                written = (written - here) | set().union(*(w for _, w in arriving))
-                for reg in here:
-                    paths = [s[reg] for s, w in arriving if reg in w]  # paths that never wrote it bring nothing
-                    force = forced.get(off, {}).get(reg)
-                    if any(reg not in w for _, w in arriving) and any(p and not run_time_symbol(p) for p in paths):
-                        # An edge with no definition brings the hardware's leftover, not this symbol: unproven.
-                        self.sym[reg] = ('joined at a branch target',)
-                        continue
-                    if force is None and paths and names_one_value(paths[0]) and all(p == paths[0] for p in paths):
-                        self.sym[reg] = kept[off][reg] = paths[0]
-                        continue
-                    if force == 'refuse' or any(p and not run_time_symbol(p) for p in paths):
-                        self.sym[reg] = ('joined at a branch target',)
-                        continue
-                    if reg in entry_ud:
-                        materialize[reg] = 'ud%d' % entry_ud[reg][1]
-                    self.sym.pop(reg, None)
-                    if reg != 'm0':
-                        self.used_s.add(reg)
-            if name.startswith('s_cbranch') or name == 's_branch' or (name == 's_setpc_b64' and self.calculated_pc.get(off) is not None):
-                target = self.calculated_pc[off] if name == 's_setpc_b64' else int(parse(asm)[1][0].split('_')[1], 16)
-                there = joined.get(target, set())
-                if target > off:
-                    incoming.setdefault(target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
-                else:
-                    for reg in there & written:
-                        back, sym = self.sym.get(reg), kept.get(target, {}).get(reg)
-                        if back and not run_time_symbol(back) and back != sym:
-                            self.back_force.setdefault(target, {})[reg] = 'refuse'
-                        elif sym is not None and back != sym:
-                            self.back_force.setdefault(target, {}).setdefault(
-                                reg, 'run' if run_time_symbol(sym) else 'refuse')
-            falls = name not in ('s_branch', 's_setpc_b64', 's_endpgm')
-            dests = scalar_destinations(name, asm)
-            written |= every_sgpr if 'any' in dests else dests
-            self.pc = off
-            self.scc_effect = None
-            # Before the first branch target or terminator every path has run exactly the instructions above, so
-            # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
-            # branch-free program is past it too (dead code).
-            self.past_entry = bool(self.blocks) or 0 in targets
-            if off in targets:
-                # A join: another path can reach here with other VGPR, SGPR and SCC values, so no proof survives.
-                self.uniform_v.clear()
-                self.since_join, self.scc_uniform = set(), False
-                # A constant is only known here if no other path into the join writes the register: a loop counter
-                # set before the loop and incremented in it reaches the loop head with a new value on every pass.
-                # set_s also assigns constants at run time, so the register reads its real value once it is dropped.
-                for reg in join_writes.get(off, ()):
-                    if (self.sym.get(reg) or ('',))[0] == 'const':
-                        del self.sym[reg]
-            try:
-                if any(branch < off < target or target <= off < branch for branch, target in skipped) and (
-                        name.startswith(('s_', 'v_readlane', 'v_readfirstlane', 'v_writelane'))
-                        and not name.startswith(SKIPPABLE_SCALAR)
-                        and not (name == 's_setpc_b64' and off in self.calculated_pc)):
-                    # The wave runs this block when any lane is active, so its scalar state changes for every
-                    # lane; the one-lane model would skip it for an inactive lane.
-                    raise Unsupported('%s inside a block s_cbranch_execz skips per lane' % name)
-                term = self.one(name, asm)
-            except Unsupported as reason:
-                if refusals is None:
-                    raise
-                refusals.append((str(reason), self.kind))
+        init_entry = [r for r in set(init_sym) | init_used_s if isinstance(r, int)]
+        init_written = set(range(max(init_entry + [-1 if getattr(self, 'kind', None) == 'cs' else 15]) + 1)) | {'m0'}
+
+        for _ in range(max(4, len(self.ins) + 2)):
+            scc_effects = {}
+            self.lines = []
+            self.blocks = []          # (offset, [lines], terminator)
+            self.sym = dict(init_sym)
+            self.exec_known = init_exec_known
+            self.wqm_exec = init_wqm_exec
+            self.masks = set(init_masks)
+            self.attrs = dict(init_attrs)
+            self.used_s, self.used_v = set(init_used_s), set(init_used_v)
+            self.exports = {}
+            self.write_masks = {}
+            self.compr_params = set()
+            self.plain_params = {}
+            self.f16_plain = {}
+            self.uses_pos = False
+            self.fetched = False
+            self.uniform_v = set()
+            self.varying_s = set()
+            self.scc_uniform = True
+            self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
+            self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
+            self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
+            self.has_branches = bool(targets)
+            self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+            self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
+            self.defined_uniform_s = set(init_entry_uniform)
+            self.bad_sgprs = set()
+            bad_at_target = {}
+            tentative_kept = set()
+            materialize = {}
+            incoming = {}
+            kept = {}
+            self.back_force = {}
+            written = set(init_written)
+            falls = True
+            start = 0
+            raised_unsupported = None
+
+            for off, n, name, asm in self.ins:
+                if off in targets and off != start:
+                    self.pinned_low16_v.update(self.low16_only_v)
+                    self.blocks.append((start, self.lines, None))
+                    self.lines, start = [], off
+                self.pc = off
+                self.scc_effect = None
+                # Before the first branch target or terminator every path has run exactly the instructions above, so
+                # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
+                # branch-free program is past it too (dead code).
+                self.past_entry = bool(self.blocks) or 0 in targets
+                if off in targets:
+                    pre_uniform = {
+                        r for r in (self.defined_uniform_s if self.since_join is None else self.since_join)
+                        if r not in self.varying_s and r not in self.masks
+                    }
+                    kept[off] = {}
+                    here = joined.get(off, set())
+                    arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
+                        incoming.get(off, [])
+                    written = (written - here) | set().union(*(w for _, w in arriving))
+                    for reg in here:
+                        paths = [s[reg] for s, w in arriving if reg in w]
+                        force = local_forced.get(off, {}).get(reg)
+                        if any(reg not in w for _, w in arriving) and any(p and not run_time_symbol(p) for p in paths):
+                            self.sym[reg] = ('joined at a branch target',)
+                            continue
+                        if force is None and paths and names_one_value(paths[0]) and all(p == paths[0] for p in paths):
+                            self.sym[reg] = kept[off][reg] = paths[0]
+                            continue
+                        if force == 'refuse' or any(p and not run_time_symbol(p) for p in paths):
+                            self.sym[reg] = ('joined at a branch target',)
+                            continue
+                        if reg in entry_ud:
+                            materialize[reg] = 'ud%d' % entry_ud[reg][1]
+                        self.sym.pop(reg, None)
+                        if reg != 'm0':
+                            self.used_s.add(reg)
+                    clobber = here if off in joined else every_sgpr
+                    fwd_clobber = forward_splits.get(off, clobber)
+                    blocked = force_unproven | force_at.get(off, set())
+                    kept_u = {
+                        r for r in pre_uniform
+                        if r not in clobber or (r not in fwd_clobber and r not in blocked)
+                    }
+                    tentative_kept.update((kept_u & clobber) - blocked)
+                    self.uniform_v.clear()
+                    self.since_join, self.scc_uniform = kept_u, False
+                    # A constant is only known here if no other path into the join writes the register: a loop counter
+                    # set before the loop and incremented in it reaches the loop head with a new value on every pass.
+                    # set_s also assigns constants at run time, so the register reads its real value once it is dropped.
+                    for reg in join_writes.get(off, ()) | (clobber & every_sgpr):
+                        if (self.sym.get(reg) or ('',))[0] == 'const':
+                            del self.sym[reg]
+                    self.defined_uniform_s = set(kept_u) | {
+                        k for k, v in self.sym.items()
+                        if isinstance(k, int) and v and (
+                            (v[0] == 'const' and len(v) == 2) or v[0] in ('ud', 'fixed_buffer_word')
+                        )
+                    }
+                if name.startswith('s_cbranch') or name == 's_branch' or (
+                        name == 's_setpc_b64' and self.calculated_pc.get(off) is not None):
+                    b_target = self.calculated_pc[off] if name == 's_setpc_b64' else int(parse(asm)[1][0].split('_')[1], 16)
+                    there = joined.get(b_target, set())
+                    if b_target > off:
+                        incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                    else:
+                        for reg in there & written:
+                            back, sym = self.sym.get(reg), kept.get(b_target, {}).get(reg)
+                            if back and not run_time_symbol(back) and back != sym:
+                                self.back_force.setdefault(b_target, {})[reg] = 'refuse'
+                            elif sym is not None and back != sym:
+                                self.back_force.setdefault(b_target, {}).setdefault(
+                                    reg, 'run' if run_time_symbol(sym) else 'refuse')
+                falls = name not in ('s_branch', 's_setpc_b64', 's_endpgm')
+                dests = scalar_destinations(name, asm)
+                written |= every_sgpr if 'any' in dests else dests
+                try:
+                    if any(branch < off < target or target <= off < branch for branch, target in skipped) and (
+                            name.startswith(('s_', 'v_readlane', 'v_readfirstlane', 'v_writelane'))
+                            and not name.startswith(SKIPPABLE_SCALAR)
+                            and not (name == 's_setpc_b64' and off in self.calculated_pc)):
+                        # The wave runs this block when any lane is active, so its scalar state changes for every
+                        # lane; the one-lane model would skip it for an inactive lane.
+                        raise Unsupported('%s inside a block s_cbranch_execz skips per lane' % name)
+                    base = re.sub(r'_e(32|64)$', '', name)
+                    if base.startswith('s_cbranch_'):
+                        cond = base[10:]
+                        cond_uniform = cond in ('scc0', 'scc1') and self.scc_uniform
+                        if not cond_uniform:
+                            b_target = int(parse(asm)[1][0].split('_')[1], 16)
+                            regs, affected = div_targets.get(off, (set(), set()))
+                            regs = {r for r in regs if isinstance(r, int)}
+                            if b_target <= off:
+                                regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
+                            for tgt_off in affected:
+                                bad_at_target.setdefault(tgt_off, set()).update(regs)
+                    term = self.one(name, asm)
+                except Unsupported as reason:
+                    if refusals is None:
+                        raised_unsupported = reason
+                        break
+                    refusals.append((str(reason), self.kind))
+                    continue
+                except Exception as error:
+                    if refusals is None:
+                        raise
+                    refusals.append((handler_error(name, error, refusals), self.kind))
+                    continue
+                if self.scc_effect:
+                    scc_effects[off] = self.scc_effect
+                if term:
+                    self.pinned_low16_v.update(self.low16_only_v)
+                    self.blocks.append((start, self.lines, term))
+                    self.lines, start = [], off + n
+
+            grown_forced = False
+            for t, regs in self.back_force.items():
+                have = local_forced.setdefault(t, {})
+                for reg, kind in regs.items():
+                    if have.get(reg) not in (kind, 'refuse'):
+                        have[reg], grown_forced = kind, True
+            new_bad = self.bad_sgprs - force_unproven
+            new_at = {k: v - force_at.get(k, set()) for k, v in bad_at_target.items() if v - force_at.get(k, set())}
+            if grown_forced or ((new_bad or new_at) and tentative_kept):
+                force_unproven.update(new_bad)
+                for k, v in new_at.items():
+                    force_at.setdefault(k, set()).update(v)
+                if refusals is not None:
+                    del refusals[first_refusal:]
                 continue
-            except Exception as error:
-                if refusals is None:
-                    raise
-                refusals.append((handler_error(name, error, refusals), self.kind))
-                continue
-            if self.scc_effect:
-                scc_effects[off] = self.scc_effect
-            if term:
-                self.pinned_low16_v.update(self.low16_only_v)
-                self.blocks.append((start, self.lines, term))
-                self.lines, start = [], off + n
+            if raised_unsupported is not None:
+                raise raised_unsupported
+            break
+        else:
+            reason = 'v_readfirstlane_b32 uniformity proof exceeded pass limit'
+            if refusals is None:
+                raise Unsupported(reason)
+            refusals.append((reason, self.kind))
         if self.lines:
             self.blocks.append((start, self.lines, None))
         self.materialized = materialize  # declarations() assigns these before the body (and before any loop)
@@ -1449,8 +1599,11 @@ class Stage:
         base = re.sub(r'_e(32|64)$', '', name)
         # Compute the proof before lowering, since a destination can also be a source.
         dst = None
+        self._uniform_written = set()
         if self.tracks_uniformity() and hasattr(self, 'uniform_expr'):
-            self.forget_writes(name, ops)
+            wrote_s = {r for r in self.forget_writes(name, ops, drop_since=False) if isinstance(r, int)}
+        else:
+            wrote_s = set()
         # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
         # Past the entry block of a program with branches the read recomputes the defining expression, so the
         # proof no longer needs a known exec (see op_v_readfirstlane_b32).
@@ -1468,6 +1621,18 @@ class Stage:
                     dst = candidate[1]
         self.last_v = None
         term = self.lower(base, asm, ops, mods)
+        uniform_written = self._uniform_written
+        if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
+            self.since_join -= (wrote_s - uniform_written)
+        if wrote_s and hasattr(self, 'bad_sgprs'):
+            for r in wrote_s - uniform_written:
+                sym = self.sym.get(r)
+                if (r in self.varying_s or r in getattr(self, 'masks', ()) or
+                        (sym is not None and sym[0] not in ('const', 'ud', 'fixed_buffer_word')) or
+                        (hasattr(self, 'defined_uniform_s') and r not in self.defined_uniform_s)):
+                    if hasattr(self, 'defined_uniform_s'):
+                        self.defined_uniform_s.discard(r)
+                    self.bad_sgprs.add(r)
         if dst is not None:
             self.uniform_v.add(dst)
             if hasattr(self, 'uniform_expr'):
@@ -1527,9 +1692,9 @@ class Stage:
         ops = [ops[0], '%sv%d%s' % (src.group(1), DPP_SCRATCH, src.group(3))] + ops[2:]
         return self.lower(base, asm, ops, [])
 
-    def forget_writes(self, name, ops):
+    def forget_writes(self, name, ops, drop_since=True):
         """Before an instruction runs: an EXEC write ends every recomputable expression, and an SGPR write ends the
-        expressions that read it and that SGPR's since-join mark (set_s marks it again when it proves the new value).
+        expressions that read it and (when drop_since is set) that SGPR's since-join mark (set_s marks it again when it proves the new value).
         The VGPR proofs stay: the entry-block read copies the VGPR, which neither write changes."""
         if writes_exec(name, ops):
             self.uniform_expr.clear()
@@ -1539,12 +1704,13 @@ class Stage:
             if r and r[0] == 's':
                 regs.update(range(r[1], r[2] + 1))
         if not regs:
-            return
-        if self.since_join is not None:
+            return set()
+        if drop_since and self.since_join is not None:
             self.since_join -= regs
         for v in [v for v, expr in self.uniform_expr.items()
                   if regs & {int(n) for n in re.findall(r'\bs(\d+)\b', expr)}]:
             del self.uniform_expr[v]
+        return regs
 
     def lower(self, base, asm, ops, mods):
         pc = getattr(self, 'pc', None)
