@@ -210,6 +210,7 @@ jobs:
             tests/startup_gfx2hlsl_smem_offset_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
+            tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \

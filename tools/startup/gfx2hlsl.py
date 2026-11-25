@@ -1070,6 +1070,88 @@ class Stage:
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
         return None
 
+    def scalar_const(self, tok):
+        """Value of a 32-bit scalar source that is known at translation time, else None."""
+        r = reg_range(tok)
+        if r:
+            return self.is_const(r[1]) if r[0] == 's' and r[1] == r[2] else None
+        try:
+            return int(tok, 0) & 0xffffffff
+        except ValueError:
+            return None
+
+    def scalar_wide_op(self, name, ops, mods, wide_src, wide_dst, helper, signed=None):
+        """SOP2 shifts and bitfield extracts with a 64-bit source and/or result.
+
+        D = f(S0, S1) with S1 a 32-bit word; SCC = (D != 0). Every source is read before any destination
+        register is written, so an overlapping destination cannot feed a half-written value back."""
+        if mods or len(ops) != 3:
+            raise Unsupported('%s with %d operands and modifiers %s' % (name, len(ops), mods))
+        dst = reg_range(ops[0])
+        width = 1 + wide_dst
+        if (not dst or dst[0] != 's' or dst[2] != dst[1] + wide_dst or dst[2] > 105
+                or (wide_dst and dst[1] % 2)):
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        s1 = reg_range(ops[2])
+        if (any(self.is_lane_mask(t) for t in ops[1:]) or ops[2] in FLOATS or ops[1] in FLOATS
+                or (s1 and (s1[0] != 's' or s1[1] != s1[2] or s1[1] > 105))):
+            raise Unsupported('%s source %s' % (name, ', '.join(ops[1:])))
+        if wide_src:
+            r0 = reg_range(ops[1])
+            if r0 and r0[0] != 's':
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            low, high = self.i64_words(ops[1])
+            known = [self.scalar_const('s%d' % r0[1]), self.scalar_const('s%d' % r0[2])] if r0 else [
+                int(low[:-1]), int(high[:-1])]
+        else:
+            low, high = self.u(ops[1]), None
+            known = [self.scalar_const(ops[1])]
+        amount = self.u(ops[2])
+        amount_known = self.scalar_const(ops[2])
+        d = dst[1]
+        if None not in known and amount_known is not None:
+            x = known[0] | (known[1] << 32 if wide_src else 0)
+            value = scalar_wide_fold(helper, x, amount_known, signed)
+            for i in range(width):
+                word = (value >> (32 * i)) & 0xffffffff
+                self.set_s(d + i, '0x%08xu' % word, ('const', word))
+            self.set_scc('true' if value else 'false')
+            return None
+        uniform = (self.tracks_uniformity()
+                   and self.scalar_expr_uniform('%s %s %s' % (low, high or '', amount)))
+        sg = '' if signed is None else ', %du' % (1 if signed else 0)
+        if wide_dst:
+            call = '%s(%s, %s, %s%s)' % (helper, low, high if wide_src else '0u', amount, sg)
+            self.emit('{ uint2 t = %s; s%d = t.x; s%d = t.y; scc = (t.x | t.y) != 0u; }' % (call, d, d + 1))
+        else:
+            self.emit('{ uint t = %s(%s, %s%s); s%d = t; scc = t != 0u; }' % (helper, low, amount, sg, d))
+        for r in range(d, d + width):
+            self.sym.pop(r, None)
+            self.used_s.add(r)
+            if self.tracks_uniformity():
+                (self.varying_s.discard if uniform else self.varying_s.add)(r)
+        if self.tracks_uniformity():
+            self.scc_uniform = uniform
+        return None
+
+    def op_s_lshl_b64(self, ops, mods):
+        return self.scalar_wide_op('s_lshl_b64', ops, mods, True, True, 'shl64')
+
+    def op_s_lshr_b64(self, ops, mods):
+        return self.scalar_wide_op('s_lshr_b64', ops, mods, True, True, 'shr64u')
+
+    def op_s_ashr_i64(self, ops, mods):
+        return self.scalar_wide_op('s_ashr_i64', ops, mods, True, True, 'shr64i')
+
+    def op_s_bfe_i32(self, ops, mods):
+        return self.scalar_wide_op('s_bfe_i32', ops, mods, False, False, 'bfe32', True)
+
+    def op_s_bfe_u64(self, ops, mods):
+        return self.scalar_wide_op('s_bfe_u64', ops, mods, True, True, 'bfe64', False)
+
+    def op_s_bfe_i64(self, ops, mods):
+        return self.scalar_wide_op('s_bfe_i64', ops, mods, True, True, 'bfe64', True)
+
     def op_s_load_dwordx8(self, ops, mods):
         self.op_s_load_dwordx4(ops, mods, 8)
 
@@ -2002,6 +2084,23 @@ for _bit in (0, 1):
     setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
 
 
+def scalar_wide_fold(helper, x, amount, signed):
+    """Translation-time value of one SOP2 shift or bitfield extract (the helper name picks the operation)."""
+    m64 = 0xffffffffffffffff
+    if helper == 'shl64':
+        return (x << (amount & 63)) & m64
+    if helper == 'shr64u':
+        return x >> (amount & 63)
+    if helper == 'shr64i':
+        return ((x - (1 << 64) if x >> 63 else x) >> (amount & 63)) & m64
+    bits = 32 if helper == 'bfe32' else 64
+    field = (x >> (amount & (bits - 1))) & ((1 << ((amount >> 16) & 127)) - 1) & ((1 << bits) - 1)
+    wd = (amount >> 16) & 127
+    if signed and 0 < wd < bits and field >> (wd - 1) & 1:
+        field |= ((1 << bits) - 1) ^ ((1 << wd) - 1)
+    return 0 if signed and wd == 0 else field
+
+
 def parse_root(blob):
     if not blob or blob[:4] != b'DXBC':
         raise Unsupported('root signature blob missing')
@@ -2161,6 +2260,15 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
+               'uint2 bfe64(uint lo, uint hi, uint s1, uint sg) { uint w = (s1 >> 16u) & 127u; uint2 e = shr64u(lo, hi, s1);'
+               ' e = uint2(e.x & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u)),'
+               ' e.y & (w >= 64u ? 0xffffffffu : (w > 32u ? ((1u << ((w - 32u) & 31u)) - 1u) : 0u)));'
+               ' if (sg == 0u || w >= 64u) return e; if (w == 0u) return uint2(0u, 0u);'
+               ' uint sh = 64u - w; uint2 t = shl64(e.x, e.y, sh); return shr64i(t.x, t.y, sh); }',
+               'uint bfe32(uint x, uint s1, uint sg) { uint w = (s1 >> 16u) & 127u;'
+               ' uint e = (x >> (s1 & 31u)) & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u));'
+               ' if (sg == 0u || w >= 32u) return e; if (w == 0u) return 0u;'
+               ' uint sh = 32u - w; return asuint(asint(e << sh) >> sh); }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
