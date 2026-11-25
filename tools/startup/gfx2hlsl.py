@@ -1608,6 +1608,9 @@ class Stage:
         """
         if base not in ('s_add_u32', 's_addc_u32') or len(srcs) != 2 or not syms[0]:
             return False
+        if self.has_branches:
+            # The symbolic update runs once in disassembly order; a branch could skip it or repeat it at run time.
+            return False
         reg = reg_range(dname)
         if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
             return False
@@ -1619,10 +1622,14 @@ class Stage:
             if added > 0xfffff:
                 raise Unsupported('descriptor pointer offset %s' % srcs[1])
             self.sym[d] = ('ptr', syms[0][1], (syms[0][2] if len(syms[0]) > 2 else 0) + added)
+            # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
+            # instruction starts so that the high-word add is accepted right behind it and nowhere else.
+            size = next(n for off, n, _name, _asm in self.ins if off == self.pc)
+            self.ptr_low_add = (d, self.pc + size)
             return True
         low = self.sym.get(d - 1)
         if (syms[0][0] != 'ptrhi' or srcs[1] != '0' or not low or low[0] != 'ptr'
-                or low[1] != syms[0][1]):
+                or low[1] != syms[0][1] or getattr(self, 'ptr_low_add', None) != (d - 1, self.pc)):
             return False
         self.sym[d] = ('ptrhi', syms[0][1])
         return True

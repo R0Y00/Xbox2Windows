@@ -44,11 +44,14 @@ def stage(symbols):
     return s
 
 
-def run(symbols, program):
+def run(symbols, program, branches=False):
     """Symbols after the (op, operands) steps, or the Unsupported message."""
     s = stage(symbols)
+    s.has_branches = branches
+    s.ins = [(4 * i, 4, op, '') for i, (op, _operands) in enumerate(program)]
     try:
-        for op, operands in program:
+        for i, (op, operands) in enumerate(program):
+            s.pc = 4 * i
             if op == 's_load_dwordx4':
                 s.op_s_load_dwordx4(operands.split(', '), [])
             else:
@@ -94,6 +97,16 @@ try:
     check('an advanced pointer used whole as a descriptor is refused', False, 'accepted')
 except G.Unsupported:
     check('an advanced pointer used whole as a descriptor is refused', True)
+
+s = run(TABLE, ADVANCE, branches=True)
+check('a pointer advance in a program with branches is refused', isinstance(s, str), str(s))
+
+# The high-word add is the carry of the low-word add right before it, never of an unrelated carry in SCC.
+s = run(TABLE, [('s_cmp_eq_u32', '0, 0'), ('s_addc_u32', 's9, s9, 0')])
+check('s_addc_u32 without the low-word add is refused', isinstance(s, str), str(s))
+
+s = run(TABLE, [ADVANCE[0], ('s_cmp_eq_u32', '0, 0'), ADVANCE[1]])
+check('s_addc_u32 separated from its low-word add is refused', isinstance(s, str), str(s))
 
 if failures:
     print('FAILED: %s' % ', '.join(failures))
