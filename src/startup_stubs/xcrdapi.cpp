@@ -373,9 +373,10 @@ void __stdcall file_close(Object* self)
 long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 {
     const BOOL ok = info && GetFileInformationByHandle(self->handle, info);
+    const DWORD error = ok ? 0 : GetLastError();  // before log(), whose Win32 calls overwrite it
     log("x2w-dstorage File::GetFileInformation -> %s size=0x%llx", ok ? "ok" : "fail",
         ok ? (static_cast<unsigned long long>(info->nFileSizeHigh) << 32) | info->nFileSizeLow : 0ull);
-    return ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    return ok ? S_OK : HRESULT_FROM_WIN32(error);
 }
 
 // Queue slot 3, EnqueueRequest(request*) by the PC numbering. Request layout from the title's builder
@@ -612,19 +613,23 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
-                // With BCPack after it, the inflated size is not given; the destination size bounds it.
-                // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
-                // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
-                // so single-pass inflate succeeds and verifies Adler32, then check capacity before writing.
-                const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
-                std::size_t target_size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
-                if (bcpack) target_size = target_size * 2 + 0x10000;
+                // The public DSTORAGE_REQUEST layout has SourceSize at +0x30, IntermediateSize at +0x34 (the
+                // number of BCPack bytes when zlib and BCPack are both requested) and CancellationTag at
+                // +0x38. The tag is an arbitrary value, not a size, so no buffer is sized from it. A zlib-only
+                // request inflates to DestinationSize; with BCPack after it the inflated size is
+                // IntermediateSize, and the earlier destination-based bound is kept as the minimum.
+                const unsigned intermediate_size = *reinterpret_cast<const unsigned*>(request + 0x34);
+                std::size_t target_size = destination_size;
+                if (bcpack) {
+                    target_size = target_size * 2 + 0x10000;
+                    if (intermediate_size > target_size) target_size = intermediate_size;
+                }
                 output.resize(target_size);
                 std::size_t produced = 0;
                 bool ok = x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced);
                 if (!ok && output.size() < 0x80000) {
-                    // If destination_size was smaller than the uncompressed stream and uncompressed_size was unset,
-                    // expand up to 512 KiB to accommodate larger chunks.
+                    // If destination_size was smaller than the uncompressed stream, expand up to 512 KiB to
+                    // accommodate larger chunks.
                     std::size_t big_size = std::size_t{destination_size} * 8 + 0x40000;
                     if (big_size < 0x80000) big_size = 0x80000;
                     std::vector<unsigned char> big(big_size);

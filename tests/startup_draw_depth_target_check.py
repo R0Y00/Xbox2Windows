@@ -1,7 +1,7 @@
 """Depth target binding for translated draws (#1999 item D).
 
 usage: startup_draw_depth_target_check.py <startup_draw_depth_target> <warp|hardware> [check|drop]
-Exit codes: 0 pass, 1 failed (the drop control: failed for its stated reason), 2 the run broke, 77 no hardware.
+Exit codes: 0 pass, 1 unexpected result, 2 broken run, 77 no hardware.
 
 tests/startup_draw_depth_target.cpp draws a near green triangle (z 0.25), then a far red one (z 0.75), with a
 depth-tested stream pipeline (LESS, writes on), and reads back the colour target and the D32 depth target.
@@ -16,9 +16,8 @@ depth-tested stream pipeline (LESS, writes on), and reads back the colour target
            whole bind, so nothing is drawn (the colour target keeps its clear colour, depth keeps 1.0)
 
 "drop" is the negative control: the bound case's draw with the null handle, checked against the
-bound case's expectations. It exits 1 only when exactly the depth result differs (red in front and the
-depth target untouched) while the draw itself happened, and 0 otherwise, so its WILL_FAIL test fails if
-the depth binding stops deciding the picture.
+bound case's expectations. The control passes only when the expected mismatch appears (red in front,
+depth untouched, and one colour target bind). A broken run or an unexpected picture fails CTest.
 """
 import os
 from pathlib import Path
@@ -126,7 +125,7 @@ def main():
                 stated = failures == ["picture"] and (result["colour"], result["depth"]) == UNBOUND and result["binds"] == 1
                 print(f"control drop: {describe(result)} -> " +
                       ("failed for the stated reason" if stated else "did NOT fail for the stated reason"))
-                return 1 if stated else 0
+                return 0 if stated else 1
             failed = []
             bound = run_case(directory, args, env, "bound")
             if (bound["colour"], bound["depth"]) != BOUND:
@@ -150,7 +149,7 @@ def main():
             if unknown["binds"] or unknown["unresolved"] != 1 or not unknown["refused"]:
                 failed.append(f"unknown: binds +{unknown['binds']}, unresolved +{unknown['unresolved']}, refused {unknown['refused']}")
     except (Broken, OSError, subprocess.CalledProcessError) as error:
-        # Exit 2, not 1: a broken run must not count as the control failing for its stated reason.
+        # A broken run cannot count as seeing the expected mismatch.
         print(f"error: {error}")
         return 2
     for line in failed:

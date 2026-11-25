@@ -25,6 +25,12 @@ wrong result or SCC. Refused: every SOP2 operation the decoder names that still 
 The `s_pack_hh_b32_b16` forms use the same encoder and evaluator. The reference places the high half of src0
 in the low result half and the high half of src1 in the high result half, preserving SCC. Swapping the inputs
 must fail the value check.
+
+The `s_bfe_u32` forms use the same encoder and evaluator. The reference reads the ISA text: offset = S1[4:0], width =
+S1[22:16], a width of 0 gives 0, offset + width < 32 gives the field, and any wider field gives S0 >> offset. SCC is
+D != 0. HLSL reduces a shift count to 5 bits, so a lowering that shifts by the 7-bit width gives 0 at width 32 and a
+truncated mask at 33 to 127. The inputs reach widths 0 to 127 with the source sign bit set, as SGPR, inline and
+literal controls. The mutated table entries must read a wrong word.
 """
 import re
 import struct
@@ -44,6 +50,7 @@ from startup_gfx2hlsl_bit_alu_check import Expr  # noqa: E402
 MASK = 0xffffffff
 OPCODE = {name: op for op, (name, _) in D.SOP2_OPS.items()}
 PACK_HH = 's_pack_hh_b32_b16'
+BFE = 's_bfe_u32'
 # operation -> (non-complement sibling, reference)
 OPS = {
     's_nand_b32': ('s_and_b32', lambda a, b: ~(a & b) & MASK),
@@ -225,6 +232,85 @@ def pack_controls():
         G.SCA[PACK_HH] = saved
 
 
+BFE_OFFSETS = [0, 1, 4, 8, 16, 24, 31]
+BFE_WIDTHS = [0, 1, 8, 16, 31, 32, 33, 40, 48, 63, 64, 65, 96, 127]
+BFE_SOURCES = [MASK, 0x80000000, 0x9a345f50, 0xdeadbeef, 0x12345678, 1, 0, 0xaaaaaaaa, 0x55555555]
+# Control bits 15:5 and 31:23 are ignored; the second spelling of each control sets them all.
+BFE_CONTROLS = sorted({(w << 16) | o | junk for o in BFE_OFFSETS for w in BFE_WIDTHS for junk in (0, 0xff80ffe0)}
+                      | {0xffffffff, 0x007f0000, 0x00200000, 0x00400000})
+BFE_PAIRS = [(a, c) for a in BFE_SOURCES for c in BFE_CONTROLS]
+# Pairs that separate the old lowering from the ISA: width 32 and 64 read 0 before, a wide field loses its mask.
+BFE_WIDE = [(0x80000000, 0x00200000), (MASK, 0x00400000), (0x9a345f50, 0x00280000), (0x80000001, 0x007f0000),
+            (0x80000000, 0x003f0000), (0xdeadbeef, 0x00200008)]
+
+
+def bfe_reference(src, ctrl):
+    offset, width = ctrl & 31, (ctrl >> 16) & 127
+    if width == 0:
+        return 0
+    if offset + width < 32:
+        return (src >> offset) & ((1 << width) - 1)
+    return src >> offset
+
+
+def bfe_first_mismatch(reference=bfe_reference, pairs=BFE_PAIRS):
+    """The first (form, source, control, got, want) of s_bfe_u32 that differs from the ISA reference, or None.
+
+    Control forms: SGPR (separate, in place on either source), m0 destination, inline 0, 1 and -1, and a literal
+    for the control and for the source, so each operand kind of the translator is evaluated."""
+    cases = [((3, 1, 2, None), pairs), ((1, 1, 2, None), pairs), ((2, 1, 2, None), pairs), ((M0, 1, 2, None), pairs)]
+    cases += [((3, 1, code_, None), [(a, c) for a, c in pairs if c == INLINE[code_]]) for code_ in INLINE]
+    cases += [((3, 1, LITERAL, c), [(a, x) for a, x in pairs if x == c]) for c in sorted({x for _, x in pairs})]
+    cases += [((3, LITERAL, 2, a), [(x, c) for x, c in pairs if x == a]) for a in sorted({x for x, _ in pairs})]
+    for form, inputs in cases:
+        sdst, ssrc0, ssrc1, literal = form
+        asm, stage = attempt(code(BFE, form))
+        if stage.lines[0].startswith('refused: '):
+            return asm, stage.lines[0]
+        destination = 'm0' if sdst == M0 else 's%d' % sdst
+        for a, c in inputs:
+            env = {'s1': a, 's2': c, 'scc': SCC_UNSET}
+            want = reference(source_value(ssrc0, literal, env), source_value(ssrc1, literal, env))
+            out = run_lines(stage.lines, env)
+            got = (out.get(destination), out['scc'])
+            if got != (want, int(want != 0)):
+                return asm, hex(a), hex(c), got, (want, int(want != 0))
+    return None
+
+
+def bfe_controls():
+    check('s_bfe_u32 matches the LLVM 15 SOP2 encoding', sop2(BFE, 0, 1, 2).hex() == '01028093')
+    widths = {(c >> 16) & 127 for _, c in BFE_PAIRS}
+    wide = [bfe_reference(a, c) for a, c in BFE_WIDE]
+    check('s_bfe_u32 inputs reach widths 0 to 127, and wide fields with a nonzero result',
+          widths >= {0, 31, 32, 33, 40, 63, 64, 127} and all(wide), str(wide))
+    mismatch = bfe_first_mismatch()
+    check('s_bfe_u32 result and SCC across %d (source, control) pairs and all operand kinds' % len(BFE_PAIRS),
+          mismatch is None, str(mismatch))
+    mismatch = bfe_first_mismatch(pairs=BFE_WIDE)
+    check('s_bfe_u32 wide fields (width 32 and above)', mismatch is None, str(mismatch))
+
+    saved = G.SCA[BFE]
+    old = '({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)'
+    try:
+        # The reference itself would pass a formula that agrees with it; the old table entry must not.
+        G.SCA[BFE] = (old, saved[1])
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: the width taken mod 32 by the shift fails: %s' % (found,),
+              found is not None)
+        G.SCA[BFE] = (saved[0], None)
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: no SCC write fails: %s' % (found,), found is not None)
+        G.SCA[BFE] = ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 63)) - 1)', saved[1])
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: a 6-bit width fails: %s' % (found,), found is not None)
+        G.SCA[BFE] = ('{0} >> ({1} & 31)', saved[1])
+        found = bfe_first_mismatch()
+        check('s_bfe_u32 negative control: no field mask fails: %s' % (found,), found is not None)
+    finally:
+        G.SCA[BFE] = saved
+
+
 def controls():
     # 1. The encoder writes what the decoder reads, checked on the LLVM 15 encodings in tests/rdna2_tools_check.py.
     known = [(sop2('s_nand_b32', 0, 1, 2), '0102008c'), (sop2('s_nor_b32', 0, 1, 2), '0102008d'),
@@ -330,11 +416,13 @@ def controls():
     check('%d SOP2 operations without a lowering are refused by name (%s)' % (len(missing), ', '.join(missing)),
           missing and not wrong and not set(OPS) & set(missing), str(wrong))
     pack_controls()
+    bfe_controls()
 
 
 def all_codes():
     logic = [code(name, form) for name in list(OPS) + [s for s, _ in OPS.values()] for form in VALUE_FORMS + MASK_FORMS]
-    return logic + [code(PACK_HH, form) for form in VALUE_FORMS]
+    return (logic + [code(PACK_HH, form) for form in VALUE_FORMS]
+            + [code(BFE, form) for form in VALUE_FORMS])
 
 
 def check_binary(llvm_mc):

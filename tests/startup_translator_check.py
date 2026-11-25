@@ -210,7 +210,7 @@ def check_pending_manifest_upgrade(failures):
             return subprocess.CompletedProcess(command, 0, '', '')
 
         def pending(configured):
-            request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {})
+            request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {}, None)
             with fxc_environment(work, configured, os.path.join(work, 'none')), \
                  mock.patch.object(sys, 'argv', ['gfx2hlsl.py', '--pending', work]), \
                  mock.patch.object(gfx2hlsl, 'load_request', return_value=request), \

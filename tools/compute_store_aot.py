@@ -39,6 +39,8 @@ ALU = {
     "v_subrev_nc_u32_e32": "({1} - {0})",
     "v_min_u32_e32": "min({0}, {1})",
     "v_xor3_b32": "({0} ^ {1} ^ {2})",  # VOP3 src0 ^ src1 ^ src2 (RDNA2 ISA: D.u = S0.u ^ S1.u ^ S2.u)
+    # v_bcnt_u32_b32 (VOP3 only on gfx10; RDNA2 ISA: D.u = CountOneBits(S0.u) + S1.u), the addend wrapping modulo 2^32.
+    "v_bcnt_u32_b32": "(countbits({0}) + {1})",
     "v_max_u32_e32": "max({0}, {1})",
     "v_add_nc_u32_e32": "({0} + {1})",
     # v_mad_i32_i24 is sext(src0[23:0]) * sext(src1[23:0]) + src2, modulo 2^32, multiplied as uint (same low word).
@@ -112,6 +114,11 @@ F32_HELPERS = {
     name: f"uint f32_{name}(uint a, uint b) {{ precise float r = asfloat(a) {op} asfloat(b); return asuint(r); }}\n"
     for name, op in (("add", "+"), ("sub", "-"), ("mul", "*"))
 }
+# v_mac_f32_{e32,e64} D, S0, S1 (VOP2 0x1f): D.f = S0.f * S1.f + D.f (unfused: product rounds to binary32 before add).
+F32_HELPERS["mac"] = (
+    "uint f32_mac(uint a, uint b, uint c) { precise float p = asfloat(a) * asfloat(b); "
+    "precise float r = p + asfloat(c); return asuint(r); }\n"
+)
 # v_cvt_u32_f32_e32 D, S0 (VOP1 opcode 0x06 of the RDNA 2 ISA guide):
 #   if (isnan(S0.f)) D.u = 0;
 #   else if (S0.f <= 0.0) D.u = 0;
@@ -123,6 +130,24 @@ CVT_U32_F32_HELPER = (
     "uint cvt_u32_f32(uint bits) { float x = asfloat((bits & 0x7fffffffu) > 0x7f800000u ? 0u : bits); "
     "float finite = clamp(x, 0.0f, 4294967040.0f); return x >= 4294967296.0f ? 0xffffffffu : uint(finite); }\n"
 )
+# v_dot2_u32_u16 D, S0, S1, S2 (VOP3P 0x15):
+#   D = (uint32)(((uint64)S0[15:0] * S1[15:0] + (uint64)S0[31:16] * S1[31:16] + (uint64)S2) & 0xffffffff)
+# v_dot4_u32_u8 D, S0, S1, S2 (VOP3P 0x17):
+#   D = (uint32)(((uint64)S0[7:0]*S1[7:0] + S0[15:8]*S1[15:8] + S0[23:16]*S1[23:16] + S0[31:24]*S1[31:24] + S2) & 0xffffffff)
+# Non-clamp forms wrap modulo 2^32, so unsigned 32-bit HLSL arithmetic matches without 64-bit emulation.
+DOT_U_HELPERS = {
+    "dot2_u32_u16": (
+        "uint dot2_u32_u16(uint a, uint b, uint c) {\n"
+        "    return (a & 0xffffu) * (b & 0xffffu) + (a >> 16) * (b >> 16) + c;\n"
+        "}\n"
+    ),
+    "dot4_u32_u8": (
+        "uint dot4_u32_u8(uint a, uint b, uint c) {\n"
+        "    return (a & 0xffu) * (b & 0xffu) + ((a >> 8) & 0xffu) * ((b >> 8) & 0xffu)\n"
+        "        + ((a >> 16) & 0xffu) * ((b >> 16) & 0xffu) + (a >> 24) * (b >> 24) + c;\n"
+        "}\n"
+    ),
+}
 # The inline float constants of the encoding, as LLVM prints them, and the bits they hold.
 FLOAT_INLINE = {
     "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000, "2.0": 0x40000000,
@@ -484,12 +509,104 @@ def descriptor_store_hlsl():
     )
 
 
+def descriptor_load_hlsl():
+    """One load function shared by every descriptor-format buffer_load_format opcode.
+
+    It returns the four result words of one load from the 4-byte-aligned t0 address and sets valid only when the
+    fixed bits are an identity value, the format is handled, and the opcode reads exactly the format's channels.
+    The format unit's results outside that are not established here, so lower() makes an invalid load suppress
+    every store of the invocation: no result is published, and zero data from a valid read stays distinguishable.
+
+    Every conversion is integer arithmetic, so the result does not depend on the GPU's float division. UNORM is
+    x / (2^n - 1) and SNORM16 is max(x / 32767, -1), rounded to nearest even binary32 by long division. FLOAT16
+    widens exactly, keeping NaN payloads. 16-bit UINT and SINT zero- and sign-extend the low halfword.
+    """
+    legacy = []
+    for field, code in sorted(LEGACY_DESCRIPTOR_FORMATS.items()):
+        keyword = "if" if not legacy else "else if"
+        legacy.append(f"        {keyword} (field == {field}u) format = {code}u;")
+    bodies = {
+        "raw32": "r = raw;",
+        "unorm8": ("r = uint4(descriptor_ratio(raw.x & 0xffu, 255u), descriptor_ratio((raw.x >> 8u) & 0xffu, 255u), "
+                   "descriptor_ratio((raw.x >> 16u) & 0xffu, 255u), descriptor_ratio(raw.x >> 24u, 255u));"),
+        "unorm16x2": "r.xy = uint2(descriptor_ratio(raw.x & 0xffffu, 65535u), descriptor_ratio(raw.x >> 16u, 65535u));",
+        "unorm10": ("r = uint4(descriptor_ratio(raw.x & 0x3ffu, 1023u), descriptor_ratio((raw.x >> 10u) & 0x3ffu, 1023u), "
+                    "descriptor_ratio((raw.x >> 20u) & 0x3ffu, 1023u), descriptor_ratio(raw.x >> 30u, 3u));"),
+        "f16x2": "r.xy = uint2(descriptor_half(raw.x & 0xffffu), descriptor_half(raw.x >> 16u));",
+        "f16x4": ("r = uint4(descriptor_half(raw.x & 0xffffu), descriptor_half(raw.x >> 16u), "
+                  "descriptor_half(raw.y & 0xffffu), descriptor_half(raw.y >> 16u));"),
+        "unorm16": "r.x = descriptor_ratio(raw.x & 0xffffu, 65535u);",
+        "snorm16": "r.x = descriptor_snorm16_load(raw.x & 0xffffu);",
+        "uint16": "r.x = raw.x & 0xffffu;",
+        "sint16": "r.x = (uint)((int)(raw.x << 16u) >> 16u);",
+        "f16": "r.x = descriptor_half(raw.x & 0xffffu);",
+    }
+    grouped = {}
+    for code, (kind, channels) in DESCRIPTOR_STORE_FORMATS.items():
+        grouped.setdefault((kind, channels), []).append(code)
+    arms = []
+    for kind in _DESCRIPTOR_KIND_ORDER:
+        for channels in range(1, 5):
+            codes = grouped.get((kind, channels))
+            if codes:
+                test = " || ".join(f"format == {code}u" for code in sorted(codes))
+                keyword = "if" if not arms else "else if"
+                arms.append(f"    {keyword} (({test}) && channels == {channels}u) {{ {bodies[kind]} valid = true; }}")
+    return (
+        "uint descriptor_ratio(uint x, uint d) {\n"
+        "    // binary32 bits of x / d for 0 <= x <= d < 2^16, rounded to nearest even by long division.\n"
+        "    if (x == 0u) return 0u;\n"
+        "    if (x == d) return 0x3f800000u;\n"
+        "    uint r = x, bits = 0u, taken = 0u, lead = 0u;\n"
+        "    for (uint i = 0u; i < 48u && taken < 25u; ++i) {\n"
+        "        r <<= 1u;\n"
+        "        uint bit = r >= d ? 1u : 0u;\n"
+        "        r -= bit * d;\n"
+        "        if (taken == 0u && bit == 0u) { ++lead; continue; }\n"
+        "        bits = (bits << 1u) | bit;\n"
+        "        ++taken;\n"
+        "    }\n"
+        "    uint result = ((126u - lead) << 23u) | ((bits >> 1u) & 0x7fffffu);\n"
+        "    if ((bits & 1u) != 0u && (r != 0u || (result & 1u) != 0u)) ++result;\n"
+        "    return result;\n"
+        "}\n"
+        "uint descriptor_snorm16_load(uint bits16) {\n"
+        "    int value = (int)(bits16 << 16u) >> 16;\n"
+        "    if (value <= -32767) return 0xbf800000u;\n"
+        "    return value < 0 ? 0x80000000u | descriptor_ratio((uint)(-value), 32767u) : descriptor_ratio((uint)value, 32767u);\n"
+        "}\n"
+        "uint descriptor_half(uint h) {\n"
+        "    uint sign = (h & 0x8000u) << 16u, e = (h >> 10u) & 31u, m = h & 0x3ffu;\n"
+        "    if (e == 31u) return sign | 0x7f800000u | (m << 13u);\n"
+        "    if (e != 0u) return sign | ((e + 112u) << 23u) | (m << 13u);\n"
+        "    if (m == 0u) return sign;\n"
+        "    uint top = firstbithigh(m);\n"
+        "    return sign | ((top + 103u) << 23u) | ((m << (23u - top)) & 0x7fffffu);\n"
+        "}\n"
+        "uint4 load_descriptor_format(uint formatWord, uint addr, uint channels, out bool valid) {\n"
+        "    valid = false;\n"
+        f"    uint fixedBits = formatWord & {DESCRIPTOR_FIXED_MASK:#x}u;\n"
+        f"    uint field = (formatWord >> {DESCRIPTOR_FORMAT_SHIFT}u) & {DESCRIPTOR_FORMAT_MASK:#x}u;\n"
+        "    uint format = 0u;\n"
+        f"    if (fixedBits == {DESCRIPTOR_GFX10_FIXED:#x}u) {{\n"
+        "        format = field;\n"
+        f"    }} else if (fixedBits == {DESCRIPTOR_LEGACY_FIXED:#x}u) {{\n"
+        + "\n".join(legacy) + "\n"
+        "    }\n"
+        "    uint4 raw = inputData.Load4(addr);\n"
+        "    uint4 r = uint4(0u, 0u, 0u, 0u);\n"
+        + "\n".join(arms) + "\n"
+        "    return r;\n"
+        "}\n"
+    )
+
+
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
           lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
-          descriptor_format_constant=None, rsrc2=None, wave_size=None):
+          descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
@@ -504,6 +621,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     descriptor_format_constant lists one b0 word index per formatted MUBUF store, in program
     order. Each index must already have been read from the constant descriptor. The word is
     V# word 3. An unknown format or a channel count that does not match the opcode does not store.
+    load_format_constant does the same for gfx1013 buffer_load_format_{x,xy,xyz,xyzw} through t0: one b0
+    word index per formatted load, in program order, read by load_descriptor_format (see descriptor_load_hlsl).
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
     A full-mask 2D D16 image_store requires an RGBA16 FLOAT UAV.
@@ -622,6 +741,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 or any(not isinstance(index, int) or isinstance(index, bool)
                        or index not in range(CONSTANT_WORDS) for index in format_words)):
             raise ValueError("Invalid buffer descriptor format constant")
+    load_format_words = None
+    if load_format_constant is not None:
+        load_format_words = tuple(load_format_constant)
+        if (cpu != "gfx1013" or constant_descriptor is None or source_stride is None or source_format is not None
+                or not load_format_words
+                or any(not isinstance(index, int) or isinstance(index, bool)
+                       or index not in range(CONSTANT_WORDS) for index in load_format_words)):
+            raise ValueError("Invalid buffer load format constant")
+    format_load_index = 0
     scalar = {table_reg: "table"}
     for axis, reg in group_regs.items():
         scalar[reg] = ("group", axis)
@@ -653,6 +781,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     # s_or_b32 restoring exec or the final exit. An optional s_cbranch_execz must land exactly
     # where the guarded stores end. The guarded stores become an HLSL if.
     vcc = guard = None
+    vcc_carry = None
     guard_span = None
     if not instructions or instructions[-1] != "s_endpgm":
         raise ValueError("Missing final program exit")
@@ -711,11 +840,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     or any(word is None or isinstance(word, tuple) and word[0] in ("source", "alu") for word in words)):
                 raise ValueError("Unverified lane guard compare")
             vcc = (op, *words)
+            vcc_carry = None
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
             saved = int(m[1])
             if guard_span is not None or vcc is None or saved > 105 or saved in pending:
                 raise ValueError("Unverified or repeated lane guard")
-            guard = dict(label=None, at_label=False, holders=None,
+            guard = dict(label=None, at_label=False, holders=None, vcc_carry=vcc_carry,
                          scalar=dict(scalar), vector=dict(vector), pending=set(pending), loading=dict(loading))
             scalar[saved] = ("exec",)
             guard_span = [len(stores), None, vcc]
@@ -746,6 +876,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 for reg in [reg for reg, value in state.items() if reg not in before or before[reg] != value]:
                     del state[reg]
             pending |= guard["pending"]
+            if vcc_carry != guard["vcc_carry"]:
+                vcc_carry = None
             guard = None
             guard_span[1] = len(stores)
         elif line in ("s_mov_b32 m0, 0", "s_mov_b32 m0, 0x0"):
@@ -1610,6 +1742,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
+        elif ((m := re.fullmatch(rf"v_mac_f32_e32 v(\d+), {FLOAT_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"v_mac_f32_e64 v(\d+), {FLOAT_SOURCE}, {FLOAT_SOURCE}", line))):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            words = [float_word(token, scalar, vector, pending) for token in (*m.groups()[1:], f"v{dst}")]
+            if None in words:
+                raise ValueError("Unverified float operand")
+            expression = f"f32_mac({', '.join(map(hlsl_word, words))})"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(rf"v_cvt_u32_f32_e32 v(\d+), {FLOAT_SOURCE}", line):
             dst = int(m[1])
             if dst > 255:
@@ -1619,6 +1763,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if word is None:
                 raise ValueError("Unverified float operand")
             expression = f"cvt_u32_f32({hlsl_word(word)})"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"(v_dot2_u32_u16|v_dot4_u32_u8) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line):
+            op, dst = m[1], int(m[2])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if None in words:
+                raise ValueError("Unverified ALU operand")
+            helper = "dot2_u32_u16" if op == "v_dot2_u32_u16" else "dot4_u32_u8"
+            expression = f"{helper}({', '.join(map(hlsl_word, words))})"
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
@@ -1650,7 +1806,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  f"    uint {value} = {source} | {hlsl_word(values[1])};"))
             vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
-              or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32|v_bcnt_u32_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
@@ -1662,6 +1818,96 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
+        elif ((m := re.fullmatch(rf"(v_sub(?:rev)?_co_u32) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_sub(?:rev)?_co_ci_u32_e32) v(\d+), (vcc_lo), {ALU_SOURCE}, (v\d+), (vcc_lo)", line))
+              or (m := re.fullmatch(rf"(v_sub(?:rev)?_co_ci_u32_e64) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}, (vcc_lo|s\d+)", line))):
+            # RDNA2 ISA:
+            #   v_sub_co_u32:       temp = (uint64)S0 - (uint64)S1; D = temp[31:0]; SDST[lane] = (S0 < S1) ? 1 : 0
+            #   v_subrev_co_u32:    temp = (uint64)S1 - (uint64)S0; D = temp[31:0]; SDST[lane] = (S1 < S0) ? 1 : 0
+            #   v_sub_co_ci_u32:    temp = (int64)S0 - (int64)S1 - (int64)borrow_in[lane]; D = temp[31:0]; SDST[lane] = (temp < 0) ? 1 : 0
+            #   v_subrev_co_ci_u32: temp = (int64)S1 - (int64)S0 - (int64)borrow_in[lane]; D = temp[31:0]; SDST[lane] = (temp < 0) ? 1 : 0
+            op, dst, sdst, src0, src1 = m[1], int(m[2]), m[3], m[4], m[5]
+            borrow_in_tok = m[6] if len(m.groups()) == 6 else None
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            if dims[0] * dims[1] * dims[2] > 32 and wave_size != 32:
+                raise ValueError("Borrow-out subtract requires wave_size=32 for groups larger than 32 threads")
+            if sdst != "vcc_lo":
+                sdst_reg = int(sdst[1:])
+                if sdst_reg > 105 or sdst_reg in pending:
+                    raise ValueError("Unverified borrow destination")
+            words = [alu_word(token, scalar, vector, pending) for token in (src0, src1)]
+            if None in words:
+                raise ValueError("Unverified ALU operand")
+            a, b = map(hlsl_word, words)
+            if op.startswith("v_subrev_"):
+                a, b = b, a
+            diff_ab = f"({a} - {b})"
+            if borrow_in_tok is None:
+                expression = diff_ab
+                borrow_expression = f"({a} < {b} ? 1u : 0u)"
+            else:
+                if borrow_in_tok == "vcc_lo":
+                    borrow_in = vcc_carry
+                else:
+                    bin_reg = int(borrow_in_tok[1:])
+                    borrow_in = scalar.get(bin_reg) if bin_reg <= 105 and bin_reg not in pending else None
+                if not (isinstance(borrow_in, tuple) and borrow_in[0] == "borrow"):
+                    raise ValueError("Unverified borrow-in operand")
+                c = borrow_in[1]
+                expression = f"({diff_ab} - {c})"
+                borrow_expression = f"(({a} < {b} || {diff_ab} < {c}) ? 1u : 0u)"
+            if len(expression) > ALU_EXPRESSION_LIMIT or len(borrow_expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+            if sdst == "vcc_lo":
+                vcc = None
+                vcc_carry = ("borrow", borrow_expression)
+            else:
+                scalar[sdst_reg] = ("borrow", borrow_expression)
+        elif ((m := re.fullmatch(rf"(v_add_co_u32) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_add_co_ci_u32_e32) v(\d+), (vcc_lo), {ALU_SOURCE}, (v\d+), (vcc_lo)", line))
+              or (m := re.fullmatch(rf"(v_add_co_ci_u32_e64) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}, (vcc_lo|s\d+)", line))):
+            # RDNA2 ISA:
+            #   v_add_co_u32:    temp = (uint64)S0 + (uint64)S1; D = temp[31:0]; SDST[lane] = (temp >> 32) & 1
+            #   v_add_co_ci_u32: temp = (uint64)S0 + (uint64)S1 + (uint64)carry_in[lane]; D = temp[31:0]; SDST[lane] = (temp >> 32) & 1
+            dst, sdst, src0, src1 = int(m[2]), m[3], m[4], m[5]
+            carry_in_tok = m[6] if len(m.groups()) == 6 else None
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            if dims[0] * dims[1] * dims[2] > 32 and wave_size != 32:
+                raise ValueError("Carry-out add requires wave_size=32 for groups larger than 32 threads")
+            if sdst != "vcc_lo":
+                sdst_reg = int(sdst[1:])
+                if sdst_reg > 105 or sdst_reg in pending:
+                    raise ValueError("Unverified carry destination")
+            words = [alu_word(token, scalar, vector, pending) for token in (src0, src1)]
+            if None in words:
+                raise ValueError("Unverified ALU operand")
+            a, b = map(hlsl_word, words)
+            sum_ab = f"({a} + {b})"
+            if carry_in_tok is None:
+                expression = sum_ab
+                carry_expression = f"({sum_ab} < {a} ? 1u : 0u)"
+            else:
+                if carry_in_tok == "vcc_lo":
+                    carry_in = vcc_carry
+                else:
+                    cin_reg = int(carry_in_tok[1:])
+                    carry_in = scalar.get(cin_reg) if cin_reg <= 105 and cin_reg not in pending else None
+                if not (isinstance(carry_in, tuple) and carry_in[0] == "carry"):
+                    raise ValueError("Unverified carry-in operand")
+                c = carry_in[1]
+                expression = f"({sum_ab} + {c})"
+                carry_expression = f"(({sum_ab} < {a} || {expression} < {c}) ? 1u : 0u)"
+            if len(expression) > ALU_EXPRESSION_LIMIT or len(carry_expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+            if sdst == "vcc_lo":
+                vcc = None
+                vcc_carry = ("carry", carry_expression)
+            else:
+                scalar[sdst_reg] = ("carry", carry_expression)
         elif m := re.fullmatch(r"v_mad_u32_u24 v(\d+), (v\d+|-?\d+|0x[0-9a-f]+), (v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
             dst, column = int(m[1]), int(m[4])
             # The literal pitch may be either multiplicand; LLVM 15 places it in src0.
@@ -1706,7 +1952,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unsupported vector buffer read target or address mode")
             if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
-            if resource_channels:
+            descriptor_load = None
+            if resource_channels and load_format_words is not None:
+                # The format is V# word 3 from a constant word, decoded in the shader (descriptor_load_hlsl).
+                if packed:
+                    raise ValueError("Descriptor-format d16 loads are not lowered")
+                if not idxen or offen:
+                    raise ValueError("Unsupported formatted buffer read target or address mode")
+                if format_load_index >= len(load_format_words):
+                    raise ValueError("Formatted buffer load is missing a format constant")
+                descriptor_load = load_format_words[format_load_index]
+                format_load_index += 1
+                if not any(tag == ("constant_word", descriptor_load) and reg not in pending
+                           for reg, tag in scalar.items()):
+                    raise ValueError("Formatted buffer load format constant is not ready")
+            elif resource_channels:
                 if cpu != "gfx1030" or not idxen or offen:
                     raise ValueError("Unsupported formatted buffer read target or address mode")
                 if source_format is None:
@@ -1732,7 +1992,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Reads from the stored UAV are not supported")
             if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            alignment = source_texel_bytes if resource_channels else width
+            # A descriptor-format load reads whole dwords from a 4-byte-aligned address.
+            alignment = 4 if descriptor_load is not None else source_texel_bytes if resource_channels else width
             if offset % alignment or offset > 4095:
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
@@ -1746,13 +2007,25 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
                 # A formatted load selects a prefix of a complete four-component texel.
-                read_bytes = source_texel_bytes if resource_channels else width * count
+                # A descriptor-format load uses at most four bytes per channel of the opcode.
+                read_bytes = (4 * components if descriptor_load is not None
+                              else source_texel_bytes if resource_channels else width * count)
                 if offset + read_bytes > source_stride:
                     raise ValueError("Read leaves its source element")
                 aligned = offset & ~3
                 addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]
             else:
                 raise ValueError("Unsupported read address")
+            if descriptor_load is not None:
+                result = f"format_load_{format_load_index - 1}"
+                staged_steps.append((None, f"    bool format_valid_{format_load_index - 1};\n"
+                                           f"    uint4 {result} = load_descriptor_format("
+                                           f"{hlsl_word(('constant_word', descriptor_load))}, {addresses[0]}, "
+                                           f"{components}u, format_valid_{format_load_index - 1});"))
+                for reg in range(dst, dst + count):
+                    vector.pop(reg, None)
+                    loading[reg] = ("alu", f"{result}.{'xyzw'[reg - dst]}")
+                continue
             # The address has been captured, so the index can alias a destination.
             for reg, address in enumerate(addresses, dst):
                 vector.pop(reg, None)
@@ -2212,6 +2485,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
     if format_words is not None and format_store_index != len(format_words):
         raise ValueError("Unused buffer descriptor format constant")
+    if load_format_words is not None and format_load_index != len(load_format_words):
+        raise ValueError("Unused buffer load format constant")
+    if load_format_words is not None:
+        # Every load is staged before the stores. The format words are uniform constants, so an invalid
+        # format leaves the whole dispatch unwritten rather than publishing a placeholder result.
+        valid = " && ".join(f"format_valid_{index}" for index in range(len(load_format_words)))
+        staged_steps.append((None, f"    if (!({valid})) return;"))
     if not stores:
         raise ValueError("Expected at least one observable store")
     if guard is not None and guard["label"] is not None and not guard["at_label"]:
@@ -2247,10 +2527,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     if "cvt_u32_f32(" in body:
         cbuffer += CVT_U32_F32_HELPER
+    cbuffer += "".join(text for name, text in DOT_U_HELPERS.items() if f"{name}(" in body)
     uav_texel_type = image_atomic_type or ("float4" if float_image else "uint4")
     uav = f"RWTexture2D<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
     # The helper reads outputData, so it follows the UAV declaration.
     descriptor_hlsl = descriptor_store_hlsl() if "store_descriptor_format(" in body else ""
+    if "load_descriptor_format(" in body:
+        descriptor_hlsl += descriptor_load_hlsl()
     return (f"{cbuffer}{uav} outputData : register(u0);\n{descriptor_hlsl}"
             f"[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
@@ -2285,6 +2568,8 @@ def main():
                         help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
     parser.add_argument("--descriptor-format-constant", action="append", type=lambda n: int(n, 0),
                         help="b0 word index holding V# word 3 for one formatted store, in program order")
+    parser.add_argument("--load-format-constant", action="append", type=lambda n: int(n, 0),
+                        help="b0 word index holding the t0 V# word 3 for one gfx1013 formatted load, in program order")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
@@ -2324,8 +2609,8 @@ def main():
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
-descriptor_format_constant=args.descriptor_format_constant,
-rsrc2=args.rsrc2, wave_size=args.wave_size)
+                   descriptor_format_constant=args.descriptor_format_constant,
+                   rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
