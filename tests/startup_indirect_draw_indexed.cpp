@@ -497,6 +497,24 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
+// The lease fixtures hold a writer queue behind a CPU-signalled gate while run() clears and reads back
+// its targets. With NVIDIA driver 32.0.16.2124, releasing a queue during that hold blocks until the test
+// times out when another process releases a queue during its own hold. Those clears and copies therefore
+// share one DIRECT queue per device that lives until the process exits.
+ID3D12CommandQueue* kept_direct_queue(ID3D12Device* device)
+{
+    static std::mutex lock;
+    static std::vector<std::pair<ID3D12Device*, ComPtr<ID3D12CommandQueue>>> queues;
+    const std::lock_guard guard(lock);
+    for (const auto& [owner, queue] : queues)
+        if (owner == device) return queue.Get();
+    const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    ComPtr<ID3D12CommandQueue> queue;
+    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "create kept readback queue");
+    queues.emplace_back(device, queue);
+    return queue.Get();
+}
+
 struct MeshLeaseDraw {
     UINT64 address;
     IUnknown* queue;
@@ -900,7 +918,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         if (leased && leased->before_submit) {
             // A submission-level refusal skips the entire wrapped list,
             // including its clear. Initialize the readback target separately.
-            ComputeCommands clear_targets(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            ComputeCommands clear_targets(device, kept_direct_queue(device), nullptr);
             for (std::size_t i = 0; i < targets.size(); ++i) {
                 auto* target = targets[i].Get();
                 transition(clear_targets.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1147,7 +1165,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
     for (const auto& target : targets) {
         const auto pixel_readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        ComputeCommands copy(device, kept_direct_queue(device), nullptr);
         transition(copy.list.Get(), target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION source{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         D3D12_TEXTURE_COPY_LOCATION destination{pixel_readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
@@ -1318,6 +1336,98 @@ bool check_translated_refusal_census(const std::wstring& log_path)
     for (const auto& line : entries) std::printf("%s\n", line.c_str());
     return true;
 }
+
+bool check_indirect_other_refusal_census(const std::wstring& log_path)
+{
+    const std::size_t needed = x2w_d3d12_census_report(nullptr, 0);
+    std::string report(needed + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    report.resize(std::strlen(report.c_str()));
+    std::string summary;
+    std::vector<std::string> entries;
+    bool saw_indirect_draw = false;
+    std::size_t pos = 0;
+    while (pos < report.size()) {
+        std::size_t end = report.find('\n', pos);
+        if (end == std::string::npos) end = report.size();
+        std::string line = report.substr(pos, end - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("x2w-d3d12 indirect-other refusals:", 0) == 0) summary = line;
+        else if (line.rfind("x2w-d3d12 indirect-other refusal ", 0) == 0) entries.push_back(line);
+        else if (line.rfind("x2w-d3d12 indirect-draw refusal", 0) == 0) saw_indirect_draw = true;
+        pos = end + 1;
+    }
+    if (saw_indirect_draw) {
+        std::fprintf(stderr, "indirect-other refusal census saw unexpected indirect-draw refusal lines\n");
+        return false;
+    }
+    const std::string expected =
+        "x2w-d3d12 indirect-other refusals: total 4; distinct keys 2, distinct pairs 3 (overflow calls 0)";
+    if (summary != expected) {
+        std::fprintf(stderr, "indirect-other refusal census mismatch:\n  got      '%s'\n  expected '%s'\n",
+                     summary.c_str(), expected.c_str());
+        return false;
+    }
+    if (entries.size() != 3) {
+        std::fprintf(stderr, "indirect-other refusal census expected 3 detail lines, got %zu\n", entries.size());
+        return false;
+    }
+    struct ParsedEntry {
+        unsigned index = 0;
+        std::string key;
+        std::string reason;
+        unsigned long long calls = 0;
+    };
+    std::vector<ParsedEntry> parsed;
+    for (const auto& line : entries) {
+        unsigned index = 0;
+        char key[32]{};
+        char reason[64]{};
+        unsigned long long calls = 0;
+        if (std::sscanf(line.c_str(), "x2w-d3d12 indirect-other refusal %u: key=%16[0-9a-f] reason=%63s calls=%llu",
+                        &index, key, reason, &calls) != 4 || std::strlen(key) != 16) {
+            std::fprintf(stderr, "malformed indirect-other refusal detail line: '%s'\n", line.c_str());
+            return false;
+        }
+        parsed.push_back({index, key, reason, calls});
+    }
+    const std::string zero_key = "0000000000000000";
+    const bool entries_ok =
+        parsed[0].index == 1 && parsed[0].key != zero_key &&
+        parsed[0].reason == "missing_viewport_or_scissor" && parsed[0].calls == 2 &&
+        parsed[1].index == 2 && parsed[1].key == parsed[0].key &&
+        parsed[1].reason == "argument_outside_placed_buffer" && parsed[1].calls == 1 &&
+        parsed[2].index == 3 && parsed[2].key == zero_key &&
+        parsed[2].reason == "graphics_multi_command" && parsed[2].calls == 1;
+    if (!entries_ok) {
+        std::fprintf(stderr, "indirect-other refusal census entries did not match expected per-(key, reason) rows:\n");
+        for (const auto& line : entries) std::fprintf(stderr, "  %s\n", line.c_str());
+        return false;
+    }
+    std::ifstream file(log_path, std::ios::binary);
+    std::string log_line;
+    bool saw_vp_log = false, saw_arg_log = false, saw_multi_log = false;
+    const std::string want_vp = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
+        " [missing_viewport_or_scissor]: indirect graphics requires one matching target, viewport and scissor";
+    const std::string want_arg = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
+        " [argument_outside_placed_buffer]: argument record is outside a unique placed buffer";
+    const std::string want_multi = "x2w-render ExecuteIndirect refused, key " + zero_key +
+        " [graphics_multi_command]: indirect graphics requires one command and no count buffer";
+    while (std::getline(file, log_line)) {
+        if (!log_line.empty() && log_line.back() == '\r') log_line.pop_back();
+        if (log_line == want_vp) saw_vp_log = true;
+        if (log_line == want_arg) saw_arg_log = true;
+        if (log_line == want_multi) saw_multi_log = true;
+    }
+    if (!saw_vp_log || !saw_arg_log || !saw_multi_log) {
+        std::fprintf(stderr, "indirect-other refusal log lines missing (vp=%d, arg=%d, multi=%d)\n",
+                     saw_vp_log ? 1 : 0, saw_arg_log ? 1 : 0, saw_multi_log ? 1 : 0);
+        return false;
+    }
+    std::printf("%s\n", summary.c_str());
+    for (const auto& line : entries) std::printf("%s\n", line.c_str());
+    return true;
+}
 bool fixed_mesh_create_contract(ID3D12Device* guest)
 {
     const D3D12_ROOT_SIGNATURE_DESC root_desc{};
@@ -1404,7 +1514,11 @@ int main(int argc, char** argv) try
     const bool lease_fixture = GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_XMEM", lease_xmem, MAX_PATH) != 0;
     const bool dual_lease = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DUAL", nullptr, 0) != 0;
     if (dual_lease) check(lease_fixture && !lease_arguments ? S_OK : E_FAIL, "configure combined mesh XMem fixture");
-    if (lease_fixture && !lease_arguments)
+    const bool loose_root = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_LOOSE_ROOT", nullptr, 0) != 0;
+    if (loose_root)
+        check(lease_fixture && SetEnvironmentVariableA("X2W_MESH86_LOOSE_XMEM_SRV", "1") &&
+            SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", nullptr) ? S_OK : E_FAIL, "enable loose XMem root SRV");
+    else if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
@@ -1412,12 +1526,14 @@ int main(int argc, char** argv) try
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
     const bool refusal_census_control = argc == 3 && std::strcmp(argv[2], "translated-refusal-census-control") == 0;
     const bool refusal_census = refusal_census_control || (argc == 3 && std::strcmp(argv[2], "translated-refusal-census") == 0);
+    const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
+    const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
     const bool rect = argc == 3 && std::strcmp(argv[2], "translated-indexed-rect") == 0;
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = copy_on || copy_off || refusal_census || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = copy_on || copy_off || refusal_census || other_refusal_census || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -1460,7 +1576,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || refusal_census) {
+    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1548,6 +1664,72 @@ int main(int argc, char** argv) try
                                         writer.Get(), initialize.Get(), append.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
         }
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
+        if (loose_root) {
+            const bool ready = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0) != 0;
+            MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem, nullptr, nullptr, nullptr, nullptr, true);
+            const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            const auto verify = [&](const MeshLeaseDraw& draw, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
+                    DrawKind::mesh, false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false,
+                    &draw);
+            };
+            if (!ready) {
+                const bool ok = verify({source.address(), queue.Get(), black}, "loose mesh requires shader proof");
+                source.free_original();
+                return ok ? 0 : 1;
+            }
+            if (!verify({source.address(), queue.Get(), green}, "loose mesh reads ordinary XMem root SRV") ||
+                !verify({source.address() + 4, queue.Get(), black}, "loose mesh refuses misaligned root") ||
+                !verify({source.address() + 2 * MeshLeaseWriter::page, queue.Get(), black}, "loose mesh refuses unmapped page"))
+                return 1;
+            const std::unique_ptr<void, FreeMemory> unrelated(
+                VirtualAlloc(nullptr, MeshLeaseWriter::page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!unrelated || !verify({reinterpret_cast<UINT64>(unrelated.get()), queue.Get(), black},
+                "loose mesh refuses readable untracked memory")) return 1;
+            const auto registered_desc = D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, MeshLeaseWriter::page,
+                1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+            ComPtr<IUnknown> placed;
+            check(slot<Place>(guest.Get(), 133)(guest.Get(), source.cpu, &registered_desc, D3D12_RESOURCE_STATE_COMMON,
+                nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(placed.GetAddressOf())), "register overlapping buffer");
+            if (!verify({source.address(), queue.Get(), black}, "loose mesh refuses registered resource without a publisher")) return 1;
+            placed.Reset();
+
+            MeshLeaseDraw late{source.address(), queue.Get(), red};
+            late.before_submit = [&] { std::memcpy(source.cpu + source.record_offset, &red, sizeof(red)); };
+            if (!verify(late, "loose mesh sees a CPU write after Close")) return 1;
+            // The queue rejects the entire stale recording, so use already
+            // initialized external DispatchMesh arguments for this control.
+            PlacedBuffer args(device.Get(), guest.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_RESOURCE_FLAG_NONE);
+            const auto upload = make_buffer(device.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ);
+            const D3D12_RANGE empty{};
+            void* memory{};
+            check(upload->Map(0, &empty, &memory), "map loose-root dispatch arguments");
+            std::memcpy(memory, MeshLeaseWriter::old_groups.data(), sizeof(MeshLeaseWriter::old_groups));
+            upload->Unmap(0, nullptr);
+            ComputeCommands seed(device.Get(), nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            seed.list->CopyBufferRegion(args.native.Get(), 0, upload.Get(), 0, sizeof(MeshLeaseWriter::old_groups));
+            seed.submit_and_wait(device.Get());
+            MeshLeaseDraw remap{source.address(), queue.Get(), black};
+            remap.argument = args.wrapped.Get();
+            remap.before_submit = [&] { source.replace_loose_page(); };
+            if (!verify(remap, "loose mesh refuses a remapped page on submit") ||
+                !verify({source.address(), queue.Get(), green}, "new loose mesh recording reads replacement page")) return 1;
+            source.free_original();
+            check_lease_debug(info.Get());
+
+            std::ifstream log{std::filesystem::path(log_path)};
+            const std::string lines{std::istreambuf_iterator<char>(log), {}};
+            log.close();
+            DeleteFileW(log_path.c_str());
+            check(lines.find("mesh XMem loose root bind") != std::string::npos &&
+                  lines.find("mesh XMem submit refused: writer or live page identity changed") != std::string::npos &&
+                  lines.find("mesh XMem loose root SRV has no usable single-page lease") != std::string::npos &&
+                  lines.find("mesh XMem read address is missing or misaligned") != std::string::npos ? S_OK : E_FAIL,
+                  "observe loose binding, stale submission and invalid range refusals");
+            return 0;
+        }
         if (lease_fixture) {
             MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);
             const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -1621,24 +1803,47 @@ int main(int argc, char** argv) try
         return ok ? 0 : 1;
     }
     if (mesh && GetEnvironmentVariableA("X2W_MESH_REQUEST_FIXTURE", nullptr, 0)) {
-        const auto cache = std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
+        wchar_t exchange[MAX_PATH]{};
+        const DWORD exchange_size = GetEnvironmentVariableW(L"X2W_TEST_MESH57_EXCHANGE", exchange, MAX_PATH);
+        if (exchange_size >= MAX_PATH) return 1;
+        const auto cache = exchange_size ? std::filesystem::path(exchange) / "requests" :
+            std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set mesh fixture cache");
+        const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants = {0, 0, 2};
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {1, &srv};
+        const D3D12_ROOT_SIGNATURE_DESC source_root{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const auto& desc = exchange_size ? source_root : graphics_desc;
         ComPtr<ID3DBlob> root_blob;
-        const auto root = create_root(guest.Get(), graphics_desc, &root_blob);
-        const auto different_root = create_root(guest.Get(), graphics_desc);
+        const auto root = create_root(guest.Get(), desc, &root_blob);
+        const auto different_root = create_root(guest.Get(), desc);
         // Distinct, source-owned bounded spans. The request publisher must preserve their stage roles and lengths.
-        const std::array<UINT, 4> ms{0xbfa00003, 0xbf900009, 0xbf810000, 0};
-        const std::array<UINT, 2> ps{0xbfa00003, 0xbf810000};
+        const std::array<UINT, 4> default_ms{0xbfa00003, 0xbf900009, 0xbf810000, 0};
+        const std::array<UINT, 2> default_ps{0xbfa00003, 0xbf810000};
+        const auto read_stage = [&](const wchar_t* name) {
+            std::ifstream file(std::filesystem::path(exchange) / name, std::ios::binary);
+            return std::vector<char>(std::istreambuf_iterator<char>(file), {});
+        };
+        const auto source_ms = exchange_size ? read_stage(L"ms.bin") : std::vector<char>{};
+        const auto source_ps = exchange_size ? read_stage(L"ps.bin") : std::vector<char>{};
+        if (exchange_size && (source_ms.empty() || source_ps.empty())) return 1;
+        const void* ms = exchange_size ? static_cast<const void*>(source_ms.data()) : default_ms.data();
+        const void* ps = exchange_size ? static_cast<const void*>(source_ps.data()) : default_ps.data();
+        const auto ms_size = exchange_size ? source_ms.size() : sizeof(default_ms);
+        const auto ps_size = exchange_size ? source_ps.size() : sizeof(default_ps);
         const auto make_pso = [&](bool with_pixel, bool with_vertex, bool incomplete_pixel) {
             std::array<UINT64, 0x300 / sizeof(UINT64)> fields{};
             fields[0] = reinterpret_cast<UINT64>(root.Get());
-            fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps.data()) : 0;
-            fields[6] = with_pixel && !incomplete_pixel ? sizeof(ps) : 0;
-            fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps.data()) : 0;
-            fields[10] = with_vertex ? sizeof(ps) : 0;
-            fields[13] = reinterpret_cast<UINT64>(ms.data());
-            fields[14] = sizeof(ms);
+            fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps) : 0;
+            fields[6] = with_pixel && !incomplete_pixel ? ps_size : 0;
+            fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps) : 0;
+            fields[10] = with_vertex ? ps_size : 0;
+            fields[13] = reinterpret_cast<UINT64>(ms);
+            fields[14] = ms_size;
             using Create = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
             ComPtr<IUnknown> pso;
             check(slot<Create>(guest.Get(), 57)(guest.Get(), fields.data(), __uuidof(ID3D12PipelineState),
@@ -1677,13 +1882,13 @@ int main(int argc, char** argv) try
             auto path = file.path();
             if (path.extension() != ".m57") continue;
             ++requests;
-            if (!matches(path, ms.data(), sizeof(ms)) ||
+            if (!matches(path, ms, ms_size) ||
                 !matches(path.replace_extension(".root"), root_blob->GetBufferPointer(), root_blob->GetBufferSize())) return 1;
-            if (matches(path.replace_extension(".ps57"), ps.data(), sizeof(ps))) ++with_ps;
+            if (matches(path.replace_extension(".ps57"), ps, ps_size)) ++with_ps;
             else if (!matches(path, nullptr, 0)) return 1;
         }
         if (requests != 2 || with_ps != 1 || files != 6) return 1;
-        std::filesystem::remove_all(cache);
+        if (!exchange_size) std::filesystem::remove_all(cache);
         std::puts("slot 57 MS+PS and MS-only requests preserved stages and the matching root");
         return 0;
     }
@@ -1799,6 +2004,21 @@ int main(int argc, char** argv) try
                     DrawKind::vertices, false, Refusal::copied_table_buffer, "census key3 incomplete_table_buffer #2", &copied_buffer) &&
                 verify(producer.Get(), false, Refusal::none, "census valid draw does not increment refusals");
             if (ok) ok = check_translated_refusal_census(log_path);
+            std::filesystem::remove_all(cache);
+            DeleteFileW(log_path.c_str());
+            return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
+        if (other_refusal_census) {
+            bool ok = verify(producer.Get(), false, Refusal::none, "other census warm up translated pipeline key") &&
+                verify(producer.Get(), false, Refusal::missing_viewport, "other census key1 missing_viewport_or_scissor #1") &&
+                verify(producer.Get(), false, other_refusal_census_control ? Refusal::none : Refusal::short_argument,
+                       other_refusal_census_control ? "other census control valid draw replaces second reason"
+                                                    : "other census key1 argument_outside_placed_buffer") &&
+                verify(producer.Get(), false, Refusal::missing_viewport, "other census key1 missing_viewport_or_scissor #2");
+            if (ok) {
+                refuse_each_reason(guest.Get(), signature.Get());
+                ok = check_indirect_other_refusal_census(log_path);
+            }
             std::filesystem::remove_all(cache);
             DeleteFileW(log_path.c_str());
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;

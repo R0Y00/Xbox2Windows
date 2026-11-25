@@ -1156,7 +1156,12 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         std::uint64_t end = (raw_end + 0x1ff) & ~std::uint64_t{0x1ff};
         if (end > raw.size()) end = raw.size();
         if (first >= end) continue;
-        const std::uint64_t length = end - first < span ? end - first : span;
+        // Windows maps the section in whole pages: raw data past VirtualSize stays visible up to the
+        // end of the section's last page, and never reaches the next page. The section starts on a
+        // page and its span lies inside SizeOfImage, so the rounded window stays in the allocation.
+        const std::uint64_t page = system.dwPageSize;
+        const std::uint64_t window = (std::uint64_t{span} + page - 1) & ~(page - 1);
+        const std::uint64_t length = end - first < window ? end - first : window;
         std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
     }
 
