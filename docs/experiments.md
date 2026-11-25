@@ -12003,6 +12003,17 @@ bound static sampler keeps the title's own words, `CLAMP_Z` included. The
 check accepts `CLAMP_Z` 1 to 7 and keeps refusing wrap or mirror in X or
 Y and an anisotropy ratio. Its negative control removes the 2D profile and
 expects the refusal again, and one draw runs with `CLAMP_Z` set.
+
+A point XY filter (`XY_MAG_FILTER` or `XY_MIN_FILTER` 0, SQ_IMG_SAMP_WORD2)
+is checked as bilinear. The same spec section says gather4 "Gathers the
+four texels that would be used in a bi-linear filtering operation" and uses
+only the addressing modes. The renderer the draws use already binds a point
+static sampler (`FILTER_MIN_MAG_MIP_POINT` in `tests/pixel_aot_vs.hlsl`)
+and reads the bilinear footprint. Anisotropic XY, a linear mip filter and
+a LOD bias stay refused. The check translates point magnification,
+minification and both, together with `CLAMP_Z`, and its negative control
+refuses the point filter again once the profile only clears `CLAMP_Z`. One
+draw runs with point XY and `CLAMP_Z` set.
 [RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) ·
 [Direct3D gather semantics](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#Gather4)
 

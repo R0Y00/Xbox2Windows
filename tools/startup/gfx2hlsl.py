@@ -78,10 +78,16 @@ def gather_2d_profile_words(words):
     """The sampler words a 2D gather is checked with: fields a 2D gather cannot observe are set to the profile.
 
     SQ_IMG_SAMP_WORD0 bits 8:6 (CLAMP_Z) address the third coordinate, which a 2D view does not have; D3D11.3
-    functional spec 22.4.2 (gather4): "Only the addressing modes of the sampler are used". The words bound as
-    the static sampler stay the title's own.
+    functional spec 22.4.2 (gather4): "Only the addressing modes of the sampler are used". For the same reason a
+    point XY_MAG_FILTER or XY_MIN_FILTER (WORD2 bits 21:20 and 23:22, value 0) reads the same four texels as the
+    bilinear one: gather4 "Gathers the four texels that would be used in a bi-linear filtering operation", whatever
+    the sampler's filter, so a point filter is checked as bilinear. Anisotropic filters (2, 3) keep their values and
+    stay refused. The words bound as the static sampler stay the title's own.
     """
     w0, w1, w2, w3 = words
+    for shift in (20, 22):
+        if (w2 >> shift) & 3 == 0:
+            w2 |= 1 << shift
     return (w0 & ~(7 << 6), w1, w2, w3)
 
 

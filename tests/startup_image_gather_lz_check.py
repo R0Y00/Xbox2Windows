@@ -89,6 +89,7 @@ def controls(llvm_mc):
     refused(shader(prefix=bad_min_lod), 'requires normalized clamp')
     refused(shader(prefix=missing_sampler), 'constant sampler')
     check_clamp_z()
+    check_point_xy()
     print('Four fixed-mip gather channels and unsupported encodings checked')
 
 
@@ -119,6 +120,36 @@ def check_clamp_z():
     G.gather_2d_profile_words = lambda words: tuple(words)
     try:
         refused(shader(prefix=with_word0(0x92)), 'requires normalized clamp')
+    finally:
+        G.gather_2d_profile_words = profile
+
+
+# Word 2 is moved as a literal (s_mov_b32 s26, 0x04500000: bilinear XY, point mip).
+FILTER_WORD2 = bytes.fromhex('ff039abe00005004')
+
+
+def with_word2(word, prefix=PREFIX):
+    return prefix.replace(FILTER_WORD2, bytes.fromhex('ff039abe') + struct.pack('<I', word))
+
+
+def check_point_xy():
+    # Gather returns the bilinear footprint whatever the XY filter (D3D11.3 functional spec 22.4.2), so point
+    # magnification, minification or both translate. The last word pair is clamp-last-texel in X, Y and Z with
+    # point XY and point mip filtering.
+    for word0, word2 in ((0x12, 0x04000000), (0x12, 0x04100000), (0x12, 0x04400000), (0x92, 0x04000000)):
+        pipe = pipeline(shader(prefix=with_word2(word2, with_word0(word0))))
+        assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
+        assert f'smp 0 {word0:#x} 0x0 {word2:#x} 0x0\n' in pipe.manifest(), pipe.manifest()
+    # Still refused: anisotropic XY, a linear mip filter, a nonzero LOD bias field.
+    refused(shader(prefix=with_word2(0x04a00000)), 'requires normalized clamp')
+    refused(shader(prefix=with_word2(0x04800000)), 'requires normalized clamp')
+    refused(shader(prefix=with_word2(0x08000000)), 'requires normalized clamp')
+    refused(shader(prefix=with_word2(0x04000001)), 'requires normalized clamp')
+    # Negative control: a profile that only clears CLAMP_Z refuses the point filter, as before this change.
+    profile = G.gather_2d_profile_words
+    G.gather_2d_profile_words = lambda words: (words[0] & ~(7 << 6),) + tuple(words[1:])
+    try:
+        refused(shader(prefix=with_word2(0x04000000, with_word0(0x92))), 'requires normalized clamp')
     finally:
         G.gather_2d_profile_words = profile
 
@@ -168,6 +199,8 @@ def draw(dxc, renderer, adapter):
         run(3, 0, 1, (-0.5, 1.25), shader(2, prefix=clamped))
         # The same draw with the title's CLAMP_Z set: a 2D gather cannot observe it.
         run(3, 1, 0, uv, shader(1, prefix=with_word0(0x92)))
+        # Point XY filtering with CLAMP_Z set, the sampler state of the refused run pipelines: the same four texels.
+        run(3, 1, 3, uv, shader(8, prefix=with_word2(0x04000000, with_word0(0x92))))
         run(3, 1, 2, uv, shader(4), mutant=True)
 
 
