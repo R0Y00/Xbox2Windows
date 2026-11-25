@@ -2617,12 +2617,14 @@ void __stdcall list_set_predication(Wrapper* self, void* buffer_arg, u64 offset,
         return refuse("buffer has no desktop resource");
     auto* resource = has_buffer ? static_cast<ID3D12Resource*>(buffer->own().real) : nullptr;
     const auto desc = has_buffer ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
+    // Width is the size in bytes only for a buffer, so the Dimension check must stay above check(), which takes it as the size.
     if (has_buffer && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return refuse("predication needs a buffer");
     switch (x2w_predication::check(has_buffer, offset, operation, desc.Width)) {
     case x2w_predication::Verdict::clear:
         self->own().predication_buffer = nullptr;
         list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         return;
+    // set: the arguments are valid, but the heap and state checks below can still refuse; the list then keeps its previous predication.
     case x2w_predication::Verdict::set: break;
     case x2w_predication::Verdict::bad_operation: return refuse("operation is not 0 or 1");
     case x2w_predication::Verdict::bad_offset: return refuse("offset is not a multiple of 8");
