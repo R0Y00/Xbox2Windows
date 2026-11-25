@@ -2303,6 +2303,12 @@ class Stage:
             if tok in FLOATS or tok in ('exec', 'exec_lo') or (
                     r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255) or (r[0] == 's' and r[1] > 105))):
                 raise Unsupported('%s factor %s' % (name, tok))
+        for tok in ops[2:5]:
+            r = reg_range(tok)
+            if tok in ('vcc', 'vcc_lo', 'vcc_hi') or (r and r[0] == 's' and any(
+                    w in self.masks for w in range(r[1], r[2] + 1))):
+                # u() would supply the per-lane 0/1 projection, not the architectural 32-bit mask.
+                raise Unsupported('%s reads the lane mask %s as an integer' % (name, tok))
         low, high = self.i64_words(ops[4])
         self.emit('{ uint3 r = %s(%s, %s, %s, %s);' % ('mad64i' if signed else 'mad64u',
                                                          self.u(ops[2]), self.u(ops[3]), low, high))

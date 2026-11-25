@@ -158,6 +158,22 @@ def controls():
     overlap = translate('v_mad_u64_u32 v[20:21], s60, v18, v19, v[20:21]')
     check('a destination overlapping S2 reads S2 before it writes', overlap.lines[0].endswith('v20, v21);'))
 
+    for asm in ('v_mad_u64_u32 v[14:15], vcc_lo, s60, 1, 0',
+                'v_mad_u64_u32 v[14:15], vcc_lo, vcc_lo, 1, 0',
+                'v_mad_u64_u32 v[14:15], vcc_lo, v18, v19, s[60:61]',
+                'v_mad_u64_u32 v[14:15], vcc_lo, v18, v19, s[59:60]'):
+        masked = Probe()
+        masked.masks, masked.varying_s = {60}, set()
+        try:
+            masked.one('v_mad_u64_u32', asm)
+            ok = False
+        except G.Unsupported:
+            ok = True
+        check('refused lane-mask input: %s' % asm, ok)
+    unmasked = Probe()
+    unmasked.masks, unmasked.varying_s = {60}, set()
+    unmasked.one('v_mad_u64_u32', 'v_mad_u64_u32 v[14:15], vcc_lo, s58, 1, s[56:57]')
+    check('a scalar that is not a lane mask is still accepted', bool(unmasked.lines))
     for asm in ('v_mad_i64_i32 v[12:13], vcc_lo, v18, v19, v[20:21]',
                 'v_mad_u64_u32 v[12:13], null, v18, v19, v[20:21]',
                 'v_mad_u64_u32 v[12:13], vcc_lo, v18, v19, v[20:21] clamp',
