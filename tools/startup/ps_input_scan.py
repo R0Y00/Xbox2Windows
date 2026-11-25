@@ -40,7 +40,10 @@ import os
 import re
 import struct
 import sys
+import tempfile
+import zlib
 from collections import Counter, namedtuple
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gfx2hlsl as G  # noqa: E402  (also puts tools/ on sys.path)
@@ -1004,7 +1007,45 @@ def run(directory, capture_path, pixel_dir, top, limit, listing):
     return lines, result
 
 
-def main(argv=None):
+def _same_path(left, right):
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_json_path(json_path, request_dir, pixel_dir, capture_path):
+    json_resolved = json_path.resolve()
+    if capture_path:
+        cap_path = Path(capture_path)
+        if _same_path(json_path, cap_path):
+            raise ValueError('--json path collides with --capture: %s' % json_path)
+        if cap_path.resolve() in json_resolved.parents:
+            raise ValueError('--json path cannot be inside --capture: %s' % json_path)
+    for label, dir_arg in (('request directory', request_dir), ('--pixel-dir', pixel_dir)):
+        if dir_arg and _same_path(json_path, Path(dir_arg)):
+            raise ValueError('--json path collides with %s: %s' % (label, json_path))
+    if json_path.exists() and json_path.is_dir():
+        raise ValueError('--json path is an existing directory: %s' % json_path)
+    for label, dir_arg in (('request directory', request_dir), ('--pixel-dir', pixel_dir)):
+        if not dir_arg:
+            continue
+        dir_path = Path(dir_arg)
+        if dir_path.resolve() in json_resolved.parents:
+            raise ValueError('--json path cannot be inside %s: %s' % (label, json_path))
+        if json_path.exists() and any(_same_path(json_path, child) for child in dir_path.iterdir()):
+            raise ValueError('--json path collides with file in %s: %s' % (label, json_path))
+
+
+def _atomic_write_text(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging_dir:
+        staged = Path(staging_dir) / path.name
+        staged.write_text(text, encoding='utf-8')
+        os.replace(staged, path)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('request_dir', nargs='?', help='directory with req_<key>.a/.b/.root files')
     parser.add_argument('--capture', help='capture.bin whose path-57 PSOs are scanned')
@@ -1024,13 +1065,17 @@ def main(argv=None):
         parser.error('--capture is not a file')
     if args.top < 1 or args.region_limit < 8:
         parser.error('--top must be positive and --region-limit at least 8')
-    lines, result = run(args.request_dir, args.capture, args.pixel_dir, args.top, args.region_limit, args.list)
+    try:
+        if args.json is not None:
+            _validate_json_path(Path(args.json), args.request_dir, args.pixel_dir, args.capture)
+        lines, result = run(args.request_dir, args.capture, args.pixel_dir, args.top, args.region_limit, args.list)
+        if args.json is not None:
+            _atomic_write_text(args.json, json.dumps(result, indent=1))
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
+        parser.error(str(exc))
     print('\n'.join(lines))
-    if args.json:
-        with open(args.json, 'w', encoding='utf-8') as file:
-            json.dump(result, file, indent=1)
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    raise SystemExit(main())
