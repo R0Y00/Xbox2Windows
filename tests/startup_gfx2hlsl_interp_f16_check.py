@@ -199,6 +199,24 @@ def controls():
     assert got == expected, ('translated words', [hex(w) for w in got], [hex(w) for w in expected])
     print('translated: %s' % ','.join('%08x' % w for w in got))
 
+    # The p2 lowering keeps the upper half of the destination with this mask; dropping it must fail the check.
+    assert ps.count('& 0xffff0000u) | f32tof16(') == 4, ps
+    # The whole-program scan runs once per translated program, not once per p1ll / p2 statement.
+    calls = []
+    scan = G.Stage.interp_f16_scan
+
+    def counting(self):
+        calls.append(self.interp_scanned)
+        return scan(self)
+
+    G.Stage.interp_f16_scan = counting
+    try:
+        translate()
+    finally:
+        G.Stage.interp_f16_scan = scan
+    assert calls.count(False) == 1 and len(calls) == 8, calls
+    print('scan: %d calls, 1 full run' % len(calls))
+
     # A decoded instruction must be the source line (LLVM's spelling).
     lines = PS_SOURCE.splitlines()
     for (_, size, name, asm), line in zip(G.decode(G.strip_header(PS_WORDS)), lines):

@@ -450,6 +450,9 @@ class Stage:
     # unit probes build a Stage without __init__.
     interp_p1 = None
     needs_sm6 = False   # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
+    # The whole-program proof of interp_f16_scan depends only on the decoded program, so it runs once per Stage
+    # (a class default keeps probes built without __init__ working).
+    interp_scanned = False
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -1968,6 +1971,8 @@ class Stage:
         (LLVM 15 SIInstrInfo/VOP3Instructions.td model the result as f16 only; the encoding states no
         high-half behaviour), so only a plain v_cvt_f32_f16 reading the low half may consume it.
         """
+        if self.interp_scanned:
+            return
         pair = None
         targets = set()
         rows = []
@@ -2043,6 +2048,7 @@ class Stage:
                                       regs(ops[0]) & {base, base + 1})))
             if n == 'v_swap_b32' and len(ops) == 2 and regs(ops[1]) & {base, base + 1}:
                 raise Unsupported('v_swap_b32 writes the entry barycentric registers')
+        self.interp_scanned = True
 
     def op_v_interp_p1ll_f16(self, ops, mods):
         # P0 + I * P10 in f32 from a binary16 attribute. The rasterizer interpolates the float channel, so the
