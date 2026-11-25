@@ -5,6 +5,7 @@ Scalar registers are also tracked symbolically at translation time so that point
 values (tables, vertex-buffer table, root buffers) turn into HLSL resources instead of arithmetic.
 The output is HLSL for both stages plus a manifest that tells the runtime what to bind where.
 """
+import bisect
 from contextlib import suppress
 import functools
 import os
@@ -409,6 +410,20 @@ def check_encoding(code, off, n, name, asm):
             operand = fields[i + 1]
             fields[i + 1] = operand[:len(operand) - len(operand.lstrip())] + '0x%08x' % (bits ^ 0x80000000)
             asm = ','.join(fields)
+    if n >= 8 and struct.unpack_from('<I', code, off)[0] >> 26 == 0b110101:
+        # VOP3 NEG (w1[31:29], bit 29 + i for source i) on a non-negative inline integer (128..192) or a literal (255).
+        # The decoder prints inline 1 with NEG as `-1`, the text of the plain inline -1 (193), so both would translate to
+        # 0xffffffff, and a literal 5 would become 0xfffffffb. Only v_cndmask_b32_e64 models NEG on its two data
+        # sources (above, as the sign bit flipped). Inline floats, registers and negative inlines are not affected.
+        # ABS is not tested: on the VOP3b forms w0[10:8] is SDST, not a modifier.
+        word1, = struct.unpack_from('<I', code, off + 4)
+        for i in range(3):
+            if name == 'v_cndmask_b32_e64' and i < 2 or not word1 & (1 << (29 + i)):
+                continue
+            source = (word1 >> (9 * i)) & 0x1ff
+            if 128 <= source <= 192 or source == 255:
+                raise Unsupported('%s with NEG on an integer or literal source %d: the printed sign would read as inline -N'
+                                  % (name, i))
     return asm
 
 
@@ -538,6 +553,23 @@ def mask_words(tok, count):
     return words if len(words) == count else None
 
 
+@functools.lru_cache(maxsize=None)
+def clear_shape(name, asm):
+    """What clear_after needs from one instruction's text, which the fixed point would otherwise parse again on every
+    visit: 'cmpx', None for a form that carries no fact, or (operation, saving suffix, word count, operand words)."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base.startswith('v_cmpx'):
+        return 'cmpx'
+    m = re.fullmatch(r's_(mov|and|or|xor|andn2)(_saveexec|_wrexec)?_b(32|64)', base)
+    if not m or (m.group(2) and m.group(1) == 'mov'):
+        return None
+    count = 2 if m.group(3) == '64' else 1
+    words = [mask_words(op, count) for op in parse(asm)[1]]
+    if None in words or len(words) != (2 if m.group(2) or m.group(1) == 'mov' else 3):
+        return None
+    return m.group(1), m.group(2), count, tuple(tuple(word) for word in words)
+
+
 def clear_after(name, asm, may, clear):
     """Forward step of the proof Stage.execz_refusals runs over a block that s_cbranch_execz skips. A fact (key, h)
     says: for every lane of wave half h (0: lanes 0 to 31, 1: lanes 32 to 63) whose exec bit was clear at the branch,
@@ -548,22 +580,18 @@ def clear_after(name, asm, may, clear):
     source holds; A | B and A ^ B what both hold; A & ~B and a move what A holds. A saveexec or wrexec form is its
     operation on exec plus the copy it saves, and v_cmpx ANDs its result into exec. Any other write, a compare
     result included, drops the facts of what it may write."""
-    base = re.sub(r'_e(32|64)$', '', name)
-    _, ops, _ = parse(asm)
     out = {fact for fact in clear if fact[0] not in may - EXEC_KEYS}
-    if base.startswith('v_cmpx'):
+    shape = clear_shape(name, asm)
+    if shape == 'cmpx':
         return out
-    halves = lambda word: {0, 1} if word == '0' else {h for key, h in clear if key == word}
-    m = re.fullmatch(r's_(mov|and|or|xor|andn2)(_saveexec|_wrexec)?_b(32|64)', base)
-    saving = m and m.group(2)
-    count = 2 if m and m.group(3) == '64' else 1
-    words = [mask_words(op, count) for op in ops] if m and not (saving and m.group(1) == 'mov') else [None]
-    if None in words or len(words) != (2 if saving or m.group(1) == 'mov' else 3):
+    if shape is None:
         return {fact for fact in out if fact[0] not in may}
-    dest, srcs = words[0], words[1:]
+    op, saving, count, words = shape
+    halves = lambda word: {0, 1} if word == '0' else {h for key, h in clear if key == word}
+    dest, srcs = words[0], list(words[1:])
     if saving:  # RDNA 2 ISA SOP1: the operation is S0 op EXEC, so andn2 is S0 & ~EXEC
-        srcs.append(['exec', 'exec_hi'][:count])
-    combine = {'and': set.union, 'or': set.intersection, 'xor': set.intersection}.get(m.group(1), lambda a, *b: a)
+        srcs.append(('exec', 'exec_hi')[:count])
+    combine = {'and': set.union, 'or': set.intersection, 'xor': set.intersection}.get(op, lambda a, *b: a)
     value = [combine(*(halves(src[j]) for src in srcs)) for j in range(count)]
     writes = list(zip(dest, value))
     if saving:  # saveexec keeps the old exec in D; wrexec writes the result to both
@@ -2282,21 +2310,22 @@ class Stage:
     def join_writes(self, branches):
         """Branch target -> the scalar registers another path can write before it reaches the target: the loop body
         [target, branch] for a backward branch, and the skipped instructions (branch, target) for a forward one."""
+        offs, written = [], []  # per instruction, once: a program has hundreds of branches over thousands of instructions
+        for off, _n, name, asm in self.ins:
+            regs = set(range(128)) if name.startswith('s_movreld') else set()  # M0 picks the destination
+            for tok in destinations(name, parse(asm)[1]):
+                r = reg_range(tok)
+                if r and r[0] == 's':
+                    regs.update(range(r[1], r[2] + 1))
+                elif tok == 'm0':
+                    regs.add('m0')
+            offs.append(off)
+            written.append(regs)
         writes = {}
         for branch, target in branches:
-            regs = writes.setdefault(target, set())
-            for off, _n, name, asm in self.ins:
-                if not (target <= off <= branch if target <= branch else branch < off < target):
-                    continue
-                _, ops, _ = parse(asm)
-                if name.startswith('s_movreld'):
-                    regs.update(range(128))  # M0 picks the destination
-                for tok in destinations(name, ops):
-                    r = reg_range(tok)
-                    if r and r[0] == 's':
-                        regs.update(range(r[1], r[2] + 1))
-                    elif tok == 'm0':
-                        regs.add('m0')
+            lo, hi = ((bisect.bisect_left(offs, target), bisect.bisect_right(offs, branch)) if target <= branch else
+                      (bisect.bisect_right(offs, branch), bisect.bisect_left(offs, target)))
+            writes.setdefault(target, set()).update(*written[lo:hi])
         return writes
 
     def tracks_uniformity(self):
