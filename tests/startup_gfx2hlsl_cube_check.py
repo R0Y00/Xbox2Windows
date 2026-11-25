@@ -78,7 +78,7 @@ def main():
     stage.const_words = lambda _ops: None
     stage.kind, stage.blocks = 'ps', []
     stage.image(['v[4:7]', 'v[0:2]', 's[8:15]', 's[16:19]'], ['dim:SQ_RSRC_IMG_CUBE', 'dmask:0xf'], 'lz')
-    if stage.pipe.kinds != ['tex2da'] or 'float3(F(v0), F(v1), F(v2))' not in ' '.join(stage.lines):
+    if stage.pipe.kinds != ['tex2da'] or 'float3(F(v0) - 1.0, F(v1) - 1.0, F(v2))' not in ' '.join(stage.lines):
         failures.append('cube sample: %s %s' % (stage.pipe.kinds, stage.lines))
 
     for failure in failures:

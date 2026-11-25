@@ -2013,6 +2013,10 @@ class Stage:
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
             elif one:
                 uv = self.f(cs[0])
+            elif dim == 'SQ_RSRC_IMG_CUBE':
+                # The ISA's s and t are sc / |ma| + 1.5 with ma twice the major axis, so they sit in [1, 2];
+                # Texture2DArray wants [0, 1]. Remove the integer bias and keep the face id as the slice.
+                uv = 'float3(%s - 1.0, %s - 1.0, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             elif three:
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
