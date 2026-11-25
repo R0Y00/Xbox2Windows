@@ -3008,19 +3008,24 @@ void log_root_view_refusal(const char* what, UINT parameter, x2w_startup::RootVi
     if (first_calls(refused, 6)) log("x2w-render %s %u ignored: %s", what, parameter, x2w_startup::root_view_reason(result));
 }
 // List slots 41 / 43 (desktop 37 / 39 + 4), SetComputeRootConstantBufferView / SetComputeRootShaderResourceView.
-// The bytes at the title address are copied to desktop memory and the copy is bound, as for slot 44. The
-// view is dropped from the store when no copy can be made.
+// A CBV never exceeds 64 KiB, so its bytes at the title address are copied to desktop memory and the copy is
+// bound, as for slot 44. A root SRV has no such bound (a shader may read any offset of the buffer behind it) and
+// the buffer extent is not known here, so an SRV is only recorded: a prefix copy would let reads past it return
+// unrelated ring memory. The view is dropped from the store when no copy can be made.
 void compute_read_view(Wrapper* self, UINT parameter, u64 address, unsigned wanted, const char* what)
 {
     auto* list = recording(self);
     if (!list) return;
     Pass& pass = pass_of(self);
     const unsigned declared = declared_root_type(pass.compute_params, parameter);
-    const std::size_t bytes = address ? readable_window(address, 0x10000) : 0;
+    const bool copies = wanted == x2w_startup::root_type_cbv;
+    const std::size_t bytes = (copies && address) ? readable_window(address, 0x10000) : 0;
     // An SRV address inside this recording's own upload pages already has a desktop address: bind it directly.
+    // Any other SRV address is only recorded.
     const UINT64 own_page = wanted == x2w_startup::root_type_srv ? list_upload_gpu(self, address, 1) : 0;
     const bool direct = own_page && !(own_page % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
-    const auto result = pass.compute_views.set(pass.compute_root, declared, wanted, parameter, bytes || direct ? address : 0);
+    const u64 kept = copies ? (bytes ? address : 0) : address;
+    const auto result = pass.compute_views.set(pass.compute_root, declared, wanted, parameter, kept);
     if (result != x2w_startup::RootViewResult::stored) return log_root_view_refusal(what, parameter, result);
     if (direct) {
         list->SetComputeRootShaderResourceView(parameter, own_page);
@@ -3028,9 +3033,7 @@ void compute_read_view(Wrapper* self, UINT parameter, u64 address, unsigned want
     }
     if (!bytes) return;
     const D3D12_GPU_VIRTUAL_ADDRESS desktop = upload_from_title(address, bytes);
-    if (!desktop) return;
-    if (wanted == x2w_startup::root_type_cbv) list->SetComputeRootConstantBufferView(parameter, desktop);
-    else list->SetComputeRootShaderResourceView(parameter, desktop);
+    if (desktop) list->SetComputeRootConstantBufferView(parameter, desktop);
 }
 void __stdcall list_compute_root_cbv(Wrapper* self, UINT parameter, u64 address)
 {
