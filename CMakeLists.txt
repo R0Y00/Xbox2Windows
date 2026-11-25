@@ -2487,6 +2487,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_sopk_accum COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sopk_accum_check.py")
     # gfx2hlsl scalar s_lshl2_add_u32, s_lshl3_add_u32, s_bitset0_b32 and s_ff0_i32_b32 against an integer reference (#1723).
+    # gfx2hlsl scalar s_bitset0_b32 and s_ff0_i32_b32 against an integer reference (#1723).
     add_test(NAME startup_gfx2hlsl_scalar_twins COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_twins_check.py")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with

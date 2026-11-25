@@ -89,12 +89,24 @@ def check_m0_and_refusals():
     lines = translate(sop1('s_bitset0_b32', M0, 2))
     assert any(l.startswith('m0 = ') for l in lines) and not any(l.startswith('scc') for l in lines), lines
     refused(sop1('s_bitset0_b32', 4, 126), 'lane mask')   # exec_lo
+    refused(sop1('s_ff0_i32_b32', 4, 126), 'lane mask')   # exec_lo
+    refused(sop1('s_ff0_i32_b32', 4, 106), 'lane mask')   # vcc_lo
+
+
+def check_numeric_symbols():
+    for tag in (('ud', 0), ('fixed_buffer_word',)):
+        stage = ProbeStage()
+        stage.sym[2] = tag
+        _, name, asm, _ = D.decode_instruction(sop1('s_bitset0_b32', 4, 2), 0)
+        stage.one(name, asm)
+        assert stage.lines, tag
 
 
 def main():
     check_bitset0()
     check_ff0()
     check_m0_and_refusals()
+    check_numeric_symbols()
     print('startup_gfx2hlsl_scalar_twins_check: ok')
 
 

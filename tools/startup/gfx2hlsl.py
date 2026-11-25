@@ -1078,7 +1078,7 @@ class Stage:
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
         word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
-        if shift_add or word_complement or word_pack:
+        if shift_add or word_complement or word_pack or base == 's_ff0_i32_b32':
             # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
             # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
             mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
@@ -1480,7 +1480,7 @@ class Stage:
             if t in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') or (r and r[0] == 's' and r[1] in self.masks):
                 raise Unsupported('%s on a lane mask' % base)
             sym = self.sym.get(r[1]) if r and r[0] == 's' else None
-            if sym and sym[0] != 'const':
+            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
                 raise Unsupported('%s on descriptor data' % base)
             out.append(self.u(t))
         return out
