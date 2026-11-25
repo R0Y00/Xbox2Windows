@@ -486,6 +486,9 @@ def barycentric_controls(expected):
     refused('upper half read by a shift', PS_VARIANTS['upper half read by a shift'], 'upper 16 bits')
     refused('upper half exported', PS_VARIANTS['upper half exported'], 'upper 16 bits')
     refused('branch into p2 without the matching p1ll', PS_VARIANTS['branch into p2'], 'a branch between')
+    # The calculated branch jumps from byte 16 to byte 28, skipping the first p1ll.
+    calculated = PS_WORDS[:4] + bytes.fromhex('001f94be1494148015801582142080be') + PS_WORDS[4:]
+    refused('calculated branch into p2', calculated, 'a branch between')
     pair_and_export = PS_VARIANTS['upper half exported']
     # s_cbranch_vccz skips the one-word full-width conversion and reaches the export.
     skip_conversion = pair_and_export[:20] + bytes.fromhex('010086bf0417087e') + pair_and_export[20:]

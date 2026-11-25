@@ -1073,6 +1073,33 @@ def read_controls():
             ("s_or_b32 exec_lo", "v_mov_b32_e32 v1, 5\ns_or_b32 exec_lo"),
             ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)
 
+    # A heap view provides a runtime stride only to formatted loads.
+    formatted = "buffer_load_format_x v10, v8, s[40:43], 0 idxen"
+    raw = "buffer_load_dword v10, v8, s[40:43], 0 idxen"
+    heap_lines = [
+        "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+        "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+        "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+        "s_load_dwordx4 s[40:43], s[12:13], 0x50",
+        "v_lshl_add_u32 v8, s11, 2, v0",
+        "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dwordx4 s[24:27], s[16:19], null",
+        "s_waitcnt lgkmcnt(0)",
+        formatted, "s_waitcnt vmcnt(0)",
+        "buffer_store_dword v10, v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+    heap_binding = dict(table_reg=7, descriptor_offset=0x30, constant_descriptor=0x40,
+                        source_descriptor=0x50, group_reg=11, stride=4, cpu="gfx1013",
+                        heap_view=(0, 64, 1, 128))
+    source = aot.lower(heap_lines, 4, **heap_binding)
+    assert "uint4 format_load_0 = load_heap_view_format(" in source and "Noneu" not in source
+    rejects("Unsupported read address", aot.lower,
+            variant(heap_lines, (formatted, formatted + "\ns_waitcnt vmcnt(0)\n" + raw)),
+            4, **heap_binding)
+    source = aot.lower(variant(heap_lines, (formatted, raw)), 4,
+                       **(heap_binding | dict(heap_view=None, source_stride=16)))
+    assert "inputData.Load(tid.x * 16u + 0u)" in source
+
 
 def alu_controls():
     """Read-compute-write: exact output, then one rejection per instruction or operand outside the subset."""
@@ -1468,6 +1495,14 @@ def mbcnt_controls():
             variant(MBCNT, ("v4, -1, 0", "v4, s30, 0")), 64, **MBCNT_BINDING)
     rejects("Unverified lane count operand", aot.lower,
             variant(MBCNT, ("v5, 0x5a5a5a5a, 7", "v5, 0x5a5a5a5a, v40")), 64, **MBCNT_BINDING)
+    # exec_lo is the full mask once a guard has been restored, but not while the guard is open.
+    join_binding = GUARD_BINDING | dict(stride=8)
+    restored = variant(GUARD_JOIN, ("v_mov_b32_e32 v1, 0x600d", "v_mbcnt_lo_u32_b32 v1, exec_lo, 0"))
+    assert "countbits(0xffffffffu" in aot.lower(restored, 32, **join_binding)
+    rejects("Active lane mask inside guarded region", aot.lower,
+            variant(GUARD_JOIN, ("buffer_store_dword v0, v0, s[4:7], 0 idxen",
+                                 "v_mbcnt_lo_u32_b32 v1, exec_lo, 0\nbuffer_store_dword v0, v0, s[4:7], 0 idxen")),
+            32, **join_binding)
 
 
 def mbcnt_binary(directory, assembler, objcopy, library):
@@ -2013,7 +2048,7 @@ def ff1_scalar_controls():
             variant(FF1_SCALAR, ("s20, s4", "s12, s4")), 32, **FF1_SCALAR_BINDING)
     rejects("Unsupported compute instruction: s_ff0_i32_b32", aot.lower,
             variant(FF1_SCALAR, ("s_ff1_i32_b32 s20, s4", "s_ff0_i32_b32 s20, s4")), 32, **FF1_SCALAR_BINDING)
-    rejects("Unsupported compute instruction: s_cselect_b32", aot.lower,
+    rejects("Unverified SCC for scalar select", aot.lower,
             variant(FF1_SCALAR, ("s_ff1_i32_b32 s20, s4", "s_ff1_i32_b32 s20, s4\ns_cselect_b32 s24, s20, 0")),
             32, **FF1_SCALAR_BINDING)
 
@@ -3091,7 +3126,7 @@ def salu_i32_controls():
         (unsupported + "s_abs_i32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, -s16"),)),
         (unsupported + "s_add_i32_e64", (("s_add_i32 s16, 0x7fffffff, 1", "s_add_i32_e64 s16, 0x7fffffff, 1"),)),
         (unsupported + "s_abs_u32", (("s_abs_i32 s22, 0x80000000", "s_abs_u32 s22, 0x80000000"),)),
-        (unsupported + "s_cselect_b32", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, 0x80000000\ns_cselect_b32 s22, 1, 2"),)),
+        ("Unverified SCC for scalar select", (("s_abs_i32 s22, 0x80000000", "s_abs_i32 s22, 0x80000000\ns_cselect_b32 s22, 1, 2"),)),
     ):
         rejects(message, lambda *c: aot.lower(variant(SALU_I32, *c), 64, **SALU_I32_BINDING), *changes)
     # Pending constant-buffer load as source or destination:
