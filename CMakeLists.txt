@@ -2792,6 +2792,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_dpp_quad_swap_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl lane-local DPP forms of v_add_f32, v_sub_f32, v_or_b32 and v_add_nc_u32: the translated pair is drawn
     # on WARP and hardware (FXC 5_1 and DXC 6_0) and read back against a plain float32/integer reference, with a
     # mutation that must read a different word.
