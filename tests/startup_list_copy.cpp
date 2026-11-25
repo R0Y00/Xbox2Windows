@@ -17,6 +17,8 @@
 //   7. a title-backed texture copied to a texture: the destination holds its texels; one whose memory cannot
 //      be read is refused and the destination stays empty
 //   8. after Close, the same calls change no counter
+//   9. a copy into a title-backed texture, discarded by Close and Reset unsubmitted: a later copy out of that
+//      texture still reads its own memory
 //
 // The desktop device must not be removed and the debug layer must store no errors.
 //
@@ -267,15 +269,23 @@ int main(int argc, char** argv)
     if (!readable_memory || !gone_memory) return 30;
     for (std::size_t i = 0; i < title_bytes / sizeof(std::uint32_t); ++i) readable_memory[i] = title_texel;
     VirtualFree(gone_memory, title_bytes, MEM_DECOMMIT);
+    // A third placed texture whose only copy is recorded and then discarded without a submission.
+    auto* const discard_memory = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, title_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!discard_memory) return 30;
+    for (std::size_t i = 0; i < title_bytes / sizeof(std::uint32_t); ++i) discard_memory[i] = title_texel;
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     const D3D12_RESOURCE_DESC title_desc = texture(4, DXGI_FORMAT_R8G8B8A8_UNORM, 1, none);
     void *title_readable = nullptr, *title_gone = nullptr;
-    ComPtr<ID3D12Resource> dest_readable, dest_gone;
+    void* title_discarded = nullptr;
+    ComPtr<ID3D12Resource> dest_readable, dest_gone, discard_out;
     if (!create(title_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, dest_readable) ||
+        !create(title_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, discard_out) ||
         !create(title_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, dest_gone))
         return 31;
     if (!ok(invoke(device, 133, arg(readable_memory), arg(&title_desc), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
                    arg(&title_readable))) || !title_readable ||
+        !ok(invoke(device, 133, arg(discard_memory), arg(&title_desc), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+                   arg(&title_discarded))) || !title_discarded ||
         !ok(invoke(device, 133, arg(gone_memory), arg(&title_desc), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
                    arg(&title_gone))) || !title_gone)
         return 32;
@@ -355,6 +365,20 @@ int main(int argc, char** argv)
                 staged_copy, title_texel, refused_copy);
     if (staged_copy != title_texel) return 35;
     if (refused_copy != 0) return 36;
+
+    // A copy into a title-backed texture that is recorded, then discarded by Close and Reset without ever being
+    // submitted, did not happen: the texture still takes its first upload from its own memory.
+    invoke(list, 17, arg(title_discarded), arg(empty_d.Get()));
+    if (!step("10a CopyResource into a title-backed texture, then discarded", {0, 1, 0, 0}, seen)) return 37;
+    invoke(list, 9);
+    if (!ok(invoke(list, 139, arg(allocator), 0))) return 38;
+    invoke(list, 17, arg(discard_out.Get()), arg(title_discarded));
+    if (!step("10b CopyResource out of the texture after the discard", {0, 1, 0, 0}, seen)) return 39;
+    invoke(list, 9);
+    if (!probe.submit(list)) return 40;
+    const std::uint32_t after_discard = probe.texel(discard_out.Get());
+    std::printf("copy out after a discarded copy: %08x (expected %08x)\n", after_discard, title_texel);
+    if (after_discard != title_texel) return 41;
 
     std::vector<std::uint8_t> whole, moved;
     if (!probe.bytes(buffer_x.Get(), 256, whole) || !probe.bytes(buffer_y.Get(), 80, moved)) return 25;

@@ -84,6 +84,7 @@ bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
         // A target or UAV holds what the GPU wrote; its title memory is never uploaded.
         if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return true;
         const auto written = texture_uploads().find(source.resource);
+        if (list_wrote(self, source.resource)) return true;
         if (written != texture_uploads().end() && written->second.gpu_written) return true;
         if (!upload_texture(self, source.wrapper, source.resource)) return false;
         const auto found = texture_uploads().find(source.resource);
@@ -93,14 +94,56 @@ bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
     return info && info->placement == Placement::aliased_buffer;
 }
 
-// A copy or resolve destination now holds what the GPU wrote. A title-backed texture would otherwise be
-// uploaded over it from its stale memory the first time a draw samples it.
-void mark_gpu_written(const CopyEndpoint& destination)
+// Copy and resolve destinations a recording wrote but no ExecuteCommandLists has submitted. A discarded
+// recording (Reset or a failed Close) must leave the destination's title memory uploadable, so the state a
+// draw consults changes only on submission. A closed list stays submittable until its next Reset, so
+// commit leaves the records in place and only Reset or a failed Close drops them.
+SRWLOCK pending_writes_lock = SRWLOCK_INIT;
+std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>>& pending_gpu_writes()
+{
+    static std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>> m;
+    return m;
+}
+
+bool list_wrote(Wrapper* list, ID3D12Resource* resource)
+{
+    AcquireSRWLockShared(&pending_writes_lock);
+    bool found = false;
+    if (const auto it = pending_gpu_writes().find(list); it != pending_gpu_writes().end())
+        found = std::find(it->second.begin(), it->second.end(), resource) != it->second.end();
+    ReleaseSRWLockShared(&pending_writes_lock);
+    return found;
+}
+
+void discard_list_gpu_writes(Wrapper* self)
+{
+    AcquireSRWLockExclusive(&pending_writes_lock);
+    pending_gpu_writes().erase(self);
+    ReleaseSRWLockExclusive(&pending_writes_lock);
+}
+
+void commit_list_gpu_writes(Wrapper* self)
+{
+    AcquireSRWLockShared(&pending_writes_lock);
+    if (const auto it = pending_gpu_writes().find(self); it != pending_gpu_writes().end()) {
+        for (ID3D12Resource* resource : it->second) {
+            TextureUpload& state = texture_uploads()[resource];
+            state.gpu_written = true;
+            state.done = true;
+        }
+    }
+    ReleaseSRWLockShared(&pending_writes_lock);
+}
+
+// A copy or resolve destination will hold what the GPU wrote once `self` is submitted. A title-backed texture
+// would otherwise be uploaded over it from its stale memory the first time a draw samples it.
+void mark_gpu_written(Wrapper* self, const CopyEndpoint& destination)
 {
     if (!destination.wrapper || !destination.wrapper->own().title_memory) return;
-    TextureUpload& state = texture_uploads()[destination.resource];
-    state.gpu_written = true;
-    state.done = true;
+    AcquireSRWLockExclusive(&pending_writes_lock);
+    auto& writes = pending_gpu_writes()[self];
+    if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
+    ReleaseSRWLockExclusive(&pending_writes_lock);
 }
 
 // Refusal shared by the three handlers once the descriptions passed, or none.
@@ -131,7 +174,7 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->CopyBufferRegion(to.resource, destination_offset, from.resource, source_offset, bytes);
-    mark_gpu_written(to);
+    mark_gpu_written(self, to);
     InterlockedIncrement(&list_buffer_copies);
 }
 
@@ -151,7 +194,7 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to.resource, from.resource);
-    mark_gpu_written(to);
+    mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
 }
 
@@ -177,7 +220,7 @@ void __stdcall list_resolve_subresource(Wrapper* self, u64 destination, UINT des
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_RESOLVE_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->ResolveSubresource(to.resource, destination_subresource, from.resource, source_subresource, plan.format);
-    mark_gpu_written(to);
+    mark_gpu_written(self, to);
     InterlockedIncrement(&list_resolves);
 }
 

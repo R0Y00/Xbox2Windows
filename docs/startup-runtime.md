@@ -430,8 +430,8 @@ desktop would reject is counted, logged (first six) and not forwarded, with the 
 `initial_state` (a placed buffer that does not start in COMMON) or `title_backed_source` (a title-backed default-heap
 buffer or an upload buffer, which have no desktop copy the list can refresh without rewriting bytes an earlier submission may
 still read). A source the title maps at its own memory must be current: a texture takes the draw path's upload and is refused
-when that upload cannot stage it (unreadable or unsupported memory), and an aliased placed buffer is already current. A copy or resolve destination with title memory is marked GPU-written, so a later draw does not
-upload the stale title memory over the result. CopyResource accepts formats of one DXGI family (colour, depth, 8/16/32-bit
+when that upload cannot stage it (unreadable or unsupported memory), and an aliased placed buffer is already current. A copy or resolve destination with title memory is marked GPU-written when its list is submitted (on its own list at once), so a later draw does not
+upload the stale title memory over the result; a list discarded by Reset or a failed Close marks nothing. CopyResource accepts formats of one DXGI family (colour, depth, 8/16/32-bit
 and block-compressed). A resolve format is exact against a fully typed endpoint and only family-compatible with a
 typeless one; a typeless resolve format (or an unknown one over typeless endpoints) resolves as the family's typed
 choice: half float for `R16G16B16A16`, normalised for the 8-bit and 10-bit families. Calls on a closed list are ignored.

@@ -1085,6 +1085,8 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 void release_targets(Wrapper* self);
 void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
 void reset_list_dynamic_state(Wrapper* self);
+void discard_list_gpu_writes(Wrapper* self);
+void commit_list_gpu_writes(Wrapper* self);
 void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void discard_address_uploads(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
@@ -1410,6 +1412,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     ReleaseSRWLockExclusive(&allocator_lock);
     if (SUCCEEDED(hr)) {
         reset_list_dynamic_state(self);
+        discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(previous);
         discard_address_uploads(previous);
         if (draw_dump_frame()) draw_dumps().discard(previous);
@@ -1444,6 +1447,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&render_closes);
     if (FAILED(hr)) {
+        discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(list);
         discard_address_uploads(list);
         if (draw_dump_frame()) draw_dumps().discard(list);
@@ -2726,6 +2730,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             retire_address_uploads(queue, ready);
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
+            for (Wrapper* w : submitted) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
         }
         ReleaseSRWLockExclusive(&allocator_lock);
