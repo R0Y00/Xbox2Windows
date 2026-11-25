@@ -16,6 +16,7 @@
 // sampling_wanted is set (a script with a picture wait asks for it); otherwise it creates no GPU
 // objects and submits nothing, and only counts presents.
 #pragma once
+#include "resource_budget.h"
 
 #include "startup_stubs/present_signature.h"
 #include "startup_stubs/present_view_format.h"
@@ -43,7 +44,8 @@ inline bool layout_of(DXGI_FORMAT format, Layout& layout)
 
 class Sampler {
 public:
-    explicit Sampler(int every, bool always = true) : every_(every), always_(always) {}
+    explicit Sampler(int every, bool always = true, bool capture_center = false)
+        : capture_center_(capture_center), every_(every), always_(always) {}
 
     // Called once per present with the presented surface. Returns true when this call published a sample.
     bool present(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG64 present_number, Block* block)
@@ -51,11 +53,18 @@ public:
         bool published = false;
         if (in_flight_ && fence_->GetCompletedValue() >= fence_value_) {
             in_flight_ = false;
+            if (capture_center_) {
+                last_present_ = copied_present_;
+                last_format_ = format_;
+                last_surface_ = source_;
+            }
             retire_source();
             void* mapped = nullptr;
             const D3D12_RANGE range{0, static_cast<SIZE_T>(row_stride_ * rows_)};
             if (SUCCEEDED(readback_->Map(0, &range, &mapped))) {
                 const auto* base = static_cast<const unsigned char*>(mapped);
+                if (capture_center_)
+                    std::memcpy(last_rgba_, base + row_stride_ * (cells_y / 2) + (width_ / 2) * 4, 4);
                 std::uint8_t luma[cells];
                 for (int band = 0; band < cells_y; ++band) reduce_row(base + row_stride_ * band, width_, layout_, luma + band * cells_x);
                 if (rows_ > cells_y)
@@ -117,12 +126,18 @@ public:
         }
         in_flight_ = true;
         layout_ = layout;
+        if (capture_center_) format_ = desc.Format;
         width_ = width;
         row_stride_ = stride;
         rows_ = rows;
         copied_present_ = present_number;
         return published;
     }
+
+    DXGI_FORMAT last_format() const { return last_format_; }
+    LONG64 last_present() const { return last_present_; }
+    const unsigned char* last_rgba() const { return last_rgba_; }
+    ID3D12Resource* last_surface() const { return last_surface_; }
 
     bool failed() const { return failed_; }
     bool stranded() const { return stranded_; }
@@ -179,7 +194,10 @@ private:
             buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                  IID_PPV_ARGS(&readback_));
-            if (SUCCEEDED(hr)) readback_bytes_ = bytes;
+            if (SUCCEEDED(hr)) {
+                x2w_budget::committed(device, readback_, D3D12_HEAP_TYPE_READBACK);
+                readback_bytes_ = bytes;
+            }
         }
         if (FAILED(hr)) failed_ = true;
         return SUCCEEDED(hr);
@@ -195,6 +213,11 @@ private:
         list_->ResourceBarrier(1, &b);
     }
 
+    const bool capture_center_;
+    DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN, last_format_ = DXGI_FORMAT_UNKNOWN;
+    LONG64 last_present_ = 0;
+    unsigned char last_rgba_[4]{};
+    ID3D12Resource* last_surface_ = nullptr;
     int every_;
     bool always_;
     LONG64 counter_ = 0, copied_present_ = 0;

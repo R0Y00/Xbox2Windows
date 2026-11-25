@@ -205,6 +205,13 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
         ("GPU-written resource at the supplied address", "gpu_written_resource"),
         ("unavailable buffer at the supplied address", "buffer_unavailable"),
         ("unavailable texture at the supplied base and layout", "texture_unavailable"),
+        ("unavailable texture at the supplied base and layout", "partial_tile_xg_rows"),
+        ("unavailable texture at the supplied base and layout", "partial_tile_beyond_xg_size"),
+        ("unavailable texture at the supplied base and layout", "unsupported_desktop_format"),
+        ("unavailable texture at the supplied base and layout", "console_layout_xg_rows"),
+        ("unavailable texture at the supplied base and layout", "console_layout_without_footprints"),
+        ("unavailable texture at the supplied base and layout", "console_layout_beyond_xg_size"),
+        ("unavailable texture at the supplied base and layout", "overlapping_resource"),
     ]
     reasons = [reason for _, reason in cases]
     lines = [
