@@ -21,10 +21,10 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
-// lod_limits (manifest line smpl, image_sample_b): the descriptor's LOD clamp is carried over. MIN_LOD (word 1 bits
+// lod_limits (manifest line smpl, image_sample_b and a constant sampler of image_sample, _l, _lz): the descriptor's LOD clamp is carried over. MIN_LOD (word 1 bits
 // 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json,
 // SQ_IMG_SAMP_WORD1; radeonsi si_state.c:5169-5170 encodes them as S_FIXED(x, 8)), so MinLOD and MaxLOD are the fields
-// divided by 256. Without it MinLOD stays 0 and MaxLOD unbounded, as for every other sample form.
+// divided by 256. Without it MinLOD stays 0 and MaxLOD unbounded, as for heap samplers and the other sample forms.
 inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
                                                 bool lod_limits = false)
 {

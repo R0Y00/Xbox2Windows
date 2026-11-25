@@ -2286,12 +2286,24 @@ class Stage:
                     raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
+            name = 'image_sample' + ('' if how == 'sample' else '_' + how)
             if how == 'b':
                 # The guest clamps the biased LOD to the sampler's MIN_LOD and MAX_LOD. Only a constant descriptor
                 # can be read here, and only its limits are carried to the static sampler (line smpl), so a sampler
                 # from the heap or from a register is refused: its limits and bias cannot be shown to be irrelevant.
                 words = self.sample_b_sampler(heap, words)
                 smp = self.pipe.sampler(tuple(words), lod_limits=True)
+            elif how in ('sample', 'l', 'lz') and (heap or (words and self.default_sampler_words(words))):
+                # A heap sampler, or the fixed default that stands in for one, keeps its unbounded static LOD range: the
+                # descriptor is read at run time, so its MIN_LOD, MAX_LOD and bias are not validated here (#2221).
+                self.pipe.lod_unvalidated.add(name)
+                smp = heap or self.pipe.sampler(tuple(words))
+            elif how in ('sample', 'l', 'lz') and words:
+                # A constant descriptor carries its LOD limits like image_sample_b, under the same bias and range
+                # validation. A mip filter of 0 (base level only) keeps the ordinary sampler, as before: refusing it
+                # would drop every pipeline with an all-zero inline sampler, and only the bias form needs it refused.
+                self.lod_sampler_words(name, words, mip_filter_none_ok=True)
+                smp = self.pipe.sampler(tuple(words), lod_limits=bool((words[2] >> 26) & 3))
             else:
                 smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             if packed_2d:
@@ -2428,16 +2440,26 @@ class Stage:
             raise Unsupported('image_sample_b through a sampler heap (LOD limits and bias unknown)')
         if not words:
             raise Unsupported('image_sample_b with a sampler that is not constant')
-        if list(words) == [0, 0, 0, 0] and 'dynamic sampler index replaced by a default sampler' in self.pipe.notes:
-            # The default-sampler shortcut for a run-time heap load leaves four zero words behind.
+        if self.default_sampler_words(words):
             raise Unsupported('image_sample_b through a sampler heap (replaced by a default sampler)')
+        return self.lod_sampler_words('image_sample_b', words)
+
+    def default_sampler_words(self, words):
+        """True for the four zero words that the default-sampler shortcut of a run-time heap load leaves behind."""
+        return list(words) == [0, 0, 0, 0] and 'dynamic sampler index replaced by a default sampler' in self.pipe.notes
+
+    def lod_sampler_words(self, name, words, mip_filter_none_ok=False):
+        """The words of a constant sampler whose LOD limits are carried to the static sampler, or Unsupported.
+
+        Shared by image_sample_b and by image_sample, _l and _lz (#2177). Only the bias form refuses a mip filter of
+        0 (mip_filter_none_ok False): there the bias would count; the other forms leave that sampler as it was."""
         if words[2] & 0xfffff:
-            raise Unsupported('image_sample_b with a sampler LOD bias (word 2 %#x)' % words[2])
-        if (words[2] >> 26) & 3 == 0:
-            raise Unsupported('image_sample_b with mipmapping disabled (sampler mip filter 0)')
+            raise Unsupported('%s with a sampler LOD bias (word 2 %#x)' % (name, words[2]))
+        if (words[2] >> 26) & 3 == 0 and not mip_filter_none_ok:
+            raise Unsupported('%s with mipmapping disabled (sampler mip filter 0)' % name)
         if words[1] & 0xfff > (words[1] >> 12) & 0xfff:
-            raise Unsupported('image_sample_b with sampler MIN_LOD %#x above MAX_LOD %#x'
-                              % (words[1] & 0xfff, (words[1] >> 12) & 0xfff))
+            raise Unsupported('%s with sampler MIN_LOD %#x above MAX_LOD %#x'
+                              % (name, words[1] & 0xfff, (words[1] >> 12) & 0xfff))
         return words
 
     def op_image_sample_b(self, ops, mods):
@@ -3598,6 +3620,7 @@ class Pipeline:
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
         self.notes = set()    # shortcuts taken (written to the manifest as comments)
+        self.lod_unvalidated = set()  # image_sample forms read through a heap sampler (LOD fields unchecked, #2221)
         self.modified = set()
         self.rect = self.ud(('rect',))
         if refusals is None:
@@ -3904,6 +3927,7 @@ class ComputePipeline(Pipeline):
         self.uses_sampler_heap = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified = set(), set()
+        self.lod_unvalidated = set()
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
     def resource(self, key, kind):
@@ -4032,6 +4056,14 @@ def compute_refusals(out_dir, key):
     return refusals
 
 
+def log_unvalidated_lod(key, pipe):
+    """Once per translated module: the sample forms that read a heap sampler keep its LOD fields unvalidated (#2221)."""
+    forms = getattr(pipe, 'lod_unvalidated', None)  # test stand-ins for Pipeline do not set it
+    if forms:
+        print('%016x: %s through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)'
+              % (key, ', '.join(sorted(forms))), file=sys.stderr, flush=True)
+
+
 def translate_compute(out_dir, key):
     """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
     X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
@@ -4044,6 +4076,7 @@ def translate_compute(out_dir, key):
     except Unsupported as reason:
         open(name + '.fail', 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
+    log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
     if os.environ.get('X2W_FXC') != '':
         compiler = find_dxc()
@@ -4145,6 +4178,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     except Unsupported as reason:
         open(name + '.fail', 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
+    log_unvalidated_lod(key, pipe)
     open(name + '.vs.hlsl', 'w').write(vs)
     open(name + '.ps.hlsl', 'w').write(ps)
     fxc = find_fxc() if check else ''
