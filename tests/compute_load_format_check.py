@@ -382,6 +382,7 @@ def draw(directory, compiler, renderer, backend):
     for (check, label, extra, _data, _mutated), result in zip(jobs, results):
         if check == "pass":
             print(f"{NAME}: {label}", flush=True)
+            sys.stdout.write(result.stdout)
             if result.returncode:
                 sys.stderr.write(result.stderr)
                 return 1
