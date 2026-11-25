@@ -7598,6 +7598,24 @@ hashes and per-case outcomes. The union of the two new coverage records matched
 the original 710 forms. This establishes equivalent selected work on WARP, not
 physical-adapter timeout headroom.
 
+If `pixel_aot_hardware` approaches its 60 s timeout on Windows, you can prime
+the Python bytecode cache once before measuring. CTest starts the fixture with
+`-B`, so Python can read cached modules but does not write them during the test.
+From the repository root, use the same interpreter configured as `INTAKE_PYTHON`
+(the default path is shown here) and run CTest in the same PowerShell session.
+
+```powershell
+$env:PYTHONPYCACHEPREFIX = Join-Path $PWD 'out/pycache'
+& .\out\pe-env\Scripts\python.exe -c "import sys; sys.path.insert(0, 'tests'); import pixel_aot_check"
+ctest --preset dev --no-tests=error -R '^pixel_aot_hardware$' -V
+```
+
+On Windows 11 build 26100.9711 at `82bb67ef`, six of eight runs on an Intel UHD
+770 and RTX 4060 reached the timeout before priming. The import took 5.75 s
+once. With the cache, three runs per adapter took 25.68–27.77 s and produced
+the same 1,010-line form record as the two earlier completed runs.
+[Commands, drivers and individual times in #448](https://github.com/R0Y00/Xbox2Windows/issues/448#issuecomment-7174505456).
+
 The first raw buffer_load_dword path remains a proposal while
 [issue #319](https://github.com/R0Y00/Xbox2Windows/issues/319) is open. The
 [binding contract](pixel_mubuf_contract.md) records the separate DW0/DW1
