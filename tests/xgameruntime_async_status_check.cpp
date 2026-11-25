@@ -154,8 +154,7 @@ bool load_api(HMODULE module, Api& api)
            find_proc(module, "XTaskQueueCloseHandle", api.queue_close);
 }
 
-// Before dispatch both queries say pending; after one dispatch they report the
-// completed operation; consuming the result ends tracking of the block.
+// Both queries report the completed operation before and after the one dispatch; consuming the result ends tracking of the block.
 bool manual_queue_lifecycle(const Api& api, XUserHandle user, XTaskQueueHandle queue)
 {
     Probe probe;
@@ -163,9 +162,11 @@ bool manual_queue_lifecycle(const Api& api, XUserHandle user, XTaskQueueHandle q
     bool ok = expect_hr(api.initialize_async(user, configuration_id, false, &block), S_OK,
                         "async initialize");
     std::size_t size = 123;
-    ok = expect_hr(api.get_status(&block, false), E_PENDING, "status before dispatch") && ok;
-    ok = expect_hr(api.get_result_size(&block, &size), E_PENDING, "result size before dispatch") && ok;
-    ok = expect(size == 0, "pending result size clears the output") && ok;
+    // Completion is separate from callback dispatch: both queries report the
+    // finished operation before the first dispatch, and fire no callback.
+    ok = expect_hr(api.get_status(&block, false), S_OK, "status before dispatch") && ok;
+    ok = expect_hr(api.get_result_size(&block, &size), S_OK, "result size before dispatch") && ok;
+    ok = expect(size == sizeof(XGameSaveProviderHandle), "result size before dispatch is one provider handle") && ok;
     ok = expect(probe.calls == 0, "status queries fire no callback") && ok;
 
     // wait=true never blocks on an operation that already completed.
@@ -260,7 +261,7 @@ bool close_guard(const Api& api, XUserHandle user)
     ok = expect_hr(api.initialize_async(user, configuration_id, false, &block), S_OK,
                    "async initialize on the guard queue") && ok;
     api.queue_close(queue);
-    ok = expect_hr(api.get_status(&block, false), E_PENDING, "status after a refused queue close") && ok;
+    ok = expect_hr(api.get_status(&block, false), S_OK, "status after a refused queue close") && ok;
     ok = expect(api.queue_dispatch(queue, port_completion, 0) && probe.calls == 1,
                 "dispatch still runs after a refused queue close") && ok;
     ok = expect_hr(api.get_status(&block, false), S_OK, "status after guarded dispatch") && ok;

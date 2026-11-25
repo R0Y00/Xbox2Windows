@@ -900,6 +900,7 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
     AcquireSRWLockExclusive(&runtime_state.lock);
     if (FAILED(status)) {
         *reserved = ProviderAsyncSlot{};
+        WakeAllConditionVariable(&task_queue_changed);
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return status;
     }
@@ -911,8 +912,8 @@ HRESULT game_save_initialize_provider_async(XUserHandle requesting_user, const c
     if (defer) {
         reserved->callback_pending = true;
         reserved->order = runtime_state.next_async_order++;
-        WakeAllConditionVariable(&task_queue_changed);
     }
+    WakeAllConditionVariable(&task_queue_changed);
     ReleaseSRWLockExclusive(&runtime_state.lock);
     if (!defer && callback) callback(async_block);
     return S_OK;
@@ -943,6 +944,9 @@ HRESULT game_save_initialize_provider_result(XAsyncBlock* async_block,
     return status;
 }
 
+// Completion and callback dispatch are separate: once the provider work has
+// finished, both queries report it even while the callback still waits for
+// XTaskQueueDispatch. Only a block whose work is still in flight is pending.
 HRESULT async_get_status(XAsyncBlock* async_block, bool wait) noexcept
 {
     if (!async_block) return E_INVALIDARG;
@@ -952,11 +956,13 @@ HRESULT async_get_status(XAsyncBlock* async_block, bool wait) noexcept
         ReleaseSRWLockExclusive(&runtime_state.lock);
         return E_INVALIDARG;
     }
-    // A started operation has completed before its Begin call returned, so a
-    // waiting query never blocks. A non-waiting query reports E_PENDING while the
-    // completion callback still waits for XTaskQueueDispatch, matching the result.
-    const bool pending = !slot->completed || (slot->callback_pending && !wait);
-    const HRESULT status = pending ? E_PENDING : slot->status;
+    while (wait && !slot->completed) {
+        SleepConditionVariableSRW(&task_queue_changed, &runtime_state.lock, INFINITE, 0);
+        slot = find_provider_async(async_block);
+        if (!slot) break;  // the start failed and the block is no longer tracked
+    }
+    HRESULT status = E_INVALIDARG;
+    if (slot) status = slot->completed ? slot->status : E_PENDING;
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return status;
 }
@@ -973,7 +979,7 @@ HRESULT async_get_result_size(XAsyncBlock* async_block, std::size_t* buffer_size
         return E_INVALIDARG;
     }
     HRESULT status = E_PENDING;
-    if (slot->completed && !slot->callback_pending) {
+    if (slot->completed) {
         status = slot->status;
         // The result is one provider handle; nothing is consumed here.
         if (SUCCEEDED(status)) *buffer_size = sizeof(XGameSaveProviderHandle);
