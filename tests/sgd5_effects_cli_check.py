@@ -263,7 +263,8 @@ class Sgd5EffectsCliNegativeAndMutationTests(unittest.TestCase):
                     ("neg_group_end", [str(archive), "draw", "--group", str(grp_start), "-1", "--arrays", str(arrays), "--record", str(rec_start), str(rec_end)]),
                     ("neg_arrays", [str(archive), "draw", "--group", str(grp_start), str(grp_end), "--arrays=-0x1", "--record", str(rec_start), str(rec_end)]),
                     ("neg_record_start", [str(archive), "draw", "--group", str(grp_start), str(grp_end), "--arrays", str(arrays), "--record", "-1", str(rec_end)]),
-                    ("neg_record_end", [str(archive), "draw", "--group", str(grp_start), str(grp_end), "--arrays", str(arrays), "--record", str(rec_start), "-0x10"]),
+                    # Older argparse versions treat a separate negative hex token as an option, not as an offset.
+                    ("neg_record_end", [str(archive), "draw", "--group", str(grp_start), str(grp_end), "--arrays", str(arrays), "--record", str(rec_start), "-16"]),
                 ):
                     with self.subTest(archive=archive.name, case=label):
                         with mock.patch.object(

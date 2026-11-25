@@ -620,6 +620,16 @@ def fbits(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
 
+def ptr_high_symbol(source, offset):
+    """High word of a 64-bit pointer advanced by a literal offset: the original word, or the one a completed
+    s_addc_u32 produced for exactly that accumulated offset (an advanced word never equals another offset's)."""
+    return ('ptrhi', source) if not offset else ('ptrhi', source, offset)
+
+
+# Sources whose pointer is a 64-bit register pair (the low word 'ptr', the high word 'ptrhi').
+PTR64_SOURCES = ('root', 'vbtab')
+
+
 @functools.lru_cache(maxsize=None)
 def reg_range(tok):
     """'s[8:11]' -> ('s', 8, 11); 's8' -> ('s', 8, 8); 'v[1:3]' -> ('v', 1, 3); 'exec'/'vcc' pairs too."""
@@ -2110,6 +2120,8 @@ class Stage:
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
+            if len(s) > 2 and s[2]:
+                raise Unsupported('descriptor operand %s is a pointer with offset %s' % (tok, hex(s[2]) if isinstance(s[2], int) else s[2]))
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
@@ -2754,7 +2766,8 @@ class Stage:
                 continue
             seen.add((off, stale))
             size, name, asm = instructions[off]
-            if stale and off not in self.calculated_pc and reads_scc(name, asm):
+            if (stale and off not in self.calculated_pc and off not in getattr(self, 'ptr_addc_pcs', ())
+                    and reads_scc(name, asm)):
                 yield stale, name
             if off in effects:
                 stale = effects[off] if effects[off] != 'emitted' else None
@@ -3141,6 +3154,14 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
             return self.scalar(base, ops)
+        if base == 's_addc_u32':
+            # Only the high word of an advanced descriptor pointer; the carry is not modelled.
+            hi = reg_range(ops[1]) if len(ops) == 3 else None
+            if hasattr(self, 'scc_uniform') and self.tracks_uniformity():
+                self.scc_uniform = False
+            if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
+                return None
+            raise Unsupported(base)
         if base == 's_getpc_b64':
             # RDNA 2 GETPC returns the address of its successor: the shader's load address plus a known byte
             # offset, which is not an integer this model can emit. It is elided only when the program also
@@ -3392,6 +3413,54 @@ class Stage:
                       destination in self.low16_only_v)
         self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
 
+    def pointer_add(self, base, dname, srcs, syms):
+        """Propagate a descriptor pointer through s_add_u32 sD, sP, <literal> / s_addc_u32 sD+1, sP+1, 0.
+
+        The pair advances a table or root pointer by a literal byte offset, into the same or
+        another register pair. The offset rides in the low word as ('ptr', source, offset); the
+        high word keeps ('ptrhi', source). The low-word carry is taken as zero: the base is a
+        table or root address and the offset is below 1 MiB. Anything else returns False.
+        """
+        if base not in ('s_add_u32', 's_addc_u32') or len(srcs) != 2 or not syms[0]:
+            return False
+        if getattr(self, 'has_branches', False):
+            # The symbolic update runs once in disassembly order; a branch could skip it or repeat it at run time.
+            return False
+        reg = reg_range(dname)
+        if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
+            return False
+        d = reg[1]
+        if base == 's_add_u32':
+            if syms[0][0] != 'ptr' or not re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|\d+)', srcs[1]):
+                return False
+            added = int(srcs[1], 0)
+            if added > 0xfffff:
+                raise Unsupported('descriptor pointer offset %s' % srcs[1])
+            before = syms[0][2] if len(syms[0]) > 2 else 0
+            self.sym[d] = ('ptr', syms[0][1], before + added)
+            if syms[0][1][0] in PTR64_SOURCES and d + 1 <= 105:
+                # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
+                # instruction starts so that the high-word add is accepted right behind it and nowhere else.
+                size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
+                self.ptr_low_add = (d, self.pc + size, syms[0][1], before, before + added)
+                # The pair stays open until the matching s_addc_u32 completes it. The high register is left as it
+                # is (in place it is still the original high source); a load through an open pair is refused.
+                self.__dict__.setdefault('ptr_open_pairs', set()).add(d)
+            return True
+        low = self.sym.get(d - 1)
+        mark = getattr(self, 'ptr_low_add', None)
+        hi = reg_range(srcs[0])
+        # The high operand is judged by what it holds, not by where it sits: a copied high word still counts.
+        if (not mark or srcs[1] != '0' or not low or low[0] != 'ptr' or not hi or hi[0] != 's'
+                or mark[:2] != (d - 1, getattr(self, 'pc', 0)) or low[1] != mark[2]
+                or self.sym.get(hi[1]) != ptr_high_symbol(mark[2], mark[3])):
+            return False
+        self.sym[d] = ptr_high_symbol(mark[2], mark[4])
+        getattr(self, 'ptr_open_pairs', set()).discard(d - 1)
+        # This s_addc_u32 is the only reader of the low add's elided carry; any other SCC reader stays refused.
+        self.__dict__.setdefault('ptr_addc_pcs', set()).add(self.pc)
+        return True
+
     # scalar ALU with descriptor-word bookkeeping
     def exec_absorbed_source(self, base, srcs):
         """Index of a joined source of the instruction at a branch target whose stale value cannot reach bit 0 of
@@ -3483,6 +3552,8 @@ class Stage:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
+            if self.pointer_add(base, dname, srcs, syms):
+                return None
             if dname == 'm0':
                 if scc:
                     raise Unsupported('scc from descriptor data')
@@ -3509,6 +3580,10 @@ class Stage:
                             self.sym[d + 1] = hi
                         elif self.tracks_uniformity():
                             self.varying_s.add(d + 1)
+            elif (own and own[0] == 'ptr' and base in ('s_add_u32', 's_addc_u32')
+                  and not getattr(self, 'has_branches', False)):
+                # With branches the offset is not tracked: the 'added' mark below stays, and the join refuses it.
+                raise Unsupported('%s adds a non-literal to a descriptor pointer' % base)
             elif raw is not None:
                 self.sym[d] = raw
                 if raw[0] == 'desc':
@@ -3853,6 +3928,15 @@ class Stage:
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
+        if len(p) > 2 and not isinstance(p[2], int):
+            # The 'added' mark (an add whose offset is not tracked, as in a program with branches): no byte offset.
+            raise Unsupported('s_load through s%d: the pointer was advanced by an untracked offset' % base[1])
+        base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
+        if (base_off or len(p) > 2) and p[1][0] in PTR64_SOURCES:
+            # An advanced 64-bit pointer needs its high word completed by the matching s_addc_u32;
+            # a table pointer is 32 bits wide and has no high word.
+            if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[1] + 1) != ptr_high_symbol(p[1], base_off):
+                raise Unsupported('s_load through s%d: its high word is not the matching advanced pair' % base[1])
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
         token = smem_offset(ops[2])
         known = self.const_soffset(token) if p[1] != ('smpheap',) else None
@@ -3874,7 +3958,7 @@ class Stage:
                     raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
                 buf = self.pipe.resource((p[1], None), 'buf')
                 for i in range(count):
-                    self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
+                    self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, base_off + off + 4 * i))
                 return
             # The pointer symbol does not record an addend or a rewritten high word, so two loads through such a
             # pointer may read different words under the same (source, offset). In a compute or vertex stage (the
@@ -3890,7 +3974,7 @@ class Stage:
             else:
                 load = (self.pc,)
             for i in range(count):
-                self.sym[dst[1] + i] = ('desc', p[1], off, i) + load
+                self.sym[dst[1] + i] = ('desc', p[1], base_off + off, i) + load
             if into_vcc:
                 self.vcc_lost = True
                 self.vcc_descriptor_overwritten = False
@@ -3900,6 +3984,8 @@ class Stage:
             return
         if into_vcc:
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
+        if base_off:
+            raise Unsupported('s_load through %s advanced by %#x' % (p[1], base_off))
         if p[1] == ('smpheap',):
             if self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
@@ -4833,6 +4919,27 @@ class Stage:
         if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
             raise Unsupported('unverified 1D image sample address or modifiers')
         lod = bias = None
+        grads = None
+        if how == 'd':
+            # Address dwords are ddx then ddy (one per coordinate axis each) and then the coordinates, so a 2D
+            # sample is six registers, a 2D array seven and a volume nine. Offsets, bias, clamp, a16 and the
+            # other layout-changing modifiers are refused; only cache-policy bits are accepted.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_sample_d modifier %s' % m)
+            if dmask == 0:
+                raise Unsupported('image_sample_d with an empty dmask')
+            if one:
+                raise Unsupported('image_sample_d on a 1D image')
+            axes = 3 if dim == 'SQ_RSRC_IMG_3D' else 2
+            want = 3 * axes + (1 if dim == 'SQ_RSRC_IMG_2D_ARRAY' else 0)
+            if want == 9 and len(cs) == 16 and not ops[1].startswith('['):
+                # A contiguous nine-dword volume address is encoded as a sixteen-register range; the rest is padding.
+                cs = cs[:9]
+            if len(cs) != want:
+                raise Unsupported('image_sample_d with %d address registers' % len(cs))
+            grads = (cs[:axes], cs[axes:2 * axes])
+            cs = cs[2 * axes:]
         if how in ('l', 'b'):
             # image_sample_l: the address dwords are the coordinates and then the explicit level. image_sample_b:
             # the RDNA 2 ISA (section 8.2.5, "{ offset } { bias } { z-compare } { derivative } { body }") puts one
@@ -4934,12 +5041,12 @@ class Stage:
                 if heap or not words or self.default_sampler_words(words):
                     raise Unsupported('image_get_lod with a sampler that is not constant (LOD limits and bias unknown)')
                 smp = self.pipe.sampler(tuple(self.lod_sampler_words('image_get_lod', words)), lod_limits=True)
-            elif how in ('sample', 'l', 'lz') and (heap or (words and self.default_sampler_words(words))):
+            elif how in ('sample', 'l', 'lz', 'd') and (heap or (words and self.default_sampler_words(words))):
                 # A heap sampler, or the fixed default that stands in for one, keeps its unbounded static LOD range: the
                 # descriptor is read at run time, so its MIN_LOD, MAX_LOD and bias are not validated here (#2221).
                 self.pipe.lod_unvalidated.add(name)
                 smp = heap or self.pipe.sampler(tuple(words))
-            elif how in ('sample', 'l', 'lz') and words:
+            elif how in ('sample', 'l', 'lz', 'd') and words:
                 # A constant descriptor carries its LOD limits like image_sample_b, under the same bias and range
                 # validation. A mip filter of 0 (base level only) keeps the ordinary sampler, as before: refusing it
                 # would drop every pipeline with an all-zero inline sampler, and only the bias form needs it refused.
@@ -4959,7 +5066,11 @@ class Stage:
             if how == 'sample' and self.kind == 'cs':
                 # A compute lane has no pixel quad to supply derivatives; level 0 would be a guess.
                 raise Unsupported('image_sample with implicit LOD in a compute program')
-            if how == 'l':
+            if how == 'd':
+                axes = len(grads[0])
+                dx, dy = ['float%d(%s)' % (axes, ', '.join(self.f(r) for r in g)) for g in grads]
+                call = '%s.SampleGrad(%s, %s, %s, %s)' % (tex, smp, uv, dx, dy)
+            elif how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'b':
                 # SampleBias adds the bias to the implicit LOD, like the ISA's _B suffix ("Add this BIAS to the LOD
@@ -5110,6 +5221,12 @@ class Stage:
 
     def op_image_sample_b(self, ops, mods):
         self.image(ops, mods, 'b')
+
+    def op_image_sample_d(self, ops, mods):
+        self.image(ops, mods, 'd')
+
+    def op_image_sample_c_d(self, ops, mods):
+        raise Unsupported('image_sample_c_d: SampleCmpGrad needs shader model 6.8; only c and c_lz are lowered')
 
     def op_image_get_lod(self, ops, mods):
         self.image(ops, mods, 'get_lod')
