@@ -14,6 +14,34 @@ CONSTANT_WORDS = 16
 AXES = "xyz"
 # Integer compares a lane guard may use. Inequality is the same for signed and unsigned words.
 GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<=", "ne": "!="}
+INT_COMPARE_PREDICATES = {
+    "f": lambda a, b: "false",
+    "lt": lambda a, b: f"({a} < {b})",
+    "eq": lambda a, b: f"({a} == {b})",
+    "le": lambda a, b: f"({a} <= {b})",
+    "gt": lambda a, b: f"({a} > {b})",
+    "ne": lambda a, b: f"({a} != {b})",
+    "ge": lambda a, b: f"({a} >= {b})",
+    "t": lambda a, b: "true",
+}
+FLOAT_COMPARE_PREDICATES = {
+    "f": lambda a, b: "false",
+    "lt": lambda a, b: f"(!isnan({a}) && !isnan({b}) && ({a} < {b}))",
+    "eq": lambda a, b: f"(!isnan({a}) && !isnan({b}) && ({a} == {b}))",
+    "le": lambda a, b: f"(!isnan({a}) && !isnan({b}) && ({a} <= {b}))",
+    "gt": lambda a, b: f"(!isnan({a}) && !isnan({b}) && ({a} > {b}))",
+    "lg": lambda a, b: f"(!isnan({a}) && !isnan({b}) && ({a} != {b}))",
+    "ge": lambda a, b: f"(!isnan({a}) && !isnan({b}) && ({a} >= {b}))",
+    "o": lambda a, b: f"(!isnan({a}) && !isnan({b}))",
+    "u": lambda a, b: f"(isnan({a}) || isnan({b}))",
+    "nge": lambda a, b: f"(isnan({a}) || isnan({b}) || ({a} < {b}))",
+    "nlg": lambda a, b: f"(isnan({a}) || isnan({b}) || ({a} == {b}))",
+    "ngt": lambda a, b: f"(isnan({a}) || isnan({b}) || ({a} <= {b}))",
+    "nle": lambda a, b: f"(isnan({a}) || isnan({b}) || ({a} > {b}))",
+    "neq": lambda a, b: f"(isnan({a}) || isnan({b}) || ({a} != {b}))",
+    "nlt": lambda a, b: f"(isnan({a}) || isnan({b}) || ({a} >= {b}))",
+    "tru": lambda a, b: "true",
+}
 # The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
 # read-compute-write fixture, on known words only. v_and_b32, v_or_b32, v_xor_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
 # reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_lshlrev_b32 and v_ashrrev_i32 shift src1
@@ -879,6 +907,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     # where the guarded stores end. The guarded stores become an HLSL if.
     vcc = guard = None
     vcc_carry = None
+    vcc_cond = None
     guard_span = None
     if not instructions or instructions[-1] != "s_endpgm":
         raise ValueError("Missing final program exit")
@@ -926,23 +955,70 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         elif image_output and stores and line == "s_waitcnt_vscnt null, 0x0":
             # The single image write becomes visible when the dispatch completes.
             continue
-        elif ((m := re.fullmatch(rf"v_cmp_(gt|lt|ge|le)_u32_e32 vcc_lo, {ALU_SOURCE}, (v\d+)", line))
-              or (m := re.fullmatch(rf"v_cmp_(ne)_i32_e32 vcc_lo, {ALU_SOURCE}, (v\d+)", line))
-              or (m := re.fullmatch(rf"v_cmp_(ne)_i32_e64 vcc_lo, {ALU_SOURCE}, {ALU_SOURCE}", line))):
-            op, src0, src1 = m.groups()
+        elif ((m := re.fullmatch(rf"v_cmp_(f|lt|eq|le|gt|ne|ge|t)_(u32|i32)_(e32) (vcc_lo), {ALU_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"v_cmp_(f|lt|eq|le|gt|ne|ge|t)_(u32|i32)_(e64) (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))):
+            # RDNA2 ISA: VOPC sets SDST[lane] = pred(S0, S1) for each active lane.
+            pred, typ, enc, sdst, src0, src1 = m.groups()
             operands = (src0, src1)
+            if sdst != "vcc_lo":
+                sdst_reg = int(sdst[1:])
+                if sdst_reg > 105 or sdst_reg in pending:
+                    raise ValueError("Unverified compare destination")
             words = [alu_word(token, scalar, vector, pending) for token in operands]
-            # A word read or computed in the program is not a verified guard operand.
-            if (any(token.startswith("v") and int(token[1:]) > 255 for token in operands)
-                    or any(word is None or isinstance(word, tuple) and word[0] in ("source", "alu") for word in words)):
+            if any(token.startswith("v") and int(token[1:]) > 255 for token in operands) or None in words:
                 raise ValueError("Unverified lane guard compare")
-            vcc = (op, *words)
-            vcc_carry = None
+            a, b = map(hlsl_word, words)
+            if typ == "i32":
+                a, b = f"asint({a})", f"asint({b})"
+            cond_expr = INT_COMPARE_PREDICATES[pred](a, b)
+            if len(cond_expr) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            guard_ok = (
+                sdst == "vcc_lo"
+                and ((typ == "u32" and enc == "e32" and pred in ("gt", "lt", "ge", "le"))
+                     or (typ == "i32" and pred == "ne"))
+                and not any(isinstance(word, tuple) and word[0] in ("source", "alu") for word in words)
+            )
+            if guard is not None and not guard_ok:
+                raise ValueError("Unverified lane guard compare")
+            if sdst == "vcc_lo":
+                vcc = (pred, *words) if guard_ok else ("invalid",)
+                vcc_cond = ("cond", cond_expr)
+                vcc_carry = None
+            else:
+                scalar[sdst_reg] = ("cond", cond_expr)
+        elif ((m := re.fullmatch(rf"v_cmp_(f|lt|eq|le|gt|lg|ge|o|u|nge|nlg|ngt|nle|neq|nlt|tru)_f32_(e32) (vcc_lo), {FLOAT_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"v_cmp_(f|lt|eq|le|gt|lg|ge|o|u|nge|nlg|ngt|nle|neq|nlt|tru)_f32_(e64) (vcc_lo|s\d+), {FLOAT_SOURCE}, {FLOAT_SOURCE}", line))):
+            # RDNA2 ISA: VOPC f32 compare sets SDST[lane] = pred(S0, S1) with IEEE unordered NaN rules.
+            pred, enc, sdst, src0, src1 = m.groups()
+            operands = (src0, src1)
+            if guard is not None:
+                raise ValueError("Unverified lane guard compare")
+            if sdst != "vcc_lo":
+                sdst_reg = int(sdst[1:])
+                if sdst_reg > 105 or sdst_reg in pending:
+                    raise ValueError("Unverified compare destination")
+            words = [FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending)
+                     for token in operands]
+            if any(token.startswith("v") and int(token[1:]) > 255 for token in operands) or None in words:
+                raise ValueError("Unverified float operand")
+            fa, fb = (f"asfloat({hlsl_word(w)})" for w in words)
+            cond_expr = FLOAT_COMPARE_PREDICATES[pred](fa, fb)
+            if len(cond_expr) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            if sdst == "vcc_lo":
+                vcc = ("invalid",)
+                vcc_cond = ("cond", cond_expr)
+                vcc_carry = None
+            else:
+                scalar[sdst_reg] = ("cond", cond_expr)
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
             saved = int(m[1])
+            if vcc == ("invalid",) and guard_span is None and saved <= 105 and saved not in pending:
+                raise ValueError("Unverified lane guard compare")
             if guard_span is not None or vcc is None or saved > 105 or saved in pending:
                 raise ValueError("Unverified or repeated lane guard")
-            guard = dict(label=None, at_label=False, holders=None, vcc_carry=vcc_carry,
+            guard = dict(label=None, at_label=False, holders=None, vcc_carry=vcc_carry, vcc_cond=vcc_cond,
                          scalar=dict(scalar), vector=dict(vector), pending=set(pending), loading=dict(loading))
             scalar[saved] = ("exec",)
             guard_span = [len(stores), None, vcc]
@@ -975,6 +1051,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             pending |= guard["pending"]
             if vcc_carry != guard["vcc_carry"]:
                 vcc_carry = None
+            if vcc_cond != guard["vcc_cond"]:
+                vcc_cond = None
             guard = None
             guard_span[1] = len(stores)
         elif line in ("s_mov_b32 m0, 0", "s_mov_b32 m0, 0x0"):
@@ -1093,22 +1171,32 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unverified lane mask source")
             pair = sum(((int(src, 0) >> (bit // 2)) & 1) << bit for bit in range(64))
             scalar[dst], scalar[high] = pair & 0xffffffff, pair >> 32
-        elif m := re.fullmatch(rf"v_cndmask_b32_e64 v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, s(\d+)", line):
-            # D = mask[lane] ? src1 : src0, with the wave32 mask in one SGPR that holds a statically known word.
-            # In a one-dimensional group of at most 32 threads the group is one wave at either wave size and the
-            # lane is local X. Past lane 31 the same encoding reads the high mask word in wave64, which the
-            # translator cannot tell from the code, so larger and multi-dimensional groups are refused.
-            dst, reg = int(m[1]), int(m[4])
-            if dims[1:] != (1, 1) or dims[0] > 32:
-                raise ValueError("Lane mask select requires a one-dimensional group of at most 32 threads")
-            mask = scalar.get(reg) if reg <= 105 and reg not in pending else None
-            if not isinstance(mask, int):
-                raise ValueError("Unverified lane mask")
-            words = [alu_word(token, scalar, vector, pending) for token in (m[2], m[3])]
-            if dst > 255 or None in words:
+        elif ((m := re.fullmatch(rf"v_cndmask_b32_e32 v(\d+), {ALU_SOURCE}, (v\d+), (vcc_lo)", line))
+              or (m := re.fullmatch(rf"v_cndmask_b32_e64 v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, (vcc_lo|s\d+)", line))):
+            # D = mask[lane] ? src1 : src0, either from a per-lane ("cond", ...) or from a statically known
+            # wave32 constant mask in an SGPR. For a constant mask, a one-dimensional group of at most 32
+            # threads is one wave at either wave size and the lane is local X; past lane 31 the same encoding
+            # reads the high mask word in wave64, which the translator cannot tell from the code.
+            dst, src0, src1, mask_tok = int(m[1]), m[2], m[3], m[4]
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            words = [alu_word(token, scalar, vector, pending) for token in (src0, src1)]
+            if None in words:
                 raise ValueError("Unverified ALU operand")
-            expression = (f"(((0x{mask:08x}u >> (tid.x % {dims[0]}u)) & 1u) != 0u ? {hlsl_word(words[1])}"
-                          f" : {hlsl_word(words[0])})")
+            if mask_tok == "vcc_lo":
+                mask = vcc_cond
+            else:
+                reg = int(mask_tok[1:])
+                mask = scalar.get(reg) if reg <= 105 and reg not in pending else None
+            if isinstance(mask, tuple) and mask[0] == "cond":
+                expression = f"({mask[1]} ? {hlsl_word(words[1])} : {hlsl_word(words[0])})"
+            elif isinstance(mask, int):
+                if dims[1:] != (1, 1) or dims[0] > 32:
+                    raise ValueError("Lane mask select requires a one-dimensional group of at most 32 threads")
+                expression = (f"(((0x{mask:08x}u >> (tid.x % {dims[0]}u)) & 1u) != 0u ? {hlsl_word(words[1])}"
+                              f" : {hlsl_word(words[0])})")
+            else:
+                raise ValueError("Unverified lane mask")
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
@@ -1959,6 +2047,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             vector[dst] = ("alu", expression)
             if sdst == "vcc_lo":
                 vcc = None
+                vcc_cond = None
                 vcc_carry = ("borrow", borrow_expression)
             else:
                 scalar[sdst_reg] = ("borrow", borrow_expression)
@@ -2002,6 +2091,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             vector[dst] = ("alu", expression)
             if sdst == "vcc_lo":
                 vcc = None
+                vcc_cond = None
                 vcc_carry = ("carry", carry_expression)
             else:
                 scalar[sdst_reg] = ("carry", carry_expression)
