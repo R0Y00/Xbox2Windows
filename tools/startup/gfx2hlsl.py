@@ -2602,7 +2602,8 @@ class Stage:
                 continue
             seen.add((off, stale))
             size, name, asm = instructions[off]
-            if stale and off not in self.calculated_pc and reads_scc(name, asm):
+            if (stale and off not in self.calculated_pc and off not in getattr(self, 'ptr_addc_pcs', ())
+                    and reads_scc(name, asm)):
                 yield stale, name
             if off in effects:
                 stale = effects[off] if effects[off] != 'emitted' else None
@@ -3219,6 +3220,8 @@ class Stage:
             return False
         self.sym[d] = ('ptrhi', mark[2])
         getattr(self, 'ptr_open_pairs', set()).discard(d - 1)
+        # This s_addc_u32 is the only reader of the low add's elided carry; any other SCC reader stays refused.
+        self.__dict__.setdefault('ptr_addc_pcs', set()).add(self.pc)
         return True
 
     # scalar ALU with descriptor-word bookkeeping
