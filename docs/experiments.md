@@ -13,10 +13,10 @@ whose reflected constants depend on the draw's start vertex or instance. It also
 shader bytecode. A deferred guest root can still supply the recorded tables to the translated root.
 A missing cached translation retains the request publishing path.
 
-Table buffer views bind their complete byte range from the recording's upload allocation, one unique
-aliased placed buffer, or a wrapped committed resource with desktop backing and no title shadow.
-The runtime refuses non-DWORD ranges, misaligned offsets, cross-device views, views that overlap the
-indirect argument resource, and copied placed buffers whose desktop contents are unproven. It binds
+Table buffer views bind their complete byte range, up to 16 MiB, from the recording's upload allocation,
+one unique aliased placed buffer, or a wrapped resource with desktop backing and no title shadow.
+The runtime refuses non-DWORD ranges, misaligned offsets, cross-device views, any view of the
+same resource that contains the indirect arguments, and copied placements with unproven desktop contents. It binds
 the accepted resource directly as a desktop raw SRV and uses its recorded stride for the shader entry.
 
 Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
