@@ -204,6 +204,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/mesh_heap_sampler_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py
 ./out/pe-env/bin/python -B tests/mesh_join_descriptor_check.py
+./out/pe-env/bin/python -B tests/mesh_loop_census_check.py
 ./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_c_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_alu_check.py

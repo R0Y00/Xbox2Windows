@@ -7441,6 +7441,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" skipped)
     add_test(NAME mesh_scc_any_lane_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_scc_any_lane_check.py")
+    add_test(NAME mesh_loop_census COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_loop_census_check.py")
     add_test(NAME mesh_amplification_refusal COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_amplification_refusal_check.py")
     set_tests_properties(mesh_amplification_refusal PROPERTIES TIMEOUT 30)
