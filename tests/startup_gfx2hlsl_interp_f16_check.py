@@ -19,7 +19,8 @@ the four halves, converts each to f32 and exports them to mrt0. The reference is
 with struct ('e' format) conversions, not from the lowering: the translated text is evaluated on the CPU by a small
 interpreter of exactly the statements the fixture produces. Negative controls: the lowering removed (the pair is
 refused), the high bit inverted on both instructions (the evaluated words differ from the reference), and every
-modifier or form the fixture does not cover (refused).
+modifier or form the fixture does not cover (refused),
+including every op_sel bit (ACO's v_interp_p2_hi_f16 writes the high half of the destination).
 
 The binary mode compares with llvm-mc after clearing the unused src2 field of v_interp_p1ll_f16: LLVM 15 encodes it
 as 0, newer llvm-mc encodes the inline constant 0 (128), and the words below are the LLVM 15 ones.
@@ -230,6 +231,9 @@ def controls():
     refused('p1ll clamp', patch(PS_WORDS, 0, w0=0x8000), 'clamp')
     refused('p1ll div:2', patch(PS_WORDS, 0, w1=3 << 27), 'div:2')
     refused('p1ll mul:2', patch(PS_WORDS, 0, w1=1 << 27), 'mul:2')
+    for bit in range(11, 15):
+        refused('p1ll op_sel bit %d' % (bit - 11), patch(PS_WORDS, 0, w0=1 << bit), 'op_sel')
+        refused('p2 op_sel bit %d' % (bit - 11), patch(PS_WORDS, 1, w0=1 << bit), 'op_sel')
     refused('p2 clamp', patch(PS_WORDS, 1, w0=0x8000), 'clamp')
     refused('p2 abs on j', patch(PS_WORDS, 1, w0=0x200), 'plain VGPRs')
     refused('p2 neg on p1', patch(PS_WORDS, 1, w1=4 << 29), 'plain VGPRs')

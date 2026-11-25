@@ -291,6 +291,12 @@ CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
 
 
 def check_encoding(code, off, n, name, asm):
+    if name in ('v_interp_p1ll_f16', 'v_interp_p2_f16'):
+        # The shared disassembler ignores op_sel (w0[14:11]) here, as LLVM 15 does. Mesa ACO's
+        # v_interp_p2_hi_f16 is p2 with op_sel bit 3 (w0[14]): it writes the high half of the destination. The
+        # attribute half `high` is a different bit (w1[8]) and is printed, so it is not refused here.
+        if struct.unpack_from('<I', code, off)[0] & 0x7800:
+            raise Unsupported('%s with op_sel: only the plain form and high are lowered' % name)
     if name == 'image_load_mip':
         # The shared disassembler does not expose these gfx10 MIMG flags.
         word0, word1 = struct.unpack_from('<2I', code, off)
