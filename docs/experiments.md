@@ -15121,6 +15121,31 @@ data, because a refusal is observable at the `Stage` entry point.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sad_(controls|warp|hardware)$' -V
+## Startup translator: signed 4-bit offset conversion (`v_cvt_off_f32_i4`)
+
+`tools/startup/gfx2hlsl.py` lowers `v_cvt_off_f32_i4` in VOP1 `_e32` (`0x0e`) and VOP3A `_e64` (`0x18e`) via
+`VEC_U_TO_F` as `(float(int({0} << 28) >> 28) * 0.0625)`, matching RDNA 2 ISA semantics: the offset is inherent
+in the signed 4-bit two's-complement nibble (`[3:0]` in `[-8, +7]`, with no separate `- 8` bias term subtracted),
+scaled by `1/16` to produce exact binary32 steps in `[-0.5, +0.4375]`. As a `VEC_U_TO_F`
+conversion, it accepts output modifiers (`clamp`, `mul:2`, `mul:4`, `div:2`, scaled before `clamp`), marks its source
+`low16_only=True` in `Stage.lower` because only bits `[3:0]` are read, and participates in `UNIFORM_VALU` tracking for
+`v_readfirstlane_b32`. VOP3A source `abs`/`neg` bits, `op_sel`, wrong operand counts, and SDWA forms (`_sdwa`) are
+refused.
+
+[The check fixture](../tests/startup_gfx2hlsl_cvt_off_f32_i4_check.py) constructs synthetic gfx1013 VOP1 `_e32` and
+VOP3A `_e64` words decoded via `gfx2hlsl.decode()` (no game data), verifies all 16 nibble values `0..15` with upper-bit
+garbage (`0x12345678`, `0xfffffff8`), output modifiers, `low16_only` provenance (odd-dmask `d16` `image_load` followed
+by `v_cvt_off_f32_i4`, in-place overwrite clearing, and whole-word read refusal), `UNIFORM_VALU` propagation and refusals,
+`abs`/`neg`/`op_sel`/arity/SDWA refusals, and an unlowered control. On WARP (`Microsoft Basic Render Driver`, driver
+`10.0.26100.9818`, debug layer unavailable) with FXC `ps_5_1` and DXC `ps_6_0`, all 14 draws matched (7 per compiler,
+covering all 16 nibbles, upper-bit garbage, and output modifiers) and all 6 mutated draws (`unsigned_nibble`,
+`5bit_signext`, and `early_clamp`) failed against the reference with their mutated output words. Not covered: hardware
+GPU draw (`startup_gfx2hlsl_cvt_off_f32_i4_hardware` not run here) and SDWA/DPP forms (refused).
+
+```powershell
+python -B tests/startup_gfx2hlsl_cvt_off_f32_i4_check.py
+python -B tests/startup_gfx2hlsl_cvt_off_f32_i4_check.py draw <dxc.exe> <offscreen_check.exe> warp <fxc.exe>
+ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_cvt_off_f32_i4_(controls|warp|hardware)$" -V
 ```
 
 ## Opt-in release of retired slot-133 title-memory textures (Slice 2)

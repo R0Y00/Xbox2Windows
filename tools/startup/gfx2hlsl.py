@@ -373,6 +373,14 @@ def check_encoding(code, off, n, name, asm):
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0x700 or word1 & 0xe0000000:
             raise Unsupported('%s with neg/abs' % name)
+    if name == 'v_cvt_off_f32_i4_e64':
+        # Integer-nibble conversion: the instruction has one source, so only src0's VOP3A ABS (w0[8]) and NEG
+        # (w1[29]) can carry a modifier. Masking all three bit positions of each field (w0[10:8], w1[31:29])
+        # also refuses the unused src1/src2 bits, which keeps an inline constant from masquerading as a
+        # negative integer and keeps a hidden modifier out of the printed operand.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & 0x700 or word1 & 0xe0000000:
+            raise Unsupported('%s with neg/abs: not a 4-bit integer source modifier' % name)
     if name == 'v_cndmask_b32_e64':
         # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -678,8 +686,8 @@ def smem_mods(mods):
 # Multiply, fused multiply-add (including the literal form), reciprocal and median of three use
 # only local arithmetic. Move copies its input bits. None reads a lane ID or another lane.
 UNIFORM_VALU = frozenset((
-    'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_u32', 'v_cvt_f32_ubyte0', 'v_mul_f32',
-    'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_med3_f32', 'v_mov_b32',
+    'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_u32', 'v_cvt_f32_ubyte0', 'v_cvt_off_f32_i4',
+    'v_mul_f32', 'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_med3_f32', 'v_mov_b32',
 ))
 
 
@@ -2567,7 +2575,7 @@ class Stage:
             if any(m not in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods):
                 raise Unsupported('%s with %s' % (base, mods))
             dst = reg_range(ops[0])[1]
-            low16 = base in ('v_cvt_f32_f16', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1')
+            low16 = base in ('v_cvt_f32_f16', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1', 'v_cvt_off_f32_i4')
             self.set_vf(dst, text_f.format(*[self.u(o, low16_only=low16) for o in ops[1:1 + arity]]), mods)
             if (base.startswith('v_cvt_f32_ubyte') and not mods and self.exec_known and
                     not getattr(self, 'has_branches', True)):
@@ -2722,6 +2730,8 @@ class Stage:
     # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
     # dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
+        if base == 'v_cvt_off_f32_i4':
+            raise Unsupported('SDWA form of %s' % base)
         fields = {}
         out_mods = []
         float_result = base in VEC_U_TO_F
@@ -5409,6 +5419,7 @@ VEC_U_TO_F = {
     'v_cvt_f32_ubyte0': (1, 'float({0} & 255)'), 'v_cvt_f32_ubyte1': (1, 'float(({0} >> 8) & 255)'),
     'v_cvt_f32_ubyte2': (1, 'float(({0} >> 16) & 255)'), 'v_cvt_f32_ubyte3': (1, 'float({0} >> 24)'),
     'v_cvt_f32_f16': (1, 'f16tof32({0})'),
+    'v_cvt_off_f32_i4': (1, '(float(int({0} << 28) >> 28) * 0.0625)'),
 }
 # operands are uints; the result is a uint expression
 VEC_U = {
