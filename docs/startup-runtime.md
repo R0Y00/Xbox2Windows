@@ -533,7 +533,7 @@ upload the stale title memory over the result; a list discarded by Reset or a fa
 and block-compressed). A resolve format is exact against a fully typed endpoint and only family-compatible with a
 typeless one; a typeless resolve format (or an unknown one over typeless endpoints) resolves as the family's typed
 choice: half float for `R16G16B16A16`, normalised for the 8-bit and 10-bit families. Calls on a closed list are ignored.
-These slots have not been seen in a title log yet. `CopyTextureRegion` (16) and `CopyTiles` (18) are not handled.
+These slots have not been seen in a title log yet. Slot 16 is described in [Command list CopyTextureRegion](#command-list-copytextureregion-list-slot-16). Slot 18 (`CopyTiles`) is not handled.
 `ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,
 resolves and reads back through the `x2w_d3d12_list_copy_stats` export.
 
@@ -2696,9 +2696,9 @@ check only:
   `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
   (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).
 - The two sides must name the same format (`format_mismatch`) and the same sample count
-  (`sample_mismatch`); a multisampled copy is whole subresource to whole subresource of equal size,
-  with origin 0 (`partial_multisample`). Buffer footprints are single-sample, so a multisampled texture
-  and a buffer are refused.
+  (`sample_mismatch`). Multisampled and single-plane depth-stencil copies require equally sized whole
+  subresources, destination origin 0 and a null source box (`partial_multisample`, `partial_depth_stencil`).
+  Buffer footprints are single-sample, so a multisampled texture and a buffer are refused.
 - Upload and readback footprint buffers keep their fixed heap states and get no barrier; an upload buffer as
   destination or a readback buffer as source is refused (`bad_heap`).
 - A source or destination texture is brought up to date from its guest backing (`upload_texture`) before the

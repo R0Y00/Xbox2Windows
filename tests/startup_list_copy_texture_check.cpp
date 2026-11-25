@@ -75,6 +75,12 @@ int main(int argc, char** argv)
     ms2.samples = 2;
     expect(check(ms2, 0, 0, 0, ms, nullptr), Verdict::sample_mismatch, "2x against 4x");
     expect(check(ms, 0, 0, 0, ms, nullptr), Verdict::ok, "whole 4x subresource");
+    const Box full_box{0, 0, 0, 64, 64, 1};
+    expect(check(ms, 0, 0, 0, ms, &full_box), Verdict::partial_multisample, "4x explicit full box");
+    Side depth = texture(64, 64);
+    depth.depth_stencil = true;
+    expect(check(depth, 0, 0, 0, depth, nullptr), Verdict::ok, "whole depth subresource");
+    expect(check(depth, 0, 0, 0, depth, &full_box), Verdict::partial_depth_stencil, "depth explicit full box");
     expect(check(ms, 8, 0, 0, ms, &(const Box&)Box{0, 0, 0, 56, 64, 1}), Verdict::partial_multisample, "4x offset");
     expect(check(ms, 0, 0, 0, ms, &(const Box&)Box{0, 0, 0, 32, 32, 1}), Verdict::partial_multisample, "4x partial box");
     expect(check(footprint(64, 64, 0, 256, 4, 1 << 20), 0, 0, 0, ms, nullptr), Verdict::sample_mismatch, "4x to buffer");

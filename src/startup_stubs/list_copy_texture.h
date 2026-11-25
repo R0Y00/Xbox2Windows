@@ -27,6 +27,7 @@ struct Side {
     // A subresource side: its index and the resource's counts, for D3D12's
     // index = mip + slice * mips + plane * mips * array_size.
     std::uint32_t subresource, mips, array_size, planes;
+    bool depth_stencil = false;
 };
 
 struct Subresource {
@@ -63,7 +64,8 @@ enum class Verdict {
     bad_alignment,      // a block-compressed copy that does not start on a block
     bad_subresource,    // an index outside the resource's mips * array slices * planes
     format_mismatch,    // the two sides name different formats
-    partial_multisample // a multisampled copy that is not the whole subresource at the origin
+    partial_multisample, // a multisampled copy that is not the whole subresource at the origin
+    partial_depth_stencil
 };
 
 inline const char* name(Verdict v) noexcept
@@ -82,6 +84,7 @@ inline const char* name(Verdict v) noexcept
     case Verdict::bad_subresource: return "bad_subresource";
     case Verdict::format_mismatch: return "format_mismatch";
     case Verdict::partial_multisample: return "partial_multisample";
+    case Verdict::partial_depth_stencil: return "partial_depth_stencil";
     }
     return "unknown";
 }
@@ -144,10 +147,11 @@ inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uin
     const Side& tex = dst.kind == Kind::subresource ? dst : src;  // the side that knows the block size
     if (x % tex.block_w || use.left % tex.block_w || y % tex.block_h || use.top % tex.block_h) return Verdict::bad_alignment;
     const std::uint32_t w = use.right - use.left, h = use.bottom - use.top, d = use.back - use.front;
-    // A multisampled copy is whole subresource to whole subresource of equal size.
-    if (src.samples > 1 && (x || y || z || w != src.width || h != src.height || d != src.depth || w != dst.width ||
-                            h != dst.height || d != dst.depth))
-        return Verdict::partial_multisample;
+    // D3D12 requires a null source box even if an explicit box would cover the whole subresource.
+    const bool depth_stencil = src.depth_stencil || dst.depth_stencil;
+    if ((src.samples > 1 || depth_stencil) &&
+        (box || x || y || z || w != dst.width || h != dst.height || d != dst.depth))
+        return src.samples > 1 ? Verdict::partial_multisample : Verdict::partial_depth_stencil;
     if (std::uint64_t{x} + w > dst.width || std::uint64_t{y} + h > dst.height || std::uint64_t{z} + d > dst.depth)
         return Verdict::dest_overflow;
     for (const Side* s : {&dst, &src}) {

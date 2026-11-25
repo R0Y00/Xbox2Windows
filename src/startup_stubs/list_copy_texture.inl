@@ -30,6 +30,8 @@ bool copy_texture_side(const D3D12_TEXTURE_COPY_LOCATION* location, ID3D12Resour
     side = {};
     side.block_w = side.block_h = 1;
     side.samples = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
+    side.depth_stencil = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 ||
+        desc.Format == DXGI_FORMAT_D16_UNORM || desc.Format == DXGI_FORMAT_D32_FLOAT;
     side.mips = side.array_size = side.planes = 1;
     if (location->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return false;
