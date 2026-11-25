@@ -49,6 +49,12 @@ SLOT70_REASONS = {
     # the partial-tile holds of device_memory_srv
     "partial_tile_xg_rows",
     "partial_tile_beyond_xg_size",
+    # the console-layout holds of device_memory_srv (#2015)
+    "unsupported_desktop_format",
+    "console_layout_xg_rows",
+    "console_layout_without_footprints",
+    "console_layout_beyond_xg_size",
+    "overlapping_resource",
 }
 DSTORAGE_FAIL_OUTCOMES = {
     "bcpack failed",

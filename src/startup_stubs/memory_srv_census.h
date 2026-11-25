@@ -33,6 +33,9 @@ constexpr const char* memory_srv_reasons[] = {
     "texture_unavailable",
     // the partial-tile holds of device_memory_srv (upstream #2105)
     "partial_tile_xg_rows", "partial_tile_beyond_xg_size",
+    // the console-layout holds of device_memory_srv (#2015)
+    "unsupported_desktop_format", "console_layout_xg_rows", "console_layout_without_footprints",
+    "console_layout_beyond_xg_size", "overlapping_resource",
 };
 constexpr int memory_srv_reason_count = static_cast<int>(sizeof(memory_srv_reasons) / sizeof(memory_srv_reasons[0]));
 
@@ -43,12 +46,13 @@ inline int memory_srv_reason_index(const char* reason)
     return memory_srv_reason_count;  // other
 }
 
-// The reasons a different resource description could have avoided: their shapes are kept.
+// The reasons that depend on the resource description: their shapes are kept. The others (no
+// destination, unreadable arguments, no address, a destination outside the view heaps) do not.
 inline bool memory_srv_reason_has_shape(int reason)
 {
-    return reason == memory_srv_reason_index("unsupported_description") ||
-           reason == memory_srv_reason_index("buffer_unavailable") ||
-           reason == memory_srv_reason_index("texture_unavailable");
+    return reason < memory_srv_reason_count && reason != memory_srv_reason_index("null_destination") &&
+           reason != memory_srv_reason_index("unreadable_resource") && reason != memory_srv_reason_index("unreadable_view") &&
+           reason != memory_srv_reason_index("null_address") && reason != memory_srv_reason_index("destination_outside_view_heaps");
 }
 
 struct RefusedShape {
@@ -105,7 +109,7 @@ public:
             ReleaseSRWLockExclusive(&lock_);
             return false;
         }
-        char line[640];
+        char line[1024];
         int n = std::snprintf(line, sizeof(line), "x2w-d3d12 memory SRV refusals (slot 70): total %llu;",
                               static_cast<unsigned long long>(total_));
         for (int r = 0; r <= memory_srv_reason_count && n > 0 && n < static_cast<int>(sizeof(line)); ++r)
@@ -182,7 +186,7 @@ public:
             ReleaseSRWLockExclusive(&lock_);
             return false;
         }
-        char line[640];
+        char line[1024];
         int n = std::snprintf(line, sizeof(line), "x2w-draw token texture nulls: total %llu in %u pipelines;",
                               static_cast<unsigned long long>(total_), count_);
         for (unsigned i = 0; i < count_ && n > 0 && n < static_cast<int>(sizeof(line)); ++i)

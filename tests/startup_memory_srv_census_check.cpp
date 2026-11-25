@@ -58,7 +58,9 @@ int main()
     check("summary", !report.empty() && report[0] ==
           "x2w-d3d12 memory SRV refusals (slot 70): total 138; null_destination 1, unreadable_resource 0, unreadable_view 0, "
           "null_address 1, unsupported_description 133, destination_outside_view_heaps 0, gpu_written_resource 0, "
-          "buffer_unavailable 1, texture_unavailable 1, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, other 1; distinct shapes 128 (calls past the shape table 5)");
+          "buffer_unavailable 1, texture_unavailable 1, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, unsupported_desktop_format 0, "
+          "console_layout_xg_rows 0, console_layout_without_footprints 0, console_layout_beyond_xg_size 0, overlapping_resource 0, "
+          "other 1; distinct shapes 128 (calls past the shape table 5)");
     check("first shape line", report.size() > 1 && report[1] ==
           "x2w-d3d12 memory SRV refused shape 1: reason=unsupported_description dim=3 fmt=71 size=64x64x1 mips=7 layout=0x0 "
           "flags=0x0 calls=2");
