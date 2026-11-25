@@ -466,6 +466,7 @@ OperationResult run_readback_batch(const OperationContext& ctx, AfterCase after_
     const bool pairs = operation == "--check-pixel-pairs";
     const bool compute = operation == "--compute-store-batch";
     const int stride = pairs ? 2 : 1;
+    ComputeReadbackProgram program;
     bool failed = false;
     for (int i = 4, index = 0; i < ctx.argc; i += stride, ++index) {
         const char* shader = ctx.argv[pairs ? i - 1 : 3];
@@ -474,8 +475,12 @@ OperationResult run_readback_batch(const OperationContext& ctx, AfterCase after_
         if (pairs) std::fprintf(stderr, "shader=%s\n", shader);
         try {
             check(ctx.device->GetDeviceRemovedReason(), compute ? "Compute batch device" : "Pixel batch device");
-            if (compute) check_compute_file(ctx.device, shader, false, ctx.argv[i]);
-            else check_translated_pixel(ctx.device, shader, false, ctx.argv[i]);
+            if (compute) {
+                if (!program.pipeline) program = load_compute_store_program(ctx.device, shader);
+                check_compute_store_reference(ctx.device, program, ctx.argv[i]);
+            } else {
+                check_translated_pixel(ctx.device, shader, false, ctx.argv[i]);
+            }
             after_case(index);
         } catch (const ReadbackMismatch& e) {
             std::fprintf(stderr, "%s\n", e.what());
