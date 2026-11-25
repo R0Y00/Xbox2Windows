@@ -13172,6 +13172,30 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_gather_lz(_warp|_hardware)?$' -V
 ```
 
+### Startup compute D16 image store
+
+The startup compute translator accepts a 2D `image_store d16` with all four
+DMASK bits set, full-width X/Y and eight intact image descriptor words from a
+fixed table offset. The R/G half-floats occupy the low/high halves of the first
+data VGPR. B/A occupy the second. The translator widens the four halves for a
+typed UAV store under the lane's EXEC bit. The version 2 compute manifest
+records `uav N tex2d float table P O channels 4`. Raw buffer and texture UAVs
+share a register index space. The consumer must validate the bound view against
+its dimension and float type. [AMD RDNA 2 ISA, §§8.2.1 and 8.2.5](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+
+The standalone dispatch uses the source and CPU reference from the
+[gfx1013 D16 store fixture](#gfx1013-2d-d16-float-image-stores). Two groups
+write 16 texels to mip zero of an RGBA16_FLOAT UAV. Each run compares all 1,344
+half-words across three mips, including signed zeros, subnormals and untouched
+texels. A second program masks out the second row. Omitting the store, swapping
+R/G, swapping the packed registers and dropping the EXEC guard produce 64, 32,
+64 and 32 differences respectively. Slot-67 runtime binding is tracked in #2274.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
+```
+
 ## Startup translator: fixed-mip 2D comparison gathers
 
 The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D

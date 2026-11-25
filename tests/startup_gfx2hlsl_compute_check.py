@@ -168,13 +168,13 @@ def splice(*lines, at=STORE_A):
     return WORDS_A[:at] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[at:]
 
 
-def root_blob():
-    """RTS0: param 0 = two root constants (b0), param 1 = a descriptor table with no ranges."""
+def root_blob(constants=2):
+    """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges."""
     params_at, constants_at = 24, 24 + 2 * 12
     table_at = constants_at + 12
     rts0 = (struct.pack('<6I', 2, 2, params_at, 0, table_at + 8, 0)
             + struct.pack('<3I', 1, 0, constants_at) + struct.pack('<3I', 0, 0, table_at)
-            + struct.pack('<3I', 0, 0, 2) + struct.pack('<2I', 0, table_at + 8))
+            + struct.pack('<3I', 0, 0, constants) + struct.pack('<2I', 0, table_at + 8))
     part = b'RTS0' + struct.pack('<I', len(rts0)) + rts0
     return b'DXBC' + bytes(16) + struct.pack('<III', 1, 32 + 4 + len(part), 1) + struct.pack('<I', 36) + part
 
@@ -230,9 +230,7 @@ def patch(words, old, new):
 
 def check_controls():
     a = translate('A')
-    # The compute stage keeps its buffer stores in self.uavs as descriptor key -> u index, while the pixel stage's
-    # image stores (#2155) are listed by stored_images() through the shared common() and manifest(). A compute
-    # program must list no image stores: no RWTexture2D declaration and no `uav <i> tex2d` line.
+    # This buffer-only compute program has no typed UAV declaration or image manifest entry.
     assert a.uavs and a.stored_images() == {}, (a.uavs, a.stored_images())
     hlsl, manifest = a.hlsl_cs(), a.manifest()
     assert not any(line.startswith('RWTexture2D') for line in hlsl.splitlines()), hlsl

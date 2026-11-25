@@ -2508,8 +2508,20 @@ class Stage:
     def op_image_load_mip(self, ops, mods):
         self.image(ops, mods, 'load_mip')
 
+    def fixed_table_image(self, operand, name):
+        """The compute manifest binds the original table view, including all eight descriptor words."""
+        image = reg_range(operand)
+        first = self.sym.get(image[1]) if image and image[0] == 's' and image[2] - image[1] == 7 else None
+        if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 8:
+            raise Unsupported('%s requires a fixed table image descriptor' % name)
+        for i in range(8):
+            word = first[:3] + (first[3] + i,)
+            if self.sym.get(image[1] + i) != word or desc_key(word) in self.pipe.modified:
+                raise Unsupported('%s through a modified image descriptor' % name)
+        return self.descriptor(operand)
+
     def op_image_store(self, ops, mods):
-        """image_store in a pixel stage: a typed store of four channels to one texel of a 2D image.
+        """Write one four-channel 2D texel from pixel FP32 or compute packed FP16 data.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D) and SRSRC the image descriptor; the
@@ -2521,11 +2533,16 @@ class Stage:
         hardware drops them for lanes outside exec.
         """
         name = 'image_store'
-        if self.kind != 'ps':
+        d16 = self.kind == 'cs' and mods.count('d16') == 1
+        if self.kind == 'cs' and not d16:
+            raise Unsupported('compute image_store requires d16')
+        if not d16 and self.kind != 'ps':
             raise Unsupported('%s outside a pixel stage' % name)
         if len(ops) != 3:
             raise Unsupported('%s with %d operands' % (name, len(ops)))
         for m in mods:
+            if d16 and m == 'd16':
+                continue
             if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
                 raise Unsupported('%s modifier %s' % (name, m))
         dims = [m[4:] for m in mods if m.startswith('dim:')]
@@ -2541,8 +2558,9 @@ class Stage:
         if mask != 0xf:
             raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
         data = reg_range(ops[0])
-        if not data or data[0] != 'v' or data[2] - data[1] != 3:
-            raise Unsupported('%s data %s: four VGPRs expected' % (name, ops[0]))
+        count = 2 if d16 else 4
+        if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
+            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], 'two' if d16 else 'four'))
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -2551,8 +2569,18 @@ class Stage:
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
         if len(cs) != 2:
             raise Unsupported('%s with %d address registers: x and y expected' % (name, len(cs)))
-        image = self.pipe.uav(self.descriptor(ops[2]), 'tex2d')
-        value = 'asfloat(uint4(%s))' % ', '.join(self.u('v%d' % n) for n in range(data[1], data[1] + 4))
+        words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
+        if d16:
+            if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
+                raise Unsupported('compute image_store requires full-width VGPR coordinates')
+            key = self.fixed_table_image(ops[2], name)
+            # RDNA 2 ISA §8.2.5: RG occupy VDATA, BA occupy VDATA+1, low half first.
+            rgba = ['f16tof32(%s & 0xffffu), f16tof32(%s >> 16)' % (word, word) for word in words]
+            value = 'float4(%s)' % ', '.join(rgba)
+        else:
+            key = self.descriptor(ops[2])
+            value = 'asfloat(uint4(%s))' % ', '.join(words)
+        image = self.pipe.uav(key, 'tex2d')
         body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
@@ -2584,18 +2612,8 @@ class Stage:
             check_gather_sampler(gather_2d_profile_words(words), 1, comparison=False)
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (name, error)) from error
-        if self.kind == 'cs':
-            # The compute manifest binds the original table view. Each of its eight
-            # words must still belong to the same image descriptor.
-            image = reg_range(ops[2])
-            first = self.sym.get(image[1]) if image and image[0] == 's' and image[2] - image[1] == 7 else None
-            if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 8:
-                raise Unsupported('%s requires a fixed table image descriptor' % name)
-            for i in range(8):
-                word = first[:3] + (first[3] + i,)
-                if self.sym.get(image[1] + i) != word or desc_key(word) in self.pipe.modified:
-                    raise Unsupported('%s through a modified image descriptor' % name)
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        key = self.fixed_table_image(ops[2], name) if self.kind == 'cs' else self.descriptor(ops[2])
+        tex = self.pipe.resource(key, 'tex2d')
         smp = self.pipe.sampler(tuple(words))
         u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
         self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channels[masks[0]], smp, u, v))
@@ -3737,7 +3755,7 @@ class Pipeline:
         r = self.uavs.setdefault(key, dict(index=len(self.uavs), kind=kind))
         if r['kind'] != kind:
             raise Unsupported('stored image %s used as %s and %s' % (key, r['kind'], kind))
-        return 'w%d' % r['index']
+        return ('u%d' if kind == 'raw' else 'w%d') % r['index']
 
     def sampler(self, key, comparison=False, lod_limits=False):
         if not isinstance(key[0], int):
@@ -3983,19 +4001,20 @@ class ComputePipeline(Pipeline):
             raise Unsupported('descriptor %s used for a load and a store' % (key,))
         return super().resource(key, kind)
 
-    def uav(self, key):
+    def uav(self, key, kind='raw'):
         if key in self.resources:
             raise Unsupported('descriptor %s used for a load and a store' % (key,))
-        return 'u%d' % self.uavs.setdefault(key, len(self.uavs))
+        return super().uav(key, kind)
 
     def stored_images(self):
-        # self.uavs here maps buffer descriptors to u indices (declared and listed by common() and manifest()
-        # below); the pixel-stage image stores that Pipeline.stored_images lists do not occur in a compute program.
-        return {}
+        return {key: r for key, r in self.uavs.items() if r['kind'] != 'raw'}
 
     def common(self):
         out = [line for line in super().common() if self.uds or not line.startswith('cbuffer entry')]
-        return out + ['RWByteAddressBuffer u%d : register(u%d);' % (i, i) for i in sorted(self.uavs.values())]
+        for r in self.uavs.values():
+            if r['kind'] == 'raw':
+                out.append('RWByteAddressBuffer u{0} : register(u{0});'.format(r['index']))
+        return out
 
     def hlsl_cs(self):
         s = self.cs
@@ -4018,7 +4037,12 @@ class ComputePipeline(Pipeline):
             else:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
-        lines += ['uav %d table %d %d' % (i, key[0][1], key[1]) for key, i in sorted(self.uavs.items(), key=lambda kv: kv[1])]
+        for (source, off), r in self.uavs.items():
+            where = 'table %d %d' % (source[1], off)
+            if r['kind'] == 'raw':
+                lines.append('uav %d %s' % (r['index'], where))
+            else:
+                lines.append('uav %d tex2d float %s channels 4' % (r['index'], where))
         for key, i in self.samplers.items():
             comparison = key[0] == 'cmp'
             lines.append('%s %d %s' % ('smpc' if comparison else 'smp', i, ' '.join('0x%x' % w for w in key[comparison:])))
