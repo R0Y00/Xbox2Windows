@@ -1709,7 +1709,8 @@ struct IndirectBufferView {
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false)
 {
-    constexpr u64 limit = 16u << 20;
+    // The translated shader uses an R32_TYPELESS raw SRV over existing GPU storage.
+    constexpr u64 max_raw_elements = u64{1} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP;
     u64 address = 0, offset = 0, bytes = 0;
     UINT stride = 0;
     const Wrapper* owner = nullptr;
@@ -1750,7 +1751,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
-    if (!bytes || bytes > limit || bytes % 4) return {};
+    if (!bytes || bytes % 4 || bytes / 4 > max_raw_elements) return {};
     ID3D12Resource* native = nullptr;
     bool upload = false;
     Wrapper* device = self->own().list_device;

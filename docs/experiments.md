@@ -104,6 +104,12 @@ The table's nonzero offset and stride select the second colour, the short view r
 non-aliased placement is refused. A raw descriptor over a recording-owned upload page reads the
 same colour and refuses a view that crosses its allocation.
 
+The same test reads the last DWORD of a GPU-backed raw view extending 16 bytes beyond
+16 MiB. The compute writer puts red there and green one element earlier. Shortening the
+view by one element makes the pixel read zero although the resource still contains red.
+The shim binds the existing GPU range directly and checks the complete range against its
+backing and the D3D12 raw-view element limit.
+
 ### Index views backed by a recording upload
 
 Under `X2W_TRANSLATED_INDIRECT_DRAW=1`, a translated indexed draw can bind
