@@ -9001,6 +9001,134 @@ The fixture maps two pages from the shim's `SEC_RESERVE` pool and copies a 4 KiB
 
 Run `cmake --build --preset release --target xmem_section_lease_check` and `ctest --preset release --no-tests=error -R '^xmem_section_lease_' -V`. The tests report a capability skip (77) when the D3D12 device lacks existing heap support.
 
+#### GPU queue handoff to an XMem-backed root SRV (#1914)
+
+The same fixture has mesh and vertex modes that read one DWORD through a root
+SRV at byte offset `0xf800` in the first leased page. A COPY queue writes a new
+DWORD to the desktop buffer placed over the XMem pages. A DIRECT queue waits
+on the writer's fence, binds a graphics root SRV and draws to a 4×2 UINT target.
+The fixture records the lease ID, section page offset and byte offset at the
+write and at the bind. For the missing-wait control, the writer stays behind a
+gate until the reader finishes, so the read of the old DWORD is deterministic.
+Binding the second page while retaining the wait returns its independent
+sentinel. Both queues complete before the buffer, heap view and lease are released.
+
+Release on base `76aeef7f` plus the fixture, Windows 10 build 19045.6456 with
+the D3D12 debug layer enabled: WARP 10.0.19041.5794 and GeForce GTX 1080 Ti
+32.0.15.8278 each returned eight pixels of `0x9abcdef0` with the wait,
+`0x12345678` without it, and `0x1372ba5d` from the other page. The vertex
+mode reported zero debug warnings or errors on each adapter. The two mesh
+runs reported capability skip (77), because neither selected device supported
+mesh shaders.
+
+```powershell
+cmake --build --preset release --target xmem_section_lease_check
+ctest --preset release --no-tests=error -j1 -R '^xmem_section_lease_' -V
+```
+
+This measures a source-built D3D12 queue handoff. The same-recording copy proof from
+[#2240](https://github.com/R0Y00/Xbox2Windows/pull/2240) identifies contents
+in a desktop copy. The lease handoff needs its own proof of page identity and
+writer ordering across queues.
+
+**Branch goal and PR acceptance.** `codex/mesh-root-srv-lease` targets one
+GPU-written XMem range consumed by a root SRV in the cached slot 86 mesh path.
+The proposed PR, `gpu: bind one leased XMem range for cached mesh draws`, uses
+the lease from [#2280](https://github.com/R0Y00/Xbox2Windows/pull/2280) and
+covers one SRV with a proven byte extent through the startup command-list and
+queue wrappers. Track it under [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914#issuecomment-7159228037)
+and [#870](https://github.com/R0Y00/Xbox2Windows/issues/870).
+
+- Verify the full read extent, physical page identity and byte offset at writer
+  publication and root bind. Refuse a page mismatch, an out-of-range read or
+  a missing writer record with a specific diagnostic.
+- Before submitting a consumer on a different queue, enqueue a GPU wait on
+  the last writer's fence. The startup fixture must read the fresh DWORD. A
+  control that omits the wait must expose the old DWORD, and a different-page
+  control must be refused by the runtime.
+- Retain the lease and desktop backing until the last consumer fence completes.
+  Hold a consumer behind a gate and verify that its physical slots cannot be
+  reused until the submission finishes.
+- Run the end-to-end mesh case on at least one mesh-capable adapter. Record the
+  commit, test command, adapter, driver, Windows build and debug-layer status.
+
+Two pieces of the runtime contract now have source-built checks. The lease
+matcher compares the live CPU and GPU mappings against the original pinned
+slab slots and byte extent under the XMem lock. The check accepts the full
+span and a second-page subrange. It rejects a different page, a different
+offset, bytes outside the original span and a replacement mapping at the
+same virtual address. A pinned desktop view remains valid after the old
+guest mapping stops matching.
+
+Slot 44 supplies an address alone. The cache publisher's `--prove-root-srv`
+option derives a four-byte extent from DXC's dump of the compiled shader.
+It emits a version 2 marker tied to the published bytecode only for one
+raw DWORD load at offset zero from `t0 space0`, with a resource-free pixel
+stage. The check compiles and rejects shifted, dynamic, wider and wrong-space
+loads and a pixel-stage buffer read. Run it with
+`ctest --preset release --no-tests=error -R '^startup_mesh86_srv_proof$' -V`.
+
+On the Release worktree at `76aeef7f` plus these changes, the combined lease,
+SRV proof, export and mapped-page selection passed eight tests. The two mesh
+cases returned 77 on the adapters listed above. `dumpbin /exports` showed
+lease and release at ordinals 19 and 20, and match at 21.
+
+**Wrapped startup path.** With `X2W_MESH86_XMEM_SRV=1`, one eligible slot 15
+copy from an upload buffer writes a DWORD to a mirrored slot 133 buffer. The
+normal desktop copy and the write into the leased view use the same GPU source.
+The copied placement must be live and unique, and the word must be aligned for
+a raw root SRV. Slot 86 accepts the version 2 marker for one `t0 space0` root
+SRV, with matching stage hashes. Slot 61 binds the lease after checking the
+placement, page identity and byte extent. An overlapping copy without a lease
+update invalidates the writer publication when its recording is submitted.
+
+Slot 10 publishes the writer after enqueuing its completion signal. A consumer
+on a different queue waits on that fence, or on a later access already ordered
+after it. The wrapper checks the live mapping again at submission. Each flight
+holds the buffer, heap view and lease through its own completion fence. A closed
+recording also holds its reference until Reset or Release, so it can be submitted
+again. If a completion signal fails after submission, the runtime retains the
+in-flight backing and refuses further handoffs for it.
+
+Build and run the wrapped fixtures with a mesh-capable adapter. For app-local
+software coverage, use Microsoft.Direct3D.WARP 1.0.22 and
+Microsoft.Direct3D.D3D12 1.620.2. Put their x64 files in local directories
+under `out/`. Keep the Agility NuGet archive as `sdk.nupkg` alongside its
+x64 DLLs so the build can use the matching headers. Set `$warp` and `$agility`
+to those directories and `$python` to the test Python interpreter.
+
+```powershell
+cmake --preset release -B out/build/mesh-agility "-DOFFSCREEN_WARP_DIR=$warp" "-DOFFSCREEN_AGILITY_620_DIR=$agility" "-DINTAKE_PYTHON=$python"
+cmake --build out/build/mesh-agility --target startup_indirect_draw_indexed startup_list_copy_check --parallel 3
+ctest --test-dir out/build/mesh-agility --no-tests=error -j1 -R '^(startup_indirect_mesh_lease_|startup_indirect_mesh_cache_warp$|startup_mesh_xmem_writer_(warp|hardware)$|startup_mesh86_srv_proof$|startup_list_copy_validation)' --output-on-failure
+```
+
+The wrapped test uses an actual slot 15 writer on a COPY queue and a cached
+slot 86 mesh shader dispatched through slot 61 on a DIRECT queue. Wrong page,
+same-page wrong offset, absent writer and a corrupted cache marker each leave
+the eight target pixels at the clear color. Ordered readback expects eight red
+pixels. The omitted-wait control keeps the writer behind a gate until the read
+finishes and expects eight green pixels. The lifetime case removes both guest
+mappings and releases the resource and recordings while the consumer is gated.
+An allocation after that release takes a different slot. The consumer still
+reads red, and the original slot becomes reusable after its completion fence.
+
+Release on base `5c7b538b` plus this branch, Windows 10 build 19045.6456,
+MSVC 19.31.31105 and DXC 1.8.2502.11: the app-local selection passed ten
+tests with two capability skips. Microsoft Basic Render Driver 1.0.22.0
+with D3D12Core 1.620.2 ran the ordered and missing-wait mesh cases with the
+debug layer enabled and reported zero warnings or errors. GeForce GTX 1080 Ti
+32.0.15.8278 passed the wrapped writer check with the debug layer enabled
+and skipped both mesh cases. The earlier in-box Release run on base `76aeef7f`
+passed twenty tests with two capability skips. It also checks the original
+XMem lease, mapped pages, exported names, copy validation and WARP list
+resubmission.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed startup_list_copy_check startup_list_copy startup_list_resubmit xmem_section_lease_check xmem_shim_check xmem_shim_test_controls --parallel 3
+ctest --preset release --no-tests=error -j1 -R '^(xmem_section_lease_|xmem_shim_(exports|mapped_pages|page_runs)$|startup_(mesh_xmem_writer|mesh86_srv_proof|list_copy|list_resubmit.*_warp$))' --output-on-failure
+```
+
 #### Xbox frame events and token wait semantics (#874)
 
 The source-built frame events fixture (`tests/cpu/frame_events_caller.asm`, `tests/cpu/frame_events_provider.cpp`, `tests/cpu/frame_events_check.py`, CTest `cpu_native_frame_events`) models the scheduling and wait semantics of the Xbox frame-pacing extensions in `d3d12_xs.dll`:

@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 
 #include "desktop_gpu.h"
+#include "xmem_section_lease.h"
 #include "startup_indirect_mesh_mesh.h"
 #include "startup_indirect_mesh_amplify.h"
 #include "startup_indirect_mesh_amplified_mesh.h"
@@ -16,12 +17,20 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+
+#if defined(OFFSCREEN_AGILITY_620)
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
+__declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
+}
+#endif
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -371,10 +380,11 @@ struct PlacedBuffer {
     ComPtr<ID3D12Resource> native;
 };
 
-ComPtr<IUnknown> begin_guest_list(ID3D12Device* guest, ID3D12CommandAllocator* allocator)
+ComPtr<IUnknown> begin_guest_list(ID3D12Device* guest, ID3D12CommandAllocator* allocator,
+                                 D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT)
 {
     using CreateList = HRESULT (WINAPI*)(IUnknown*, const void*, IUnknown*, IUnknown*, REFIID, void**);
-    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    const UINT list_desc[]{static_cast<UINT>(type), 2, 1, 0};
     ComPtr<IUnknown> result;
     check(slot<CreateList>(guest, 73)(guest, list_desc, allocator, nullptr, __uuidof(ID3D12GraphicsCommandList),
                                      reinterpret_cast<void**>(result.GetAddressOf())), "create guest command list");
@@ -395,6 +405,20 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(queue->Signal(fence.Get(), 1), "signal completion fence");
     check(fence->SetEventOnCompletion(1, nullptr), "wait for completion");
     check(device->GetDeviceRemovedReason(), "GPU completion");
+}
+
+struct MeshLeaseDraw {
+    UINT64 address;
+    IUnknown* queue;
+    UINT expected;
+    bool drop_recording = false;
+    std::function<void(ID3D12Fence*)> queued;
+};
+
+void submit_wrapped(IUnknown* queue, IUnknown* list)
+{
+    using Execute = void (WINAPI*)(IUnknown*, UINT, IUnknown* const*);
+    slot<Execute>(queue, 10)(queue, list ? 1u : 0u, list ? &list : nullptr);
 }
 
 enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered,
@@ -504,7 +528,7 @@ constexpr UINT command_stride(DrawKind kind)
 bool supports_mesh(ID3D12Device* device)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
-    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options))) &&
+    return SUCCEEDED(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options))) &&
         options.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
 }
 
@@ -513,7 +537,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
-         UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false)
+         UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
+         const MeshLeaseDraw* leased = nullptr)
 {
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool translated_indexed = translated && indexed;
@@ -588,7 +613,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
 
     ComPtr<ID3D12CommandAllocator> allocator;
     check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create guest allocator");
-    const auto wrapped_list = begin_guest_list(guest, allocator.Get());
+    auto wrapped_list = begin_guest_list(guest, allocator.Get());
     auto* wrapped = wrapped_list.Get();
     const auto native_list = native_object<ID3D12GraphicsCommandList>(device, guest, wrapped);
     auto* list = native_list.Get();
@@ -690,7 +715,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     }
     slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Bind>(wrapped, 34)(wrapped, refusal == Refusal::wrong_root ? translated->wrong_root.Get() : graphics_root);
-    if (cached_mesh_targets || cached_depth_only) {
+    if (leased) {
+        using RootSrv = void (WINAPI*)(IUnknown*, UINT, UINT64);
+        slot<RootSrv>(wrapped, 44)(wrapped, 0, leased->address);
+    } else if (cached_mesh_targets || cached_depth_only) {
         using Constants = void (WINAPI*)(IUnknown*, UINT, UINT, const UINT*, UINT);
         const UINT values[]{17, 29};
         slot<Constants>(wrapped, 40)(wrapped, 0, 1, values, 0);
@@ -840,7 +868,19 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         }
     }
     check(closed, "close guest command list");
-    submit(device, list);
+    if (leased) {
+        const auto queue = native_object<ID3D12CommandQueue>(device, guest, leased->queue);
+        ComPtr<ID3D12Fence> completion;
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)), "create mesh consumer fence");
+        submit_wrapped(leased->queue, wrapped);
+        check(queue->Signal(completion.Get(), 1), "signal mesh consumer completion");
+        if (leased->drop_recording) wrapped_list.Reset();
+        if (leased->queued) leased->queued(completion.Get());
+        check(completion->SetEventOnCompletion(1, nullptr), "wait for mesh consumer");
+        check(device->GetDeviceRemovedReason(), "leased mesh GPU completion");
+    } else {
+        submit(device, list);
+    }
 
     if (restore_compute) {
         const D3D12_RANGE read{0, 4}, none{0, 0};
@@ -918,6 +958,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 const std::uint32_t background = cached_depth_only ? 0xffff : black;
                 auto wanted = drawn ? (cached_depth_only ? 0u :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
+                if (leased) wanted = leased->expected;
                 if (rect) {
                     // NDC pixel centers are x=(-.75,-.25,.25,.75), y=(.5,-.5).
                     // UV follows the clipped original rectangle, not the viewport/scissor.
@@ -1043,11 +1084,17 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
     std::puts("slot 57 creation result and output matched all controls");
     return true;
 }
+#include "startup_indirect_mesh_lease.inl"
 }  // namespace
 
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
+    const bool lease_writer = argc == 3 && std::strcmp(argv[2], "mesh-lease-writer") == 0;
+    wchar_t lease_xmem[MAX_PATH]{};
+    const bool lease_fixture = GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_XMEM", lease_xmem, MAX_PATH) != 0;
+    if (lease_fixture)
+        check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
     const bool copy_on = argc == 3 && std::strcmp(argv[2], "copy-provenance") == 0;
@@ -1063,7 +1110,7 @@ int main(int argc, char** argv) try
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0)) kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
-    else if (argc != 2 && !count_control && !translated_indexed) return 2;
+    else if (argc != 2 && !count_control && !translated_indexed && !lease_writer) return 2;
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool mesh = kind == DrawKind::mesh;
     const bool fixed_create_fixture = mesh && GetEnvironmentVariableA("X2W_FIXED_MESH_CREATE_FIXTURE", nullptr, 0);
@@ -1125,6 +1172,20 @@ int main(int argc, char** argv) try
     if (fixed_create_fixture) return fixed_mesh_create_contract(guest.Get()) ? 0 : 1;
     ComPtr<ID3D12InfoQueue> info;
     if (debug) check(device.As(&info), "get debug message queue");
+    if (lease_fixture && !supports_lease_heap(device.Get())) {
+        std::puts("mesh XMem capability skip: existing heaps unavailable");
+        return 77;
+    }
+    if (lease_writer) {
+        if (!lease_fixture) return 2;
+        MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);
+        source.start();
+        source.finish();
+        source.free_original();
+        source.check_retirement("completed writer releases the first XMem slot");
+        check_lease_debug(info.Get());
+        return 0;
+    }
     const D3D12_ROOT_PARAMETER uav{D3D12_ROOT_PARAMETER_TYPE_UAV, {}, D3D12_SHADER_VISIBILITY_ALL};
     const D3D12_ROOT_SIGNATURE_DESC writer_desc{1, &uav, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     const auto root_flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -1141,8 +1202,10 @@ int main(int argc, char** argv) try
         };
         const auto ms = read_stage("source.ms.dxbc");
         const auto ps = depth_only ? std::vector<char>{} : read_stage("source.ps.dxbc");
-        D3D12_ROOT_PARAMETER parameter{D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, {}, D3D12_SHADER_VISIBILITY_ALL};
-        parameter.Constants = {0, 0, 2};
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ParameterType = lease_fixture ? D3D12_ROOT_PARAMETER_TYPE_SRV : D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameter.ShaderVisibility = lease_fixture ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_ALL;
+        if (!lease_fixture) parameter.Constants = {0, 0, 2};
         const D3D12_ROOT_SIGNATURE_DESC root_desc{1, &parameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         const auto root = create_root(guest.Get(), root_desc);
         D3D12_INDIRECT_ARGUMENT_DESC argument{};
@@ -1152,8 +1215,68 @@ int main(int argc, char** argv) try
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create cached mesh signature");
         const auto pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(
             guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
-            {}, depth_only ? 0 : 3, depth_only);
+            {}, depth_only ? 0 : lease_fixture ? 1 : 3, depth_only);
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
+        if (lease_fixture) {
+            MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);
+            const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            const auto verify = [&](const MeshLeaseDraw& draw, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
+                           DrawKind::mesh, false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false,
+                           &draw);
+            };
+            const MeshLeaseDraw no_writer{source.address(), queue.Get(), black};
+            if (!verify(no_writer, "mesh lease missing writer or proof")) return 1;
+            if (GetEnvironmentVariableA("X2W_MESH86_FIXTURE_REJECT_MARKER", nullptr, 0)) {
+                source.start();
+                source.finish();
+                return verify(no_writer, "mesh lease rejects invalid marker even with a writer") ? 0 : 1;
+            }
+            if (!GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0)) return 0;
+            source.start();
+            const MeshLeaseDraw wrong_page{source.address() + MeshLeaseWriter::page, queue.Get(), black};
+            if (!verify(wrong_page, "mesh lease different page refused")) return 1;
+            const MeshLeaseDraw wrong_offset{source.address() + 16, queue.Get(), black};
+            if (!verify(wrong_offset, "mesh lease same-page byte range refused")) return 1;
+            const bool skip_wait = GetEnvironmentVariableA("X2W_TEST_MESH_XMEM_SKIP_WAIT", nullptr, 0) != 0;
+            MeshLeaseDraw ordered{source.address(), queue.Get(), skip_wait ? green : red};
+            if (!skip_wait) ordered.queued = [&](ID3D12Fence* done) {
+                const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                check(event ? S_OK : E_FAIL, "create bounded wait probe event");
+                const auto registered = done->SetEventOnCompletion(1, event);
+                const DWORD result = SUCCEEDED(registered) ? WaitForSingleObject(event, 50) : WAIT_FAILED;
+                // Open the gate even if the ordering check fails. The event
+                // must stay live through the completion it was registered for.
+                check(source.gate->Signal(1), "open producer after ordering probe");
+                if (SUCCEEDED(registered)) WaitForSingleObject(event, 5000);
+                CloseHandle(event);
+                check(result == WAIT_TIMEOUT ? S_OK : E_FAIL, "consumer waited for the held writer");
+            };
+            if (!verify(ordered, skip_wait ? "mesh control reads stale bytes" : "mesh reads the published XMem write")) return 1;
+            source.finish();
+            if (!skip_wait) {
+                const auto consumer_gate = source.create_fence();
+                struct ReleaseGate {
+                    ID3D12Fence* gate;
+                    ~ReleaseGate() { gate->Signal(1); }
+                } release{consumer_gate.Get()};
+                auto native = native_object<ID3D12CommandQueue>(device.Get(), guest.Get(), queue.Get());
+                check(native->Wait(consumer_gate.Get(), 1), "hold leased consumer before draw");
+                MeshLeaseDraw pinned{source.address(), queue.Get(), red, true};
+                pinned.queued = [&](ID3D12Fence*) {
+                    source.free_original();
+                    check(source.allocate_probe(2) != source.published_page ? S_OK : E_FAIL,
+                          "in-flight mesh consumer pins the original slot");
+                    check(consumer_gate->Signal(1), "release the mesh consumer");
+                };
+                if (!verify(pinned, "submitted mesh still reads the leased page after unmapping")) return 1;
+                source.check_retirement("mesh completion returns the original slot to XMem");
+            } else {
+                source.free_original();
+            }
+            check_lease_debug(info.Get());
+            return 0;
+        }
         const auto verify = [&](Refusal control, const char* label) {
             return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
                        DrawKind::mesh, false, control, label, nullptr, false, nullptr, false, false, depth_only ? 0 : 3, depth_only);

@@ -30,6 +30,11 @@ struct Backing {
 
 using Slot = std::pair<std::size_t, ULONG64>;
 struct SlotPin { unsigned references{}; bool retired{}; };
+struct SectionLease {
+    SIZE_T first_byte;
+    SIZE_T length;
+    std::vector<Slot> slots;
+};
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
 // views so its bytes survive unmapping. Its backing is released before reuse.
@@ -52,7 +57,7 @@ struct PhysicalMemory {
     // A grant may be freed after unmapping while a submitted GPU operation
     // still uses the section. Keep those slots out of the reusable pool.
     std::map<Slot, SlotPin> pins;
-    std::map<ULONG64, std::vector<Slot>> leases;
+    std::map<ULONG64, SectionLease> leases;
     ULONG64 next_lease = 1;
 
     ~PhysicalMemory()
@@ -66,6 +71,26 @@ struct PhysicalMemory {
 
 PhysicalMemory memory;
 constexpr SIZE_T page_bytes = era_physical::page_bytes;
+
+// Caller holds memory.mutex. A lease may only refer to committed pages whose
+// CPU and GPU views still name the same grant.
+bool mirrored_range(ULONG_PTR address, SIZE_T length)
+{
+    if (!length || !memory.mirror_gpu || address < memory.mirror_gpu || address > UINT64_MAX - length)
+        return false;
+    const auto offset = address - memory.mirror_gpu;
+    return offset < memory.mirror_bytes && length <= memory.mirror_bytes - offset;
+}
+
+const Backing* mirrored_backing(ULONG_PTR page)
+{
+    const auto mirror = memory.views.find(page);
+    const auto cpu = memory.views.find(memory.mirror_cpu + (page - memory.mirror_gpu));
+    if (mirror == memory.views.end() || cpu == memory.views.end() || cpu->second != mirror->second)
+        return nullptr;
+    const auto backing = memory.backings.find(mirror->second);
+    return backing != memory.backings.end() && backing->second.committed ? &backing->second : nullptr;
+}
 
 // Caller holds memory.mutex.
 void unpin_slot(const Slot& slot)
@@ -1020,11 +1045,9 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
     *out = {};
     if (version != x2w_xmem_section_lease_version) return FALSE;
     constexpr SIZE_T max_pages = 64;
-    if (!length || length > max_pages * page_bytes || address > UINT64_MAX - length) return FALSE;
+    if (length > max_pages * page_bytes) return FALSE;
     const std::lock_guard guard(memory.mutex);
-    if (!memory.mirror_gpu || address < memory.mirror_gpu || !memory.next_lease) return FALSE;
-    const auto offset = address - memory.mirror_gpu;
-    if (offset >= memory.mirror_bytes || length > memory.mirror_bytes - offset) return FALSE;
+    if (!memory.next_lease || !mirrored_range(address, length)) return FALSE;
     const auto first = address & ~(page_bytes - 1);
     const auto first_byte = address - first;
     const auto count = (first_byte + length + page_bytes - 1) / page_bytes;
@@ -1036,19 +1059,14 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
         selected.reserve(count);
         for (SIZE_T i = 0; i < count; ++i) {
             const auto page = first + i * page_bytes;
-            const auto mirror = memory.views.find(page);
-            const auto cpu = memory.views.find(memory.mirror_cpu + (page - memory.mirror_gpu));
-            if (mirror == memory.views.end() || cpu == memory.views.end() || cpu->second != mirror->second)
-                return FALSE;
-            const auto backing = memory.backings.find(mirror->second);
-            if (backing == memory.backings.end() || !backing->second.committed) return FALSE;
-            const auto& slot = backing->second;
+            const auto* slot = mirrored_backing(page);
+            if (!slot) return FALSE;
             if (selected.empty())
-                section = slot.section;
-            else if (slot.section != section || slot.slab != selected.front().first ||
-                     slot.offset != selected.front().second + i * page_bytes)
+                section = slot->section;
+            else if (slot->section != section || slot->slab != selected.front().first ||
+                     slot->offset != selected.front().second + i * page_bytes)
                 return FALSE;
-            selected.emplace_back(slot.slab, slot.offset);
+            selected.emplace_back(slot->slab, slot->offset);
         }
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE,
                              DUPLICATE_SAME_ACCESS))
@@ -1058,7 +1076,7 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
             ++pinned;
         }
         const auto lease = memory.next_lease;
-        memory.leases.emplace(lease, selected);
+        memory.leases.emplace(lease, SectionLease{first_byte, length, selected});
         ++memory.next_lease;
         *out = {duplicate, lease, selected.front().second, count * page_bytes, first_byte};
         return TRUE;
@@ -1069,13 +1087,34 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
     }
 }
 
+extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_T byte_offset,
+                                              ULONG_PTR address, SIZE_T length)
+{
+    if (version != x2w_xmem_section_lease_version || byte_offset % page_bytes != address % page_bytes)
+        return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    const auto found = memory.leases.find(lease);
+    if (found == memory.leases.end() || !mirrored_range(address, length)) return FALSE;
+    const auto& pin = found->second;
+    if (byte_offset < pin.first_byte || byte_offset - pin.first_byte >= pin.length ||
+        length > pin.length - (byte_offset - pin.first_byte)) return FALSE;
+    const SIZE_T first_slot = byte_offset / page_bytes;
+    const SIZE_T last_slot = (byte_offset + length - 1) / page_bytes;
+    const auto first_page = address & ~(page_bytes - 1);
+    for (SIZE_T slot = first_slot; slot <= last_slot; ++slot) {
+        const auto* backing = mirrored_backing(first_page + (slot - first_slot) * page_bytes);
+        if (!backing || pin.slots[slot] != Slot{backing->slab, backing->offset}) return FALSE;
+    }
+    return TRUE;
+}
+
 extern "C" BOOL WINAPI x2w_xmem_release_section(UINT version, ULONG64 lease)
 {
     if (version != x2w_xmem_section_lease_version) return FALSE;
     const std::lock_guard guard(memory.mutex);
     const auto found = memory.leases.find(lease);
     if (found == memory.leases.end()) return FALSE;
-    for (const auto& slot : found->second) unpin_slot(slot);
+    for (const auto& slot : found->second.slots) unpin_slot(slot);
     memory.leases.erase(found);
     return TRUE;
 }

@@ -25,7 +25,7 @@ def source_envelope(stage):
     return b'DXBC' + bytes(16) + struct.pack('<IIII', 1, 36 + len(part), 1, 36) + part
 
 
-def run(dxc, fixture, backend, work, depth_only):
+def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, skip_wait=False):
     for suffix, stage in (('ms', 13), ('ps', 0)):
         (work / f'source.{suffix}.dxbc').write_bytes(source_envelope(stage))
     environment = dict(os.environ, X2W_MESH86_FIXTURE_DIR=str(work), X2W_SHADER_CACHE=str(work))
@@ -33,6 +33,11 @@ def run(dxc, fixture, backend, work, depth_only):
     environment.pop('X2W_MESH86_FIXTURE_DEPTH', None)
     if depth_only:
         environment['X2W_MESH86_FIXTURE_DEPTH'] = '1'
+    if lease_xmem:
+        environment['X2W_MESH86_FIXTURE_XMEM'] = str(lease_xmem)
+        environment.pop('X2W_TEST_MESH_XMEM_SKIP_WAIT', None)
+        if skip_wait:
+            environment['X2W_TEST_MESH_XMEM_SKIP_WAIT'] = '1'
     cmd = [fixture, backend, 'mesh']
     capture = subprocess.run(cmd, env=environment)
     if capture.returncode:
@@ -43,15 +48,19 @@ def run(dxc, fixture, backend, work, depth_only):
     assert source_ms == source_envelope(13) and source_ps == (b'' if depth_only else source_envelope(0))
     assert root.startswith(b'DXBC') and stream[:16] == bytes(16)
     ms, ps = (work / f'desktop.{suffix}.cso' for suffix in ('ms', 'ps'))
-    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'mesh', '-Fo', ms, HERE / 'startup_indirect_mesh.hlsl'], check=True)
-    if not depth_only:
+    mesh_source = HERE / ('xmem_mesh_root_srv.hlsl' if lease_xmem else 'startup_indirect_mesh.hlsl')
+    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'mesh', '-Fo', ms, mesh_source], check=True)
+    if lease_xmem:
+        subprocess.run([dxc, '-T', 'ps_6_0', '-E', 'pixel', '-D', 'X2W_MESH_LEASE_COLOR=1',
+                        '-Fo', ps, mesh_source], check=True)
+    elif not depth_only:
         subprocess.run([dxc, '-T', 'ps_6_0', '-E', 'main', '-Fo', ps, HERE / 'startup_indirect_mesh_cache.hlsl'], check=True)
-    mesh86_cache.publish(work, key, ms, None if depth_only else ps)
+    mesh86_cache.publish(work, key, ms, None if depth_only else ps, srv_dxc=dxc if lease_xmem else None)
     assert (work / f'{key:016x}.ps.cso').is_file() != depth_only
     ready = work / f'{key:016x}.mesh86.txt'
     correct = ready.read_bytes()
-    ready.write_bytes(correct.replace(b'mesh86 1', b'mesh86 0', 1))
-    stale = subprocess.run(cmd, env=environment)
+    ready.write_bytes(correct.replace(b'mesh86 2' if lease_xmem else b'mesh86 1', b'mesh86 0', 1))
+    stale = subprocess.run(cmd, env=dict(environment, X2W_MESH86_FIXTURE_REJECT_MARKER='1') if lease_xmem else environment)
     if stale.returncode:
         return stale.returncode
     ready.write_bytes(correct)
@@ -63,8 +72,10 @@ def run(dxc, fixture, backend, work, depth_only):
 
 
 if __name__ == '__main__':
-    for depth_only in (False, True):
-        with tempfile.TemporaryDirectory(prefix='mesh86-') as directory:
-            result = run(*sys.argv[1:], Path(directory), depth_only)
+    dxc, fixture, backend, *lease = sys.argv[1:]
+    for depth_only in ((False,) if lease else (False, True)):
+        with tempfile.TemporaryDirectory(prefix='mesh86-', dir=Path.cwd()) as directory:
+            result = run(dxc, fixture, backend, Path(directory), depth_only, Path(lease[0]) if lease else None,
+                         len(lease) > 1 and lease[1] == 'skip-wait')
             if result:
                 sys.exit(result)
