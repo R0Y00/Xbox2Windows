@@ -83,6 +83,7 @@ LLVM_LIB="$LLVM_PREFIX/lib/libLLVM-15.dylib" \
 
 The [CI workflow](../.github/workflows/windows.yml) runs the platform-independent Python suite on Ubuntu 24.04 with Python 3.12 (`python-linux`) and the `gfx1013` machine-code checks on Ubuntu 22.04 with LLVM 15 (`pixel-binary`).
 Both jobs use `tools/run_checks_parallel.py`; the machine-code matrix supplies per-check LLVM arguments and environment overrides.
+The runner lists checks that exit 77 under `SKIPPED:` and other nonzero exits under `FAILED:`. Either summary makes the runner exit 1 so CI catches required checks that did not run. Open a skipped check's log group to see its output.
 
 On Debian/Ubuntu, install `python3-venv` first. Without it, `python3 -m venv` fails with `ensurepip is not available`:
 
@@ -339,7 +340,10 @@ not Windows verification; report it as such.
   on a sampler heap). This is an open difference; the stand-ins hand out the desktop handle for
   those heap types.
 - **Two top-level windows.** The executable's own window can sit above the stand-in's output
-  window under an X11 window manager. Minimise it to see the output.
+  window under an X11 window manager. With `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`),
+  the stand-in hides it while frames are shown in the output window
+  ([Switches](startup-runtime.md#switches)). Keyboard input to the title after the hide is not
+  measured. Otherwise, minimise it to see the output.
 
 Known cost under Wine: one section per 64 KiB physical page
 (`src/xmem_mapped_pages.cpp`) is slow there. A request for about 100,000 pages did not finish

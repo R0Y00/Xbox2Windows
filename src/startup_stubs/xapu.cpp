@@ -10,7 +10,9 @@
 
 // Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the audio command queue; otherwise they trap. Call shapes observed:
-//   XApuConnect(input*, output*, handle*) -> HRESULT (the handle is later passed to the others)
+//   XApuConnect(input*, output*, handle*) -> HRESULT (the handle is later passed to the others). In one
+//     title's calls, the caller reads one pointer from output +0 and its later decode commands point into that
+//     buffer; the size is taken from the u32 at input +0x0C (0x104000 there). Not traced to every consumer.
 //   XApuGetResultCount(handle, 0) -> count
 //   XApuDequeueResult(handle, result*) -> HRESULT; zeroes 0x58 bytes. With the experimental
 //     X2W_XAPU_TYPED_COMPLETIONS=1, also echoes the command type at +0 and slot at +4.
@@ -22,10 +24,12 @@ constexpr long hr_ok = 0;
 constexpr long hr_pointer = static_cast<long>(0x80004003);  // E_POINTER
 constexpr long hr_handle = static_cast<long>(0x80070006);   // E_HANDLE
 constexpr long hr_out_of_memory = static_cast<long>(0x8007000E); // E_OUTOFMEMORY
+constexpr long hr_invalid_arg = static_cast<long>(0x80070057);  // E_INVALIDARG
 constexpr long hr_pending_results = static_cast<long>(0x8AC81001); // XAPU_E_PENDING_RESULTS
 constexpr std::size_t command_header_size = 8;
 constexpr std::size_t result_size = 0x58;
 constexpr std::size_t max_queue_entries = 16384;  // 128 KiB cap per connection for undrained commands
+constexpr std::uint32_t max_buffer_bytes = 64u << 20;  // sanity cap against a bad size, not a measured limit
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
 
@@ -41,6 +45,7 @@ struct Connection {
     std::size_t head = 0;
     std::size_t count = 0;
     std::size_t capacity = 0;
+    void* buffer = nullptr;  // returned in output +0
 };
 
 SRWLOCK connection_lock = SRWLOCK_INIT;
@@ -106,12 +111,25 @@ extern "C" __declspec(noinline) long XApuConnect(u64 rcx, u64 rdx, u64 r8, u64 r
     char input[3 * 0x18 + 1], output[3 * 0x10 + 1];
     hex(reinterpret_cast<const void*>(rcx), 0x18, input, sizeof(input));
     hex(reinterpret_cast<const void*>(rdx), 0x10, output, sizeof(output));
-    if (!r8 || !x2w_local::writable(reinterpret_cast<const void*>(r8), sizeof(void*))) {
+    if (!r8 || !x2w_local::writable(reinterpret_cast<const void*>(r8), sizeof(void*)) || !rcx ||
+        !x2w_local::readable(reinterpret_cast<const void*>(rcx), 0x10) || !rdx ||
+        !x2w_local::writable(reinterpret_cast<const void*>(rdx), sizeof(void*))) {
         x2w_local::logf("x2w-audio XApuConnect input=[%s] output(before)=[%s] -> E_POINTER", input, output);
         return hr_pointer;
     }
-    auto* conn = new (std::nothrow) Connection;
-    if (!conn) return hr_out_of_memory;
+    std::uint32_t buffer_bytes = 0;
+    std::memcpy(&buffer_bytes, reinterpret_cast<const unsigned char*>(rcx) + 0x0C, sizeof(buffer_bytes));
+    if (buffer_bytes == 0 || buffer_bytes > max_buffer_bytes) {
+        x2w_local::logf("x2w-audio XApuConnect input=[%s] buffer bytes 0x%x -> E_INVALIDARG", input, buffer_bytes);
+        return hr_invalid_arg;
+    }
+    void* buffer = VirtualAlloc(nullptr, buffer_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    auto* conn = buffer ? new (std::nothrow) Connection : nullptr;
+    if (!conn) {
+        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
+        return hr_out_of_memory;
+    }
+    conn->buffer = buffer;
     AcquireSRWLockExclusive(&connection_lock);
     const u64 handle = next_handle++;
     if (next_handle == 0) next_handle = 0x5841500000000001ULL;
@@ -125,9 +143,10 @@ extern "C" __declspec(noinline) long XApuConnect(u64 rcx, u64 rdx, u64 r8, u64 r
         if (!timer_active) x2w_local::logf("x2w-audio 1 ms mixer timer request unavailable");
     }
     ReleaseSRWLockExclusive(&connection_lock);
+    *reinterpret_cast<void**>(rdx) = buffer;
     *reinterpret_cast<void**>(r8) = reinterpret_cast<void*>(handle);
-    x2w_local::logf("x2w-audio XApuConnect input=[%s] output(before)=[%s] -> handle %p, S_OK", input, output,
-                    reinterpret_cast<void*>(handle));
+    x2w_local::logf("x2w-audio XApuConnect input=[%s] output(before)=[%s] -> handle %p, buffer %p (0x%x bytes), S_OK",
+                    input, output, reinterpret_cast<void*>(handle), buffer, buffer_bytes);
     return hr_ok;
 }
 
@@ -233,6 +252,7 @@ extern "C" __declspec(noinline) long XApuDisconnect(u64 rcx, u64 rdx, u64 r8, u6
         x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> E_HANDLE", rcx);
         return hr_handle;
     }
+    VirtualFree(conn->buffer, 0, MEM_RELEASE);
     delete[] conn->entries;
     delete conn;
     x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> S_OK", rcx);

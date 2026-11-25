@@ -86,6 +86,25 @@ FAKE_USER_WARNING = (
     "Without -FakeUser, user API calls go to the host gaming runtime (docs/startup-runtime.md)."
 )
 FAKE_USER_WARN_LINE = f'Write-Warning "{FAKE_USER_WARNING}"'
+WARNING_PROBE = "x2w warning prefix probe"
+WARNING_PREFIXES = {}
+
+
+def warning_prefix(shell, env):
+    """Return the prefix this shell puts before a Write-Warning message, such as "WARNING: ".
+
+    PowerShell localizes the prefix with the host's UI language ("ADVERTENCIA: " on Spanish
+    Windows), so it is read from the shell under test with the same environment as run.ps1.
+    """
+    if shell not in WARNING_PREFIXES:
+        out = subprocess.run([shell, "-NoProfile", "-Command", f"Write-Warning '{WARNING_PROBE}'"],
+                             env=env, capture_output=True, text=True, errors="replace", timeout=60)
+        lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+        if len(lines) != 1 or not lines[0].endswith(WARNING_PROBE) or lines[0] == WARNING_PROBE:
+            raise SystemExit(f"{shell}: cannot read the Write-Warning prefix from {lines!r} "
+                             f"(stderr: {out.stderr.strip()!r})")
+        WARNING_PREFIXES[shell] = lines[0][:-len(WARNING_PROBE)]
+    return WARNING_PREFIXES[shell]
 
 
 def decode(raw):
@@ -154,7 +173,7 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
     want_output = STUB_LINES[:HEAD_LINES]
     if not fake_user_env and "-FakeUser" not in switches:
-        want_output = [f"WARNING: {FAKE_USER_WARNING}", *want_output]
+        want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
     if printed != want_output:
         found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
                      f"(stderr: {error_text!r})")
@@ -254,6 +273,9 @@ def mutants_of(script):
         "fixed exit 2": ["exit 2" if is_exit(line) else line for line in lines],
         "exit before the log head": early,
         "no FakeUser warning": no_fake_warn,
+        # The same text without the warning prefix: the run must still see Write-Warning's prefix.
+        "FakeUser warning printed with Write-Host": [
+            line.replace(FAKE_USER_WARN_LINE, f'Write-Host "{FAKE_USER_WARNING}"') for line in lines],
     }
     return {name: None if mutant == lines else "\n".join(mutant) + "\n" for name, mutant in mutants.items()}
 

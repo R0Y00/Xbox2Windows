@@ -170,6 +170,9 @@ def check():
                     for pc, text in decoded], 2, "Unproven runtime geometry word")
     expect_refusal([(pc, "s_branch -1" if text == "s_cbranch_scc0 1" else text)
                     for pc, text in decoded], 2, "Expected a forward mesh branch")
+    # LLVM 15 prints a negative branch SIMM16 unsigned: s_branch 65535 is the same back-edge.
+    expect_refusal([(pc, "s_branch 65535" if text == "s_cbranch_scc0 1" else text)
+                    for pc, text in decoded], 2, "Expected a forward mesh branch")
     expect_refusal(decoded, 1, "Geometry read outside binding")
     expect_refusal(decoded, 2, "Conflicting mesh counts", limits=(3, 1))
     with patch("mesh_dynamic_aot.MAX_VARIANTS", 1):
