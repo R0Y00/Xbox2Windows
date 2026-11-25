@@ -27,11 +27,16 @@ RWByteAddressBuffer converted : register(u0);
 
 [numthreads(1, 1, 1)]
 void convert() {
-    uint4 args = source.Load4(0);
+    // Four scalar loads: the title's draw record may sit at any 4-byte offset, and a 16-byte vector load from such an
+    // address is not valid on every GPU (an Intel Gen9 draws nothing from it).
+    uint4 args = uint4(source.Load(0), source.Load(4), source.Load(8), source.Load(12));
     uint rectangles = args.x / 3;
     // 0x2AAAAAAA * 6 is the largest product below 2^32.
     uint vertices = rectangles > 0x2AAAAAAAu ? 0 : rectangles * 6;
-    converted.Store4(0, uint4(vertices, args.y, args.z, args.w));
+    converted.Store(0, vertices);
+    converted.Store(4, args.y);
+    converted.Store(8, args.z);
+    converted.Store(12, args.w);
 }
 )";
 
