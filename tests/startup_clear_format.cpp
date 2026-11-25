@@ -4,8 +4,10 @@
 //
 //   startup_clear_format <warp|hardware>     (X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_RENDER=1 X2W_D3D12_DEBUG=1)
 //
-// Both creations must return success and an object. Then the debug layer's stored messages are read: none may
-// be an error, and none may carry id 816 or 817. When the debug layer is not installed the creations are still
+// Both creations must return success and an object. The debug layer's stored messages are read right after
+// each creation (slot 27 clears the shared queue): none may be an error, and none may carry id 816 or 817.
+// A negative control first sends the unmapped clear value to desktop D3D12 and requires it to be rejected with
+// a message (exit 14 otherwise), so the checks can fail on the defect. When the debug layer is not installed the creations are still
 // checked and the test reports a skip (77) for the message part.
 //
 // Exit codes: 0 pass, 77 no physical adapter or no debug layer, other values name the failing step.
@@ -79,6 +81,47 @@ int main(int argc, char** argv)
     clear.Format = static_cast<DXGI_FORMAT>(console_d16_s8);
     clear.DepthStencil.Depth = 1.0f;
 
+    // Reads and clears the stored debug layer messages. Every call site runs right after the creation it
+    // checks: a later device call clears the shared queue, which would hide the messages of an earlier one.
+    struct Messages { UINT64 errors = 0, clear_value = 0; };
+    const auto drain = [&](const char* step) {
+        Messages seen;
+        for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
+            SIZE_T bytes = 0;
+            if (FAILED(info->GetMessage(i, nullptr, &bytes))) continue;
+            std::vector<char> storage(bytes);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            if (FAILED(info->GetMessage(i, message, &bytes))) continue;
+            if (static_cast<int>(message->ID) == 816 || static_cast<int>(message->ID) == 817) ++seen.clear_value;
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                ++seen.errors;
+                std::printf("debug layer %d (%s): %.*s\n", static_cast<int>(message->ID), step,
+                            static_cast<int>(message->DescriptionByteLength), message->pDescription);
+            }
+        }
+        info->ClearStoredMessages();
+        std::printf("%s: clear value messages (816, 817): %llu, debug layer errors: %llu\n", step,
+                    static_cast<unsigned long long>(seen.clear_value), static_cast<unsigned long long>(seen.errors));
+        return seen;
+    };
+
+    // Negative control: the same clear value, unmapped (console format 118), sent straight to desktop D3D12 must
+    // be refused and leave debug layer messages, so the checks below can fail on exactly this defect. Without
+    // it, a mapping that is removed could still pass through the creation retry without a clear value.
+    if (has_layer) {
+        D3D12_RESOURCE_DESC mapped_desc = depth_desc;
+        mapped_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        const D3D12_HEAP_PROPERTIES control_props{D3D12_HEAP_TYPE_DEFAULT};
+        ComPtr<ID3D12Resource> control;
+        const HRESULT control_hr = desktop->CreateCommittedResource(&control_props, D3D12_HEAP_FLAG_NONE, &mapped_desc,
+                                                                    D3D12_RESOURCE_STATE_COMMON, &clear, IID_PPV_ARGS(&control));
+        const Messages control_seen = drain("negative control (unmapped clear value)");
+        if (SUCCEEDED(control_hr) || (control_seen.clear_value == 0 && control_seen.errors == 0)) {
+            std::printf("negative control: an unmapped clear value was not rejected with a message\n");
+            return 14;
+        }
+    }
+
     // Slot 133, placed on title memory: a texture is a committed stand-in.
     static std::array<std::uint8_t, 65536 + 4096> memory{};
     const Word address = (reinterpret_cast<Word>(memory.data()) + 0xffff) & ~Word{0xffff};
@@ -87,6 +130,9 @@ int main(int argc, char** argv)
                    arg(&placed))) || !placed)
         return 10;
     std::printf("slot 133: depth texture with a clear value created\n");
+    // Inspect right now: the slot 27 call below clears the shared queue before it could be read.
+    Messages slot133;
+    if (has_layer) slot133 = drain("slot 133");
 
     // Slot 27, desktop order (props, flags, desc, state, clear, riid, ppv).
     const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
@@ -101,22 +147,7 @@ int main(int argc, char** argv)
         std::printf("debug layer not installed: message check skipped\n");
         return 77;
     }
-    UINT64 errors = 0, clear_value_messages = 0;
-    for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
-        SIZE_T bytes = 0;
-        if (FAILED(info->GetMessage(i, nullptr, &bytes))) continue;
-        std::vector<char> storage(bytes);
-        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-        if (FAILED(info->GetMessage(i, message, &bytes))) continue;
-        if (static_cast<int>(message->ID) == 816 || static_cast<int>(message->ID) == 817) ++clear_value_messages;
-        if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
-            ++errors;
-            std::printf("debug layer %d: %.*s\n", static_cast<int>(message->ID), static_cast<int>(message->DescriptionByteLength),
-                        message->pDescription);
-        }
-    }
-    std::printf("clear value messages (816, 817): %llu, debug layer errors: %llu\n",
-                static_cast<unsigned long long>(clear_value_messages), static_cast<unsigned long long>(errors));
-    if (clear_value_messages) return 13;
-    return errors == 0 ? 0 : 70;
+    const Messages slot27 = drain("slot 27");
+    if (slot133.clear_value || slot27.clear_value) return 13;
+    return slot133.errors + slot27.errors == 0 ? 0 : 70;
 }
