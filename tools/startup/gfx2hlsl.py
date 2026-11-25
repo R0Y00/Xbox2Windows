@@ -3471,6 +3471,11 @@ class ComputePipeline(Pipeline):
             raise Unsupported('descriptor %s used for a load and a store' % (key,))
         return 'u%d' % self.uavs.setdefault(key, len(self.uavs))
 
+    def stored_images(self):
+        # self.uavs here maps buffer descriptors to u indices (declared and listed by common() and manifest()
+        # below); the pixel-stage image stores that Pipeline.stored_images lists do not occur in a compute program.
+        return {}
+
     def common(self):
         out = [line for line in super().common() if self.uds or not line.startswith('cbuffer entry')]
         return out + ['RWByteAddressBuffer u%d : register(u%d);' % (i, i) for i in sorted(self.uavs.values())]
