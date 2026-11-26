@@ -279,6 +279,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_hi_msad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_pk_int16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_null_check.py
+./out/pe-env/bin/python -B tests/startup_compute_global_load_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support
