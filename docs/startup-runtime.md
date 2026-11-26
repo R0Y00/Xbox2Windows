@@ -2227,6 +2227,12 @@ These are measured on one executable; treat them as hypotheses for others.
   ([the note](experiments/startup-gfx2hlsl-wave-reduce.md)). Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_wave_reduce"`.
   [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
+- **First active lane.** In a straight-line pixel stage whose EXEC is still the entry mask, without `s_wqm`,
+  `s_ff1_i32_b32 sD, exec_lo` followed by `v_readlane_b32 sX, vY, sD` becomes `WaveReadLaneFirst(vY)` over the active
+  lanes of the desktop wave. This follows the packing contract of the wave reductions. `sD` has no run-time value,
+  and any other read of it is refused ([the note](experiments/startup-gfx2hlsl-pixel-first-lane.md)). Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_pixel_first_lane"`.
+  [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path

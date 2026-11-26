@@ -7788,7 +7788,8 @@ class Stage:
     def op_s_ff1_i32_b32(self, ops, mods):
         """Find first set bit in a 32-bit scalar; SCC unchanged (#2022 Item F).
 
-        The compute-entry special case on `exec_lo` still folds to lane 0. Every other accepted
+        The compute-entry special case on `exec_lo` still folds to lane 0; in a pixel stage `exec_lo` is the
+        first active lane for a later v_readlane_b32 (first_active_lane). Every other accepted
         source uses `firstbitlow` (0xffffffff when the word is zero), matching `pixel_aot`.
         """
         if mods or len(ops) != 2:
@@ -7797,6 +7798,9 @@ class Stage:
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
             raise Unsupported('s_ff1_i32_b32 destination %s' % ops[0])
         if ops[1] == 'exec_lo':
+            if self.kind == 'ps':
+                self.first_active_lane(dst[1])
+                return None
             if self.kind != 'cs':
                 raise Unsupported('s_ff1_i32_b32 of exec_lo outside compute')
             if getattr(self, 'past_entry', False) or not getattr(self, 'exec_known', False):
@@ -8395,9 +8399,65 @@ class Stage:
         if value is not None:
             self.emit('sp%d_%d = %s;' % (n, lane, value))
 
+    # The first active lane of a pixel stage (#2618, the F rows). `s_ff1_i32_b32 sD, exec_lo` gives the index of the
+    # lowest lane in EXEC (RDNA 2 ISA, S_FF1_I32_B32) and `v_readlane_b32 sX, vY, sD` copies vY from that lane, so the
+    # pair reads vY from the first active lane. The console packs pixels into waves in its own way, so a correct
+    # program cannot depend on which pixel that is (the contract of the #2835 wave reductions), and the pair becomes
+    # WaveReadLaneFirst(vY) over the active lanes of the desktop wave. The lane number itself means nothing on the
+    # desktop, so sD is a symbol with no run-time value and every other read of it is refused. Accepted only where the
+    # one-lane model holds the whole wave's EXEC: a straight-line pixel stage whose EXEC is the entry mask at the
+    # s_ff1 and at each readlane, without s_wqm (helper lanes are then out of EXEC on the console, as they are out of
+    # desktop wave operations). The decoder prints wave32 syntax, and in wave64 exec_lo is half the wave (an empty
+    # low half gives -1, which v_readlane reads as lane 63), so a program that names exec_hi or the 64-bit exec is
+    # refused.
+    def first_active_lane(self, n):
+        what = 's_ff1_i32_b32 s%d, exec_lo in a pixel stage' % n
+        if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
+            raise Unsupported('%s with branches: only straight-line pixel stages are lowered' % what)
+        if not getattr(self, 'exec_known', False):
+            raise Unsupported('%s: EXEC is not the entry mask' % what)
+        if getattr(self, 'wqm_exec', False):
+            raise Unsupported('%s after s_wqm exec, exec: the first lane may be a helper lane' % what)
+        ins = self.ins
+        if any('exec_hi' in scalar_tokens(' '.join(parse(asm)[1])) for _o, _n, _name, asm in ins):
+            raise Unsupported('%s of a program that names exec_hi or the 64-bit exec (in wave64, exec_lo is half the '
+                              'wave)' % what)
+        index = next(i for i, item in enumerate(ins) if item[0] == self.pc)
+        key = 's%d' % n
+        for _off, _n, name, asm in ins[index + 1:]:
+            reads, writes, may = scalar_effects(name, asm)
+            ops = parse(asm)[1]
+            if key in reads and not (re.sub(r'_e(32|64)$', '', name) == 'v_readlane_b32' and len(ops) == 3 and
+                                     ops[2] == key):
+                raise Unsupported('%s: %s reads the lane number as data (the desktop numbers its lanes in its own '
+                                  'way); only the lane select of v_readlane_b32 is lowered' % (what, asm))
+            if key in writes or key in may:
+                break
+        self.set_s(n, 'WaveReadLaneFirst(WaveGetLaneIndex())', sym=('first_lane',))
+
+    def read_first_lane(self, ops, mods):
+        """v_readlane_b32 sX, vY, sD with sD from first_active_lane: WaveReadLaneFirst(vY)."""
+        what = 'v_readlane_b32 %s of the first active lane' % ', '.join(ops)
+        dst, src = reg_range(ops[0]), reg_range(ops[1])
+        if mods:
+            raise Unsupported('%s with %s' % (what, ' '.join(mods)))
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105 or src[1] != src[2] or src[1] > 255:
+            raise Unsupported('%s: expected one SGPR destination and one VGPR' % what)
+        if not getattr(self, 'exec_known', False) or getattr(self, 'wqm_exec', False):
+            raise Unsupported('%s: EXEC is no longer the entry mask of the s_ff1_i32_b32' % what)
+        for _o, _n, name, asm in self.ins:
+            other = parse(asm)[1]
+            if re.sub(r'_e(32|64)$', '', name) == 'v_writelane_b32' and other and reg_range(other[0]) == src:
+                raise Unsupported('%s: v%d is a lane spill written by v_writelane_b32' % (what, src[1]))
+        self.set_s(dst[1], 'WaveReadLaneFirst(%s)' % self.u(ops[1]), uniform=False)
+
     def op_v_readlane_b32(self, ops, mods):
         if len(ops) != 3 or reg_range(ops[1]) is None or reg_range(ops[1])[0] != 'v':
             raise Unsupported('v_readlane_b32 requires a VGPR source')
+        lane = reg_range(ops[2])
+        if lane and lane[0] == 's' and lane[1] == lane[2] and getattr(self, 'sym', {}).get(lane[1]) == ('first_lane',):
+            self.read_first_lane(ops, mods)
+            return
         n, dst, lane = self.spill_operands('v_readlane_b32', ops, mods)
         if getattr(self, 'has_branches', False):
             sym, uniform, proven, mask = self.spill_join(n, lane)
