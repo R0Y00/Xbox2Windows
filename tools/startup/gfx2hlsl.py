@@ -7186,7 +7186,7 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute FP32, a full 2D-array texel.
+        """Write a full 2D texel or, for compute, a full 2D-array texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
@@ -7216,8 +7216,6 @@ class Stage:
         array = dims[0] == 'SQ_RSRC_IMG_2D_ARRAY'
         if dims[0] != 'SQ_RSRC_IMG_2D' and (not array or self.kind != 'cs'):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
-        if array and d16:
-            raise Unsupported('compute image_store d16 requires a 2D image')
         try:
             mask = int(masks[0], 0)
         except ValueError:
