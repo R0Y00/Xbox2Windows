@@ -104,9 +104,13 @@ def vertex_red(words):
     return mesh[:at] + words.split() + mesh[at:]
 
 
-def masked_vertex_red():
-    mesh = vertex_red('7e0e02f0 7d880086 be94246a bf880002 7e0e02f2 bf820001 bf800000 '
-                      '8afe7e14 7e0e0280 befe04c1')
+MASKED_IF_ELSE = '7e0e02f0 7d880086 be94246a bf880002 7e0e02f2 bf820001 bf800000 8afe7e14 7e0e0280 befe04c1'
+# The same if/else with s_add_u32 s50, s13, 1 in the then arm. No path reads s50 after the join.
+MASKED_DEAD_SCALAR = '7e0e02f0 7d880086 be94246a bf880003 7e0e02f2 8032810d bf820001 bf800000 8afe7e14 7e0e0280 befe04c1'
+
+
+def masked_vertex_red(words=MASKED_IF_ELSE):
+    mesh = vertex_red(words)
     at = mesh.index('f80008cf')
     return mesh[:at] + ['bf880004'] + mesh[at:]  # s_cbranch_execz skips both vertex exports
 
@@ -152,6 +156,8 @@ BRANCH_CASES = (
     # v_mov v7, 1.0; s_branch .else; .empty: s_nop; .else: s_andn2_b64 exec, s[20:21], exec
     # v_mov v7, 0; s_mov_b64 exec, -1
     ('lane-masked if/else', masked_vertex_red(), lambda lane: 255 if lane < 6 else 0),
+    ('lane-masked if/else with a dead scalar write', masked_vertex_red(MASKED_DEAD_SCALAR),
+     lambda lane: 255 if lane < 6 else 0),
 )
 
 COUNT = [i for i, word in enumerate(MESH) if word == 'bf8a0000'][2]
@@ -353,9 +359,6 @@ REFUSALS = (
      count_entry_red('876a8080'), EXCHANGE_BRANCH_REFUSAL),  # s_and_b32 vcc_lo, 0, 0
     ('a scalar load in the count-entry block',
      count_entry_red('f4000a05', 'fa000000'), EXCHANGE_BRANCH_REFUSAL),  # s_load_dword s40, s[10:11], 0
-    ('dead scalar ALU in a different EXEC-zero block',
-     vertex_red('7e0e02f2 bf880001 ' + DEAD_SCALAR),
-     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
     ('a v_cmpx in the skipped block',
      mutate('7e0e02f2', '7da8000d', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
     ('an EXEC-zero branch over the count exchange',
@@ -432,9 +435,6 @@ REFUSALS = (
      'slot 57 mesh: export pos0 is not under exec = -1 narrowed by its output count > thread index'),
     ('a position export after joining different EXEC masks', joined_vertex_masks(),
      'slot 57 mesh: export pos0 is not under exec = -1 narrowed by its output count > thread index'),
-    # s_mov_b32 s40, 1 replaces the then-arm v_mov inside the s_cbranch_execz range.
-    ('an EXEC-zero branch that skips a scalar write', mutate('7e0e02f2', 'bea80381', mesh=masked_vertex_red()),
-     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
     ('EXEC-zero skips a scalar memory load', vertex_red(SHIFT_WORDS.replace('8f2881ff 1fc00000', 'f4000a00 fa000000')),
      'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
     ('a shift with a mask from an unproven thread register',
@@ -572,6 +572,18 @@ def controls():
                    ('wave_any = (tid & ~63u) < ' in text, 'pc = (!wave_any) ?' in text), (True, True))
             expect('the scalar buffer read is inside a branched fall-through',
                    bool(re.search(r'\[branch\] if \(pc == \d+\) \{[^}]*s40 = [^\n]*\.Load\(', text)), True)
+        # #2643 kept its dead-scalar rule to the count-entry block. A scalar result that no path reads past the join
+        # is invisible in every other execz block too: lanes that skip never read it, lanes that run it compute the
+        # wave-uniform value. These two shapes were refusal controls of #2643 and translate now.
+        for what, mesh in (
+                ('dead scalar ALU in a different EXEC-zero block', vertex_red('7e0e02f2 bf880001 ' + DEAD_SCALAR)),
+                ('an EXEC-zero branch that skips a dead scalar write',
+                 mutate('7e0e02f2', 'bea80381', mesh=masked_vertex_red()))):
+            expect(what + ' translates', request(tmp, mesh)[1], 'ok')
+        # v_mov_b32 v8, s50 after the full EXEC restore reads the scalar the skipped arm wrote.
+        live = masked_vertex_red(MASKED_DEAD_SCALAR.replace('befe04c1', 'befe04c1 7e100232'))
+        expect('scalar write in a skipped block read after the join', request(tmp, live)[1],
+               'unsupported: ' + WAVE_LOAD_REFUSAL)
         for what, mesh in WAVE_LOAD_REFUSALS + WAVE_BLOCK_REFUSALS:
             expect(what, request(tmp, mesh)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
         for what, mesh in WAVE_LOAD_ACCEPTED:

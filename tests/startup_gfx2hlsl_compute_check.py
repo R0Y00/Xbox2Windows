@@ -4,7 +4,7 @@
   binary <llvm-mc>                                reassemble the fixture sources and compare them with the words below
   dispatch <dxc> <offscreen_check> <warp|hardware>
                                                   translate, compile with DXC cs_6_0, dispatch and compare every word
-  control <swapped-axes|dropped-store|b-offset|c-unpredicated|j-scalar-dropped|h-inner-unpredicated|m-else-unswitched|n-unmasked|o-mask-kept> <dxc> <offscreen_check> <warp|hardware>
+  control <swapped-axes|dropped-store|b-offset|c-unpredicated|j-scalar-dropped|h-inner-unpredicated|m-else-unswitched|n-unmasked|o-mask-kept|s-min-strict|s-borrow-flipped> <dxc> <offscreen_check> <warp|hardware>
                                                   the same dispatch with a mutated translation, which must mismatch
 
 The fixtures are source-built gfx1013 compute programs. The root signature puts two root constants (key, stride)
@@ -564,6 +564,80 @@ WORDS_CARRY = bytes.fromhex(
     '06038abe 80038bbe 05030cf4000000fa 7fc08cbf 07811493 14c21480 80fd1580 81801685'
     ' 0784178f 1702087e 1402107e 1502127e 1602147e 00107ce004080480 000081bf')
 
+
+SCC_EDGES = (0, 0xffffffff, 0x7fffffff, 0x80000000)
+SCC_OPS = ('s_add_u32', 's_sub_u32', 's_add_i32', 's_sub_i32', 's_min_u32', 's_max_u32', 's_min_i32', 's_max_i32')
+
+
+def scc_fixture():
+    """Group (x, y) of the 4 x 4 grid takes S0 = edge[x], S1 = edge[y] (0, -1, INT_MAX, INT_MIN); the runner accepts at most 5 groups per axis. Each s_add/s_sub/s_min/s_max forms is run
+    twice (the destination apart from S0, then the destination that is S0) and its SCC read right after; word 0 of the
+    group holds the 16 SCC bits, word 1 a hash of the 16 results. RDNA 2 ISA: s_add_u32 carry out, s_sub_u32 borrow,
+    s_add_i32 / s_sub_i32 signed overflow, s_min / s_max SCC = (D == S0)."""
+    lines = ['s_mov_b32 s10, s6', 's_mov_b32 s11, 0', 's_load_dwordx8 s[12:19], s[10:11], 0x0', 's_waitcnt lgkmcnt(0)',
+             's_lshl_b32 s24, s8, 2', 's_add_u32 s24, s24, s7', 'v_lshlrev_b32 v4, 3, s24', 's_mov_b32 s22, s7',
+             's_mov_b32 s23, s8']
+    for reg, index in (('s20', 's22'), ('s21', 's23')):
+        lines.append('s_mov_b32 %s, 0' % reg)
+        for n, value in ((1, '-1'), (2, '0x7fffffff'), (3, '0x80000000')):
+            lines += ['s_cmp_eq_u32 %s, %d' % (index, n), 's_cselect_b32 %s, %s, %s' % (reg, value, reg)]
+    lines += ['s_mov_b32 s27, 0', 's_mov_b32 s28, 0']
+    bit = 0
+    for op in SCC_OPS:
+        for dst, init in (('s24', None), ('s26', 's_mov_b32 s26, s20')):
+            lines += ([init] if init else []) + [
+                '%s %s, %s, s21' % (op, dst, dst if init else 's20'), 's_cselect_b32 s25, 1, 0',
+                's_lshl_b32 s25, s25, %d' % bit, 's_or_b32 s27, s27, s25', 's_xor_b32 s28, s28, %s' % dst,
+                's_lshl_b32 s28, s28, 1']
+            bit += 1
+    lines += ['v_mov_b32 v5, s27', 'buffer_store_dword v5, v4, s[16:19], 0 offen', 'v_add_nc_u32 v4, 4, v4',
+              'v_mov_b32 v5, s28', 'buffer_store_dword v5, v4, s[16:19], 0 offen', 's_endpgm']
+    return '\n'.join(lines) + '\n'
+
+
+def scc_reference(a, b):
+    """(SCC bits, result hash) of the fixture for S0 = a, S1 = b, from the ISA rules (no code shared with the translator)."""
+    def signed(x):
+        return x - (1 << 32) if x >> 31 else x
+    bits = hashed = 0
+    for n, op in enumerate(SCC_OPS):
+        for alias in (0, 1):
+            x = a  # the aliased run starts from a copy of S0, which is S0 again
+            if op.endswith('add_u32'):
+                total = x + b
+                result, scc = total & MASK, total > MASK
+            elif op == 's_sub_u32':
+                result, scc = (x - b) & MASK, x < b
+            elif op == 's_add_i32':
+                result = (x + b) & MASK
+                scc = not -(1 << 31) <= signed(x) + signed(b) < (1 << 31)
+            elif op == 's_sub_i32':
+                result = (x - b) & MASK
+                scc = not -(1 << 31) <= signed(x) - signed(b) < (1 << 31)
+            else:
+                view = signed if op.endswith('i32') else (lambda v: v)
+                pick = min if 'min' in op else max
+                result = pick(x, b, key=view)
+                scc = result == x
+            bits |= int(scc) << (2 * n + alias)
+            hashed = ((hashed ^ result) << 1) & MASK
+    return bits, hashed
+
+WORDS_S = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0882188f1807188004001ad583300000070396be080397be800394be'
+    '168106bfc1141485168206bfff141485ffffff7f168306bfff14148500000080800395be178106bfc1151585178206bf'
+    'ff151585ffffff7f178306bfff1515850000008080039bbe80039cbe14151880818019851980198f1b191b881c181c89'
+    '1c811c8f14039abe1a151a80818019851981198f1b191b881c1a1c891c811c8f14159880818019851982198f1b191b88'
+    '1c181c891c811c8f14039abe1a159a80818019851983198f1b191b881c1a1c891c811c8f14151881818019851984198f'
+    '1b191b881c181c891c811c8f14039abe1a151a81818019851985198f1b191b881c1a1c891c811c8f1415988181801985'
+    '1986198f1b191b881c181c891c811c8f14039abe1a159a81818019851987198f1b191b881c1a1c891c811c8f14159883'
+    '818019851988198f1b191b881c181c891c811c8f14039abe1a159a83818019851989198f1b191b881c1a1c891c811c8f'
+    '1415988481801985198a198f1b191b881c181c891c811c8f14039abe1a159a8481801985198b198f1b191b881c1a1c89'
+    '1c811c8f1415188381801985198c198f1b191b881c181c891c811c8f14039abe1a151a8381801985198d198f1b191b88'
+    '1c1a1c891c811c8f1415188481801985198e198f1b191b881c181c891c811c8f14039abe1a151a8481801985198f198f'
+    '1b191b881c1a1c891c811c8f1b020a7e001070e0040504808408084a1c020a7e001070e004050480000081bf'
+)
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -586,6 +660,7 @@ CASES = {
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
     'N': (SOURCE_N, WORDS_N, USER7 | tidig(1), (16, 1, 1), (1, 1, 1)),
+    'S': (scc_fixture(), WORDS_S, USER7 | TGID_X | TGID_Y | tidig(1), (1, 1, 1), (4, 4, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -838,6 +913,10 @@ def expected(name):
         return out
     if name == 'N':
         out[:16] = [input_word(0) ^ input_word(lane) for lane in range(16)]
+        return out
+    if name == 'S':
+        for group in range(16):
+            out[2 * group:2 * group + 2] = scc_reference(SCC_EDGES[group & 3], SCC_EDGES[group >> 2])
         return out
     producer_offsets = {'G': (1, 32), 'G-offset0-only': (31, 0), 'G-offset1-only': (0, 31)}
     if name in producer_offsets:
@@ -1176,6 +1255,37 @@ def splice_words(*chunks, at=STORE_A):
     return WORDS_A[:at] + b''.join(chunks) + WORDS_A[at:]
 
 
+def check_scc_modelled():
+    # s_add / s_sub / s_min / s_max write SCC (carry, borrow, signed overflow, S0 chosen). The lowering used to leave the
+    # emitted SCC as it was, so a later s_cbranch_scc or s_cselect read a stale value. Each form now emits its SCC from
+    # its sources, ahead of the branch.
+    words = {'s_add_u32 s23, s7, -1': '07c11780', 's_sub_u32 s23, s7, 1': '07819780',
+             's_add_i32 s23, s7, 0x7fffffff': '07ff1781ffffff7f', 's_sub_i32 s23, s7, 1': '07819781',
+             's_min_u32 s23, s7, 4': '07849783', 's_max_i32 s23, s7, 4': '07841784', 's_wqm_b32 s23, s7': '070997be',
+             's_cselect_b32 s24, 1, 0': '81801885', 's_cbranch_scc1 1': '010085bf'}
+    SPLICE.update(words)
+    for line, word in words.items():  # the decoder prints each hand-assembled word as its line (literals in hex)
+        (_, _, name, text), = G.decode(bytes.fromhex(word))
+        # the decoder prints a branch with its target label and a -1 literal in hex
+        assert text == line or text == line.replace('-1', '0xffffffff') or (
+            name.startswith('s_cbranch') and text.startswith(name + ' ')), (line, text)
+    for op, scc in (('s_add_u32 s23, s7, -1', 'scc = (s7 + 0xffffffffu) < (s7);'),
+                    ('s_sub_u32 s23, s7, 1', 'scc = (s7) < (0x00000001u);'),
+                    ('s_add_i32 s23, s7, 0x7fffffff',
+                     'scc = (((((s7) ^ (s7 + 0x7fffffffu)) & ((0x7fffffffu) ^ (s7 + 0x7fffffffu))) >> 31) != 0);'),
+                    ('s_sub_i32 s23, s7, 1', 'scc = (((((s7) ^ (0x00000001u)) & ((s7) ^ (s7 - 0x00000001u))) >> 31) != 0);'),
+                    ('s_min_u32 s23, s7, 4', 'scc = ((s7) <= (0x00000004u));'),
+                    ('s_max_i32 s23, s7, 4', 'scc = (int(s7) >= int(0x00000004u));')):
+        text = translate('A', code=splice(op, 's_cbranch_scc1 1', 'v_mov_b32 v3, 0')).hlsl_cs()
+        assert scc in text and text.index(scc) < text.index('pc = (scc)'), (op, text)
+    # A reader whose last SCC writer the lowering still does not model is refused by name (s_wqm is not lowered).
+    refused('scc from an SCC write that is not modelled in s_cbranch_scc1', lambda: translate(
+        'A', code=splice('s_wqm_b32 s23, s7', 's_cbranch_scc1 1', 'v_mov_b32 v3, 0')))
+    refused('scc from an SCC write that is not modelled in s_cselect_b32', lambda: translate(
+        'A', code=splice('s_wqm_b32 s23, s7', 's_cselect_b32 s24, 1, 0')))
+    translate('A', code=splice('s_wqm_b32 s23, s7')).hlsl_cs()  # nothing reads that SCC
+
+
 def check_descriptor_scc():
     # Case A loads the input descriptor into s[12:15] and stores through s[16:19].
     # Read s20's lane bit into the stored value. The SCC branches skip both dwords of the lane select.
@@ -1458,13 +1568,18 @@ def check_controls():
     assert 's21 = (scc ? 1u : 0u);' in carry
     lo, hi, end = (bytes.fromhex(x) for x in ('04051480', '80fd1580', '000081bf'))
     for near_miss in (
-            lo + bytes.fromhex('81809e80') + hi,             # intervening s_sub_u32 writes SCC
-            lo + bytes.fromhex('000080bf') + hi,             # non-adjacent
             bytes.fromhex('010084bf') + lo + hi,             # branch into the high add
-            bytes.fromhex('06811480') + hi,                  # elided descriptor arithmetic
-            lo + bytes.fromhex('81fd1580'),                  # high addend is one
-            lo + bytes.fromhex('80fd1680')):                 # high register is not the next SGPR
+            bytes.fromhex('06811480') + hi):                 # elided descriptor arithmetic
         refused('src_scc', lambda: translate('address-carry', code=near_miss + end))
+    # Every SCC writer is modelled, so src_scc after a plain add reads the carry the add computed, whatever sits between
+    # (an intervening s_sub_u32 writes the borrow) or follows: the add's own carry is emitted ahead of its use.
+    for name, ok in (('s_sub_u32 between', lo + bytes.fromhex('81809e80') + hi),
+                     ('non-adjacent', lo + bytes.fromhex('000080bf') + hi),
+                     ('high addend is one', lo + bytes.fromhex('81fd1580')),
+                     ('high register is not the next SGPR', lo + bytes.fromhex('80fd1680'))):
+        text = translate('address-carry', code=ok + end).hlsl_cs()
+        want = '(0x00000001u) < (0x00000000u)' if name.startswith('s_sub') else '(ud0 + ud1) < (ud0)'
+        assert want in text and text.index(want) < text.index('(scc ? 1u : 0u)'), (name, text)
     refused('lane mask', lambda: translate('address-carry', code=bytes.fromhex('7e811480') + hi + end))
     ff1 = bytes.fromhex('7e1385be')
     end = bytes.fromhex('000081bf')
@@ -1479,6 +1594,7 @@ def check_controls():
     assert expected('A-ff1') != expected('A')
     check_lds()
     check_descriptor_scc()
+    check_scc_modelled()
     check_mbcnt()
     check_lane_mask_data()
     check_lane_mask_high_word()
@@ -1777,6 +1893,7 @@ def check_controls():
     assert translate('M').hlsl_cs().endswith('''\
     if (pc == 1) {
         s22 = s7 * ud1;
+        scc = (s22 + ud0) < (s22);
         s22 = s22 + ud0;
         if (exec & 1) v5 = s22 ^ v3;
         vcc = (exec & ((0x00000003u > v0) ? 1u : 0u));
@@ -2089,6 +2206,10 @@ MBCNT_LANE = '(tid.x + 4u * (tid.y + 2u * tid.z))'
 MBCNT_COUNT = f'countbits(0x85241249u & ((1u << {MBCNT_LANE}) - 1u))'
 CONTROLS = {
     'join-load-zero': ('join-load', 's24 = ul24_7;', 's24 = 0u;'),
+    # s_min_u32 sets SCC when S0 is chosen, equal operands included: a strict compare differs at S0 == S1.
+    's-min-strict': ('S', '(s20) <= (s21)', '(s20) < (s21)'),
+    # s_sub_u32 borrow: the first source is the smaller one.
+    's-borrow-flipped': ('S', '(s20) < (s21);\n    s24 = s20 - s21;', '(s21) < (s20);\n    s24 = s20 - s21;'),
     'swapped-axes': ('A', '    s7 = gid.x;\n    s8 = gid.y;\n', '    s7 = gid.y;\n    s8 = gid.x;\n'),
     'dropped-store': ('A', '    u0.Store(a, v5);\n', ''),
     'b-offset': ('B', '    a = (v4 + 8) & 0xfffffffcu;\n', '    a = (v4 + 0) & 0xfffffffcu;\n'),

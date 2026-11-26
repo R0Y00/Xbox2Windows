@@ -998,6 +998,19 @@ UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
+# Image ops that take implicit derivatives of the pixel quad (see Stage.quad_vote).
+DERIVATIVE_OPS = ('image_sample_b', 'image_get_lod')
+# "Some lane of the 2x2 quad has bit 0 set": fine derivatives of a 0/1 value read the row neighbour (ddx_fine), then
+# the other row (ddy_fine). Exact for 0/1 and defined only where the quad runs the statement together (SM 5.0 and 6.0).
+# The derivatives are arithmetic operands, not operands of a short-circuit ||: a DXC build for some GPUs moved a derivative
+# under the condition of an ||, where only some lanes ran it (measured on a hardware adapter).
+QUAD_ANY_HLSL = [
+    'bool x2w_quad_any(uint bit) {',
+    '    float lane = (bit & 1u) != 0u ? 1.0 : 0.0;',
+    '    float row = (lane + abs(ddx_fine(lane)) != 0.0) ? 1.0 : 0.0;',
+    '    return row + abs(ddy_fine(row)) != 0.0;',
+    '}',
+]
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
@@ -1913,6 +1926,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     pending.append(i + 1)
         return False
 
+    def dead_block_scalar(i, join):
+        """Scalar ALU in a skipped block whose results no path reads past the join. Lanes that skip the block per lane
+        never read them, and lanes that run it compute the wave-uniform values the guest computes once per wave."""
+        name, asm = ins[i][2:]
+        if name in MESH_WAVE_BLOCK_LOADS or not name.startswith('s_') or not mesh_wave_block_scalar(name, asm):
+            return False
+        _, must, may = scalar_effects(name, asm)
+        return not any(live_at_join(reg, join) for reg in must | may)
+
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
@@ -1968,7 +1990,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 if not (no_effect(i) or name == 'exp'
                         or (name == 's_branch' and edges[i] >= target
                             and all(no_effect(k) for k in range(target, edges[i])))
-                        or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))):
+                        or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))
+                        or dead_block_scalar(i, target)):
                     raise Unsupported(execz_effects)
         elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
             raise Unsupported('slot 57 mesh: a branch bypasses an export')
@@ -3438,6 +3461,11 @@ class Stage:
             splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
+        # A pixel program with an implicit-derivative op and no backward branch decides its EXEC branches per quad
+        # (quad vote): see Stage.quad_vote. Loops keep the rules of the back-edge proof below.
+        self.quad_exec = getattr(self, 'kind', None) == 'ps' and not any(t <= pc for pc, t in branches) and any(
+            name in DERIVATIVE_OPS for _off, _n, name, _asm in self.ins)
+        self.uses_quad_vote = False
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.loads_after_exec_write = set()
         if (back_targets and getattr(self, 'kind', None) == 'cs' and
@@ -3489,10 +3517,14 @@ class Stage:
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
+            self.wqm_count, self.execcopy_epoch = 0, {}
+            self.helper_restore = False
             # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
             self.uniform_cf = True
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
+            self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
+            self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.mask_high = set()
@@ -3725,6 +3757,15 @@ class Stage:
                             cond_uniform = True
                         if cond_uniform:
                             self.uniform_branches.add(off)
+                        elif (cond in ('execz', 'execnz') and self.quad_exec and not self.exec_known
+                                and self.uniform_cf and not self.lane_exec_breaks
+                                and self.skipped_block_vector_only(off, int(parse(asm)[1][0].split('_')[1], 16))):
+                            # Decided per quad (x2w_quad_any): every lane of a quad takes it together, so it parts no
+                            # quad and the derivative ops after it still see their four lanes. It reads the quad, so it
+                            # is only taken while the control flow so far is quad-uniform and every lane's EXEC bit
+                            # still follows the guest's.
+                            self.voted_branches.add(off)
+                            cond_uniform = True
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
@@ -3767,6 +3808,10 @@ class Stage:
                     continue
                 # A write proves the mark again: every path from here on runs it. s_movreld can write any SGPR.
                 self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
+                if not self.scc_effect and ('scc' in scalar_effects(name, asm)[1] or name.startswith(('s_wqm', 's_quadmask'))):
+                    # The guest wrote SCC and the lowering emitted nothing for it: a later reader would see an older
+                    # value (descriptor_scc_reads follows every path from here to the reader).
+                    self.scc_effect = 'an SCC write that is not modelled'
                 if self.scc_effect:
                     scc_effects[off] = self.scc_effect
                 if self.scc_effect or not self.scc_verified:
@@ -3947,6 +3992,124 @@ class Stage:
 
     def pc_index(self):
         return next((i for i, ins in enumerate(self.ins) if ins[0] == self.pc), None)
+
+    def helper_off_copy(self, tok, sym):
+        """Whether `tok` is a copy of EXEC saved before an `s_wqm_b64 exec, exec`: the guest's entry EXEC leaves the
+        helper lanes off, while every thread here starts with exec = 1, so writing it back would turn the guest's helper
+        lanes off (stale VGPRs) and keep the translation's on."""
+        r = reg_range(tok)
+        return bool(r and r[0] == 's' and sym == ('execcopy',)
+                    and getattr(self, 'execcopy_epoch', {}).get(r[1], 0) < getattr(self, 'wqm_count', 0))
+
+    def exec_write_exact(self, srcs, syms):
+        """Whether a scalar EXEC write takes every source from a lane mask (vcc, exec, a saved EXEC or a tagged mask) or
+        from the all-zero / all-ones constants: then each lane's bit is the guest's. Any other source (a mask built
+        from a number such as 1) selects guest lanes the one-lane model cannot tell apart."""
+        for tok, sym in zip(srcs, syms):
+            r = reg_range(tok)
+            if self.helper_off_copy(tok, sym):
+                return False
+            # The 64-bit forms only (see also the exec_lo destination at the call site): in wave64 a 32-bit write
+            # (s_mov_b32 exec_lo, vcc_lo) keeps the old bits of lanes 32..63, while the model sets every lane.
+            if tok in ('exec', 'vcc') or sym == ('execcopy',) or (
+                    r and r[0] == 's' and r[1] in getattr(self, 'masks', ())):
+                continue
+            try:
+                if int(tok, 0) in (0, -1, 0xffffffff, 0xffffffffffffffff):
+                    continue
+            except ValueError:
+                pass
+            return False
+        return True
+
+    def skipped_block_vector_only(self, branch, target):
+        """Whether the instructions a forward EXEC branch can skip are per-lane vector work only.
+
+        The guest takes the branch once for the whole wave, so a scalar write, a mask write or a branch inside the block
+        happens once for the wave when any quad takes the block. A quad that votes to skip it would miss that effect while
+        a later read in the same wave sees it. Only vector ALU/memory/export instructions and waits, which each lane
+        applies to its own registers, are allowed between the branch and its target; s_endpgm too (a quad that ends
+        reads nothing later)."""
+        if target <= branch:
+            return False
+        for off, _n, name, asm in self.ins:
+            if not branch < off < target:
+                continue
+            if name == 's_endpgm':
+                # A quad that ends reads nothing later, unless later code can turn it back on: an EXEC write after the
+                # branch (a restore of a saved mask) would reactivate every quad of the guest wave.
+                if any(o > branch and writes_exec(n, parse(a)[1]) for o, _s, n, a in self.ins):
+                    return False
+                continue
+            if not (self.vector_only_instruction(name, asm)
+                    or name.startswith(('image_', 'buffer_', 'tbuffer_', 'global_', 'flat_', 'exp'))
+                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt')):
+                return False
+        return True
+
+    @staticmethod
+    def vector_only_instruction(name, asm):
+        """A vector ALU instruction whose only destination is a VGPR: no SGPR, VCC or EXEC write (a carry-out, a compare,
+        a readlane), which the guest performs once for the whole wave."""
+        if not name.startswith('v_') or name.startswith(('v_cmp', 'v_readlane', 'v_readfirstlane', 'v_writelane',
+                                                         'v_div_scale', 'v_mad_u64', 'v_mad_i64')):
+            return False
+        if re.match(r'v_(add|sub|subrev)_co|v_addc|v_subb', name):
+            return False
+        for tok in destinations(name, parse(asm)[1]):
+            r = reg_range(tok)
+            if tok in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0') or (r and r[0] == 's'):
+                return False
+        return True
+
+    def uniform_bias(self, tok):
+        """Whether a VGPR holds one value in every lane at the op: its last earlier write is a v_mov_b32 of a constant
+        that every lane ran (no EXEC write and no branch before it, so no lane skipped it and the other lanes keep an
+        older value). No backward branch exists in a quad program, so later writes cannot reach the op."""
+        r = reg_range(tok)
+        if not r or r[0] != 'v' or r[1] != r[2]:
+            return False
+        last = None
+        for off, _n, name, asm in self.ins:
+            if off >= self.pc:
+                break
+            ops = parse(asm)[1]
+            first = reg_range(ops[0]) if ops else None
+            if first and first[0] == 'v' and first[1] <= r[1] <= first[2]:
+                const = (re.sub(r'_e(32|64)$', '', name) == 'v_mov_b32' and len(ops) == 2 and not reg_range(ops[1]))
+                last = off if const else None
+        if last is None:
+            return False
+        narrowed = 0
+        for off, _n, name, asm in self.ins:
+            if off >= last:
+                break
+            base = re.sub(r'_e(32|64)$', '', name)
+            ops = parse(asm)[1]
+            if name.startswith('s_cbranch') or name == 's_branch':
+                target = int(ops[0].split('_')[1], 16) if '_' in ops[0] else None
+                if target is None or target > last:
+                    return False  # the write can be skipped by some lanes
+            elif base in ('s_or_b64', 's_or_b32') and ops[:2] in (['exec', 'exec'], ['exec_lo', 'exec_lo']):
+                narrowed = max(narrowed - 1, 0)  # the restore that ends a saveexec region
+            elif base.startswith('s_and_saveexec') or (base.startswith('s_wqm') and ops[:2] not in (['exec', 'exec'], ['exec_lo', 'exec_lo'])):
+                narrowed += 1
+            elif writes_exec(name, ops) and not (base.startswith('s_wqm') and ops[:2] in (['exec', 'exec'], ['exec_lo', 'exec_lo'])):
+                return False
+        return narrowed == 0
+
+    def derivative_exec_ok(self):
+        """Whether an implicit-derivative op may rely on the EXEC the lanes hold here.
+
+        At the entry mask every lane runs the call. Past an EXEC write (v_cmpx, saveexec, a restore) the one-lane
+        model still follows the guest's bit of each lane exactly (EXEC is written per lane, set_v is EXEC guarded),
+        so a quad program (a pixel program with a derivative op and no backward branch) is proven as long as no
+        lane-exec break happened: an s_wqm of a narrowed EXEC (a no-op here, while the guest turns on the lanes of
+        every touched quad) or a discard under an unknown EXEC. The callers also need uniform_cf, which a branch
+        that parts a quad clears; an EXEC branch decided per quad (quad_vote) does not."""
+        # A restored pre-s_wqm mask (helper_restore) is the entry mask, but the guest's helper lanes are off from here.
+        return ((self.exec_known and not getattr(self, 'helper_restore', False))
+                or (getattr(self, 'quad_exec', False) and not getattr(self, 'lane_exec_breaks', None)))
 
     def uniform_source(self, tok):
         r = reg_range(tok)
@@ -4387,8 +4550,13 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
+                self.wqm_count = getattr(self, 'wqm_count', 0) + 1
                 if getattr(self, 'wqm_set_at', False) is None:
                     self.wqm_set_at = getattr(self, 'pc', None)  # where the quad-read flow proof starts
+            elif hasattr(self, 'lane_exec_breaks'):
+                # Any other s_wqm is a no-op here, while the guest turns on the inactive lanes of every touched quad
+                # (or writes a whole-quad mask somewhere): a lane's EXEC bit may be 0 where the guest's is 1.
+                self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if isinstance(self.align4_v, set):
@@ -4446,6 +4614,11 @@ class Stage:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
+            if base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
+                # The wave skips the block only when no lane is active; a quad with an active lane runs it whole, its
+                # other lanes masked (their VGPRs kept for the derivatives, writes guarded by EXEC), as the guest does.
+                self.uses_quad_vote = True
+                cond = ('!' if base.endswith('execz') else '') + 'x2w_quad_any(exec)'
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
@@ -5044,8 +5217,6 @@ class Stage:
             self.set_s(dst[1], '(scc ? 1u : 0u)')
             self.set_scc('false')  # 0 + a single bit never produces another carry.
             return None
-        if base in SCC_UNMODELLED and self.tracks_uniformity() and ops[0] != 'null':
-            self.scc_uniform = False
         pair = base.endswith('_b64')
         srcs = ops[1:]
         # 64-bit operands name the low register; exec/vcc name themselves.
@@ -5204,8 +5375,7 @@ class Stage:
                 raise Unsupported('%s into null on a lane mask' % base)
             if pair:
                 raise Unsupported('%s into null' % base)
-            if base in SCC_UNMODELLED and getattr(self, 'pc', None) not in getattr(self, 'address_carry_pairs', ()):
-                raise Unsupported('%s into null: SCC is not modelled' % base)
+        deferred_scc = None
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
@@ -5221,7 +5391,19 @@ class Stage:
             self.set_scc('(%s) < %s' % (expr, values[0]))
             self.address_carry_reader = self.address_carry_pairs[self.pc]
         elif base in SCC_UNMODELLED:
-            self.scc_verified = False
+            scc_text = add_sub_min_max_scc(base, values[0], values[1], expr)
+            if re.search(r'\bscc\b', scc_text):
+                # An operand is the incoming SCC (src_scc): the destination must read it before this instruction's own
+                # SCC replaces it, so the destination is written first and the SCC after, from sources it did not change.
+                if dname in ('m0', 'exec', 'exec_lo', 'vcc', 'vcc_lo', 'null') or any(
+                        reg_range(t) and dst and reg_range(t)[0] == 's' and dst[1] <= reg_range(t)[1] <= dst[2]
+                        for t in srcs):
+                    raise Unsupported('%s reads src_scc with a destination that is also a source or a special register'
+                                      % base)
+                deferred_scc = scc_text
+            else:
+                # From the sources, before the destination is written (it can be a source).
+                self.set_scc(scc_text)
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
@@ -5237,8 +5419,11 @@ class Stage:
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
             var = dname[:4].rstrip('_') if dname.startswith('exec') else 'vcc'
             if var == 'exec':
-                copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
+                copy = base in ('s_mov_b64', 's_mov_b32') and dname == 'exec' and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
+                    if hasattr(self, 'lane_exec_breaks') and self.helper_off_copy(srcs[0], syms[0]):
+                        self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
+                        self.helper_restore = True
                     # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
                     self.wqm_exec = False  # and the copy can be older than the WQM
                     if hasattr(self, 'uniform_v'):
@@ -5247,6 +5432,10 @@ class Stage:
                         self.align4_v.clear()
                     return None
                 self.exec_known = False
+                if hasattr(self, 'lane_exec_breaks') and (dname == 'exec_lo' or not self.exec_write_exact(srcs, syms)):
+                    # exec = (expr) & 1 writes every pixel and helper lane alike; the guest enables only the lanes the
+                    # source selects, so the lane's EXEC bit may stop following the guest's from here.
+                    self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
             self.emit('%s = (%s) & 1;' % (var, expr))
             if scc:
                 self.set_scc(scc.replace('$', var))
@@ -5300,6 +5489,9 @@ class Stage:
         if base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known:
             self.set_s(d, 'exec')
             self.sym[d] = ('execcopy',)
+            if not hasattr(self, 'execcopy_epoch'):
+                self.execcopy_epoch = {}
+            self.execcopy_epoch[d] = getattr(self, 'wqm_count', 0)   # the s_wqm count when the mask was saved
             self.masks.add(d)
             if pair:
                 self.sym.pop(d + 1, None)
@@ -5317,6 +5509,8 @@ class Stage:
                             self.uniform_source(high_source))
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
         self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
+        if deferred_scc is not None:
+            self.set_scc(deferred_scc)
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
             # Keep the runtime SGPR assignment intact while letting const_words() read inline float patterns
             # such as 0x40000000 (OPAQUE_BLACK, encoded as inline 244 / '2.0').
@@ -6882,12 +7076,16 @@ class Stage:
                 # Elsewhere the plain sample is lowered to level 0, which would drop the bias, so the bias form is
                 # refused instead. A uniform join (scc with scc_uniform) or later loop does not drop the proof
                 # (M200-01 B/L). Divergent EXEC or a vcc/exec-conditioned branch before the sample stays refused.
-                if (self.kind != 'ps' or not self.exec_known or
+                if (self.kind != 'ps' or not self.derivative_exec_ok() or
                         not getattr(self, 'uniform_cf', True)):
                     raise Unsupported('image_sample_b needs implicit derivatives: pixel stage with the entry EXEC '
                                      'mask and wave-uniform control flow')
                 if hasattr(self, 'derivative_sites'):
                     self.derivative_sites.append((self.pc, 'image_sample_b'))
+                if not self.exec_known and not self.uniform_bias(cs[0]):
+                    # Past a divergent EXEC the op is only drawn with one bias for the quad (tests/startup_image_sample_b_
+                    # flow_check.py); a bias that differs per lane (a join of different values) stays refused by name.
+                    raise Unsupported('image_sample_b with a per-lane bias past a divergent EXEC')
                 bias, cs = cs[0], cs[1:]
         if how == 'get_lod':
             # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
@@ -6899,7 +7097,7 @@ class Stage:
             if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
                 raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
             # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
-            if not self.exec_known or not getattr(self, 'uniform_cf', True):
+            if not self.derivative_exec_ok() or not getattr(self, 'uniform_cf', True):
                 raise Unsupported('image_get_lod needs implicit derivatives: pixel stage with the entry EXEC '
                                  'mask and wave-uniform control flow')
             if hasattr(self, 'derivative_sites'):
@@ -7186,7 +7384,7 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute FP32, a full 2D-array texel.
+        """Write a full 2D texel or, for compute, a full 2D-array texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
@@ -7216,8 +7414,6 @@ class Stage:
         array = dims[0] == 'SQ_RSRC_IMG_2D_ARRAY'
         if dims[0] != 'SQ_RSRC_IMG_2D' and (not array or self.kind != 'cs'):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
-        if array and d16:
-            raise Unsupported('compute image_store d16 requires a 2D image')
         try:
             mask = int(masks[0], 0)
         except ValueError:
@@ -8168,8 +8364,10 @@ class Stage:
             if n.startswith('s_cbranch') or n == 's_branch':
                 target = int(ops[0].split('_')[1], 16)
             if target is not None:
-                if target <= off:
-                    raise Unsupported('a backward branch in a program with v_interp_p1ll_f16 / v_interp_p2_f16')
+                # A backward branch needs no refusal of its own: every branch instruction is a boundary below, where
+                # the scan requires that no p1ll result is pending, no p2 result is stale and no destination has an
+                # undefined upper half. Nothing the scan tracks therefore travels along a back edge, and the loop head
+                # (also a boundary, entered with the same empty state) starts clean on every iteration.
                 targets.add(target)
 
         def regs(tok):
@@ -8927,6 +9125,8 @@ class Stage:
                               % next(f for f in flags if f.startswith('en:'))[3:])
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+            if hasattr(self, 'lane_exec_breaks'):
+                self.lane_exec_breaks.append((self.pc, 'a discard'))
         if target == 'null':
             return None  # the null target writes no render target; its only effect is the vm discard above
         if target == 'mrtz':
@@ -9253,6 +9453,22 @@ VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
 # trusting it.
 SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
                             's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
+
+
+def add_sub_min_max_scc(base, a, b, result):
+    """The SCC expression of s_add/s_sub/s_min/s_max_{i,u}32 over the source texts a and b and the result text.
+    s_add_u32: carry out; s_sub_u32: borrow (S0 < S1); s_add_i32 / s_sub_i32: signed overflow (the sign of the result
+    differs from the sign the operands imply); s_min / s_max: SCC = (D == S0), the first source was chosen."""
+    if base == 's_add_u32':
+        return '(%s) < (%s)' % (result, a)
+    if base == 's_sub_u32':
+        return '(%s) < (%s)' % (a, b)
+    if base == 's_add_i32':
+        return '(((((%s) ^ (%s)) & ((%s) ^ (%s))) >> 31) != 0)' % (a, result, b, result)
+    if base == 's_sub_i32':
+        return '(((((%s) ^ (%s)) & ((%s) ^ (%s))) >> 31) != 0)' % (a, b, a, result)
+    cast = 'int' if base.endswith('_i32') else ''
+    return '(%s(%s) %s %s(%s))' % (cast, a, '<=' if base.startswith('s_min') else '>=', cast, b)
 
 PACK_B16 = frozenset(('s_pack_ll_b32_b16', 's_pack_lh_b32_b16', 's_pack_hh_b32_b16'))
 SCA = {
@@ -10015,7 +10231,8 @@ class Pipeline:
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
         depth = 'depth' in s.exports
-        out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};']
+        quad = QUAD_ANY_HLSL if getattr(s, 'uses_quad_vote', False) else []
+        out = self.common() + quad + ['struct PSIn {'] + self.interface(True) + ['};']
         if not targets and not depth:
             out += ['void main(PSIn i) {'] + s.declarations() + s.body() + ['}']
             return '\n'.join(out) + '\n'
@@ -10237,7 +10454,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-25'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-27'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -10247,7 +10464,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-25cs')
+    key = fnv(b'x2w-startup-shader-27cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
