@@ -48,6 +48,7 @@
 #include "startup_stubs/per_reason_refusal_census.h"
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/srv_refusal_cache.h"
 #include "startup_stubs/single_element_srv.h"
 #include "startup_stubs/view_dimension.h"
 #include "startup_stubs/list_copy.h"
@@ -4908,7 +4909,7 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
     auto& group = placement_group(desc->Width);
     const HRESULT hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
-        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); });
+        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); x2w_startup::note_placement_change(); });
     if (FAILED(hr)) {
         // The caller has never received this wrapper; release its desktop resource and storage.
         AcquireSRWLockExclusive(&registry_lock);
@@ -5431,6 +5432,7 @@ void drain_retired_resources()
             {
                 x2w_startup::ExclusiveNoteLock guard(note_lock);
                 resource_address_index().erase(address, drop.wrapper);
+                x2w_startup::note_placement_change();
             }
             if (drop.wrapper->own().retire_has_written_gen && !retire_address_has_live_user(address, drop.wrapper)) {
                 AcquireSRWLockExclusive(&written_lock);

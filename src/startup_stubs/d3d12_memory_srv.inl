@@ -287,6 +287,7 @@ void clear_unplaced_buffers(Wrapper* device)
             }
             it->resource.Reset();
             it = unplaced_buffers.erase(it);
+            x2w_startup::note_placement_change();
         } else {
             ++it;
         }
@@ -435,6 +436,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     }
 
     unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, native_resource, w});
+    x2w_startup::note_placement_change();
     return w;
 }
 
@@ -669,6 +671,37 @@ void publish_as_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const Me
     view_slot<18, 2>(self, 0, reinterpret_cast<u64>(&resolved), destination, 0);
 }
 
+// Refused buffer SRVs are remembered for a short time (srv_refusal_cache.h): the same view of the same address is
+// published every frame, and each refusal used to repeat the placement scans and the memory questions.
+x2w_startup::SrvRefusalCache& buffer_refusal_cache()
+{
+    static x2w_startup::SrvRefusalCache cache;
+    return cache;
+}
+
+x2w_startup::SrvRefusalKey buffer_refusal_key(const D3D12_RESOURCE_DESC& resource, const MemoryShaderResourceView& input, u64 span_bytes)
+{
+    const auto& view = input.view;
+    x2w_startup::SrvRefusalKey key;
+    key.address = input.address;
+    key.span_bytes = span_bytes;
+    key.view_a = (u64{static_cast<UINT>(view.Format)} << 32) | (u64{static_cast<UINT>(view.ViewDimension)} << 16) | view.Shader4ComponentMapping;
+    key.view_b = view.Buffer.FirstElement;
+    key.view_c = (u64{view.Buffer.NumElements} << 32) | (u64{view.Buffer.StructureByteStride} << 8) | static_cast<UINT>(view.Buffer.Flags);
+    key.resource_a = (u64{static_cast<UINT>(resource.Dimension)} << 32) | static_cast<UINT>(resource.Flags);
+    key.resource_b = resource.Width;
+    return key;
+}
+
+// The generation first, then the memory: a change between the two reads makes the entry stale, never fresh.
+x2w_startup::SrvRefusalStamp buffer_refusal_stamp(u64 address)
+{
+    x2w_startup::SrvRefusalStamp stamp;
+    stamp.generation = x2w_startup::srv_placement_generation().load(std::memory_order_acquire);
+    stamp.valid = x2w_startup::region_stamp(reinterpret_cast<const void*>(address), stamp.base, stamp.size, stamp.commit, stamp.flags);
+    return stamp;
+}
+
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
@@ -700,6 +733,13 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
+        const auto refusal_key = buffer_refusal_key(*resource, *input, span_bytes);
+        const auto refusal_stamp = buffer_refusal_stamp(input->address);
+        if (buffer_refusal_cache().hit(refusal_key, refusal_stamp, GetTickCount64())) {
+            refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
+                              destination);
+            return;
+        }
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
         if (!buffer) {
             buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource);
@@ -709,6 +749,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         if (!buffer || !info ||
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
+            buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64());
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;

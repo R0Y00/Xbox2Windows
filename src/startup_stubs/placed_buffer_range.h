@@ -70,6 +70,23 @@ inline std::uint64_t allocation_bytes(const void* address)
     return info.RegionSize;
 }
 
+// One region-information call for the allocation holding address: its base, size, committed bytes and flags, with no
+// page-table scan. False when the call is missing or fails (the caller must then not cache anything on it).
+inline bool region_stamp(const void* address, std::uint64_t& base, std::uint64_t& size, std::uint64_t& commit,
+                         std::uint64_t& flags)
+{
+    placed_detail::RegionInformation info{};
+    SIZE_T returned = 0;
+    const placed_detail::QueryRegion query = placed_detail::query_region();
+    if (!address || !query || !query(GetCurrentProcess(), address, 0 /* MemoryRegionInfo */, &info, sizeof(info), &returned))
+        return false;
+    base = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+    size = info.RegionSize;
+    commit = info.CommitSize;
+    flags = info.Flags;
+    return true;
+}
+
 // False when the address is not committed (slot 133 returns E_INVALIDARG). Otherwise covered is
 // exactly "offset <= committed bytes from base && width <= committed bytes - offset" for the run the
 // full walk measures.
