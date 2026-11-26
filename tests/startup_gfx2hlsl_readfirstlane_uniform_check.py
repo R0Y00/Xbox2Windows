@@ -355,7 +355,9 @@ for label, instructions, size in (
         ('signed field', ('v_bfe_i32 v2, v0, 2, 3', SHIFT1, READ1), 8),
         ('unknown group for a masked field', (AND_OR, SHIFT, READ1), None)):
     got = run(*instructions, kind='cs', group=(size, 1, 1) if size else None)
-    check(f'{label} refused', got == REFUSAL, repr(got))
+    # a lane mask as the OR source meets the mask rule (#2702) before the uniformity rule: either refusal keeps it refused
+    mask_first = label == 'predicate as OR source' and got == 'v_and_or_b32 reads lane mask s2 as numeric data'
+    check(f'{label} refused', got == REFUSAL or mask_first, repr(got))
 
 # Older probes may provide either no tracker or only part of the tracking state.
 for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):
