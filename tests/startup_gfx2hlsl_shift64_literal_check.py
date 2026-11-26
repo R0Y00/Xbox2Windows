@@ -50,6 +50,8 @@ def main():
         check('%s with literal %s' % (op, literal), lowered(op, literal) == want)
     check('literals wider than 32 bits stay refused',
           all(refused('%s v[0:1], v2, 0x100000000' % op) for op in ('v_lshlrev_b64', 'v_ashrrev_i64')))
+    check('a hex literal stays refused as the addend of v_mad_u64_u32 and v_mad_i64_i32',
+          all(refused('%s v[0:1], vcc_lo, v2, v3, 0x41' % op) for op in ('v_mad_u64_u32', 'v_mad_i64_i32')))
     check('a literal is not accepted as a destination or in the wrong operand count',
           refused('v_lshrrev_b64 0x41, v2, v[4:5]') and refused('v_lshrrev_b64 v[0:1], 0x41'))
 

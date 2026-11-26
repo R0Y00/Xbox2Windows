@@ -339,6 +339,7 @@ jobs:
             tests/startup_gfx2hlsl_s_quadmask_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
+            tests/startup_gfx2hlsl_shift64_literal_check.py \
             tests/startup_gfx2hlsl_mad64_check.py \
             tests/startup_gfx2hlsl_cmp_class_f16_sdwa_check.py \
             tests/startup_gfx2hlsl_mul_hi_i32_check.py \

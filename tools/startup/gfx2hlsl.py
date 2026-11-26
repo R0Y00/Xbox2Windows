@@ -5170,7 +5170,7 @@ class Stage:
             r0 = reg_range(ops[1])
             if r0 and r0[0] != 's':
                 raise Unsupported('%s source %s' % (name, ops[1]))
-            low, high = self.i64_words(ops[1], helper == 'shr64i' or signed is True)
+            low, high = self.i64_words(ops[1], helper == 'shr64i' or signed is True, True)
             known = [self.scalar_const('s%d' % r0[1]), self.scalar_const('s%d' % r0[2])] if r0 else [
                 int(low[:-1]), int(high[:-1])]
         else:
@@ -7629,9 +7629,9 @@ class Stage:
     def op_v_cubema_f32(self, ops, mods):
         self.cube('ma', ops, mods)
 
-    def i64_words(self, tok, signed=False):
+    def i64_words(self, tok, signed=False, literal=False):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair, an inline int or a
-        32-bit hex literal (zero-extended, sign-extended when the operation is signed)."""
+        32-bit hex literal when `literal` is set (zero-extended, sign-extended when the operation is signed)."""
         pair = reg_range(tok)
         if pair and pair[2] == pair[1] + 1:
             if pair[0] == 'v' and pair[2] <= 255:
@@ -7642,7 +7642,7 @@ class Stage:
         if re.fullmatch(r'0|-?[1-9]\d*', tok) and -16 <= int(tok) <= 64:
             value = int(tok) & 0xffffffffffffffff
             return '%du' % (value & 0xffffffff), '%du' % (value >> 32)
-        if re.fullmatch(r'0x[0-9a-f]{1,8}', tok):
+        if literal and re.fullmatch(r'0x[0-9a-f]{1,8}', tok):
             word = int(tok, 16)
             return '%du' % word, ('4294967295u' if signed and word >> 31 else '0u')
         raise Unsupported('64-bit source %s' % tok)
@@ -7660,7 +7660,7 @@ class Stage:
                 or ops[1] in ('vcc', 'exec') or ops[1] in FLOATS):
             raise Unsupported('64-bit shift amount %s' % ops[1])
         amount = self.u(ops[1])
-        low, high = self.i64_words(ops[2], helper == 'shr64i')
+        low, high = self.i64_words(ops[2], helper == 'shr64i', True)
         body = '{ uint2 t = %s(%s, %s, %s); v%d = t.x; v%d = t.y; }' % (
             helper, low, high, amount, dst[1], dst[2])
         if hasattr(self, 'uniform_v'):
