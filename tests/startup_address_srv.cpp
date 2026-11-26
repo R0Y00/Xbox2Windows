@@ -97,6 +97,8 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
             // The shader uses packed 32-byte records. Publish both views at native
             // slot boundaries, then pack the second token in the guest-owned table.
             std::memmove(title_table.data() + 32, title_table.data() + stride, 32);
+            // The heap-record case (X2W_TEST_HEAP_SRV) uses the same four strips: keys 2 and 3 name records the two-entry
+            // heap does not hold, and each such draw must be refused.
             for (UINT key = 0; key < 4; ++key) {
                 invoke(list, 40, 1, 1, ptr(&key), 0);
                 draw(static_cast<LONG>(swap * 4 + key));

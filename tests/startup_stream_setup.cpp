@@ -149,6 +149,10 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             root_desc.NumParameters = 2;
         }
     }
+    // X2W_TEST_HEAP_SRV (with X2W_TEST_JOINED_TABLE, tests/startup_pixel_heap_srv_check.py): the shader indexes the view heap
+    // itself, so the root signature carries CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED (0x400).
+    if (joined_table && GetEnvironmentVariableW(L"X2W_TEST_HEAP_SRV", nullptr, 0))
+        root_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400);
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
     // "wrong_type" declares a shader resource view there instead.
     D3D12_ROOT_PARAMETER root_cbv{};
