@@ -120,6 +120,15 @@ REFUSED = {
                  'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     'loop': (PROLOGUE + 'BB1:\n' + SAMPLE + 's_waitcnt vmcnt(0)\nv_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccnz BB1\n'
              + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A scalar write inside the block an EXEC branch can skip happens once for the wave in the guest; a quad that
+    # votes to skip it would miss it (review of the first version): the branch is not voted, the op is refused.
+    'scalar_in_block': (PROLOGUE + 's_mov_b32 s28, -1.0\nv_cmp_eq_u32_e32 vcc, 2, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n'
+                        's_mov_b32 s28, 0\nBB1:\ns_or_b64 exec, exec, s[0:1]\nv_mov_b32_e32 v1, s28\n'
+                        + SAMPLE + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A bias that differs per lane (a join of two values) past a divergent EXEC is not drawn: refused by name.
+    'bias_per_lane': (PROLOGUE + 'v_mov_b32_e32 v14, 1.0\nv_cmp_eq_u32_e32 vcc, 0, v8\nv_cndmask_b32_e32 v1, v1, v14, vcc\n'
+                      + branch_on_x(0, '-0.5') + SAMPLE + EXPORT,
+                      'image_sample_b with a per-lane bias past a divergent EXEC'),
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
