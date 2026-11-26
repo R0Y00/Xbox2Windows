@@ -35,6 +35,11 @@ CLAMP_WORDS = IMAGE_WORDS.replace(
 WRAP_SOURCE = CLAMP_SOURCE.replace('s_bfm_b32 s24, s28, 33', 's_bfm_b32 s24, 0, 33')
 WRAP_WORDS = CLAMP_WORDS.replace(bytes.fromhex('1ca11892'), bytes.fromhex('80a11892'))
 
+# The clamp sampler with word 0 built in s29 and copied into s24 (s_mov_b32 s24, s29): only the copy fold lets
+# the four words be read as constants, so the draw below depends on it.
+COPY_CLAMP_SOURCE = CLAMP_SOURCE.replace('s_bfm_b32 s24, s28, 33', 's_bfm_b32 s29, s28, 33\ns_mov_b32 s24, s29')
+COPY_CLAMP_WORDS = CLAMP_WORDS.replace(bytes.fromhex('1ca11892'), bytes.fromhex('1ca11d92' '1d0398be'))
+
 # s9 is root constant 1. Overwrite a previously folded word to check that the
 # run-time write clears its constant value before the sampler is consumed.
 DYNAMIC_SOURCE = CLAMP_SOURCE.replace('v_mov_b32 v0,', 's_bfm_b32 s24, s9, 33\nv_mov_b32 v0,')
@@ -145,6 +150,7 @@ def controls():
     for name, code, words in (
         ('clamp', CLAMP_WORDS, (0x2, 0, 0x00100000, 0)),
         ('wrap', WRAP_WORDS, (0, 0, 0x00100000, 0)),
+        ('copied clamp', COPY_CLAMP_WORDS, (0x2, 0, 0x00100000, 0)),
     ):
         pipe = translate(code)
         manifest = pipe.manifest()
@@ -163,8 +169,9 @@ def controls():
         print('root-constant mask width: inline sampler refused (%s)' % error)
     else:
         raise AssertionError('run-time write to s24 was accepted as an inline sampler')
-    (clamp_ps, clamp_line), (_, wrap_line) = fixtures
-    return clamp_ps, clamp_line, wrap_line
+    (clamp_ps, clamp_line), (_, wrap_line), (copy_ps, copy_line) = fixtures
+    assert copy_line == clamp_line, (copy_line, clamp_line)
+    return clamp_ps, clamp_line, wrap_line, copy_ps
 
 
 def check_binary(llvm_mc):
@@ -172,14 +179,15 @@ def check_binary(llvm_mc):
         ('clamp', CLAMP_SOURCE, CLAMP_WORDS),
         ('wrap', WRAP_SOURCE, WRAP_WORDS),
         ('root constant', DYNAMIC_SOURCE, DYNAMIC_WORDS),
+        ('copied clamp', COPY_CLAMP_SOURCE, COPY_CLAMP_WORDS),
     ):
         built = assemble(llvm_mc, source)
         assert built == recorded, '%s: assembled %s, recorded %s' % (name, built.hex(), recorded.hex())
-    print('all three fixture programs match llvm-mc')
+    print('all four fixture programs match llvm-mc')
 
 
 def check_draw(dxc, renderer, adapter, fxc=None):
-    ps, clamp, wrap = controls()
+    ps, clamp, wrap, copy_ps = controls()
     expected_clamp = texel(1, 0, 0)
     expected_wrap = texel(0, 0, 0)
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
@@ -194,9 +202,13 @@ def check_draw(dxc, renderer, adapter, fxc=None):
         for kind, compiler, vs_profile, ps_profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'fullscreen', vs_profile, directory)
             shader = compile_hlsl(compiler, kind, ps, 'inline_sampler', ps_profile, directory)
-            command = [renderer, adapter, '--startup-image-3d', str(vs), str(shader), '0.25', expected_clamp]
-            # Hold shader, texture, and reference fixed. Only the manifest sampler changes.
-            for label, line, result in (('clamp', clamp, 0), ('wrap control', wrap, 1)):
+            copy_shader = compile_hlsl(compiler, kind, copy_ps, 'inline_sampler_copy', ps_profile, directory)
+            # Hold shader, texture, and reference fixed. Only the manifest sampler changes. The copied-word shader
+            # is drawn with its own sampler (must read the clamped texel) and with the wrap sampler (must mismatch).
+            for label, shader_path, line, result in (('clamp', shader, clamp, 0), ('wrap control', shader, wrap, 1),
+                                                     ('copied-word clamp', copy_shader, clamp, 0),
+                                                     ('copied-word wrap control', copy_shader, wrap, 1)):
+                command = [renderer, adapter, '--startup-image-3d', str(vs), str(shader_path), '0.25', expected_clamp]
                 run = subprocess.run([*command, line], capture_output=True, text=True)
                 print(run.stdout, end='', flush=True)
                 if run.returncode == 77:
