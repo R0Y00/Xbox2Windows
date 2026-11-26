@@ -10,6 +10,7 @@ import tempfile
 
 from pixel_gather_check import SIDE, texel, write_case
 from startup_sampler_heap_check import VS_WORDS, assemble, root_blob
+from startup_image_3d_check import FULLSCREEN_VS
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools' / 'startup'))
 import gfx2hlsl as G  # noqa: E402
@@ -231,20 +232,27 @@ def draw(dxc, renderer, adapter):
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
         hlsl = directory / 'gather.hlsl'
+        vs_hlsl, vs_dxil = directory / 'fullscreen.hlsl', directory / 'fullscreen.dxil'
+        vs_hlsl.write_text(FULLSCREEN_VS, encoding='ascii')
+        subprocess.run([dxc, '-WX', '-T', 'vs_6_0', '-E', 'main', '-Fo', vs_dxil, vs_hlsl], check=True)
         dxil = directory / 'gather.dxil'
         case = directory / 'gather.case'
 
         def run(mips, first, component, uv, code, *, mutant=False, wrap=(False, False), wrong=False):
-            source = pipeline(code).hlsl_ps()
-            # The offscreen vertex shader places TEXCOORD0 before SV_Position.
-            source = source.replace('struct PSIn {', 'struct PSIn {\n    float4 uv : TEXCOORD0;', 1)
+            pipe = pipeline(code)
+            source = pipe.hlsl_ps()
+            # The sampler is the one the translation bound: the smp line of the manifest goes to the renderer, which
+            # builds the static sampler from the guest's words (a repeat draw cannot be read with the fixed clamp one).
+            # That root signature takes a vertex shader without an embedded one, so the pixel stage has SV_Position only.
+            line = [l for l in pipe.manifest().splitlines() if l.startswith('smp ')]
+            assert len(line) == 1, pipe.manifest()
             if mutant:
                 source = source.replace('U(t.x)', 'U(t.w)', 1)
             hlsl.write_text(source, encoding='ascii')
             subprocess.run([dxc, '-WX', '-T', 'ps_6_0', '-E', 'main', '-Fo', dxil, hlsl], check=True)
             # The renderer uploads fixture level zero at the first resident mip.
             write_case(case, mips, first, [expected_taps(0, component, uv, wrap)] * SIDE**2)
-            proc = subprocess.run([renderer, adapter, '--check-pixel-gather', dxil, case],
+            proc = subprocess.run([renderer, adapter, '--check-pixel-gather', dxil, case, line[0], str(vs_dxil)],
                                   capture_output=True, text=True)
             output = proc.stdout + proc.stderr
             print(f'{CHANNELS[component]}: mip {first}, {mips} resource mips, uv {uv}, wrap {wrap}, mutant {mutant}, wrong sampler {wrong}\n{output}',
