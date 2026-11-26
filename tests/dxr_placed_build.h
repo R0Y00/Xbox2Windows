@@ -175,9 +175,14 @@ public:
         must_reject(tlas, unmapped, scratch, sizes, true, Cause::source_not_placed, "source outside the placed buffers");
         must_reject(tlas, scratch, scratch, sizes, true, Cause::source_wrong_state,
                     "source in a buffer that is not an acceleration structure");
-        // An aligned source one stride past the destination is beyond the end of a structure this small (the partial-overlap
-        // rule needs a structure longer than 256 bytes and is checked by value in placed_build_causes).
-        must_reject(tlas, tlas + 256, scratch, sizes, true, Cause::source_not_placed, "source past the end of the destination's buffer");
+        // An aligned source one stride (256 bytes) past the destination: where the structure is longer than that the two
+        // partly overlap (the shape rule, checked by value in placed_build_causes names it); on a device that sizes it
+        // shorter, the source lies past the end of the destination's buffer.
+        const Cause stride_cause = x2w_startup::check_update_shape(true, tlas + 256, tlas, sizes.ResultDataMaxSizeInBytes);
+        must_reject(tlas, tlas + 256, scratch, sizes, true,
+                    stride_cause != Cause::ok ? stride_cause : Cause::source_not_placed, "source one stride past the destination");
+        if (stride_cause != Cause::ok && stride_cause != Cause::source_dest_partial_overlap)
+            throw std::runtime_error("The shape rule named an unexpected cause for a source one stride past the destination");
         // The scratch rule applies to an update as to a build.
         must_reject(tlas, tlas, big_as_, sizes, true, Cause::wrong_state, "update with a scratch in an acceleration-structure buffer");
 
