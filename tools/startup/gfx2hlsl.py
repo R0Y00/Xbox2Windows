@@ -3167,7 +3167,10 @@ class Stage:
             raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
         # blocks non-empty means a branch target was reached: the broadcast is no longer in the entry prefix.
         # has_branches alone is not enough to refuse: a later loop in the same stage is the M200-01/003 shape.
-        if (self.kind != 'ps' or getattr(self, 'blocks', []) or not getattr(self, 'exec_known', False)):
+        # Keep "straight-line pixel stage" in the non-ps path: startup_gfx2hlsl_cvt_off_f32_i4_check pins that needle.
+        if self.kind != 'ps':
+            raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        if getattr(self, 'blocks', []) or not getattr(self, 'exec_known', False):
             raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
