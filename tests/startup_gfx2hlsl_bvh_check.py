@@ -112,6 +112,14 @@ def half_nodes(nodes):
     return quantized
 
 
+HALF_BASE = 512
+HALF_NODES = half_nodes(NODES[0])
+HALF_RAYS = tuple(
+    (name, HALF_BASE, extent, origin, direction, reference(HALF_NODES, extent, origin, direction, True))
+    for name, _offset, extent, origin, direction, _expected in RAYS
+)
+
+
 def translate_program(*, node=0x05, sort_boxes=True, word0=0x00100000, word1=None, word2=0x0b,
                       word3=RESOURCE_TYPE, loaded_descriptor=False, modifier="", opcode="image_bvh_intersect_ray",
                       constant_node=True, stage_kind="cs"):
@@ -312,6 +320,11 @@ def dispatch_hlsl(mutate_miss=False):
                 lines.append("    data.Store(%du, %s);" % (base_offset + 16 + 24 * i + 12 + 4 * j, fbits(hi[j])))
         for i in range(4):
             lines.append("    data.Store(%du, 0u);" % (base_offset + 112 + 4 * i))
+    for i, (child, lo, hi) in enumerate(HALF_NODES):
+        lines.append("    data.Store(%du, 0x%08xu);" % (HALF_BASE + 4 * i, child))
+        packed = struct.unpack("<3I", struct.pack("<6e", *lo, *hi))
+        for j, word in enumerate(packed):
+            lines.append("    data.Store(%du, 0x%08xu);" % (HALF_BASE + 16 + 12 * i + 4 * j, word))
     lines.append("    DeviceMemoryBarrierWithGroupSync();")
     for case, (_name, offset, extent, origin, direction, _expected) in enumerate(RAYS):
         inv = tuple(1.0 / c for c in direction)
@@ -321,7 +334,16 @@ def dispatch_hlsl(mutate_miss=False):
                 case, (offset >> 3) | 5, ffloat(extent), ffloat(origin[0]), ffloat(origin[1]),
                 ffloat(origin[2]), ffloat(inv[0]), ffloat(inv[1]), ffloat(inv[2])))
         for word in range(4):
-            lines.append("    data.Store(%du, r%d.%s);" % (512 + 16 * case + 4 * word, case, "xyzw"[word]))
+            lines.append("    data.Store(%du, r%d.%s);" % (576 + 16 * case + 4 * word, case, "xyzw"[word]))
+    for case, (_name, offset, extent, origin, direction, _expected) in enumerate(HALF_RAYS):
+        inv = tuple(1.0 / c for c in direction)
+        lines.append(
+            "    uint4 h%d = x2w_bvh_intersect_box16(data, 0x%08xu, 0x00100000u, 0x80000000u, "
+            "0x00000040u, 0x80000000u, %s, float3(%s, %s, %s), float3(%s, %s, %s));" % (
+                case, (offset >> 3) | 4, ffloat(extent), ffloat(origin[0]), ffloat(origin[1]),
+                ffloat(origin[2]), ffloat(inv[0]), ffloat(inv[1]), ffloat(inv[2])))
+        for word in range(4):
+            lines.append("    data.Store(%du, h%d.%s);" % (672 + 16 * case + 4 * word, case, "xyzw"[word]))
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -336,7 +358,7 @@ def run_dispatch(dxc, runner, adapter, directory, mutate=False):
                               capture_output=True, text=True)
     if compiled.returncode or compiled.stderr:
         raise AssertionError(compiled.stderr or "dxc exited with %d" % compiled.returncode)
-    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", "592", str(output)],
+    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", "768", str(output)],
                             capture_output=True, text=True)
     print(result.stdout, end="")
     if result.returncode == 77:
@@ -361,14 +383,18 @@ def check_dispatch(dxc, runner, adapter):
             print("dispatch: skip (adapter unavailable)")
             return 77
         for case, (_name, _offset, _extent, _origin, _direction, expected) in enumerate(RAYS):
-            got = tuple(words[128 + 4 * case:132 + 4 * case])
+            got = tuple(words[144 + 4 * case:148 + 4 * case])
             check("dispatch case %d %s" % (case, _name), got == expected,
+                  "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in expected]))
+        for case, (_name, _offset, _extent, _origin, _direction, expected) in enumerate(HALF_RAYS):
+            got = tuple(words[168 + 4 * case:172 + 4 * case])
+            check("dispatch box16 case %d %s" % (case, _name), got == expected,
                   "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in expected]))
         status, mutant = run_dispatch(dxc, runner, adapter, directory, mutate=True)
         if status == 77:
             print("dispatch control: skip (adapter unavailable)")
             return 77
-        changed = mutant[128:132]
+        changed = mutant[144:148]
         check("dispatch miss-fill control decays case 2", tuple(changed) != (INVALID,) * 4,
               "got %s" % ["%08x" % w for w in changed])
     if failures:

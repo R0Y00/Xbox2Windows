@@ -58,11 +58,12 @@ prints `dxc compile: skip` and does not count that as a pass.
 python -B tests/startup_gfx2hlsl_bvh_check.py dispatch <dxc> <offscreen_check> warp
 ```
 
-The dispatch mode compiles the same helper with a `RWByteAddressBuffer` in place of the bound
-`ByteAddressBuffer`, writes the two synthetic nodes and five rays, and compares all twenty result words on a
-Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.10068`). It also dispatches a mutant that leaves
-missed child words in place; the case 2 word 0 must stop being `0xffffffff`. That control caught the first version
-of this helper, which sorted the keys correctly but returned the original child pointer for a miss.
+The dispatch mode compiles the helpers with a `RWByteAddressBuffer` in place of the bound
+`ByteAddressBuffer`, writes the two FP32 nodes, one binary16 node and ten rays, and compares all forty result
+words on a Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.10068`). All five FP32 and all five
+binary16 cases pass on WARP. It also dispatches a mutant that leaves missed child words in place; the case 2 word 0
+must stop being `0xffffffff`. That control caught the first version of this helper, which sorted the keys
+correctly but returned the original child pointer for a miss.
 
 This is a translator slice. It does not execute the native gfx1030 probe, does not bind the node buffer on a
 D3D12 device, and does not establish any title behavior.
