@@ -161,6 +161,23 @@ void bad_requests()
     std::uint32_t apu = 0xDEADBEEF;
     check(free_fn(nullptr) == ok, "free(null) is a no-op");
     check(take(nullptr, 64) == no_pointer, "null output");
+    if (void* ro = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)) {
+        auto* ro_ptr = static_cast<void**>(ro);
+        auto* ro_apu = static_cast<std::uint32_t*>(ro);
+        check(take(ro_ptr, 64, 16, &apu) == no_pointer && apu == 0xDEADBEEF,
+              "read-only virtual_address returns E_POINTER and leaves apu unchanged");
+        out = const_cast<void*>(sentinel);
+        check(take(&out, 64, 16, ro_apu) == no_pointer && !out,
+              "read-only apu_address returns E_POINTER and zeroes virtual_address");
+        out = const_cast<void*>(sentinel);
+        check(take(&out, 0, 16, ro_apu) == no_pointer && !out,
+              "read-only apu_address with size 0 returns E_POINTER");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    } else {
+        check(false, "VirtualAlloc PAGE_READONLY for ApuAlloc negative control");
+    }
+    check_empty("unwritable ApuAlloc outputs");
+    out = const_cast<void*>(sentinel);
     check(take(&out, usable + 16, 16, &apu) == no_memory && !out && apu == 0xDEADBEEF, "larger than the heap");
     out = const_cast<void*>(sentinel);
     check(take(&out, 0xFFFFFFFFull, 16, &apu) == no_memory && !out, "size near 2^32");
@@ -283,6 +300,12 @@ void concurrent()
 // block that overlaps a live one, or leave a live block unfreeable.
 void first_creation(CreateFn create)
 {
+    // A heap that would cross 4 GiB by one byte (rounded up to 64 KiB) is refused before any memory is
+    // committed and leaves no heap behind; the creations below still succeed.
+    check(create(0xFFFFFFFFull, 2) == invalid, "heap crossing 4 GiB by one byte is refused");
+    check(create(0xFFFFFFFFull, 0xFFFFFFFFull) == invalid, "two maximal 32-bit sizes are refused");
+    void* refused = nullptr;
+    check(take(&refused, 64) == no_memory && !refused, "refused ApuCreateHeap leaves no heap");
     constexpr unsigned callers = 4;
     std::atomic<bool> go{false};
     std::atomic<int> bad{0};
@@ -376,6 +399,23 @@ void hal_and_address_mapping()
     }
     void* hal = nullptr;
     check(hal_create_fn(&hal) == ok && hal != nullptr, "AcpHalCreate returns stand-in object");
+    {
+        constexpr unsigned callers = 4;
+        std::atomic<bool> go{false};
+        std::atomic<int> bad{0};
+        void* objects[callers] = {};
+        std::vector<std::thread> threads;
+        for (unsigned id = 0; id < callers; ++id)
+            threads.emplace_back([&, id] {
+                while (!go.load()) std::this_thread::yield();
+                if (hal_create_fn(&objects[id]) != ok || !objects[id]) ++bad;
+            });
+        go = true;
+        for (auto& t : threads) t.join();
+        check(bad.load() == 0, "concurrent AcpHalCreate calls succeed");
+        for (unsigned i = 0; i < callers; ++i)
+            check(objects[i] == hal, "concurrent AcpHalCreate returns the same stand-in object");
+    }
     if (hal) {
         auto* const* vtable = *reinterpret_cast<void* const* const*>(hal);
         auto connect = reinterpret_cast<HalConnectFn>(vtable[0]);
@@ -401,12 +441,27 @@ void hal_and_address_mapping()
     check(valid_fn(nullptr) == 0, "ApuIsVirtualAddressValid(null) is 0");
     check(valid_fn(&failures) == 0, "ApuIsVirtualAddressValid(foreign) is 0");
     check(valid_fn(heap_base - 1) == 0, "ApuIsVirtualAddressValid(before heap) is 0");
+    check(valid_fn(heap_base) == 0, "ApuIsVirtualAddressValid(reserved offset 0) is 0");
+    check(valid_fn(heap_base + 0x100) == 0, "ApuIsVirtualAddressValid(inside reserved guard) is 0");
+    check(valid_fn(heap_base + first_offset - 1) == 0, "ApuIsVirtualAddressValid(last reserved byte) is 0");
+    check(valid_fn(heap_base + first_offset) != 0, "ApuIsVirtualAddressValid(first allocatable byte) is 1");
+    check(valid_fn(heap_base + heap_size - 1) != 0, "ApuIsVirtualAddressValid(last heap byte) is 1");
     check(valid_fn(heap_base + heap_size) == 0, "ApuIsVirtualAddressValid(at heap end) is 0");
     check(map_fn(nullptr) == 0, "ApuMapVirtualAddress(null) is 0");
     check(map_fn(&failures) == 0, "ApuMapVirtualAddress(foreign) is 0");
     check(map_fn(heap_base - 1) == 0, "ApuMapVirtualAddress(before heap) is 0");
+    check(map_fn(heap_base) == 0, "ApuMapVirtualAddress(reserved offset 0) is 0");
+    check(map_fn(heap_base + 0x100) == 0, "ApuMapVirtualAddress(inside reserved guard) is 0");
+    check(map_fn(heap_base + first_offset - 1) == 0, "ApuMapVirtualAddress(last reserved byte) is 0");
+    check(map_fn(heap_base + first_offset) == first_offset, "ApuMapVirtualAddress(first allocatable byte)");
+    check(map_fn(heap_base + heap_size - 1) == heap_size - 1, "ApuMapVirtualAddress(last heap byte)");
     check(map_fn(heap_base + heap_size) == 0, "ApuMapVirtualAddress(at heap end) is 0");
     check(map_apu_fn(0) == nullptr, "ApuMapApuAddress(0) is null");
+    check(map_apu_fn(1) == nullptr, "ApuMapApuAddress(1 in reserved guard) is null");
+    check(map_apu_fn(0x100) == nullptr, "ApuMapApuAddress(0x100 in reserved guard) is null");
+    check(map_apu_fn(first_offset - 1) == nullptr, "ApuMapApuAddress(last reserved byte) is null");
+    check(map_apu_fn(first_offset) == heap_base + first_offset, "ApuMapApuAddress(first allocatable byte)");
+    check(map_apu_fn(heap_size - 1) == heap_base + heap_size - 1, "ApuMapApuAddress(last heap byte)");
     check(map_apu_fn(heap_size) == nullptr, "ApuMapApuAddress(heap_size) is null");
     check(map_apu_fn(heap_size + 0x1000) == nullptr, "ApuMapApuAddress(past end) is null");
 

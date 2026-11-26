@@ -53,6 +53,7 @@
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/rect_indirect_args.h"
+#include "startup_stubs/split_indirect_dispatch.h"
 #include "startup_stubs/profile_zone.h"
 
 #include "startup_stubs/slice_footprints.h"
@@ -1525,6 +1526,39 @@ ID3D12Resource* recording_rect_scratch(Wrapper* self)
     return scratch;
 }
 
+// Keeps `resource` with this recording's desktop allocator, like the rectangle-list scratch above. False if the list
+// is not recording (the caller must not use the resource then).
+bool retain_with_recording(Wrapper* self, x2w_startup::ComPtr<ID3D12Resource> resource)
+{
+    bool retained = false;
+    AcquireSRWLockExclusive(&allocator_lock);
+    const auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (state.list_open && found != list_recordings.end() && found->second) {
+        try {
+            found->second->scratches.push_back(std::move(resource));
+            retained = true;
+        } catch (const std::bad_alloc&) {
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return retained;
+}
+
+// Fixture query: how many scratch buffers the desktop allocator of this list's latest recording still holds (the
+// rectangle-list scratch and the split indirect Dispatch records). They are released only when that allocator is
+// reset after every queue that ran its recordings has passed its fence (allocator_reset).
+extern "C" __declspec(dllexport) UINT x2w_d3d12_recording_scratches(void* guest_list)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind) return 0;
+    AcquireSRWLockShared(&allocator_lock);
+    const auto found = list_recordings.find(self);
+    const UINT held = found != list_recordings.end() && found->second ? static_cast<UINT>(found->second->scratches.size()) : 0;
+    ReleaseSRWLockShared(&allocator_lock);
+    return held;
+}
+
 // Fixture query for two closed recordings before either is submitted.
 extern "C" __declspec(dllexport) BOOL x2w_d3d12_distinct_rect_scratch(void* first, void* second)
 {
@@ -2465,6 +2499,8 @@ struct Pass {
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
     ID3D12RootSignature* compute_pipeline_root = nullptr; // root the bound compute pipeline was built against
     UINT compute_srv_bound = 0;                           // root SRV parameters that reached the desktop list since slot 33
+    // Desktop root UAVs a fixture bound through x2w_d3d12_fixture_compute_root_uav, set again after a shim compute pass.
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_root_uavs{};
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
     bool compute_root_has_arguments = false;     // that root declares parameters other than root SRVs, or static samplers
@@ -2688,6 +2724,40 @@ UINT __stdcall list_resource_barriers(Wrapper* self, UINT count, const D3D12_RES
     return 0; // no console barrier actions to perform on the caller's side
 }
 
+// Compute root views on the desktop list. Root SRVs come from slot 43; root UAVs only from the fixture hook
+// x2w_d3d12_fixture_compute_root_uav (slot 45 is not forwarded). Both are recorded here so restore_compute_root can set
+// them again after a shim compute pass has replaced the desktop compute root.
+void bind_compute_root_view(Pass& pass, ID3D12GraphicsCommandList* list, UINT parameter, D3D12_ROOT_PARAMETER_TYPE type,
+                            D3D12_GPU_VIRTUAL_ADDRESS address)
+{
+    if (type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        pass.desktop_compute_upload_srvs[parameter] = address;
+        list->SetComputeRootShaderResourceView(parameter, address);
+    } else if (type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        pass.desktop_compute_root_uavs[parameter] = address;
+        list->SetComputeRootUnorderedAccessView(parameter, address);
+    }
+}
+bool has_compute_root_views(const Pass& pass)
+{
+    const auto live = [](D3D12_GPU_VIRTUAL_ADDRESS address) { return address != 0; };
+    return std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(), live) ||
+        std::any_of(pass.desktop_compute_root_uavs.begin(), pass.desktop_compute_root_uavs.end(), live);
+}
+// Sets the title's desktop compute root again, with every view bind_compute_root_view recorded under it, after a shim
+// compute pass (indexed-draw validation, split indirect Dispatch) replaced the root and invalidated its arguments.
+void restore_compute_root(const Pass& pass, ID3D12GraphicsCommandList* list)
+{
+    if (!pass.desktop_compute_root) return;
+    list->SetComputeRootSignature(pass.desktop_compute_root.Get());
+    for (UINT parameter = 0; parameter < pass.desktop_compute_upload_srvs.size(); ++parameter) {
+        if (const auto address = pass.desktop_compute_upload_srvs[parameter])
+            list->SetComputeRootShaderResourceView(parameter, address);
+        if (const auto address = pass.desktop_compute_root_uavs[parameter])
+            list->SetComputeRootUnorderedAccessView(parameter, address);
+    }
+}
+
 void __stdcall list_compute_root(Wrapper* self, void* root)
 {
     auto* list = recording(self);
@@ -2712,11 +2782,33 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
     pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) {
-        if (pass.desktop_compute_root.Get() != pass.compute_root)
+        if (pass.desktop_compute_root.Get() != pass.compute_root) {
             pass.desktop_compute_upload_srvs.fill(0);
+            pass.desktop_compute_root_uavs.fill(0);
+        }
         pass.desktop_compute_root = pass.compute_root;
         list->SetComputeRootSignature(pass.compute_root);
     }
+}
+
+// Fixture binding of a desktop root UAV (a desktop GPU address) on a guest list's recording, under the compute root
+// set through slot 33. Not a guest slot: titles have no compute root UAV on the desktop list (slot 45 is not
+// forwarded). It records the view through bind_compute_root_view, as slot 43 does for root SRVs, so
+// restore_compute_root sets it again after a shim compute pass; a binding made on the desktop list directly would be
+// lost there.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* guest_list, UINT parameter, UINT64 address)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind) return FALSE;
+    auto* list = recording(self);
+    auto& pass = pass_of(self);
+    const auto* params = pass.compute_params;
+    if (!list || !pass.compute_root || !params || parameter >= params->size() ||
+        parameter >= pass.desktop_compute_root_uavs.size() || (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_UAV ||
+        !address)
+        return FALSE;
+    bind_compute_root_view(pass, list, parameter, D3D12_ROOT_PARAMETER_TYPE_UAV, address);
+    return TRUE;
 }
 
 // Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
@@ -2894,12 +2986,20 @@ constexpr const char* aliased_index_unaligned = "aliased_index_unaligned";
 constexpr const char* mesh_xmem_read = "mesh_xmem_read";
 constexpr const char* rect_live_compute_root = "rect_live_compute_root";
 constexpr const char* rect_conversion_unavailable = "rect_conversion_unavailable";
+constexpr const char* split_dispatch_unavailable = "split_dispatch_unavailable";
 constexpr const char* count_missing_resource = "count_missing_resource";
 constexpr const char* count_invalid_offset = "count_invalid_offset";
 constexpr const char* count_outside_placed_buffer = "count_outside_placed_buffer";
 constexpr const char* count_not_common_state = "count_not_common_state";
 constexpr const char* unknown = "unknown";
 }  // namespace indirect_other_refusal_code
+
+// Opt-in (X2W_SPLIT_INDIRECT_DISPATCH=1): a batched or counted indirect Dispatch with a desktop compute pipeline is
+// split into single-command calls (split_indirect_dispatch.h). Without it the native call runs on every adapter.
+bool split_indirect_dispatch_enabled()
+{
+    return x2w_local::env_on("X2W_SPLIT_INDIRECT_DISPATCH");
+}
 
 // The guest method has independent resource and byte-offset arguments.
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
@@ -3141,8 +3241,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         }
     }
     if (rect_list) {
-        if (std::any_of(pass.desktop_compute_upload_srvs.begin(), pass.desktop_compute_upload_srvs.end(),
-                        [](u64 address) { return address != 0; }))
+        if (has_compute_root_views(pass))
             return refuse("rectangle-list conversion would drop live compute root arguments",
                           indirect_other, indirect_other_refusal_code::rect_live_compute_root);
         // The producer's count names three vertices per rectangle; the desktop draw needs six. Convert on the GPU
@@ -3172,6 +3271,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             }
         }
     }
+    // Opt-in split of a batched or counted Dispatch for adapters that run only its first command
+    // (split_indirect_dispatch.h). Only a rootless Dispatch signature with a desktop compute pipeline and root reaches
+    // here with a count above one or a count buffer; graphics and mesh signatures are refused above.
+    const bool split = command == IndirectCommand::dispatch && pass.compute_pipeline && pass.compute_root &&
+        (count > 1 || count_buffer) && split_indirect_dispatch_enabled();
     ID3D12Resource* counts = nullptr;
     if (count_buffer) {
         // The count word is four bytes in a unique placed buffer that also tracks state from COMMON.
@@ -3188,7 +3292,35 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         if (!count_info || count_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
             return refuse("count buffer does not use COMMON state tracking", indirect_other, indirect_other_refusal_code::count_not_common_state);
         counts = static_cast<ID3D12Resource*>(count_wrapper->own().real);
-        if (counts != resource) require_state(self, counts, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        if (counts != resource)
+            require_state(self, counts, split ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    }
+    if (split) {
+        // The rewrite reads the title's records and count word by copies only, then replaces the compute root and
+        // pipeline. The compute state the title can set on the desktop list is the pipeline (slot 25), the root
+        // (slot 33) and root SRVs (slot 43); the other compute root setters are not forwarded. The pipeline is set
+        // again here and the root with its views by restore_compute_root, the same code as after the indexed-draw
+        // validation pass, before the single-command calls.
+        auto* desktop = device_of(self->own().list_device);
+        const auto stride = static_cast<UINT>(sig->own().indirect_bytes);
+        auto rewritten = x2w_startup::SplitIndirectDispatch::make_scratch(desktop, count, stride);
+        if (!rewritten || !retain_with_recording(self, rewritten))
+            return refuse("split indirect Dispatch has no scratch buffer", indirect_other,
+                          indirect_other_refusal_code::split_dispatch_unavailable);
+        require_state(self, resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (!x2w_startup::split_indirect_dispatch().rewrite(list, resource, offset, count, stride, counts, count_offset,
+                                                             rewritten.Get()))
+            return refuse("split indirect Dispatch rewrite is unavailable", indirect_other,
+                          indirect_other_refusal_code::split_dispatch_unavailable);
+        list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
+        restore_compute_root(pass, list);
+        const auto first = x2w_startup::SplitIndirectDispatch::rewritten_offset(count, stride);
+        auto* command = static_cast<ID3D12CommandSignature*>(sig->own().real);
+        for (UINT i = 0; i < count; ++i)
+            list->ExecuteIndirect(command, 1, rewritten.Get(), first + u64{i} * sizeof(D3D12_DISPATCH_ARGUMENTS), nullptr, 0);
+        x2w_startup::SplitIndirectDispatch::finish(list, rewritten.Get());
+        InterlockedIncrement64(&indirect_calls[indirect_forwarded][static_cast<int>(kind)]);
+        return;
     }
     if (!leased_arguments && !rect_list) {
         require_state(self, resource, argument_state);
@@ -3650,8 +3782,7 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     // A rejected replacement leaves no valid binding: the desktop list may still hold the previous address.
     if (parameter < 32) pass.compute_srv_bound &= ~(1u << parameter);
     if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
-        pass.desktop_compute_upload_srvs[parameter] = gpu;
-        list->SetComputeRootShaderResourceView(parameter, gpu);
+        bind_compute_root_view(pass, list, parameter, D3D12_ROOT_PARAMETER_TYPE_SRV, gpu);
         if (parameter < 32) pass.compute_srv_bound |= 1u << parameter;
     }
 }

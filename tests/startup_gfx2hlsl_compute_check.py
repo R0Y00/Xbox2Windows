@@ -4,7 +4,7 @@
   binary <llvm-mc>                                reassemble the fixture sources and compare them with the words below
   dispatch <dxc> <offscreen_check> <warp|hardware>
                                                   translate, compile with DXC cs_6_0, dispatch and compare every word
-  control <swapped-axes|dropped-store|b-offset|c-unpredicated|j-scalar-dropped|h-inner-unpredicated|m-else-unswitched> <dxc> <offscreen_check> <warp|hardware>
+  control <swapped-axes|dropped-store|b-offset|c-unpredicated|j-scalar-dropped|h-inner-unpredicated|m-else-unswitched|n-unmasked|o-mask-kept> <dxc> <offscreen_check> <warp|hardware>
                                                   the same dispatch with a mutated translation, which must mismatch
 
 The fixtures are source-built gfx1013 compute programs. The root signature puts two root constants (key, stride)
@@ -31,6 +31,10 @@ reads the read buffer at that index and stores to its own destination:
 - case M is case H with an if/else in the skipped block: each arm has its own s_cbranch_execz, s_andn2_b32 of the
   saved mask switches to the else arm and s_mov_b32 restores it. Lanes tid.x < 3 store the first word, lanes 3-5
   the second, the rest none.
+- case N skips a block that only sets vcc from a compare; the join ANDs vcc with exec before it restores exec, and
+  the result selects the storing lanes. Lanes tid.x < 3 store one word; lanes 6 and 7 skip the block with vcc set.
+- case O removes the lanes tid.x < 3 from the saved mask with s_andn2_b32 s0, s0, exec_lo inside the skipped block,
+  and the join moves s0 into exec. Lanes 3-7 store one word; lanes 6 and 7 skip the block and keep their bit.
 - case G reads two independently offset LDS dwords with the address in the first destination VGPR.
 - cases L-uint and L-unorm use the same formatted load with native descriptor stride and word 3 supplied by the
   harness. The descriptor selects unaligned UINT16 pairs or an UNORM8 field and permutes the outputs.
@@ -277,6 +281,67 @@ WORDS_M = bytes.fromhex(
     '6a03febe' '0e0088bf' '07051693' '16041680' '16060a3a' '8300887d' '6a3c80be' '020088bf' '001070e004050480'
     '007e7e8a' '030088bf' '056f0c7e' '041070e004060480' '0003febe' '1503febe' '000081bf')
 
+# Case NM skips a block that only sets vcc from a compare (lanes tid.x < 3 of the lanes tid.x < 6 that enter it);
+# the join masks vcc with exec (s_and_b32 s23, vcc_lo, exec_lo) before it restores exec, and s23 later selects
+# the lanes that store. vcc is all ones before the branch, so lanes 6 and 7, which skip the block, hold a stale
+# vcc that only the exec mask removes.
+SOURCE_NM = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v4, 2, v3
+s_mov_b32 s21, exec_lo
+v_cmp_gt_u32 vcc_lo, 6, v0
+s_and_saveexec_b32 s0, vcc_lo
+s_mov_b32 vcc_lo, -1
+s_cbranch_execz 1
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_and_b32 s23, vcc_lo, exec_lo
+s_or_b32 exec_lo, exec_lo, s0
+v_xor_b32 v5, s4, v3
+s_mov_b32 exec_lo, s23
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_mov_b32 exec_lo, s21
+s_endpgm
+"""
+WORDS_NM = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '0783148f' '1400064a' '82060834' '7e0395be' '8600887d'
+    '6a3c80be' 'c103eabe' '010088bf' '8300887d' '6a7e1787' '7e007e88' '04060a3a' '1703febe' '001070e004050480'
+    '1503febe' '000081bf')
+
+# Case O enters the block with the lanes tid.x < 6 (s_and_saveexec_b32 s0 saves all eight), narrows exec to the
+# lanes tid.x < 3 and removes them from the saved mask with s_andn2_b32 s0, s0, exec_lo inside the block; the join
+# moves s0 into exec. Lanes 3-5 lose their bit nowhere and lanes 6 and 7 skip the block with theirs, so lanes 3-7
+# store one word.
+SOURCE_O = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v4, 2, v3
+s_mov_b32 s21, exec_lo
+v_cmp_gt_u32 vcc_lo, 6, v0
+s_and_saveexec_b32 s0, vcc_lo
+s_cbranch_execz 3
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_and_b32 exec_lo, exec_lo, vcc_lo
+s_andn2_b32 s0, s0, exec_lo
+s_mov_b32 exec_lo, s0
+v_xor_b32 v5, s4, v3
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_mov_b32 exec_lo, s21
+s_endpgm
+"""
+WORDS_O = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '0783148f' '1400064a' '82060834' '7e0395be' '8600887d'
+    '6a3c80be' '030088bf' '8300887d' '7e6a7e87' '007e008a' '0003febe' '04060a3a' '001070e004050480' '1503febe'
+    '000081bf')
+
 def saveexec_fixture():
     # RDNA 2 ISA, SOP1: D takes old EXEC, then EXEC takes the bitwise result and SCC reports nonzero.
     # A single-thread group makes the lane bit the whole participating wave mask.
@@ -459,6 +524,8 @@ CASES = {
     'J': (SOURCE_J, WORDS_J, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'H': (SOURCE_H, WORDS_H, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'M': (SOURCE_M, WORDS_M, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
+    'NM': (SOURCE_NM, WORDS_NM, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
+    'O': (SOURCE_O, WORDS_O, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'K': (SOURCE_K, WORDS_K, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
@@ -728,6 +795,14 @@ def expected(name):
                                     out[2 * i] = value
                                 elif tx < 6:  # the else arm; lanes 6 and 7 skip the block
                                     out[2 * i + 1] = ~value & MASK
+                            elif name == 'NM':
+                                i = gx * 8 + tx
+                                if tx < 3:  # vcc & exec: the compare's lanes; lanes 6 and 7 skip it with vcc set
+                                    out[i] = i ^ KEY
+                            elif name == 'O':
+                                i = gx * 8 + tx
+                                if tx >= 3:  # the saved mask less the lanes the block kept; 6 and 7 skip it
+                                    out[i] = i ^ KEY
                             elif name == 'J':
                                 i = gx * 8 + tx
                                 if tx < 3:  # the lanes the compare leaves active; the others skip the block
@@ -1382,6 +1457,123 @@ def check_controls():
     }
 }
 ''')
+    # A definition live where the block joins whose reads are all absorbed by exec. The block's exec writes are
+    # proven, so a lane that skipped it has its exec bit clear at the join in the wave as in the model; while exec is
+    # unchanged since the join, W & exec and exec & W give that lane 0 and ~(W & exec) and W | ~exec give it 1,
+    # whatever W holds. Accepted at the join (case N runs the first on the GPU), and when the read overwrites W.
+    SPLICE.update({
+        's_and_b32 s23, vcc_lo, exec_lo': '6a7e1787', 's_and_b32 s23, exec_lo, vcc_lo': '7e6a1787',
+        's_nand_b32 s23, vcc_lo, exec_lo': '6a7e178c', 's_orn2_b32 s23, vcc_lo, exec_lo': '6a7e178b',
+        's_and_b32 vcc_lo, vcc_lo, exec_lo': '6a7e6a87', 's_orn2_b32 s23, exec_lo, vcc_lo': '7e6a178b',
+        's_mov_b32 s23, vcc_lo': '6a0397be', 's_and_b32 s23, vcc_lo, exec_hi': '6a7f1787', 's_and_b32 s23, vcc_hi, exec_lo': '6b7e1787',
+        's_cbranch_scc1 65533': 'fdff85bf'})
+    compare = ['s_cbranch_execz 1', 'v_cmp_gt_u32 vcc_lo, 3, v0']
+    for read in ('s_and_b32 s23, vcc_lo, exec_lo', 's_and_b32 s23, exec_lo, vcc_lo', 's_orn2_b32 s23, vcc_lo, exec_lo',
+                 's_and_b32 vcc_lo, vcc_lo, exec_lo'):
+        translate('A', code=splice(*enter, *compare, read, *leave, 's_cbranch_vccz 1', 'v_mov_b32 v5, s20')
+                  if read.startswith('s_and_b32 vcc') else splice(*enter, *compare, read, *leave)).hlsl_cs()
+    assert translate('NM').hlsl_cs().endswith('''\
+    if (pc == 1) {
+        vcc = (exec & ((0x00000003u > v0) ? 1u : 0u));
+        pc = 2;
+    }
+    if (pc == 2) {
+        s23 = (vcc & exec) & 1;
+        scc = s23 != 0;
+        exec = (exec | s0) & 1;
+        scc = exec != 0;
+        if (exec & 1) v5 = ud0 ^ v3;
+        exec = (s23) & 1;
+        a = (v4 + 0) & 0xfffffffcu;
+        if (exec & 1) u0.Store(a, v5);
+        exec = (s21) & 1;
+        pc = 0xffffu;
+    }
+}
+''')
+    # Refused: a read once exec has been restored, a copy, exec | ~vcc (vcc decides), exec_hi in the low half, the
+    # vcc branch after an absorbed read, and an absorbed read at the join that a loop re-enters after the restore
+    # (exec is no longer the join's there). The reason names the first read that is not proven.
+    live = 'v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc, live where the block joins'
+    for before, after, name in (([], ['s_and_b32 s23, vcc_lo, exec_lo'], 's_and_b32'),
+                                (['s_mov_b32 s23, vcc_lo'], [], 's_mov_b32'),
+                                (['s_orn2_b32 s23, exec_lo, vcc_lo'], [], 's_orn2_b32'),
+                                (['s_and_b32 s23, vcc_lo, exec_hi'], [], 's_and_b32'),
+                                (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_vccz 1', 'v_mov_b32 v5, s20'],
+                                 's_cbranch_vccz'),
+                                (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_scc1 65533'], 's_and_b32')):
+        refused('%s: read by %s after the join' % (live, name), lambda before=before, after=after: translate(
+            'A', code=splice(*enter, *compare, *before, *leave, *after)).hlsl_cs())
+    # Wave64: the compare writes vcc_hi too (its decoded text names vcc_lo only). A 32-bit read of vcc_hi after the join
+    # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted.
+    refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc_hi, live where the block '
+            'joins: read by s_and_b32 after the join',
+            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs())
+    assert G.exec_absorbs('s_and_b32', 's_and_b32 s2, vcc_hi, exec_lo', 'vcc_hi') is False
+    # The rule on its own: which reads exec absorbs for a word.
+    for line, word, absorbed in (('s_and_b32 s2, s3, exec_lo', 's3', True), ('s_and_b64 s[2:3], exec, s[4:5]', 's5', True),
+                                 ('s_nand_b32 s2, exec_lo, s3', 's3', True), ('s_orn2_b32 s2, s3, exec_lo', 's3', True),
+                                 ('s_orn2_b32 s2, exec_lo, s3', 's3', False), ('s_or_b32 s2, s3, exec_lo', 's3', False),
+                                 ('s_and_b32 s2, s3, s3', 's3', False), ('s_and_b64 s[2:3], s[4:5], exec', 's4', True),
+                                 ('s_and_b64 s[2:3], s[4:5], s[4:5]', 's4', False), ('s_and_b32 s2, s3, exec_hi', 's3', False),
+                                 ('s_and_b64 s[2:3], s[4:5], exec_lo', 's4', False)):
+        assert G.exec_absorbs(line.split()[0], line, word) == absorbed, line
+    # A mask the block only narrows by lanes whose exec bit is clear for a skipped lane: `s_andn2 R, R, X` with X
+    # clear for that lane (the exec-write proof's fact at that instruction) keeps its bit of R, so at the join it is
+    # the model's. Reads that take bit n of the result from bit n of R, for the same half, and write it to that exec
+    # word or back to R are then the model's too. Accepted on the restore after the block (case O runs it on the GPU).
+    SPLICE.update({'s_andn2_b32 s0, s0, exec_lo': '007e008a', 's_andn2_b32 s0, s0, s21': '0015008a',
+                   's_mov_b32 s1, s0': '000381be', 's_add_u32 s23, s0, 1': '00811780'})
+    save = ['s_mov_b32 s21, exec_lo', 'v_cmp_gt_u32 vcc_lo, 1, v0', 's_and_saveexec_b32 s0, vcc_lo']
+    translate('A', code=splice(*save, 's_cbranch_execz 1', 's_andn2_b32 s0, s0, exec_lo', 's_mov_b32 exec_lo, s0',
+                               *leave)).hlsl_cs()
+    assert translate('O').hlsl_cs().endswith('''\
+    if (pc == 1) {
+        vcc = (exec & ((0x00000003u > v0) ? 1u : 0u));
+        exec = (exec & vcc) & 1;
+        scc = exec != 0;
+        s0 = (s0 & ~exec) & 1;
+        scc = s0 != 0;
+        pc = 2;
+    }
+    if (pc == 2) {
+        exec = (s0) & 1;
+        if (exec & 1) v5 = ud0 ^ v3;
+        a = (v4 + 0) & 0xfffffffcu;
+        if (exec & 1) u0.Store(a, v5);
+        exec = (s21) & 1;
+        pc = 0xffffu;
+    }
+}
+''')
+    # Refused: X not clear (the mask saved before the block), another write of s0 in the block, alone or after the
+    # narrowing, a copy and a data read after the join, and a block that a branch from outside enters (the fact is
+    # not proven there).
+    kept = ' inside a block s_cbranch_execz skips per lane: definition of s0, live where the block joins: read by %s ' \
+           'after the join'
+    for prefix, body, join, inner, name in (
+            ([], ['s_andn2_b32 s0, s0, s21'], [], 's_andn2_b32', 's_mov_b32'),
+            ([], ['s_mov_b32 s0, 4'], [], 's_mov_b32', 's_mov_b32'),
+            ([], ['s_andn2_b32 s0, s0, exec_lo', 's_mov_b32 s0, 4'], [], 's_andn2_b32', 's_mov_b32'),
+            ([], ['s_andn2_b32 s0, s0, exec_lo'], ['s_mov_b32 s1, s0'], 's_andn2_b32', 's_mov_b32'),
+            ([], ['s_andn2_b32 s0, s0, exec_lo'], ['s_add_u32 s23, s0, 1'], 's_andn2_b32', 's_add_u32'),
+            (['s_cbranch_scc1 1'], ['s_andn2_b32 s0, s0, exec_lo'], [], 's_andn2_b32', 's_mov_b32')):
+        refused(inner + kept % name, lambda prefix=prefix, body=body, join=join: translate('A', code=splice(
+            *save, *prefix, 's_cbranch_execz %d' % len(body), *body, *join, 's_mov_b32 exec_lo, s0', *leave)).hlsl_cs())
+    # The rule's steps on their own: the halves a write keeps, and the reads that keep the lane's bit.
+    for line, word, clear, halves in (('s_andn2_b32 s0, s0, exec_lo', 's0', start, {0}),
+                                      ('s_andn2_b64 s[0:1], s[0:1], exec', 's1', start, {1}),
+                                      ('s_andn2_b64 s[0:1], s[0:1], exec', 's1', {('exec', 0)}, set()),
+                                      ('s_andn2_b32 s0, s0, exec_hi', 's0', start, {1}),
+                                      ('s_andn2_b32 s0, s1, exec_lo', 's0', start, set()),
+                                      ('s_or_b32 s0, s0, exec_lo', 's0', start, set())):
+        assert G.kept_halves(line.split()[0], line, word, clear) == halves, line
+    for line, word, halves, ok in (('s_mov_b32 exec_lo, s0', 's0', {0}, True), ('s_mov_b32 exec_lo, s0', 's0', {1}, False),
+                                   ('s_mov_b64 exec, s[0:1]', 's1', {1}, True), ('s_mov_b64 exec, s[0:1]', 's1', {0}, False),
+                                   ('s_andn2_b32 s0, s0, exec_lo', 's0', {0}, True), ('s_mov_b32 s1, s0', 's0', {0}, False),
+                                   ('s_and_b32 exec_lo, s0, exec_hi', 's0', {0}, False),
+                                   ('s_mov_b32 exec_hi, s0', 's0', {1}, False)):
+        assert G.lane_read(line.split()[0], line, word, halves) == ok, line
     # The compiler's i1-phi lane mask: M is zeroed before the branch, set from exec in the block, and read per lane
     # after the join. For a lane the model skips, the wave's M bit is 0 either way (exec only narrows in the block),
     # which is the model's M. Accepted for vcc_lo and for an sN, with a move or an s_and in either operand order.
@@ -1500,6 +1692,8 @@ CONTROLS = {
     'j-scalar-dropped': ('J', '        s22 = s7 * ud1;\n', ''),
     'h-inner-unpredicated': ('H', 'if (exec & 1) u0.Store(a, v5);', 'u0.Store(a, v5);'),
     'm-else-unswitched': ('M', 'exec = (s0 & ~exec) & 1;', 'exec = (s0) & 1;'),  # the then lanes run the else arm
+    'n-unmasked': ('NM', 's23 = (vcc & exec) & 1;', 's23 = (vcc) & 1;'),  # lanes 6 and 7 store with their stale vcc
+    'o-mask-kept': ('O', 's0 = (s0 & ~exec) & 1;', 's0 = (s0) & 1;'),  # lanes 0-2 keep their bit and store
     'k-block-entered': ('K', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),  # skipped waves run it
     'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
                           'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),

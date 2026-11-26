@@ -362,8 +362,8 @@ def check_exec_join():
     exec_join_refused(JOINED_S16, and_s16, **only_skips)
     # a plain run-time number on every path is no joined register: the read is the ordinary one;
     assert '        s16 = (s16 & exec) & 1;' in exec_join_hlsl(and_s16, before=cmp_ne(16, 0))
-    # a compute stage is left out: the pre-pass refuses a definition inside the skipped block that the target reads,
-    # and with the pre-pass out of the way the target's read is refused as it was, not absorbed.
+    # The compute pre-pass can now prove the lane absorption, but the scalar value is still a
+    # joined descriptor/number, so lowering must still refuse its numeric use.
     cs = (bytes.fromhex('06038abe80038bbe05030cf4000000fa7fc08cbf') + cmp_ne(30, 0) + sop2(S_AND_B64, EXEC, EXEC, 30)
           + sopp(EXECZ, 2) + cmp_ne(12, 0) + sop2(S_AND_B64, 12, 12, EXEC) + bytes.fromhex('0c02027e000081bf'))
     import startup_gfx2hlsl_compute_check as C
@@ -374,13 +374,8 @@ def check_exec_join():
         except G.Unsupported as reason:
             return str(reason)
         raise AssertionError('compute accepted')
-    assert 'definition of s12, live where the block joins' in refusal_of_cs()
-    pre_pass = G.Stage.execz_refusals
-    G.Stage.execz_refusals = lambda self: {}
-    try:
-        assert refusal_of_cs() == 'numeric use of s12 holding joined at a branch target', refusal_of_cs()
-    finally:
-        G.Stage.execz_refusals = pre_pass
+    reason = refusal_of_cs()
+    assert reason == 'numeric use of s12 holding joined at a branch target', reason
     # Without the lowering every accepted form is refused where it reads s16.
     absorbed = G.Stage.exec_absorbed_source
     G.Stage.exec_absorbed_source = lambda self, base, srcs: None
