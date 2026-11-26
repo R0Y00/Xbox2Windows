@@ -5415,8 +5415,17 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
 // (3), the converter entry's root signature and pipeline (2), the alias entry's placed buffer (1), the
 // readback entry's buffer and fence (2). The caller can warm one cache at a time to see each one release
 // what it owns when the module is unloaded.
-extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches)
+//
+// `placed_heap` is how bit 4 hands the heap it creates over to the caller. The alias entry keeps that heap
+// as a key only -- it owns no reference, as the route's heap belongs to the device's allocation -- so the
+// one reference this probe holds is the caller's from the moment the entry is entered, and the caller must
+// release it after the cache released the placed buffer (a heap must outlive the resources placed in it).
+// Bit 4 is not warmed when `placed_heap` is null: an entry whose backing heap nobody owns is the leak this
+// handover exists to rule out. Every other bit leaves `*placed_heap` null.
+extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches,
+                                                                    ID3D12Heap** placed_heap)
 {
+    if (placed_heap) *placed_heap = nullptr;
     if (!device || !caches || (caches & ~15u)) return 0;
     UINT owned = 0;
     if (caches & 1u) {
@@ -5469,7 +5478,12 @@ extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Devic
         std::fprintf(stderr, "x2w-cache-probe device=%p wrapper=%p desktop=%p caches=0x%x\n",
                      static_cast<void*>(device), static_cast<void*>(wrapper), static_cast<void*>(desktop), caches);
 
-    if (caches & 4u) {
+    // Bit 4 needs an owner for the heap it creates, and that owner is the caller: with no out pointer
+    // there is nowhere to put the reference, so the alias is not warmed at all rather than entered on a
+    // heap nobody owns for the rest of the process.
+    if ((caches & 4u) && !placed_heap && trace)
+        std::fputs("x2w-cache-probe placed: no heap out pointer, bit 4 not warmed\n", stderr);
+    if ((caches & 4u) && placed_heap) {
         // One placed buffer on a heap of this device, entered where the translated indirect address route
         // keeps its aliases. The page word is only the cache key: no title address is involved here, and
         // the entry never dereferences the heap. The route's buffers carry ALLOW_CROSS_ADAPTER; sharing
@@ -5501,10 +5515,11 @@ extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Devic
             if (trace) std::fprintf(stderr, "x2w-cache-probe insert=%d used=%u/64\n", entered ? 1 : 0, used);
             if (entered) {
                 // The route's heap belongs to the device's allocation, not to an alias entry: the shim
-                // keeps it for the device's lifetime. Leaving this reference is what keeps the placed
-                // buffer's memory valid past the probe and past this module (a heap must outlive the
-                // resources placed in it), and matches what the real entry's heap does.
-                heap.Detach();
+                // keeps it for the device's lifetime, and the entry only stores the pointer. This probe
+                // created its own heap, so the one reference it holds is not abandoned here but handed to
+                // the caller, who owns it from now on and releases it after the placed buffer this entry
+                // keeps -- a heap must outlive the resources placed in it.
+                *placed_heap = heap.Detach();
                 ++owned;
             }
         }

@@ -12,6 +12,12 @@
 // and that reference has to stay alone once the module is gone -- the count of the entry's own object is
 // the release measure.
 //
+// The placed-alias case also owns the heap its buffer is placed on. The probe creates that heap and hands
+// its one reference over (the entry keeps the heap as a key only, as the real route does), so the fixture
+// holds it across the unload and releases it only after the cache released the placed buffer: a heap must
+// outlive the resources placed in it. That release has to be the last reference on the heap, and the case
+// fails when it is not, because a heap left with no owner is the leak this check exists to catch.
+//
 // Termination: a second load warms every cache and is deliberately left loaded. On process exit the
 // loader detaches the module with lpReserved != nullptr, after Windows has stopped the display driver;
 // releasing a pipeline state then faults inside the driver (amdxc64 offset 0x35f2a19, through
@@ -51,8 +57,9 @@ namespace {
 
 using XboxCreateDevice = HRESULT(WINAPI*)(IUnknown*, const void*, REFIID, void**);
 // Probe bits: 1 the indexed-validation pipeline, 2 the rectangle-list argument converter, 4 the placed
-// page aliases, 8 the draw-dump readbacks.
-using CachedObjectsProbe = UINT(WINAPI*)(ID3D12Device*, UINT);
+// page aliases, 8 the draw-dump readbacks. Bit 4 also creates a heap and hands its one reference over
+// through the third argument, which only it fills; the alias entry keeps that heap as a key only.
+using CachedObjectsProbe = UINT(WINAPI*)(ID3D12Device*, UINT, ID3D12Heap**);
 // One reference of an object a warmed entry owns: cache 4 slot 0 the placed buffer, cache 8 slot 0 the
 // readback buffer, cache 8 slot 1 its fence.
 using CachedObjectProbe = IUnknown*(WINAPI*)(UINT, UINT);
@@ -62,14 +69,15 @@ struct CacheCase {
     UINT probe_bits;
     UINT owned;     // objects the warmed cache holds for one device
     unsigned slots; // owned objects the probe hands out; 0: measured through the device count
+    bool heap;      // the probe also hands over the placed buffer's backing heap
 };
 
 // One case per cache, so a leak names the cache that kept it.
 constexpr CacheCase cache_cases[] = {
-    {"indexed-validation", 1u, 3u, 0u},  // device, root signature, pipeline
-    {"rect-converter", 2u, 2u, 0u},      // root signature, pipeline
-    {"placed-pages", 4u, 1u, 1u},        // the placed buffer behind the alias entry
-    {"draw-readbacks", 8u, 2u, 2u},      // the readback buffer and the fence that owns its completion
+    {"indexed-validation", 1u, 3u, 0u, false},  // device, root signature, pipeline
+    {"rect-converter", 2u, 2u, 0u, false},      // root signature, pipeline
+    {"placed-pages", 4u, 1u, 1u, true},         // the placed buffer behind the alias entry, and its heap
+    {"draw-readbacks", 8u, 2u, 2u, false},      // the readback buffer and the fence that owns its completion
 };
 
 // Same selection convention as the other D3D12 fixtures: WARP on request, otherwise the first
@@ -192,6 +200,16 @@ void release_objects(IUnknown* (&objects)[2])
     }
 }
 
+// Gives back what the fixture holds of a placed alias entry on an error path: the placed buffer's
+// reference first, then the heap behind it. A heap must outlive the resources placed in it, so the two
+// releases are not interchangeable; the success path below releases them one at a time instead, because
+// it reports each count.
+void release_placed(ComPtr<ID3D12Heap>& heap, IUnknown* (&objects)[2])
+{
+    release_objects(objects);
+    heap.Reset();
+}
+
 // Phase 1: load, warm one cache, unload explicitly, and check that this cache released what it owned.
 int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase& cache)
 {
@@ -213,13 +231,33 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
     ULONG before = 0, warm = 0;
     IUnknown* objects[2] = {nullptr, nullptr};
     ULONG held[2] = {0, 0};
+    // The backing heap of the placed buffer, when this case has one: the probe hands it over with the one
+    // reference it holds, so the fixture owns it from here to the end of this function -- across the
+    // unload -- and it is released last, after the cache and the fixture both let the placed buffer go.
+    ComPtr<ID3D12Heap> heap;
+    ULONG heap_held = 0;
     if (!cache.slots) before = reference_count(device.Get());
 
-    const UINT owned = probe(device.Get(), cache.probe_bits);
+    ID3D12Heap* warmed_heap = nullptr;
+    const UINT owned = probe(device.Get(), cache.probe_bits, &warmed_heap);
+    if (warmed_heap) heap.Attach(warmed_heap);
     if (owned != cache.owned) {
         std::fprintf(stderr, "%s: probe reports %u cached objects, expected %u\n", cache.name, owned, cache.owned);
+        release_placed(heap, objects);
         FreeLibrary(shim);
         return 5;
+    }
+    if (cache.heap != (heap.Get() != nullptr)) {
+        std::fprintf(stderr, "%s: the probe %s a backing heap for the placed buffer, expected %s\n", cache.name,
+                     heap ? "also handed over" : "handed over no", cache.heap ? "one" : "none");
+        release_placed(heap, objects);
+        FreeLibrary(shim);
+        return 15;
+    }
+    if (heap) {
+        heap_held = reference_count(heap.Get());
+        std::printf("warm %s: backing heap handed over with %lu reference%s\n", cache.name,
+                    static_cast<unsigned long>(heap_held), heap_held == 1 ? "" : "s");
     }
 
     if (cache.slots) {
@@ -228,6 +266,7 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
             objects[slot] = object_probe(cache.probe_bits, slot);
             if (!objects[slot]) {
                 std::fprintf(stderr, "%s: the warmed cache owns no object in slot %u\n", cache.name, slot);
+                release_placed(heap, objects);
                 FreeLibrary(shim);
                 return 6;
             }
@@ -235,7 +274,7 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
             if (held[slot] < 2) {
                 std::fprintf(stderr, "%s: slot %u reports %lu references, expected the cache's and this fixture's\n",
                              cache.name, slot, static_cast<unsigned long>(held[slot]));
-                release_objects(objects);
+                release_placed(heap, objects);
                 FreeLibrary(shim);
                 return 6;
             }
@@ -253,12 +292,14 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
     if (!FreeLibrary(shim)) {
         std::fprintf(stderr, "%s: FreeLibrary failed: %lu\n", cache.name,
                      static_cast<unsigned long>(GetLastError()));
-        release_objects(objects);
+        // The cache still owns the placed buffer here, so this run has already failed; the fixture gives
+        // back what it holds in the order it would have used otherwise.
+        release_placed(heap, objects);
         return 7;
     }
     if (GetModuleHandleW(L"d3d12_xs.dll")) {
         std::fprintf(stderr, "%s: d3d12_xs.dll is still loaded after FreeLibrary\n", cache.name);
-        release_objects(objects);
+        release_placed(heap, objects);
         return 8;
     }
 
@@ -269,13 +310,32 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
                 std::fprintf(stderr, "%s: the unloaded module kept a reference on slot %u: %lu -> %lu (expected %lu)\n",
                              cache.name, slot, static_cast<unsigned long>(held[slot]),
                              static_cast<unsigned long>(after), static_cast<unsigned long>(held[slot] - 1));
-                release_objects(objects);
+                release_placed(heap, objects);
                 return 9;
             }
             std::printf("unload %s: slot %u reference %lu -> %lu\n", cache.name, slot,
                         static_cast<unsigned long>(held[slot]), static_cast<unsigned long>(after));
         }
+        // The module dropped its reference on the placed buffer above; this drops the fixture's. The heap
+        // has to outlive the buffer placed in it, so it is released only now -- and that release is the
+        // last reference, which is what proves the fixture, and not the cache, owned the heap.
         release_objects(objects);
+        if (heap) {
+            // Still alive with the module gone, and what keeps it alive is the fixture's reference: it was
+            // taken from the probe before the unload and this scope is where it ends.
+            const ULONG alive = reference_count(heap.Get());
+            std::printf("unload %s: heap alive after the unload, %lu reference%s, placed buffer released first\n",
+                        cache.name, static_cast<unsigned long>(alive), alive == 1 ? "" : "s");
+            ID3D12Heap* released = heap.Detach();
+            const ULONG last = released->Release();
+            if (last != 0) {
+                std::fprintf(stderr, "%s: the fixture's heap release was not the last: %lu references left, so "
+                                     "something else owns the backing heap\n",
+                             cache.name, static_cast<unsigned long>(last));
+                return 16;
+            }
+            std::printf("unload %s: heap released last, %lu -> 0\n", cache.name, static_cast<unsigned long>(alive));
+        }
         std::printf("unload %s: %u objects released, module unloaded\n", cache.name, owned);
         return 0;
     }
@@ -323,13 +383,21 @@ int termination_warm(const std::wstring& path, const std::string& backend)
         caches |= cache.probe_bits;
         expected += cache.owned;
     }
-    const UINT owned = probe(device.Get(), caches);
+    ID3D12Heap* placed_heap = nullptr;
+    const UINT owned = probe(device.Get(), caches, &placed_heap);
     if (owned != expected) {
         std::fprintf(stderr, "termination: probe reports %u cached objects, expected %u\n", owned, expected);
         return 5;
     }
+    if (!placed_heap) {
+        std::fputs("termination: the placed alias probe handed over no backing heap\n", stderr);
+        return 6;
+    }
     // Deliberately no FreeLibrary: the shim stays loaded, so the loader detaches it during process exit.
     // Releasing the device here, while the process and the driver still run, is the test's own reference.
+    // The backing heap is kept for the same reason and is not released either: the exit path detaches the
+    // placed buffer instead of releasing it, so the heap has to outlive the process exit. Unlike before
+    // this reference has an owner -- this child -- instead of being abandoned by the probe.
     std::printf("termination: %u objects left to the process exit path\n", owned);
     return 0;
 }
