@@ -208,9 +208,10 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-Graphics and compute use cache revisions `x2w-startup-shader-21` and `x2w-startup-shader-21cs`.
-Revision 21 invalidates compute shaders that assumed the entry EXEC mask at a load reached on a later
+Graphics and compute use cache revisions `x2w-startup-shader-22` and `x2w-startup-shader-22cs`.
+Revision 22 invalidates compute shaders that assumed the entry EXEC mask at a load reached on a later
 loop iteration after an EXEC write. The two cache keys advance together.
+Revision 21 refuses a compute lane-mask form that revision 20 translated (`s_and_b32 M, X, exec_lo` with X data).
 Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch.
 Revision 19 folds `s_mov_b32` from a scalar register that holds a plain constant, so later reads of the copy use the constant word. The fixed slot 57 mesh
 (`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.

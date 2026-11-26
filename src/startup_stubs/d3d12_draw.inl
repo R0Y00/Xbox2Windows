@@ -353,7 +353,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-21";
+    constexpr char revision[] = "x2w-startup-shader-22";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -474,7 +474,7 @@ u64 publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-21cs";  // tools/startup/gfx2hlsl.py compute_key
+    constexpr char compute_revision[] = "x2w-startup-shader-22cs";  // tools/startup/gfx2hlsl.py compute_key
     u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
@@ -1867,6 +1867,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     u64 address = 0, offset = 0, bytes = 0;
     UINT stride = 0;
     const Wrapper* owner = nullptr;
+    bool own_memory = false;
     if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
         ViewRecord record{};
@@ -1896,8 +1897,16 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             bytes = u64{view.Buffer.NumElements} * element;
             stride = raw ? 0 : element;
             if (const auto base = reinterpret_cast<u64>(owner->own().title_memory)) {
+                // A buffer on a custom heap outside the placement index (the memory view path places it in the title's
+                // own heap) is that memory: the view offset is bound in the token's own desktop resource.
+                const auto* info = resource_info(owner);
+                D3D12_HEAP_PROPERTIES props{};
+                D3D12_HEAP_FLAGS flags{};
+                own_memory = info && info->placement == Placement::none &&
+                    SUCCEEDED(static_cast<ID3D12Resource*>(owner->own().real)->GetHeapProperties(&props, &flags)) &&
+                    props.Type == D3D12_HEAP_TYPE_CUSTOM;
                 if (offset > UINT64_MAX - base) return refuse("an input buffer view has no element size or overflows");
-                address = base + offset;
+                if (!own_memory) address = base + offset;
             }
         } else {
             return refuse("an input view token is not a buffer view of a desktop resource");
@@ -1933,6 +1942,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
         if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
             return refuse("an input is in a placed buffer that does not alias title memory");
+    } else if (own_memory) {
+        native = static_cast<ID3D12Resource*>(owner->own().real);
     } else if (owner && !owner->own().title_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
         D3D12_HEAP_PROPERTIES props{};

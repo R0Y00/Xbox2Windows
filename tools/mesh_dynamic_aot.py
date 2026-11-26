@@ -26,6 +26,7 @@ from pathlib import Path
 
 from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
 from mesh_entry_aot import U32, UNDEF, Wave, decode_mesh, float4, live_barriers_agree, run_group
+from mesh_param_link import hlsl_param_fields, hlsl_param_writes, merge_wave_params, validate_linkage
 
 
 MAX_VARIANTS = 32
@@ -334,6 +335,7 @@ class Variant:
     indices: dict
     # {vertex: {(kind, vector): values}} for the enabled clip and cull distances.
     distances: dict = None
+    params: dict = None
 
 
 def run_variant(decoded, geometry, limits, conditions):
@@ -344,16 +346,15 @@ def run_variant(decoded, geometry, limits, conditions):
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = first.counts[0]
     pos = first.positions | second.positions
-    attrs = first.attributes | second.attributes
+    params = merge_wave_params([first, second], pos)
+    attrs = params.get(0, {})
     indices = first.indices | second.indices
     if (not 0 <= nv <= limits[0] or not 0 <= np <= limits[1]
             or set(pos) != set(range(nv)) or set(indices) != set(range(np))
             or any(max(triangle) >= nv for triangle in indices.values())):
         raise ValueError("Conflicting mesh counts, vertices or primitive indices")
-    if attrs and attrs.keys() != pos.keys():
-        raise ValueError("Incomplete vertex attribute")
     distances = vertex_distances(first.position_exports | second.position_exports, geometry.distance_layout)
-    return Variant(conditions, (nv, np), expressions, pos, attrs, indices, distances)
+    return Variant(conditions, (nv, np), expressions, pos, attrs, indices, distances, params)
 
 
 def enumerate_variants(decoded, geometry_word_count, limits, sampler_heap_sgpr=None, vs_out_cntl=None):
@@ -384,13 +385,21 @@ def enumerate_variants(decoded, geometry_word_count, limits, sampler_heap_sgpr=N
             pending.append((*conditions, (split.index, split.value, True)))
     if not any(variant.conditions for variant in variants):
         raise ValueError("No runtime geometry comparisons")
-    if len({bool(variant.attributes) for variant in variants if variant.positions}) > 1:
+    if len({frozenset(variant.params) for variant in variants if variant.positions}) > 1:
         raise ValueError("Runtime mesh branches disagree on the vertex signature")
     return variants
 
 
-def emit_hlsl(variants, limits, distance_layout=None):
-    has_attributes = any(variant.attributes for variant in variants)
+def emit_hlsl(variants, limits, distance_layout=None, param_linkage=None):
+    exported_params = tuple(sorted(next((v.params for v in variants if v.positions), {})))
+    validate_linkage(
+        exported_params,
+        pixel_attrs=param_linkage.pixel_attrs if param_linkage is not None else None,
+        flat=param_linkage.flat if param_linkage is not None else (),
+        f16_plain=param_linkage.f16_plain if param_linkage is not None else (),
+        distance_vectors=len(distance_layout.fields()) if distance_layout else 0,
+        semantic=param_linkage.semantic if param_linkage is not None else ("param" if any(s > 0 for s in exported_params) else "texcoord"),
+    )
     input_words = sorted({index for variant in variants for index, _, _ in variant.conditions})
     samples = any(expr.startswith(TEXTURE_NAME + ".SampleLevel(")
                   for variant in variants for expr in variant.expressions)
@@ -402,7 +411,7 @@ def emit_hlsl(variants, limits, distance_layout=None):
            f"SamplerState qh[{SAMPLER_HEAP_SIZE}] : register(s0, space{SAMPLER_HEAP_SPACE});"]
           if samples else []),
         "struct Vertex { float4 position : SV_Position; "
-        + ("float4 attr : TEXCOORD0; " if has_attributes else "") + hlsl_fields(distance_layout) + "};",
+        + hlsl_param_fields(exported_params, param_linkage) + hlsl_fields(distance_layout) + "};",
         '[outputtopology("triangle")]',
         "[numthreads(128,1,1)]",
         "void main(uint id : SV_GroupIndex, "
@@ -432,8 +441,14 @@ def emit_hlsl(variants, limits, distance_layout=None):
         for index, position in sorted(variant.positions.items()):
             lines.append(f"    if (id == {index}) {{")
             lines.append(f"      vertices[{index}].position = {float4(position)};")
-            if has_attributes:
-                lines.append(f"      vertices[{index}].attr = {float4(variant.attributes[index])};")
+            for write_line in hlsl_param_writes(
+                f"vertices[{index}]",
+                {s: d[index] for s, d in variant.params.items()},
+                exported_params,
+                float4,
+                param_linkage,
+            ):
+                lines.append(f"      {write_line}")
             if variant.distances:
                 lines.append(f"      {hlsl_writes(f'vertices[{index}]', variant.distances[index])}")
             lines.append("    }")
@@ -445,15 +460,15 @@ def emit_hlsl(variants, limits, distance_layout=None):
     return "\n".join(lines) + "\n"
 
 
-def lower(decoded, geometry_word_count, limits, sampler_heap_sgpr=None, vs_out_cntl=None):
+def lower(decoded, geometry_word_count, limits, sampler_heap_sgpr=None, vs_out_cntl=None, param_linkage=None):
     variants = enumerate_variants(decoded, geometry_word_count, limits, sampler_heap_sgpr, vs_out_cntl)
     layout = None if vs_out_cntl is None else decode_vs_out_cntl(vs_out_cntl)
-    return emit_hlsl(variants, limits, layout)
+    return emit_hlsl(variants, limits, layout, param_linkage)
 
 
-def translate(blob, geometry_word_count, library, sampler_heap_sgpr=None, vs_out_cntl=None):
+def translate(blob, geometry_word_count, library, sampler_heap_sgpr=None, vs_out_cntl=None, param_linkage=None):
     decoded, limits = decode_mesh(blob, library)
-    return lower(decoded, geometry_word_count, limits, sampler_heap_sgpr, vs_out_cntl)
+    return lower(decoded, geometry_word_count, limits, sampler_heap_sgpr, vs_out_cntl, param_linkage)
 
 
 def _same_path(left: Path, right: Path) -> bool:

@@ -9154,6 +9154,51 @@ unsupported profile, SDK header set or device capability as a skip (77).
 Intel Arc B390 and WARP passed the Level tests. WARP passed the Bias tests.
 Arc B390 reported the Bias capability unavailable and skipped those tests.
 
+### gfx1030 2D comparison sample gradients
+
+`image_sample_c_d`, `image_sample_c_d_o`, `image_sample_c_d_g16`, and
+`image_sample_c_d_o_g16` lower to `SampleCmpGrad` for a 2D `R32_FLOAT` view
+with two visible mips and `dmask:0x1`. The contiguous address starts with the
+optional packed signed XY offset, then the comparison reference, the explicit
+gradients in `(du/dx, dv/dx, du/dy, dv/dy)` order, and the full-width UV pair.
+G16 packs each gradient vector as two binary16 components with U in the low
+half and V in the high half. The gradient inputs must be statically known
+normal values or zero in their input precision. The explicit gradients do not
+require whole-quad UV provenance. The comparison sampler uses point XY and
+mip filtering, clamp-to-edge addressing, `MIN_LOD = 0`, `MAX_LOD = 1`, and no
+sampler LOD bias. Bind the same range on the desktop comparison sampler.
+
+The depth fixture compares every RGBA pixel at 8×8 and 16×16 against the CPU
+reference. A horizontal V slope of −1/4 at 8×8 and a vertical U slope of +1/4
+at 16×16 each select mip one. Zeroing the active slope selects mip zero. In
+the offset forms, replacing `(1, -2)` with `(0, 0)` changes the taps in mip one.
+Each mutation must match its complete CPU reference and first differ from the
+original at the predicted pixel and values. The fixture measures these whole
+mip choices and leaves fractional LOD transitions unmeasured.
+
+LLVM 15 code generation checks the comparison reference, optional offset and
+gradient order for all four encodings, including the two distinct G16 packed
+words. LLVM MC, the disassembler and the container CLI check the end-to-end
+machine-code path. The GLSL `sampler2DShadow` check validates the explicit
+reference and `Grad` or `Grad|ConstOffset` operands in SPIR-V. The DXC compile
+check verifies four distinct gradient components in the emitted DXIL call.
+
+```sh
+python3 -B tests/pixel_compare_grad_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+python3 -B tests/pixel_compare_grad_check.py glsl glslangValidator spirv-val spirv-dis
+```
+
+```powershell
+python -B tests/pixel_compare_grad_check.py compile dxc
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_grad_(warp|hardware)$' -V
+```
+
+The draw requires PS 6.8 and `D3D12_OPTIONS21.SampleCmpGradientAndBiasSupported`.
+An unsupported shader profile or missing SDK or device capability produces a
+capability skip (77). WARP passed readback for all four forms. Intel Arc B390
+reported the comparison gradient capability unavailable and skipped the test.
+Physical GPU readback requires an adapter that reports this capability.
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:
@@ -15508,13 +15553,24 @@ be the lane select of `v_cndmask`, the carry-in of `v_addc`, `v_subb`, `v_add_co
 `s_and_saveexec_b32` / `s_and_b32` with exec. `s_cbranch_vccz`, `s_cbranch_vccnz`, `s_cmp`, a copy of M and M
 as a data operand see the other lanes' bits, which the one-lane model does not have, and keep the refusal.
 
+The same lane mask is accepted with three more block writes, each exact only under a condition. All of them need
+every mask the write uses to hold lane bits (bit 0 is the lane's own bit: a `v_cmp`, an `s_and` with exec, a copy
+of exec, or 0 / -1), not data such as a group id or `s_mov_b32 M, 16`, whose lane bit sits at bit `lane` in the wave:
+- preserving: `s_andn2_b32 M, M, exec_lo` and `s_or_b32 M, M, T`, with T written in the block by a `v_cmp` or an
+  `s_and` of exec and a lane mask. A skipped lane keeps its bit, so M needs no zeroing, but M's last write before the
+  branch must itself hold lane bits (no branch or branch target after it);
+- compare: a `v_cmp` (not `v_cmpx`) into M, only when `s_mov_b32 M, 0` (or `s_movk_i32 M, 0`) is the last write before the branch;
+- all ones: `s_orn2_b32 M, X, exec_lo`, X a lane mask, only when `s_mov_b32 M, -1` is the last write before the branch.
+Zeroing and all-ones writes do not mix, and any other write of M that no later zeroing or all-ones write overwrites
+keeps the refusal.
+
 The block is still refused in these cases:
 - a definition that is live at the join, unless the absorbed-read or narrowed-mask rule proves every read of it
   or it is the lane mask above; a lane mask with a failed condition stays refused (zeroing with a value other
   than 0 or missing, a branch or a branch target between the zeroing and the branch, a write of M that is not
-  from exec, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
+  one of the forms above, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
 - any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
-  some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
+  some of the paths, written by a form the pass does not follow (`s_orn2` into exec, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
   the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven
   calculated `s_setpc_b64` jump counts), or restored from a copy of the other exec half;
 - an effect outside scalar registers, such as a scalar store or atomic, a barrier, `s_endpgm` or `v_writelane`;
@@ -15885,6 +15941,8 @@ python -B tests/startup_gfx2hlsl_scalar_m0_check.py binary llvm-mc-15
 ```
 
 ## Startup translator: uniform sources of v_readfirstlane_b32
+
+In a compute entry block, the translator can bound the bits of an untouched X thread ID by the local group size. For `((tid.x & mask) | scalar) >> n`, the result is `scalar >> n` if every possible thread-ID bit selected by the mask is shifted away. For `v_bfe_u32` with literal offset and width, the translator applies the extraction to the possible thread-ID bits first. If the following shift clears them all, the result is zero. The `masked-tid` and `extracted-tid` compute fixtures read both results after a branch and store one word per thread. Their controls retain a bit in the mask or enlarge the group enough to populate a previously zero bit in the field.
 
 The startup shaders are compiled with FXC (shader model 5), which has no wave intrinsics. The translator lowers `v_readfirstlane_b32 sD, vS` to `sD = vS` only when it proves that `vS` holds the same value in every lane. The previous proof covered only a `v_cvt_i32_f32` of a fixed buffer word. An unproven source still produces `v_readfirstlane_b32 requires a proven uniform source` (see [issue #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)).
 
