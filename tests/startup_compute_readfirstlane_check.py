@@ -160,21 +160,25 @@ def expected():
     return out
 
 
-def llvm_lines():
+def llvm_decoded_lines(decoded):
+    """Format decoded instructions for llvm-mc, resolving label branches to dword offsets."""
     lines = []
-    for off, _n, _name, asm in DECODED:
+    for off, _n, _name, asm in decoded:
         m = re.fullmatch(r'(s_branch|s_cbranch_\w+) label_0x([0-9a-f]+)', asm)
         if m:
             lines.append('%s %d' % (m.group(1), (int(m.group(2), 16) - off - 4) // 4))
         else:
             lines.append(asm.replace('vcc_lo', 'vcc'))
-    lines += [
+    return lines
+
+
+def llvm_lines():
+    return llvm_decoded_lines(DECODED) + [
         's_cbranch_vccnz -8',
         's_cbranch_vccz 1',
         's_mov_b32 s20, 9',
         's_mov_b32 s22, vcc_lo',
     ]
-    return lines
 
 
 def check_binary(llvm_mc):
@@ -393,8 +397,7 @@ def img_load_controls(llvm_mc=None):
     finally:
         G.UNIFORM_IMAGE_LOADS = saved
     if llvm_mc:
-        decoded = G.decode(IMG_LOAD_WORDS)
-        lines = [asm for _, _, _, asm in decoded]
+        lines = llvm_decoded_lines(G.decode(IMG_LOAD_WORDS))
         proc = subprocess.run(
             [llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64,-wavefrontsize32', '-show-encoding'],
             input='\n'.join(lines) + '\n', capture_output=True, text=True, check=True)
