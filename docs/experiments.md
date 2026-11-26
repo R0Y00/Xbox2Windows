@@ -17299,3 +17299,111 @@ needs support for consuming the resulting `srv ... buf root` manifest record.
 ```powershell
 ctest --test-dir out/build/release --no-tests=error -R "^startup_compute_global_load_(controls|warp|hardware)$" -V
 ```
+
+## Design B retention pressure and the 16 GiB host-commit reduction (#2379)
+
+R0Y00's standing decision on #2379 keeps **design B** (#2679): a materialized descriptor and its copies own the
+resource until the slot is overwritten, copied over, or the heap wrapper is destroyed. A final guest `Release()`
+plus completed release fences retire prior references and submissions, but a live descriptor slot must still
+support rebinding, so `drain_retired_resources()` frees a class member only when `retire_view_refs == 0` and no
+recording hold or in-flight submission names it. Slice 3 ended with #2719 (slots 19-21 tracked like slot 18);
+`X2W_D3D12_RELEASE_RETIRED_VIEWS` stays a legacy diagnostic that logs clearing is disabled. The retained bytes
+below are therefore **intended pressure**, not a reclamation bug, and are recorded here as the measurement that
+decision rests on. No game names, paths, dumps or captures are included; adapters and aggregate counters only.
+
+### Matched retention pair (AMD Radeon RX 9070 XT, 16 GB, driver 32.0.32029.2010, Windows 11 26300)
+
+One release build, `main` `6b9fb9d9` (#2468 merged), only `X2W_D3D12_RELEASE_RETIRED` differs; same executable,
+saved profile, warm shader cache, 32 GiB job cap, `X2W_D3D12_BUDGET=1`, `run.ps1 -Render`, 600 s window, scripted
+input that clears the legal/acceptance page (MasterDomino, #2379):
+
+| | switch off | switch on |
+|---|---|---|
+| first failure / timeout | access violation at **490.7 s** after 8x `0x8007000e` | none; still running at the 600 s timeout |
+| `0x8007000e` / device removed | 8 / 0 | 0 / 0 |
+| desktop references dropped by the drain | 0 | 53,000 |
+| texture retained, peak | **10.67 GB / 4,874** | **9.41 GB / 4,364** |
+| texture retained, end | 10.67 GB / 4,874 | 9.10 GB / 4,267 |
+| DXGI local usage / budget, peak | 20.32 / 14.51 GB | 19.91 / 14.46 GB |
+| DXGI non-local usage, peak | 6.01 GB | 6.43 GB |
+| system commit 10 s after exit | 24.9 GiB | 25.0 GiB |
+
+Retention climbs in steps and does not come back down (switch-on: ~0.08 GB at 290 s, 3.80 GB at 375 s, 6.28 GB at
+460 s, 9.39 GB at 520 s). Slice 2 removed the out-of-memory failure inside the window but left local usage about
+5.4 GB over the DXGI budget; a second switch-on run at `e29b1a7b` reached the timeout with 9.14 GB retained. The
+~9 GB is the design-B remainder: slot 133 textures whose SRV lives in a heap slot the workload never overwrites.
+
+### Attribution: live slots vs recording holds vs in-flight work
+
+A local opt-in reason counter (JB2WIN, #2379, `1cce2a32`, ~6 min start-up run) attributed every final-released,
+still-live resource:
+
+```
+x2w-retire held: view-refs=2297/4445110272(oldest 4374f) never-class:buffer=8178/551813120
+  never-class:dimension=4/262144 never-class:rt-ds-uav=14/200212480
+  view-refs-in-visible-heap=2297/4445110272 total=10493/5197398016 unattributed=0/0
+```
+
+About **4.4 GB** (4,445,110,272 bytes / 2,297 objects, oldest 4,374 frames) are slot 133 class members kept alive
+only by a descriptor in a shader-visible heap that is never overwritten (`view-refs`, all in visible heaps);
+~0.55 GB are never-class buffers and ~0.2 GB never-class RT/DS/UAV textures. `unattributed=0/0`: the counter
+accounts for every retained byte.
+
+Upstream `X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`) emits one
+`x2w-retire held:` heartbeat line from `retire_reasons_line` (`src/startup_stubs/d3d12_xs_device.cpp`). The `Held`
+taxonomy distinguishes the three ownership kinds R0Y00 asked to separate:
+
+- **live descriptor slots** - `view-refs` (a tracked `HeapInfo::shadow` cell still names the resource), plus
+  `view-refs-in-visible-heap` for the shader-visible subset;
+- **recording holds** - `list-hold` (`retire_list_holds`, a closed recording that names the resource) and
+  `unqueued` / `drain-pending`;
+- **in-flight work** - `flight` (`retire_flights`, a submission behind an unsignalled fence) and
+  `queued-waiting-fence`;
+- resources that left the class are reported as `left-class:{view,view-copy,residency,present,hold-missed}` and
+  `never-class:{slot,buffer,dimension,msaa,rt-ds-uav,heap-type,heap-flags,title-memory,aliased,reserved}`, with
+  `total` and `unattributed` (budget `retained` minus the attributed sum) closing the line.
+
+On a GTX 1660 SUPER diagnostic run with the current tree the line reads
+`never-class:buffer=2/131072 never-class:dimension=4/262144 never-class:rt-ds-uav=3/103481344 total=9/103874560
+unattributed=0/0`; the descriptor-owned bytes stay in the budget `retained` column because design B keeps them
+resolvable, exactly as the matched pair above measures.
+
+### 16 GiB host-commit reduction (system RAM, distinct from local-VRAM retention)
+
+The retention above is local video memory. A separate pressure on 16 GiB hosts is **system commit**: eager
+`CreateCommittedResource` / `OpenExistingHeapFromAddress` / `MEM_COMMIT` allocations charge the page file even
+when the GPU never touches them. Four opt-in/default changes were measured together on a 16 GiB host (GTX 1660
+SUPER, 5,966 MiB VRAM, Windows 11, `SysCommitLimit` 22,931.8 MiB), release build, `-Render -Translate -FakeUser
+-GpuMirror -LazyMemory`, `X2W_D3D12_LAZY_TEXTURES=1`, 300 s window, 3,260 storage requests, 6,434 frames:
+
+| change | effect |
+|---|---|
+| #2767 `audio: commit the stand-in APU heap on demand` | ~457 MiB eager `MEM_COMMIT` -> reserve + page commit/decommit |
+| #2770 `xmem: lazily reserve below-40 startup blocks and reclaim empty slabs` | below-`2^40` lazy startup + empty 256 MiB slab `CloseHandle` reclaim |
+| #2773 `gpu: defer CreateCommittedResource for read-only slot 133 textures` | read-only slot 133 textures commit on first use |
+| #2775 `gpu: cap slot 133 existing heaps at 256 MiB and grow upload ring on demand` | no multi-GiB `OpenExistingHeapFromAddress` pin; 16 MiB upload-ring start |
+
+| metric | baseline `main` | combined four | delta |
+|---|---|---|---|
+| host commit peak (`x2w-dstorage` heartbeat) | 12,144 MiB | **8,787 MiB** | **-3,357 MiB (-3.28 GiB)** |
+| DXGI non-local peak (`x2w-budget`) | 2,897 MiB | **695 MiB** | -2,202 MiB |
+| existing-heap bytes (`heap` column) | 2,199 MiB | **0 MiB** | -2,199 MiB |
+
+The largest remaining commit targets are slot 133 textures that carry `ALLOW_RENDER_TARGET` /
+`ALLOW_DEPTH_STENCIL` / `ALLOW_UNORDERED_ACCESS` (deferred only for read-only textures by #2773), ~3,155 tiny
+`< 64 KiB` slot 133 buffers paying the WDDM 64 KiB commit floor, and `MEM_MAPPED` duplicate committed buffers.
+These are commit (page-file) reductions and do not change the design-B local-VRAM retention contract.
+
+### Verification
+
+```powershell
+ctest --preset dev --no-tests=error -R "^startup_resource_(retire|budget)" -V
+ctest --preset dev --no-tests=error -R "^startup_slot133_(lazy_textures|heap_cap)" -V
+ctest --preset dev --no-tests=error -R "^(xmem_|startup_run_ps1)" -V
+python -B tests/docs_links_check.py
+```
+
+`startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
+design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences); the matched
+title pairs above are local executable runs, not source-built fixtures, and are recorded as pressure measurements
+only. Refs #2379, #2679, #2719, #1199.
