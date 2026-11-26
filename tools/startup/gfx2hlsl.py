@@ -3140,7 +3140,7 @@ class Stage:
     # Accepted only where the whole quad is proven active: the entry straight-line prefix of a pixel stage that ran
     # s_wqm exec, exec and whose EXEC is still that mask (helper lanes are active, so no source lane is off). A later
     # uniform loop or forward branch elsewhere in the stage does not drop the proof: every path still reaches the
-    # broadcast with the same EXEC, and blocks is empty until the first branch target. bound_ctrl then has nothing to
+    # broadcast with the same EXEC and cannot jump back to the prefix. bound_ctrl then has nothing to
     # decide (the source lane is never disabled), so it is accepted and ignored. A broadcast after a branch target,
     # after EXEC changed, or with divergent EXEC stays refused, as do other DPP controls (pair broadcasts, row shifts,
     # mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
@@ -3165,12 +3165,11 @@ class Stage:
             raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
         if fields.get('bound_ctrl', '1') != '1':
             raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
-        # blocks non-empty means a branch target was reached: the broadcast is no longer in the entry prefix.
-        # has_branches alone is not enough to refuse: a later loop in the same stage is the M200-01/003 shape.
-        # Keep "straight-line pixel stage" in the non-ps path: startup_gfx2hlsl_cvt_off_f32_i4_check pins that needle.
         if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
-        if getattr(self, 'blocks', []) or not getattr(self, 'exec_known', False):
+        # A branch to offset zero also makes the nominal entry block re-entrant.
+        if (getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))) or
+                not getattr(self, 'exec_known', False)):
             raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive

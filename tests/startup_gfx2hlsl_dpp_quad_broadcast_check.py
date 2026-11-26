@@ -113,6 +113,9 @@ LOOP_WORDS = (INT_WORDS[:-len(EXPORT_TAIL)] + bytes.fromhex('800380be') + LOOP_B
               + sopp(5, -len(LOOP_BODY) // 4 - 1) + EXPORT_TAIL)
 # Branch target before the first broadcast: still refused (no longer the entry prefix).
 AFTER_BRANCH_WORDS = WQM + sopp(4, 0) + INT_WORDS[len(WQM):]
+# The same loop targeting offset zero would execute the broadcast again.
+ENTRY_BACKEDGE_PREFIX = LOOP_WORDS[:-len(EXPORT_TAIL) - 4]
+ENTRY_BACKEDGE_WORDS = ENTRY_BACKEDGE_PREFIX + sopp(5, -len(ENTRY_BACKEDGE_PREFIX) // 4 - 1) + EXPORT_TAIL
 # Divergent EXEC before the broadcast: clear exec_lo after WQM so the whole-quad proof is gone.
 DIVERGENT_WORDS = WQM + bytes.fromhex('8003febe') + INT_WORDS[len(WQM):]  # s_mov_b32 exec_lo, 0
 NO_WQM_WORDS = INT_WORDS[len(WQM):]  # the entry EXEC may leave out lanes of a partly covered quad
@@ -275,6 +278,7 @@ def controls():
     check('entry-prefix broadcast still translates when the stage later has branches',
           not refused(sane, branches=True))
     check('refused: broadcast after a branch target', refused_in_stage(AFTER_BRANCH_WORDS))
+    check('refused: branch back to the broadcast entry block', refused_in_stage(ENTRY_BACKEDGE_WORDS))
     check('refused: divergent EXEC before the broadcast', refused_in_stage(DIVERGENT_WORDS))
     check('control: the sane line itself translates', not refused(sane))
     # fi:1 only decides what a disabled source lane returns, and the whole quad is proven active.
