@@ -828,6 +828,8 @@ def scalar_free_span(ins, lo, hi):
             continue
         if name.startswith('s_movrel'):
             return False
+        if name.startswith('v_cmpx'):  # prints only its sources and writes EXEC (exec_only_narrows judges that)
+            continue
         for tok in destinations(name, parse(asm)[1]):
             r = reg_range(tok)
             if r and r[0] == 's' and not (r[1] >= 126 and r[2] <= 127) or tok == 'm0':
@@ -4463,7 +4465,8 @@ class Stage:
             if getattr(self, 'kind', None) == 'ms' and base in ('s_cbranch_scc0', 's_cbranch_scc1') and not self.scc_uniform:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             if getattr(self, 'kind', None) == 'cs' and not getattr(self, 'branch_proven', False) and (
-                    base[10:] in ('vccz', 'vccnz', 'execnz') or (base[10:] in ('scc0', 'scc1') and self.scc_verified and not self.scc_uniform)):
+                    base[10:] in ('vccz', 'vccnz', 'execnz') or (base[10:] in ('scc0', 'scc1') and self.scc_verified and not self.scc_uniform
+                     and self.scc_def is None)):
                 # The wave takes this branch for all its lanes at once, on the whole mask (any / all lanes). The one-lane
                 # model would take it from its own lane's bit, so an unproven condition is refused. s_cbranch_execz has
                 # its own proof (execz_refusals); an SCC from wave-uniform data is the same for every lane.

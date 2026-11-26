@@ -1024,6 +1024,15 @@ def check_wave_branches():
         refused('%s %s' % (branch.split()[0], WAVE_BRANCH), lambda branch=branch: translate('A', code=splice(
             cmp3, save, 's_cbranch_execz 3', 'v_cmp_gt_u32 vcc_lo, 1, v0', branch, 'v_mov_b32 v5, 7',
             's_or_b32 exec_lo, exec_lo, s0')))
+    # The proven-uniform SCC of one compare survives forward joins: two branches that read it, with no SCC write between.
+    translate('A', code=splice('s_cmp_lt_u32 s7, 4', 's_cbranch_scc1 1', 'v_mov_b32 v3, 0', 's_cbranch_scc1 1',
+                               'v_mov_b32 v3, 0')).hlsl_cs()
+    # v_cmpx prints only its sources (here s7, a read) and writes EXEC: a loop closed by it stays scalar-free.
+    SPLICE.update({'v_cmpx_gt_u32 s7, v3': '0706a87d', 's_cbranch_execnz 65533': 'fdff89bf'})
+    (_, _, name, text), = G.decode(bytes.fromhex(SPLICE['v_cmpx_gt_u32 s7, v3']))
+    assert text == 'v_cmpx_gt_u32_e32 s7, v3', text
+    translate('A', code=splice('s_mov_b32 s0, exec_lo', 'v_mov_b32 v3, 0', 'v_add_nc_u32 v3, 1, v3',
+                               'v_cmpx_gt_u32 s7, v3', 's_cbranch_execnz 65533', 's_mov_b32 exec_lo, s0')).hlsl_cs()
     # An execnz loop that only narrows EXEC and changes vector registers: a lane that left changes nothing.
     translate('A', code=splice('s_mov_b32 s0, exec_lo', *loop, 's_and_b32 exec_lo, exec_lo, vcc_lo',
                                's_cbranch_execnz 65532', 's_mov_b32 exec_lo, s0')).hlsl_cs()
