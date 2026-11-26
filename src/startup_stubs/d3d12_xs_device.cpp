@@ -994,14 +994,20 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
     *out = nullptr;
     HRESULT hr = E_NOINTERFACE;
     if (is_base_iid(*iid) || kind_for(*iid) == self->own().kind) {
-        InterlockedIncrement(&self->own().refs);
+        const auto refs = InterlockedIncrement(&self->own().refs);
+        if (self->own().kind == resource_kind && self->own().title_memory) x2w_startup::note_resource_reference(refs);
         *out = self;
         hr = S_OK;
     }
     log("x2w-d3d12 %s::QueryInterface riid=%s -> 0x%08lx", kind_names[self->own().kind], text, static_cast<unsigned long>(hr));
     return hr;
 }
-ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
+ULONG __stdcall add_ref(Wrapper* self)
+{
+    const auto refs = InterlockedIncrement(&self->own().refs);
+    if (self->own().kind == resource_kind && self->own().title_memory) x2w_startup::note_resource_reference(refs);
+    return static_cast<ULONG>(refs);
+}
 // X2W_D3D12_LINEAR_BUFFERS (opt-in): the shared or copied backing of slot 133's linear buffers
 // (src/startup_stubs/linear_buffer_backing.h). Unused while the switch is off.
 x2w_startup::LinearBuffers& linear_buffers()

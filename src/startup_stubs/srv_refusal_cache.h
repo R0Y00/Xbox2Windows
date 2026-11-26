@@ -49,6 +49,13 @@ inline void note_placement_change()
     srv_placement_generation().fetch_add(1, std::memory_order_acq_rel);
 }
 
+// Call with the reference count a resource has just reached by add_ref / query_interface: the step from zero back to
+// one makes it live again for existing_memory_buffer, so a refusal cached while it was released is stale.
+inline void note_resource_reference(long refs_after_increment)
+{
+    if (refs_after_increment == 1) note_placement_change();
+}
+
 struct SrvRefusalKey {
     std::uint64_t device = 0;      // the device wrapper: every placement lookup is per device
     std::uint64_t address = 0;

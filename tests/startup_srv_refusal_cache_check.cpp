@@ -232,6 +232,11 @@ int main(int argc, char** argv)
         const auto before = srv_placement_generation().load();
         note_placement_change();
         check("note_placement_change advances the generation", srv_placement_generation().load() == before + 1);
+        note_resource_reference(2);
+        note_resource_reference(3);
+        check("a reference added to a live resource keeps the generation", srv_placement_generation().load() == before + 1);
+        note_resource_reference(1);
+        check("a resource referenced again from zero advances the generation", srv_placement_generation().load() == before + 2);
     }
 
     if (failures) {
