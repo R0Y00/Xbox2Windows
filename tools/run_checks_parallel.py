@@ -42,6 +42,20 @@ def _validate_script_path(raw_path: str) -> str:
     return raw_path
 
 
+def split_command(line, windows=None):
+    """Split a listed line like a shell would, but keep backslashes in Windows paths.
+
+    POSIX splitting treats a backslash as an escape and would turn `C:\\x2w\\a.py` into
+    `C:x2wa.py`. On Windows the line is split without escapes and matching quotes are removed.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return shlex.split(line)
+    return [word[1:-1] if len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'" else word
+            for word in shlex.split(line, posix=False)]
+
+
 def read_check_files(directory):
     """Return the check commands listed in `directory/*.txt`, files in name order.
 
@@ -62,7 +76,7 @@ def read_check_files(directory):
                 continue
             where = f"{listing}:{number}"
             try:
-                command = shlex.split(line)
+                command = split_command(line)
             except ValueError as exc:
                 raise ValueError(f"{where}: {exc}") from exc
             try:

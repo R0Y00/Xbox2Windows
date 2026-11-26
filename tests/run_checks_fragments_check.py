@@ -1,5 +1,6 @@
 """The parallel check runner also runs the checks listed in a directory of text files."""
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -73,6 +74,12 @@ with tempfile.TemporaryDirectory() as tmp:
     twice = run("--from-dir", two)
     assert twice.returncode == 1 and "b.txt:1" in twice.stdout and "duplicate" in twice.stdout, twice.stdout
     assert run().returncode == 2
+
+# On Windows a listed path keeps its backslashes and quoted words lose their quotes; POSIX
+# splitting would eat the backslashes (`C:\x2w\a.py` -> `C:x2wa.py`).
+split = runpy.run_path(RUNNER)["split_command"]
+assert split(r'C:\x2w\tests\a.py "b c" d', windows=True) == [r"C:\x2w\tests\a.py", "b c", "d"]
+assert split("tests/a.py 'b c' d", windows=False) == ["tests/a.py", "b c", "d"]
 
 # The lists committed to the repository only name scripts that exist, so CI cannot lose one.
 for sub in ("python-linux", "pixel-binary"):
