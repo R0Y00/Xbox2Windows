@@ -799,11 +799,12 @@ def names_one_value(sym):
     if sym is None:
         return False
     if sym[0] == 'desc':
-        # ('desc', source, load offset, dword) and, in a compute stage, the offset of the s_load that read it: the
-        # source does not record an addend on the pointer, so only the same load proves the same words.
+        # A compute descriptor can also carry an integer tag identifying the load or constant high word.
         return len(sym) == 4 or (len(sym) == 5 and isinstance(sym[4], int))
-    # An add on a pointer keeps its symbol and marks it 'added' (the offset is not in the tuple), so only an
-    # untouched pointer, exactly (kind, source), names one value.
+    # A table and a known byte offset identify one descriptor address. The legacy 'added'
+    # marker carries no offset, so two occurrences of it can denote different addresses.
+    if sym[0] == 'ptr' and len(sym) == 3 and sym[1][0] == 'table':
+        return isinstance(sym[2], int)
     return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
 
 
@@ -1395,6 +1396,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
     - Exchange: exec = 1 (lane 0 of each wave), the mask saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
       entry v5 >> 7 at byte 8, waits and passes a barrier; every other wave passes a barrier and reads byte 8 to v5.
     - Code up to the next barrier. Its only read of v5 may be one v_readfirstlane_b32 under exec = -1.
+      After a full EXEC reset, an unsigned GT or LT EXEC compare with defined operands may guard a forward
+      execz branch to that barrier. The skipped instructions only affect active lanes or dead scalars, and
+      both exchange arms replace EXEC, so a per-lane skip has the same visible effects as a per-wave skip.
     - Counts: one barrier; the wave whose index (s_bfe_u32 of s3, 4 bits at 24) is zero stores SGPR P at byte 0 and
       SGPR V at byte 4 under the saved lane-0 mask, waits, passes a barrier and sends one allocation request with
       m0 = P << 12 | V; every other wave passes a barrier and reads both words back into the same P and V.
@@ -1437,6 +1441,40 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
 
     offsets = {item[0]: i for i, item in enumerate(ins)}
     edges = {}
+    count_entry = count_entry_branch = None
+    no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+    exchange_branch_refusal = 'slot 57 mesh: a branch enters or crosses a group-memory exchange'
+
+    def lane_only(i):
+        _, _, name, asm = ins[i]
+        return (name.startswith(('v_', 'buffer_load')) and not name.startswith(EXECZ_REFUSED)
+                and not scalar_effects(name, asm)[2])
+
+    def dead_count_entry_scalar(i):
+        _, _, name, asm = ins[i]
+        if not re.fullmatch(
+                r's_(and|or|xor|andn2|orn2|bfe|max|min|mul|add|sub|lshl|lshr|ashr|mov|movk)_[biu]\d+', name):
+            return False
+        _, must, may = scalar_effects(name, asm)
+        written = must | may
+        regs = written - {'scc'}
+        if not written or any(not re.fullmatch(r's\d+', reg) for reg in regs):
+            return False
+        # Uses within the skipped block are fine. Every path out of it joins at the count exchange.
+        if any(regs & scalar_effects(*ins[j][2:])[0] for j in range(count_at, len(ins))):
+            return False
+        if 'scc' in written:
+            for j in range(count_at, len(ins)):
+                reads, must, may = scalar_effects(*ins[j][2:])
+                if ins[j][2].startswith(('s_cbranch', 's_branch', 's_setpc', 's_call', 's_swappc', 's_endpgm')):
+                    return False
+                if 'scc' in reads:
+                    return False
+                if 'scc' in must:  # a may-write alone (s_barrier) neither reads nor kills it
+                    return True
+            return False
+        return True
+
     for lo, hi in ((0, start), (a_end, count_at), (b_end, len(ins))):
         for i in range(lo, hi):
             off, _, name, asm = ins[i]
@@ -1450,10 +1488,23 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
             dest = offsets.get(target)
             if dest is None:
                 raise Unsupported('slot 57 mesh: a branch target is not an instruction boundary')
-            # The first instruction of an exchange is also the preceding region's join.
-            # Branches must reconverge before that instruction.
             if not lo <= dest < hi:
-                raise Unsupported('slot 57 mesh: a branch enters or crosses a group-memory exchange')
+                # Both count exchange arms replace the incoming EXEC before lane-dependent work.
+                if lo != a_end or dest != count_at or name != 's_cbranch_execz':
+                    raise Unsupported(exchange_branch_refusal)
+                compare = i - 1
+                while compare >= lo and ins[compare][2] in ('s_nop', 's_waitcnt'):
+                    compare -= 1
+                if (compare <= lo or ins[compare - 1][3] != 's_mov_b64 exec, -1'
+                        or ins[compare][2] not in ('v_cmpx_gt_u32_e32', 'v_cmpx_lt_u32_e32')
+                        or any(not (no_effect(k) or lane_only(k) or dead_count_entry_scalar(k))
+                               for k in range(i + 1, dest))):
+                    raise Unsupported(exchange_branch_refusal)
+                _, sources, _ = parse(ins[compare][3])
+                if len(sources) != 2 or any(not (re.fullmatch(r'[sv]\d+', tok) or tok in FLOATS
+                                                 or pc_word(tok) is not None) for tok in sources):
+                    raise Unsupported(exchange_branch_refusal)
+                count_entry, count_entry_branch = compare, i
             if target <= off:
                 raise Unsupported('slot 57 mesh: a loop outside the group-memory exchanges is not covered')
             if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz') + MESH_VCC_BRANCHES:
@@ -1461,7 +1512,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
             edges[i] = dest
 
     targets = set(edges.values())
-    no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+    if count_entry is not None and targets.intersection(range(count_entry, count_at)):
+        raise Unsupported(exchange_branch_refusal)
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
     for source, target in edges.items():
@@ -1476,12 +1528,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
             # s_branch may land at the execz target or past it over instructions without effect (the
             # `s_branch .else` over `.empty: s_nop` of an if/else), so both paths meet with the same state.
             for i in range(source + 1, target):
-                _, _, name, asm = ins[i]
+                name = ins[i][2]
                 if not (no_effect(i) or name == 'exp'
                         or (name == 's_branch' and edges[i] >= target
                             and all(no_effect(k) for k in range(target, edges[i])))
-                        or (name.startswith(('v_', 'buffer_load')) and not name.startswith(EXECZ_REFUSED)
-                            and not scalar_effects(name, asm)[2])):
+                        or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))):
                     raise Unsupported('slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes')
         elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
             raise Unsupported('slot 57 mesh: a branch bypasses an export')
@@ -1504,7 +1555,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
     exports = []
     incoming = {}
     falls = True
-    for index in (list(range(first, start)) + [start] + list(range(a_end, count_at)) + [None]
+    for index in (list(range(first, start)) + [start] + list(range(a_end, count_at + 1))
                   + list(range(b_end, len(ins)))):
         if index in targets:
             paths = incoming[index]
@@ -1536,7 +1587,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
             if base == a_bits or base in lane:
                 base = None
             continue
-        if index is None:
+        if index == count_at:
             if not wave_known:
                 raise Unsupported('slot 57 mesh count exchange: the compared register is not the wave index')
             out.append(span(count_at, b_end - 2) + (
@@ -1629,6 +1680,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
             stale |= pending
             pending.clear()
             mask, scc_stale = ('else', mask), True
+        elif index == count_entry:
+            if mask is not None or mesh_vregs(ops) & stale:
+                raise Unsupported(exchange_branch_refusal)
+            mask = 'count_entry'
         elif base_name.startswith('v_cmpx'):
             count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
             if (base_name != 'v_cmpx_gt_i32' or not after or mask is not None or count is None
@@ -2479,6 +2534,10 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
+        # Forward edges reach each block in disassembly order. A back edge could
+        # repeat a pointer advance before the next table load.
+        self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
+                                   and all(target > pc for pc, target in branches))
         # Targets that only forward s_cbranch_execz branches (and the fall-through) enter: on a taken edge the lane's
         # exec bit is 0 at the target. Compute stages have their own execz handling and are left out.
         names = {off: name for off, _n, name, _asm in self.ins}
@@ -3424,8 +3483,9 @@ class Stage:
         if base not in ('s_add_u32', 's_addc_u32') or len(srcs) != 2 or not syms[0]:
             return False
         if getattr(self, 'has_branches', False):
-            # The symbolic update runs once in disassembly order; a branch could skip it or repeat it at run time.
-            return False
+            if (not getattr(self, 'forward_table_adds', False) or base != 's_add_u32'
+                    or syms[0][0] != 'ptr' or syms[0][1][0] != 'table'):
+                return False
         reg = reg_range(dname)
         if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
             return False
@@ -3437,6 +3497,10 @@ class Stage:
             if added > 0xfffff:
                 raise Unsupported('descriptor pointer offset %s' % srcs[1])
             before = syms[0][2] if len(syms[0]) > 2 else 0
+            if not isinstance(before, int):
+                raise Unsupported('add through a pointer with unknown byte offset')
+            if getattr(self, 'forward_table_adds', False) and before + added > 0xfffff:
+                raise Unsupported('accumulated table pointer offset %#x' % (before + added))
             self.sym[d] = ('ptr', syms[0][1], before + added)
             if syms[0][1][0] in PTR64_SOURCES and d + 1 <= 105:
                 # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
@@ -3595,7 +3659,7 @@ class Stage:
                     self.sym[d] = own[:4] + ('modified',)
                     getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
                 else:
-                    self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
+                    self.sym[d] = own[:2] + ('added',)  # this operation has no proven byte offset
             else:
                 self.sym[d] = ('descnum',)
             return None
@@ -3826,6 +3890,58 @@ class Stage:
         value = sopk_imm(ops[1], True)
         self.scalar_cmov([ops[0], '0x%x' % value], mods, False, 's_cmovk_i32')
 
+    def op_s_bitset0_b32(self, ops, mods):
+        return self.scalar_bitset(ops, mods, clear=True)
+
+    def op_s_bitset1_b32(self, ops, mods):
+        return self.scalar_bitset(ops, mods, clear=False)
+
+    def scalar_bitset(self, ops, mods, clear):
+        """s_bitset0/1_b32: clear or set bit S0[4:0] of D in place; SCC unchanged.
+
+        RDNA 2 ISA SOP1 0x1b / 0x1d (and the pixel_aot / #1579 lowering): D.u &= ~(1u << (S0.u & 31))
+        or D.u |= (1u << (S0.u & 31)). The destination is also a source (READ_MODIFY_WRITE). Only a
+        plain user SGPR destination is accepted; lane masks and descriptor-bearing SGPRs stay refused
+        so a partial word cannot be treated as a full 32-bit scalar.
+        """
+        name = 's_bitset%d_b32' % (0 if clear else 1)
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2 unmodified' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        d = dst[1]
+        if self.is_lane_mask(ops[0]) or d in self.masks:
+            raise Unsupported('%s on a lane mask' % name)
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        bit_sym = None
+        if imm:
+            index_imm = int(ops[1], 0) & 31
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+                raise Unsupported('%s on a lane mask' % name)
+            bit_sym = self.sym.get(src[1])
+            if bit_sym and bit_sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('%s on %s data' % (name, bit_sym[0]))
+            index_imm = bit_sym[1] & 31 if bit_sym and bit_sym[0] == 'const' else None
+        sym = self.sym.get(d)
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('%s on %s data' % (name, sym[0]))
+        prev = self.S(d)
+        bit = self.u(ops[1])
+        mask = '(1u << (%s & 31))' % bit
+        result = '(%s & ~%s)' % (prev, mask) if clear else '(%s | %s)' % (prev, mask)
+        if sym and sym[0] == 'const' and index_imm is not None:
+            value = ((sym[1] & ~(1 << index_imm)) if clear else (sym[1] | (1 << index_imm))) & 0xffffffff
+            self.set_s(d, '0x%08xu' % value, ('const', value))
+        else:
+            self.set_s(d, result)
+        self.masks.discard(d)
+        return None
+
     def scalar_cmov(self, ops, mods, pair, name=None):
         """D = SCC ? S0 : D on plain SGPR destinations; SCC is unchanged."""
         name = name or 's_cmov_b%d' % (64 if pair else 32)
@@ -3960,10 +4076,8 @@ class Stage:
                 for i in range(count):
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, base_off + off + 4 * i))
                 return
-            # The pointer symbol does not record an addend or a rewritten high word, so two loads through such a
-            # pointer may read different words under the same (source, offset). In a compute or vertex stage (the
-            # stages that accept a raw descriptor conversion before a store) those loads are told apart by the
-            # offset of the s_load; loads through the untouched pair keep one identity.
+            # A compute or vertex raw-store conversion must distinguish loads through different high words
+            # even when the source and byte offset match. Keep the load PC for a changed pointer pair.
             # A 32-bit table pointer carries a high word the program sets to a constant: loads through the same
             # untouched low word and the same constant read the same words (tag -1 - constant).
             hi = self.sym.get(base[1] + 1)
@@ -4321,7 +4435,7 @@ class Stage:
         return key
 
     def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False,
-                            raw_conversion_ok=False):
+                            raw_conversion_ok=False, uniform_off=False):
         """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
@@ -4333,7 +4447,7 @@ class Stage:
             elif m != 'offen':
                 raise Unsupported('%s modifier %s' % (kind_label, m))
         offen = 'offen' in mods
-        if len(ops) != 4 or (not offen and not (allow_scalar_address and glc and ops[1] == 'off')):
+        if len(ops) != 4 or not (offen or ops[1] == 'off' and (allow_scalar_address and glc or uniform_off)):
             raise Unsupported('%s without the offen address form' % kind_label)
         data = reg_range(ops[0])
         if not data or data[0] != 'v' or data[2] - data[1] != data_count - 1 or data[2] > 255:
@@ -4345,7 +4459,7 @@ class Stage:
         key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
-            if not offen:
+            if not offen and not uniform_off:
                 raise Unsupported('%s off requires a scalar register soffset' % kind_label)
             offset += int(ops[3], 0)
         else:
@@ -4367,7 +4481,12 @@ class Stage:
             return self.op_buffer_store_vs(ops, mods, count)
         if self.kind != 'cs':
             raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
-        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True)
+        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True,
+                                                        uniform_off=True)
+        # The `off` form (no VGPR address, MUBUF offen = idxen = 0) gives every lane the same byte address, so the
+        # lanes race; with one proven value in all of them any order stores the same words.
+        if ops[1] == 'off' and not all(self.proven_uniform_v(n) for n in range(src[1], src[2] + 1)):
+            raise Unsupported('buffer store off with data not proven wave-uniform')
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
         # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
@@ -5504,6 +5623,42 @@ class Stage:
         # FF1 reports its index and leaves SCC unchanged.
         self.set_s(dst[1], '0u', ('const', 0))
 
+    def op_s_abs_i32(self, ops, mods):
+        """Signed absolute value; SCC = result != 0 (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot: D = asint(S0) < 0 ? (0u - S0) : S0 (INT_MIN stays).
+        Lane masks and descriptor-bearing SGPRs are refused so a projected bit is not treated
+        as a full signed word.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_abs_i32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_abs_i32 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_abs_i32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        src_sym = None
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('s_abs_i32 source %s' % ops[1])
+            if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+                raise Unsupported('s_abs_i32 on a lane mask')
+            src_sym = self.sym.get(src[1])
+            if src_sym and src_sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('s_abs_i32 on %s data' % src_sym[0])
+            value = src_sym[1] & 0xffffffff if src_sym and src_sym[0] == 'const' else None
+        if value is not None:
+            folded = (-value if value & 0x80000000 else value) & 0xffffffff
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            return None
+        expr = '(asint(%s) < 0 ? (0u - %s) : %s)' % ((self.u(ops[1]),) * 3)
+        self.set_s(dst[1], expr, scc='$ != 0')
+        return None
+
     # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
     def op_x2w_mesh_lane0(self, ops, mods):
         # `s_mov_b64 exec, 1` leaves lane 0 of each wave running. The saved copy of that mask is not modelled.
@@ -5591,14 +5746,21 @@ class Stage:
     def op_v_mbcnt_hi_u32_b32(self, ops, mods):
         self.op_v_mbcnt_lo_u32_b32(ops, mods, high=True)
 
+    def proven_uniform_v(self, n):
+        """VGPR n holds one value in every lane EXEC enables now. In the entry block EXEC is known; past it, a
+        recomputable expression proves no join, EXEC write or overwrite lies between the definition and here."""
+        if not self.tracks_uniformity() or n not in self.uniform_v:
+            return False
+        # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
+        if getattr(self, 'past_entry', True):
+            return n in getattr(self, 'uniform_expr', {}) and getattr(self, 'has_branches', False)
+        return getattr(self, 'exec_known', False)
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
-        # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
-        if (mods or not self.tracks_uniformity() or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v or
-                (src[1] not in getattr(self, 'uniform_expr', {}) or not getattr(self, 'has_branches', False)
-                 if past_entry else not getattr(self, 'exec_known', False))):
+        if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
+                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
         if past_entry:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
@@ -6089,6 +6251,17 @@ class Stage:
         self.clear_low16(dst[2])
         self.used_v.update((dst[1], dst[2]))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+        # Scalar or literal sources give every lane the same result, under the conditions Stage.one uses for VALU.
+        pair = reg_range(ops[2])
+        sources = [ops[1]] + (['%s%d' % (pair[0], pair[1]), '%s%d' % (pair[0], pair[2])] if pair else [])
+        if (self.tracks_uniformity() and not any(reg_range(t)[0] == 'v' for t in sources if reg_range(t)) and
+                all(self.uniform_source(t) for t in sources) and
+                (getattr(self, 'past_entry', False) and hasattr(self, 'uniform_expr') or
+                 not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False))):
+            self.uniform_v.update((dst[1], dst[2]))
+            if hasattr(self, 'uniform_expr'):
+                for n, half in ((dst[1], 'x'), (dst[2], 'y')):
+                    self.uniform_expr[n] = '%s(%s, %s, %s).%s' % (helper, low, high, amount, half)
 
     def carry_out_op(self, ops, mods, kind):
         """v_{add,sub,subrev}_co_u32 D, SDST, S0, S1: a 32-bit add or subtract with a carry or borrow out.
