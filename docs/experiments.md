@@ -403,7 +403,7 @@ ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|
 
 A typed buffer view that the title creates through the runtime (`CreateShaderResourceView`, `BUFFER`, no flags, no structure stride) leaves no hardware descriptor in the table. For this case the draw builds word 3 the way the console driver builds it from the view, using `view_word3()` in `src/startup_stubs/buffer_format_word3.h`:
 
-- FORMAT is the code of the DXGI format whose typed read gives the same components. The 14 formats in the switch are covered: `R8_UNORM` 1, `R8_UINT` 5, `R8G8_UNORM` 14, `R32_FLOAT` 22, `R16G16_UNORM` 23, `R16G16_SNORM` 24, `R16G16_UINT` 27, `R16G16_FLOAT` 29, `R8G8B8A8_UNORM` 56, `R8G8B8A8_UINT` 60, `R32G32_FLOAT` 64, `R16G16B16A16_FLOAT` 71, `R32G32B32_FLOAT` 74 and `R32G32B32A32_FLOAT` 77. The codes are the LLVM 15 `llvm-mc -mcpu=gfx1013` encodings of the tbuffer `format:` operand.
+- FORMAT is the code of the DXGI format whose typed read gives the same components. The 15 formats in the switch are covered: `R8_UNORM` 1, `R8_UINT` 5, `R8G8_UNORM` 14, `R32_FLOAT` 22, `R16G16_UNORM` 23, `R16G16_SNORM` 24, `R16G16_UINT` 27, `R16G16_FLOAT` 29, `R10G10B10A2_UNORM` 50, `R8G8B8A8_UNORM` 56, `R8G8B8A8_UINT` 60, `R32G32_FLOAT` 64, `R16G16B16A16_FLOAT` 71, `R32G32B32_FLOAT` 74 and `R32G32B32A32_FLOAT` 77. The codes are the LLVM 15 `llvm-mc -mcpu=gfx1013` encodings of the tbuffer `format:` operand.
 - DST_SEL comes from `Shader4ComponentMapping`: a channel becomes 4 to 7, a forced 0 becomes 0 and a forced 1 becomes 1.
 
 The draw is refused, not read as zeros, whenever a translated formatted load has no resolved word 3:
