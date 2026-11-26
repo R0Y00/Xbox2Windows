@@ -178,7 +178,7 @@ With the Linux build of DXC, `spirv-val` and `spirv-dis` from SPIRV-Tools, a C c
 python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device Intel
 ```
 
-`--device` is a substring of the Vulkan device name (repeat it for several adapters), and `VK_DRIVER_FILES` selects a driver such as lavapipe. To build the host once and reuse it, run `cc -std=c11 -O1 -o out/vk/vk_pixel_draw tests/vk_pixel_draw.c -lvulkan` and pass `out/vk/vk_pixel_draw` instead of the `.c` file.
+`--device` is a substring of the Vulkan device name (repeat it for several adapters), and `VK_DRIVER_FILES` selects a driver such as lavapipe. To build the host once and reuse it, run `mkdir -p out/vk && cc -std=c11 -O1 -o out/vk/vk_pixel_draw tests/vk_pixel_draw.c -lvulkan` and pass `out/vk/vk_pixel_draw` instead of the `.c` file.
 
 A `ps_6_2` pixel shader runs seven operations whose inputs or results are binary32 subnormals and writes each result word to its own RGBA32UI pixel. DXC compiles it with `-spirv -fspv-target-env=vulkan1.2 -fvk-b-shift 0 0 -fvk-t-shift 16 0 -fvk-s-shift 32 0 -fvk-u-shift 48 0`. The words read back must equal IEEE binary32 arithmetic computed in Python under `-denorm preserve`. The same shader compiled with `-denorm ftz` is the negative control and must differ, otherwise the check fails because it cannot tell preserve from flush. The log lists the device, driver, DXC and SPIRV-Tools versions, the SPIR-V execution mode, every word read back for both modes and the cases where the control differs.
 
