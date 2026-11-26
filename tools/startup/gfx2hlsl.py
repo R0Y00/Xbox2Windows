@@ -2335,6 +2335,13 @@ class Stage:
                 value = reads | (out - writes)
                 if value != live_in[i]:
                     live_in[i], changed = value, True
+        self.waterfall_reads = {}
+        for close, target in jumps:
+            head = index.get(target)
+            if (head is not None and head + 3 < close and self.ins[close][2] == 's_cbranch_scc1'
+                    and self.ins[head][2] == 'v_readfirstlane_b32'
+                    and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
+                self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
         refused = {}
         for b, (off, n, name, asm) in enumerate(self.ins):
             if name != 's_cbranch_execz':
@@ -2380,6 +2387,89 @@ class Stage:
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def waterfall_refusal(self, head, close, effects, live_in, jumps):
+        """Return None when the lane can pick its own key at the head of the waterfall.
+
+        CMPX selects all remaining lanes with the first lane's key. WREXEC removes those lanes,
+        so each incoming lane participates exactly once. A lane-local body computes its value on
+        that visit. Other visits can only affect it through shared state or an escaping scalar.
+        """
+        ins = self.ins
+        _, key_ops, mods = parse(ins[head][3])
+        if (mods or len(key_ops) != 2 or not re.fullmatch(r's\d+', key_ops[0])
+                or not re.fullmatch(r'v\d+', key_ops[1])):
+            return 'unsupported key operands'
+        key = key_ops[0]
+        name, ops, mods = parse(ins[head + 1][3])
+        if re.sub(r'_e(32|64)$', '', name) != 'v_cmpx_eq_i32' or mods or ops != key_ops:
+            return 'the next instruction does not select lanes with the same key'
+        _, ops, mods = parse(ins[close - 1][3])
+        if mods or len(ops) != 2 or ops[0] != ops[1] or not re.fullmatch(r's\d+', ops[0]) or ops[0] == key:
+            return 'the closing mask is not a distinct remaining-lanes register'
+        remaining = ops[0]
+        # The b32 close covers only the low 32 lanes when the hardware uses wave64.
+        x, y, z = self.pipe.group
+        if x * y * z > 32:
+            return 'b32 remaining mask requires at most 32 threads per group'
+        copy = None
+        for i in reversed(range(head)):
+            _, _, op, asm = ins[i]
+            if op.startswith(('s_branch', 's_cbranch', 's_setpc', 's_endpgm', 's_movrel')):
+                break
+            if remaining in effects[i][2] or effects[i][2] & EXEC_KEYS:
+                if op == 's_mov_b32' and parse(asm)[1] == [remaining, 'exec_lo']:
+                    copy = i
+                break
+        if copy is None:
+            return 'remaining mask is not an unchanged copy of EXEC'
+        if any(ins[copy][0] < target <= ins[close][0] for branch, target in jumps if branch != close):
+            return 'another branch enters the saved mask or loop'
+        # Only ordinary lane-local operations and reads of a bound raw buffer. An instruction
+        # that observes the other lanes sharing this key cannot use this scalarization (e.g. mbcnt of EXEC).
+        body_writes = {key, 'scc'}  # WREXEC supplies SCC for the next iteration.
+        numeric_writes = {key}
+        descriptor_inputs, buffer_descriptors = set(), set()
+        reads_before_write = set()
+        defined = {key}
+        for j in range(head + 2, close - 1):
+            base, ops, mods = parse(ins[j][3])
+            base = re.sub(r'_e(32|64)$', '', base)
+            if base not in ('s_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
+                            'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32', 's_load_dwordx4', 'buffer_load_dword'):
+                return 'body instruction %s is not proven lane-local' % base
+            if mods and not (base == 'buffer_load_dword' and mods == ['offen']):
+                return 'body instruction %s has unproved modifiers' % base
+            reads, writes, may_write = effects[j]
+            if (reads | may_write) & (EXEC_KEYS | {'vcc', 'vcc_hi', 'm0', remaining}):
+                return 'body reads or changes a lane mask or special register'
+            if base == 's_load_dwordx4':
+                dst = reg_range(ops[0]) if len(ops) == 3 else None
+                if not dst or dst[0] != 's' or dst[2] > 105:
+                    return 'descriptor load overlaps a special register'
+                descriptor_inputs.update(reads)
+            else:
+                numeric_writes.update(may_write)
+            if base == 'buffer_load_dword':
+                if len(ops) < 3:
+                    return 'buffer load has no descriptor'
+                buffer_descriptors.update(scalar_tokens(ops[2]))
+            reads_before_write.update(reads - defined)
+            defined.update(writes)
+            body_writes.update(may_write)
+        if reads_before_write & body_writes:
+            return 'body reads loop-carried scalar state'
+        # The data byte offset can use the key. Loading or modifying the resource descriptor
+        # with the key needs a separate proof that the runtime binds the whole range.
+        if descriptor_inputs & body_writes or buffer_descriptors & numeric_writes:
+            return 'per-lane descriptor selection requires a proven bound heap range'
+        # The close leaves EXEC and SCC zero. The last physical pass's other scalar
+        # values can differ per lane in this model and must be dead on every successor.
+        if close + 1 < len(ins) and (body_writes - {'scc'}) & live_in[close + 1]:
+            return 'body scalar is live at the loop exit'
+        if any(name.startswith('s_movrel') for _, _, name, _ in ins):
+            return 'relative scalar indexing can observe a loop register'
+        return None
 
     def phi_mask_ok(self, key, b, t, effects, succ, targets, index):
         """True when lane mask `key` ('vcc' for vcc_lo, or 'sN'), live at the join t of the s_cbranch_execz at b, is
@@ -5893,6 +5983,13 @@ class Stage:
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
+        waterfalls = getattr(self, 'waterfall_reads', {})
+        if getattr(self, 'pc', None) in waterfalls and not (src and self.proven_uniform_v(src[1])):
+            reason = waterfalls[self.pc]
+            if reason:
+                raise Unsupported('compute readfirstlane waterfall: ' + reason)
+            self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
+            return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
                 not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
