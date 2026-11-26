@@ -272,6 +272,7 @@ jobs:
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_waitcnt_depctr_check.py \
             tests/startup_mesh57_skeleton_check.py \
+            tests/startup_mesh57_depth_only_check.py \
             tests/startup_mesh57_loop_refusal_check.py \
             tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \

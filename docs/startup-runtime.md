@@ -275,6 +275,67 @@ presenter, its owned window and a dialog stay visible. Where the host lets the t
 it also checks that the foreground moves to the output window. A run under Wine did; the fixture prints
 which case applied.
 
+### Presented planes
+
+A console present (CommandQueue slot 32) carries a plane count and an array of plane records
+(`src/startup_stubs/present_planes.h`). Measured from the first presents: one record is 0x48 bytes,
+with +0x00 a frame token, +0x08 the resource count and +0x10 a pointer to the resource array. On the
+Series S profile a title presented two planes: plane 0 at 1920x1080 stayed black and plane 1 at
+3840x2160 held the picture, with alpha 255 wherever it drew. Showing plane 0 alone gave a black
+window. Why plane 0 stays black is not known.
+
+By default the output window still shows plane 0 alone, as before the planes were decoded. The
+experimental `X2W_PRESENT_COMPOSITE=1` makes it composite the planes instead
+(`src/startup_stubs/plane_compositor.h`, shared by the window presenter and its fixture). It stays
+opt-in until a matched comparison on the same executable, with this change alone, shows what it does
+to a real present. The contract under the switch:
+
+- Order: plane 0 first, each later plane over it, in plane order (`composite_steps`). At most four
+  planes are read.
+- The lowest drawn plane is opaque: its colour replaces the window and its alpha is ignored.
+- Each later plane is blended by its own alpha, not premultiplied:
+  `rgb = src.rgb * src.a + dst.rgb * (1 - src.a)`, `a = src.a + dst.a * (1 - src.a)` (D3D12
+  `SRC_ALPHA` / `INV_SRC_ALPHA`, alpha `ONE` / `INV_SRC_ALPHA`). Alpha 0 leaves what is below,
+  alpha 255 replaces it, and the window alpha stays 255.
+- Left out: a plane whose record or resource array is unreadable or empty, a surface that is not a
+  known resource or that the presenter cannot draw (`present_view_format.h`), and a repeat of a
+  surface already drawn. If plane 0 is left out, the next drawn plane is the opaque base.
+- Each plane is scaled to the whole window with a linear, clamped sampler. The planes' source and
+  destination rectangles in the record (after +0x10) are not decoded; a plane that covers only part
+  of the screen on the console is stretched here.
+- The baseline capture is unchanged with or without the switch: the frame capture, the presented
+  signature, `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented` readback all read plane 0's
+  first resource, as before. Under the switch the highest plane above plane 0 with a known resource
+  is also sampled on the same frames, before compositing, and logged as a raw plane:
+
+  ```text
+  x2w-render raw plane <i> (not composited): surface <w>x<h> format <f>, sample <k>, mean level <l>/255, mean alpha <a>/255
+  ```
+
+  Neither line is the composited window picture.
+
+The first presents and every 300th log each plane:
+
+```text
+x2w-present frame <n> plane <i>/<count>: <width>x<height> format <f> flags=0x<flags>
+```
+
+`ctest --preset dev --no-tests=error -R '^startup_present_planes(_control)?$'` checks the record layout
+and the composite order on synthetic records; the control reads 0x40-byte records and composites
+plane 0 alone, and must print `FAIL:`.
+`ctest --preset dev --no-tests=error -R '^startup_present_composite_(warp|overlay_removed_control_warp)$'`
+draws source-built planes through the same records, `composite_steps` and compositor (directly, without
+the switch) into a 64x32 RGBA8 target on WARP and reads every texel back: a single plane is shown as is (including a cell with alpha 0); a black
+plane 0 under a plane with alpha 0, 128, 5 and 255 cells and a third plane with opaque and
+half-transparent cells gives 0, 128, 5 and 255 levels and the plane-order result 128,0,127 for half
+red over blue (within 1 for blended cells, exact otherwise); a repeated surface and an empty record
+are left out. The control runs the same cases, then removes the overlays and composites the black
+plane 0 alone. It passes only on `control ok: baseline matched, ...`, printed when the baseline and
+stacked cases matched, every fence completed without device removal, and the overlay-free picture is
+black and differs from the stacked expectation in exactly the six cells the overlays draw. Any `FAIL:`
+line fails it, including queue, compositor, target or plane setup, a fence that does not complete and
+device removal. Both exit 77 without a WARP adapter.
+
 ## Null Texture2D descriptors
 
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
@@ -288,6 +349,52 @@ one with only the other slot's use, R8G8B8A8 with one use or none, failed querie
 dimensions, formats, resources and counters that are left alone. A rewrite must keep every other
 field of the description. `startup_null_texture_view_unchecked_fallback_control` rewrites without
 asking about R8G8B8A8 and must fail.
+
+## Unknown and mismatched view dimensions
+
+A view description with `ViewDimension` 0 (UNKNOWN) makes desktop D3D12 remove the device instead of
+failing the call, and so does a dimension that does not suit the resource (debug layer: "The
+ViewDimension in the View Desc is incompatible with the type of the Resource"). Measured: a console
+package module made such SRVs on 2D RGBA8 textures. Views of device slots 18 to 21 (shader resource,
+unordered access, render target, depth stencil) are now checked before they are forwarded:
+
+- an SRV (slot 18) with dimension 0 gets the resource's default view (a null description) where
+  desktop allows one: a texture with a typed format that is not a depth format. The default view
+  replaces the whole description, including its format and component mapping. Only this SRV case is
+  measured. With dimension 0 every other view is skipped;
+- a dimension whose resource dimension differs from the resource's is skipped.
+
+The default view for UAV, RTV and DSV descriptions with dimension 0 is an explicit experiment,
+`X2W_D3D12_VIEW_DEFAULTS=all`: it is unmeasured, and it drops the requested format the same way.
+`X2W_D3D12_VIEW_DEFAULTS=off` skips the SRV case too. Any other value, or none, keeps the SRV
+default.
+
+A refused SRV, for any reason, writes a null SRV (R8G8B8A8_UNORM, the requested dimension where it
+is a texture dimension, else 2D) into its destination descriptor. Otherwise the slot would keep the
+view it held before. That view would still be bindable and would be copied by `CopyDescriptors`,
+although the slot's record no longer keeps its resource alive. Translated draws already resolve the
+slot to nothing.
+
+A refused UAV, RTV or DSV leaves the previous descriptor and its tracking record in place.
+
+The first of each are logged (`x2w-d3d12 Device::slot<n> view dimension ...`), and when a view still
+removes the device, its forwarded description and the resource's shape are logged
+(`removing view desc`). Run
+`ctest --preset dev --no-tests=error -R '^startup_view_dimension(_control)?$'`
+(`src/startup_stubs/view_dimension.h`); the control swaps the resource dimension of the mismatched
+cases for the matching one and must print `FAIL:`.
+
+`startup_view_dimension_warp` goes through `d3d12_xs.dll` on WARP. A compute shader samples each
+descriptor of a shader-visible heap through the wrapper's desktop heap. The fixture checks three
+cases. An unknown-dimension SRV of a texture filled with one distinct colour must read back that
+colour. An explicit TEXTURE3D SRV of a 2D texture must be refused with the device not removed.
+A descriptor slot that held a valid view of a second colour, then receives a refused TEXTURE2D
+SRV of a buffer, must read zero, and so must a `CopyDescriptorsSimple` copy of it. The slot gate
+for UAV, RTV and DSV is checked without a device by `startup_view_dimension`.
+`startup_view_dimension_off_control_warp` runs the same fixture with
+`X2W_D3D12_VIEW_DEFAULTS=off`. It must print `FAIL: (a) default view` with `device not removed`,
+so it fails on the missing default view and not on setup or a removed device. Both return 77
+without WARP.
 
 ## 16-bit packed targets
 
@@ -1353,17 +1460,22 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
+| `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
+| `X2W_PRESENT_COMPOSITE=1` | experimental, in render mode: the output window composites every presented plane, bottom to top, instead of showing plane 0 alone, and the highest plane above plane 0 is sampled as `x2w-render raw plane <i> (not composited)`. Off by default; the baseline capture and `x2w-render presented` read plane 0 either way. See [Presented planes](#presented-planes) |
+| `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
+| `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
+| `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
@@ -1390,6 +1502,34 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
+
+## Console profile
+
+`X2W_DEVICE_TYPE` answers the two registry reads a title makes of
+`HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM\ConsoleMode`
+(`src/startup_stubs/console_mode.h`, `registry_console_mode.inl`): with `X2W_RUNTIME_PROXY=1` the
+stand-in rewrites the registry imports of the EXE and package helpers. `6` answers 0x60 (Series S),
+`7` answers 0x64 (Series X) and `1` reports the value missing (PC); unset, every call goes to the real
+registry. Only registry imports that the Windows registry provides are rewritten: an IAT entry must
+name `advapi32.dll`, `kernelbase.dll`, `kernel32.dll` or an `api-ms-win-core-registry-*` API set and be
+bound inside the system-directory copy of the first three, and `GetProcAddress` must be called on one
+of those modules. A package DLL that exports the same names keeps its own exports and is never kept as
+the real registry. Opening the key and reading the value are logged a few times either way, and a
+seventeenth OEM key handle open at once is logged once and not tracked. What the values mean on the
+console is taken from public notes, not measured here.
+`ctest --preset dev --no-tests=error -R '^startup_console_mode(_control|_provider_control)?$'` runs it
+against fake registry functions and a source-built decoy DLL with the same export names, with the switch
+unset and set. The control leaves the switch unset for the answered cases and the provider control
+matches registry imports by name alone; both must print `FAIL:`. `startup_runtime_proxy_scope` checks the
+same decoy rule through the real loader against `advapi32.dll`.
+
+The switch changes only what the registry reads answer. A title can take a different start-up path
+for each profile: on the Series S profile, one loaded an upscaler package module that the other
+profiles do not, and that module met desktop refusals the other profiles did not reach
+(`Device::slot76`, views with `ViewDimension` 0, and `R9G9B9E5_SHAREDEXP` textures with unordered
+access, the last covered by the
+[shared-exponent stand-in](#shared-exponent-render-and-unordered-access-targets)). Choosing a profile
+is not evidence that the path it leads to runs.
 
 ## D3D12 resource budget
 

@@ -881,6 +881,12 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+MODIFIER_FREE_HANDLERS = frozenset((
+    'op_v_mov_b32', 'op_v_cvt_pkrtz_f16_f32', 'op_v_interp_p1_f32',
+    'op_v_interp_p2_f32', 'op_v_interp_mov_f32',
+))
+
+
 def smem_mods(mods):
     """Non-negative 21-bit signed immediate byte offset from SMEM modifiers, refusing unknown or negative forms."""
     imm = None
@@ -3339,6 +3345,8 @@ class Stage:
             return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
+            if mods and handler.__name__ in MODIFIER_FREE_HANDLERS:
+                raise Unsupported('%s with %s' % (base, mods))
             return handler(ops, mods)
         if base in MUBUF_ATOMIC_OPS:
             return self.buffer_atomic(base, ops, mods)
@@ -6115,11 +6123,15 @@ class Stage:
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         attr, comp = self.note_attr(ops[2], 'linear')
         self.set_v(reg_range(ops[0])[1], 'U(i.param%d.%s)' % (attr, comp))
 
@@ -8386,11 +8398,13 @@ def translate_mesh57(out_dir, key):
     if ps:
         pixel = decode(strip_header(ps))
         # A pixel shader with no colour output ends in a null-target export (LLVM SILateBranchLowering, Mesa ACO create_fs_null_export): depth-only.
-        null_only = {a.split()[1] for _, _, op, a in pixel if op == 'exp'} == {'null'}
+        targets = {a.split()[1] for _, _, op, a in pixel if op == 'exp'}
+        null_only = targets == {'null'}
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
-        if null_only:
-            raise Unsupported('slot 57 mesh with a depth-only pixel stage is not covered')
+        # The slot 57 depth-only profile is the null export alone; the general pixel path keeps its mixed forms.
+        if 'null' in targets and not null_only:
+            raise Unsupported('slot 57 pixel stage mixes the null export with another export')
     pipe = MeshPipeline(ms, ps or None, root)
     sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
     if ps:

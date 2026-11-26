@@ -178,6 +178,7 @@ check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 
 # These instructions refuse before v_readfirstlane_b32 is reached.
 EARLIER = {
     'op_sel overwrite': 'modifier op_sel:[0,0]',
+    'modified move overwrite': "v_mov_b32 with ['clamp']",
     'mask from uniform compare': 'v_mov_b32 data operand s2 is a lane mask',
     'vcc': 'v_mov_b32 data operand vcc_lo is a lane mask',
     'exec': 'v_mov_b32 data operand exec_lo is a lane mask',

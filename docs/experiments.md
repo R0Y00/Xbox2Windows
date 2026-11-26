@@ -9659,7 +9659,7 @@ restored before exports.
 The lowering clamps both counts to the 128 threads of a group and each index to
 the last vertex. It reads 9-bit indices, ignores the edge flags, and gives a
 primitive whose null bit (31) is set one vertex three times, so it covers no
-pixel. A depth-only pixel program is refused. The source-built fixture draws
+pixel. A depth-only pixel program is translated (see below). The source-built fixture draws
 on WARP and a hardware
 adapter and matches a CPU rasteriser. The runtime does not load the
 translated pair, so the dispatch stays unforwarded.
@@ -9675,10 +9675,25 @@ The one-pixel negative control uses that same published pair.
 
 The translator also accepts the same slot 57 mesh shape with an empty
 `req_<key>.ps57`. It emits the mesh stage alone, keeping position and
-primitive exports, and records `ps none` in `<key>.ms57.txt`. A null-export
-depth-only pixel stage is still refused. Run
+primitive exports, and records `ps none` in `<key>.ms57.txt`. Run
 `python -B tests/startup_mesh57_skeleton_check.py` for the source and cache
 checks, or run the `startup_mesh57_skeleton` CTest checks below for the DXC mode.
+
+A pixel stage whose only export is `exp null off, off, off, off done vm` (the
+depth-only form of LLVM `SILateBranchLowering` and Mesa ACO
+`create_fs_null_export`) is translated with the pair. The null target writes
+no channel; when the stage narrowed EXEC first, as an alpha test does, the `vm`
+flag keeps its `discard`. The pixel stage is emitted as `void main(PSIn i)`
+with no `SV_Target`, and the manifest has an empty `targets` line instead of
+`ps none`, because the stage still decides coverage. Run
+`python -B tests/startup_mesh57_depth_only_check.py`: it checks the discard,
+the empty `targets` line, a control without the EXEC narrowing (no discard)
+and a null export followed by a position export (still refused). A slot 57
+pixel stage that has the null export next to an `mrt0`, `mrtz` or `param0`
+export, in either order, is refused before any source or manifest is written;
+the general pixel path keeps those mixed forms. Nothing is
+drawn. The runtime does not load slot 57 results yet, so these draws are not
+submitted.
 
 The pending scan checks the DXContainer header and file length for every
 required slot 57 bytecode artifact. A `ps none` result needs the mesh artifact
@@ -16111,6 +16126,20 @@ Building on #2443 (Slice 1), `X2W_D3D12_RELEASE_RETIRED=1` extends desktop objec
 ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
 ```
 
+## Refusing unmodelled modifiers in the startup translator
+
+Several `Stage` instruction handlers accepted a `mods` list without reading it, so an encoding modifier such as
+`clamp`, `omod` (`mul:2`), or `op_sel` on `v_mov_b32`, `v_cvt_pkrtz_f16_f32`, or `v_interp_mov_f32` was silently
+dropped from the emitted HLSL (#1771). `MODIFIER_FREE_HANDLERS` declares these five handlers (`op_v_mov_b32`,
+`op_v_cvt_pkrtz_f16_f32`, `op_v_interp_p1_f32`, `op_v_interp_p2_f32`, and `op_v_interp_mov_f32`), and `Stage.one`
+refuses any non-empty `mods` list before dispatching to them. Scalar-ALU handlers are omitted because their encodings
+have no modifier field. Separately, `op_v_interp_p1_f32` and `op_v_interp_p2_f32` refuse `abs`/`neg` modifiers (`|...|`
+or `-...`) printed on the ignored data-source operand (`ops[1]`).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_modifier_free$' -V
+```
+
 ## Source `abs` modifiers (`|src|` and `-|src|`) on `v_cndmask_b32_e64` in the startup translator
 
 `Stage.u_src` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py#L1506-L1521) now strips `|...|` after `split_neg(tok)` for `v_cndmask_b32_e64` data sources (`src0` and `src1`, both VGPRs and SGPRs), clearing the `off_diag.py` refusal `operand '|v0|' at v_cndmask_b32_e64 v0, v0, |v0|, s30`. Per the RDNA2 VOP3A source-modifier order, `abs` clears bit 31 (`& 0x7fffffffu`) first and `neg` flips bit 31 (`^ 0x80000000u`) second:
@@ -16197,7 +16226,9 @@ PSO-cache change. Canonical output bytes remain unchanged.
 
 Two caches keep desktop D3D12 objects for a device for as long as the module that holds them is loaded: the
 indexed-validation pipeline (`startup_stubs/d3d12_draw.inl`) and the rectangle-list argument converter
-(`startup_stubs/rect_indirect_args.h`). Both are function-local statics, so they are destroyed during the
+(`startup_stubs/rect_indirect_args.h`); the same boundary covers the placed page aliases of the translated
+indirect address route (`startup_stubs/d3d12_xs_device.cpp`) and the draw-dump readbacks
+(`startup_stubs/draw_dump_tracking.h`). All four are function-local statics, so they are destroyed during the
 module's CRT teardown, and that teardown happens at two different moments. At process exit Windows has already
 detached the display driver: releasing a pipeline state then faults inside the driver (`amdxc64`, at
 `0x35f2a19`, through `D3D12Core!CPipelineState::FinalRelease`) and the loader turns it into `0xC0000409`.
@@ -16215,18 +16246,44 @@ ctest --preset dev --no-tests=error -R "^startup_teardown_unload_(warp|hardware)
 ctest --preset dev --no-tests=error -R "^startup_indirect_(translated_indexed|rectlist)" -V
 ```
 
-The fixture (`tests/startup_teardown_unload.cpp`) loads the built `d3d12_xs.dll` by path, warms both caches
-through the module's own probe, and unloads it: the caches must release what they own, the device's reference
+The fixture (`tests/startup_teardown_unload.cpp`) loads the built `d3d12_xs.dll` by path, warms one cache at a
+time through the module's own probe, and unloads it: the cache must release what it owns, the device's reference
 count must come back, and the module must be gone. A second load is warmed and left loaded, so process
 termination exercises the other path. It is source-built and loads no title.
 
+The two caches added with the ownership change own desktop objects that hold no reference on the device handle
+the fixture holds, so the fixture measures them on the object: `x2w_d3d12_cached_object_probe` hands over one
+reference of the placed buffer, of the readback buffer and of its fence, and that reference has to stay alone
+once the module is unloaded. The placed-buffer case also owns the heap that buffer is placed on: the alias
+entry keeps the heap as a key only, as the real route does, so `x2w_d3d12_cached_objects_probe` creates the
+heap and hands its one reference to the fixture through an out parameter, and bit 4 is not warmed without that
+pointer rather than leaving an unowned heap behind. The fixture keeps that heap across the unload, drops the
+cache's and its own reference on the placed buffer first, and only then releases the heap -- a heap must
+outlive the resources placed in it -- and requires that release to be the last reference, so a heap the cache
+still owned would fail the case instead of leaking quietly. The termination load runs in a child of the fixture
+(the fixture itself, `--termination-only`), because the evidence only exists while that process tears the module
+down: with `X2W_TEARDOWN_REPORT=1` each cache writes `x2w-teardown <cache> detached=<n> released=<n>` straight
+to stderr (no stdio buffer survives a CRT teardown), and the child has to report every owned reference detached
+and none released. `X2W_TEARDOWN_NO_GUARD=<pages|readbacks|all>` is the negative control: it makes that cache
+release instead of detach, and the same check has to fail. Each passing run re-runs the child once per new cache
+with the hook set and requires that failure, so a check that passes with and without a guard cannot report
+success. Neither variable is read by an ordinary run.
+
+```powershell
+startup_teardown_unload.exe <path-to-d3d12_xs.dll> warp
+set X2W_TEARDOWN_REPORT=1
+set X2W_TEARDOWN_NO_GUARD=pages
+startup_teardown_unload.exe <path-to-d3d12_xs.dll> warp   # must fail: the pages guard is what detaches
+```
+
 Measured on Windows 11 25H2 (26200.9974, MSVC 19.44.35230), AMD Radeon RX 9070 XT (`1002:7550`, driver
-`32.0.32029.2010`), debug layer unavailable: `startup_teardown_unload` passes on WARP and on the card, and the
-five `startup_indirect_*_hardware` runs that died with `0xC0000409` now reach their last assertion and exit
-`0`. Removing either destructor brings its own failure back and only its own: without the validation-pipeline
-destructor the four `translated_indexed*` runs fail and `rectlist` passes; without the converter destructor
-`rectlist` fails and the four pass. Not covered: an explicit unload while a device is still referenced by a
-title, and any adapter other than the one above.
+`32.0.32029.2010`), debug layer unavailable: with the two original cases, `startup_teardown_unload` passes on
+WARP and on the card, and the five `startup_indirect_*_hardware` runs that died with `0xC0000409` now reach
+their last assertion and exit `0`. Removing either destructor brings its own failure back and only its own:
+without the validation-pipeline destructor the four `translated_indexed*` runs fail and `rectlist` passes;
+without the converter destructor `rectlist` fails and the four pass. The backing-heap handover is newer than
+that run and has not been exercised on either machine yet. Not covered: an explicit unload while a device is
+still referenced by a title, and any adapter other than the one above.
 
 ## Exact binary16 min, max, fract, and frexp forms (VOP1/VOP2/VOP3/DPP16/DPP8/SDWA) in pixel_aot
 

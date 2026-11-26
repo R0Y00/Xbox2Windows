@@ -1,0 +1,5 @@
+LIBRARY startup_console_mode_decoy
+EXPORTS
+    RegOpenKeyExW = decoy_open_key_ex_w
+    RegQueryValueExW = decoy_query_value_ex_w
+    decoy_calls

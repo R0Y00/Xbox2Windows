@@ -510,8 +510,7 @@ def controls():
             os.environ['X2W_FXC'] = ''
     # exp null off, off, off, off done vm; s_endpgm: a pixel stage without a colour output.
     with tempfile.TemporaryDirectory() as tmp:
-        expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1],
-               'unsupported: slot 57 mesh with a depth-only pixel stage is not covered')
+        expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1], 'ok')
     # The request path refuses a missing s_endpgm earlier; the walk takes the last instruction as the terminator
     # unread, so the pipeline refuses it too (s_nop in its place).
     try:
