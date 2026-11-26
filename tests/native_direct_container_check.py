@@ -161,17 +161,21 @@ def interpolated_pixel(mismatched=False):
     body.extend(code)
     return pack(body,[(b"ISG1",signature(b"TEXCOORD"))])
 
-def publish(directory, *stages, pixel_entry=b""):
+def publish(directory, *stages, ps_inputs=None):
     directory.mkdir(exist_ok=True)
     key = 1469598103934665603
-    for byte in b"x2w-startup-shader-28" + b"".join(stages) + pixel_entry:
+    tail = b"" if ps_inputs is None else b"psin1" + struct.pack("<II", *ps_inputs)
+    for byte in b"x2w-startup-shader-28" + b"".join(stages) + tail:
         key = ((key ^ byte) * 1099511628211) & ((1 << 64) - 1)
-    stem = f"req_{key:016x}"
+    hex_key = f"{key:016x}"
+    stem = f"req_{hex_key}"
     for suffix, data in zip((".a", ".b", ".root", ".ia"), stages):
         (directory / (stem + suffix)).write_bytes(data)
-    if pixel_entry:
-        (directory / (stem + ".psin")).write_bytes(pixel_entry)
-    return stem
+    if ps_inputs is not None:
+        (directory / (stem + ".psin")).write_bytes(
+            f"psin1 {hex_key} ena=0x{ps_inputs[0]:04x} addr=0x{ps_inputs[1]:04x}\n".encode("ascii")
+        )
+    return hex_key
 
 
 def comparison_program(op=47, dim=1, sampler=0x08001012):
@@ -903,7 +907,7 @@ def main():
                   0xf42000c4,0xfa000000,0x7e000203,0xf80008cf,0,end]
             raw = words(*op)
             fixture_dir = folder/f"reflected-slot-{slot}"
-            publish(fixture_dir, ps, raw, short.read_bytes(), pixel_entry=b"PSI1"+words(0x8080,0))
+            publish(fixture_dir, ps, raw, short.read_bytes(), ps_inputs=(0x8080, 0x8080))
             job = [exe,sdk,interfaces.parent,"gfx1013-container-pair","--requests",fixture_dir,folder/"warm"]
             for offset,error in ((8*slot,None),(8*slot+8,"raw load disagrees with reflected table record")):
                 install(raw, vertex(program=op, uses=[(0x302,offset,0,0,4 | 8<<8)]))
@@ -943,7 +947,7 @@ def main():
             if clobber:
                 sequence.insert(6, 0xbe880380)
             fixture = folder/name
-            key = publish(fixture, words(*sequence), raw_vs, root, pixel_entry=b"PSI1"+words(2,1))
+            key = publish(fixture, words(*sequence), raw_vs, root, ps_inputs=(2, 2))
             job = batch.copy()
             job[-2] = fixture
             result = subprocess.run(job, capture_output=True, text=True)
@@ -955,27 +959,27 @@ def main():
                                               folder/"warm"/f"{key}.ps.cso"], text=True)
                 assert "call void @dx.op.discard(i32 82, i1 %" in ir
         for name, entry, ps, vs, ok in (
-                ("packed-input", words(0x8080,0), packed_ps, raw_vs, True),
-                ("packed-absent", words(0,0), packed_ps, raw_vs, False),
-                ("center-position-zw", words(0x0c02, 1),
+                ("packed-input", (0x8080, 0x8080), packed_ps, raw_vs, True),
+                ("packed-absent", (0, 0), packed_ps, raw_vs, False),
+                ("center-position-zw", (0x0c02, 0x0c02),
                  words(0xf800180f, 0x03020302, end), raw_vs, True),
-                ("center-position-zw-packed", words(0x8c02, 1),
+                ("center-position-zw-packed", (0x8c02, 0x8c02),
                  words(0xf800180f, 0x04040302, end), raw_vs, True),
-                ("center-position-missing-w", words(0x0402, 1),
+                ("center-position-missing-w", (0x0402, 0x0402),
                  words(0xf800180f, 0x03020302, end), raw_vs, False),
-                ("whole-quad-second-param", words(2,2),
+                ("whole-quad-second-param", (2, 2),
                  words(0xbe8c047e, 0xbefe0a7e, 0xc8100400, 0xc8110401,
                        0xbefe040c, 0xf800180f, 0x04040404, end),
                  words(0xbe8c0400, 0x938dff0d, 0x80000, 0xf4080406, 0xfa000000,
                        0x4a000002, 0xbf8cc07f, 0xe03c2000, 0x80040100,
                        0xe0342010, 0x80040400, 0xe9c3200c, 0x80040800,
                        0xf80008cf, 0x08030201, 0xf8000211, 0x04040404, end), True),
-                ("whole-quad-param", words(0x8002,1),
+                ("whole-quad-param", (0x8002, 0x8002),
                    words(0xbe8c047e, 0xbefe0a7e, 0xbe8a047e, 0xc8100000, 0xc8140100,
                          0xc8110001, 0xc8150101, 0xbefe040c, 0xf800180f, 0x05040504, end),
                  words(0x7e020b00,0xf80008cf,0x01010101,0xf800020f,0x01010101,end), True)):
             fixture = folder / name
-            key = publish(fixture, ps, vs, root, pixel_entry=b"PSI1" + entry)
+            key = publish(fixture, ps, vs, root, ps_inputs=entry)
             job = batch.copy()
             job[-2] = fixture
             result = subprocess.run(job, capture_output=True, text=True)
@@ -1050,7 +1054,7 @@ def main():
         gs=folder/"warm"/f"{stem}.gs.cso"
         dump=subprocess.run([pathlib.Path(sdk)/"dxc.exe","-dumpbin",gs],capture_output=True,text=True,check=True).stdout
         assert dump.count("call void @dx.op.emitStream(")==6 and dump.count("call void @dx.op.cutStream(")==2
-        (capture / (stem + ".root")).write_bytes(root + b"!")
+        (capture / f"req_{stem}.root").write_bytes(root + b"!")
         result = subprocess.run(batch, capture_output=True, text=True)
         assert result.returncode and "graphics request key mismatch" in result.stderr
         for case, element, error in (

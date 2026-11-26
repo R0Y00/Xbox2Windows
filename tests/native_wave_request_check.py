@@ -195,8 +195,10 @@ def main(cli, gpu, sdk):
         batch = subprocess.run([cli, sdk, work / "cache", "--jobs", "2", "gfx1013-compute-wave32@0",
                                 "--requests", work, batch_dir], capture_output=True, text=True)
         assert batch.returncode == 1 and "requests=2 compiled=1 refused=1" in batch.stdout
-        assert (batch_dir / marker.with_suffix(".cso").name).read_bytes() == (work / "good.cso").read_bytes()
-        assert not (batch_dir / rejected.with_suffix(".cso").name).exists()
+        assert (batch_dir / f"{marker.stem[4:]}.cs.cso").read_bytes() == (work / "good.cso").read_bytes()
+        assert (batch_dir / f"{marker.stem[4:]}.txt").is_file()
+        assert not (batch_dir / f"{rejected.stem[4:]}.cs.cso").exists()
+        assert not (batch_dir / f"{rejected.stem[4:]}.txt").exists()
         first = subprocess.run([gpu, sdk, marker, work / "cache"])
         if first.returncode:
             return first.returncode

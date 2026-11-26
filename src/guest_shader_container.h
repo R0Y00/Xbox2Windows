@@ -42,7 +42,7 @@ struct GuestShaderStage {
     std::vector<ShaderAttribute> attributes, outputs;
     std::vector<PixelExportPatch> exports;
     std::vector<ShaderSemantic> input_signature, output_signature;
-    unsigned pixel_input_address{}, depth_control{};
+    unsigned pixel_input_address{}, pixel_input_enable = ~0u, depth_control{};
     unsigned mesh_clip_control{}, max_vertices{}, max_primitives{}, topology{};
     std::string full_precision_code() const;
 };

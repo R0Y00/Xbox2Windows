@@ -1,11 +1,13 @@
 #include "direct_compute_cache.h"
 #include "guest_shader_container.h"
 #include "gfx1013_isa.h"
+#include "native_graphics_bindings.h"
 #include "shader_compute_request.h"
 #include "native_shader_revision.h"
 #include "shader_dxil_compiler.h"
 #include <atomic>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <charconv>
@@ -81,6 +83,8 @@ struct Reader {
 Bytes encode(const NativeComputeShader &program) {
     Bytes out;
     word(out, program.instruction_count);
+    for (unsigned n : program.group)
+        word(out, n);
     word(out, static_cast<uint32_t>(program.bindings.size()));
     for (const auto &b : program.bindings) {
         word(out, static_cast<uint32_t>(b.kind));
@@ -119,6 +123,7 @@ NativeComputeShader decode(std::string_view bytes) {
     Reader in{bytes};
     NativeComputeShader shader{};
     shader.instruction_count = in.count(1 << 18);
+    shader.group = {in.count(1024), in.count(1024), in.count(64)};
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
@@ -178,17 +183,24 @@ NativeComputeShader decode(std::string_view bytes) {
     return shader;
 }
 bool lookup(const fs::path &path, const Bytes &key, Bytes &payload) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    const auto size = file.tellg();
-    if (size <= 128 || size > 256 * 1024 * 1024)
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
         return false;
-    file.seekg(0);
-    Bytes id(64, 0), checksum(64, 0);
-    payload.resize(static_cast<size_t>(size) - 128);
-    if (!file.read(id.data(), 64) || id != key || !file.read(checksum.data(), 64) ||
-        !file.read(payload.data(), payload.size()) || shader_digest(payload) != checksum)
-        return false;
-    return true;
+    LARGE_INTEGER size{};
+    bool ok = false;
+    if (GetFileSizeEx(handle, &size) && size.QuadPart > 128 && size.QuadPart <= 256ll * 1024 * 1024) {
+        Bytes id(64, 0), checksum(64, 0);
+        payload.resize(static_cast<size_t>(size.QuadPart) - 128);
+        DWORD got_id = 0, got_sum = 0, got_body = 0;
+        ok = ReadFile(handle, id.data(), 64, &got_id, nullptr) && got_id == 64 && id == key &&
+             ReadFile(handle, checksum.data(), 64, &got_sum, nullptr) && got_sum == 64 &&
+             ReadFile(handle, payload.data(), static_cast<DWORD>(payload.size()), &got_body, nullptr) &&
+             got_body == payload.size() && shader_digest(payload) == checksum;
+    }
+    CloseHandle(handle);
+    return ok;
 }
 void publish(const fs::path &path, const Bytes &key, const Bytes &payload) {
     fs::create_directories(path.parent_path());
@@ -541,19 +553,25 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
         if (!interfaces.count(GpuStage::vs) || !interfaces.count(GpuStage::ps))
             throw UnsupportedComputeShader("missing vertex or pixel interface");
         if (exact_pair && !pixel_entry.empty()) {
-            const auto &ps = interfaces.at(GpuStage::ps);
-            Bytes expected = "PSI1";
-            word(expected,ps.pixel_input_address);
-            word(expected,static_cast<uint32_t>(ps.attributes.size()));
-            exact_pair = expected == pixel_entry;
+            auto &ps = interfaces.at(GpuStage::ps);
+            uint32_t enable_mask = 0, address_mask = 0;
+            if (pixel_entry.size() != 13 || pixel_entry.substr(0, 5) != "psin1")
+                throw UnsupportedComputeShader("invalid raw pixel entry record");
+            std::memcpy(&enable_mask, pixel_entry.data() + 5, 4);
+            std::memcpy(&address_mask, pixel_entry.data() + 9, 4);
+            if (enable_mask > 0xffff || address_mask > 0xffff || (enable_mask & ~address_mask))
+                throw UnsupportedComputeShader("contradictory pixel input enable/address masks");
+            exact_pair = ps.pixel_input_address == address_mask;
+            if (exact_pair)
+                ps.pixel_input_enable = enable_mask;
         }
         if (pixel_entry.empty() && !exact_pair) {
             const auto &ps = interfaces.at(GpuStage::ps);
             if (ps.pixel_input_address != 2 || ps.attributes.empty() || ps.attributes.size() > 7)
                 throw UnsupportedComputeShader("raw graphics requires its captured pixel entry");
-            entry = "PSI1";
+            entry = "psin1";
             word(entry, ps.pixel_input_address);
-            word(entry, static_cast<uint32_t>(ps.attributes.size()));
+            word(entry, ps.pixel_input_address);
             pixel_entry = entry;
         }
     }
@@ -664,5 +682,193 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     payload += encode(pair.pixel);
     publish(path, key, payload);
     return pair;
+}
+
+std::optional<std::string> format_compute_runtime_manifest(const NativeComputeShader &program) {
+    if (!program.group[0] || !program.group[1] || !program.group[2])
+        return std::nullopt;
+    unsigned ud_count = 0;
+    for (const auto &block : program.constants) {
+        if (block.root_parameter >= 16 || block.count > 8)
+            return std::nullopt;
+        ud_count += block.count;
+    }
+    if (ud_count > 32)
+        return std::nullopt;
+
+    auto sorted = program.bindings;
+    std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) {
+        const bool ua = compute_uav(a.kind), ub = compute_uav(b.kind);
+        if (ua != ub)
+            return !ua;
+        return a.shader_register < b.shader_register;
+    });
+
+    unsigned srv_count = 0, uav_count = 0;
+    std::ostringstream srv_lines, uav_lines, sampler_lines;
+    for (const auto &b : sorted) {
+        if (b.root_parameter >= 16)
+            return std::nullopt;
+        if (!compute_uav(b.kind)) {
+            if (b.shader_register != srv_count++)
+                return std::nullopt;
+            if (b.kind == ComputeViewKind::buffer_srv || b.kind == ComputeViewKind::raw_vector_srv ||
+                b.kind == ComputeViewKind::byte_window_srv) {
+                srv_lines << "srv " << b.shader_register << " buf table " << b.root_parameter << ' ' << b.byte_offset
+                          << '\n';
+            } else if (b.kind == ComputeViewKind::texture_srv && b.image_dimension == 1 && b.array_count == 1) {
+                srv_lines << "srv " << b.shader_register << " tex2d table " << b.root_parameter << ' ' << b.byte_offset
+                          << '\n';
+            } else {
+                return std::nullopt;
+            }
+        } else {
+            if (b.shader_register != uav_count++)
+                return std::nullopt;
+            if (b.kind == ComputeViewKind::raw_buffer_uav) {
+                uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
+                          << '\n';
+            } else if ((b.kind == ComputeViewKind::texture_uav || b.kind == ComputeViewKind::half4_texture_uav) &&
+                       (b.image_dimension == 1 || b.image_dimension == 5) && b.array_count == 1) {
+                uav_lines << "uav " << b.shader_register << (b.image_dimension == 5 ? " tex2da" : " tex2d")
+                          << " float table " << b.root_parameter << ' ' << b.byte_offset << " channels 4\n";
+            } else {
+                return std::nullopt;
+            }
+        }
+    }
+    if (srv_count > 32 || uav_count > 8)
+        return std::nullopt;
+
+    for (size_t i = 0; i < program.samplers.size(); ++i) {
+        const auto &s = program.samplers[i];
+        if (s.comparison)
+            return std::nullopt;
+        char line[64];
+        std::snprintf(line, sizeof(line), "%s %zu %08x %08x %08x %08x\n", s.explicit_lod ? "smpl" : "smp", i,
+                      s.words[0], s.words[1], s.words[2], s.words[3]);
+        sampler_lines << line;
+    }
+
+    std::ostringstream out;
+    out << "x2w-manifest 2\nstage cs\ngroup " << program.group[0] << ' ' << program.group[1] << ' ' << program.group[2]
+        << "\nud " << ud_count << '\n';
+    unsigned ud_index = 0;
+    for (const auto &block : program.constants)
+        for (unsigned j = 0; j < block.count; ++j)
+            out << "udsrc " << ud_index++ << " rootconst " << block.root_parameter << ' ' << j << '\n';
+    out << srv_lines.str() << uav_lines.str() << sampler_lines.str();
+    return out.str();
+}
+
+std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphicsPair &pair) {
+    if (pair.vertex.vertex_fetch || !pair.input_layout.empty())
+        return std::nullopt;
+    for (const auto &in : pair.vertex.inputs)
+        if (in.name != "SV_VertexID" && in.name != "SV_InstanceID")
+            return std::nullopt;
+    for (const auto &out : pair.pixel.outputs)
+        if (out.name == "SV_Target" && out.component != 9)
+            return std::nullopt;
+
+    std::optional<NativeGraphicsBindings> maybe_bindings;
+    GraphicsConstantLayout constants;
+    try {
+        maybe_bindings.emplace(pair);
+        constants = pair.constant_layout();
+    } catch (const std::exception &) {
+        return std::nullopt;
+    }
+    const auto &bindings = *maybe_bindings;
+    const unsigned uav_count = static_cast<unsigned>(bindings.views.size()) - bindings.srv_count;
+    if (bindings.srv_count > 32 || uav_count > 8)
+        return std::nullopt;
+    for (unsigned count : constants.counts)
+        if (count > 8)
+            return std::nullopt;
+    const unsigned total_constants = constants.offset(static_cast<unsigned>(constants.counts.size()));
+    if (total_constants > 32)
+        return std::nullopt;
+
+    std::ostringstream srv_lines, uav_lines, sampler_lines;
+    for (unsigned i = 0; i < bindings.srv_count; ++i) {
+        const auto &b = bindings.views[i];
+        if (b.root_parameter >= 16)
+            return std::nullopt;
+        if (b.kind == ComputeViewKind::buffer_srv || b.kind == ComputeViewKind::raw_vector_srv ||
+            b.kind == ComputeViewKind::byte_window_srv) {
+            srv_lines << "srv " << i << " buf table " << b.root_parameter << ' ' << b.byte_offset << '\n';
+        } else if (b.kind == ComputeViewKind::root_buffer_srv && b.byte_offset == 0 && b.array_count == 1) {
+            srv_lines << "srv " << i << " buf root " << b.root_parameter << '\n';
+        } else if ((b.kind == ComputeViewKind::texture_srv || b.kind == ComputeViewKind::comparison_texture_srv) &&
+                   b.array_count == 1) {
+            const char *tex = b.image_dimension == 0   ? "tex1d"
+                              : b.image_dimension == 1 ? "tex2d"
+                              : b.image_dimension == 2 ? "tex3d"
+                              : b.image_dimension == 5 ? "tex2da"
+                                                       : nullptr;
+            if (!tex)
+                return std::nullopt;
+            srv_lines << "srv " << i << ' ' << tex << " table " << b.root_parameter << ' ' << b.byte_offset << '\n';
+        } else {
+            return std::nullopt;
+        }
+    }
+    for (unsigned j = 0; j < uav_count; ++j) {
+        const auto &b = bindings.views[bindings.srv_count + j];
+        if (b.root_parameter >= 16 || b.array_count != 1)
+            return std::nullopt;
+        if (b.kind != ComputeViewKind::texture_uav && b.kind != ComputeViewKind::half4_texture_uav)
+            return std::nullopt;
+        if (b.image_dimension != 1 && b.image_dimension != 5)
+            return std::nullopt;
+        uav_lines << "uav " << j << (b.image_dimension == 5 ? " tex2da table " : " tex2d table ") << b.root_parameter
+                  << ' ' << b.byte_offset << '\n';
+    }
+    for (size_t i = 0; i < bindings.samplers.statics.size(); ++i) {
+        const auto &w = bindings.samplers.statics[i];
+        const bool cmp = i < bindings.samplers.comparison.size() && bindings.samplers.comparison[i];
+        const bool lod = !cmp && i < bindings.samplers.lod_limits.size() && bindings.samplers.lod_limits[i];
+        char line[64];
+        std::snprintf(line, sizeof(line), "%s %zu %08x %08x %08x %08x\n", cmp ? "smpc" : lod ? "smpl" : "smp", i, w[0],
+                      w[1], w[2], w[3]);
+        sampler_lines << line;
+    }
+
+    unsigned params = 0;
+    for (const auto &out : pair.vertex.outputs)
+        if (out.name == "TEXCOORD")
+            params = (std::max)(params, out.index / 4 + 1);
+
+    std::ostringstream out;
+    out << "x2w-manifest " << (uav_count ? 2 : 1) << "\nud " << (total_constants ? total_constants : 1u) << '\n';
+    if (!total_constants) {
+        out << "udsrc 0 rect\n";
+    } else {
+        unsigned ud_index = 0;
+        for (unsigned r = 0; r < constants.counts.size(); ++r)
+            for (unsigned j = 0; j < constants.counts[r]; ++j)
+                out << "udsrc " << ud_index++ << " rootconst " << r << ' ' << j << '\n';
+    }
+    out << srv_lines.str() << uav_lines.str() << sampler_lines.str() << "params " << params << "\ntargets";
+    bool any_target = false;
+    for (unsigned t = 0; t < pair.pixel.pixel_writes.size(); ++t) {
+        if (!pair.pixel.pixel_writes[t])
+            continue;
+        out << ' ' << t;
+        any_target = true;
+    }
+    if (!any_target)
+        out << ' ';
+    out << '\n';
+    for (unsigned t = 0; t < pair.pixel.pixel_writes.size(); ++t) {
+        const unsigned mask = pair.pixel.pixel_writes[t];
+        if (mask > 0 && mask < 0xf) {
+            char line[16];
+            std::snprintf(line, sizeof(line), "wmask %u 0x%x\n", t, mask);
+            out << line;
+        }
+    }
+    return out.str();
 }
 } // namespace x2w

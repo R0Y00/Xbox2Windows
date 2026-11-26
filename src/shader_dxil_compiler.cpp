@@ -13,13 +13,26 @@ namespace fs = std::filesystem;
 using Microsoft::WRL::ComPtr;
 namespace {
 using Bytes = std::vector<unsigned char>;
+bool try_read_file(const fs::path& path, Bytes& bytes) {
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    const bool sized = GetFileSizeEx(handle, &size) && size.QuadPart >= 0 && size.QuadPart <= 256ll * 1024 * 1024;
+    bool ok = sized;
+    if (sized) {
+        bytes.resize(static_cast<size_t>(size.QuadPart));
+        DWORD read_bytes = 0;
+        ok = !size.QuadPart || (ReadFile(handle, bytes.data(), static_cast<DWORD>(size.QuadPart), &read_bytes, nullptr) &&
+                                read_bytes == static_cast<DWORD>(size.QuadPart));
+    }
+    CloseHandle(handle);
+    return ok;
+}
 Bytes read_file(const fs::path& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    auto size = file.tellg();
-    if (size < 0 || size > 256 * 1024 * 1024) throw std::runtime_error("unreadable or oversized input");
-    Bytes bytes(static_cast<size_t>(size));
-    file.seekg(0);
-    if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) throw std::runtime_error("short read");
+    Bytes bytes;
+    if (!try_read_file(path, bytes)) throw std::runtime_error("unreadable or oversized input");
     return bytes;
 }
 std::string digest(const void* data, size_t size) {
@@ -107,13 +120,11 @@ CompiledShader ShaderDxilCompiler::compile(const std::string& source_text, const
         digest(source_text.data(),source_text.size());
     const auto key = digest(identity.data(),identity.size());
     const auto path = cache / (key + ".bin");
-    if (fs::exists(path)) {
-        auto bytes = read_file(path);
-        if (bytes.size() > 128 && std::equal(key.begin(),key.end(),bytes.begin())) {
-            const auto hash = digest(bytes.data()+128, bytes.size()-128);
-            if (std::equal(hash.begin(),hash.end(),bytes.begin()+64))
-                return {Bytes(bytes.begin()+128,bytes.end()),true};
-        }
+    Bytes cached;
+    if (try_read_file(path, cached) && cached.size() > 128 && std::equal(key.begin(), key.end(), cached.begin())) {
+        const auto hash = digest(cached.data() + 128, cached.size() - 128);
+        if (std::equal(hash.begin(), hash.end(), cached.begin() + 64))
+            return {Bytes(cached.begin() + 128, cached.end()), true};
     }
     ComPtr<IDxcBlob> blob;
     if (direct) {

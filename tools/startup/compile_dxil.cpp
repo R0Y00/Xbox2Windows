@@ -25,19 +25,14 @@ static double elapsed_ms(Clock::time_point since) {
 
 namespace fs = std::filesystem;
 
-static void compile_source(x2w::ShaderDxilCompiler& compiler,const std::string& source,const std::wstring& profile,
-                           const fs::path& destination,const fs::path& cache,bool direct,std::ostream& report) {
-    auto start=Clock::now();
-    auto output=compiler.compile(source,profile,cache,direct?x2w::ShaderSourceFormat::dxil_ir:x2w::ShaderSourceFormat::hlsl);
-    report << (output.cache_hit?"cache_hit_ms=":"cold_compile_and_publish_ms=")
-              << elapsed_ms(start) << " bytes=" << output.dxil.size() << '\n';
+static void publish_atomic(const fs::path& destination, const void* data, size_t size) {
     static std::atomic<unsigned long long> serial{};
     auto temp=destination;
     temp += L"." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(serial++) + L".tmp";
     try {
         std::ofstream file(temp,std::ios::binary);
         file.exceptions(std::ios::badbit | std::ios::failbit);
-        file.write(reinterpret_cast<const char*>(output.dxil.data()),output.dxil.size());
+        if (size) file.write(static_cast<const char*>(data),size);
         file.close();
         if(!MoveFileExW(temp.c_str(),destination.c_str(),MOVEFILE_REPLACE_EXISTING))
             throw std::runtime_error("could not publish output");
@@ -48,10 +43,30 @@ static void compile_source(x2w::ShaderDxilCompiler& compiler,const std::string& 
     }
 }
 
-static void compile_one(x2w::ShaderDxilCompiler& compiler, std::wstring profile, const fs::path& input_path,
-                        const fs::path& destination, const fs::path& cache, std::ostream& report,const x2w::NativeComputeShader *linked=nullptr) {
+static std::vector<unsigned char> compile_to_dxil(x2w::ShaderDxilCompiler& compiler, const std::string& source,
+                                                  const std::wstring& profile, const fs::path& cache, bool direct,
+                                                  std::ostream& report) {
+    auto start=Clock::now();
+    auto output=compiler.compile(source,profile,cache,direct?x2w::ShaderSourceFormat::dxil_ir:x2w::ShaderSourceFormat::hlsl);
+    report << (output.cache_hit?"cache_hit_ms=":"cold_compile_and_publish_ms=")
+              << elapsed_ms(start) << " bytes=" << output.dxil.size() << '\n';
+    return std::move(output.dxil);
+}
+
+static void compile_source(x2w::ShaderDxilCompiler& compiler,const std::string& source,const std::wstring& profile,
+                           const fs::path& destination,const fs::path& cache,bool direct,std::ostream& report) {
+    auto dxil = compile_to_dxil(compiler, source, profile, cache, direct, report);
+    publish_atomic(destination, dxil.data(), dxil.size());
+}
+
+static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler, std::wstring profile,
+                                              const fs::path& input_path, const fs::path& destination,
+                                              const fs::path& cache, std::ostream& report,
+                                              const x2w::NativeComputeShader *linked=nullptr,
+                                              bool emit_manifest=false) {
     Clock::time_point start;
     std::string source;
+    std::optional<std::string> manifest;
     const std::wstring clear_prefix=L"gfx1013-group-clear@";
     const std::wstring direct_prefix=L"gfx1013-direct-cs@";
     const bool container=profile==L"gfx1013-container-cs";
@@ -77,6 +92,7 @@ static void compile_one(x2w::ShaderDxilCompiler& compiler, std::wstring profile,
             if (b.scalar_table == Table::srv) report << " table_view=srv";
             report << '\n';
         }
+        if (emit_manifest && !container) manifest = x2w::format_compute_runtime_manifest(program);
         source=direct?std::move(program.dxil_ir):std::move(program.hlsl);profile=L"cs_6_6";
     } else if (profile.compare(0,clear_prefix.size(),clear_prefix)==0) {
         auto offset=profile.substr(clear_prefix.size());
@@ -130,6 +146,7 @@ static void compile_one(x2w::ShaderDxilCompiler& compiler, std::wstring profile,
         profile=L"ps_6_0";
     }
     compile_source(compiler,source,profile,destination,cache,direct,report);
+    return manifest;
 }
 
 // Outputs of concurrent jobs must be independent. Compare Windows paths
@@ -176,7 +193,7 @@ int wmain(int argc, wchar_t** argv) {
         const bool graphics_batch = directory && direct_pair;
         const bool compute_request = profile.rfind(L"gfx1013-group-clear@",0)==0 ||
                                      profile.rfind(L"gfx1013-compute-wave32@",0)==0 || profile.rfind(L"gfx1013-direct-cs@",0)==0 || profile==L"gfx1013-container-cs";
-        std::vector<fs::path> inputs, outputs;
+        std::vector<fs::path> inputs, outputs, stems;
         if (directory) {
             if (!compute_request && !graphics_batch) throw std::runtime_error("profile does not take capture directories");
             const auto extension = graphics_batch ? L".a" : profile == L"gfx1013-container-cs" ? L".cdx" : L".c67";
@@ -188,8 +205,12 @@ int wmain(int argc, wchar_t** argv) {
             if (inputs.empty()) throw std::runtime_error("no ready shader requests");
             std::sort(inputs.begin(),inputs.end());
             fs::create_directories(argv[first+2]);
-            for (const auto& path : inputs)
-                outputs.push_back(fs::weakly_canonical(fs::path(argv[first+2]) / path.filename().replace_extension(L".cso")));
+            for (const auto& path : inputs) {
+                auto key_stem = path.stem().wstring().substr(4);
+                if (key_stem.empty()) key_stem = L"_invalid";
+                stems.push_back(fs::weakly_canonical(fs::path(argv[first+2]) / key_stem));
+                outputs.push_back(fs::path(stems.back()) += (graphics_batch ? L".vs.cso" : L".cs.cso"));
+            }
         } else {
             for(int i=first;i<argc;i+=2) {
                 inputs.push_back(fs::weakly_canonical(fs::absolute(argv[i])));
@@ -234,26 +255,65 @@ int wmain(int argc, wchar_t** argv) {
                     occupied.insert(fs::weakly_canonical(fs::path(input).replace_extension(suffix)));
             }
         }
-        for(const auto& output : outputs)
-            if(!occupied.insert(output).second)
+        if(graphics_batch) {
+            for(const auto& input : inputs) {
+                for(auto suffix : {L".b",L".root",L".ia",L".psin"})
+                    occupied.insert(fs::weakly_canonical(fs::path(input).replace_extension(suffix)));
+            }
+        }
+        auto reserve_output = [&](const fs::path& path) {
+            if(!occupied.insert(path).second)
                 throw std::runtime_error("parallel outputs must be distinct from all inputs and other outputs");
+        };
+        for(int i=0;i<count;++i) {
+            reserve_output(outputs[i]);
+            if(directory) {
+                reserve_output(fs::path(stems[i]) += L".txt");
+                if(graphics_batch) {
+                    reserve_output(fs::path(stems[i]) += L".ps.cso");
+                    reserve_output(fs::path(stems[i]) += L".psdep");
+                    if(rectangles) reserve_output(fs::path(stems[i]) += L".gs.cso");
+                }
+            }
+        }
         auto compile_job = [&](x2w::ShaderDxilCompiler &compiler, int i, std::ostream &report) {
             if (!graphics_batch) {
-                compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, linked_stage(i));
+                if (!directory) {
+                    compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, linked_stage(i));
+                    return;
+                }
+                const fs::path manifest_path = fs::path(stems[i]) += L".txt";
+                std::error_code ignored;
+                fs::remove(manifest_path, ignored);
+                auto manifest = compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, nullptr, true);
+                if (manifest) publish_atomic(manifest_path, manifest->data(), manifest->size());
                 return;
             }
+            const fs::path manifest_path = fs::path(stems[i]) += L".txt";
+            const fs::path psdep_path = fs::path(stems[i]) += L".psdep";
+            std::error_code ignored;
+            fs::remove(manifest_path, ignored);
             auto input = x2w::read_graphics_request(inputs[i]);
             bool hit = false;
             auto pair = x2w::prepare_direct_graphics(input.a, input.b, argv[2], hit, input.root, input.input_layout, input.pixel_entry);
             report << "graphics_pair frontend_cache_hit=" << hit << '\n';
+            auto manifest = rectangles ? std::nullopt : x2w::format_graphics_runtime_manifest(pair);
+            std::vector<unsigned char> gs_dxil;
             if (rectangles) {
                 auto ir=x2w::native_rectangle_geometry(pair.vertex.outputs,pair.pixel.inputs);
-                compile_source(compiler,ir,L"gs_6_6",fs::path(outputs[i]).replace_extension(L".gs.cso"),argv[2],true,report);
+                gs_dxil = compile_to_dxil(compiler, ir, L"gs_6_6", argv[2], true, report);
             }
-            compile_one(compiler, L"gfx1013-container-vs", inputs[i], fs::path(outputs[i]).replace_extension(L".vs.cso"),
-                        argv[2], report, &pair.vertex);
-            compile_one(compiler, L"gfx1013-container-ps", inputs[i], fs::path(outputs[i]).replace_extension(L".ps.cso"),
-                        argv[2], report, &pair.pixel);
+            auto vs_dxil = compile_to_dxil(compiler, pair.vertex.dxil_ir, L"vs_6_6", argv[2], true, report);
+            auto ps_dxil = compile_to_dxil(compiler, pair.pixel.dxil_ir, L"ps_6_6", argv[2], true, report);
+            if (rectangles)
+                publish_atomic(fs::path(stems[i]) += L".gs.cso", gs_dxil.data(), gs_dxil.size());
+            publish_atomic(outputs[i], vs_dxil.data(), vs_dxil.size());
+            publish_atomic(fs::path(stems[i]) += L".ps.cso", ps_dxil.data(), ps_dxil.size());
+            if (manifest) {
+                if (!input.pixel_input_description.empty())
+                    publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
+                publish_atomic(manifest_path, manifest->data(), manifest->size());
+            }
         };
         if(jobs==1 && !directory) {
             x2w::ShaderDxilCompiler compiler(argv[1]);

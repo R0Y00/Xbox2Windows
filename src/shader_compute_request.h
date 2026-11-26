@@ -12,7 +12,8 @@ struct ComputeContainer {
     std::string bytes, root;
 };
 struct GraphicsRequest {
-    std::string a, b, root, input_layout, pixel_entry;
+    std::string a, b, root, input_layout, pixel_entry, pixel_input_description;
+    uint64_t key{};
 };
 GraphicsRequest read_graphics_request(const std::filesystem::path &marker);
 std::string read_shader_container_bytes(const std::filesystem::path &file);

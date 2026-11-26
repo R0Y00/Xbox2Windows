@@ -102,6 +102,7 @@ struct NativeComputeShader {
     std::vector<ComputeViewBinding> bindings;
     std::vector<ComputeSampler> samplers;
     unsigned instruction_count{};
+    std::array<unsigned, 3> group{};
     bool vertex_fetch = false;
     std::array<unsigned, 8> pixel_writes{};
 };

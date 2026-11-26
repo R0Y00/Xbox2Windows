@@ -50,7 +50,7 @@ struct GraphicsStage {
             unsigned base = 0, first = UINT_MAX;
             for (unsigned bit = 0; bit < 7; ++bit)
                 if (stage.pixel_input_address & (1u << bit)) {
-                    if (src == base + (op == 1)) {
+                    if ((stage.pixel_input_enable & (1u << bit)) && src == base + (op == 1)) {
                         mode = bary_modes[bit];
                         first = base;
                         break;
@@ -154,6 +154,8 @@ struct GraphicsStage {
                     continue;
                 const unsigned width = bit == 3 ? 3 : bit < 7 ? 2 : 1;
                 if (vgpr >= first && vgpr < first + width) {
+                    if (!(stage.pixel_input_enable & (1u << bit)))
+                        break;
                     if (bit < 7 && bary_modes[bit]) {
                         // I/J weight vertices one and two. Distinct guest
                         // pairs may need distinct host system-value elements.
@@ -1294,7 +1296,7 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
     DirectCompute alu{emitter};
     const bool pixel = stage.stage == GpuStage::ps;
     alu.pixel_stage = pixel;
-    alu.perspective_center_pair = pixel && (stage.pixel_input_address & 3) == 2;
+    alu.perspective_center_pair = pixel && (stage.pixel_input_address & 3) == 2 && (stage.pixel_input_enable & 2) != 0;
     if (pixel && !(stage.pixel_input_address >> 16))
         for (unsigned b = 0; b < 16; ++b)
             if (stage.pixel_input_address & (1u << b))

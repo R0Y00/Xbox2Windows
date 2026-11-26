@@ -13,4 +13,6 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
                                           const std::filesystem::path &cache, bool &cache_hit,
                                           std::string_view root = {}, std::string_view input_layout = {},
                                           std::string_view pixel_entry = {});
+std::optional<std::string> format_compute_runtime_manifest(const NativeComputeShader &program);
+std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphicsPair &pair);
 }

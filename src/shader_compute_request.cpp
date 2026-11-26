@@ -1,8 +1,10 @@
 #include "shader_compute_request.h"
 #include <charconv>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -32,30 +34,118 @@ void hash_bytes(uint64_t &key, const void *data, size_t size) {
     for (size_t i = 0; i < size; ++i)
         key = (key ^ bytes[i]) * 1099511628211ull;
 }
+bool lower_hex(std::string_view text) {
+    if (text.empty()) return false;
+    for (char c : text)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+uint64_t parse_request_stem(std::string_view stem, const char *error_message) {
+    const std::string_view digits = stem.substr(4);
+    uint64_t expected = 0;
+    if (!lower_hex(digits))
+        throw std::runtime_error(error_message);
+    const auto end = digits.data() + digits.size();
+    const auto parsed = std::from_chars(digits.data(), end, expected, 16);
+    if (parsed.ec != std::errc{} || parsed.ptr != end)
+        throw std::runtime_error(error_message);
+    return expected;
+}
+void parse_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry, Bytes &description) {
+    fs::path path = marker;
+    path.replace_extension(".psin");
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto size = file.tellg();
+    if (size < 0 || size > 128)
+        throw std::runtime_error("invalid pixel input description");
+    Bytes raw(static_cast<size_t>(size), 0);
+    file.seekg(0);
+    if (size && !file.read(raw.data(), size))
+        throw std::runtime_error("short read");
+    std::string_view line = raw;
+    if (!line.empty() && line.back() == '\n')
+        line.remove_suffix(1);
+    if (line.size() < 22 || line.substr(0, 6) != "psin1 " || line.find_first_of("\r\n") != std::string_view::npos)
+        throw std::runtime_error("invalid pixel input description");
+    const std::string_view key_hex = line.substr(6, 16);
+    if (!lower_hex(key_hex))
+        throw std::runtime_error("invalid pixel input description");
+    uint64_t described_key = 0;
+    const auto key_end = key_hex.data() + key_hex.size();
+    if (std::from_chars(key_hex.data(), key_end, described_key, 16).ptr != key_end)
+        throw std::runtime_error("invalid pixel input description");
+    bool has_ena = false, has_addr = false;
+    uint32_t ena = 0, addr = 0;
+    unsigned fields = 0;
+    size_t pos = 22;
+    while (pos < line.size()) {
+        if (line[pos] != ' ' || ++fields > 2)
+            throw std::runtime_error("invalid pixel input description");
+        ++pos;
+        const size_t next = line.find(' ', pos);
+        const std::string_view token = line.substr(pos, next == std::string_view::npos ? line.size() - pos : next - pos);
+        pos = next == std::string_view::npos ? line.size() : next;
+        const bool is_ena = token.substr(0, 6) == "ena=0x";
+        const bool is_addr = token.substr(0, 7) == "addr=0x";
+        if (!is_ena && !is_addr)
+            throw std::runtime_error("invalid pixel input description");
+        const std::string_view mask_hex = token.substr(is_ena ? 6 : 7);
+        if (mask_hex.empty() || mask_hex.size() > 4 || !lower_hex(mask_hex) || (is_ena ? has_ena : has_addr))
+            throw std::runtime_error("invalid pixel input description");
+        uint32_t value = 0;
+        const auto mask_end = mask_hex.data() + mask_hex.size();
+        if (std::from_chars(mask_hex.data(), mask_end, value, 16).ptr != mask_end)
+            throw std::runtime_error("invalid pixel input description");
+        if (is_ena) {
+            has_ena = true;
+            ena = value;
+        } else {
+            has_addr = true;
+            addr = value;
+        }
+    }
+    if (described_key != expected)
+        throw std::runtime_error("pixel input description names another pipeline");
+    if (!has_ena)
+        throw std::runtime_error("pixel input enable mask missing from the stream description");
+    if (!has_addr)
+        throw std::runtime_error("pixel input address mask missing from the stream description");
+    if (ena & ~addr)
+        throw std::runtime_error("contradictory pixel input enable/address masks");
+    entry.assign("psin1", 5);
+    const uint32_t words[2]{ena, addr};
+    entry.append(reinterpret_cast<const char *>(words), sizeof(words));
+    char text[64];
+    std::snprintf(text, sizeof(text), "psin1 %016llx ena=0x%04x addr=0x%04x\n",
+                  static_cast<unsigned long long>(expected), ena, addr);
+    description = text;
+}
 } // namespace
 
 x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
     auto stem = marker.stem().string();
     if (marker.extension() != ".a" || stem.size() != 20 || stem.compare(0, 4, "req_"))
         throw std::runtime_error("expected req_<16 hex digits>.a");
-    uint64_t expected = 0;
-    const auto end = stem.data() + stem.size();
-    const auto parsed = std::from_chars(stem.data() + 4, end, expected, 16);
-    if (parsed.ec != std::errc{} || parsed.ptr != end)
-        throw std::runtime_error("invalid graphics request key");
+    const uint64_t expected = parse_request_stem(stem, "invalid graphics request key");
     GraphicsRequest request{part(marker, ".a", 64 << 20), part(marker, ".b", 64 << 20),
-                            part(marker, ".root", 16 << 20), {}};
+                            part(marker, ".root", 16 << 20), {}, {}, {}, expected};
     if (fs::exists(fs::path(marker).replace_extension(".ia")))
         request.input_layout = part(marker, ".ia", 1 << 20);
     if (fs::exists(fs::path(marker).replace_extension(".psin")))
-        request.pixel_entry = part(marker, ".psin", 12);
+        parse_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
     constexpr char revision[] = "x2w-startup-shader-28";
     uint64_t key = 1469598103934665603ull;
     hash_bytes(key, revision, sizeof(revision) - 1);
     for (const auto *p : {&request.a, &request.b, &request.root, &request.input_layout, &request.pixel_entry})
         hash_bytes(key, p->data(), p->size());
-    if (request.root.empty() || key != expected)
+    if (request.root.empty())
         throw std::runtime_error("graphics request key mismatch or missing root");
+    if (key != expected) {
+        if (!request.pixel_entry.empty())
+            throw std::runtime_error("stale pixel input description: graphics request key mismatch");
+        throw std::runtime_error("graphics request key mismatch or missing root");
+    }
     return request;
 }
 
@@ -63,15 +153,11 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     auto name = marker.stem().string();
     if (marker.extension() != ".c67" || name.size() != 20 || name.compare(0, 4, "req_"))
         throw std::runtime_error("expected req_<16 hex digits>.c67");
-    uint64_t expected = 0;
-    auto parsed = std::from_chars(name.data() + 4, name.data() + 20, expected, 16);
-    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + 20)
-        throw std::runtime_error("invalid request key");
+    const uint64_t expected = parse_request_stem(name, "invalid request key");
     auto code = part(marker, ".c67", 1 << 20), data = part(marker, ".data", 1 << 20),
          root = part(marker, ".root", 16 << 20);
     auto desc = part(marker, ".desc", 96), sa = part(marker, ".sa", 4096), sb = part(marker, ".sb", 4096);
-    if (desc.size() != 96 || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4 ||
-        read<uint64_t>(desc, 48) != code.size() || read<uint64_t>(desc, 64) != data.size() ||
+    if (desc.size() != 96 || read<uint64_t>(desc, 48) != code.size() || read<uint64_t>(desc, 64) != data.size() ||
         read<uint64_t>(desc, 16) != sa.size() || read<uint64_t>(desc, 32) != sb.size())
         throw std::runtime_error("inconsistent compute request");
     uint64_t key = 1469598103934665603ull;
@@ -84,6 +170,9 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     }
     if (key != expected)
         throw std::runtime_error("compute request key mismatch");
+    if (root.empty() || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4)
+        throw std::runtime_error(sa.size() != 28 ? "compute state block A is not 28 bytes"
+                                                 : "inconsistent compute request");
     return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), key};
 }
 
