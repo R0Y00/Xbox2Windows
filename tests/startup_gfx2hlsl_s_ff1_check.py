@@ -37,6 +37,9 @@ WORDS = (0x00000000, 0xffffffff, 0x80000001, 0x00010020, 0x55555555, 0xaaaaaaaa,
 DRAW_B32 = (0x00000000, 0x00000001, 0x80000000, 0x00010000)
 # b64 immediates only (hi forced to 0 by zero-extension). hi-nonzero is #2072.
 IMMEDIATE_B64 = (0x00000000, 0x00000001, 0x00010000, 0x80000000)
+# Live SGPR pair s4:s5 as (lo, hi): both zero, lo only, hi only, both set (lo wins), edge bits in each half.
+PAIR_B64 = ((0, 0), (1, 0), (0, 1), (0, 0x80000000), (0, 0x10), (0x80000000, 0xffffffff), (0x00010000, 0x1),
+            (0xffffffff, 0xffffffff))
 SCC_UNSET = 2
 VCC_LO, EXEC_LO = 106, 126
 
@@ -273,6 +276,52 @@ def dispatch_b32(dxc, runner, adapter, cases, directory):
     return actual[len(fill):word_count]
 
 
+def ff1_64(lo, hi):
+    """CPU reference for s_ff1_i32_b64: lowest set bit of the pair, -1 when both words are zero."""
+    lo, hi = lo & MASK, hi & MASK
+    return ff1_32(lo) if lo else (32 + ff1_32(hi) if hi else MASK)
+
+
+def dispatch_b64_pairs(dxc, runner, adapter, cases, directory):
+    """Translate s_ff1_i32_b64 of the live pair s4:s5 once; feed each (lo, hi) through a UAV and read it back."""
+    lines, _ = translate(sop1('s_ff1_i32_b64', 3, 4))
+    assert lines and not lines[0].startswith('refused'), lines
+    fill = tuple(((i + 1) * 0x9e3779b1 & MASK) | 1 for i in range(2 * len(cases)))
+    hlsl = ['RWByteAddressBuffer data : register(u0);', '[numthreads(1, 1, 1)]', 'void main() {']
+    for i, (lo, hi) in enumerate(cases):
+        hlsl.extend((
+            '    {',
+            '        uint s4 = data.Load(%d) ^ %s;' % (8 * i, '%#010xu' % (fill[2 * i] ^ lo)),
+            '        uint s5 = data.Load(%d) ^ %s;' % (8 * i + 4, '%#010xu' % (fill[2 * i + 1] ^ hi)),
+            '        uint s3;',
+            '        bool scc = true;',
+        ))
+        hlsl.extend('        ' + line for line in lines)
+        hlsl.append('        data.Store(%d, s3);' % (4 * (len(fill) + i)))
+        hlsl.append('    }')
+    hlsl.append('}')
+
+    src, cso, output = (directory / ('s_ff1_b64_pair' + suffix) for suffix in ('.hlsl', '.cso', '.bin'))
+    src.write_text('\n'.join(hlsl) + '\n', encoding='ascii')
+    compile_result = subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)],
+                                    stderr=subprocess.PIPE, text=True)
+    if compile_result.returncode or compile_result.stderr:
+        raise AssertionError(compile_result.stderr or 'DXC exited with %d' % compile_result.returncode)
+    word_count = len(fill) + len(cases)
+    dump_words = (word_count + 3) // 4 * 4
+    run_result = subprocess.run(
+        [runner, adapter, '--raw-uav-dump', str(cso), '1', str(4 * dump_words), str(output)],
+        capture_output=True, text=True)
+    print(run_result.stdout, end='')
+    if run_result.returncode == 77:
+        sys.exit(77)
+    if run_result.returncode or run_result.stderr:
+        raise AssertionError(run_result.stderr or 'raw UAV dump exited with %d' % run_result.returncode)
+    actual = struct.unpack('<%dI' % dump_words, output.read_bytes())
+    assert actual[:len(fill)] == fill, 'operand region changed: %s' % (actual[:len(fill)],)
+    return actual[len(fill):word_count]
+
+
 def dispatch_b64_immediates(dxc, runner, adapter, cases, directory):
     """Store the folded b64-immediate results; proves the zero-extend fold on the adapter."""
     hlsl = ['RWByteAddressBuffer data : register(u0);', '[numthreads(1, 1, 1)]', 'void main() {']
@@ -329,6 +378,14 @@ def check_dispatch(dxc, runner, adapter):
             want = ff1_32(word)  # hi = 0 by zero-extension
             check('dispatch s_ff1_i32_b64 immediate %#010x (hi=0)' % word, got64[i] == want,
                   'got %#x want %#x' % (got64[i], want))
+        gotpair = dispatch_b64_pairs(dxc, runner, adapter, PAIR_B64, directory)
+        for i, (lo, hi) in enumerate(PAIR_B64):
+            want = ff1_64(lo, hi)
+            check('dispatch s_ff1_i32_b64 pair hi=%#010x lo=%#010x' % (hi, lo), gotpair[i] == want,
+                  'got %#x want %#x' % (gotpair[i], want))
+        # Negative control: a lo-first scan that ignored the high word would answer 0xffffffff here.
+        check('dispatch scans the high word when lo is zero', gotpair[PAIR_B64.index((0, 0x10))] == 36,
+              hex(gotpair[PAIR_B64.index((0, 0x10))]))
     if failures:
         print('FAILED: %s' % ', '.join(failures))
         sys.exit(1)
