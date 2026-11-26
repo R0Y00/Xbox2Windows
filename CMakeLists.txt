@@ -2139,7 +2139,7 @@ add_executable(startup_srv_refusal_cache_check tests/startup_srv_refusal_cache_c
 target_include_directories(startup_srv_refusal_cache_check PRIVATE src)
 target_compile_features(startup_srv_refusal_cache_check PRIVATE cxx_std_17)
 add_test(NAME startup_srv_refusal_cache COMMAND startup_srv_refusal_cache_check)
-foreach(mutation IN ITEMS generation commit key device age hits invalid)
+foreach(mutation IN ITEMS generation memory key device age hits invalid)
     add_test(NAME startup_srv_refusal_cache_${mutation}_control COMMAND startup_srv_refusal_cache_check --mutate ${mutation})
     set_tests_properties(startup_srv_refusal_cache_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()

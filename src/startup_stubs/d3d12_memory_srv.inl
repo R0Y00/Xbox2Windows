@@ -294,12 +294,22 @@ void clear_unplaced_buffers(Wrapper* device)
     }
 }
 
-Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc)
+// memory_independent (out, optional): set when a nullptr answer was decided by the request and the stand-in state
+// alone (a live resource overlaps, no page extent, a placed buffer owns the page), not by what is committed at the
+// address. Only such refusals are exact enough to cache (srv_refusal_cache.h).
+Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
+                                bool* memory_independent = nullptr)
 {
-    if (address_resource_overlap(address, span_bytes)) return nullptr;
-    u64 page_start = 0, page_span = 0;
-    if (!x2w_startup::unplaced_buffer_extent(address, span_bytes, page_start, page_span))
+    if (memory_independent) *memory_independent = false;
+    if (address_resource_overlap(address, span_bytes)) {
+        if (memory_independent) *memory_independent = true;
         return nullptr;
+    }
+    u64 page_start = 0, page_span = 0;
+    if (!x2w_startup::unplaced_buffer_extent(address, span_bytes, page_start, page_span)) {
+        if (memory_independent) *memory_independent = true;
+        return nullptr;
+    }
 
     x2w_startup::PlacedBufferRange memory{};
     if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(page_start), page_span, memory) ||
@@ -307,7 +317,10 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         return nullptr;
 
     const auto nearby = placed_buffer_range(device, page_start, page_span, true);
-    if (nearby.reject || nearby.owner) return nullptr;
+    if (nearby.reject || nearby.owner) {
+        if (memory_independent) *memory_independent = true;
+        return nullptr;
+    }
 
     auto* desktop = device_of(device);
     if (!desktop) return nullptr;
@@ -697,12 +710,22 @@ x2w_startup::SrvRefusalKey buffer_refusal_key(const Wrapper* device, const D3D12
     return key;
 }
 
-// The generation first, then the memory: a change between the two reads makes the entry stale, never fresh.
+// Refusals that depend on what is committed at the address are not cached unless X2W_SRV_REFUSAL_CACHE_MEMORY is
+// set: commit and decommit happen behind the stand-ins and a region stamp cannot see pages that move with the same
+// total, so a retry right after the title commits the buffer could be refused again for up to 250 ms.
+bool srv_refusal_cache_memory_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_SRV_REFUSAL_CACHE_MEMORY");
+    return enabled;
+}
+
+// The generation first, then (opt-in only) the memory: a change between the two reads makes the entry stale, never fresh.
 x2w_startup::SrvRefusalStamp buffer_refusal_stamp(u64 address)
 {
     x2w_startup::SrvRefusalStamp stamp;
     stamp.generation = x2w_startup::srv_placement_generation().load(std::memory_order_acquire);
-    stamp.valid = x2w_startup::region_stamp(reinterpret_cast<const void*>(address), stamp.base, stamp.size, stamp.commit, stamp.flags);
+    if (srv_refusal_cache_memory_enabled())
+        stamp.valid = x2w_startup::region_stamp(reinterpret_cast<const void*>(address), stamp.base, stamp.size, stamp.commit, stamp.flags);
     return stamp;
 }
 
@@ -739,21 +762,23 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
         const auto refusal_key = buffer_refusal_key(self, *resource, *input, span_bytes);
         const auto refusal_stamp = buffer_refusal_stamp(input->address);
-        if (buffer_refusal_cache().hit(refusal_key, refusal_stamp, GetTickCount64())) {
+        if (buffer_refusal_cache().hit(refusal_key, refusal_stamp, GetTickCount64(), srv_refusal_cache_memory_enabled())) {
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;
         }
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
+        bool memory_independent = false;
         if (!buffer) {
-            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource);
+            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, &memory_independent);
         }
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
         if (!buffer || !info ||
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
-            buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64());
+            // A buffer that was found (placed or unplaced) and does not fit the view is decided by its recorded size.
+            buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64(), memory_independent || buffer != nullptr);
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;
