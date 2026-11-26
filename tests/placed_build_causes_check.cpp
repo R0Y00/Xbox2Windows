@@ -12,6 +12,8 @@ using x2w_startup::PlacedBuildCause;
 using Cause = PlacedBuildCause;
 using x2w_startup::check_update_shape;
 using x2w_startup::ranges_overlap;
+using x2w_startup::gpu_range_cause;
+using x2w_startup::PlacedBuildLedger;
 
 #define CHECK(condition)                                                                  \
     do {                                                                                  \
@@ -90,6 +92,50 @@ void source_causes_read_as_the_source()
     CHECK(x2w_startup::as_source_cause(Cause::ok) == Cause::ok);
     CHECK(x2w_startup::as_source_cause(Cause::source_unaligned) == Cause::source_unaligned);
 }
+
+// The translated address of a placed buffer: this is the only rule behind `range` and `source_range` that a real device cannot
+// be made to break (buffers are placed 64 KB aligned and never at address zero), so it is checked here by value.
+void the_translated_address_must_be_usable()
+{
+    constexpr std::uint64_t gpu = 0x7000'0000'0000;
+    CHECK(gpu_range_cause(gpu, 0) == Cause::ok);
+    CHECK(gpu_range_cause(gpu, 512) == Cause::ok);
+    CHECK(gpu_range_cause(0, 0) == Cause::range);                    // no GPU address at all
+    CHECK(gpu_range_cause(gpu, 1) == Cause::range);                  // the offset breaks the 256-byte alignment
+    CHECK(gpu_range_cause(gpu + 128, 0) == Cause::range);            // a misaligned base
+    CHECK(gpu_range_cause(UINT64_MAX - 255, 256) == Cause::range);   // the offset wraps the address
+    CHECK(gpu_range_cause(UINT64_MAX - 255, 255) == Cause::range);   // (no wrap, but the sum is misaligned)
+    CHECK(gpu_range_cause(UINT64_MAX - 511, 256) == Cause::ok);      // the last aligned fit
+    CHECK(x2w_startup::as_source_cause(gpu_range_cause(0, 0)) == Cause::source_range);
+}
+
+// An update needs a source built with ALLOW_UPDATE; the resolver records each build's flag and checks it here.
+void an_update_source_needs_a_recorded_allow_update_build()
+{
+    PlacedBuildLedger ledger;
+    CHECK(ledger.check_source(base) == Cause::source_not_built);               // never built
+    ledger.record(base, size, true);
+    CHECK(ledger.check_source(base) == Cause::ok);
+    CHECK(ledger.check_source(base + 256) == Cause::source_not_built);         // only the start of a structure names it
+    CHECK(ledger.check_source(base - 256) == Cause::source_not_built);
+    ledger.record(base + 8 * size, size, false);                               // built without ALLOW_UPDATE
+    CHECK(ledger.check_source(base + 8 * size) == Cause::source_not_updatable);
+    CHECK(ledger.check_source(base) == Cause::ok);                             // the other structure is unaffected
+    // Building again over the same memory replaces the record, in either direction.
+    ledger.record(base + 8 * size, size, true);
+    CHECK(ledger.check_source(base + 8 * size) == Cause::ok);
+    ledger.record(base, size, false);
+    CHECK(ledger.check_source(base) == Cause::source_not_updatable);
+    // A build that overlaps another structure's memory (partly or wholly) drops that structure's record.
+    ledger.record(base, size, true);
+    ledger.record(base + 256, size, true);
+    CHECK(ledger.check_source(base) == Cause::source_not_built);
+    CHECK(ledger.check_source(base + 256) == Cause::ok);
+    // An adjacent build (first byte past) keeps it.
+    ledger.record(base + 256 + size, size, false);
+    CHECK(ledger.check_source(base + 256) == Cause::ok);
+    CHECK(ledger.size() == 3);
+}
 }  // namespace
 
 int main()
@@ -101,6 +147,8 @@ int main()
     the_source_must_be_aligned();
     overlap_edges();
     source_causes_read_as_the_source();
+    the_translated_address_must_be_usable();
+    an_update_source_needs_a_recorded_allow_update_build();
     std::puts("placed build causes: all checks passed");
     return 0;
 }

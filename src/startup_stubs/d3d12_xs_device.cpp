@@ -7063,12 +7063,16 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& sizes,
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build)
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build, x2w_startup::PlacedBuildCause* reported)
 {
     using Cause = x2w_startup::PlacedBuildCause;
     // One log line per cause, for the first refusal of that kind in the process.
     static LONG logged[static_cast<std::size_t>(Cause::count)];
+    // What the resolver published for each placed build (flags per structure), see PlacedBuildLedger.
+    static SRWLOCK ledger_lock = SRWLOCK_INIT;
+    static x2w_startup::PlacedBuildLedger ledger;
     const auto refuse = [&](Cause cause, const char* role, UINT64 address) {
+        if (reported) *reported = cause;
         if (first_calls(logged[static_cast<std::size_t>(cause)], 1))
             log("x2w-dxr placed build refused: %s (%s at title 0x%llx)", x2w_startup::cause_name(cause), role,
                 static_cast<unsigned long long>(address));
@@ -7093,7 +7097,7 @@ HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT6
         const auto base = reinterpret_cast<UINT64>(found.owner->own().title_memory);
         const auto gpu = static_cast<ID3D12Resource*>(found.owner->own().real)->GetGPUVirtualAddress();
         const auto offset = address - base;
-        if (!gpu || offset > UINT64_MAX - gpu || (gpu + offset) % alignment) return {Cause::range, 0};
+        if (const Cause usable = x2w_startup::gpu_range_cause(gpu, offset); usable != Cause::ok) return {usable, 0};
         return {Cause::ok, gpu + offset};
     };
     constexpr auto as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -7112,9 +7116,22 @@ HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT6
         from = translate(source, sizes.ResultDataMaxSizeInBytes, as_state);
         if (from.cause != Cause::ok) return refuse(x2w_startup::as_source_cause(from.cause), "source", source);
     }
+    // The provenance of the source and the record of this build are one step under the lock: nothing is recorded for a refusal.
+    AcquireSRWLockExclusive(&ledger_lock);
+    if (update) {
+        if (const Cause built = ledger.check_source(source); built != Cause::ok) {
+            ReleaseSRWLockExclusive(&ledger_lock);
+            return refuse(built, "source", source);
+        }
+    }
+    // The structure written here keeps ALLOW_UPDATE only if this build asked for it (an update repeats the source's flags).
+    ledger.record(dest, sizes.ResultDataMaxSizeInBytes,
+                  (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE) != 0);
+    ReleaseSRWLockExclusive(&ledger_lock);
     build.DestAccelerationStructureData = out.gpu;
     build.ScratchAccelerationStructureData = temp.gpu;
     if (update) build.SourceAccelerationStructureData = from.gpu;
+    if (reported) *reported = Cause::ok;
     return S_OK;
 }
 
