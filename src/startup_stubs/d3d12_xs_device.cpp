@@ -4438,11 +4438,15 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     };
     const char* skip = nullptr;
     bool default_view = false;
+    bool uav_denied = false;  // a UAV of a resource without unordered access: recorded as not created, as before #2649
     if (N == 17) skip = "constant buffer view (title GPU address)";
     if (N >= 18 && N <= 21 && args[0]) {
         const UINT flags = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc().Flags;
         if (N == 18 && (flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) skip = "resource denies shader resource views";
-        if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) skip = "resource lacks unordered access";
+        if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            skip = "resource lacks unordered access";
+            uav_denied = true;
+        }
         if (N == 20 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) skip = "resource lacks render target";
         if (N == 21 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) skip = "resource lacks depth stencil";
         // Every view description of slots 18-21 starts with Format, then ViewDimension.
@@ -4491,6 +4495,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             record_view(false);
         } else if constexpr (N == 17) {
             record_view(false);  // Translated constant-buffer views use only the descriptor record.
+        } else if constexpr (N == 19) {
+            // A translated compute Dispatch tells this refusal from a descriptor that holds no view by the record.
+            // A refused creation leaves a descriptor that still holds a live view as it is.
+            if (uav_denied && !descriptor_has_live_view(args[D], title_dest)) record_view(false);
         }
     };
     if (skip) {

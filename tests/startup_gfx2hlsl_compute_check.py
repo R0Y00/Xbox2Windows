@@ -1735,6 +1735,9 @@ def check_controls():
                               (zv, ['s_andn2_b32 vcc_lo, vcc_lo, exec_lo', 's_and_b32 s22, vcc_lo, exec_lo',
                                     's_or_b32 vcc_lo, vcc_lo, s22'], cnd_vcc)):
         phi_text(phi(zero, write, read))
+    # ANDing a numeric word with EXEC does not turn it into this lane's projected bit.
+    refused(live('s20'), lambda: phi_text(phi(['s_and_b32 s20, s7, exec_lo'], blend[:1], cnd_s)))
+    phi_text(phi(['s_and_b32 s20, vcc_lo, exec_lo'], blend[:1], cnd_s))
     phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc))       # compare into a zeroed M
     phi_text(phi(['s_mov_b32 s20, -1'], ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_orn2_b32 s20, vcc_lo, exec_lo'], cnd_s))  # orn2
     # controls: the same writes without their set-up, an unmasked term, M not the first source, mixed classes,
