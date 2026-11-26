@@ -208,9 +208,9 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-19`. Revision 19 folds `s_mov_b32` from a scalar register that
+The shader cache revision is `x2w-startup-shader-20`. Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch, so cached shaders from revision 19 are not reused. Revision 19 folds `s_mov_b32` from a scalar register that
 holds a plain constant, so later reads of the copy use the constant word. The matching compute
-(`x2w-startup-shader-19cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
+(`x2w-startup-shader-20cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
 (`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
 Revisions before 19 read a register copied from a constant as a run-time value.
 Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
@@ -1594,8 +1594,9 @@ explicit overwrite and normal completion, with the legacy setting on and off.
 resource whose final guest Release happened and whose desktop object is still
 alive, once, by the first cause that applies. Format: `reason=count/bytes(oldest Nf)`,
 bytes from the budget ticket, `oldest` in frames since the final Release:
-- `view-refs`: a tracked slot 18 descriptor still names it;
-  `view-refs-in-visible-heap` is the part with a descriptor in a shader-visible heap.
+- `view-refs`: a tracked descriptor slot still names it (a slot 18 SRV, and since
+  Slice 3a a slot 19 UAV, 20 RTV or 21 DSV); `view-refs-in-visible-heap` is the
+  slot-18 part with a descriptor in a shader-visible heap.
 - `list-hold`, `flight`: a closed or recording list, or a submission, holds a
   desktop reference.
 - `queued-waiting-fence`: queued, the release-time fence of a queue has not passed;
@@ -1613,24 +1614,46 @@ recorded and no line is built.
 
 Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
 targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
-described above. A resource leaves the class for good when a UAV/RTV/DSV view is
-created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
-an untracked descriptor slot or is copied out of tracked heaps, when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
-SRV keeps the resource only when the desktop created the view: desktop view
-creation returns `void`, so a removed device is the only failure it reports, and
-a slot whose creation failed is recorded without a reference. Tracked
-slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+described above. A descriptor slot the shim shadows (`HeapInfo::shadow`) holds one
+reference for each materialized view it names: a slot 18 SRV, and since Slice 3a
+also a slot 19 UAV (one for the view resource and one for its counter resource),
+a slot 20 RTV and a slot 21 DSV. `note_view` adds the references when a view is
+written into a tracked slot (writing the same view again adds nothing), and the
+same functions release exactly the references they added: `note_view` on an
+overwrite, `note_copy` when a copy moves another view over the slot or into
+another tracked slot, and the heap's `Release` through `retire_drop_heap_views`
+when the slot's heap is destroyed. A view the desktop did not create (a removed
+device) is recorded unmaterialized: it releases the slot's previous references
+and adds none. A resource leaves the class for good when a view call targets a
+descriptor slot no heap shadow tracks, or a copy moves a tracked view into an
+untracked heap (`retire_leave_class`, slots 18-21, a slot 19 counter too), when
+it is passed to MakeResident or Evict (slots 34 and 35), or when it is presented.
+Tracked views (including slot 70 `device_memory_srv`) keep the resource retained
 while any descriptor slot in `HeapInfo::shadow` names it (updated across
 `note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
 bound textures via `retire_hold`. Only wrappers can be in the class; a raw
 desktop pointer never is. Sampler feedback is not checked: no device slot of the
 stand-in reaches it.
 
+The 19-21 references free nothing on their own yet: the class still excludes a
+texture created with the render-target, depth-stencil or unordered-access flag
+(`retire_classify`), and desktop creates a UAV/RTV/DSV only on a resource that
+carries the matching flag. A class texture's 19-21 view call is therefore the
+console-only case the shim refuses (a UAV of a depth texture, an RTV of a texture
+without render-target); it records no view, adds no reference, and the texture
+still retires once it is released and its fences have passed. The accounting is
+the prerequisite for a later slice that admits those textures. The slots 19-21
+fallback is unchanged: in a heap the shim does not shadow the call keeps
+`retire_leave_class`, so nothing is freed under a descriptor the shim cannot
+follow. `X2W_D3D12_RELEASE_RETIRED_VIEWS` no longer clears live descriptors; it is a legacy
+diagnostic that logs that clearing is disabled and enables the retirement
+breakdown. A tracked descriptor reference in any of slots 18-21 keeps its resource
+until the slot is overwritten, copied over, or its heap is destroyed (#2679).
+
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
-passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
-recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+passed, all tracked descriptor references (slots 18-21) have dropped to zero, and
+no recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
 resolve destination (19), or translated draw SRV bind that the stand-in forwards
 makes the list hold a desktop reference to each resource of the class it names,
 source and destination, until the list is Reset, fails to Close or is destroyed. A list
@@ -1672,8 +1695,18 @@ and a translated draw that samples such a texture through a descriptor table (th
 token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
 a clear sentinel corner, and the texture leaves the budget only after the closed draw
 recording is dropped); the `_off_` case checks that an ordinary committed texture (no
-title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
-`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+title memory) still records its upload. Since Slice 3a the title fixture also drives the
+19-21 descriptor references: case 8 creates an RTV, a DSV and a UAV (and a buffer UAV with
+a counter resource) in tracked heap slots and checks through the retire probe that each
+materialized view adds one reference per slot - slot 19 one for its resource and one for
+its counter - that the same view written again adds nothing, and that overwrite, a
+`CopyDescriptorsSimple` copy and heap destruction each release exactly what was added
+(including a view in an untracked desktop heap, which adds none); case 9 checks the
+`view_slot` fallback in both switch modes: a refused RTV on a class texture in a tracked
+slot stays in the class and retires, while the same call into a descriptor slot the shim
+does not shadow keeps `retire_leave_class` and the texture stays retained. The fixture-only
+exports `x2w_d3d12_retire_probe` (which reports the resource's tracked slot references as
+`view_refs`), `x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
 `x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
@@ -2759,20 +2792,24 @@ hardware or driver glitch count.
 
 ## APU heap stand-in
 
-With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` commits. The
-heap is a first-fit free list in a static table of 4096 extents, guarded by one lock. `ApuFree` gives a
-block back and merges it with free neighbours, so streaming code that allocates and frees repeatedly no
-longer exhausts the heap. While nothing has been freed the offsets are the ones a bump allocator hands out.
+With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` reserves
+(`MEM_RESERVE`, 0 bytes committed up front). The heap is a first-fit free list in a static table of 4096
+extents, guarded by one lock. `ApuAlloc` commits the 4 KiB page span covering the allocated block on demand
+(`MEM_COMMIT`), rolling back the free-list change and returning `E_OUTOFMEMORY` if commit fails. `ApuFree`
+gives a block back, merges it with free neighbours, and decommits strictly interior 4 KiB pages
+(`[ceil_page(free_begin), floor_page(free_end))` via `MEM_DECOMMIT`) so partial boundary pages shared with
+live neighbours stay committed and streaming code that allocates and frees repeatedly no longer exhausts the
+heap or commit charge. While nothing has been freed the offsets are the ones a bump allocator hands out.
 
 - A block is aligned in address (a power of two, 16 at least; 0, anything below 16 and a value that is not a power of two
   all mean 16). Size and alignment are 32 bits. `ApuCreateHeap` creates and publishes the heap under one lock, so
   competing first calls cannot reset a heap that already has live blocks. A heap whose 64 KiB-rounded size
-  exceeds 4 GiB is refused with `E_INVALIDARG` without committing memory, so every block fits the APU range.
+  exceeds 4 GiB is refused with `E_INVALIDARG` without reserving or committing memory, so every block fits the APU range.
 - Null or non-writable output (`virtual_address` or optional `apu_address`) is `E_POINTER` without
-  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, or a full extent table is
-  `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
+  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, a full extent table, or a failed
+  page commit is `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
   and writes null to the virtual-address output when writable.
-- A block that is reused is zeroed, as fresh heap memory is.
+- A block that is reused is zeroed, as fresh heap memory is (including still-committed shared boundary pages).
 - `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
   already freed) is `E_INVALIDARG` and changes nothing.
 - `ApuIsVirtualAddressValid` and the two map calls read the published heap bounds under the heap lock and
@@ -2783,7 +2820,9 @@ The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4)
 rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
 check loads the stub, checks non-permissive traps, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment,
 coalescing, every refused call, shape-context allocation and partial-failure rollback, `AcpHalCreate`, and the
-address validity/mapping exports, then runs 4 threads of 1000 rounds against an interval map of live blocks:
+address validity/mapping exports, runs 4 threads of 1000 rounds against an interval map of live blocks, and
+verifies on-demand commit, interior-page decommit, shared-boundary-page preservation, and commit-failure
+rollback against `GetProcessMemoryInfo().PagefileUsage` and `VirtualQuery` in a 64 MiB heap:
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V

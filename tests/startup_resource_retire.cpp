@@ -39,6 +39,7 @@ struct RetireProbe {
     unsigned cache_entries;  // texture_uploads, pending_gpu_writes and view_targets entries naming the resource
     unsigned list_states;    // resources the open recording of the list moved out of COMMON
     unsigned list_holds;     // resources the list's recordings hold
+    unsigned view_refs;      // tracked descriptor slots (18-21) holding the resource
 };
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_budget_snapshot(x2w_budget::Snapshot*, SIZE_T);
