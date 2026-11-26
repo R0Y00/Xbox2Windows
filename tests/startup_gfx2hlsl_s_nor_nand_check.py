@@ -59,10 +59,10 @@ def accepts(name, dest, kind, group):
 
 def stage_checks():
     """exec_lo leaves lanes 32..63 alone, so a wave64 stage must keep refusing it (a wave64 wave would keep stale
-    upper lanes active while the low lanes are rewritten). Only a pixel stage or compute with at most 32 threads
-    per group is proven wave32. An SGPR destination is exact per lane in every stage."""
+    upper lanes active while the low lanes are rewritten). Only compute with at most 32 threads per group is proven
+    wave32; the wave size of a pixel or vertex stage is unknown. An SGPR destination is exact per lane in every stage."""
     for name in REFERENCES:
-        for kind, group, want in (('ps', None, True), ('cs', (32, 1, 1), True), ('cs', (8, 4, 1), True),
+        for kind, group, want in (('ps', None, False), ('cs', (32, 1, 1), True), ('cs', (8, 4, 1), True),
                                   ('cs', (64, 1, 1), False), ('cs', (8, 8, 1), False),
                                   ('ms', None, False), ('vs', None, False)):
             C.check('%s into exec_lo in a %s stage%s is %s' % (name, kind, ' of %s threads' % (group,) if group else '',

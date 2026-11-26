@@ -4693,12 +4693,13 @@ class Stage:
                     r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks)
             sgpr_dest = bool(dst) and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105
             # A write to exec_lo leaves lanes 32..63 alone, so it is exact only where the wave is proven wave32:
-            # a pixel stage, or compute with at most 32 threads per group (as the b32 waterfall close requires).
-            # Other stages (the slot 57 mesh stage is wave64) keep refusing it.
-            kind = getattr(self, 'kind', 'ps')  # a bare test probe has no pipeline and stands for a pixel stage
+            # compute with at most 32 threads per group (as the b32 waterfall close requires). The wave size of a
+            # pixel or vertex stage is unknown here (see require_spill_lanes_apart) and the slot 57 mesh stage is
+            # wave64, so those keep refusing it.
             group = getattr(getattr(self, 'pipe', None), 'group', None)
-            wave32_stage = kind == 'ps' or (kind == 'cs' and group is not None and group[0] * group[1] * group[2] <= 32)
-            exec_dest = (dname == 'exec_lo' and base in ('s_nand_b32', 's_nor_b32') and wave32_stage)
+            wave32_stage = (getattr(self, 'kind', None) == 'cs' and group is not None
+                            and group[0] * group[1] * group[2] <= 32)
+            exec_dest = dname == 'exec_lo' and base in ('s_nand_b32', 's_nor_b32') and wave32_stage
             lane_complement = (word_complement and (sgpr_dest or exec_dest)
                                and all(mask_source(t) for t in (ops[1:] if exec_dest else srcs)))
             if not lane_complement and (mask_dest or any(self.is_lane_mask(t) for t in srcs)):

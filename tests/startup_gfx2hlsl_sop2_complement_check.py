@@ -53,6 +53,7 @@ import re
 import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
@@ -119,8 +120,10 @@ def code(name, form):
 
 
 class Probe(G.Stage):
-    """A Stage with no pipeline: enough state for decoded instructions to be translated. It is a pixel stage (wave32)
-    unless a test sets `kind` and `pipe.group`."""
+    """A Stage with no pipeline: enough state for decoded instructions to be translated. It is a compute stage of
+    one 32-lane group (proven wave32) unless a test sets `kind` and `pipe.group`."""
+    kind = 'cs'
+    pipe = SimpleNamespace(group=(32, 1, 1))
 
     def __init__(self):
         self.lines, self.sym = [], {}
