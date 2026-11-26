@@ -209,6 +209,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_load_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_pack_absdiff_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
@@ -278,6 +279,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_hi_msad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_pk_int16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_null_check.py
+./out/pe-env/bin/python -B tests/startup_compute_global_load_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support

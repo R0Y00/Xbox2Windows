@@ -360,30 +360,32 @@ MUBUF_ATOMIC_METHODS = {
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
     "inc": "CompareExchange", "dec": "CompareExchange", "csub": "CompareExchange",
-    "fmin": "CompareExchange", "fmax": "CompareExchange",
+    "fmin": "CompareExchange", "fmax": "CompareExchange", "fcmpswap": "CompareExchange",
 }
 
 IMAGE_FLOAT_ATOMIC_OPS = ("fcmpswap", "fmin", "fmax")
 
-def float_min_max_cas(cas_prefix, value, op):
-    """Raw-word finite-normal binary32 min/max as an InterlockedCompareExchange loop.
+def float_min_max_cas(cas_prefix, value, op, *, wide=False):
+    """Raw-word finite-normal binary32/binary64 min/max as an InterlockedCompareExchange loop.
 
     Shared by the image (texel) and MUBUF (byte-address) atomic profiles; cas_prefix is the
     call up to the opening parenthesis: the free intrinsic `InterlockedCompareExchange(dest)`
     for a texel destination and the raw UAV method `outputData.InterlockedCompareExchange(off)`
     for the byte-address destination. The caller guarantees every stored word and the operand
-    are finite-normal binary32, never NaN, subnormal or signed zero. The sign-dependent key
+    are finite normals, never NaN, subnormal or signed zero. The sign-dependent key
     orders those values exactly as unsigned integers, so integer CAS reproduces the fmin/fmax
     result bit-for-bit. The zero seed is outside the caller's domain and can only fetch the
     observed word; it never writes.
     """
     comparison = "<" if op == "fmin" else ">"
-    return (f"    uint value = {value};",
-            "    uint valueKey = value ^ ((value & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
-            "    uint observed = 0u;", "    uint expected;",
+    kind, zero, sign, mask = ("uint64_t", "0ull", "0x8000000000000000ull", "0xffffffffffffffffull") if wide else (
+        "uint", "0u", "0x80000000u", "0xffffffffu")
+    return (f"    {kind} value = {value};",
+            f"    {kind} valueKey = value ^ ((value & {sign}) ? {mask} : {sign});",
+            f"    {kind} observed = {zero};", f"    {kind} expected;",
             "    [allow_uav_condition] do {", "        expected = observed;",
-            "        uint oldKey = expected ^ ((expected & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
-            f"        uint next = (valueKey {comparison} oldKey) ? value : expected;",
+            f"        {kind} oldKey = expected ^ ((expected & {sign}) ? {mask} : {sign});",
+            f"        {kind} next = (valueKey {comparison} oldKey) ? value : expected;",
             f"        {cas_prefix}, expected, next, observed);",
             "    } while (observed != expected);")
 
@@ -1020,9 +1022,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     and selects signed min/max. R32_FLOAT declares a native atomic image carried as raw words
     in a desktop R32_UINT UAV. The caller guarantees finite-normal binary32 in the accessed texels
     and operand VGPRs by setting image_float_domain="finite-normal".
-    A raw fixed-address buffer_atomic_fmin/fmax also requires the caller's
-    buffer_float_domain="finite-normal" statement: every stored word and the operand VGPR
-    hold finite-normal binary32, never NaN, subnormal or signed zero.
+    A raw fixed-address floating buffer atomic requires buffer_float_domain="finite-normal":
+    the caller guarantees finite-normal binary32 or binary64 at the accessed address and in the
+    operands, never NaN, subnormal or signed zero. For binary64 or compare-swap, the lowering
+    further requires finite-normal literal operands.
     gather_mips declares the visible mip count of matching gfx1013 RGBA32 FLOAT native and desktop 2D views at t0
     for one image_gather4_l (see GATHER_HLSL).
     """
@@ -3023,6 +3026,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?(?P<glc> glc)?", line):
             op, wide, glc = m["op"], bool(m["wide"]), bool(m["glc"])
+            floating = op in IMAGE_FLOAT_ATOMIC_OPS
+            float_extended = floating and (wide or op == "fcmpswap")
             fixed = m["addr"] == "off" and not (m["idxen"] or m["offen"])
             if cpu == "gfx1030" and not fixed:
                 raise ValueError(f"Unsupported compute instruction: {line}")
@@ -3042,7 +3047,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     raise ValueError("Unsupported atomic reduction target or binding: "
                                      "gfx1013 requires an unguarded raw-buffer program")
             else:
-                if op in ("fmin", "fmax") and (buffer_float_domain != "finite-normal" or wide or glc):
+                if float_extended and (buffer_float_domain != "finite-normal" or glc):
+                    raise ValueError("Float buffer compare-swap and _x2 require a finite-normal domain and no glc")
+                if floating and not float_extended and (buffer_float_domain != "finite-normal" or glc):
                     raise ValueError("buffer_atomic fmin/fmax require a finite-normal domain, "
                                      "a single 32-bit operand and no glc")
                 if op == "csub" and (wide or not glc):
@@ -3071,12 +3078,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     written_spans.append((offset, offset + 4))
             src, *last = map(int, re.findall(r"\d+", m["data"]))
             width = 2 if wide else 1
-            count = 2 * width if op == "cmpswap" else width
+            compare_swap = op in ("cmpswap", "fcmpswap")
+            count = 2 * width if compare_swap else width
             if last != ([src + count - 1] if count > 1 else []) or src + count > 256:
                 raise ValueError("Unverified atomic reduction data range")
             values = [vector.get(reg) for reg in range(src, src + count)]
             if not all(is_word(value) for value in values):
                 raise ValueError("Atomic reduction data is not a known word")
+            if float_extended:
+                shift, exponent = (20, 0x7ff) if wide else (23, 0xff)
+                if not all(isinstance(value, int) for value in values) or any(
+                        ((high_word >> shift) & exponent) in (0, exponent)
+                        for high_word in values[width - 1::width]):
+                    raise ValueError("Float buffer atomic operands must be finite-normal constants")
             words = list(map(hlsl_word, values))
             operands = ([f"(uint64_t({lo}) | (uint64_t({hi}) << 32u))" for lo, hi in zip(words[::2], words[1::2])]
                         if wide else words)
@@ -3089,14 +3103,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             # Raw UAV atomics on pairs require SM 6.6.
             kind = ("int64_t" if signed else "uint64_t") if wide else ("int" if signed else "uint")
             method = MUBUF_ATOMIC_METHODS[op] + ("64" if wide else "")
-            if op == "cmpswap":
-                # RDNA 2 MUBUF opcode 49 takes replacement in VDATA and compare in VDATA+1.
-                # HLSL takes compare first.
+            if compare_swap:
+                # RDNA 2 takes replacement first, then compare, each in one word or a pair.
+                # HLSL takes compare first. Finite-normal float equality is bit equality.
                 word = f"{operands[1]}, {word}"
             if op in ("fmin", "fmax"):
-                # Raw-word finite-normal binary32 min/max on the raw UAV, under the caller's
-                # finite-normal domain statement. Reuses the image ordering.
-                stores.extend(float_min_max_cas(f"outputData.InterlockedCompareExchange({offset}u", word, op))
+                stores.extend(float_min_max_cas(f"outputData.Interlocked{method}({offset}u", word, op, wide=wide))
             elif op in ("inc", "dec", "csub"):
                 one, zero = ("1ull", "0ull") if wide else ("1u", "0u")
                 if op == "inc":
@@ -3126,7 +3138,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     if glc:
                         loading[src] = ("alu", result)
             atomic_update = True
-            if op in ("fmin", "fmax"):
+            if floating:
                 buffer_float_update = True
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
@@ -3455,8 +3467,8 @@ def main():
     parser.add_argument("--image-float-domain", choices=("finite-normal",),
                         help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
     parser.add_argument("--buffer-float-domain", choices=("finite-normal",),
-                        help="Required for raw fixed-address buffer_atomic_fmin/fmax. Every stored word "
-                             "and the operand is finite-normal binary32, never NaN, subnormal or signed zero.")
+                        help="Required for raw fixed-address floating buffer atomics. The stored value and "
+                             "operands are finite-normal binary32 or binary64.")
     parser.add_argument("--wave-size", type=int, choices=(32, 64),
                         help="Caller's statement of the wave width: 32 for lane indices in larger groups, "
                              "64 (gfx1013 shared LDS only) for a group of up to 64 threads as one wave")

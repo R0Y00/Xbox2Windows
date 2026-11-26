@@ -6006,7 +6006,7 @@ uses reproduces the ISA result bit-for-bit on the byte-addressed UAV:
 `outputData.InterlockedCompareExchange(offset, expected, next, observed)`.
 The operand stays 32-bit with `glc` clear, the address stays fixed, and
 the atomic remains the sole UAV operation; a missing, misspelled or
-unused domain, `_x2`, `glc`, `idxen`/`offen`, and every other reduction
+unused domain, `glc`, `idxen`/`offen`, and every other reduction
 binding violation is rejected with the family's diagnostics.
 
 Four source-built gfx1030 cases cover both operations with and without
@@ -6030,6 +6030,38 @@ CLI. The full binary suite and DXC/WARP/hardware runs were not run.
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_float_' -V
+```
+
+### gfx1030 fixed-address MUBUF float compare-swap and x2
+
+The same non-returning raw `u0` profile accepts `buffer_atomic_fcmpswap`
+(opcode 62) and `buffer_atomic_fcmpswap_x2`, `buffer_atomic_fmin_x2`,
+`buffer_atomic_fmax_x2` (94–96). The address is a fixed aligned byte
+immediate; `_x2` uses eight-byte alignment and SM 6.6 raw UAV integer
+atomics. The caller declares finite-normal memory at the corresponding
+width, and both the replacement and compare operands (or the min/max
+operand) must be statically known finite normals. `glc`, dynamic addresses,
+non-normal values, and mixed UAV operations are outside this profile.
+
+On finite normals float equality is bit equality. AMD places replacement
+before compare in the VGPR tuple; the HLSL CAS takes compare first. The
+unsigned sign-adjusted minimum/maximum ordering extends to 64 bits, using
+one CAS over both little-endian DWORDs. The fixtures compare all 320 words
+at one and two 32-lane groups, including adjacent sentinel words and a
+compare miss triggered by changing only the low bit. An operand-order or
+min/max mutation is checked against the independent CPU model and the
+original expected readback. These cases contend on one address with the
+same literal operands, not distinct per-lane inputs.
+
+```sh
+python3 -B tests/compute_store_check.py binary-mubuf-float-extra llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+python -B tests/compute_store_check.py compile-mubuf-float-cmpswap dxc
+python -B tests/compute_store_check.py compile-mubuf-float-x2 dxc
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_float-(cmpswap|x2)_' -V
 ```
 
 ### Indexed gfx1030 raw vector reads
@@ -15870,12 +15902,14 @@ Past the entry block of a program with branches, the read does not copy the VGPR
 
 A lane that was inactive at the definition keeps an older VGPR value; the recomputed expression gives every lane the first active lane's value instead. `exec` need not be known at the definition. A conditional branch between the definition and the read is a fall-through, not a join, and is accepted. The one case where hardware can differ is a read with no active lane: it returns lane 0's VGPR, which the program cannot rely on. `tests/startup_gfx2hlsl_readfirstlane_recompute_check.py` checks the accepted forms (including one-path scalars and uniform loop counters both inside and after loops) and refuses each condition above, including a definition under a narrower `exec` than the read, a rewritten scalar input, a loop back edge, a divergent `else`-arm write before a join, a non-uniform loop back-edge and a join where two definitions reach.
 
+A compute buffer load through a read-only descriptor and uniform address is also accepted past the entry block when the entry EXEC mask is still known. The lowering saves the uniform value in a function-scope temporary so the read uses the value held when the load ran, even if the offset scalar later changes. A narrowed mask may be empty. In that case RDNA 2 reads the previous lane-zero VGPR, which an unguarded reload cannot reproduce. Branch targets, EXEC writes and VGPR overwrites invalidate the proof between the load and read. The source-built controls cover scalar and vector addresses, the second dword, formatted loads, and a lane-zero sentinel followed by empty EXEC.
+
 [`tests/startup_compute_readfirstlane_check.py`](../tests/startup_compute_readfirstlane_check.py) pairs that unit coverage with a source-built gfx1013 compute fixture (`(4, 1, 1)` local threads x `(2, 1, 1)` groups) containing both a one-path SGPR across a uniform forward branch join and a four-iteration uniform loop counter read via `v_readfirstlane_b32` inside the loop and after exit, machine-code refusal patches (non-uniform `s_cbranch_vccnz` back-edge, divergent `else`/`then` write before a join, lane-mask loop update) and 320-word GPU readback with pinned `dropped-one-path`, `dropped-loop-read` and `dropped-post-loop` negative controls. Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 25H2 (build 26200.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 7900 XTX (driver 32.0.32029.2010).
 
 `tests/startup_gfx2hlsl_readfirstlane_uniform_check.py` translates short sequences through the stage's dispatch without shader machine code. It checks emitted assignments for the listed operations, supported modifiers, and in-place and cross-register chains, the median of three that clamps a scalar to `[0, 0.5]`, including the unsigned-division reciprocal estimate (`v_cvt_f32_u32`, `v_rcp_f32`, `v_mul_f32` by `0x4f7ffffe`, `v_cvt_u32_f32`) that compiled shaders read back with `v_readfirstlane_b32`. That chain stays refused from a lane-varying source or a lane mask, across an `exec` write or an overwrite, and from a definition in another block. Refusal cases cover varying sources and offsets, overwrites that invalidate a proof, WQM, a restored `exec` copy and other exec writes, lane masks, overlapping and descriptor-path 64-bit moves, branch and operand restrictions (a read at the first branch target, in a loop whose header is in the entry block, at a backward branch target, in an entry block re-entered by a loop, or after `s_endpgm` in a branch-free program; a read after the first terminator is recomputed), and constructor-less probes with incomplete tracking state. The negative control empties the allowlist and requires every accepted sequence to refuse.
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^(startup_gfx2hlsl_readfirstlane_(uniform|recompute)|startup_compute_readfirstlane(_(warp|hardware))?)$' -V
+ctest --preset dev --no-tests=error -R '^(startup_gfx2hlsl_readfirstlane_(uniform|recompute|load_recompute)|startup_compute_readfirstlane(_(warp|hardware))?)$' -V
 python -B tests/startup_compute_readfirstlane_check.py --llvm-mc llvm-mc-15
 ```
 
@@ -16640,7 +16674,7 @@ the field layouts rather than assembled.
 
 ## Translated compute Dispatch
 
-With a device slot 67 placeholder bound, command-list slot 14 looks up the translation of the pipeline's published request (`<key>.txt` with `stage cs`, and `<key>.cs.cso`) and records it on the desktop list. It binds, from the compute descriptor tables of slot 35: raw buffers named by 16-byte hardware buffer descriptors, and 2D textures named by the token of a view the caller created (device slot 18 for an input, slot 19 for an output the program stores `float4` to). `smp` manifest lines become static samplers, and entry values come from the compute root constants of slots 37 and 39. A buffer input must resolve to a complete GPU-backed range; a buffer output must be a placed buffer that aliases the caller's memory and allows unordered access; a texture view must be 2D, created on the desktop, and for an output have a float or normalized format that is not packed, on a texture that is not also an input of the call. Any other manifest line (other texture kinds, sampler heaps, comparison samplers, root views, `stride` and `descword3` entry values) leaves the pipeline untranslated, and a Dispatch that cannot be bound completely is refused with one logged reason: no Dispatch is recorded and nothing is bound (the upload of an input texture the caller filled in memory may already be recorded; it only syncs content). No view is ever bound null. The entry values live in the compute root-constant store of #1975: a word no slot 37 or 39 call wrote since the compute root was set (slot 33 with another root, or a list reset) has no value and is refused with `an entry value was not set since the compute root`; setting the same root again keeps the words, and the graphics words of slot 40 are separate.
+With a device slot 67 placeholder bound, command-list slot 14 looks up the translation of the pipeline's published request (`<key>.txt` with `stage cs`, and `<key>.cs.cso`) and records it on the desktop list. It binds, from the compute descriptor tables of slot 35: raw buffers named by 16-byte hardware buffer descriptors, and 2D textures named by the token of a view the caller created (device slot 18 for an input, slot 19 for an output the program stores `float4` to). `smp` manifest lines become static samplers, and entry values come from the compute root constants of slots 37 and 39. A buffer input must resolve to a complete GPU-backed range; a buffer output must be a placed buffer that aliases the caller's memory and allows unordered access; a texture view must be 2D, created on the desktop, and for an output have a float or normalized format that is not packed, on a texture that is not also an input of the call. Any other manifest line (other texture kinds, sampler heaps, comparison samplers, root views, entry values that are neither a root constant nor a buffer descriptor word) leaves the pipeline untranslated, and a Dispatch that cannot be bound completely is refused with one logged reason: no Dispatch is recorded and nothing is bound (the upload of an input texture the caller filled in memory may already be recorded; it only syncs content). No view is ever bound null. The entry values live in the compute root-constant store of #1975: a word no slot 37 or 39 call wrote since the compute root was set (slot 33 with another root, or a list reset) has no value and is refused with `an entry value was not set since the compute root`; setting the same root again keeps the words, and the graphics words of slot 40 are separate.
 
 `tests/startup_compute_dispatch_check.py` drives a source-built gfx1013 program through the stand-in's list on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back from the aliased memory. Controls in the same run: before the offline translation, without a Dispatch, and with the two descriptors exchanged, every output word must keep its sentinel. The two entry values arrive through slot 37 and slot 39, with other values written through slot 40 in between; `dispatch-same-root` must still give the expected words, and five refused modes must log their reason and keep the sentinels: a missing word, another compute root set and the first set again, a list reset, a compute root that is not the pipeline's, and one buffer named as input and output. `tests/startup_compute_dispatch_texture_check.py` does the same for a program that stores to a 32x8 RGBA16_FLOAT texture (1024 halves read back through CopyTextureRegion; controls: before translation, without a Dispatch, a texture without unordered access) and for the raw buffer program with a level-zero sample of a 1x1 texture XORed into each stored word (control: no view at the table entry). The texture output program is also bound under a manifest edited to declare no entry values.
 
@@ -16658,6 +16692,18 @@ Run the two backends with `ctest --preset release --no-tests=error -j 1 -R '^sta
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
+```
+
+### Entry values from a buffer descriptor
+
+A formatted buffer load passes the input's stride and word 3 as entry values (`udsrc <i> stride <srv>`, `udsrc <i> descword3 <srv>`), and a formatted buffer store (`buffer_store_format_d16_x`, and `buffer_store_format_xyzw` of #2530) passes the output's word 3, the upper half of word 1 and the record count (`uav_descword3`, `uav_stride`, `uav_numrecords`). At Dispatch the stand-in takes each from the descriptor words the same call binds the view from: the stride as the draw path takes it (from the hardware descriptor, or from the title's buffer view for a token), word 3 through the draw path's formatted-buffer check (a token's word is built from its view; a FORMAT the program does not decode refuses the dispatch with `a formatted input has no word 3 the program decodes`), and the output words unmasked, since the store helper checks the swizzle bits itself. A descriptor that is not bound refuses the dispatch as before; an entry value naming a texture slot leaves the pipeline untranslated, and so does any other source.
+
+`tests/startup_compute_dispatch_entry_check.py` dispatches two source-built programs on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back: the formatted load of `startup_gfx2hlsl_compute_check.py` with two word-3 values on one translation, and the `buffer_store_format_d16_x` program of `startup_compute_store_d16_x_check.py` with four output descriptors (two formats, another stride and record count, and SWIZZLE_ENABLE set in word 1, for which the translated program stores nothing). A FORMAT the program does not decode is refused with every output word at its sentinel. Returning a constant output stride and record count in the runtime, or masking the stride to 14 bits as the draw path does, makes a store run fail. The record count cannot be checked apart from the bound range, which is sized from the same word.
+
+Measured on two synthetic programs. In a local set of 29 compute programs whose first refusal was this manifest line (about 1.4 million calls in one run), 27 now pass the manifest (about 1.39 million calls; 17 of them, about 0.6 million calls, use the store of #2530) and 2 stop at a 1D or 3D texture input. Every formatted store in the 27 passes a zero `soffset`: a nonzero one in structured mode can store past `stride * records` bytes, outside the bound range, and is not checked here. Which bind-time reason the 27 meet next has not been measured.
+
+```powershell
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_entry_" -V
 ```
 
 ### Static samplers with a LOD clamp
@@ -16682,6 +16728,31 @@ Measured on one synthetic program. The offset is a literal byte offset into the 
 python -B tests/startup_gfx2hlsl_heap_record_check.py --llvm-mc llvm-mc-15
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_heap_" -V
+```
+
+#### A heap record index read from a table buffer
+
+The index can also be a word of a table buffer. `gfx2hlsl.py` accepts `s_buffer_load_dword(xN)` from a table buffer descriptor that no instruction modified, at a literal byte offset or at `<root constant word> * k + c` built with `s_mul_i32`, `s_mulk_i32`, `s_add_u32`, `s_add_i32` or `s_addk_i32` and literals (plus any `offset:` modifier), dword-aligned, with no branch target between the arithmetic and the load or between the load and the shift. The manifest names the word as `srv <i> buf heap word table <parameter> <byte> at <offset> [rootconst <parameter> <word> times <k>]`. At Dispatch the stand-in reads the table record, computes the byte offset in 32-bit arithmetic, reads the index word from the buffer's memory and binds the heap record it names as above. The read is made at record time, so it is sound only when the GPU does not write the word: the stand-in reads it only when the buffer lies in the recording's upload memory (list slot 148), which no GPU command writes. A buffer elsewhere refuses the dispatch (`a heap index word is not in the list's upload memory`), and so does a word past the buffer's `stride * num_records` bytes (`a heap index word is outside its table buffer`). An index from a per-thread value, a group ID, another buffer word, a register sum or a modified descriptor keeps the refusal.
+
+`tests/startup_gfx2hlsl_heap_word_check.py` compares the manifest and the HLSL of a source-built program whole, with six more accepted forms and ten refused controls, and with `--llvm-mc` reassembles every new instruction. `tests/startup_compute_dispatch_heap_word_check.py` dispatches it on WARP and on a physical adapter: only the word at `288 + 336 * <root constant>` names the input's record, every other word names an output record, and all 320 output words must match; a record outside the heap, a buffer that ends before the word and a buffer outside upload memory each refuse with one reason and leave every output word at its sentinel. Ignoring the scale, the byte offset or the read word, or dropping the upload or range check, makes the dispatch test fail; dropping the alignment, descriptor, register-offset or branch-target checks makes a translator control fail.
+
+Measured on one synthetic program. That the title leaves the upload memory unchanged between recording and execution is a hypothesis, the same one the heap record read relies on, and which memory the real index buffers live in has not been measured. In a local set of 158 compute requests that hold such a load, 153 stopped first at the buffer-read index. All 153 change their first refusal and none translates fully yet: 145 now stop at a later instruction (82 at a per-lane `vcc` live at an `s_cbranch_execz` join, 24 at `v_fma_mix_f32`, 14 at `src_scc` in `s_mul_i32`, 25 at others), 6 at a buffer read in another form and 2 at an 8-dword record. 145 programs hold a heap load that now lowers, but 120 of the 158 still hold a refused heap-record load somewhere: 101 a buffer read in another form, 32 an offset that is not a root constant shifted by 5, 2 an 8-dword record (this counts every refusal site, including sites after an earlier refusal). Most of the buffer-form sites compute the offset or read the word before a branch target, which ends the marks because another path into the join may hold a different word; in about 97 programs an 8-dword (image) heap record would stay refused even past that.
+
+```powershell
+python -B tests/startup_gfx2hlsl_heap_word_check.py --llvm-mc llvm-mc-15
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_heap_word_" -V
+```
+
+#### Named reasons for an input buffer range
+
+The refusal `an input is not a complete GPU-backed buffer range` is split into the condition that failed, in the same census lines: `an input buffer descriptor has zero records`; a range over 16 MiB or not whole dwords; a range that crosses the end of a placed buffer or of its upload allocation; an address outside any placed buffer; `an input is in a placed buffer that does not alias title memory`; a view token that is not a buffer view of a desktop resource, has no element size, names upload memory, is not on a default or upload heap, or whose resource does not hold its range; a null address; a range not 16-byte aligned in its resource; a released resource, one not created in the common state, one on another device, and a range outside its desktop buffer. The first refusal of a key also logs which input it was and where its descriptor was read (`x2w-draw compute <key> first refused input <i> (table|heap <a> <b>), descriptor at <address>`). Only the reason changes: what was bound is still bound, what was refused is still refused, and the draw paths that call the same function do not ask for it.
+
+`tests/startup_compute_dispatch_input_check.py` dispatches case A through the stand-in's list on WARP and on a physical adapter (exit 77 without one): the unchanged recording matches all 320 words, and five replaced input descriptors (zero records, 16 bytes past the placed input, memory between the placed buffers, a buffer placed where the desktop cannot alias it, and the token of a texture view) each refuse with their own reason and the input line, and keep every output word at its sentinel.
+
+Local observation, one run, counts only, from the four descriptor words the census keeps for each key's first refused call: of 18 keys and 1,143,787 calls refused with the old reason, 1 key with 1,057,520 calls had zero records (a nonzero base, no stride and word 3 zero); 11 keys with 31,649 calls named raw descriptors inside placed buffers that fell back to a separate desktop copy (inferred from the creation log: a base offset not 64 KiB aligned, or one buffer over several memory pieces); and 6 keys with 54,618 calls named a shader resource view token whose failing condition the log does not show. Which input of the zero-record key fails, and whether its record comes from the title or from memory the stand-in never filled, needs a run with this split. A load from a zero-record descriptor whose bounds check is on reads 0 on the hardware, so a null view would read the same, but it is not bound until that run shows where the record comes from. #2218 (open, opt-in) owns backing placed buffers the desktop cannot alias and overlaps this form; whether its scope covers these keys (most sit in one buffer created with unordered access) is not checked.
+
+```powershell
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_input_" -V
 ```
 
 ## Startup compute dual-offset/stride-64 LDS ops and 32-bit LDS atomics
@@ -17128,3 +17199,19 @@ The `_dispatch_warp` and `_dispatch_hardware` tests run `s_cmp_eq_u32` then `s_m
 UAV dispatch and compare each lane with the CPU reference (SCC 0 and SCC 1, distinct per-case data). A copy of the
 lowering mutated to `(scc ? 0u : 1u)` must read back wrong. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc_dispatch_warp$' -V`.
+
+## Startup compute translator: `global_load_dword` with a scalar register pair (`saddr`)
+
+The source-built dispatch binds the root SRV directly. The startup runtime still
+needs support for consuming the resulting `srv ... buf root` manifest record.
+
+`tools/startup/gfx2hlsl.py` lowers the RDNA 2 `GLOBAL` one-dword `saddr` load (`global_load_dword vdst, vaddr, s[base:base+1] [offset:imm]`, #2618 ticket `C500-01/031`, #2022) in the `cs` stage:
+
+- **Address, alignment, and resource provenance** (AMD RDNA 2 ISA §9.2, LLVM 15 `SelectGlobalSAddr`): `ADDR = SADDR[63:0] + zext(VADDR[31:0]) + sext(OFFSET[11:0])`. `s[base:base+1]` must be an even-aligned SGPR pair (`0 <= base <= 104`) holding a proven 64-bit root buffer pointer (`('ptr', ('root', index))` and matching `ptr_high_symbol`, including `s_mov_b32` / `s_mov_b64` copies and completed literal `s_add_u32` / `s_addc_u32` advances). Because RDNA 2 low-bit `GLOBAL` alignment depends on `SH_MEM_CONFIG.ALIGNMENT_MODE` (unmeasured on Scarlett) and HLSL `ByteAddressBuffer.Load` requires a multiple of four, `base_off`, `offset`, and `vaddr` (`align4_v` / `align4_s`) must each be proven 4-byte aligned. Each distinct root parameter binds a `ByteAddressBuffer r<i> : register(t<i>)` (`srv <i> buf root <index>` in the manifest), capturing `a = vaddr` first (so `vdst == vaddr` aliasing is preserved) and guarding the signed 64-bit view-relative sum `zext(a) + base_off + imm` against `[0, 0xffffffff]` before converting to a 32-bit `Load` offset (`a <= 0xffffffff - total_off ? r<i>.Load(a + total_off) : 0u` for `total_off > 0`, `a >= -total_off ? r<i>.Load(a - (-total_off)) : 0u` for `total_off < 0`, and `r<i>.Load(a)` for `total_off == 0`), refusing `|total_off| > 0xffffffff`.
+- **Encoding and stage refusals**: `check_encoding` rejects reserved bit `w0[25]`, `nv` (`w1[23]`), and non-zero unused `data` (`w1[15:8]`). `Stage.op_global_load_dword` checks modifiers before arity so `lds` refuses by modifier name, allows cache flags (`glc`, `slc`, `dlc`) and 4-byte-aligned signed 12-bit `offset` (`-2048..2044`), and keeps `off` (`saddr = 0x7d`), unaligned immediate/pointer/`vaddr` offsets, sub-dword and multi-dword `GLOBAL` loads, `GLOBAL` stores/atomics, `FLAT`/`SCRATCH` loads, non-compute stages, table/heap/descriptor/numeric pairs, and incomplete or mismatched pointer pairs refused.
+
+[`tests/startup_compute_global_load_check.py`](../tests/startup_compute_global_load_check.py) builds 3 synthetic gfx1013 compute kernels (no game data) over 320 pairwise-distinct nonzero words in a bounded root view (`--compute-store-sized-case`), varies per-lane `vaddr`, scalar bases (direct, `s_mov_b64`-copied, single and chained `s_add_u32`/`s_addc_u32` advances, and multi-root SRVs), signed positive/negative immediate offsets (`+8`, `-12`, `-16`, `+2044`, `-2048`), positive-offset 64-bit overflow (`0xfffffffc + 8 -> base + 0x100000004`), negative-offset underflow (`0..12` below `16`/`4`), low-bit runtime offsets masked across distinct neighboring DWORDs, and partial `EXEC` masks, checks LLVM 15 `llvm-mc` / `libLLVM` round-trips, and executes 9 DXC `cs_6_0` dispatches plus 4 reference controls and 10 negative HLSL mutations per adapter on Microsoft WARP (`1414:008c`, driver `10.0.26100.9818`) and an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`) with `0` debug-layer errors or warnings.
+
+```powershell
+ctest --test-dir out/build/release --no-tests=error -R "^startup_compute_global_load_(controls|warp|hardware)$" -V
+```
