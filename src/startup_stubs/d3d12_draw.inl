@@ -1691,6 +1691,7 @@ constexpr const char* sampled_texture_unbindable = "sampled_texture_unbindable";
 constexpr const char* incomplete_vertex_stream = "incomplete_vertex_stream";
 constexpr const char* incomplete_table_buffer = "incomplete_table_buffer";
 constexpr const char* indexed_validation_failed = "indexed_validation_failed";
+constexpr const char* read_only_depth_write = "read_only_depth_write";
 }  // namespace indirect_refusal_code
 
 struct TranslatedIndirectDraw {
@@ -2141,6 +2142,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
+        if (bound->has_depth_stencil && pass.dsv_format != DXGI_FORMAT_UNKNOWN && !pass.depth_view_writable &&
+            ((bound->depth_stencil.DepthEnable && bound->depth_stencil.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO) ||
+             (bound->depth_stencil.StencilEnable && bound->depth_stencil.StencilWriteMask != 0))) {
+            indirect->set_refusal("translated draw writes depth or stencil to a read-only depth view",
+                                  indirect_refusal_code::read_only_depth_write);
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
     }
     ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, indexed_rect) : nullptr;
     if (indirect && indexed_rect && !pipeline) {
@@ -2266,7 +2275,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
                 }
             }
-            if (indirect && (!texture || record.slot != 18 || texture == pass.target0)) {
+            const auto aliases_writable_target = [&](ID3D12Resource* tex) {
+                if (!tex) return false;
+                for (UINT t = 0; t < pass.target_count; ++t)
+                    if (pass.bound_targets[t] == tex) return true;
+                return pass.bound_depth == tex && pass.depth_view_writable;
+            };
+            if (indirect && (!texture || record.slot != 18 || aliases_writable_target(texture))) {
                 indirect->set_refusal("translated draw requires a matching sampled texture distinct from the target",
                                       indirect_refusal_code::sampled_texture_mismatch);
                 ReleaseSRWLockExclusive(&draw_lock);
