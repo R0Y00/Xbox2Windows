@@ -794,6 +794,35 @@ OperationResult run_sampled_coverage(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
+{
+// Windows SDK 10.0.22621 does not declare the SM 6.8 capability query.
+#if defined(__ID3D12Device14_INTERFACE_DEFINED__)
+    const bool bias = std::strcmp(ctx.argv[2], "--check-pixel-compare-bias") == 0;
+    const D3D_SHADER_MODEL required = bias ? D3D_SHADER_MODEL_6_8 : D3D_SHADER_MODEL_6_7;
+    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{required};
+    if (FAILED(check_feature(ctx.device, D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel))) ||
+        shaderModel.HighestShaderModel < required)
+        return {OutcomeKind::skip, bias ? "Comparison bias requires SM 6.8" : "Comparison LOD requires SM 6.7"};
+    if (bias) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS21 options{};
+        if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS21, &options, sizeof(options))) ||
+            !options.SampleCmpGradientAndBiasSupported)
+            return {OutcomeKind::skip, "Comparison bias requires SampleCmpGradientAndBiasSupported"};
+    } else {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS14 options{};
+        if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options))) ||
+            !options.AdvancedTextureOpsSupported)
+            return {OutcomeKind::skip, "Comparison LOD requires AdvancedTextureOpsSupported"};
+    }
+    check_pixel_compare(ctx.device, ctx.argv[3], ctx.argv[4], true);
+    return {OutcomeKind::pass, nullptr};
+#else
+    (void)ctx;
+    return {OutcomeKind::skip, "Comparison LOD/bias fixture requires Windows SDK 10.0.26100 headers"};
+#endif
+}
+
 OperationResult run_check_pixel_compare(const OperationContext& ctx)
 {
     check_pixel_compare(ctx.device, ctx.argv[3], ctx.argv[4]);
@@ -1293,8 +1322,10 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
-    const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
-    const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
+    const bool array_mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
+    const bool one_dimensional_mips = std::strcmp(ctx.argv[2], "--startup-image-1d-mips") == 0;
+    const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
+    const bool one_dimensional = one_dimensional_mips || std::strcmp(ctx.argv[2], "--startup-image-1d") == 0;
     const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
     float z = 0.0f;
     if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
@@ -1311,8 +1342,8 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1,
-                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0, two_dimensional);
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array,
+                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1651,6 +1682,7 @@ const OperationSpec kOperations[] = {
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
@@ -1697,6 +1729,8 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
+    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
+    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
     {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
     {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},

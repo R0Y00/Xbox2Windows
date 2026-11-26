@@ -665,6 +665,31 @@ def _same_path(left: Path, right: Path) -> bool:
     return False
 
 
+def _validate_args(args: argparse.Namespace) -> tuple[str, str]:
+    if _same_path(args.output, args.source):
+        raise ValueError("use separate input assembly and output binary paths")
+    if args.source.is_dir():
+        raise IsADirectoryError(f"source path must not be a directory: {args.source}")
+    if not args.source.exists():
+        raise FileNotFoundError(f"source file not found: {args.source}")
+    if not args.source.is_file():
+        raise ValueError(f"source path must be a regular file: {args.source}")
+    if args.output.is_symlink():
+        raise ValueError(f"output path must not be a symlink: {args.output}")
+    if args.output.is_dir():
+        raise IsADirectoryError(f"output path must not be a directory: {args.output}")
+    for parent in args.output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"output parent is not a directory: {parent}")
+    assembler = args.assembler.strip()
+    if not assembler:
+        raise ValueError("--assembler must be a non-empty string")
+    validator = args.validator.strip()
+    if not validator:
+        raise ValueError("--validator must be a non-empty string")
+    return assembler, validator
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
@@ -673,10 +698,7 @@ def main(argv=None) -> int:
     parser.add_argument("--validator", default="spirv-val")
     args = parser.parse_args(argv)
     try:
-        if _same_path(args.output, args.source):
-            raise ValueError("use separate input assembly and output binary paths")
-        if args.output.is_dir():
-            raise ValueError(f"output path must not be a directory: {args.output}")
+        assembler, validator = _validate_args(args)
         original = args.source.read_text(encoding="utf-8")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
@@ -684,8 +706,8 @@ def main(argv=None) -> int:
             binary = path / "module.spv"
 
             def validate(source):
-                subprocess.run([args.assembler, "--target-env", "vulkan1.2", source, "-o", binary], check=True)
-                subprocess.run([args.validator, "--target-env", "vulkan1.2", binary], check=True)
+                subprocess.run([assembler, "--target-env", "vulkan1.2", source, "-o", binary], check=True)
+                subprocess.run([validator, "--target-env", "vulkan1.2", binary], check=True)
 
             snapshot = path / "original.spvasm"
             snapshot.write_text(original, encoding="utf-8")
