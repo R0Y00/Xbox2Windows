@@ -109,6 +109,8 @@ def main(consumer, dxc, adapter):
         assert got == expected and not lines(result, 'refused: '), result.stderr[-3000:]
         assert not lines(result, 'reservation refused'), lines(result, 'reservation refused')
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) >= 1, result.stderr[-3000:]
+        # The input must really come from a snapshot (8 MiB), not be read in place: an empty long case would pass everything above.
+        assert len(lines(result, 'comes from a snapshot of title memory (8388608 bytes)')) == 1, result.stderr[-3000:]
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
         assert not errors, errors[0]
         # An all-zero descriptor is an unbound buffer: the dispatch runs on zeros instead of being refused (the empty

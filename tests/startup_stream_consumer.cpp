@@ -215,6 +215,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
+// (The long case puts its input at 0x28000, not at a 64 KiB multiple like 0x20000: there the placed buffer would alias title memory
+// and the input would be read in place, never snapshotted, which is how an earlier version of this case passed without a snapshot.)
 // dispatch-input-snapshot-long: dispatch-input-snapshot with an 8 MiB input range (the descriptor declares 2M records; the program
 // reads the first 320 words) dispatched in 48 frames, 384 MiB of snapshots in all, with the queue completed between frames. The
 // snapshot pool holds 128 MiB, so every frame after the sixteenth reuses chunks the GPU is done with; a pool that is not recycled
@@ -226,7 +228,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     constexpr UINT long_records = 2u << 20, long_frames = 48;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, long_run ? 0x20000 + long_records * sizeof(UINT) : indirect ? 0x30000 : 0x20000,
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, long_run ? 0x28000 + long_records * sizeof(UINT) : indirect ? 0x30000 : 0x20000,
                                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
@@ -256,7 +258,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | fields[i][0] << 16, fields[i][1], fields[i][2]};
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
     }
-    const UINT64 between = reinterpret_cast<UINT64>(memory) + (long_run ? 0x20000 : 0x8000);
+    const UINT64 between = reinterpret_cast<UINT64>(memory) + (long_run ? 0x28000 : 0x8000);
     // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
     // exist only in title memory (the desktop copy of a buffer that does not alias holds zeros); dispatch-input-copied
     // leaves that memory zero.
