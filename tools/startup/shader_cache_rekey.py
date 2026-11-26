@@ -3,16 +3,18 @@
 
 usage: shader_cache_rekey.py <old cache dir> <new request dir>
 
-The key of a graphics request (req_<key>.a), of an RTV variant (req_<key>.rtv) and of a device slot 67 compute
-request (req_<key>.c67) hashes the translation revision string (pipeline_key and compute_key in gfx2hlsl.py).
+Graphics (req_<key>.a), slot 67 compute (req_<key>.c67) and slot 57 mesh (req_<key>.m57) request keys hash their
+translation revision strings (pipeline_key, compute_key and mesh57_key in gfx2hlsl.py). RTV variants
+(req_<key>.rtv) hash text containing the graphics key.
 After a revision change the runtime asks for new keys, so a kept cache is cold again. This tool recomputes the
 key of every such request with the gfx2hlsl.py next to it and copies the request files under the new names into
 <new request dir>. `gfx2hlsl.py --pending <new request dir>` can then translate them without a running title.
 
 The old cache is only read. Only request files (req_*) are written; results and .fail files are not, and a file
 that already exists in <new request dir> is left as it is. Each file is written to a temporary name and renamed;
-the ready marker (.a, .c67) goes last, as the runtime writes it. Slot 57 and slot 86 mesh requests have their own
-key strings and are only counted.
+the ready marker (.a, .c67, .m57) goes last, as the runtime writes it. A stream description (.psin) is written
+again under the new key with the same masks, since its line names the key and its masks are part of the key.
+Slot 86 mesh requests are only counted.
 
 All requests are read before anything is written. When a request part is missing or unreadable, or an RTV
 variant is malformed, does not match its own name or names a base request that is not in the cache, the tool
@@ -29,8 +31,9 @@ import gfx2hlsl as g  # noqa: E402
 
 REQUEST = re.compile(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57|m86)')
 # Request files of each kind; the ready marker is last.
-PARTS = {'g': ('.b', '.root', '.ia', '.a'), 'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67')}
-OPTIONAL = {'.ia'}  # a graphics request without an input layout has no .ia
+PARTS = {'g': ('.b', '.root', '.ia', '.psin', '.a'), 'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67'),
+         'm57': ('.ps57', '.root', '.m57')}
+OPTIONAL = {'.ia', '.psin'}  # a graphics request may have no input layout (.ia) and no stream description (.psin)
 
 
 class Incomplete(Exception):
@@ -60,7 +63,14 @@ def current_key(job):
     except OSError as error:
         return kind, key, None, 'unreadable %s: %s' % (os.path.basename(error.filename or ''), error.strerror)
     if kind == 'g':
-        return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b'')), None
+        # The pixel input masks of a stream description are part of the key; the description names its key.
+        try:
+            masks = g.read_ps_inputs(request_name(src, key, '.psin'), key)
+        except g.Unsupported as reason:
+            return kind, key, None, str(reason)
+        return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b''), masks), None
+    if kind == 'm57':
+        return kind, key, g.mesh57_key(p['.m57'], p['.ps57'], p['.root']), None
     return kind, key, g.compute_key(p['.c67'], p['.data'], p['.root'], p['.desc'], p['.sa'], p['.sb']), None
 
 
@@ -111,7 +121,8 @@ def rekey(src, dst, jobs=None, out=None):
     if os.path.exists(dst) and os.path.samefile(src, dst):
         print('error: the new request dir must not be the old cache', file=sys.stderr)
         return 2
-    found = {'g': [], 'c': [], 'rtv': [], 'm57': 0, 'm86': 0}
+    found = {kind: [] for kind in (*PARTS, 'rtv')}
+    m86 = 0
     try:
         entries = sorted(os.listdir(src))
     except OSError as error:
@@ -122,12 +133,12 @@ def rekey(src, dst, jobs=None, out=None):
         if not m:
             continue
         key, ext = int(m.group(1), 16), m.group(2)
-        if ext in ('m57', 'm86'):
-            found[ext] += 1
+        if ext == 'm86':
+            m86 += 1
         else:
-            found[{'a': 'g', 'c67': 'c', 'rtv': 'rtv'}[ext]].append(key)
+            found[{'a': 'g', 'c67': 'c'}.get(ext, ext)].append(key)
 
-    work = [(src, kind, key) for kind in ('g', 'c') for key in found[kind]]
+    work = [(src, kind, key) for kind in PARTS for key in found[kind]]
     jobs = min(jobs or g.translation_jobs(), len(work))
     if jobs < 2:
         results = [current_key(job) for job in work]
@@ -136,7 +147,7 @@ def rekey(src, dst, jobs=None, out=None):
         with ProcessPoolExecutor(max_workers=jobs) as pool:
             results = list(pool.map(current_key, work, chunksize=max(1, len(work) // (jobs * 4))))
 
-    new = {'g': {}, 'c': {}}
+    new = {kind: {} for kind in PARTS}
     bad = []
     for kind, old, key, reason in results:
         if reason:
@@ -165,7 +176,7 @@ def rekey(src, dst, jobs=None, out=None):
         return 1
     stats = {'written': 0, 'kept': 0}
     try:
-        for kind, label in (('g', 'graphics'), ('c', 'compute')):
+        for kind, label in (('g', 'graphics'), ('c', 'compute'), ('m57', 'm57')):
             done = set()
             for old, key in sorted(new[kind].items()):
                 if key in done:  # requests of the same pipeline from several revisions
@@ -173,6 +184,9 @@ def rekey(src, dst, jobs=None, out=None):
                 done.add(key)
                 # Read again, not checked against the hashing pass: nothing may write the old cache meanwhile.
                 for ext, data in read_parts(src, kind, old).items():
+                    if ext == '.psin':  # the line names the new key
+                        data = ('psin1 %016x ena=0x%04x addr=0x%04x\n' % (
+                            key, *g.read_ps_inputs(request_name(src, old, '.psin'), old))).encode('ascii')
                     publish(request_name(dst, key, ext), data, stats)
             current = sum(old == key for old, key in new[kind].items())
             print('%s: %d requests, %d already current -> %d keys' % (label, len(new[kind]), current, len(done)), file=out)
@@ -182,7 +196,7 @@ def rekey(src, dst, jobs=None, out=None):
         print('error: failed writing %s: %s' % (dst, error), file=sys.stderr)
         return 1
     print('rtv variants: %d requests -> %d keys' % (len(found['rtv']), len(rtv)), file=out)
-    print('not re-keyed (own key strings): m57 %d, m86 %d' % (found['m57'], found['m86']), file=out)
+    print('not re-keyed (own key strings): m86 %d' % m86, file=out)
     print('files: %d written, %d already present in %s' % (stats['written'], stats['kept'], dst), file=out)
     return 0
 

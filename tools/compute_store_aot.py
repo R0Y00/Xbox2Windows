@@ -50,6 +50,7 @@ FLOAT_COMPARE_PREDICATES = {
 # src0[23:0] * src1[23:0] + src2, modulo 2^32. None of them writes vcc, so the guard compare stays valid.
 ALU = {
     "v_and_b32_e32": f"({INTEGER['and_b32'][1]})",
+    "v_bfm_b32": "(((1u << ({0} & 31u)) - 1u) << ({1} & 31u))",  # VOP3 only: ((1 << src0[4:0]) - 1) << src1[4:0]
     "v_lshrrev_b32_e32": f"({INTEGER['lshrrev_b32'][1]})",
     "v_lshlrev_b32_e32": f"({INTEGER['lshlrev_b32'][1]})",
     # v_max3_u32 and v_min3_u32 are the unsigned maximum and minimum of the three sources, max(max(a, b), c).
@@ -94,6 +95,8 @@ SALU = {
     # RDNA2 SOP2: temp.i64 = (int64)S0.i32 - (int64)S1.i32; D.i32 = temp.i32[31:0]; SCC = (temp.i64 != (int64)D.i32) ? 1 : 0 (unread).
     "s_sub_i32": "({0} - {1})",
     "s_and_b32": "({0} & {1})",
+    "s_bitset0_b32": "({0} & ~(1u << ({1} & 31u)))",
+    "s_bitset1_b32": "({0} | (1u << ({1} & 31u)))",
     "s_or_b32": "({0} | {1})",
     "s_xor_b32": "({0} ^ {1})",
     "s_lshr_b32": "({0} >> ({1} & 31u))",
@@ -368,6 +371,29 @@ def float_word(token, scalar, vector, pending, sizes=None):
     return word
 
 
+def float_e64_source(token, scalar, vector, pending):
+    """The HLSL word of a VOP3 binary32 source after its source modifiers, or None for an unknown word.
+
+    LLVM prints the VOP3 source modifiers on a register as -v, |v| and -|v|. They act on the sign bit of the word:
+    abs clears bit 31, then neg flips it, as pixel_aot does for v_cvt_f64_f32_e64 and binary64 compare sources, so a
+    zero or NaN keeps its other bits. Modifiers on a constant (neg(0x...), |1.0|) and the abs() spelling are refused.
+    """
+    m = re.fullmatch(r"(-?)(\|?)(s\d+|v\d+)(\|?)", token)
+    if not m and not re.fullmatch(FLOAT_SOURCE, token):
+        raise ValueError(f"Unsupported float source modifier: {token}")
+    if m and m[2] != m[4]:
+        raise ValueError(f"Unsupported float source modifier: {token}")
+    word = float_word(m[3] if m else token, scalar, vector, pending)
+    if word is None:
+        return None
+    expression = hlsl_word(word)
+    if m and m[2]:
+        expression = f"({expression} & 0x7fffffffu)"
+    if m and m[1]:
+        expression = f"({expression} ^ 0x80000000u)"
+    return expression
+
+
 def vector_operands(line):
     """VGPR numbers named by an instruction, single or as a range."""
     regs = set()
@@ -618,6 +644,11 @@ def descriptor_load_hlsl():
     Every conversion is integer arithmetic, so the result does not depend on the GPU's float division. UNORM is
     x / (2^n - 1) and SNORM16 is max(x / 32767, -1), rounded to nearest even binary32 by long division. FLOAT16
     widens exactly, keeping NaN payloads. 16-bit UINT and SINT zero- and sign-extend the low halfword.
+
+    With d16 the channels pack two per result word, x in the low half. Float-type formats give binary16: the
+    FLOAT16 halves as stored, and UNORM and SNORM16 rounded to nearest even binary16 (denormals kept) by long
+    division. 16-bit UINT and SINT give the 16-bit integer, not a float. A 32-bit format has no d16 rule here and
+    is invalid.
     """
     legacy = []
     for field, code in sorted(LEGACY_DESCRIPTOR_FORMATS.items()):
@@ -642,14 +673,32 @@ def descriptor_load_hlsl():
     grouped = {}
     for code, (kind, channels) in DESCRIPTOR_STORE_FORMATS.items():
         grouped.setdefault((kind, channels), []).append(code)
+    halves = {
+        "unorm8": ("h = uint4(descriptor_ratio16(raw.x & 0xffu, 255u), descriptor_ratio16((raw.x >> 8u) & 0xffu, 255u), "
+                   "descriptor_ratio16((raw.x >> 16u) & 0xffu, 255u), descriptor_ratio16(raw.x >> 24u, 255u));"),
+        "unorm16x2": ("h.xy = uint2(descriptor_ratio16(raw.x & 0xffffu, 65535u), "
+                      "descriptor_ratio16(raw.x >> 16u, 65535u));"),
+        "unorm10": ("h = uint4(descriptor_ratio16(raw.x & 0x3ffu, 1023u), "
+                    "descriptor_ratio16((raw.x >> 10u) & 0x3ffu, 1023u), "
+                    "descriptor_ratio16((raw.x >> 20u) & 0x3ffu, 1023u), descriptor_ratio16(raw.x >> 30u, 3u));"),
+        "f16x2": "h.xy = uint2(raw.x & 0xffffu, raw.x >> 16u);",
+        "f16x4": "h = uint4(raw.x & 0xffffu, raw.x >> 16u, raw.y & 0xffffu, raw.y >> 16u);",
+        "unorm16": "h.x = descriptor_ratio16(raw.x & 0xffffu, 65535u);",
+        "snorm16": "h.x = descriptor_snorm16_half(raw.x & 0xffffu);",
+        "uint16": "h.x = raw.x & 0xffffu;",
+        "sint16": "h.x = raw.x & 0xffffu;",
+        "f16": "h.x = raw.x & 0xffffu;",
+    }
     arms = []
-    for kind in _DESCRIPTOR_KIND_ORDER:
-        for channels in range(1, 5):
-            codes = grouped.get((kind, channels))
-            if codes:
-                test = " || ".join(f"format == {code}u" for code in sorted(codes))
-                keyword = "if" if not arms else "else if"
-                arms.append(f"    {keyword} (({test}) && channels == {channels}u) {{ {bodies[kind]} valid = true; }}")
+    for d16, table in ((False, bodies), (True, halves)):
+        for kind in _DESCRIPTOR_KIND_ORDER:
+            for channels in range(1, 5):
+                codes = grouped.get((kind, channels))
+                if codes and kind in table:
+                    test = " || ".join(f"format == {code}u" for code in sorted(codes))
+                    keyword = "if" if not arms else "else if"
+                    arms.append(f"    {keyword} (d16 {'!=' if d16 else '=='} 0u && ({test}) && channels == {channels}u) "
+                                f"{{ {table[kind]} valid = true; }}")
     return (
         "uint descriptor_ratio(uint x, uint d) {\n"
         "    // binary32 bits of x / d for 0 <= x <= d < 2^16, rounded to nearest even by long division.\n"
@@ -668,6 +717,31 @@ def descriptor_load_hlsl():
         "    if ((bits & 1u) != 0u && (r != 0u || (result & 1u) != 0u)) ++result;\n"
         "    return result;\n"
         "}\n"
+        "uint descriptor_ratio16(uint x, uint d) {\n"
+        "    // binary16 bits of x / d for 0 <= x <= d < 2^16, rounded to nearest even, denormals kept.\n"
+        "    if (x == 0u) return 0u;\n"
+        "    if (x == d) return 0x3c00u;\n"
+        "    uint r = x, f = 0u;\n"
+        "    for (uint i = 0u; i < 26u; ++i) {\n"
+        "        r <<= 1u;\n"
+        "        uint bit = r >= d ? 1u : 0u;\n"
+        "        r -= bit * d;\n"
+        "        f = (f << 1u) | bit;\n"
+        "    }\n"
+        "    // x / d = f / 2^26 plus a remainder. A normal result keeps 11 bits; a denormal counts units of 2^-24.\n"
+        "    uint lead = firstbithigh(f);\n"
+        "    uint shift = lead >= 12u ? lead - 10u : 2u;\n"
+        "    uint result = lead >= 12u ? (((lead - 11u) << 10u) | ((f >> shift) & 0x3ffu)) : (f >> shift);\n"
+        "    uint roundBit = (f >> (shift - 1u)) & 1u;\n"
+        "    bool sticky = (f & ((1u << (shift - 1u)) - 1u)) != 0u || r != 0u;\n"
+        "    if (roundBit != 0u && (sticky || (result & 1u) != 0u)) ++result;\n"
+        "    return result;\n"
+        "}\n"
+        "uint descriptor_snorm16_half(uint bits16) {\n"
+        "    int value = (int)(bits16 << 16u) >> 16;\n"
+        "    if (value <= -32767) return 0xbc00u;\n"
+        "    return value < 0 ? 0x8000u | descriptor_ratio16((uint)(-value), 32767u) : descriptor_ratio16((uint)value, 32767u);\n"
+        "}\n"
         "uint descriptor_snorm16_load(uint bits16) {\n"
         "    int value = (int)(bits16 << 16u) >> 16;\n"
         "    if (value <= -32767) return 0xbf800000u;\n"
@@ -681,7 +755,7 @@ def descriptor_load_hlsl():
         "    uint top = firstbithigh(m);\n"
         "    return sign | ((top + 103u) << 23u) | ((m << (23u - top)) & 0x7fffffu);\n"
         "}\n"
-        "uint4 load_descriptor_format(uint formatWord, uint addr, uint channels, out bool valid) {\n"
+        "uint4 load_descriptor_format(uint formatWord, uint addr, uint channels, uint d16, out bool valid) {\n"
         "    valid = false;\n"
         f"    uint fixedBits = formatWord & {DESCRIPTOR_FIXED_MASK:#x}u;\n"
         f"    uint field = (formatWord >> {DESCRIPTOR_FORMAT_SHIFT}u) & {DESCRIPTOR_FORMAT_MASK:#x}u;\n"
@@ -692,8 +766,9 @@ def descriptor_load_hlsl():
         + "\n".join(legacy) + "\n"
         "    }\n"
         "    uint4 raw = inputData.Load4(addr);\n"
-        "    uint4 r = uint4(0u, 0u, 0u, 0u);\n"
+        "    uint4 r = uint4(0u, 0u, 0u, 0u), h = uint4(0u, 0u, 0u, 0u);\n"
         + "\n".join(arms) + "\n"
+        "    if (d16 != 0u) r = uint4(h.x | (h.y << 16u), h.z | (h.w << 16u), 0u, 0u);\n"
         "    return r;\n"
         "}\n"
     )
@@ -738,7 +813,7 @@ def heap_view_hlsl(table_offset, view_count, buffer_bytes):
         "        inRange = inRange && instOffset + 4u * channels <= left - start;\n"
         "        addr = v.x + start + instOffset;\n"
         "    }\n"
-        "    uint4 r = load_descriptor_format(v.w, inRange ? addr : 0u, channels, valid);\n"
+        "    uint4 r = load_descriptor_format(v.w, inRange ? addr : 0u, channels, 0u, valid);\n"
         "    return inRange ? r : zero;\n"
         "}\n"
     )
@@ -878,7 +953,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unknown image SRV dimension")
     if image_srv_dimension == "1d" and not (rgba32_float_image and image_srv_descriptor is not None):
         raise ValueError("1D image loads require a separate gfx1013 RGBA32 FLOAT SRV binding")
-    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only (add, umax, cmpswap; see lower()).
+    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only
+    # (add, umin, umax, cmpswap; see lower()).
     gfx1013_image_atomic = cpu == "gfx1013" and image_atomic_type is not None and image_format == "R32_UINT"
     if image_output:
         if ((cpu != "gfx1030" and not float_image and not gfx1013_image_atomic)
@@ -1216,6 +1292,17 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         ):
             op, dst = m[1], int(m[2])
             words = [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
+            if dst > 105 or dst in pending or None in words:
+                raise ValueError("Unverified scalar ALU operand")
+            expression = SALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            scalar[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"(s_bitset[01]_b32) s(\d+), {SALU_SOURCE}", line):
+            # SOP1 s_bitset0_b32 and s_bitset1_b32 clear or set bit src0[4:0] of sD and keep its other bits, so sD
+            # is read as well as written: it must already hold a known word. SCC is not written.
+            op, dst = m[1], int(m[2])
+            words = [alu_word(f"s{dst}", scalar, vector, pending, sizes), alu_word(m[3], scalar, vector, pending, sizes)]
             if dst > 105 or dst in pending or None in words:
                 raise ValueError("Unverified scalar ALU operand")
             expression = SALU[op].format(*map(hlsl_word, words))
@@ -2098,11 +2185,27 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
         elif ((m := re.fullmatch(r"v_and_b32_e32 v(\d+), (?:0xffff|65535), v(\d+)", line))
-              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] == "source_low16"):
+              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] in ("source_low16", "alu_low16")):
             dst = int(m[1])
             if dst > 255:
                 raise ValueError("Invalid vector destination")
-            vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
+            word = f"inputData.Load({partial[1]})" if partial[0] == "source_low16" else partial[1]
+            vector[dst] = ("alu", f"({word} & 0xffffu)")
+        elif ((m := re.fullmatch(r"(v_(?:add|sub|subrev|mul)_f32)_e64 v(\d+), ([^,\s]+), ([^,\s]+)( .+)?", line))
+              and any(token.startswith(("-", "|", "neg(", "abs(")) and not re.fullmatch(FLOAT_SOURCE, token)
+                      for token in m.groups()[2:4])):
+            # The VOP3 spelling with a source modifier on at least one source; either source is any binary32 source.
+            # The unmodified _e64 form is left to the fall-through. clamp and omod (mul:2, mul:4, div:2) are refused.
+            op, dst = m[1] + "_e32", int(m[2])
+            if m[5]:
+                raise ValueError(f"Unsupported float output modifier: {line}")
+            sources = [float_e64_source(token, scalar, vector, pending) for token in m.groups()[2:4]]
+            if dst > 255 or None in sources:
+                raise ValueError("Unverified float operand")
+            expression = FALU[op].format(*sources)
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(rf"(v_(?:add|sub|subrev|mul)_f32_e32) v(\d+), {FLOAT_SOURCE}, (v\d+)", line):
             op, dst = m[1], int(m[2])
             words = [float_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
@@ -2206,7 +2309,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  + (f"{result};" if bound else f"{inside} ? {result} : ({hlsl_word(values[2])});")))
             vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
-              or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32|v_bcnt_u32_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32|v_bcnt_u32_b32|v_bfm_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
@@ -2357,8 +2460,6 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             descriptor_load = None
             if resource_channels and load_format_words is not None:
                 # The format is V# word 3 from a constant word, decoded in the shader (descriptor_load_hlsl).
-                if packed:
-                    raise ValueError("Descriptor-format d16 loads are not lowered")
                 if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer read target or address mode")
                 if format_load_index >= len(load_format_words):
@@ -2436,15 +2537,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if descriptor_load is not None:
                 result = f"format_load_{format_load_index - 1}"
                 slot = hlsl_word(('constant_word', descriptor_load))
+                if heap_view is not None and packed:
+                    raise ValueError("D16 descriptor-format loads are not lowered through a heap view")
                 call = (f"load_heap_view_format({slot}, tid.{AXES[tag[1]]}, {aligned}u, {components}u, "
                         f"format_valid_{format_load_index - 1})" if heap_view is not None else
-                        f"load_descriptor_format({slot}, {addresses[0]}, {components}u, "
+                        f"load_descriptor_format({slot}, {addresses[0]}, {components}u, {int(packed)}u, "
                         f"format_valid_{format_load_index - 1})")
                 staged_steps.append((None, f"    bool format_valid_{format_load_index - 1};\n"
                                            f"    uint4 {result} = {call};"))
                 for reg in range(dst, dst + count):
                     vector.pop(reg, None)
-                    loading[reg] = ("alu", f"{result}.{'xyzw'[reg - dst]}")
+                    # An odd d16 count leaves the high half of the last word undefined, as for source_low16.
+                    low16 = packed and components % 2 and reg == dst + count - 1
+                    loading[reg] = ("alu_low16" if low16 else "alu", f"{result}.{'xyzw'[reg - dst]}")
                 continue
             # The address has been captured, so the index can alias a destination.
             for reg, address in enumerate(addresses, dst):
@@ -2500,8 +2605,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             op = m["op"]
             signed = op in ("smin", "smax")
             # gfx1013 is limited to the forms its draws cover; the lowering itself is the gfx1030 one.
-            if cpu == "gfx1013" and op not in ("add", "umax", "cmpswap"):
-                raise ValueError("gfx1013 image atomics require add, umax or cmpswap")
+            if cpu == "gfx1013" and op not in ("add", "umin", "umax", "cmpswap"):
+                raise ValueError("gfx1013 image atomics require add, umin, umax or cmpswap")
             if (image_atomic_type != ("int" if signed else "uint") or image_float != (op in IMAGE_FLOAT_ATOMIC_OPS)
                     or guard_span is not None or stores):
                 raise ValueError("Unsupported image atomic target or binding")
