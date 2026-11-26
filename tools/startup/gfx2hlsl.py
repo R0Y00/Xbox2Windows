@@ -946,6 +946,48 @@ def writes_exec(name, ops):
     return 'saveexec' in name or 'wrexec' in name or name.startswith(('v_cmpx', 's_movreld'))
 
 
+# In wave32 VCC is vcc_lo alone and vcc_hi is a free scalar register that compilers allocate like any other (RDNA 2
+# ISA, "VCC": in wave32 only VCC_LO is the condition mask). The translator models it as an ordinary SGPR the program
+# never names, taken from the top of the 106 (beyond the user-data and system registers set at entry).
+def wave32_vcc_hi(ins):
+    """`ins` with every vcc_hi operand renamed to an unused SGPR when vcc_hi is provably an ordinary scalar register,
+    else `ins`.
+
+    The decoder prints wave32 syntax, so the program text alone does not give the wave size. vcc_hi holds its own
+    word in both wave sizes as long as only scalar instructions write it; in wave64 a VALU write of VCC (a compare,
+    a carry-out, v_div_scale, printed as vcc_lo) also writes vcc_hi with the high lanes. So the rename is exact when
+    - no instruction names the 64-bit pair `vcc` (whose high word would then be vcc_hi), and
+    - a VALU instruction writes vcc_hi or an odd SGPR as its compare or carry destination (a misaligned pair in
+      wave64, so the program is wave32), or no VALU instruction writes vcc_lo.
+    Otherwise, or when M0-relative s_movrel* could reach the chosen register, vcc_hi is left alone and refused."""
+    if not any(re.search(r'\bvcc_hi\b', asm) for *_, asm in ins):
+        return ins
+    if any(re.search(r'\bvcc\b', asm) or name.startswith('s_movrel') for _o, _n, name, asm in ins):
+        return ins
+    masks = []  # lane-mask destinations of VALU compares and carry-outs (VOP3b SDST)
+    for _o, _n, name, asm in ins:
+        ops = parse(asm)[1]
+        if name.startswith('v_cmp_') and ops:
+            masks.append(ops[0])
+        elif VOP3B_SDST.match(name) and len(ops) > 1:
+            masks.append(ops[1])
+        if name in ('v_cndmask_b32_e64', 'v_add_co_ci_u32_e64', 'v_sub_co_ci_u32_e64', 'v_subrev_co_ci_u32_e64') \
+                and ops[-1] != 'vcc_lo':
+            masks.append(ops[-1])  # a lane-mask source is a pair in wave64 too: vcc_hi or an odd SGPR proves wave32
+    odd = any((reg_range(tok) or ('', 0, 1))[0] == 's' and reg_range(tok)[1] == reg_range(tok)[2]
+              and reg_range(tok)[1] % 2 for tok in masks)
+    if 'vcc_hi' not in masks and not odd and 'vcc_lo' in masks:
+        return ins
+    named = set()
+    for *_, asm in ins:
+        for lo, hi, single in re.findall(r'\bs\[(\d+):(\d+)\]|\bs(\d+)\b', asm):
+            named.update(range(int(lo), int(hi) + 1) if lo else (int(single),))
+    free = next((n for n in range(105, 63, -1) if n not in named), None)
+    if free is None:
+        return ins
+    return [(off, n, name, re.sub(r'\bvcc_hi\b', 's%d' % free, asm)) for off, n, name, asm in ins]
+
+
 def pc_pair(token):
     """Only aligned pairs of ordinary SGPRs can carry a symbolic code address."""
     r = reg_range(token)
@@ -2015,6 +2057,8 @@ class Stage:
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
+        if kind in ('vs', 'ps'):
+            self.ins = wave32_vcc_hi(self.ins)
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
