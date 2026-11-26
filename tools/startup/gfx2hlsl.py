@@ -1993,6 +1993,8 @@ class Stage:
             if m:
                 raise Unsupported('numeric use of m0 holding %s' % m[0])
             return 'm0'
+        if tok == 'null':
+            return '0x00000000u'
         r = reg_range(tok)
         if r:
             if r[0] == 'v':
@@ -2079,6 +2081,8 @@ class Stage:
         return s[1] if s and s[0] == 'const' else None
 
     def const_u32(self, tok):
+        if tok == 'null':
+            return 0
         r = reg_range(tok)
         if r:
             if r[0] == 's' and r[1] == r[2]:
@@ -3018,7 +3022,7 @@ class Stage:
             if sym:
                 return sym[0] in ('const', 'ud', 'fixed_buffer_word')
             return lo not in self.varying_s
-        if tok in FLOATS:
+        if tok == 'null' or tok in FLOATS:
             return True
         try:
             int(tok, 0)
@@ -3357,7 +3361,7 @@ class Stage:
                     if sr is not None:
                         if sr[1] != sr[2] or (sr[0] == 'v' and sr[1] > 255) or (sr[0] == 's' and sr[1] > 105):
                             raise Unsupported('%s source %s' % (base, src))
-                    elif src not in FLOATS and src != 'm0':
+                    elif src not in FLOATS and src not in ('m0', 'null'):
                         try:
                             val = int(src, 0)
                         except ValueError:
@@ -3733,14 +3737,16 @@ class Stage:
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
+        dst = reg_range(ops[0])
         if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
+            if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+                raise Unsupported('s_add_u32 destination %s' % ops[0])
             # The immediately preceding numeric add emitted the carry; no branch can enter here.
-            self.set_s(reg_range(ops[0])[1], '(scc ? 1u : 0u)')
+            self.set_s(dst[1], '(scc ? 1u : 0u)')
             self.set_scc('false')  # 0 + a single bit never produces another carry.
             return None
-        if base in SCC_UNMODELLED and self.tracks_uniformity():
+        if base in SCC_UNMODELLED and self.tracks_uniformity() and ops[0] != 'null':
             self.scc_uniform = False
-        dst = reg_range(ops[0])
         pair = base.endswith('_b64')
         srcs = ops[1:]
         # 64-bit operands name the low register; exec/vcc name themselves.
@@ -3828,7 +3834,12 @@ class Stage:
                 return None
             if dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
                 raise Unsupported('mask from descriptor data')
-            d = reg_range(dname)[1]
+            if dname == 'null':
+                raise Unsupported('scc from descriptor data' if (scc or base in SCC_UNMODELLED)
+                                  else '%s into null on descriptor data' % base)
+            if not dst or dst[0] != 's':
+                raise Unsupported('%s destination %s' % (base, ops[0]))
+            d = dst[1]
             own = self.sym.get(d)
             raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
                    if getattr(self, 'kind', None) in ('cs', 'vs') and len(syms) == 2 else None)
@@ -3874,6 +3885,13 @@ class Stage:
         needed = max((int(i) for i in re.findall(r'\{(\d+)\}', text)), default=-1) + 1
         if len(srcs) < needed:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), needed + 1))
+        if dname == 'null':
+            if any(self.is_lane_mask(t) for t in srcs):
+                raise Unsupported('%s into null on a lane mask' % base)
+            if pair:
+                raise Unsupported('%s into null' % base)
+            if base in SCC_UNMODELLED and getattr(self, 'pc', None) not in getattr(self, 'address_carry_pairs', ()):
+                raise Unsupported('%s into null: SCC is not modelled' % base)
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
@@ -3915,7 +3933,13 @@ class Stage:
             if scc:
                 self.set_scc(scc.replace('$', var))
             return None
-        d = reg_range(dname)[1]
+        if dname == 'null':
+            if scc:
+                self.set_scc(scc.replace('$', '(%s)' % expr))
+            return None
+        if not dst or dst[0] != 's':
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        d = dst[1]
         is_mask = pair or any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
                               for t in srcs) and base.split('_')[1] in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor', 'xnor', 'not', 'cselect')
         if base in ('s_mov_b32', 's_mov_b64', 's_movk_i32') and re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', srcs[0]) and srcs[0] not in FLOATS:
@@ -3933,6 +3957,8 @@ class Stage:
                 if r and r[0] == 's' and r[1] == r[2]:
                     c = self.is_const(r[1])
                     return c if c is not None else getattr(self, '_pre_fconst', getattr(self, 'float_const_s', {})).get(r[1])
+                if tok == 'null':
+                    return 0
                 if tok in FLOATS:
                     return fbits(FLOATS[tok])
                 if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', tok) and tok not in FLOATS:
@@ -4136,7 +4162,9 @@ class Stage:
             raise Unsupported('%s on a lane mask' % name)
         imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
         bit_sym = None
-        if imm:
+        if ops[1] == 'null':
+            index_imm = 0
+        elif imm:
             index_imm = int(ops[1], 0) & 31
         else:
             src = reg_range(ops[1])
@@ -4377,6 +4405,8 @@ class Stage:
             r = reg_range(o)
             if r and r[0] == 's':
                 vals.append(self.is_const(r[1]))
+            elif o == 'null':
+                vals.append(0)
             else:
                 try:
                     vals.append(int(o, 0))
@@ -4391,7 +4421,16 @@ class Stage:
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
             return None
-        d = reg_range(ops[0])[1]
+        if ops[0] == 'null':
+            if any(self.is_lane_mask(t) for t in ops[1:3]):
+                raise Unsupported('s_bfm_b32 into null on a lane mask')
+            self.u(ops[1])
+            self.u(ops[2])
+            return None
+        dst = reg_range(ops[0])
+        if not dst:
+            raise Unsupported('s_bfm_b32 destination %s' % ops[0])
+        d = dst[1]
         if None not in vals:
             value = (((1 << (vals[0] & 31)) - 1) << (vals[1] & 31)) & 0xffffffff
             self.set_s(d, '0x%08xu' % value, ('const', value))
@@ -4401,6 +4440,8 @@ class Stage:
 
     def scalar_const(self, tok):
         """Value of a 32-bit scalar source that is known at translation time, else None."""
+        if tok == 'null':
+            return 0
         r = reg_range(tok)
         if r:
             return self.is_const(r[1]) if r[0] == 's' and r[1] == r[2] else None
