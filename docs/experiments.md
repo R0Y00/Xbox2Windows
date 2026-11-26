@@ -6320,6 +6320,11 @@ Run `ctest --preset dev -R '^compute_(heap_store_controls|store_aot_heap_view_st
 
 ### Packed D16 heap-view stores
 
+The `compute_store_aot_heap_view_store_{warp,hardware}` tests group matching readbacks by shader.
+One renderer process per shader runs 12 UINT4 cases and 12, 16, 17 and 17 cases for D16 XYZW, X,
+XY and XYZ respectively. Each case dispatches separately and compares 320 words. The 52 shader
+mutations run individually and retain their readback diagnostics.
+
 With the same `--heap-store-view` binding, gfx1013 `buffer_store_format_d16_xyzw` reads X/Y from the low/high halves of the first VGPR and Z/W from the second. A live identity `BUF_FMT_32_32_32_32_FLOAT` view (format 77) receives four binary32 words. Two source VGPRs still require 16 writable bytes in the destination. `buffer_store_format_d16_x` takes one source VGPR, converts its low 16 bits (`& 0xffffu`) via `f16tof32`, and writes one 4-byte binary32 word into a live identity `BUF_FMT_32_FLOAT` view (format 22, `0x01016fac`), enforcing 4-byte offset/stride/base alignment and `(bytes - view.x - offset - 4u) / stride` bounds without a raw UAV read-modify-write. A view whose format differs from the required component count or numeric type leaves the output untouched. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [HLSL half-to-float conversion](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/f16tof32)
 
 The heap-store CTest selection above runs the UINT4 program and all four packed D16 widths. Each D16 fixture checks 320 words across its heap-view cases (with `D16_X` additionally checking four binary16 payload patterns with poisoned high halves: `1.0`..`1.00293`, `-2.0`.., minimum positive subnormal + `+0.0`, and `-0.0` + negative subnormals, plus `UINT1` and `FLOAT4` mismatch rejections and untouched adjacent sentinel dwords). Eleven compiled shader mutations check addressing, view selection, and half-float extraction, including swapping high for low bits, checking the wrong format word, and writing packed values directly.
@@ -15739,6 +15744,20 @@ rewrite the lowering to the uncapped `frac` and to a `min`-form cap and require 
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_fract$' -V
 ```
 
+## Startup scalar bit counts and scans
+
+`tools/startup/gfx2hlsl.py` lowers eight scalar bit operations that it used to refuse with `Unsupported`: `s_bcnt0_i32_b32`, `s_bcnt1_i32_b32`, `s_bcnt0_i32_b64`, `s_bcnt1_i32_b64`, `s_ff0_i32_b64`, `s_ff1_i32_b64`, `s_flbit_i32_b64` and `s_flbit_i32_i64`. Each writes one 32-bit SGPR. The counts set `SCC` to `result != 0`. The scans return `0xffffffff` when no bit qualifies and leave `SCC` alone. `s_flbit_i32_i64` counts the leading bits equal to the sign bit, so it complements a negative value before it counts. The 32-bit scan forms were already covered elsewhere and are not changed.
+
+Scope: the source is a register only (`s0` to `s105`, an even-aligned pair for the `b64` forms; an odd start is refused). Literals, inline constants, `exec`, `vcc`, `m0`, a pair that crosses `s105`, source or destination modifiers and a wrong operand count are refused. A source that holds a lane mask is refused with `... on a lane mask`; a destination that held a mask stops being one. The destination must be one SGPR in `s0..s105`.
+
+`tests/startup_gfx2hlsl_s_bit_scan_check.py` builds the SOP1 words, translates them, runs the emitted HLSL on the integer evaluator of `startup_gfx2hlsl_bit_alu_check.py` and compares every result with a loop-and-string reference written from the ISA description. The same file has a `draw` mode: a pixel stage loads literals into `s4`/`s5`, runs each of the eight forms on four lanes, and the adapter output words are read back against the same reference (FXC 5_1 and DXC 6_0). The fixture XORs the result with `0x3f000000` before the float export so every expected integer is carried as a finite normal bit pattern. A wrong-count reference must produce a readback mismatch.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_s_bit_scan_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bit_scan$' -V
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bit_scan_warp$' -V
+```
+
 ## Vulkan subnormal preservation in a pixel shader
 
 `tests/pixel_denorm_vulkan_check.py` compiles one source-built `ps_6_2` pixel shader with DXC for Vulkan 1.2 and draws it with `tests/vk_pixel_draw.c`. Seven operations (`1 * 2^-149`, `0x007fffff + 0`, `minnorm * 0.5`, `minnorm - 2^-149`, `2^-149 + 2^-149`, `-0x00000003 * 1` and `2^-149 * 2^23`) take or produce binary32 subnormals. The inputs come from a constant buffer so DXC cannot fold them, and each result word is read back from an RGBA32UI pixel. The reference is IEEE binary32 arithmetic in Python. `-denorm preserve` must match it on all seven; `-denorm ftz` is the negative control and must differ on at least one, which shows that the probe separates preserve from flush. A device with `shaderDenormPreserveFloat32` false is a capability skip, and a module that `spirv-val` or the driver refuses is a validation refusal; both are reported apart from mismatches. The check shows how a driver treats subnormals in this one shader. It does not show that translated shaders from `tools/pixel_aot.py` render the same bits under Vulkan.
@@ -16008,6 +16027,26 @@ Building on #2443 (Slice 1), `X2W_D3D12_RELEASE_RETIRED=1` extends desktop objec
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
 ```
+
+## Source `abs` modifiers (`|src|` and `-|src|`) on `v_cndmask_b32_e64` in the startup translator
+
+`Stage.u_src` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py#L1506-L1521) now strips `|...|` after `split_neg(tok)` for `v_cndmask_b32_e64` data sources (`src0` and `src1`, both VGPRs and SGPRs), clearing the `off_diag.py` refusal `operand '|v0|' at v_cndmask_b32_e64 v0, v0, |v0|, s30`. Per the RDNA2 VOP3A source-modifier order, `abs` clears bit 31 (`& 0x7fffffffu`) first and `neg` flips bit 31 (`^ 0x80000000u`) second:
+
+- `|src|` emits `(src & 0x7fffffffu)`
+- `-|src|` (and `neg(|src|)`) emits `((src & 0x7fffffffu) ^ 0x80000000u)` (forces bit 31 to `1`)
+- `-src` keeps `(src ^ 0x80000000u)`
+
+`check_encoding()` still refuses `ABS` on inline or literal immediates (`v_cndmask_b32_e64 ABS on an immediate`), `Stage.u()` still refuses `|vN|` when `vN` is in `low16_only_v` (whole-word 32-bit read), `op_v_cndmask_b32` still refuses `abs`/`neg` on the mask operand (`src2`), `v_cndmask_b32` stays out of `UNIFORM_VALU`, and other integer instructions keep using `Stage.u()` so unexpected `|...|` modifiers remain refused.
+
+```powershell
+out\pe-env\Scripts\python.exe -B tests\startup_gfx2hlsl_cndmask_abs_check.py
+out\pe-env\Scripts\python.exe -B tests\startup_gfx2hlsl_cndmask_abs_check.py draw dxc.exe out\build\dev\offscreen_check.exe warp fxc.exe
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_abs_(controls|warp|hardware)$' -V
+```
+
+### Measured results and open scope
+
+[`tests/startup_gfx2hlsl_cndmask_abs_check.py`](../tests/startup_gfx2hlsl_cndmask_abs_check.py) decodes synthetic VOP3A bytes with `G.decode()` (no game data) covering `v_cndmask_b32_e64 v0, v0, |v0|, s30`, `|v0|` / `-|v0|` on `src0` and `src1`, SGPR `|s4|` / `-|s4|`, `neg(|v0|)`, and 17 refusal controls, then evaluates the emitted HLSL across 11 32-bit patterns (`+0.0`, `-0.0`, `+1.0`, `-1.0`, `+qNaN`, `-qNaN`, `+inf`, `-inf`, `-denormal`, `0x12345678`, `0x92345678`) under both mask states (`22/22` exact matches; both order-reversed and `abs`-dropped mutations mismatch on `22/22` cases). On WARP (`Microsoft Basic Render Driver` `1414:008c`, driver `10.0.26100.9818`, `debug_layer=unavailable`) with FXC (`ps_5_1`) and DXC (`ps_6_0`), all 44 positive draws (22 FXC + 22 DXC) matched bit-for-bit and all 8 mutated draws (4 reverse-order + 4 drop-abs) failed with their expected wrong words. Physical GPU (`startup_gfx2hlsl_cndmask_abs_hardware`) and title shader execution remain unverified here.
 
 ## Binary16 SDWA arithmetic, rounding, scaling and conversions in pixel_aot
 

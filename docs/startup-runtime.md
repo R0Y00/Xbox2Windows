@@ -2866,6 +2866,20 @@ freed slots are reused in address order so that pages reused together share a vi
 bytes from the queried page to the end of the view, not one page. A placed buffer on such memory
 is not affected: section-backed pages already took the committed, not-aliased path.
 
+## Committed resources (device slot 76)
+
+Device slot 76 (Xbox order, +0x260) takes the seven arguments of desktop `CreateCommittedResource`:
+heap properties, heap flags, desc, initial state, clear value, riid and ppv. Measured: a console
+package module (an upscaler) creates its resources through it. The stand-in shares the
+committed-resource path of slot 127 (the `CreateCommittedResource3` order, with protected session and
+castable formats, which slot 76 does not pass): the same initial-state choice per heap, the same
+clear-value retry and title memory, and a log line naming the slot. Run
+`ctest --preset dev --no-tests=error -R '^startup_committed_slot76_(warp|control)$'`
+(`tests/startup_committed_slot76_check.cpp`): a render target with a clear value and buffers on the
+default, upload and readback heaps, passed with initial state 0xffffffff as a title passes them, must
+be created and leave the device alive. The control asks for a 2D texture on an upload heap and must
+return `E_INVALIDARG` with no resource and leave the device alive. The control also requires all four valid creations to pass. `startup_committed_slot76_hardware` runs the creation checks on a physical GPU.
+
 - `ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V` runs the
   earlier contract check and `tests/xmem_page_runs_check.py`: a batch across two sections with
   holes, moved and reused pages; `VirtualQuery` before and after a view is split; two views of

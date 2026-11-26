@@ -5767,10 +5767,10 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
 // COMMON, GENERIC_READ on an upload heap and COPY_DEST on a readback heap (the initial states D3D12
 // requires there; the Windows 10 runtime refuses COMMON with E_INVALIDARG). When desktop rejects the
 // clear value it is retried without one.
-HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
-                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
-                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
-                                            void** out)
+// Slot 76 shares the work with the slot number in the log line.
+HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                         const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear, void* session,
+                         UINT castable_count, const void* castable, const GUID* iid, void** out)
 {
     char text[48];
     guid_text(iid, text, sizeof(text));
@@ -5779,7 +5779,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     const D3D12_RESOURCE_DESC copy = sanitized(*desc);
     const auto flags = static_cast<D3D12_HEAP_FLAGS>(heap_flags);
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(0, 1, &copy);
-    check_device("Device before slot", 127);
+    check_device("Device before slot", slot);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
     ID3D12Resource* resource = nullptr;
     const D3D12_RESOURCE_STATES initial = props->Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
@@ -5797,8 +5797,9 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     }
     static LONG calls;
     if (first_calls(calls, 12))
-        log("x2w-d3d12 Device::slot127(CreateCommittedResource3?) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
-            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", props->Type, heap_flags, desc->Dimension,
+        log("x2w-d3d12 Device::slot%d(%s) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
+            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", slot,
+            slot == 76 ? "CreateCommittedResource" : "CreateCommittedResource3?", props->Type, heap_flags, desc->Dimension,
             desc->Width, desc->Height, desc->Format, desc->Flags, state, static_cast<const void*>(clear),
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
@@ -5810,6 +5811,25 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     note_resource(w, desc, info.SizeInBytes != ~0ull ? info.SizeInBytes : 0);
     *out = w;
     return S_OK;
+}
+
+HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
+                                            void** out)
+{
+    return create_committed(127, self, props, heap_flags, desc, state, clear, session, castable_count, castable, iid, out);
+}
+
+// Device slot 76 (Xbox order, +0x260): the seven arguments of desktop CreateCommittedResource
+// (heap properties, heap flags, desc, initial state, clear value, riid, ppv). Seen from a console
+// package module (an upscaler) that a title loaded only on the Series S profile. Same desktop
+// creation as slot 127 (tests/startup_committed_slot76_check.cpp).
+HRESULT __stdcall device_create_committed(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                          const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                          const GUID* iid, void** out)
+{
+    return create_committed(76, self, props, heap_flags, desc, state, clear, nullptr, 0, nullptr, iid, out);
 }
 
 // Device slot 80 (Xbox order): (type, timeout, 0, flags, &token) -> HRESULT, the frame-event wait
@@ -6266,6 +6286,7 @@ void build_tables()
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
     tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
+    tables[device_kind][76] = reinterpret_cast<void*>(&device_create_committed);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
     tables[device_kind][80] = reinterpret_cast<void*>(&device_wait_frame_event);
