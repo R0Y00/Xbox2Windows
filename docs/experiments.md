@@ -87,8 +87,9 @@ ctest --preset dev --no-tests=error -R '^startup_present_producer_(warp|hardware
 
 `X2W_DRAW_DUMP_FRAME=<n>` with `X2W_DRAW_DUMP_PIXEL=<x>,<y>` keeps one texel of render target 0 after
 each translated draw of that frame instead of copying the whole target. The completed reads are
-written to `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: `draw=` is the copy ordinal in the frame,
-`key=` is the translated manifest key, and `rgba=` is decoded for R8G8B8A8/B8G8R8A8 UNORM or sRGB.
+written to `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: `draw=` is the copy ordinal, `frame=` is the
+frame that recorded it, `key=` is the translated manifest key, and `rgba=` is decoded for
+R8G8B8A8/B8G8R8A8 UNORM or sRGB.
 The same 48-copy bound as the full dump applies. A reader can follow the value after every draw and
 name the one that last changed the texel.
 

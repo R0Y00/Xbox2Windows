@@ -13,6 +13,7 @@ namespace x2w_startup {
 
 struct PixelHistorySample {
     std::uint64_t draw{};
+    long frame{};
     std::uint64_t key{};
     unsigned count{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
@@ -52,7 +53,7 @@ inline bool pixel_history_decode(PixelHistorySample& sample, const void* pixel)
 
 // Rewrites the report with every sample kept so far. The caller owns the bounded list; this helper
 // stays device-free so a fixture can compare the exact text.
-inline bool pixel_history_write(const char* folder, long frame, const PixelHistorySample* samples, std::size_t count)
+inline bool pixel_history_write(const char* folder, const PixelHistorySample* samples, std::size_t count)
 {
     if (!folder || !*folder) return false;
     char path[512]{};
@@ -60,11 +61,11 @@ inline bool pixel_history_write(const char* folder, long frame, const PixelHisto
     if (length <= 0 || static_cast<std::size_t>(length) >= sizeof(path)) return false;
     std::FILE* file = std::fopen(path, "wb");
     if (!file) return false;
-    std::fprintf(file, "x2w-pixel-history 1 frame=%ld samples=%zu\n", frame, count);
+    std::fprintf(file, "x2w-pixel-history 1 samples=%zu\n", count);
     for (std::size_t i = 0; i < count; ++i) {
         const PixelHistorySample& sample = samples[i];
-        std::fprintf(file, "draw=%llu key=%016llx count=%u format=%d raw=%08x",
-                     static_cast<unsigned long long>(sample.draw), static_cast<unsigned long long>(sample.key),
+        std::fprintf(file, "draw=%llu frame=%ld key=%016llx count=%u format=%d raw=%08x",
+                     static_cast<unsigned long long>(sample.draw), sample.frame, static_cast<unsigned long long>(sample.key),
                      sample.count, static_cast<int>(sample.format), sample.raw);
         if (sample.rgba)
             std::fprintf(file, " rgba=%u,%u,%u,%u", sample.channels[0], sample.channels[1], sample.channels[2],

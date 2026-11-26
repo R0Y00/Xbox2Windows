@@ -165,6 +165,7 @@ void record_draw(Target& target, ComputeCommands& commands, ID3D12RootSignature*
     recorded.draw = draw;
     recorded.key = key;
     recorded.sample.draw = draw;
+    recorded.sample.frame = 7;
     recorded.sample.key = key;
     recorded.sample.count = 3;
     recorded.sample.format = format;
@@ -239,7 +240,7 @@ int main(int argc, char** argv)
     const auto room = std::filesystem::temp_directory_path() / ("x2w-pixel-history-" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(room);
     const std::string path = (room / "pixel_history.txt").string();
-    if (!x2w_startup::pixel_history_write(room.string().c_str(), 7, samples.data(), samples.size())) return 4;
+    if (!x2w_startup::pixel_history_write(room.string().c_str(), samples.data(), samples.size())) return 4;
     std::ifstream input(path);
     std::vector<std::string> lines;
     for (std::string line; std::getline(input, line);) lines.push_back(line);
@@ -249,7 +250,7 @@ int main(int argc, char** argv)
     const bool first_black = has_rgba(first, 0, 0, 0, 0);
     const bool second_green = has_rgba(second, 0, 255, 0, 255);
     const bool third_green = has_rgba(third, 0, 255, 0, 255);
-    const bool second_key = second.find("key=2222222222222222") != std::string::npos;
+    const bool second_key = second.find("key=2222222222222222") != std::string::npos && second.find("frame=7") != std::string::npos;
     bool ok = first_black && second_green && third_green && second_key;
 
     // Negative control: without the second draw the watched texel stays black at draw 3.
@@ -259,7 +260,7 @@ int main(int argc, char** argv)
     record_draw(target, commands, root.Get(), pipeline.Get(), blue, corner, 3, 0x3333333333333333ull, control[1]);
     std::vector<x2w_startup::PixelHistorySample> control_samples;
     for (const auto& item : control) control_samples.push_back(item.sample);
-    if (!x2w_startup::pixel_history_write(room.string().c_str(), 7, control_samples.data(), control_samples.size())) return 4;
+    if (!x2w_startup::pixel_history_write(room.string().c_str(), control_samples.data(), control_samples.size())) return 4;
     std::ifstream control_input(path);
     std::vector<std::string> control_lines;
     for (std::string line; std::getline(control_input, line);) control_lines.push_back(line);

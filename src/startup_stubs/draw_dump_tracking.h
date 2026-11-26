@@ -21,6 +21,7 @@ struct DrawDump {
     UINT count{};
     DXGI_FORMAT format{};
     UINT index{};
+    LONG frame{};
     // Set for a one-texel history sample (X2W_DRAW_DUMP_PIXEL): the copy covers this pixel only and
     // the report reads one 32-bit word instead of writing a BMP.
     bool pixel{};

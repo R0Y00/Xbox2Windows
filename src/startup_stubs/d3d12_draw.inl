@@ -1576,6 +1576,7 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
     dump.key = key;
     dump.count = count;
     dump.format = desc.Format;
+    dump.frame = frame_number;
     dump.pixel = pixel.enabled;
     dump.pixel_x = pixel.x;
     dump.pixel_y = pixel.y;
@@ -1608,6 +1609,7 @@ void draw_dump_flush()
             if (FAILED(dump.buffer->Map(0, nullptr, &mapped))) continue;
             x2w_startup::PixelHistorySample sample{};
             sample.draw = dump.index;
+            sample.frame = dump.frame;
             sample.key = dump.key;
             sample.count = dump.count;
             sample.format = dump.format;
@@ -1617,7 +1619,7 @@ void draw_dump_flush()
             samples.push_back(sample);
         }
         std::sort(samples.begin(), samples.end(), [](const auto& a, const auto& b) { return a.draw < b.draw; });
-        const bool written = x2w_startup::pixel_history_write(folder, frame_number, samples.data(), samples.size());
+        const bool written = x2w_startup::pixel_history_write(folder, samples.data(), samples.size());
         log("x2w-draw pixel history: %s %zu samples at %s", written ? "wrote" : "could not write", samples.size(), folder);
         return;
     }
