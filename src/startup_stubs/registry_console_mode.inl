@@ -4,7 +4,8 @@
 // runtime_gpa_patch.h and console_mode.h.
 //
 // With X2W_RUNTIME_PROXY the stand-in rewrites five registry imports of the EXE and package helpers
-// (regular IAT and GetProcAddress by name). Every call goes to the real function except a read of
+// (regular IAT and GetProcAddress by name), only where the Windows registry provides them: see
+// registry_provider_module below. Every call goes to the real function except a read of
 // ConsoleMode under HKLM\...\OEM while X2W_DEVICE_TYPE names a known console. Opening the OEM
 // key and reading the value are logged a few times in either case, so a run shows whether the
 // title asks at all.
@@ -28,20 +29,102 @@ int registry_import_index(const char* name) noexcept
     return -1;
 }
 
+// ---- which modules are the Windows registry -----------------------------------------------------
+// A package DLL can export the same names. Only these system modules count as the registry, for the
+// GetProcAddress module, for the module that holds a bound IAT address and for what is remembered
+// as the real function. The api-ms-win-core-registry API sets resolve to kernelbase.dll.
+constexpr const wchar_t* registry_provider_names[] = {L"advapi32.dll", L"kernelbase.dll", L"kernel32.dll"};
+
+#if defined(X2W_CONSOLE_MODE_FIXTURE)
+// tests/startup_console_mode_check.cpp keeps its fake registry in the test EXE, which counts as one
+// more provider there. Its provider control sets registry_any_provider (name-only matching), which
+// the decoy checks must catch.
+bool registry_any_provider;
+bool fixture_registry_provider(HMODULE module) noexcept { return module == GetModuleHandleW(nullptr); }
+#else
+constexpr bool registry_any_provider = false;
+constexpr bool fixture_registry_provider(HMODULE) noexcept { return false; }
+#endif
+
+// The loaded system-directory copy of a provider, by full path, so a same-named DLL elsewhere does not match.
+bool registry_provider_module(HMODULE module) noexcept
+{
+    if (registry_any_provider) return true;
+    if (!module) return false;
+    if (fixture_registry_provider(module)) return true;
+    const DWORD saved = GetLastError();
+    wchar_t path[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(path, MAX_PATH);
+    bool found = false;
+    for (const wchar_t* name : registry_provider_names) {
+        if (found || !length || length >= MAX_PATH) break;
+        std::size_t at = length, i = 0;
+        path[at++] = L'\\';
+        for (; name[i] && at + 1 < MAX_PATH; ++i) path[at++] = name[i];
+        if (name[i]) break;
+        path[at] = 0;
+        found = GetModuleHandleW(path) == module;
+    }
+    SetLastError(saved);
+    return found;
+}
+
+bool registry_provider_address(const void* address) noexcept
+{
+    if (registry_any_provider) return true;
+    const DWORD saved = GetLastError();
+    HMODULE module = nullptr;
+    const bool known = address && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                     static_cast<LPCWSTR>(address), &module);
+    SetLastError(saved);
+    return known && registry_provider_module(module);
+}
+
+// Import DLL names (any case) that supply the registry: the providers above and the
+// api-ms-win-core-registry-* API sets.
+bool registry_provider_dll(const char* dll) noexcept
+{
+    if (registry_any_provider) return true;
+    if (!dll) return false;
+    const auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
+    const auto equal = [&](const char* expect) {
+        std::size_t i = 0;
+        for (; expect[i]; ++i)
+            if (lower(dll[i]) != expect[i]) return false;
+        return dll[i] == 0;
+    };
+    if (equal("advapi32.dll") || equal("kernelbase.dll") || equal("kernel32.dll")) return true;
+    static constexpr char api_set[] = "api-ms-win-core-registry-";
+    for (std::size_t i = 0; api_set[i]; ++i)
+        if (lower(dll[i]) != api_set[i]) return false;
+    return true;
+}
+
 // ---- OEM key handles the title opened -----------------------------------------------------------
 SRWLOCK oem_lock = SRWLOCK_INIT;
 HKEY oem_keys[16];
 
+void note_oem_table_full() noexcept
+{
+    static volatile LONG logged;
+    if (x2w_local::first_calls(logged, 1))
+        x2w_local::logf("x2w-runtime console mode: %u OEM key handles already open, another is not tracked",
+                        static_cast<unsigned>(sizeof(oem_keys) / sizeof(oem_keys[0])));
+}
+
 void track_oem(HKEY key) noexcept
 {
     AcquireSRWLockExclusive(&oem_lock);
+    bool tracked = false;
     for (HKEY& slot : oem_keys) {
         if (!slot) {
             slot = key;
+            tracked = true;
             break;
         }
     }
     ReleaseSRWLockExclusive(&oem_lock);
+    if (!tracked) note_oem_table_full();
 }
 
 bool oem_key(HKEY key) noexcept
@@ -183,31 +266,35 @@ void* const registry_hooks[registry_imports] = {
     reinterpret_cast<void*>(&hooked_reg_query_value_ex_w), reinterpret_cast<void*>(&hooked_reg_get_value_w),
     reinterpret_cast<void*>(&hooked_reg_close_key)};
 
-// Keep the first real address for each import; never one of the hooks themselves.
+// Keep the first real address for each import: one inside a registry provider, never one of the
+// hooks themselves.
 bool remember_registry(int which, void* real) noexcept
 {
     if (which < 0 || which >= registry_imports || !real) return false;
     for (void* hook : registry_hooks)
         if (real == hook) return false;
+    if (!registry_provider_address(real)) return false;
     void* expected = nullptr;
     real_registry[which].compare_exchange_strong(expected, real, std::memory_order_acq_rel);
     return true;
 }
 
-// GetProcAddress by name: the hook for a registry import, or null for any other name.
-FARPROC registry_hook_for(LPCSTR name, FARPROC real) noexcept
+// GetProcAddress by name: the hook for a registry import looked up on a registry provider, or null
+// for any other name or module.
+FARPROC registry_hook_for(HMODULE module, LPCSTR name, FARPROC real) noexcept
 {
     const int which = registry_import_index(name);
-    if (which < 0 || !remember_registry(which, reinterpret_cast<void*>(real))) return nullptr;
+    if (which < 0 || !registry_provider_module(module) || !remember_registry(which, reinterpret_cast<void*>(real))) return nullptr;
     return reinterpret_cast<FARPROC>(registry_hooks[which]);
 }
 
-// Rewrite one image's regular registry IAT slots. Delay-import slots hold a thunk and are left alone.
+// Rewrite one image's regular registry IAT slots that import from a registry provider and are bound
+// inside one. Delay-import slots hold a thunk and are left alone.
 int patch_registry_imports(unsigned char* base, std::size_t image_size) noexcept
 {
     int patched = 0;
-    const auto classify = [](const char*, const char* name, x2w_runtime_patch::Kind* kind) {
-        if (registry_import_index(name) < 0) return false;
+    const auto classify = [](const char* dll, const char* name, x2w_runtime_patch::Kind* kind) {
+        if (registry_import_index(name) < 0 || !registry_provider_dll(dll)) return false;
         *kind = x2w_runtime_patch::Kind::registry;
         return true;
     };

@@ -1395,10 +1395,18 @@ For a read-only census of cached shader refusals, use `python -B tools/startup/g
 (`src/startup_stubs/console_mode.h`, `registry_console_mode.inl`): with `X2W_RUNTIME_PROXY=1` the
 stand-in rewrites the registry imports of the EXE and package helpers. `6` answers 0x60 (Series S),
 `7` answers 0x64 (Series X) and `1` reports the value missing (PC); unset, every call goes to the real
-registry. Opening the key and reading the value are logged a few times either way. What the values
-mean on the console is taken from public notes, not measured here.
-`ctest --preset dev --no-tests=error -R '^startup_console_mode(_control)?$'` runs it against fake
-registry functions; the control leaves the switch unset for the answered cases and must print `FAIL:`.
+registry. Only registry imports that the Windows registry provides are rewritten: an IAT entry must
+name `advapi32.dll`, `kernelbase.dll`, `kernel32.dll` or an `api-ms-win-core-registry-*` API set and be
+bound inside the system-directory copy of the first three, and `GetProcAddress` must be called on one
+of those modules. A package DLL that exports the same names keeps its own exports and is never kept as
+the real registry. Opening the key and reading the value are logged a few times either way, and a
+seventeenth OEM key handle open at once is logged once and not tracked. What the values mean on the
+console is taken from public notes, not measured here.
+`ctest --preset dev --no-tests=error -R '^startup_console_mode(_control|_provider_control)?$'` runs it
+against fake registry functions and a source-built decoy DLL with the same export names, with the switch
+unset and set. The control leaves the switch unset for the answered cases and the provider control
+matches registry imports by name alone; both must print `FAIL:`. `startup_runtime_proxy_scope` checks the
+same decoy rule through the real loader against `advapi32.dll`.
 
 The switch changes only what the registry reads answer. A title can take a different start-up path
 for each profile: on the Series S profile, one loaded an upscaler package module that the other

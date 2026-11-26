@@ -493,7 +493,8 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
     if (real && reinterpret_cast<u64>(name) > 0xffff) {
         static LONG logged;
         if (x2w_local::first_calls(logged, 40)) x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name, static_cast<void*>(real));
-        if (const FARPROC hook = registry_hook_for(name, real)) return hook;
+        // Registry exports only when the module is a Windows registry provider (registry_console_mode.inl).
+        if (const FARPROC hook = registry_hook_for(module, name, real)) return hook;
         // Wrap gaming-runtime exports only when the provider module is xgameruntime.dll.
         if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0 &&
             remember_real_query(reinterpret_cast<QueryApi>(real)))

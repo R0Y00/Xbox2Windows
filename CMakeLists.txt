@@ -1056,13 +1056,23 @@ add_test(NAME startup_runtime_gpa_patch COMMAND startup_runtime_gpa_patch)
 add_test(NAME startup_runtime_gpa_patch_name_only_control COMMAND startup_runtime_gpa_patch --mutate name-only)
 set_tests_properties(startup_runtime_gpa_patch_name_only_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 # X2W_DEVICE_TYPE: the OEM ConsoleMode registry read, answered or passed on, against fake registry
-# functions. The control leaves the switch unset for the answered cases and must FAIL.
+# functions. A source-built decoy DLL exports the same registry names and must stay unhooked. The
+# control leaves the switch unset for the answered cases; the provider control matches registry
+# imports by name alone. Both must FAIL.
+add_library(startup_console_mode_decoy SHARED
+    tests/startup_console_mode_decoy.cpp
+    tests/startup_console_mode_decoy.def)
+target_compile_features(startup_console_mode_decoy PRIVATE cxx_std_17)
 add_executable(startup_console_mode tests/startup_console_mode_check.cpp)
 target_include_directories(startup_console_mode PRIVATE src)
 target_compile_features(startup_console_mode PRIVATE cxx_std_17)
-add_test(NAME startup_console_mode COMMAND startup_console_mode)
-add_test(NAME startup_console_mode_control COMMAND startup_console_mode --control)
-set_tests_properties(startup_console_mode_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+add_dependencies(startup_console_mode startup_console_mode_decoy)
+add_test(NAME startup_console_mode COMMAND startup_console_mode --decoy "$<TARGET_FILE:startup_console_mode_decoy>")
+add_test(NAME startup_console_mode_control
+         COMMAND startup_console_mode --control --decoy "$<TARGET_FILE:startup_console_mode_decoy>")
+add_test(NAME startup_console_mode_provider_control
+         COMMAND startup_console_mode --control provider --decoy "$<TARGET_FILE:startup_console_mode_decoy>")
+set_tests_properties(startup_console_mode_control startup_console_mode_provider_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 # EXE + late-loaded package helper through the real Windows loader: proxied xgameruntime QueryApiImpl,
 # unrelated same-named export stays original. Notification only enqueues; rewrite runs after link.
 if (WIN32)
