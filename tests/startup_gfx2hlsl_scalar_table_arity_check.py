@@ -91,17 +91,19 @@ for op in TWO_SOURCE:
         changed.append(op)
 check('a complete form is never refused for its operand count', not changed, repr(changed[:4]))
 
-# Negative control: with the guard removed the short form raises IndexError again. One template keeps its own
-# arity check (s_bfm_b32 spells "expected 3" in its body), so it refuses either way and is excluded here rather
-# than counted as a survivor.
+# Negative control: with the guard removed the short form raises IndexError again. A few templates keep their own
+# arity check (s_bfm_b32 and s_mul_hi_{u,i}32 spell "expected 3" in their bodies), so they refuse either way and are
+# excluded here rather than counted as survivors.
+OWN_ARITY = {'s_bfm_b32', 's_mul_hi_u32', 's_mul_hi_i32'}
 stripped = load(SOURCE.read_text(encoding='utf-8').replace('        if len(srcs) < needed:',
                                                           '        if False:'))
 control = [op for op in TWO_SOURCE if refusal(stripped, op, needed_sources(stripped, op) - 1) == 'IndexError']
-check('control: without the guard the short form raises IndexError', len(control) >= len(TWO_SOURCE) - 1,
-      '%d of %d' % (len(control), len(TWO_SOURCE)))
-kept = [op for op in TWO_SOURCE if op not in control]
-check('the one template with its own arity check still refuses without the guard',
-      all(refusal(stripped, op, needed_sources(stripped, op) - 1).startswith(op) for op in kept), repr(kept))
+expected_control = [op for op in TWO_SOURCE if op not in OWN_ARITY]
+check('control: without the guard the short form raises IndexError', control == expected_control,
+      'missing %r, extra %r' % (sorted(set(expected_control) - set(control)), sorted(set(control) - set(expected_control))))
+kept = [op for op in TWO_SOURCE if op in OWN_ARITY]
+check('the templates with their own arity check still refuse without the guard',
+      kept and all(refusal(stripped, op, needed_sources(stripped, op) - 1).startswith(op) for op in kept), repr(kept))
 
 print('scalar table arity checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)
