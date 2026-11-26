@@ -29,3 +29,22 @@ The capability probes reported Shader Model 6.5, DXR Tier 1.0, a wave lane
 range of 32–32 and mesh shader tier 0. The D3D12 debug layer was available.
 The logs show it enabled for the offscreen fixtures and off for fixtures
 configured to exercise the no-debug path.
+
+## Results
+
+CTest completed all 685 selected entries in 4194.11 seconds and returned exit
+code 8. It recorded 577 passes, 19 failures and 89 skips. The failures
+included seven segmentation faults and one timeout.
+
+The first failure was `startup_view_dimension_hardware`. CTest reported
+`SegFault` after 0.35 seconds with the debug layer off. The last fixture
+diagnostic was that the runtime skipped a view whose dimension did not suit the
+resource. The two sampler variants also reported the same readback
+difference at table 2, probe 3. Both expected 34 and read back 34.25.
+`startup_image_load_d16_hardware` hit its 120-second CTest timeout.
+
+Skip diagnostics include mesh shader, Shader Model 6.6, wave-width and DXR
+Tier 1.1 requirements. Fourteen SPIR-V bridge tests skipped because
+`spirv-as`, `spirv-val` and `spirv-cross` were absent at configure time.
+The two-exit mesh draw also reported a missing LLVM 15 AMDGPU prerequisite.
+The run covers the repository's source-built fixtures on this configuration.
