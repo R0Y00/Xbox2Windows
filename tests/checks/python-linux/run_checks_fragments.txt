@@ -1,0 +1,2 @@
+# Read by `tools/run_checks_parallel.py --from-dir tests/checks/python-linux` (see README.md).
+tests/run_checks_fragments_check.py
