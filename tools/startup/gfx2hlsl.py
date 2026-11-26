@@ -750,6 +750,58 @@ def clear_after(name, asm, may, clear):
     return out | {(word, h) for word, held in writes for h in held}
 
 
+def mask_lanes(name, asm):
+    """(operation, destination words, source word lists) of a bitwise scalar mask instruction, or None. Word p of
+    every operand holds the same lanes: wave half p of a 64-bit form."""
+    m = re.fullmatch(r's_(mov|and|andn2|or|orn2|nand|nor|xor|xnor)_b(32|64)', re.sub(r'_e(32|64)$', '', name))
+    if not m:
+        return None
+    words = [mask_words(op, 2 if m.group(2) == '64' else 1) for op in parse(asm)[1]]
+    if None in words or len(words) != (2 if m.group(1) == 'mov' else 3):
+        return None
+    return m.group(1), words[0], words[1:]
+
+
+def high_half_of_b32(lanes, word):
+    """True for a 32-bit form that names the high half of a mask (vcc_hi): its bit n is lane 32 + n, which the word
+    position of a one-word operand (always the low half) does not say, so no lane-wise rule applies to it."""
+    return word.endswith('_hi') and len(lanes[1]) == 1
+
+
+def exec_absorbs(name, asm, word):
+    """True when an instruction reads `word` only through an operation whose result bit is fixed while the exec bit
+    of the same lanes is clear: W & exec and exec & W give 0, ~(W & exec) and W | ~exec give 1."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or lanes[0] not in ('and', 'nand', 'orn2') or high_half_of_b32(lanes, word):
+        return False
+    a, c = lanes[2]
+    pairs = [(a, c)] if lanes[0] == 'orn2' else [(a, c), (c, a)]
+    return any(word in w and word not in e and all(e[p] == ('exec', 'exec_hi')[p] for p in range(len(w)) if w[p] == word)
+               for w, e in pairs)
+
+
+def kept_halves(name, asm, word, clear):
+    """Wave halves whose lanes keep their bit of `word` through `s_andn2 R, R, X` when X is clear for them: R & ~X
+    keeps bit n of R when bit n of X is clear. Empty for any other write of `word`."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or lanes[0] != 'andn2' or lanes[1] != lanes[2][0]:
+        return set()
+    return {h for p, w in enumerate(lanes[1]) if w == word for key, h in clear if key == lanes[2][1][p]}
+
+
+def lane_read(name, asm, word, halves):
+    """True when an instruction reads `word` as a lane mask, bit n of each result from bit n of the sources, with
+    `word` in a position whose lanes are in `halves`, any exec operand there the exec word of those lanes, and the
+    result there written to that exec word or back to `word`, not copied to another register."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or high_half_of_b32(lanes, word):
+        return False
+    _, dest, srcs = lanes
+    at = {p for src in srcs for p, w in enumerate(src) if w == word}
+    return bool(at) and at <= halves and all(dest[p] in (word, ('exec', 'exec_hi')[p]) for p in at) and all(
+        w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
+
+
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
@@ -781,6 +833,9 @@ def scalar_effects(name, asm):
         may |= EXEC_KEYS
     if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
         writes.add('scc')
+    # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too.
+    if 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
+        may.add('vcc_hi')
     return reads, writes, writes | may | ({'scc'} if base.startswith('s_') else set())
 
 # Forms with no scalar destination: their printed operands are all sources (v_cmpx writes only EXEC, which the
@@ -2500,10 +2555,12 @@ class Stage:
         the block (its branches and loops included), which masks have that lane's bit clear, and the write must
         leave exec among them. Such a lane's bit then stays clear at every instruction the wave runs in the block,
         so the wave changes nothing of that lane there and its exec at the join is the model's. The proof starts at
-        the branch, so a block that a branch from outside enters keeps its exec writes refused. A live definition,
-        an unproven exec write, a refused effect, a branch leaving the block or a backward s_cbranch_execz is
-        refused.
-        One live definition is accepted: the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
+        the branch, so a block that a branch from outside enters keeps its exec writes refused. A definition live at
+        the join is accepted when every read of it after the join is proven (execz_live_read), or when it has the
+        shape below. Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
+        or a backward s_cbranch_execz is refused.
+
+        The other accepted live definition is the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
         or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
         exec_lo`, `s_and_b32 M, X, exec_lo` in either operand order). Every write of M in the block yields a value
         whose bit is 0 for any lane whose exec bit is clear there: the clear-mask proof keeps exec clear for that lane, and a copy of exec, or X & exec, has that bit clear. M is 0
@@ -2549,7 +2606,9 @@ class Stage:
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
-        refused = {}
+        refused, into = {}, {}
+        for k, target in jumps:
+            into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
             if name != 's_cbranch_execz':
                 continue
@@ -2576,6 +2635,20 @@ class Stage:
                 not any(index.get(target) in range(b + 1, t) for target in targets)
             cand = {k for i in range(b + 1, t) for k in (effects[i][2] - EXEC_KEYS) & live if re.fullmatch(r'vcc|s\d+', k)}
             ok_masks = {k for k in cand if straight and self.phi_mask_ok(k, b, t, effects, succ, targets, index)}
+            # A live definition is still accepted when every read of it from the join on is proven (execz_live_read):
+            # the halves whose lanes keep their bit of the word through the block, and where exec is unchanged since
+            # the join on every path from it.
+            kept = {}
+            for i in range(b + 1, t):
+                for word in (effects[i][2] - EXEC_KEYS) & live:
+                    if kept.get(word, True):  # an empty set stays empty
+                        andn2 = i in before and not entered and self.ins[i][2].startswith('s_andn2')
+                        halves = kept_halves(*self.ins[i][2:], word, before[i]) if andn2 else set()
+                        kept[word] = kept.get(word, halves) & halves
+            def quiet(j):  # exec unchanged since the join on every path to j: a straight run from t, entered at t only
+                return t <= j and all(b <= k < t for k in into.get(t, ())) and not any(
+                    effects[k][2] & EXEC_KEYS for k in range(t, j)) and not any(k in into for k in range(t + 1, j + 1))
+            unread = {}
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
@@ -2588,12 +2661,51 @@ class Stage:
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
-                elif (may - EXEC_KEYS - ok_masks) & live:
-                    reason = 'definition of %s, live where the block joins' % ', '.join(
-                        sorted((may - EXEC_KEYS - ok_masks) & live))
+                elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
+                               if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
+                    named = [unread[word] for word in words if unread[word] >= 0]
+                    reason = 'definition of %s, live where the block joins' % ', '.join(words) + (
+                        ': read by %s after the join' % self.ins[min(named)][2] if named else '')
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
+        """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
+        definition, gives a lane the model skipped the wave's result; else the first read that is not proven, or -1
+        for m0 and SCC, which have implicit readers.
+
+        Such a lane's exec bit is clear at the join, in the model and in the wave (execz_refusals proves the block's
+        exec writes), and the two differ there at most in `word`. A read is proven when:
+        - exec is unchanged on every path from the join to it (`quiet`: the read ends a straight run that starts at
+          the join, which only the block enters, with no exec write in it) and it reads `word` only as W & exec,
+          ~(W & exec) or W | ~exec, exec of the same lanes (exec_absorbs): the lane's bit of the result is fixed
+          whatever its bit of `word` is, so the result agrees, and when it overwrites `word` the definition ends;
+        - the block keeps the lane's bit of `word` for its half (kept_halves: every write of `word` in the block is
+          s_andn2 R, R, X with X clear for the lane, checked over every path from the branch) and the read is a lane
+          mask read of that half (lane_read): the lane's bit of `word` is the model's, so its bit of the result is
+          too, and `word` written back that way keeps the property.
+        Any other read, a data read or a copy into another register included, is not proven. The search stops at
+        the first such read, nearest the join; the result is kept in `unread` for the block."""
+        if word in unread:
+            return unread[word]
+        if not re.fullmatch(r'vcc(_hi)?|s\d+', word):
+            unread[word] = -1
+            return -1
+        seen, work = {t}, [t]
+        for j in work:  # breadth first: the list grows while it is read
+            name, asm = self.ins[j][2:]
+            kept_read = word in effects[j][0] and halves and lane_read(name, asm, word, halves)
+            if word in effects[j][0] and not kept_read and not (exec_absorbs(name, asm, word) and quiet(j)):
+                unread[word] = j
+                return j
+            if kept_read or word not in effects[j][1]:
+                for s in succ[j]:
+                    if s not in seen:
+                        seen.add(s)
+                        work.append(s)
+        unread[word] = None
+        return None
 
     def waterfall_refusal(self, head, close, effects, live_in, jumps):
         """Return None when the lane can pick its own key at the head of the waterfall.
@@ -2983,6 +3095,7 @@ class Stage:
         names = {off: name for off, _n, name, _asm in self.ins}
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
+        back_targets = {to for pc, to in branches if to <= pc}
         self.mesh_allocation_block = None
         splits = set(targets)
         if getattr(self, 'kind', None) == 'ms' and targets:
@@ -3046,6 +3159,9 @@ class Stage:
             self.varying_s = set()
             self.scc_uniform = True
             self.scc_verified = False
+            # Offset of the emitted, uniform SCC write that reaches here (None: none, or not proven), and the one
+            # each forward branch carries to its target.
+            self.scc_def, scc_in = None, {}
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
@@ -3086,6 +3202,15 @@ class Stage:
                 self.pc = off
                 self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
+                if off in targets:
+                    # Every path in carries the same uniform emitted write, which the lane and the wave both ran
+                    # last, whichever path each took (a per-lane s_cbranch_execz edge included); the SCC writes on a
+                    # back edge are not known yet.
+                    defs = ([self.scc_def] if falls else []) + scc_in.get(off, [])
+                    one_def = off not in back_targets and len(set(defs)) == 1
+                    self.scc_def = defs[0] if one_def else None
+                elif not falls:
+                    self.scc_def = None
                 if not falls:
                     self.scc_verified = False
                 # Before the first branch target or terminator every path has run exactly the instructions above, so
@@ -3137,7 +3262,7 @@ class Stage:
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.since_join, self.scc_uniform = kept_u, False
-                    self.scc_verified = False
+                    self.scc_verified = self.scc_def is not None
                     # A constant is only known here if no other path into the join writes the register: a loop counter
                     # set before the loop and incremented in it reaches the loop head with a new value on every pass.
                     # set_s also assigns constants at run time, so the register reads its real value once it is dropped.
@@ -3162,6 +3287,7 @@ class Stage:
                     there = joined.get(b_target, set())
                     if b_target > off:
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                        scc_in.setdefault(b_target, []).append(self.scc_def)
                     else:
                         for reg in there & written:
                             back, sym = self.sym.get(reg), kept.get(b_target, {}).get(reg)
@@ -3248,6 +3374,8 @@ class Stage:
                 self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
                 if self.scc_effect:
                     scc_effects[off] = self.scc_effect
+                if self.scc_effect or not self.scc_verified:
+                    self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
                 if term:
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, term))
