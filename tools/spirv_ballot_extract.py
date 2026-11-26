@@ -32,6 +32,8 @@ def _find_lsb(dst, ballot, glsl):
 
 
 def lower_ballot_extract(assembly):
+    if not isinstance(assembly, str):
+        raise TypeError("assembly must be a str")
     extracts = "OpGroupNonUniformBallotBitExtract" in assembly
     finds = any(FIND_LSB.fullmatch(line) for line in assembly.splitlines())
     if not extracts and not finds:
@@ -73,4 +75,8 @@ def lower_ballot_extract(assembly):
             f"{tmp}low = OpBitwiseAnd %uint {tmp}shifted %x2w_ballot_c1",
             f"{dst} = OpINotEqual %bool {tmp}low %x2w_ballot_c0",
         ])
+    if not declared:
+        raise ValueError("Ballot lowering needs an OpFunction declaration")
+    if import_needed and not imported:
+        raise ValueError("Ballot find-lsb lowering needs an OpMemoryModel instruction")
     return "\n".join(lines) + "\n"

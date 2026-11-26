@@ -1550,6 +1550,17 @@ def run_case(name, dxc, runner, adapter, directory, control=None):
     return subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
 
 
+def renderer_diagnostics(stderr, adapter):
+    """Echo hardware enumeration notices and retain the remaining lines for the readback check."""
+    diagnostics = []
+    for line in stderr.splitlines():
+        if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+            print(line, file=sys.stderr)
+        else:
+            diagnostics.append(line)
+    return diagnostics
+
+
 def check_dispatch(dxc, runner, adapter, control=None):
     runner = str(Path(runner).resolve())
     out = HERE.parent / 'out'
@@ -1567,12 +1578,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             print(run.stdout, end='')
             if run.returncode == 77:
                 return 77
-            diagnostics = []
-            for line in run.stderr.splitlines():
-                if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
-                    print(line, file=sys.stderr)
-                else:
-                    diagnostics.append(line)
+            diagnostics = renderer_diagnostics(run.stderr, adapter)
             if mutation:
                 first = diagnostics[:1]
                 if (run.returncode != 1 or not any('expected=' in line for line in diagnostics) or
