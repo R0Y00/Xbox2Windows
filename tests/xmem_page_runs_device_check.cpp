@@ -110,15 +110,15 @@ int main(int argc, char** argv)
     }
     place("across two backing sections", wrapper.Get(), second + info.RegionSize, 2);
 
-    // Pages mapped one call at a time get a view each: the layout every page had before views were shared. The slots
-    // go in reverse order, so that no call continues the slot before it and joins its view (merge_with_previous).
+    // Map the single pages from high to low addresses. Each call then has no adjacent view below it to join,
+    // regardless of the order in which the allocator assigned the backing slots.
     unsigned char* const third = second + 8192 * page;
     const auto single = pages(8);
     if (single.empty()) {
         std::printf("check_failed: allocate 8 single pages (error %lu)\n", GetLastError());
         return 1;
     }
-    for (int i = 0; i < 8; ++i)
+    for (int i = 7; i >= 0; --i)
         if (XMemMapPhysicalPages(third + i * page, 1, &single[7 - i]) != third + i * page) {
             std::printf("check_failed: single-page call %d (error %lu)\n", i, GetLastError());
             return 1;
