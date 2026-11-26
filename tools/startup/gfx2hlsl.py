@@ -835,6 +835,28 @@ def scalar_free_span(ins, lo, hi):
     return True
 
 
+def exec_only_narrows(ins, lo, hi):
+    """True when every EXEC write at an offset in [lo, hi] can only clear bits: v_cmpx, and `s_and exec, exec, X` or
+    `s_andn2 exec, exec, X`. Any other write (a move, an OR, a restore of a saved mask) can set a lane that an earlier
+    round of the loop cleared, and that lane would then run again."""
+    for off, _n, name, asm in ins:
+        if not lo <= off <= hi:
+            continue
+        base, ops, _mods = parse(asm)
+        if not writes_exec(base, ops):
+            continue
+        base = re.sub(r'_e(32|64)$', '', base)
+        if base.startswith('v_cmpx'):
+            continue
+        if (base in ('s_and_b32', 's_and_b64', 's_andn2_b32', 's_andn2_b64') and len(ops) == 3
+                and ops[0] in ('exec', 'exec_lo') and ops[1] == ops[0]
+                or base in ('s_and_b32', 's_and_b64') and len(ops) == 3 and ops[0] in ('exec', 'exec_lo')
+                and ops[2] == ops[0]):
+            continue
+        return False
+    return True
+
+
 def vcc_read_after(ins, at):
     """True when an instruction after offset `at` reads VCC. After an EXEC-narrowing loop the wave's VCC holds the last
     compare, whose bits are 0 for every lane that left earlier; a lane running alone keeps its own last bit (1)."""
@@ -3395,7 +3417,8 @@ class Stage:
         # keeps it clear), so an s_cbranch_execnz there is the model's. It does not prove a vccz / vccnz / lane-data SCC
         # condition: those stay refused (the wave decides on every lane's bit).
         execnz_loops = {pc for pc, to in branches if to <= pc and names[pc] == 's_cbranch_execnz'
-                        and scalar_free_span(self.ins, to, pc) and not vcc_read_after(self.ins, pc)
+                        and scalar_free_span(self.ins, to, pc) and exec_only_narrows(self.ins, to, pc)
+                        and not vcc_read_after(self.ins, pc)
                         } if getattr(self, 'kind', None) == 'cs' else set()
         execz_covered = {off for pc, to in branches if to > pc and names[pc] == 's_cbranch_execz'
                          for off in offsets_between(self.ins, pc, to)} if getattr(self, 'kind', None) == 'cs' else set()

@@ -997,7 +997,7 @@ def check_wave_branches():
     # the branches inside it), such a branch is refused. An SCC from wave-uniform data is the same for every lane.
     SPLICE.update({
         's_cbranch_scc0 1': '010084bf', 's_cbranch_vccnz 65533': 'fdff87bf',
-        's_cbranch_execnz 65532': 'fcff89bf', 's_cbranch_execnz 65531': 'fbff89bf', 'v_cndmask_b32_e32 v3, 0, v3, vcc_lo': '80060602', 's_and_b32 exec_lo, exec_lo, vcc_lo': '7e6a7e87',
+        's_cbranch_execnz 65532': 'fcff89bf', 's_cbranch_execnz 65531': 'fbff89bf', 'v_cndmask_b32_e32 v3, 0, v3, vcc_lo': '80060602', 'v_mov_b32 v3, v0': '0003067e', 's_and_b32 exec_lo, exec_lo, vcc_lo': '7e6a7e87',
         's_mov_b32 s0, exec_lo': '7e0380be', 's_mov_b32 exec_lo, s0': '0003febe',
         's_or_b32 exec_lo, exec_lo, s0': '7e007e88'})
     for line in ('s_and_b32 exec_lo, exec_lo, vcc_lo', 's_mov_b32 s0, exec_lo', 's_mov_b32 exec_lo, s0',
@@ -1027,6 +1027,12 @@ def check_wave_branches():
     # An execnz loop that only narrows EXEC and changes vector registers: a lane that left changes nothing.
     translate('A', code=splice('s_mov_b32 s0, exec_lo', *loop, 's_and_b32 exec_lo, exec_lo, vcc_lo',
                                's_cbranch_execnz 65532', 's_mov_b32 exec_lo, s0')).hlsl_cs()
+    # Every EXEC write in the loop must only narrow the mask: restoring the saved mask in the loop sets lane bits that an
+    # earlier round cleared, so the wave runs those lanes again while a lane alone has left (X = 0 stores 2, not 3).
+    refused('s_cbranch_execnz %s' % WAVE_BRANCH, lambda: translate('A', code=splice(
+        's_mov_b32 s0, exec_lo', 'v_mov_b32 v3, v0', 's_mov_b32 exec_lo, s0', 'v_add_nc_u32 v3, 1, v3',
+        'v_cmp_gt_u32 vcc_lo, 2, v3', 's_and_b32 exec_lo, exec_lo, vcc_lo', 's_cbranch_execnz 65531',
+        's_mov_b32 exec_lo, s0')))
     # The wave's VCC after that loop holds the last compare, 0 for every lane that left earlier; a lane alone keeps its 1.
     refused('s_cbranch_execnz %s' % WAVE_BRANCH, lambda: translate('A', code=splice(
         's_mov_b32 s0, exec_lo', *loop, 's_and_b32 exec_lo, exec_lo, vcc_lo', 's_cbranch_execnz 65532',
