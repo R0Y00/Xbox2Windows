@@ -1,0 +1,24 @@
+EXPORTS
+    op_andn32
+    op_andn64
+    op_bextr32
+    op_bextr64
+    op_tzcnt32
+    op_tzcnt64
+    op_andn32_mem
+    op_andn64_mem
+    op_bextr32_mem
+    op_bextr64_mem
+    op_tzcnt32_mem
+    op_tzcnt64_mem
+    op_andn32_flags
+    op_andn64_flags
+    op_bextr32_flags
+    op_bextr64_flags
+    op_tzcnt32_flags
+    op_tzcnt64_flags
+    op_bextr64_mem_flags
+    op_tzcnt64_mem_flags
+    op_r8_source_then_store
+    op_dst_alias_src
+    op_bmi1_logic_discarded_read

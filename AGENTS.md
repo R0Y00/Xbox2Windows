@@ -200,6 +200,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_mesh57_depth_only_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_loop_refusal_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_loop_check.py
+./out/pe-env/bin/python -B tests/startup_mesh57_lane_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
@@ -256,6 +257,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_spill_branches_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cmp_class_f16_sdwa_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cmp16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
