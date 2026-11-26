@@ -30,6 +30,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 import gfx2hlsl as G  # noqa: E402
+import gpu_case_runner  # noqa: E402
 
 VS_SOURCE = """\
 v_mov_b32 v3, 0x40400000
@@ -212,17 +213,21 @@ def check_binary(llvm_mc):
 def compile_hlsl(compiler, kind, source, out, profile, directory):
     path = directory / ('%s.hlsl' % out)
     path.write_text(source, encoding='ascii')
-    if kind == 'fxc':
-        args = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', str(directory / ('%s.cso' % out)), str(path)]
-    else:
-        args = [compiler, '-T', profile, '-E', 'main', '-Fo', str(directory / ('%s.cso' % out)), str(path)]
-    subprocess.run(args, check=True, capture_output=True, text=True)
-    return directory / ('%s.cso' % out)
+    cso = directory / ('%s.cso' % out)
+
+    def args_for(target):
+        if kind == 'fxc':
+            return [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', str(target), str(path)]
+        return [compiler, '-T', profile, '-E', 'main', '-Fo', str(target), str(path)]
+
+    # Identical sources compile once across the cases of a run and across the warp and hardware runs (gpu_case_runner).
+    gpu_case_runner.compile_cached(compiler, args_for, source, [kind, profile], cso)
+    return cso
 
 
 def draw(renderer, adapter, vs, ps, expected):
-    run = subprocess.run([renderer, adapter, '--startup-flat-param', str(vs), str(ps), expected],
-                         capture_output=True, text=True)
+    # One long-lived offscreen_check per test (one D3D12 device); the one-shot call stays as the fallback.
+    run = gpu_case_runner.run(renderer, adapter, ['--startup-flat-param', vs, ps, expected])
     sys.stdout.write(run.stdout)
     if run.returncode == 77:
         print(run.stdout + run.stderr)
