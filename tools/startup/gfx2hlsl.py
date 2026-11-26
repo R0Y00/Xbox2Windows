@@ -6613,8 +6613,8 @@ class Stage:
     # stride * lane + offset built from that lane id by v_mov / v_lshlrev / v_add_nc / v_mul_u32_u24 / v_mad_u32_u24
     # with immediate operands. Every write is checked against every earlier write (and itself): for all lane pairs
     # i != j the four-byte intervals must be disjoint. A read forwards the register of the write with the identical
-    # form. Anything else is refused. Lanes of different waves are separated by the program's own per-wave base; a
-    # program in which two waves write one address with different values races on hardware too.
+    # form. Anything else is refused. The proof covers the lanes of one wave only: separation between waves is not
+    # analysed here, and two waves writing one address with different values would race on hardware too.
     GS_ALLOC_REQ = 9
     LANES = 64                    # widest guest wave
     LDS_BYTES = 1 << 16
