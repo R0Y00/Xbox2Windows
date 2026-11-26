@@ -127,6 +127,20 @@ def main():
             assert not refused.exists()
         finally:
             escape.rmdir()
+
+        # A junction whose target stays inside the package remains usable.
+        inside = package / "inside"
+        result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(inside), str(bin_dir)],
+                                capture_output=True, errors="replace", timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        try:
+            safe = root / "inside-run"
+            result = call(powershell, package, "inside/child.exe", safe)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert (safe / "child.exe").read_bytes() == b"child"
+            assert (safe / "side.DLL").read_bytes() == b"beside child"
+        finally:
+            inside.rmdir()
     print("safe startup staging: isolated executable/DLL copy, package preservation and overwrite/path guards passed")
 
 
