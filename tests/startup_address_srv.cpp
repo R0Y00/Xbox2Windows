@@ -532,6 +532,54 @@ int draw_copied_vertex_buffer_srv(void* guest, void* list)
     return 0;
 }
 
+int draw_copied_vertex_srv_pair(void* guest, void* list)
+{
+    constexpr UINT bytes = 512;
+    constexpr Word record_bytes = 32;
+    static std::uint8_t inputs[2][65536 + bytes]{};
+    constexpr std::uint32_t values[]{181, 211};
+    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    alignas(64) static std::array<std::uint8_t, 256> descriptors{};
+    Word cpu = 0;
+    if (stride < record_bytes || stride > descriptors.size() / 4 ||
+        !bind_view_table(guest, list, cpu, 4, ptr(descriptors.data()), 4 * stride) ||
+        cpu != ptr(descriptors.data())) return 42;
+
+    ViewAt view{};
+    view.view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    view.view.Buffer.NumElements = bytes / sizeof(std::uint32_t);
+    for (Word i = 0; i < 2; ++i) {
+        void* placed = nullptr;
+        view.address = (ptr(inputs[i]) + 0xffff) & ~Word{0xffff};
+        reinterpret_cast<std::uint32_t*>(view.address)[288 / sizeof(std::uint32_t)] = values[i];
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, view.address, ptr(&buffer), D3D12_RESOURCE_STATE_COMMON,
+                                               0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+        invoke(guest, 70, ptr(&buffer), ptr(&view), cpu + (2 + i) * stride);
+    }
+    auto* const records = descriptors.data();
+    if (std::memcmp(records + 2 * stride, records + 3 * stride, record_bytes) == 0) return 54;
+
+    const auto draw = [&](Word first, Word second, LONG left, LONG right) {
+        invoke(guest, 24, 1, cpu, cpu + first * stride, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        invoke(guest, 24, 1, cpu + stride, cpu + second * stride, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        // The shader reads fixed-width guest records. Copy via the reported descriptor stride first.
+        std::memmove(records + record_bytes, records + stride, record_bytes);
+        if (std::memcmp(records, records + first * stride, record_bytes) != 0 ||
+            std::memcmp(records + record_bytes, records + second * stride, record_bytes) != 0) return false;
+        const D3D12_RECT strip{left, 0, right, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+        return true;
+    };
+    if (!draw(2, 3, 0, 2) || !draw(3, 2, 2, 6) || !draw(2, 3, 6, 8)) return 55;
+    return 0;
+}
+
 int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
     static std::array<std::uint8_t, 65536 + 256> raw_buf0{};
