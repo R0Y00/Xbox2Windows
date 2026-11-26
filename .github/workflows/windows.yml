@@ -346,6 +346,7 @@ jobs:
             tests/startup_gfx2hlsl_sop2_complement_check.py \
             tests/startup_gfx2hlsl_pack_absdiff_check.py \
             tests/startup_gfx2hlsl_sopk_accum_check.py \
+            tests/startup_gfx2hlsl_bfm_b64_check.py \
             tests/startup_gfx2hlsl_f32_lg_check.py \
             tests/startup_gfx2hlsl_f32_nan_check.py \
             tests/startup_gfx2hlsl_f32_sdwa_check.py \
@@ -353,6 +354,7 @@ jobs:
             tests/startup_gfx2hlsl_sopk_signext_check.py \
             tests/startup_gfx2hlsl_mul_hi_check.py \
             tests/startup_gfx2hlsl_sad_check.py \
+            tests/startup_gfx2hlsl_sad_hi_msad_check.py \
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
             tests/startup_gfx2hlsl_s_bit_scan_check.py \
             tests/startup_gfx2hlsl_pack_b32_f16_check.py \
