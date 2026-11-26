@@ -1,4 +1,4 @@
-"""s_ff1_i32_b32 of a general scalar and s_ff1_i32_b64 of a 32-bit immediate (#2022 Item F).
+"""s_ff1_i32_b32 of a general scalar and s_ff1_i32_b64 immediates + SGPR pairs (#2022 Item F).
 
 usage: startup_gfx2hlsl_s_ff1_check.py
        startup_gfx2hlsl_s_ff1_check.py dispatch <dxc> <offscreen_check> <warp|hardware>
@@ -7,9 +7,9 @@ RDNA 2 ISA SOP1: S_FF1_I32_B32 finds the lowest set bit of a 32-bit word (0xffff
 SCC is unchanged. The compute-entry special case on exec_lo still folds to lane 0. Lane masks
 and descriptor sources are refused.
 
-S_FF1_I32_B64 of a live SGPR pair is owned by open #2072. This fixture only accepts a 32-bit
-SOP1 literal/inline, which the ISA zero-extends (high word 0), and folds it. A hi-nonzero
-source needs a register pair and is refused here.
+S_FF1_I32_B64 accepts a 32-bit SOP1 literal/inline (ISA zero-extends the high word to 0) and
+folds it, and also lowers a live SGPR pair with the same 64-bit firstbitlow scan as the scalar
+bit-scan forms.
 
 With `dispatch`, the b32 lowering runs as a compute shader on the adapter (D3D12 UAV
 readback via offscreen_check, same pattern as startup_gfx2hlsl_pack_absdiff_check). The
@@ -175,17 +175,23 @@ def controls():
           lines == ['s3 = 0xffffffffu;'] and sym.get(3) == ('const', MASK),
           str((lines, sym.get(3))))
 
-    # Live SGPR pair is owned by #2072.
+    # SGPR pairs use the same 64-bit firstbitlow scan as #2072 / SCALAR_BITS.
     lines, _ = translate(sop1('s_ff1_i32_b64', 3, 4))
-    check('s_ff1_i32_b64 refuses a live SGPR pair (#2072)',
-          lines[0].startswith('refused:') and 'SGPR pair' in lines[0] and '#2072' in lines[0],
+    check('s_ff1_i32_b64 of a live SGPR pair emits firstbitlow over the pair',
+          (not lines[0].startswith('refused:')
+           and 'firstbitlow' in lines[0]
+           and 's4' in lines[0]
+           and 's5' in lines[0]),
           str(lines))
 
-    # Even a known-constant pair stays refused so this PR does not own that slice.
     lines, _ = translate(sop1('s_ff1_i32_b64', 3, 4),
                          sym={4: ('const', 0), 5: ('const', 0x10)})
-    check('s_ff1_i32_b64 refuses a constant SGPR pair (#2072)',
-          lines[0].startswith('refused:') and 'SGPR pair' in lines[0],
+    # Known consts substitute into the scan text (hi half at +32); still not refused.
+    check('s_ff1_i32_b64 of a constant SGPR pair still scans both halves',
+          (not lines[0].startswith('refused:')
+           and 'firstbitlow' in lines[0]
+           and '32u' in lines[0]
+           and '0x00000010u' in lines[0]),
           str(lines))
 
     # Refusals: lane masks and descriptors.

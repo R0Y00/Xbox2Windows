@@ -5798,11 +5798,12 @@ class Stage:
         return None
 
     def op_s_ff1_i32_b64(self, ops, mods):
-        """Find first set bit of a 64-bit immediate; SCC unchanged (#2022 Item F).
+        """Find first set bit of a 64-bit source; SCC unchanged (#2022 Item F).
 
-        A 32-bit SOP1 literal or inline constant zero-extends to 64 bits (high word 0).
-        Live SGPR-pair sources are refused here: that register-pair lowering is owned by
-        open #2072 (`s_ff1_i32_b64` among the scalar bit-scan forms).
+        A 32-bit SOP1 literal or inline constant zero-extends to 64 bits (high word 0)
+        and folds. An SGPR pair uses the same 64-bit firstbitlow scan as SCALAR_BITS
+        (`_ctz64` / #2072). Kept as a Stage method so immediates are not refused by the
+        pair-only SCALAR_BITS template.
         """
         if mods or len(ops) != 2:
             raise Unsupported('s_ff1_i32_b64 with %d operands, expected 2 unmodified' % len(ops))
@@ -5819,9 +5820,14 @@ class Stage:
             self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
             return None
         src = reg_range(ops[1])
-        if src and src[0] == 's' and src[2] == src[1] + 1:
-            raise Unsupported('s_ff1_i32_b64 of an SGPR pair (register-pair form is in open #2072)')
-        raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
+        if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != 1:
+            raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
+        if any(r in self.masks for r in range(src[1], src[2] + 1)):
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        lo, hi = self.S(src[1]), self.S(src[2])
+        self.masks.discard(dst[1])
+        self.set_s(dst[1], _ctz64(lo, hi))
+        return None
 
     def op_s_abs_i32(self, ops, mods):
         """Signed absolute value; SCC = result != 0 (#1723).
@@ -7255,7 +7261,8 @@ SCALAR_BITS = {
     's_bcnt0_i32_b64': (True, lambda lo, hi: '(64u - countbits(%s) - countbits(%s))' % (lo, hi), '$ != 0'),
     's_bcnt1_i32_b64': (True, lambda lo, hi: '(countbits(%s) + countbits(%s))' % (lo, hi), '$ != 0'),
     's_ff0_i32_b64': (True, lambda lo, hi: _ctz64('(~%s)' % lo, '(~%s)' % hi), None),
-    # s_ff1_i32_b64: Stage.op_s_ff1_i32_b64 owns immediates here; live SGPR pairs stay with #2072.
+    # s_ff1_i32_b64 stays on Stage.op_s_ff1_i32_b64 (immediates + SGPR pairs) so SCALAR_BITS
+    # does not overwrite the zero-extended immediate fold from #2022 Item F.
     's_flbit_i32_b64': (True, _clz64, None),
     's_flbit_i32_i64': (True, _flbit_i64, None),
 }
