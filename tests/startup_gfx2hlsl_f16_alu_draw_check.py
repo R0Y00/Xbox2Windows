@@ -209,6 +209,9 @@ SDWA_EDGE_CONFIGS = [(op, 'WORD_1', 'WORD_0', 'WORD_1', 'UNUSED_PRESERVE', '', '
 GARBAGE = (0xabcd, 0x5a5a, 0xdead, 0x1234)
 OLD = (0x5a5a1234, 0xdead5678, 0x1234abcd, 0x2bcd3456)
 NAN_HALF = 0x7e00
+# The target is a float format: a result that fits in 16 bits reads back as binary32 zero or a subnormal and FXC drops it.
+# Both the drawn word and the expected word are XORed with a tag that keeps every lane a finite normal float (0x3f800000 would turn some 0x4000-class upper halves into infinity or NaN; the control below checks every lane).
+SDWA_TAG = 0x60000000
 
 
 def sdwa_place(value, selection, lane, salt):
@@ -321,7 +324,7 @@ NAN_HLSL = ('uint nanh(uint h) { return (h & 0x7fffu) > 0x7c00u ? 0x7e00u : h; }
 
 def sdwa_draw_text(cfg):
     text = G.Pipeline(vs_words([(0, 0, 0)] * 4), sdwa_ps_words(cfg), root_blob()).hlsl_ps()
-    return NAN_HLSL + re.sub(r'F\(v(1[2-5])\)', r'F(nanc(v\1))', text)
+    return NAN_HLSL + re.sub(r'F\(v(1[2-5])\)', r'F(nanc(v\1) ^ 0x%xu)' % SDWA_TAG, text)
 
 
 # Recorded llvm-mc (gfx1013) encodings of sdwa_body_source(cfg), by configuration name; `binary <llvm-mc>` compares.
@@ -395,6 +398,8 @@ def sdwa_controls(check):
         name = sdwa_name(cfg)
         check('sdwa %s: four or sixteen lanes in groups of four' % name, len(lanes) % 4 == 0 and len(lanes) >= 4)
         refs = [sdwa_reference(cfg, x) for x in lanes]
+        check('sdwa %s: every tagged word is a normal finite binary32' % name,
+              all(0 < ((r ^ SDWA_TAG) >> 23) & 0xff < 0xff for r in refs))
         # A wrong lowering must change at least one lane of this configuration (the value-is-wrong control).
         for label, flags in (('the other half of the sources', {'selection_swap': True}),
                              ('the other destination half', {'half_swap': True}),
@@ -470,6 +475,8 @@ def controls():
         except G.Unsupported as e:
             check('sdwa %s: translates (%s)' % (sdwa_name(cfg), e), False)
             continue
+        check('sdwa %s: the four exports carry the float-target tag' % sdwa_name(cfg),
+              text.count('^ 0x%xu' % SDWA_TAG) == 4)
         check('sdwa %s: translates to four lane results' % sdwa_name(cfg),
               all(('v%d = ' % r) in text for r in range(12, 16)))
     if failures:
@@ -526,7 +533,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     vs = compile_hlsl(compiler, kind,
                                       G.Pipeline(vs_words(chunk), sdwa_ps_words(cfg), root_blob()).hlsl_vs(),
                                       'vs_sdwa_%s_%d_%s' % (name, index, kind), vs_profile, directory)
-                    expected = words_text(sdwa_reference(cfg, x) for x in chunk)
+                    expected = words_text(sdwa_reference(cfg, x) ^ SDWA_TAG for x in chunk)
                     run = draw(renderer, adapter, vs, ps, expected)
                     if run.returncode:
                         failures.append('%s sdwa %s set %d' % (kind, name, index // 4))
@@ -540,7 +547,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             ps = compile_hlsl(compiler, kind, sdwa_draw_text(cfg), 'ps_sdwa_control_%s' % kind, ps_profile, directory)
             vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), sdwa_ps_words(cfg), root_blob()).hlsl_vs(),
                               'vs_sdwa_control_%s' % kind, vs_profile, directory)
-            wrong = [sdwa_reference(cfg, x) for x in chunk]
+            wrong = [sdwa_reference(cfg, x) ^ SDWA_TAG for x in chunk]
             wrong[0] ^= 0x10000
             if not draw(renderer, adapter, vs, ps, words_text(wrong)).returncode:
                 failures.append('%s sdwa wrong-value control was accepted' % kind)
