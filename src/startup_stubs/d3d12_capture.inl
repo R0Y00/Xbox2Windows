@@ -108,6 +108,38 @@ std::uint32_t shadow_id(u64 desktop_handle)
     return id;
 }
 
+// A descriptor slot that names a desktop resource: 18 SRV, 19 UAV, 20 RTV, 21 DSV. Slot 19 names two resources, the
+// view resource and the counter resource it may be paired with; slots 17 (CBV) and 22 (sampler) name none.
+bool view_slot_names_resource(std::uint32_t slot)
+{
+    return slot >= 18 && slot <= 21;
+}
+// The refs a materialized view record holds in a tracked descriptor slot: one for the slot's resource and, for a
+// slot-19 UAV, one more for its counter resource. One ref per slot, so the draw drain (retire_view_refs == 0) frees the
+// resource only once no tracked slot names it; repeated writes of the same view add nothing (note_view compares ids).
+void view_refs_add(std::uint32_t slot, u64 resource, u64 counter)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_add_view_ref(reinterpret_cast<const void*>(resource));
+    if (slot == 19 && counter) retire_add_view_ref(reinterpret_cast<const void*>(counter));
+}
+// Drops exactly the refs view_refs_add added for a materialized record: the overwrite in note_view, a copy that moves
+// another view over the slot (note_copy), and the destruction of the slot's heap (retire_drop_heap_views).
+void view_refs_release(std::uint32_t slot, u64 resource, u64 counter)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_release_view_ref(reinterpret_cast<const void*>(resource));
+    if (slot == 19 && counter) retire_release_view_ref(reinterpret_cast<const void*>(counter));
+}
+// The untracked-descriptor fallback: no slot can hold the resource for a view in a heap the shim does not shadow, so
+// the use takes the resource (and a slot-19 counter) out of the retire class for good, as before.
+void view_refs_leave_class(std::uint32_t slot, u64 resource, u64 counter, RetireLeft why)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_leave_class(reinterpret_cast<const void*>(resource), why);
+    if (slot == 19 && counter) retire_leave_class(reinterpret_cast<const void*>(counter), why);
+}
+
 constexpr std::uint32_t view_token_magic = 0x56573258;  // "X2WV"
 
 bool title_backed(u64 title_handle, u64 bytes)
@@ -388,13 +420,17 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     if (std::uint32_t* slot_ptr = shadow_slot(dest_desktop)) {
         const std::uint32_t prev = *slot_ptr;
         *slot_ptr = record.id + 1;
+        // The same view written to the same slot again keeps its id and changes no reference count. A different view
+        // takes over the slot: the new record adds its refs, the previous materialized record drops its own.
         if (prev != record.id + 1) {
-            if (slot == 18 && resource && materialized) retire_add_view_ref(reinterpret_cast<const void*>(resource));
-            if (prev && prev - 1 < view_records().size() && view_records()[prev - 1].slot == 18 && view_materialized()[prev - 1])
-                retire_release_view_ref(reinterpret_cast<const void*>(view_records()[prev - 1].resource));
+            if (materialized) view_refs_add(static_cast<std::uint32_t>(slot), resource, counter);
+            if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
+                view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
+                                  view_records()[prev - 1].counter);
         }
-    } else if (slot == 18 && resource) {
-        retire_leave_class(reinterpret_cast<const void*>(resource), RetireLeft::view);
+    } else if (view_slot_names_resource(static_cast<std::uint32_t>(slot)) && resource) {
+        // A descriptor no shadow slot tracks cannot hold the view: the use takes the resource out of the class.
+        view_refs_leave_class(static_cast<std::uint32_t>(slot), resource, counter, RetireLeft::view);
     }
     ReleaseSRWLockExclusive(&note_lock);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
@@ -414,34 +450,37 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
     const std::uint32_t* from = shadow_slot(src_desktop, &src_room);
     if (to && count <= dest_room) {
         if (from && count <= src_room) {
+            // Every copied-in view is now named by one more tracked slot; every view the destination named before is
+            // replaced. Slots 18-21 count one ref (slot 19 one for the resource and one for its counter).
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t src_id = from[i];
-                if (src_id && src_id - 1 < view_records().size() &&
-                    view_records()[src_id - 1].slot == 18 && view_materialized()[src_id - 1])
-                    retire_add_view_ref(reinterpret_cast<const void*>(view_records()[src_id - 1].resource));
+                if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
+                    view_refs_add(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
+                                  view_records()[src_id - 1].counter);
             }
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t old_id = to[i];
-                if (old_id && old_id - 1 < view_records().size() &&
-                    view_records()[old_id - 1].slot == 18 && view_materialized()[old_id - 1])
-                    retire_release_view_ref(reinterpret_cast<const void*>(view_records()[old_id - 1].resource));
+                if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
+                    view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
+                                      view_records()[old_id - 1].counter);
             }
             std::memmove(to, from, u64{count} * 4);
         } else {
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t old_id = to[i];
-                if (old_id && old_id - 1 < view_records().size() &&
-                    view_records()[old_id - 1].slot == 18 && view_materialized()[old_id - 1])
-                    retire_release_view_ref(reinterpret_cast<const void*>(view_records()[old_id - 1].resource));
+                if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
+                    view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
+                                      view_records()[old_id - 1].counter);
             }
             std::memset(to, 0, u64{count} * 4);
         }
     } else if (from && count <= src_room) {
+        // The destination is not tracked: the copy puts the views where no shadow slot can hold them.
         for (UINT i = 0; i < count; ++i) {
             const std::uint32_t src_id = from[i];
-            if (src_id && src_id - 1 < view_records().size() &&
-                view_records()[src_id - 1].slot == 18 && view_materialized()[src_id - 1])
-                retire_leave_class(reinterpret_cast<const void*>(view_records()[src_id - 1].resource), RetireLeft::view_copy);
+            if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
+                view_refs_leave_class(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
+                                      view_records()[src_id - 1].counter, RetireLeft::view_copy);
         }
     }
     ReleaseSRWLockExclusive(&note_lock);

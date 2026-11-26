@@ -45,6 +45,8 @@ int main(int argc, char** argv)
     std::uint32_t word = 0;
     check("float4 identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R32G32B32A32_FLOAT), word) &&
                                  word == (77u << 12 | identity));
+    check("R10G10B10A2 unorm identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R10G10B10A2_UNORM), word) &&
+                                            word == (50u << 12 | identity));
     check("half2 identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R16G16_FLOAT), word) && word == (29u << 12 | identity));
     check("snorm2 identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R16G16_SNORM), word) && word == (24u << 12 | identity));
     check("uint8 identity", !x2w_startup::view_word3(typed(DXGI_FORMAT_R8_UINT), word) && word == (5u << 12 | identity));
@@ -59,7 +61,7 @@ int main(int argc, char** argv)
     const DXGI_FORMAT decoded[] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R32_FLOAT,
         DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
         DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-        DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R8G8B8A8_UINT};
+        DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R10G10B10A2_UNORM};
     for (DXGI_FORMAT f : decoded) {
         const std::uint32_t code = x2w_startup::buffer_format_code(f);
         if (!code || !x2w_startup::formatted_buffer_supported(code)) {
