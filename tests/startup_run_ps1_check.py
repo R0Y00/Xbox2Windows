@@ -93,6 +93,19 @@ WARNING_PROBE = "x2w warning prefix probe"
 WARNING_PREFIXES = {}
 
 
+def unwrap_first_line(printed, want):
+    """Join the leading lines of `printed` that PowerShell wrapped at its host width back into `want`.
+
+    The host wraps a long Write-Warning at the console width it finds (80 columns when it is not
+    attached to a wide console, which depends on load and on the parent), so the one warning can
+    arrive as two lines. Only a split of exactly `want` is joined; any other text is left as printed.
+    """
+    for count in range(1, len(printed) + 1):
+        if " ".join(printed[:count]) == want:
+            return [want, *printed[count:]]
+    return printed
+
+
 def warning_prefix(shell, env):
     """Return the prefix this shell puts before a Write-Warning message, such as "WARNING: ".
 
@@ -189,6 +202,7 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     want_output = STUB_LINES[:HEAD_LINES]
     if not fake_user_env and "-FakeUser" not in switches:
         want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
+        printed = unwrap_first_line(printed, want_output[0])
     if printed != want_output:
         found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
                      f"(stderr: {error_text!r})")
@@ -345,6 +359,21 @@ def shell_failures(shell, script, tmp):
     return failures
 
 
+def unwrap_problems():
+    """Controls for unwrap_first_line: a wrapped warning joins, any other text is left alone."""
+    want = "WARNING: Without -FakeUser, user API calls go to the host gaming runtime (docs/x.md)."
+    head = "WARNING: Without -FakeUser, user API calls go to the host gaming runtime"
+    cases = [
+        ("one line", [want, "a"], [want, "a"]),
+        ("wrapped at 80 columns", [head, "(docs/x.md).", "a"], [want, "a"]),
+        ("different text", [head, "(docs/other.md).", "a"], [head, "(docs/other.md).", "a"]),
+        ("missing warning", ["a"], ["a"]),
+    ]
+    return [f"unwrap_first_line {name}: got {got}, expected {expected}"
+            for name, printed, expected in cases
+            if (got := unwrap_first_line(printed, want)) != expected]
+
+
 def main():
     if sys.argv[1:] not in ([], ["--text-only"]):
         sys.exit("usage: startup_run_ps1_check.py [--text-only]")
@@ -359,7 +388,7 @@ def main():
         mode = "executed with " + ", ".join(Path(shell).stem.lower() for shell in shells)
         if not shells:
             mode = "text only: no PowerShell found"
-    failures = []
+    failures = unwrap_problems()
     with tempfile.TemporaryDirectory() as tmp:
         # Each shell works in its own scratch dirs, so PowerShell 5.1 and 7 run side by side.
         with ThreadPoolExecutor(max_workers=len(shells) or 1) as pool:

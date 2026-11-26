@@ -176,6 +176,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_abs_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_quadmask_b64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_ff0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_bitset_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_flbit_check.py
