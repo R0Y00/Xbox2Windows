@@ -16,6 +16,7 @@ namespace {
 constexpr std::uint32_t kind_keyboard = 0x00000010;
 constexpr std::uint32_t kind_gamepad = 0x00040000;
 constexpr std::uint32_t status_connected = 0x47;
+constexpr std::uint32_t family_xbox_one = 1;  // GameInputFamilyXboxOne
 constexpr std::uint32_t blocking_enumeration = 2;
 constexpr HRESULT device_not_found = static_cast<HRESULT>(0x838A0002L);
 constexpr GUID dummy_iid = {0x11223344u, 0x5566u, 0x7788u, {0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00}};
@@ -208,6 +209,14 @@ struct IGameInput {
         using Fn = bool(__stdcall*)(IGameInput*, std::uint64_t, std::uint64_t);
         return reinterpret_cast<Fn>(vtbl[13])(this, token, timeoutUs);
     }
+
+    // GameInput.h v0 slot 7: GetTemporalReading(uint64_t timestamp, IGameInputDevice* device,
+    // IGameInputReading** reading). Documented as never implemented in v0 (removed in v1).
+    HRESULT GetTemporalReading(std::uint64_t timestamp, IGameInputDevice* device, IGameInputReading** reading)
+    {
+        using Fn = HRESULT(__stdcall*)(IGameInput*, std::uint64_t, IGameInputDevice*, IGameInputReading**);
+        return reinterpret_cast<Fn>(vtbl[7])(this, timestamp, device, reading);
+    }
     HRESULT FindDevice(int slot, const void* arg, IGameInputDevice** device)
     {
         using Fn = HRESULT(__stdcall*)(IGameInput*, const void*, IGameInputDevice**);
@@ -313,6 +322,21 @@ int main(int argc, char** argv)
     check(ts0 > 0, "GetCurrentTimestamp returns non-zero microseconds");
     input->SetFocusPolicy(1);
 
+    // GetTemporalReading (v0 slot 7) was never implemented by Microsoft and is documented to
+    // return E_NOTIMPL; the stand-in keeps that refusal and never produces a reading.
+    {
+        IGameInputReading* temporal = reinterpret_cast<IGameInputReading*>(static_cast<std::uintptr_t>(1));
+        check(input->GetTemporalReading(ts0, nullptr, &temporal) == E_NOTIMPL,
+              "GetTemporalReading -> E_NOTIMPL (never implemented in v0)");
+        check(temporal == nullptr, "GetTemporalReading never produces a reading");
+        check(input->GetTemporalReading(ts0, nullptr, nullptr) == E_POINTER,
+              "GetTemporalReading(null out) -> E_POINTER");
+        if (ro_page) {
+            check(input->GetTemporalReading(ts0, nullptr, reinterpret_cast<IGameInputReading**>(ro_page)) == E_POINTER,
+                  "GetTemporalReading(PAGE_READONLY) -> E_POINTER");
+        }
+    }
+
     // 3. Callback registration, StopCallback, UnregisterCallback, and unwritable token guards.
     DeviceCapture cap{};
     std::uint64_t dev_token = 0;
@@ -400,6 +424,18 @@ int main(int argc, char** argv)
               by_handle == nullptr,
           "FindDeviceFromPlatformHandle sets out to null and returns device_not_found");
     if (by_obj) {
+        // GameInputDeviceInfo: vendorId +4, productId +6, deviceFamily +0x60. 045E:0B12 is an Xbox Series pad,
+        // a GIP device: GameInputFamilyXboxOne (1), not GameInputFamilyXbox360 (2, the XUSB22 driver).
+        const unsigned char* info = by_obj->GetDeviceInfo();
+        std::uint16_t ids[2]{};
+        std::uint32_t family = 0;
+        if (info) {
+            std::memcpy(ids, info + 4, sizeof(ids));
+            std::memcpy(&family, info + 0x60, sizeof(family));
+        }
+        check(info && ids[0] == 0x045E && ids[1] == 0x0B12, "gamepad GetDeviceInfo names vendor 045E product 0B12");
+        if (family != family_xbox_one) std::printf("gamepad deviceFamily %u, expected %u\n", family, family_xbox_one);
+        check(family == family_xbox_one, "gamepad GetDeviceInfo deviceFamily == GameInputFamilyXboxOne");
         check(by_obj->GetDeviceStatus() == status_connected, "IGameInputDevice::GetDeviceStatus == status_connected");
         const std::uint32_t rumble[4] = {0, 0, 0, 0};
         by_obj->SetRumbleState(rumble);

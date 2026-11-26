@@ -128,6 +128,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_wakeup",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
+    # s_round_mode keeping binary32 at nearest even and writing MODE[3:2] = 0 or 3, as pixel_aot lowers it.
+    r"s_round_mode\s+0x[0c]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
     # SOPK wait forms: only null as the SGPR (reads as 0) and a count of 0..63, as in pixel_aot.
     r"s_waitcnt_(?:vmcnt|lgkmcnt|vscnt)\s+null,\s*(?:0x(?:0?[0-9a-f]|[1-3][0-9a-f])|[0-9]|[1-5][0-9]|6[0-3])",
@@ -137,6 +139,16 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_wqm_(?:b64|b32)\s+(?:exec|exec_lo),\s+(?:exec|exec_lo)",
     r"s_and_b64\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+(?:s\[\d+:\d+\]|s\d+)",
     r"s_and_b32\s+(?:exec|exec_lo),\s+(?:exec|exec_lo),\s+s\d+",
+    # The structured masked region pixel_aot lowers: the s_and_saveexec opener, the s_or close, the s_andn2 else
+    # transition and the empty-mask skip, in the wave64 spellings and the wave32 ones on exec_lo (the MOV close is the
+    # s_mov line above). Whether a line sits in a well-formed region is decided by the translator, not here.
+    r"s_and_saveexec_b64\s+s\[\d+:\d+\],\s+(?:vcc|s\[\d+:\d+\])",
+    r"s_and_saveexec_b32\s+s\d+,\s+(?:vcc_lo|s\d+)",
+    r"s_or_b64\s+exec,\s+exec,\s+s\[\d+:\d+\]",
+    r"s_or_b32\s+exec_lo,\s+exec_lo,\s+s\d+",
+    r"s_andn2_b64\s+exec,\s+s\[\d+:\d+\],\s+exec",
+    r"s_andn2_b32\s+exec_lo,\s+s\d+,\s+exec_lo",
+    r"s_cbranch_execz\s+-?(?:0x[0-9a-f]+|0|[1-9]\d*)",
     rf"s_(?:cmov|not|brev)_b64\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE}",
     rf"s_(?:lshl_b64|lshr_b64|ashr_i64)\s+s\[\d+:\d+\],\s+{SCALAR64_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_bfm_b64\s+s\[\d+:\d+\],\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
@@ -470,11 +482,15 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     }
 )
 
+OPCODE_ENCODING_SUFFIX = re.compile(r"_(?:e32|e64|sdwa|dpp.*)$")
+CROSS_LANE_VALU_OPCODES = {"v_permlane16_b32", "v_permlanex16_b32"}
+CROSS_LANE_VALU_CATEGORY = "VALU (Cross-lane)"
+
 
 def is_opcode_recognized(opcode: str) -> bool:
     """Check if opcode belongs to recognized AMD RDNA 2 ISA instructions."""
     clean = opcode.strip().lower()
-    base = re.sub(r"_(?:e32|e64|sdwa|dpp.*)$", "", clean)
+    base = OPCODE_ENCODING_SUFFIX.sub("", clean)
     if base in KNOWN_RDNA2_BASE_OPCODES or clean in KNOWN_RDNA2_BASE_OPCODES:
         return True
     if base.startswith(("v_cmp_", "v_cmpx_")) or clean.startswith(("v_cmp_", "v_cmpx_")):
@@ -489,6 +505,8 @@ def is_opcode_recognized(opcode: str) -> bool:
 def classify_isa_category(opcode: str) -> str:
     """Classify instruction into RDNA 2 ISA category according to the AMD manual."""
     op = opcode.lower()
+    if OPCODE_ENCODING_SUFFIX.sub("", op.strip()) in CROSS_LANE_VALU_OPCODES:
+        return CROSS_LANE_VALU_CATEGORY
     if op.startswith("v_interp"):
         return "VINTRP (Parameter Interpolation)"
     if op.startswith("v_"):
@@ -650,6 +668,13 @@ def is_instruction_supported(instruction_line: str) -> bool:
     if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
         counters = [token.partition("(")[0] for token in wait[1].split()]
         return len(counters) == len(set(counters))
+    if re.match(r"s_and_saveexec_b(?:32|64)\s|s_(?:or|andn2)_b(?:32|64)\s+exec", clean):
+        # Masked-region exec forms: an aligned SGPR pair or an SGPR up to s105, as pixel_aot's sgpr_pair/sgpr_name.
+        return (all(_sgpr_pair_ok(pair) for pair in re.finditer(r"s\[(\d+):(\d+)\]", clean))
+                and all(int(n) <= 105 for n in re.findall(r"(?<![\w\[:])s(\d+)(?!\d)", clean)))
+    if execz := re.fullmatch(r"s_cbranch_execz\s+(-?(?:0x[0-9a-f]+|0|[1-9]\d*))", clean):
+        # The 16-bit signed displacement pixel_aot accepts.
+        return -0x8000 <= int(execz[1], 0) <= 0x7fff
     return True
 
 
@@ -880,6 +905,8 @@ def make_progress_bar(percentage: float, width: int = 24, unicode_blocks: bool =
 def get_implementation_target(opcode: str, category: str) -> str:
     """Identify target file and subsystem in Xbox2Windows for an opcode."""
     op = opcode.lower()
+    if category == CROSS_LANE_VALU_CATEGORY:
+        return "`tools/pixel_aot.py` (Wave lane layout, active lanes and bound control)"
     if "VALU" in category or "Vector ALU" in category:
         if any(x in op for x in ["_f32", "_f16", "_i32", "_u32"]):
             return "`tools/pixel_aot.py` (ALU dictionary / table)"

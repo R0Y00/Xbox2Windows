@@ -3,6 +3,8 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "startup_stubs/d3d12_teardown.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
@@ -49,6 +51,34 @@ public:
         dump.index = ++sequence_;
         entries_.push_back({list, {}, std::move(dump)});
         return true;
+    }
+
+    // Test hook (startup_teardown_unload, #2572; the review of the ownership change asked for one):
+    // enters one recorded copy exactly as execute() leaves it after a submit -- the readback buffer and
+    // the queue fence that decides its completion -- without a command list, a queue or a draw. No real
+    // path calls it. False when the capture budget is full.
+    bool record_for_test(Microsoft::WRL::ComPtr<ID3D12Resource> buffer, Microsoft::WRL::ComPtr<ID3D12Fence> fence)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (entries_.size() + consumed_ >= limit) return false;
+        DrawDump dump;
+        dump.buffer = std::move(buffer);
+        dump.index = ++sequence_;
+        entries_.push_back({nullptr, std::move(fence), std::move(dump)});
+        return true;
+    }
+
+    // Test hook: the object the first recorded entry owns, without adding a reference -- slot 0 the
+    // readback buffer, 1 its fence. The fixture takes its own reference and watches it stay alone once
+    // the module is unloaded. Null for an unknown slot or an empty cache.
+    IUnknown* owned_for_test(unsigned slot)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : entries_) {
+            if (slot == 0 && entry.dump.buffer) return entry.dump.buffer.Get();
+            if (slot == 1 && entry.fence) return entry.fence.Get();
+        }
+        return nullptr;
     }
 
     void discard(ID3D12CommandList* list)
@@ -100,6 +130,38 @@ public:
             it = entries_.erase(it);
         }
         return complete;
+    }
+
+    // Lifetime boundary, same contract as the caches in startup_stubs/d3d12_teardown.h: a recorded copy and
+    // its fence live for as long as this module is loaded, because a list that was resubmitted still holds
+    // them. This object is a function-local static in draw_dumps(), so it is destroyed during the module's
+    // CRT teardown. On process exit the display driver is already detached and a release there faults
+    // inside it, so the references are detached; FreeLibrary keeps the process and the driver alive and
+    // the entries release their objects normally. Each reference is accounted for on the path it took and,
+    // with X2W_TEARDOWN_REPORT, reported as one x2w-teardown readbacks line.
+    ~DrawReadbacks()
+    {
+        const bool detach = d3d12_process_terminating && !teardown_guard_disabled("readbacks");
+        unsigned detached = 0, released = 0;
+        for (auto& entry : entries_) {
+            if (entry.dump.buffer) {
+                if (detach) {
+                    entry.dump.buffer.Detach();
+                    ++detached;
+                } else {
+                    ++released;
+                }
+            }
+            if (entry.fence) {
+                if (detach) {
+                    entry.fence.Detach();
+                    ++detached;
+                } else {
+                    ++released;
+                }
+            }
+        }
+        teardown_report("readbacks", detached, released);
     }
 };
 }  // namespace x2w_startup

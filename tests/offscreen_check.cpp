@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
 #include <fstream>
 #include <limits>
@@ -429,6 +430,11 @@ bool validate_check_pixel_args(int, char** argv)
     return format == "rgba" || format == "bgra";
 }
 
+bool validate_pixel_pairs_args(int argc, char**)
+{
+    return (argc - 3) % 2 == 0;
+}
+
 bool validate_mesh_entry_args(int argc, char** argv)
 {
     if (argc == 6) return true;
@@ -453,16 +459,30 @@ bool validate_compute_mesh_texture_fallback_args(int argc, char** argv)
            (argc != 10 || std::string_view(argv[9]) == "--stale");
 }
 
-OperationResult run_check_pixel_batch(const OperationContext& ctx)
+template<class AfterCase>
+OperationResult run_readback_batch(const OperationContext& ctx, AfterCase after_case)
 {
+    const std::string_view operation(ctx.argv[2]);
+    const bool pairs = operation == "--check-pixel-pairs";
+    const bool compute = operation == "--compute-store-batch";
+    const int stride = pairs ? 2 : 1;
+    ComputeReadbackProgram program;
     bool failed = false;
-    for (int i = 4; i < ctx.argc; ++i) {
+    for (int i = 4, index = 0; i < ctx.argc; i += stride, ++index) {
+        const char* shader = ctx.argv[pairs ? i - 1 : 3];
         const char* status = "pass";
-        std::fprintf(stderr, "case=%d path=%s\n", i - 4, ctx.argv[i]);
+        std::fprintf(stderr, "case=%d path=%s\n", index, ctx.argv[i]);
+        if (pairs) std::fprintf(stderr, "shader=%s\n", shader);
         try {
-            check(ctx.device->GetDeviceRemovedReason(), "Pixel batch device");
-            check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[i]);
-        } catch (const PixelMismatch& e) {
+            check(ctx.device->GetDeviceRemovedReason(), compute ? "Compute batch device" : "Pixel batch device");
+            if (compute) {
+                if (!program.pipeline) program = load_compute_store_program(ctx.device, shader);
+                check_compute_store_reference(ctx.device, program, ctx.argv[i]);
+            } else {
+                check_translated_pixel(ctx.device, shader, false, ctx.argv[i]);
+            }
+            after_case(index);
+        } catch (const ReadbackMismatch& e) {
             std::fprintf(stderr, "%s\n", e.what());
             status = "mismatch";
         } catch (const std::exception& e) {
@@ -472,10 +492,36 @@ OperationResult run_check_pixel_batch(const OperationContext& ctx)
         if (report_debug_errors(ctx.messages) || FAILED(ctx.device->GetDeviceRemovedReason()))
             status = "error";
         if (ctx.messages) ctx.messages->ClearStoredMessages();
-        std::printf("case=%d status=%s\n", i - 4, status);
+        std::printf("case=%d status=%s\n", index, status);
         failed |= std::string_view(status) != "pass";
     }
     return failed ? OperationResult{OutcomeKind::fail, nullptr} : OperationResult{OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_batch(const OperationContext& ctx)
+{
+    return run_readback_batch(ctx, [](int) {});
+}
+
+OperationResult run_pixel_batch_debug_control(const OperationContext& ctx)
+{
+    if (!ctx.messages) return {OutcomeKind::skip, "skip: pixel batch control requires the D3D12 debug layer"};
+    return run_readback_batch(ctx, [&](int index) {
+        if (index == 1)
+            check(ctx.messages->AddApplicationMessage(D3D12_MESSAGE_SEVERITY_ERROR, "pixel batch control error"),
+                  "Add pixel batch control message");
+    });
+}
+
+OperationResult run_pixel_batch_removal_control(const OperationContext& ctx)
+{
+    ComPtr<ID3D12Device5> device;
+    const HRESULT hr = ctx.device->QueryInterface(IID_PPV_ARGS(&device));
+    if (hr == E_NOINTERFACE) return {OutcomeKind::skip, "skip: pixel batch control requires ID3D12Device5"};
+    check(hr, "Query pixel batch control device");
+    return run_readback_batch(ctx, [&](int index) {
+        if (index == 1) device->RemoveDevice();
+    });
 }
 
 OperationResult run_compute_root(const OperationContext& ctx)
@@ -505,6 +551,22 @@ OperationResult run_ffx_immediate_conversion(const OperationContext& ctx)
 OperationResult run_compute_store_case(const OperationContext& ctx)
 {
     check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// The store case with both raw buffers bound as descriptor-table views (defaulting to the full 1280
+// bytes, or an explicit uav_words count in [1, 320]), so a shader reading a descriptor's size sees
+// the view size (root descriptors carry none).
+OperationResult run_compute_store_sized_case(const OperationContext& ctx)
+{
+    UINT uav_words = 0;
+    if (ctx.argc == 6) {
+        const std::string_view text = ctx.argv[5];
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), uav_words);
+        if (error != std::errc{} || end != text.data() + text.size() || uav_words == 0)
+            throw std::runtime_error("Invalid compute UAV word count");
+    }
+    check_compute_file(ctx.device, ctx.argv[3], false, ctx.argv[4], false, true, uav_words);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -732,6 +794,35 @@ OperationResult run_sampled_coverage(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
+{
+// Windows SDK 10.0.22621 does not declare the SM 6.8 capability query.
+#if defined(__ID3D12Device14_INTERFACE_DEFINED__)
+    const bool bias = std::strcmp(ctx.argv[2], "--check-pixel-compare-bias") == 0;
+    const D3D_SHADER_MODEL required = bias ? D3D_SHADER_MODEL_6_8 : D3D_SHADER_MODEL_6_7;
+    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{required};
+    if (FAILED(check_feature(ctx.device, D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel))) ||
+        shaderModel.HighestShaderModel < required)
+        return {OutcomeKind::skip, bias ? "Comparison bias requires SM 6.8" : "Comparison LOD requires SM 6.7"};
+    if (bias) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS21 options{};
+        if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS21, &options, sizeof(options))) ||
+            !options.SampleCmpGradientAndBiasSupported)
+            return {OutcomeKind::skip, "Comparison bias requires SampleCmpGradientAndBiasSupported"};
+    } else {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS14 options{};
+        if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options))) ||
+            !options.AdvancedTextureOpsSupported)
+            return {OutcomeKind::skip, "Comparison LOD requires AdvancedTextureOpsSupported"};
+    }
+    check_pixel_compare(ctx.device, ctx.argv[3], ctx.argv[4], true);
+    return {OutcomeKind::pass, nullptr};
+#else
+    (void)ctx;
+    return {OutcomeKind::skip, "Comparison LOD/bias fixture requires Windows SDK 10.0.26100 headers"};
+#endif
+}
+
 OperationResult run_check_pixel_compare(const OperationContext& ctx)
 {
     check_pixel_compare(ctx.device, ctx.argv[3], ctx.argv[4]);
@@ -741,6 +832,20 @@ OperationResult run_check_pixel_compare(const OperationContext& ctx)
 OperationResult run_check_pixel_gather(const OperationContext& ctx)
 {
     check_pixel_gather(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// A comparison gather needs a view format that advertises SHADER_GATHER_COMPARISON. R32_FLOAT does
+// on both WARP and hardware; R32G32B32A32_FLOAT does not, so the ordinary gather case cannot be reused.
+OperationResult run_check_pixel_compare_gather(const OperationContext& ctx)
+{
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{
+        DXGI_FORMAT_R32_FLOAT, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON))
+        return {OutcomeKind::skip, "R32_FLOAT comparison gather support unavailable"};
+    check_pixel_compare_gather(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                               ctx.argc == 7 ? ctx.argv[6] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -840,6 +945,11 @@ OperationResult run_mesh_amplified(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_amplified_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
                                                    ctx.argv[6]));
+}
+
+OperationResult run_mesh_heap_sampler(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_heap_sampler_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5]));
 }
 
 OperationResult run_mesh_multi(const OperationContext& ctx)
@@ -1043,6 +1153,10 @@ OperationResult run_dxr_placed_build(const OperationContext& ctx)
 {
     return skip_if_false(check_dxr_placed_build(ctx.device));
 }
+OperationResult run_dxr_slot70_as(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_slot70_as(ctx.device));
+}
 
 OperationResult run_dxr_pipeline(const OperationContext& ctx)
 {
@@ -1172,6 +1286,18 @@ OperationResult run_startup_sampler_x(const OperationContext& ctx)
                          "skip: R32_FLOAT does not report filtered sampling with mips");
 }
 
+// --startup-sampler-lod[-dropped]: sampler heap entries that differ only in word 1 LOD limits, decoded by
+// the startup stand-in (tests/startup_sampler_lod.cpp). The dropped control must read the wrong mips.
+template<bool DropClamp>
+OperationResult run_startup_sampler_lod(const OperationContext& ctx)
+{
+    const int result = check_startup_sampler_lod(ctx.device, DropClamp);
+    if (result == 77) return {OutcomeKind::skip, "skip: R32_FLOAT does not report sampling, comparison, mips and render target"};
+    if (result) return {OutcomeKind::fail, DropClamp ? "dropped LOD clamp did not read the expected wrong mips"
+                                                     : "sampler LOD readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-sampler-heap <vs.cso> <ps.cso> <byte offset> <expected red bits>: draws one pixel with a
 // gfx2hlsl pixel shader that indexes its sampler table at run time (tests/startup_sampler_heap.cpp).
 OperationResult run_startup_sampler_heap(const OperationContext& ctx)
@@ -1226,6 +1352,81 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest line> <first/count> prints one RGBA32F pixel.
+OperationResult run_startup_image_2d_view(const OperationContext& ctx)
+{
+    const std::string_view window = ctx.argv[6];
+    if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
+        window[2] < '1' || window[2] > '3')
+        return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
+    float color[4]{};
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
+                           UINT(window[0] - '0'), UINT(window[2] - '0'));
+    std::uint32_t bits[4];
+    std::memcpy(bits, color, sizeof(bits));
+    std::printf("view_rgba=%08x,%08x,%08x,%08x\n", bits[0], bits[1], bits[2], bits[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-load-d16 <r16_unorm|rgba32f|r16_unorm_array|rgba32f_array> <vs.cso> <ps.cso> <expected.bin>:
+// draws an 8x2 full-screen pair to an R32G32B32A32_UINT target against a two-mip (8x2 + 4x1) 2D or two-slice
+// 2D-array R16_UNORM / R32G32B32A32_FLOAT source texture and compares all 64 little-endian words with expected.bin.
+OperationResult run_startup_image_load_d16(const OperationContext& ctx)
+{
+    const bool depth16 = std::strcmp(ctx.argv[3], "r16_unorm") == 0 || std::strcmp(ctx.argv[3], "r16_unorm_array") == 0;
+    const bool rgba32f = std::strcmp(ctx.argv[3], "rgba32f") == 0 || std::strcmp(ctx.argv[3], "rgba32f_array") == 0;
+    const bool array = std::strcmp(ctx.argv[3], "r16_unorm_array") == 0 || std::strcmp(ctx.argv[3], "rgba32f_array") == 0;
+    if (!depth16 && !rgba32f)
+        return {OutcomeKind::fail, "image_load d16 source mode must be r16_unorm[_array] or rgba32f[_array]"};
+    std::uint32_t expected[64]{};
+    std::ifstream file(ctx.argv[6], std::ios::binary);
+    file.read(reinterpret_cast<char*>(expected), sizeof(expected));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return {OutcomeKind::fail, "expected file does not hold 64 words"};
+    std::uint32_t actual[64]{};
+    check_startup_image_load_d16(ctx.device, ctx.argv[4], ctx.argv[5], depth16, actual, array);
+    unsigned differing = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        const std::uint32_t* want = &expected[i * 4];
+        const std::uint32_t* got = &actual[i * 4];
+        if (std::memcmp(want, got, 4 * sizeof(std::uint32_t)) == 0) continue;
+        if (differing++ == 0) {
+            std::fprintf(stderr,
+                         "startup_image_load_d16 (%s) pixel (%u,%u) mismatch: expected %08x,%08x,%08x,%08x actual %08x,%08x,%08x,%08x\n",
+                         ctx.argv[3], i % 8, i / 8, want[0], want[1], want[2], want[3], got[0], got[1], got[2], got[3]);
+        }
+    }
+    if (differing) {
+        std::fprintf(stderr, "%u of 16 pixels differ\n", differing);
+        return {OutcomeKind::fail, "image_load d16 readback differs"};
+    }
+    std::printf("startup_image_load_d16 %s: all 16 pixels (64 words) matched\n", ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits>: the translated pixel stage stores to
+// u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and every other texel -1.0.
+OperationResult run_startup_image_store(const OperationContext& ctx)
+{
+    unsigned x = 0, y = 0;
+    std::uint32_t expected[4]{};
+    if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
+    if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+        return {OutcomeKind::fail, "image store readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
+const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
+
+OperationResult run_startup_sharedexp_target(const OperationContext& ctx)
+{
+    if (const char* reason = check_startup_sharedexp_target(ctx.device, ctx.messages))
+        return {OutcomeKind::skip, reason};
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_startup_packed_position(const OperationContext& ctx)
 {
     constexpr UINT width = 13, height = 7;
@@ -1247,28 +1448,47 @@ OperationResult run_startup_packed_position(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+unsigned long pixel_extent(const char* text)
+{
+    char* end = nullptr;
+    const long value = std::strtol(text, &end, 10);
+    return *end == '\0' && value >= 1 && value <= 64 ? static_cast<unsigned long>(value) : 0;
+}
+
+bool validate_pixel_words_args(int, char** argv)
+{
+    return pixel_extent(argv[5]) != 0 && pixel_extent(argv[6]) != 0;
+}
+
+bool validate_raster_args(int argc, char** argv)
+{
+    const std::string_view cull = argv[8], winding = argv[9];
+    return validate_pixel_words_args(argc, argv) && (cull == "none" || cull == "front" || cull == "back") &&
+           (winding == "cw" || winding == "ccw");
+}
+
 // --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
 // width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
 // value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
 // row by row. Reports the first differing pixel and the number of differing pixels.
 OperationResult run_startup_pixel_words(const OperationContext& ctx)
 {
-    unsigned long width = 0, height = 0;
-    try {
-        width = std::stoul(ctx.argv[5]);
-        height = std::stoul(ctx.argv[6]);
-    } catch (const std::exception&) {
-        return {OutcomeKind::fail, "width and height must be numbers"};
-    }
-    if (width == 0 || height == 0 || width > 64 || height > 64)
-        return {OutcomeKind::fail, "width and height must be 1..64"};
+    const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
     std::vector<std::uint32_t> expected(size_t(width) * height * 4);
     std::ifstream file(ctx.argv[7], std::ios::binary);
     file.read(reinterpret_cast<char*>(expected.data()), std::streamsize(expected.size() * sizeof(std::uint32_t)));
     if (!file || file.peek() != std::char_traits<char>::eof())
         return {OutcomeKind::fail, "expected file does not hold width * height * 4 words"};
     std::vector<std::uint32_t> pixels(expected.size());
-    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    if (std::string_view(ctx.argv[2]) == "--raster-reference") {
+        const std::string_view mode = ctx.argv[8], winding = ctx.argv[9];
+        const auto cull = mode == "none" ? D3D12_CULL_MODE_NONE :
+                          mode == "front" ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height),
+                                cull, winding == "ccw", 6);
+    } else {
+        check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    }
     unsigned long differing = 0;
     for (unsigned long y = 0; y < height; ++y) {
         for (unsigned long x = 0; x < width; ++x) {
@@ -1303,6 +1523,47 @@ OperationResult run_startup_flat_param(const OperationContext& ctx)
         std::fprintf(stderr, "startup_flat_param mismatch expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
                      expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
         return {OutcomeKind::fail, "flat parameter readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
+// Comma-separated 8-digit hex words, in order. An empty list or any other shape returns nothing.
+static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
+{
+    std::vector<std::uint32_t> words;
+    while (!text.empty()) {
+        std::uint32_t value = 0;
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+        if (parsed.ec != std::errc{} || parsed.ptr == text.data()) return {};
+        words.push_back(value);
+        text.remove_prefix(std::size_t(parsed.ptr - text.data()));
+        if (text.empty()) break;
+        if (text.front() != ',') return {};
+        text.remove_prefix(1);
+    }
+    return words;
+}
+
+// --startup-entry-words <vs.cso> <ps.cso> <entry words> <expected words>: draws one pixel with a gfx2hlsl
+// vertex and pixel pair that reads its operands from the entry constant buffer (tests/startup_entry_words.cpp).
+// <entry words> is 1..32 comma-separated 8-digit hex words, ud0 first; the translated vertex stage reads ud0
+// as its rectangle-list switch, so a plain triangle fixture keeps it 0. <expected words> is the four words the
+// target must hold, compared bit for bit.
+OperationResult run_startup_entry_words(const OperationContext& ctx)
+{
+    const auto entry = parse_hex_words(ctx.argv[5]);
+    const auto expected = parse_hex_words(ctx.argv[6]);
+    if (entry.empty() || entry.size() > 32)
+        return {OutcomeKind::fail, "entry constants are not 1..32 hex words"};
+    if (expected.size() != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::uint32_t words[4]{};
+    check_startup_entry_words(ctx.device, ctx.argv[3], ctx.argv[4], entry.data(), UINT(entry.size()), words);
+    if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
+        std::fprintf(stderr, "startup_entry_words mismatch expected=%08x,%08x,%08x,%08x "
+                             "actual=%08x,%08x,%08x,%08x\n",
+                     expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
+        return {OutcomeKind::fail, "entry constant readback differs"};
     }
     return {OutcomeKind::pass, nullptr};
 }
@@ -1396,12 +1657,17 @@ constexpr CapabilityGate kGateSm66MinLod{
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
 // remain inside the handlers and report OutcomeKind::skip.
 const OperationSpec kOperations[] = {
-    {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_pixel_batch},
+    {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
+    {"--check-pixel-pairs", 5, kUnboundedArgc, validate_pixel_pairs_args, kNoGate, run_check_batch},
+    {"--pixel-batch-debug-control", 7, 7, nullptr, kNoGate, run_pixel_batch_debug_control},
+    {"--pixel-batch-removal-control", 7, 7, nullptr, kNoGate, run_pixel_batch_removal_control},
     {"--compute-root", 3, 3, nullptr, kNoGate, run_compute_root},
     {"--compute-tables", 3, 3, nullptr, kNoGate, run_compute_tables},
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
+    {"--compute-store-sized-case", 5, 6, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
     {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
@@ -1415,12 +1681,18 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
+    {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
-    {"--startup-pixel-words", 8, 8, nullptr, kNoGate, run_startup_pixel_words},
+    {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
+    {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
+    {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
@@ -1454,7 +1726,10 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
+    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
+    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
     {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
+    {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},
@@ -1474,6 +1749,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
+    {"--mesh-heap-sampler", 6, 6, nullptr, kNoGate, run_mesh_heap_sampler},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
@@ -1503,6 +1779,7 @@ const OperationSpec kOperations[] = {
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
     {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
+    {"--dxr-slot70-as", 3, 3, nullptr, kNoGate, run_dxr_slot70_as},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
     {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},
@@ -1515,6 +1792,8 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-sampler-lod", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<false>},
+    {"--startup-sampler-lod-dropped", 3, 3, nullptr, kNoGate, run_startup_sampler_lod<true>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
     {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-range-provenance", 3, 3, nullptr, kNoGate, run_startup_range_provenance},
@@ -1695,6 +1974,22 @@ int run_self_test()
                                          expected_tmin, "effective opacity TMin");
     };
 
+    const auto check_extent = [&](const char* width, const char* height, CliAction action) {
+        return check_cli({"offscreen_check", "warp", "--startup-pixel-words", "vs", "ps", width, height, "ref"}, action);
+    };
+    if (!check_extent("1", "64", CliAction::operation) || !check_extent("08", "+4", CliAction::operation)) return 1;
+    for (const char* bad : {"", "8x4", "4junk", "4.5", "0", "65", "-1", "999999999999999999999"}) {
+        if (!check_extent(bad, "4", CliAction::usage_error) || !check_extent("8", bad, CliAction::usage_error)) return 1;
+    }
+    const auto check_raster = [&](const char* width, const char* cull, const char* winding, CliAction action) {
+        return check_cli({"offscreen_check", "warp", "--raster-reference", "vs", "ps", width, "4", "ref",
+                          cull, winding}, action);
+    };
+    if (!check_raster("8", "back", "ccw", CliAction::operation) ||
+        !check_raster("8x4", "none", "cw", CliAction::usage_error) ||
+        !check_raster("8", "both", "cw", CliAction::usage_error) ||
+        !check_raster("8", "front", "left", CliAction::usage_error)) return 1;
+
     for (const char* op : {"--dxr-opacity", "--dxr-opacity-pipeline"}) {
         if (!check_cli({"offscreen_check", "warp", op}, CliAction::operation, {}, 0.25f) ||
             !check_cli({"offscreen_check", "warp", op, "--tmin", "0"}, CliAction::operation, {}, 0.0f) ||
@@ -1730,6 +2025,9 @@ int run_self_test()
         return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-ballot")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--check-pixel-pairs", "a.cso", "a.case", "b.cso"},
+                   CliAction::usage_error, "Unknown GPU operation or invalid arguments: --check-pixel-pairs"))
+        return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,

@@ -56,6 +56,9 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "fxc ps: /home/alice/secret/shader.hlsl(1,1): error X3000 at 0x00007ff712345678\n",
             encoding="utf-8",
         )
+        # A device slot 67 compute request with the same reason is counted in its own class.
+        (cache_dir / "0000000000000004.fail").write_text("image_load_mip tfe\n", encoding="utf-8")
+        (cache_dir / "req_0000000000000004.c67").write_bytes(b"\0" * 4)
 
         report = triage_run.triage_run(logdir, shader_cache=cache_dir, max_items=16)
 
@@ -73,6 +76,7 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 2 | `slot5` | `0x80004005` |",
             "| 1 | `persistent_local_storage` | `0x80070005` |",
             "| 2 | `image_load_mip tfe` |",
+            "| 1 | `compute: image_load_mip tfe` |",
             f"| 1 | `{triage_run.OTHER}` |",
         ]
         for snippet in expected_snippets:
@@ -198,8 +202,16 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
         ("unsupported memory SRV arguments", "null_address"),
         ("unsupported memory SRV arguments", "unsupported_description"),
         ("unsupported memory SRV arguments", "destination_outside_view_heaps"),
+        ("GPU-written resource at the supplied address", "gpu_written_resource"),
         ("unavailable buffer at the supplied address", "buffer_unavailable"),
         ("unavailable texture at the supplied base and layout", "texture_unavailable"),
+        ("unavailable texture at the supplied base and layout", "partial_tile_xg_rows"),
+        ("unavailable texture at the supplied base and layout", "partial_tile_beyond_xg_size"),
+        ("unavailable texture at the supplied base and layout", "unsupported_desktop_format"),
+        ("unavailable texture at the supplied base and layout", "console_layout_xg_rows"),
+        ("unavailable texture at the supplied base and layout", "console_layout_without_footprints"),
+        ("unavailable texture at the supplied base and layout", "console_layout_beyond_xg_size"),
+        ("unavailable texture at the supplied base and layout", "overlapping_resource"),
     ]
     reasons = [reason for _, reason in cases]
     lines = [
@@ -501,6 +513,98 @@ def check_every_shader_reason_entry_is_reachable(failures: list[str]) -> None:
     if triage_run.classify_shader_reason("a reason nobody modelled") != triage_run.OTHER:
         failures.append("an unmodelled reason did not fall back to the other token")
 
+def check_indirect_outcomes(failures: list[str]) -> None:
+    initial = (
+        "x2w-render indirect: forwarded: draw 2; refused graphics-pipeline: dispatchmesh 5; "
+        "compute-pipeline: dispatch 3; placeholder-signature: drawindexed 1; other: other 1"
+    )
+    later = initial.replace("dispatchmesh 5", "dispatchmesh 12")
+    older = initial.replace("dispatchmesh 5", "dispatchmesh 4")
+    invalid = (
+        later.replace("other: other 1", r"other: C:\Users\alice\secret.exe"),
+        later.replace("draw 2", "draw 2 draw 99"),
+        later.replace("dispatchmesh 12", "dispatchmesh 99999999999999999999"),
+        later.replace("dispatchmesh 12", "dispatchmesh -99"),
+        later.replace("; other: other 1", ""),
+        later.replace("forwarded: draw 2", "forwarded: draw 2 dispatchmesh 0x00007ff712345678"),
+    )
+    zero = (
+        "x2w-render indirect: forwarded: 0; refused graphics-pipeline: 0; "
+        "compute-pipeline: 0; placeholder-signature: 0; other: 0"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "stderr.txt").write_text("\n".join((initial, later, later, *invalid)), encoding="utf-8")
+        (root / "trap.log").write_text(initial + "\n" + older + "\n", encoding="utf-8")
+        report = triage_run.triage_run(root)
+        expected = (
+            "### `ExecuteIndirect` Outcomes",
+            "| forwarded | 0 | 0 | 2 | 0 | 0 |",
+            "| refused graphics-pipeline | 0 | 0 | 0 | 0 | 12 |",
+            "| compute-pipeline | 0 | 3 | 0 | 0 | 0 |",
+            "| placeholder-signature | 0 | 0 | 0 | 1 | 0 |",
+            "| other | 1 | 0 | 0 | 0 | 0 |",
+        )
+        for snippet in expected:
+            if snippet not in report:
+                failures.append(f"missing indirect summary line: {snippet!r}")
+        for secret in ("alice", "secret.exe", "0x00007ff712345678"):
+            if secret in report:
+                failures.append(f"indirect summary copied private text: {secret!r}")
+        log = root / "stderr.txt"
+        log.write_text(zero + "\n", encoding="utf-8")
+        if "| forwarded | 0 | 0 | 0 | 0 | 0 |" not in triage_run.triage_run(log):
+            failures.append("a complete zero snapshot was not reported")
+        log.write_text("\n".join(invalid), encoding="utf-8")
+        if "### `ExecuteIndirect` Outcomes" in triage_run.triage_run(log):
+            failures.append("a malformed snapshot produced an indirect summary")
+
+
+def check_gpu_memory_budget(failures: list[str]) -> None:
+    def sample(local, texture):
+        return (
+            f'x2w-budget local={local} nonlocal=2/8 placed=10000/2+20000/3 texture={texture} '
+            'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0'
+        )
+
+    high_usage = sample("2500/3000", "100/5+40/2")
+    high_ratio = sample("1800/1000", "150/7+50/3")
+    high_retained = sample("n/a", "250/8+900/40").replace("nonlocal=2/8", "nonlocal=n/a")
+    malformed = (
+        sample("4000/1", "500/7+950/4").replace(" unmeasured=0", ""),
+        sample("9000/1", "900/1+999/1").replace(" buffer=1/1+0/0", r" buffer=C:\Users\alice"),
+        sample("9000/1", "900/1+999/1") + " path=secret.exe",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        log = root / "stderr.txt"
+        samples = (high_usage, high_ratio, sample("2100/1800", "170/8+80/4"), high_retained,
+                   sample("5000/0", "300/9+10/3"), sample("1000/1000", "90/6+20/1"), *malformed)
+        log.write_text("\n".join(samples), encoding="utf-8")
+        (root / "trap.log").write_text(high_ratio + "\n", encoding="utf-8")
+        report = triage_run.triage_run(root)
+        for snippet in (
+            "### GPU Memory Budget",
+            "Complete samples: `6`",
+            "Samples above local budget: `2` of `4`",
+            "| Highest local usage-to-budget ratio | 1800 | 1000 | 150 | 50 | 3 |",
+            "| Most retained texture bytes | n/a | n/a | 250 | 900 | 40 |",
+        ):
+            if snippet not in report:
+                failures.append(f"missing memory budget line: {snippet!r}")
+        for private in ("alice", "secret.exe"):
+            if private in report:
+                failures.append(f"memory budget copied private text: {private!r}")
+        log.write_text("\n".join(malformed), encoding="utf-8")
+        if "### GPU Memory Budget" in triage_run.triage_run(log):
+            failures.append("incomplete or malformed budget rows produced a section")
+        log.write_text(high_retained, encoding="utf-8")
+        report = triage_run.triage_run(log)
+        if "Highest local usage-to-budget ratio" in report or "Most retained texture bytes" not in report:
+            failures.append("an unavailable DXGI budget hid the retained-texture sample or produced a ratio")
+
+
 def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
@@ -510,6 +614,8 @@ def main() -> int:
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
     check_slot133_outcomes(failures)
+    check_indirect_outcomes(failures)
+    check_gpu_memory_budget(failures)
     check_run_endpoint(failures)
     check_every_shader_reason_entry_is_reachable(failures)
     for item in failures:

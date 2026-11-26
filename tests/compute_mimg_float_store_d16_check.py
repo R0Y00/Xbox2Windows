@@ -108,9 +108,6 @@ def reference():
 
 
 def draw(directory, compiler, renderer, adapter, source):
-    hlsl, cso, case = (directory / f"image-d16.{ext}" for ext in ("hlsl", "cso", "case"))
-    payload = reference()
-    case.write_bytes(struct.pack(f"<2I{len(payload)}H", GROUPS | FLOAT16_TEXTURE_FLAG, 0, *payload))
     original = ", ".join(COMPONENTS)
     cases = (
         ("translated", source, 0, None),
@@ -125,8 +122,16 @@ def draw(directory, compiler, renderer, adapter, source):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("image_store\n", encoding="ascii")
-    for name, code, mismatches, first_mismatch in cases:
+    for name, code, mismatches, _ in cases:
         assert (code == source) == (mismatches == 0), name
+    return draw_cases(directory, compiler, renderer, adapter, reference(), cases)
+
+
+def draw_cases(directory, compiler, renderer, adapter, payload, cases):
+    """Compile each shader and compare the raw halves of all three mips."""
+    hlsl, cso, case = (directory / f"image-d16.{ext}" for ext in ("hlsl", "cso", "case"))
+    case.write_bytes(struct.pack(f"<2I{len(payload)}H", GROUPS | FLOAT16_TEXTURE_FLAG, 0, *payload))
+    for name, code, mismatches, first_mismatch in cases:
         hlsl.write_text(code, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, hlsl], check=True)
         result = subprocess.run([renderer, adapter, "--compute-texture-store-case", cso, case],

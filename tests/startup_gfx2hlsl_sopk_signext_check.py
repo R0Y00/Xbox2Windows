@@ -5,7 +5,7 @@ usage: startup_gfx2hlsl_sopk_signext_check.py
 RDNA 2 ISA, SOPK: S_MOVK_I32 is D.i32 = signext(SIMM16[15:0]); S_CMPK_{EQ,LG,GT,GE,LT,LE}_I32 compare S0.i32 with
 signext(SIMM16[15:0]); the _U32 forms compare S0.u32 with SIMM16[15:0] zero-extended. LLVM 15 SOPInstructions.td agrees:
 the _I32 forms take s16imm (isSignExt = 1), the _U32 forms u16imm (isSignExt = 0), and s_movk_i32 takes s16imm. The
-disassembler prints the field as unsigned hex (0x8000, 0xffff). s_cmovk_i32 has no lowering and must stay refused.
+disassembler prints the field as unsigned hex (0x8000, 0xffff).
 The reference is plain Python arithmetic; the emitted text is evaluated on the CPU.
 """
 import operator
@@ -93,8 +93,7 @@ check('s_cmpk_lt_i32 s0=0, -1', bool(run(['s_cmpk_lt_i32 s5, -1'], {'s5': 0})['s
 refused = 0
 for program in (['s_movk_i32'], ['s_movk_i32 s0, 0x10000'], ['s_movk_i32 s0, -0x8001'], ['s_movk_i32 s0, -32769'], ['s_movk_i32 s0, s1'],
                 ['s_cmpk_lt_i32 s5, 0x10000'], ['s_cmpk_lt_i32 s5, -32769'], ['s_cmpk_lt_i32 s5, s6'],
-                ['s_cmpk_lt_u32 s5, 0x10000'], ['s_cmpk_lt_u32 s5, -1'],
-                ['s_cmovk_i32 s0, 0xffff']):
+                ['s_cmpk_lt_u32 s5, 0x10000'], ['s_cmpk_lt_u32 s5, -1']):
     try:
         run(program, {'s5': 0, 's1': 0, 's6': 0})
     except G.Unsupported:

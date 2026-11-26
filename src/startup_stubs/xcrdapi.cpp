@@ -8,6 +8,7 @@
 #define X2W_TRAP_MODULE "XCRDAPI.dll"
 #define X2W_TRAP_MODULE_ID 4
 #include "startup_stubs/trap.h"
+#include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
@@ -159,6 +160,7 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     if (bytes == 0) return true;
     std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
     const std::uintptr_t end = cursor + bytes;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION info{};
@@ -177,8 +179,8 @@ static bool destination_writable(const void* destination, std::size_t bytes)
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
-// Status entries are skipped, and any unrelated request, submission boundary, or non-matching
-// source/offset ends the continuation chain.
+// Status entries and requests for unrelated files are skipped. In the same file, any non-matching
+// size, non-consecutive offset, or submission boundary ends the continuation chain (Refs #1136, #1144, #1198, #1214).
 static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission_id, u64 source, u64 offset,
                                             unsigned source_size, unsigned destination_size, std::size_t total_size)
 {
@@ -196,17 +198,22 @@ static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission
         }
         if (e.type != Entry::request) continue;
         const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
+        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
+        // Skip requests for other files (interleaving across unrelated files within one submission).
+        if (e_source != source) {
+            continue;
+        }
+        // For the same file, requests must strictly be compressed file requests continuing this sequence.
         if (!(e_options & 1) || (e_options & 0x400000)) {
             break;
         }
-        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
-        if (e_source != source || e_source_size != source_size || e_offset != expected) {
+        if (e_source_size != source_size || e_offset != expected) {
             break;
         }
         const u64 delta = expected - offset;
-        if (delta >= total_size) {
+        if (delta >= total_size || delta > UINT32_MAX) {
             break;
         }
         ids.push_back(e.id);
@@ -303,13 +310,17 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
 {
     char id[48];
     guid_text(riid, id, sizeof(id));
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!path) {
+        log("x2w-dstorage Factory::OpenFile path=(null) riid=%s -> E_INVALIDARG", id);
+        return E_INVALIDARG;
+    }
     HANDLE handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
     const DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : 0;
     log("x2w-dstorage Factory::OpenFile path=\"%ls\" riid=%s -> %s (err %lu)", path ? path : L"(null)", id,
         handle == INVALID_HANDLE_VALUE ? "fail" : "ok", error);
-    if (!out) return E_POINTER;
-    *out = nullptr;
     if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(error);
     auto* object = static_cast<FileObject*>(make(file));
     object->handle = handle;
@@ -355,8 +366,10 @@ long __stdcall factory_create_queue(Object*, const unsigned char* desc, const GU
     log("x2w-dstorage Factory::CreateQueue desc=[%s] name=\"%s\" riid=%s", bytes,
         name && x2w_local::readable(name, 1) ? name : "?", id);
     if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
     Object* object = make(queue);
-    object->capacity = desc ? *reinterpret_cast<const std::uint16_t*>(desc + 8) : 0;
+    object->capacity = *reinterpret_cast<const std::uint16_t*>(desc + 8);
     *out = object;
     return S_OK;
 }
@@ -373,9 +386,10 @@ void __stdcall file_close(Object* self)
 long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 {
     const BOOL ok = info && GetFileInformationByHandle(self->handle, info);
+    const DWORD error = ok ? 0 : GetLastError();  // before log(), whose Win32 calls overwrite it
     log("x2w-dstorage File::GetFileInformation -> %s size=0x%llx", ok ? "ok" : "fail",
         ok ? (static_cast<unsigned long long>(info->nFileSizeHigh) << 32) | info->nFileSizeLow : 0ull);
-    return ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    return ok ? S_OK : HRESULT_FROM_WIN32(error);
 }
 
 // Queue slot 3, EnqueueRequest(request*) by the PC numbering. Request layout from the title's builder
@@ -451,6 +465,18 @@ StorageFailure read_failure_cause(const Object* file_object, u64 offset, u64 cou
     const bool known = file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
                        GetFileSizeEx(file_object->handle, &length) && length.QuadPart >= 0;
     return read_failure_cause(known, known ? static_cast<u64>(length.QuadPart) : 0, offset, count);
+}
+
+// The status HRESULT a failed request reports, by cause. A destination too small for the data and a
+// read at or past the end of the file are told apart; every other cause stays E_FAIL.
+HRESULT failure_result(StorageFailure cause) noexcept
+{
+    switch (cause) {
+    case StorageFailure::destination_capacity: return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    case StorageFailure::read_at_or_past_eof:
+    case StorageFailure::read_crossing_eof: return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+    default: return E_FAIL;
+    }
 }
 
 // The heartbeat's line of failure causes. It is a line of its own after the totals line, whose text
@@ -555,8 +581,56 @@ void log_bcpack_summary()
         format_counts(blank, sizeof(blank), bcpack_blank));
 }
 
+// Try to serve an identified continuation slice of an already-inflated chunked stream from the in-memory cache
+// (Refs #1136, #1144, #1198, #1214). Returns true if this request was matched as a continuation slice.
+static bool try_serve_cached_continuation(Object* self, u64 source, u64 offset, unsigned source_size,
+                                          unsigned destination_size, u64 entry_id,
+                                          std::vector<unsigned char>& output, std::size_t& decode_length,
+                                          const char*& outcome, StorageFailure& failure, const unsigned char*& data)
+{
+    if (!self || !self->work) return false;
+    QueueWork& work = *self->work;
+    const std::lock_guard guard(work.mutex);
+    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
+        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
+            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
+            if (pos != it->continuation_ids.end()) {
+                const u64 delta = offset - it->base_offset;
+                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
+                if ((delta % step) == 0 && delta < it->data.size() && delta <= UINT32_MAX) {
+                    const std::size_t available = it->data.size() - static_cast<std::size_t>(delta);
+                    if (destination_size > available) {
+                        outcome = "destination capacity exceeded";
+                        failure = StorageFailure::destination_capacity;
+                        data = nullptr;
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                    const std::size_t slice_size = destination_size < available ? destination_size : available;
+                    if (slice_size > 0) {
+                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
+                        decode_length = slice_size;
+                        data = output.data();
+                        outcome = "inflated (slice from stream cache)";
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
+    X2W_ZONE("DirectStorage request");
     if (!request) return;
     const u64 options = *reinterpret_cast<const u64*>(request);
     auto* const destination = *reinterpret_cast<unsigned char* const*>(request + 0x08);
@@ -585,6 +659,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
+    const unsigned char* data = nullptr;
+    std::size_t decode_length = source_size;
+    const std::size_t destination_capacity = destination_size;
+    bool written = false;
+
     if (options & ~known) {
         outcome = "unknown option bits, not done";
     } else if (!destination || !source_size) {
@@ -601,10 +680,6 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             failure = read_failure_cause(file_object, offset, source_size);
         }
     }
-    const unsigned char* data = nullptr;
-    std::size_t decode_length = source_size;
-    const std::size_t destination_capacity = destination_size;
-    bool written = false;
 
     if (input) {
         data = input;
@@ -612,19 +687,23 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
-                // With BCPack after it, the inflated size is not given; the destination size bounds it.
-                // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
-                // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
-                // so single-pass inflate succeeds and verifies Adler32, then check capacity before writing.
-                const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
-                std::size_t target_size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
-                if (bcpack) target_size = target_size * 2 + 0x10000;
+                // The public DSTORAGE_REQUEST layout has SourceSize at +0x30, IntermediateSize at +0x34 (the
+                // number of BCPack bytes when zlib and BCPack are both requested) and CancellationTag at
+                // +0x38. The tag is an arbitrary value, not a size, so no buffer is sized from it. A zlib-only
+                // request inflates to DestinationSize; with BCPack after it the inflated size is
+                // IntermediateSize, and the earlier destination-based bound is kept as the minimum.
+                const unsigned intermediate_size = *reinterpret_cast<const unsigned*>(request + 0x34);
+                std::size_t target_size = destination_size;
+                if (bcpack) {
+                    target_size = target_size * 2 + 0x10000;
+                    if (intermediate_size > target_size) target_size = intermediate_size;
+                }
                 output.resize(target_size);
                 std::size_t produced = 0;
                 bool ok = x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced);
                 if (!ok && output.size() < 0x80000) {
-                    // If destination_size was smaller than the uncompressed stream and uncompressed_size was unset,
-                    // expand up to 512 KiB to accommodate larger chunks.
+                    // If destination_size was smaller than the uncompressed stream, expand up to 512 KiB to
+                    // accommodate larger chunks.
                     std::size_t big_size = std::size_t{destination_size} * 8 + 0x40000;
                     if (big_size < 0x80000) big_size = 0x80000;
                     std::vector<unsigned char> big(big_size);
@@ -639,10 +718,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     output.resize(produced);
                     bool cached_chunked = false;
                     // If the stream expanded beyond this request's destination and continuation chunks are queued
-                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
+                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1144, #1198, #1214).
                     // BCPack streams are atomic multi-lane rANS payloads; they are not chunk-split continuation streams (Refs #1139).
                     if (!memory_source && !bcpack && produced > destination_size && self && self->work) {
-                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
+                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size,
+                                                                    destination_size, produced);
                         if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
                             const std::lock_guard guard(work.mutex);
@@ -668,37 +748,12 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             // slice of an already-inflated chunked stream on this queue (Refs #1136, #1144, #1214).
             // A request presenting a zlib header that failed decode (e.g. damaged checksum) is an actual
             // decode error and must stay distinct from a proven continuation. Memory requests stay strictly on direct decode.
-            if (!direct_decoded && !decode_error && !memory_source && self && self->work) {
+            if (!direct_decoded && !decode_error && !memory_source && !bcpack && destination && source_size && self && self->work) {
                 auto* file_object = reinterpret_cast<Object*>(source);
-                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE) {
-                    QueueWork& work = *self->work;
-                    const std::lock_guard guard(work.mutex);
-                    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
-                        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
-                            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
-                            if (pos != it->continuation_ids.end()) {
-                                const u64 delta = offset - it->base_offset;
-                                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
-                                if ((delta % step) == 0 && delta < it->data.size()) {
-                                    const std::size_t available = it->data.size() - delta;
-                                    // Handle short final destinations in multi-piece streams (Refs #1144)
-                                    const std::size_t slice_size = destination_size < available ? destination_size : available;
-                                    if (slice_size > 0 && destination_size <= available) {
-                                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
-                                        decode_length = slice_size;
-                                        data = output.data();
-                                        outcome = "inflated (slice from stream cache)";
-                                        direct_decoded = true;
-                                        it->continuation_ids.erase(pos);
-                                        if (it->continuation_ids.empty()) {
-                                            work.cached_streams.erase(it);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
+                    try_serve_cached_continuation(self, source, offset, source_size, destination_size, entry_id,
+                                                  output, decode_length, outcome, failure, data)) {
+                    direct_decoded = true;
                 }
             }
 
@@ -715,9 +770,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
+    }
+    if (input) {
         bool bcpack_decoded = false;
         if (data && bcpack) {
-            if (bcpack == 7 || bcpack == 1) {
+            if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
                 std::vector<unsigned char> decoded(destination_size);
                 std::size_t produced = 0;
                 if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
@@ -809,9 +866,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     }
     const bool empty = std::strcmp(outcome, "empty") == 0;
     const bool failed = (data == nullptr || !written) && !empty;
-    if (failed) count_failure(failure, self, request);
+    const HRESULT result = failure_result(failure);
+    if (failed) count_failure(failure, self, request, result);
     if (!empty) count_page_request(request, failed);
-    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(result));
     static LONG summaries, failures;
     if (x2w_local::first_calls(summaries, 12) || (failed && x2w_local::first_calls(failures, 12)))
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
@@ -1235,13 +1293,18 @@ void push(Object* self, Entry&& entry)
     start_worker(self, work);  // a failure shows at Submit
     bool recorded = false;
     bool full = false;
-    try {
+    {
         const std::lock_guard guard(work->mutex);
-        entry.id = ++work->next_entry_id;
-        work->waiting.push_back(std::move(entry));
-        recorded = true;
-        full = self->capacity && work->waiting.size() >= self->capacity;
-    } catch (const std::bad_alloc&) {
+        // The handler sits inside the lock's scope, like every other growth of these lists: a
+        // std::bad_alloc must not unwind through the guard (the MSVC build under test then leaves
+        // the mutex locked, and the next Submit throws std::system_error on its own lock).
+        try {
+            entry.id = ++work->next_entry_id;
+            work->waiting.push_back(std::move(entry));
+            recorded = true;
+            full = self->capacity && work->waiting.size() >= self->capacity;
+        } catch (const std::bad_alloc&) {
+        }
     }
     if (!recorded) {
         defer_unrecorded(self, entry);
@@ -1444,6 +1507,18 @@ MemorySample memory_sample() noexcept
     return sample;
 }
 
+// The heartbeat interval in ms: 10000 unless X2W_HEARTBEAT_INTERVAL_MS holds a whole number from 1000
+// to 10000. Only tests set it, to see a sample without waiting 10 s; anything else keeps the default.
+DWORD heartbeat_interval_ms() noexcept
+{
+    char text[16];
+    const DWORD length = GetEnvironmentVariableA("X2W_HEARTBEAT_INTERVAL_MS", text, sizeof(text));
+    if (length == 0 || length >= sizeof(text)) return 10000;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    return (*end == '\0' && value >= 1000 && value <= 10000) ? static_cast<DWORD>(value) : 10000;
+}
+
 }  // namespace
 
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
@@ -1464,8 +1539,10 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         MemorySample last_memory;
-        for (int second = 10;; second += 10) {
-            Sleep(10000);
+        const DWORD interval_ms = heartbeat_interval_ms();
+        for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
+            const int second = static_cast<int>(elapsed_ms / 1000);
+            Sleep(interval_ms);
             // Sample the counters once for every line of this report, even while the worker is reporting
             // new failures.
             StorageFailureCounts failure_counts;
