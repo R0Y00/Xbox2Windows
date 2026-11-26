@@ -9,11 +9,16 @@
 // buffers named by the hardware descriptors in its tables, textures behind view tokens) into an
 // upload ring / a private descriptor heap.
 
+#include "startup_stubs/typed_uav_load.h"
+
 // A pixel-stage image store (#1996 item F): tools/startup/gfx2hlsl.py writes 'uav N tex2d table P O' for the
 // RWTexture2D<float4> at u<N>, whose descriptor is at byte O of the title's root table P. Only that form is
-// read; a view qualifier or a 'channels' field, as in the compute line, is refused.
+// read; a view qualifier or a 'channels' field, as in the compute line, is refused. A trailing 'typedload'
+// means the binding must also support a typed UAV load. The translator does not emit it for a component
+// store, which does not read the texel.
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
+    bool needs_typed_load = false;
 };
 constexpr unsigned pixel_uav_limit = 8;
 
@@ -38,9 +43,10 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     if (w.size() > 3 && (w[3] == "float" || w[3] == "uint" || w[3] == "sint")) return "a view qualifier is not read for pixel stores";
     if (w.size() < 4 || w[3] != "table") return "view source is not a table";
     if (w.size() < 6) return "missing table parameter or offset";
-    if (w.size() > 6) return "unexpected field after the table offset";
+    if (w.size() > 7 || (w.size() == 7 && w[6] != "typedload")) return "unexpected field after the table offset";
     if (!number(w[4], out.parameter) || out.parameter >= 16) return "table parameter out of range";
     if (!number(w[5], out.offset)) return "malformed table offset";
+    out.needs_typed_load = w.size() == 7;
     return nullptr;
 }
 
@@ -88,7 +94,8 @@ bool srgb_uav_format(DXGI_FORMAT format)
 // own view (nullptr when it passed none) with console format values already mapped. Returns nullptr and fills
 // out, or the reason the binding is refused.
 const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
-                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
+                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, D3D12_UNORDERED_ACCESS_VIEW_DESC& out,
+                           bool needs_typed_load = false)
 {
     if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "resource is not a 2D texture";
     if (resource.DepthOrArraySize != 1) return "resource is a texture array";
@@ -108,6 +115,17 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
         !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
         return "format has no typed UAV store on this device";
+    // Before the view is filled, and therefore before the draw. A component store does not set
+    // needs_typed_load: it never reads the texel. A binding that does is refused when this device
+    // cannot load the format.
+    if (needs_typed_load) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        const bool additional = SUCCEEDED(device->CheckFeatureSupport(
+                                    D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+                                options.TypedUAVLoadAdditionalFormats;
+        if (const char* load = typed_uav_load_refusal(format, support.Support2, additional))
+            return load;
+    }
     out = {};
     out.Format = format;
     out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -2080,7 +2098,8 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, out[i].view);
+        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, out[i].view,
+                                            uav.needs_typed_load);
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))

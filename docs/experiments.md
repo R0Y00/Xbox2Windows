@@ -4405,6 +4405,34 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hardware)$' -V
 ```
 
+### Pixel-stage sparse image stores
+
+A pixel-stage 2D `image_store` with a partial DMASK writes only the selected
+components. `dmask:0x5` lowers to `w0[uint2(v0, v1)].xz = float2(...)`. The
+store does not read the texel, so two invocations can update disjoint channels
+of one texel without writing the other invocation's stale channels back. A
+float4 read-modify-write is not used. Compute stores, D16 stores and array
+stores still require `dmask:0xf`.
+
+The source-built fixture draws two pixels in one pass. Both address texel
+(1, 2). One invocation stores x (`dmask:0x1`, 1.0) and the other stores z
+(`dmask:0x4`, 2.0). The image starts at -1 in every channel, so the texel
+must read back (1, -1, 2, -1) and every other texel must stay -1. Writing the
+second value into y instead of z must mismatch. A manifest line that ends in
+`typedload` is refused before the draw when the format has no typed UAV load.
+The component store does not ask for that load.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_pixel_image_store' -V
+```
+
+```bash
+python3 -B tests/startup_pixel_image_store_check.py
+python3 -B tests/startup_pixel_image_store_check.py binary llvm-mc-15
+```
+
+Refs #2618.
+
 ### gfx1013 2D float image stores and mip loads
 
 The fixed compute profile accepts a 2D `R32G32B32A32_FLOAT` `image_store`

@@ -7415,16 +7415,18 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute, a full 2D-array texel.
+        """Write a 2D texel, or for compute a full 2D or 2D-array texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
         the image descriptor; the channels selected by DMASK are written in order from consecutive VDATA
-        registers. HLSL's typed UAV store writes every channel of the view, so only DMASK 0xf is exact here;
-        a partial mask would need a read-modify-write and is refused. The data is stored as float4, so the
-        bound view must be of a float or normalized format (the runtime side is not part of this lowering).
-        The store runs under the lane's exec bit, like the other per-lane writes, and D3D drops UAV writes
-        from helper lanes as the hardware drops them for lanes outside exec.
+        registers. A full DMASK 0xf is a direct float4 assignment. A partial pixel-stage mask writes only
+        those components (a swizzle store). It does not read the texel: a float4 read-modify-write would
+        store every channel, so two invocations that hit one texel with disjoint masks can put stale
+        values back, and the load needs a typed-UAV-load format. Compute, D16 and array stores still
+        require DMASK 0xf. The bound view must be a float or normalized format (the runtime side is not
+        part of this lowering). The store runs under the lane's exec bit, and D3D drops UAV writes from
+        helper lanes as the hardware drops them for lanes outside exec.
         """
         name = 'image_store'
         if self.kind not in ('ps', 'cs'):
@@ -7449,12 +7451,15 @@ class Stage:
             mask = int(masks[0], 0)
         except ValueError:
             raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
-        if mask != 0xf:
+        # Pixel 2D only. Compute, D16 and arrays keep the full-mask store.
+        sparse = self.kind == 'ps' and not array and not d16 and 0 < mask <= 0xf and mask != 0xf
+        if not sparse and mask != 0xf:
             raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
         data = reg_range(ops[0])
-        count = 2 if d16 else 4
+        count = bin(mask).count('1') if sparse else (2 if d16 else 4)
         if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
-            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], 'two' if d16 else 'four'))
+            raise Unsupported('%s data %s: %s VGPRs expected' % (
+                name, ops[0], 'two' if d16 else ('four' if count == 4 else str(count))))
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -7472,15 +7477,22 @@ class Stage:
             key = self.fixed_table_image(ops[2], name)
         else:
             key = self.descriptor(ops[2])
+        image = self.pipe.uav(key, 'tex2da' if array else 'tex2d')
+        index = 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
         if d16:
             # RDNA 2 ISA §8.2.5: RG occupy VDATA, BA occupy VDATA+1, low half first.
             rgba = ['f16tof32(%s & 0xffffu), f16tof32(%s >> 16)' % (word, word) for word in words]
             value = 'float4(%s)' % ', '.join(rgba)
+            body = '%s[%s] = %s;' % (image, index, value)
+        elif sparse:
+            # Selected components only, in VDATA order. No texel read.
+            comps = [channel for bit, channel in enumerate('xyzw') if mask & (1 << bit)]
+            swizzle = ''.join(comps)
+            values = ', '.join('asfloat(%s)' % word for word in words)
+            rhs = values if len(comps) == 1 else 'float%d(%s)' % (len(comps), values)
+            body = '%s[%s].%s = %s;' % (image, index, swizzle, rhs)
         else:
-            value = 'asfloat(uint4(%s))' % ', '.join(words)
-        image = self.pipe.uav(key, 'tex2da' if array else 'tex2d')
-        index = 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
-        body = '%s[%s] = %s;' % (image, index, value)
+            body = '%s[%s] = asfloat(uint4(%s));' % (image, index, ', '.join(words))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):

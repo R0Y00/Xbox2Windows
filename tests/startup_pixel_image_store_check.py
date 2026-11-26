@@ -5,14 +5,18 @@ four distinct binary32 values, stores them with image_store ... dmask:0xf dim:SQ
 the same values to mrt0. The words were assembled by hand from the MIMG layout and are decoded back by
 tools/disasm_rdna2.py here; --llvm-mc reassembles the source and compares the words.
 
-A second program uses dmask:0x5 (x and z) so VDATA is two registers: the UAV starts at -1 in every
-channel, the store writes 1.0 and 2.0 into x and z, and y/w stay -1. That is the sparse-mask RMW the
-M200-01 I starter asks for.
+A second program uses dmask:0x5 (x and z) so VDATA is two registers. The lowering writes only those
+components. It does not read the texel. The UAV starts at -1 in every channel, so y and w stay -1.
+
+A third program draws two pixels in one pass. Both address texel (1, 2). The pixel at x=0 stores channel
+x (dmask:0x1, 1.0) and the pixel at x=1 stores channel z (dmask:0x4, 2.0). Both updates must survive.
+Writing the second value into y instead of z is the negative control.
 
 Without arguments: translation controls and refusals. With draw: also compile the translation with DXC and
 draw it through offscreen_check --startup-image-store, which reads every texel of a 4x4 image back. Negative
 controls: the translator refuses the program when the lowering is removed, and the translated shader with
-its store deleted, or with x and y exchanged, leaves texel (1, 2) at its starting value.
+its store deleted, or with x and y exchanged, leaves texel (1, 2) at its starting value. A binding that
+asks for a typed UAV load is refused before the draw when the format cannot load.
 
 The store runs under the lane's exec bit. Two variants put v_cmpx_eq_u32 before the store, so exec is not
 known at translation time: with 1 == v0 the lane stays on and the texel is written, with 2 == v0 every lane
@@ -56,10 +60,36 @@ PREFIX = bytes.fromhex('04040cf4000000fa' '8102007e' '8202027e' 'f202087e' 'f402
 SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050607' '000081bf')
 WORDS = PREFIX + STORE + SUFFIX
 WORDS_XZ = PREFIX + STORE_XZ + SUFFIX
+# Two pixels, one texel. Packed position is v0 (SPI input bit 15). The pixel whose x is 0 stores
+# channel x; the pixel whose x is 1 stores channel z. Both write texel (1, 2).
+SOURCE_LANES = """\
+v_cmp_eq_u32_e32 0, v0
+v_mov_b32_e32 v2, 1
+v_cndmask_b32_e32 v3, 0, v2
+v_mov_b32_e32 v0, 1
+v_mov_b32_e32 v1, 2
+v_mov_b32_e32 v4, 1.0
+v_mov_b32_e32 v6, 2.0
+s_load_dwordx8 s[16:23], s[8:9], 0x0
+s_waitcnt lgkmcnt(0)
+v_cmpx_eq_u32_e32 1, v3
+image_store v4, v[0:1], s[16:23] dmask:0x1 dim:SQ_RSRC_IMG_2D
+s_mov_b64 exec, -1
+v_cmpx_eq_u32_e32 0, v3
+image_store v6, v[0:1], s[16:23] dmask:0x4 dim:SQ_RSRC_IMG_2D
+s_waitcnt vmcnt(0)
+exp mrt0 v4, v4, v6, v6 done vm
+s_endpgm
+"""
+WORDS_LANES = bytes.fromhex(
+    '8000847d' '8102047e' '80040602' '8102007e' '8202027e' 'f202087e' 'f4020c7e'
+    '04040cf4000000fa' '7fc08cbf' '8106a47d' '080120f000040400' 'c104febe' '8006a47d'
+    '080420f000060400' '703f8cbf' '0f1800f804040606' '000081bf')
+LANE_X = 'if (exec & 1) w0[uint2(v0, v1)].x = asfloat(v4);'
+LANE_Z = 'if (exec & 1) w0[uint2(v0, v1)].z = asfloat(v6);'
 STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
-# Init -1: after xz store, texel is (1.0, -1.0, 2.0, -1.0).
-SPARSE_LINE = ('t = w0[uint2(v0, v1)]; t.x = asfloat(v4); t.z = asfloat(v5); '
-               'w0[uint2(v0, v1)] = t;')
+# Init -1: an xz component store leaves the texel at (1.0, -1.0, 2.0, -1.0). No texel read.
+SPARSE_LINE = 'w0[uint2(v0, v1)].xz = float2(asfloat(v4), asfloat(v5));'
 GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
 SPARSE_BITS = ['3f800000', 'bf800000', '40000000', 'bf800000']  # 1.0, -1.0, 2.0, -1.0
 
@@ -76,6 +106,11 @@ EXEC_OFF = PREFIX + cmpx_eq(2) + STORE + SUFFIX  # v0 is 1: every lane is turned
 
 def translate(words):
     return G.Pipeline(VS_WORDS, words, root_blob())
+
+
+def translate_lanes(words):
+    # SPI_PS_INPUT bit 15 alone: the packed position occupies v0.
+    return G.Pipeline(VS_WORDS, words, root_blob(), ps_hw_inputs=(0x8000, 0x8000))
 
 
 def refused(words, *needles):
@@ -129,20 +164,27 @@ def controls():
         message = refused(with_store(store), 'image_store')
         print('refused %-20s %s' % (name + ':', message))
         assert decoded.startswith('image_store'), decoded
-    # Sparse DMASK: channels selected by the mask are written in order from consecutive VDATA registers.
-    # The UAV starts at -1; dmask:0x5 with v[4:5] = (1.0, 2.0) yields (1, -1, 2, -1).
+    # Sparse DMASK: selected components only, in VDATA order. The UAV starts at -1; dmask:0x5 with
+    # v[4:5] = (1.0, 2.0) yields (1, -1, 2, -1) without reading the texel.
     decoded_xz = D.decode_instruction(STORE_XZ, 0)[2]
     assert decoded_xz == 'image_store v[4:5], v[0:1], s[16:23] dmask:0x5 dim:SQ_RSRC_IMG_2D', decoded_xz
     sparse_ps = translate(WORDS_XZ).hlsl_ps()
     assert '    ' + SPARSE_LINE in sparse_ps, sparse_ps
+    assert 't = w0[' not in sparse_ps, sparse_ps
+    assert 'typedload' not in translate(WORDS_XZ).manifest()
     print('sparse dmask 0x5: %s' % SPARSE_LINE)
+    partial = {
+        0x7: 'w0[uint2(v0, v1)].xyz = float3(asfloat(v4), asfloat(v5), asfloat(v6));',
+        0x1: 'w0[uint2(v0, v1)].x = asfloat(v4);',
+        0x3: 'w0[uint2(v0, v1)].xy = float2(asfloat(v4), asfloat(v5));',
+    }
     for mask, data, count in ((0x7, 'v[4:6]', 3), (0x1, 'v4', 1), (0x3, 'v[4:5]', 2)):
         store = patched(1, 0, mask)
         decoded = D.decode_instruction(store, 0)[2]
         assert decoded.startswith('image_store %s, ' % data) and 'dmask:%#x' % mask in decoded, decoded
         text = translate(with_store(store)).hlsl_ps()
-        store_line = next(line for line in text.splitlines() if 't = w0[uint2(v0, v1)];' in line)
-        assert store_line.count('t.') == count, (mask, store_line)
+        assert '    ' + partial[mask] in text, (mask, text)
+        assert 't = w0[' not in text, text
         print('sparse dmask %#x accepted (%d channel(s))' % (mask, count))
     # Wrong VGPR count for a sparse mask is refused for the data, not the mask.
     try:
@@ -217,6 +259,29 @@ def controls():
     assert GUARDED_LINE not in translate(WORDS).hlsl_ps()
     print('exec after v_cmpx: %s' % GUARDED_LINE)
 
+    # Same texel, disjoint masks: two invocations write x and z, and neither store reads the texel.
+    lanes = translate_lanes(WORDS_LANES).hlsl_ps()
+    assert 'v0 = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' in lanes, lanes
+    assert '    ' + LANE_X in lanes and '    ' + LANE_Z in lanes, lanes
+    assert 't = w0[' not in lanes and 'typedload' not in translate_lanes(WORDS_LANES).manifest(), lanes
+    swapped = lanes.replace(LANE_Z, LANE_Z.replace('.z = asfloat(v6)', '.y = asfloat(v6)'))
+    assert swapped != lanes and '.z = asfloat(v6)' not in swapped
+    print('same texel: %s and %s' % (LANE_X, LANE_Z))
+    print('control: swapping the z store onto y changes the lowering')
+
+    # A binding that asks for a typed load is refused in pixel_uav_view, before the view is filled.
+    # The translator does not emit that request for a component store.
+    draw_inl = (HERE.parent / 'src/startup_stubs/d3d12_draw.inl').read_text(encoding='utf-8')
+    view = draw_inl.split('const char* pixel_uav_view', 1)[1].split('\nstruct Translation', 1)[0]
+    assert 'needs_typed_load' in view and 'typed_uav_load_refusal' in view, view
+    assert view.find('typed_uav_load_refusal') < view.find('out.Format = format'), view
+    parser = draw_inl.split('const char* read_pixel_uav_line', 1)[1].split('\nbool float_uav_format', 1)[0]
+    assert 'typedload' in parser and 'needs_typed_load' in parser, parser
+    store_cpp = (HERE / 'startup_image_store.cpp').read_text(encoding='utf-8')
+    gate = store_cpp.split('check_startup_image_store_typed_load', 1)[1]
+    assert 'DrawInstanced' not in gate and 'typed_uav_load_refusal' in gate, gate
+    print('typed UAV load is refused before the view is filled and before any draw')
+
     # Negative control: without the lowering the program is refused as before.
     lowering = G.Stage.op_image_store
     del G.Stage.op_image_store
@@ -228,9 +293,10 @@ def controls():
 
 
 def check_binary(llvm_mc):
-    built = assemble(llvm_mc, SOURCE)
-    if built != WORDS:
-        raise AssertionError('assembled %s, recorded %s' % (built.hex(), WORDS.hex()))
+    for name, source, words in (('full mask', SOURCE, WORDS), ('same texel', SOURCE_LANES, WORDS_LANES)):
+        built = assemble(llvm_mc, source)
+        if built != words:
+            raise AssertionError('%s fixture: assembled %s, recorded %s' % (name, built.hex(), words.hex()))
     print('fixture words match llvm-mc')
 
 
@@ -246,10 +312,12 @@ def check_draw(dxc, renderer, adapter):
         directory = Path(tmp)
         vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'fullscreen', 'vs_6_0', directory)
 
-        def draw(text, label, want=expected):
+        def draw(text, label, want=expected, coverage=None):
             ps = compile_hlsl(dxc, 'dxc', text, label, 'ps_6_0', directory)
-            return subprocess.run([renderer, adapter, '--startup-image-store', str(vs), str(ps), '1,2', want],
-                                  capture_output=True, text=True)
+            command = [renderer, adapter, '--startup-image-store', str(vs), str(ps), '1,2', want]
+            if coverage is not None:
+                command.append(str(coverage))
+            return subprocess.run(command, capture_output=True, text=True)
 
         run = draw(source, 'store')
         sys.stdout.write(run.stdout)
@@ -293,7 +361,7 @@ def check_draw(dxc, renderer, adapter):
         if run.returncode:
             raise AssertionError('sparse store draw failed\n%s\n%s' % (run.stdout, run.stderr))
         print('draw sparse dmask 0x5: texel (1, 2) = %s' % sparse_want)
-        # Control: writing all four channels instead of the RMW must mismatch on y and w.
+        # Control: writing all four channels instead of the selected components must mismatch on y and w.
         full_instead = sparse_source.replace(SPARSE_LINE, STORE_LINE)
         assert full_instead != sparse_source
         run = draw(full_instead, 'sparse_as_full', sparse_want)
@@ -301,6 +369,35 @@ def check_draw(dxc, renderer, adapter):
         if run.returncode == 0 or needle not in run.stderr:
             raise AssertionError('control sparse-as-full was not detected\n%s\n%s' % (run.stdout, run.stderr))
         print('control sparse-as-full: fails as expected (%s)' % mismatch_line(run.stderr))
+
+        # Two invocations, one draw, one texel, disjoint masks. Both component writes must survive.
+        lanes = translate_lanes(WORDS_LANES).hlsl_ps()
+        assert LANE_X in lanes and LANE_Z in lanes, lanes
+        assert 't = w0[' not in lanes, lanes
+        run = draw(lanes, 'same_texel', sparse_want, coverage=2)
+        if run.returncode:
+            raise AssertionError('same-texel draw failed\n%s\n%s' % (run.stdout, run.stderr))
+        print('draw same texel disjoint masks: texel (1, 2) = %s' % sparse_want)
+        # Negative control: the z store written into y must mismatch.
+        swapped = lanes.replace(LANE_Z, LANE_Z.replace('.z = asfloat(v6)', '.y = asfloat(v6)'))
+        assert swapped != lanes and '.z = asfloat(v6)' not in swapped
+        run = draw(swapped, 'same_texel_y', sparse_want, coverage=2)
+        swapped_actual = '3f800000,40000000,bf800000,bf800000'  # (1, 2, -1, -1)
+        needle = 'texel_mismatch x=1 y=2 expected=%s actual=%s' % (sparse_want, swapped_actual)
+        if run.returncode == 0 or needle not in run.stderr:
+            raise AssertionError('control same-texel channel swap was not detected\n%s\n%s' % (run.stdout, run.stderr))
+        print('control same-texel channel swap: fails as expected (%s)' % mismatch_line(run.stderr))
+
+        refused_load = subprocess.run([renderer, adapter, '--startup-image-store-reject-load'],
+                                      capture_output=True, text=True)
+        if refused_load.returncode == 77:
+            sys.exit(77)
+        if refused_load.returncode == 0 or 'typed_uav_load_refused' not in refused_load.stderr:
+            raise AssertionError('typed UAV load was not refused before the draw\n%s\n%s' % (
+                refused_load.stdout, refused_load.stderr))
+        if 'image store:' in refused_load.stdout:
+            raise AssertionError('typed UAV load refusal drew\n%s' % refused_load.stdout)
+        print('typed UAV load refused before the draw')
 
 
 def main():

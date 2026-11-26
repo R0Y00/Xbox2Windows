@@ -2277,11 +2277,15 @@ These are measured on one executable; treat them as hypotheses for others.
   `dmask:0xf` becomes a typed store to a `RWTexture2D<float4>` at its own `u` register, under the
   lane's exec bit, and the manifest becomes version 2 with a
   `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
-  channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
-  `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads
-  and stores the same image are refused by name. A
-  hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
-  texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
+  pixel-stage DMASK writes only the selected components (`w0[uint2(x, y)].xz = ...`) and does not
+  read the texel, so two invocations can update disjoint channels of one texel. Compute stores, D16
+  stores and array stores still require `dmask:0xf`. An empty or out-of-range mask, other dimensions,
+  `d16`, `a16`, `tfe`, `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and
+  a program that loads and stores the same image are refused by name. A hand-assembled program stores
+  four distinct values at texel (1, 2). Another draws two pixels in one pass; both address that texel,
+  one with `dmask:0x1` and one with `dmask:0x4`, and both updates must survive. Writing the second
+  value into y instead of z must fail. The desktop draw reads all 16 texels of a 4x4 image back;
+  deleting the store or exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
 - **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d table P O` line
   as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
@@ -2290,11 +2294,14 @@ These are measured on one executable; treat them as hypotheses for others.
   with their reason and nothing is bound in place of the view. When the manifest is loaded, the
   translation is not used for another image kind, a buffer line (`uav N raw table P O`,
   the vertex-stage store of #2059), a view qualifier (`float`, `uint`, `sint`, as in the compute line), another source, extra fields such as
-  `channels`, an index out of order or more than eight views. At draw time,
+  `channels`, an index out of order or more than eight views. A trailing `typedload` is the one extra
+  word that is read: the binding must also support a typed UAV load. The translator does not emit it
+  for a component store, which does not read the texel. At draw time,
   the draw is not translated for no table at the parameter, an entry outside the bound table, an
   entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
   array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
-  sRGB or non-colour format, a format without typed UAV store, and a texture that is also an SRV,
+  sRGB or non-colour format, a format without typed UAV store, a `typedload` binding whose format has
+  no typed UAV load, and a texture that is also an SRV,
   a render target or the depth texture of the draw; these checks run before any view of the draw is
   written or any texture changes state. Indirect draws refuse a translation with a `uav` line. Compute UAVs and barriers between
   draws that write and read the same texture are not covered. `tests/startup_pixel_uav_check.py`
