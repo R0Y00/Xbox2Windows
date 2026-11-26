@@ -19,10 +19,14 @@ LINE = 'w0[uint2(v8, v9)] = asfloat(uint4(v14, v15, v16, v17));'
 # The 2D-array store (#2742) takes x, y and the layer in v8-v10 and needs no SRV read, so its four data
 # words are constants. The bound array has four layers and three mips: layer 1 is in the middle of the
 # range and layer 3 its last entry. tests/compute_check.cpp selects the layered RWTexture2DArray view.
+# The data words are not LLVM inline float constants: 0x40000000 (2.0) and 0x40800000 (4.0) would be
+# assembled as the four-byte inline form instead of the eight-byte literal below, so the values follow
+# the literal forms that tests/startup_image_2d_array_check.py and this fixture's own prologue already
+# pin against llvm-mc-15.
 ARRAY_STORE = bytes.fromhex('280f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY
 ARRAY_FLAG = 1 << 31  # tests/compute_check.cpp texture_array_flag
 ARRAY_LAYERS = 4
-ARRAY_VALUES = (0x40000000, 0x40400000, 0x40810000, 0xbf810001)
+ARRAY_VALUES = (0x3f400000, 0x3e800000, 0x40810000, 0xbf810001)
 ARRAY_LINE = 'w0[uint3(v8, v9, v10)] = asfloat(uint4(v14, v15, v16, v17));'
 ARRAY_PROLOGUE = bytes.fromhex(
     '07038cbe'                 # s_mov_b32 s12, s7
@@ -34,8 +38,8 @@ ARRAY_SLICE = {1: bytes.fromhex('8102147e'), 3: bytes.fromhex('8302147e')}  # v_
 ARRAY_END = bytes.fromhex('000081bf')  # s_endpgm
 ARRAY_DATA = bytes.fromhex(
     '7fc08cbf'                 # s_waitcnt lgkmcnt(0)
-    'ff021c7e00000040'         # v_mov_b32_e32 v14, 0x40000000
-    'ff021e7e00004040'         # v_mov_b32_e32 v15, 0x40400000
+    'ff021c7e0000403f'         # v_mov_b32_e32 v14, 0x3f400000
+    'ff021e7e0000803e'         # v_mov_b32_e32 v15, 0x3e800000
     'ff02207e00008140'         # v_mov_b32_e32 v16, 0x40810000
     'ff02227e010081bf')        # v_mov_b32_e32 v17, 0xbf810001
 ARRAY_SOURCE = """\
@@ -46,8 +50,8 @@ v_lshl_add_u32 v8, s10, 2, v0
 v_lshl_add_u32 v9, s11, 1, v1
 v_mov_b32_e32 v10, {layer}
 s_waitcnt lgkmcnt(0)
-v_mov_b32_e32 v14, 0x40000000
-v_mov_b32_e32 v15, 0x40400000
+v_mov_b32_e32 v14, 0x3f400000
+v_mov_b32_e32 v15, 0x3e800000
 v_mov_b32_e32 v16, 0x40810000
 v_mov_b32_e32 v17, 0xbf810001
 image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY
@@ -126,6 +130,10 @@ def controls(llvm_mc):
         assert expected[first:first + 4] == list(ARRAY_VALUES), expected[first:first + 4]
         changed = [i for i, (before, after) in enumerate(zip(initial, expected)) if before != after]
         assert len(changed) == 16 * 4 and changed[0] == first and changed[-1] == first + 128 + 31, changed[:1]
+    # An eight-byte literal is encoded only for a value LLVM does not take as an inline constant: a pattern
+    # such as 0x40000000 (2.0) or 0x40800000 (4.0) would assemble to the four-byte inline form instead, and
+    # only the --llvm-mc comparison would notice. Keep the hand-written data words clear of that table.
+    assert not set(ARRAY_VALUES) & set(G.D.INLINE_FLOAT_LITERALS), G.D.INLINE_FLOAT_LITERALS
     # The array address is exactly x, y and layer: a two- or four-register address is refused.
     array_mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY']
     for address in ('v[8:9]', 'v[8:11]'):
@@ -237,8 +245,8 @@ def dispatch(directory, compiler, renderer, adapter):
     # expected words carry the four VDATA constants at mip zero of that layer only. Storing one layer off
     # must change both the wrong subresource and the untouched target, so each control differs by 128 words.
     for layer, shift, needle in (
-        (1, '+ 1', 'mip=0 word=1344 expected=40000000 actual=bf001000'),
-        (3, '- 1', 'mip=0 word=2688 expected=bf002000 actual=40000000'),
+        (1, '+ 1', 'mip=0 word=1344 expected=3f400000 actual=bf001000'),
+        (3, '- 1', 'mip=0 word=2688 expected=bf002000 actual=3f400000'),
     ):
         initial, expected = array_reference(layer)
         source = array_pipeline(layer).hlsl_cs()
@@ -246,7 +254,7 @@ def dispatch(directory, compiler, renderer, adapter):
         cases = (
             ('layer %d, full EXEC' % layer, source, 0, None),
             ('layer %d, omit store' % layer, source.replace(ARRAY_LINE, ''), 64,
-             'mip=0 word=%d expected=40000000 actual=%08x'
+             'mip=0 word=%d expected=3f400000 actual=%08x'
              % (layer * 1344, 0xbf000000 | layer << 12)),
             ('layer %d, one layer off' % layer,
              source.replace('uint3(v8, v9, v10)', 'uint3(v8, v9, v10 %s)' % shift), 128, needle),
