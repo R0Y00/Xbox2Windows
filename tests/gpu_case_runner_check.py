@@ -5,7 +5,6 @@ tests/offscreen_check.cpp: a banner closed by the marker pair of case -1, then p
 "X2WCASE <i> <exit code>" on stdout. Its one-shot mode prints the same text, so the two paths can be compared.
 """
 import os
-import stat
 import subprocess
 import sys
 import tempfile
@@ -19,8 +18,8 @@ import gpu_case_runner as R  # noqa: E402
 
 FAKE = r'''
 import os, sys
-mode = os.environ.get("FAKE_MODE", "")
-adapter, args = sys.argv[1], sys.argv[2:]
+mode = sys.argv[1].split("=", 1)[1]
+adapter, args = sys.argv[2], sys.argv[3:]
 
 def one(args):
     """The text and exit code of one case, as the real tool prints them."""
@@ -73,16 +72,11 @@ sys.exit(code)
 
 
 def launcher(directory, name, mode):
+    """The renderer as an interpreter plus script, a direct child of the runner: killing it releases its pipes at once (a
+    .cmd or shell launcher in between would leave a sleeping grandchild holding them)."""
     fake = directory / 'fake_offscreen.py'
     fake.write_text(FAKE)
-    if os.name == 'nt':
-        path = directory / (name + '.cmd')
-        path.write_text('@echo off\r\nset FAKE_MODE=%s\r\n"%s" "%s" %%*\r\n' % (mode, sys.executable, fake))
-    else:
-        path = directory / name
-        path.write_text('#!/bin/sh\nFAKE_MODE=%s exec "%s" "%s" "$@"\n' % (mode, sys.executable, fake))
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
+    return [sys.executable, str(fake), '--mode=' + mode]
 
 
 class RunnerChecks(unittest.TestCase):

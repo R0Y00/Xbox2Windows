@@ -26,6 +26,12 @@ DEVICE_REMOVED = 'device removed during case'
 _servers = {}
 
 
+def _command(renderer):
+    """The renderer as a command prefix: a path, or a list such as an interpreter plus its script (a launcher in between would
+    keep the pipes open after the renderer is killed)."""
+    return [str(part) for part in renderer] if isinstance(renderer, (list, tuple)) else [str(renderer)]
+
+
 class _Lost(Exception):
     """The server did not answer the case it was sent."""
 
@@ -33,7 +39,7 @@ class _Lost(Exception):
 class _Server:
     def __init__(self, renderer, adapter):
         self.out, self.err = queue.Queue(), queue.Queue()
-        self.proc = subprocess.Popen([str(renderer), adapter, '--serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen([*_command(renderer), adapter, '--serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, bufsize=1)
         self.banner, self.banner_err, self.ready, self.returncode, self.stderr_text = '', '', False, None, ''
         self.next_case = 0
@@ -107,6 +113,10 @@ class _Server:
             raise _Lost('could not send the case: %s' % error)
         out, err = self._get(self.out, deadline), self._get(self.err, deadline)
         if out is None or err is None or out[1] is None or err[1] is None:
+            try:                                    # a dying process closes its pipes a moment before it can be reaped
+                self.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
             state = 'timed out after %d s' % CASE_TIMEOUT_S if self.proc.poll() is None else 'exited (code %s)' % self.proc.poll()
             raise _Lost('the renderer %s during the case' % state)
         if out[1] != index or err[1] != index:
@@ -155,7 +165,7 @@ def _failed(server, reason):
 
 def run(renderer, adapter, args):
     args = [str(a) for a in args]
-    key = (str(renderer), adapter)
+    key = (tuple(_command(renderer)), adapter)
     if not SERVER_OFF and '\t' not in ''.join(args) and '\n' not in ''.join(args):
         for _ in range(2):                          # a second start only when the first server was already gone before the case
             server = _servers.get(key)
@@ -183,4 +193,4 @@ def run(renderer, adapter, args):
             return result
         else:
             _servers[key] = False
-    return subprocess.run([str(renderer), adapter, *args], capture_output=True, text=True)
+    return subprocess.run([*_command(renderer), adapter, *args], capture_output=True, text=True)
