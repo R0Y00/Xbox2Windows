@@ -45,8 +45,8 @@ CASES = {
     'b': (1, 1, None, None),
     'missing': (4, None, 'uav 0 refused: table entry holds no view', None),
     'srv': (5, None, 'uav 0 refused: table entry is not an unordered-access view', None),
-    # The device skips a UAV over a resource without ALLOW_UNORDERED_ACCESS (#2649): no view is recorded, so the draw sees an empty entry.
-    'no-ua': (2, None, 'uav 0 refused: table entry holds no view', None),
+    # The device skips a UAV over a resource without ALLOW_UNORDERED_ACCESS and records it as not created, so the draw names the resource.
+    'no-ua': (2, None, 'uav 0 refused: resource lacks ALLOW_UNORDERED_ACCESS', None),
     'uint': (3, None, 'uav 0 refused: integer format for a float view', None),
     'mip1': (6, None, 'uav 0 refused: view names a mip other than 0', None),
     'array': (7, None, 'uav 0 refused: view is not a 2D texture view', None),

@@ -271,6 +271,9 @@ for size in (1, 33, 64):
     check(f'wave index of a group of {size} accepted', got[-1] == 's9 = v1;', repr(got))
 got = run(WAVE, 's_cbranch_scc0 label_0010', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(64, 1, 1))
 check('wave index read past the entry block recomputed as zero', got[-1] == 's9 = 0u;', repr(got))
+# v0 overwritten by a constant is no thread id: the shift of a uniform value is itself uniform (200 >> 6).
+got = run('v_mov_b32_e32 v0, 200', WAVE, READ1, kind='cs', group=(64, 1, 1))
+check('shift of an overwritten v0 is a uniform integer chain', got[-1] == 's9 = v1;' and 'v1 = v0 >> (0x00000006u & 31);' in got, repr(got))
 for label, instructions, kind, group in (
         ('wave index of a group of 65', (WAVE, READ1), 'cs', (65, 1, 1)),
         ('wave index of a group of 128', (WAVE, READ1), 'cs', (128, 1, 1)),
@@ -279,7 +282,6 @@ for label, instructions, kind, group in (
         ('wave index in a graphics stage', (WAVE, READ1), 'ps', (64, 1, 1)),
         ('wave index without a stage kind', (WAVE, READ1), None, (64, 1, 1)),
         ('wave index of v1', ('v_lshrrev_b32_e32 v1, 6, v1', READ1), 'cs', (64, 1, 1)),
-        ('wave index after v0 is overwritten', ('v_mov_b32_e32 v0, 200', WAVE, READ1), 'cs', (64, 1, 1)),
         ('wave index after v0 is loaded', ('buffer_load_dword v[0:1], off, s[4:7], s2', WAVE, READ1), 'cs', (64, 1, 1)),
         ('wave index after v0 is swapped', ('v_swap_b32 v2, v0', WAVE, READ1), 'cs', (64, 1, 1)),
         ('wave index with an output modifier', ('v_lshrrev_b32_e64 v1, 6, v0 clamp', READ1), 'cs', (64, 1, 1)),
@@ -306,6 +308,39 @@ for label, instructions, group in (
         ('thread id base rewritten after', (GID, 'v_add_nc_u32_e32 v0, s3, v0', WAVE, READ1), (64, 1, 1)),
         ('thread id base scaled by 32', ('v_lshl_add_u32 v0, s2, 5, v0', WAVE, READ1), (64, 1, 1))):
     got = run(*instructions, kind='cs', group=group)
+    check(f'{label} refused', got == REFUSAL, repr(got))
+
+# Only bits that survive both the field operation and the final shift may vary across threads.
+AND_OR = 'v_and_or_b32 v2, v0, 3, s2'
+EXTRACT = 'v_bfe_u32 v2, v0, 2, 3'
+SHIFT = 'v_lshrrev_b32_e32 v1, 2, v2'
+SHIFT1 = 'v_lshrrev_b32_e32 v1, 1, v2'
+for label, op, shift, size, expression in (
+        ('masked low bits of a large group', AND_OR, SHIFT, 128, '(s2 >> 2u)'),
+        ('mask above a non-power-of-two group', 'v_and_or_b32 v2, v0, 8, s2', SHIFT1, 7, '(s2 >> 1u)'),
+        ('extracted bit cleared by shift', EXTRACT, SHIFT1, 8, '0u'),
+        ('empty extracted field', 'v_bfe_u32 v2, v0, 0, 0', SHIFT1, 64, '0u'),
+        ('narrow field of a large group', 'v_bfe_u32 v2, v0, 1, 2', SHIFT, 128, '0u')):
+    got = run(op, shift, READ1, kind='cs', group=(size, 1, 1))
+    check(f'{label} accepted at entry', got[-1] == 's9 = v1;', repr(got))
+    got = run(op, shift, 's_cbranch_scc0 label_0014', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(size, 1, 1))
+    check(f'{label} recomputed past entry', got[-1] == f's9 = {expression};', repr(got))
+for label, instructions, size in (
+        ('surviving masked bit', (AND_OR, SHIFT1, READ1), 4),
+        ('surviving extracted bit', (EXTRACT, SHIFT1, READ1), 9),
+        ('variable mask', ('v_and_or_b32 v2, v0, s2, s2', SHIFT, READ1), 4),
+        ('vector OR source', ('v_and_or_b32 v2, v0, 3, v1', SHIFT, READ1), 4),
+        ('predicate as OR source', (COMPARE, AND_OR, SHIFT, READ1), 4),
+        ('scalar overwritten before shift', (AND_OR, 's_mov_b32 s2, 5', SHIFT, READ1), 4),
+        ('scalar overwritten before recompute', (AND_OR, SHIFT, 's_mov_b32 s2, 5', 's_cbranch_scc0 label_0018',
+                                                 READ1, 's_endpgm', 's_endpgm'), 4),
+        ('overwritten thread id', ('v_swap_b32 v1, v0', EXTRACT, SHIFT1, READ1), 8),
+        ('overwritten field', (EXTRACT, 'v_mov_b32_e32 v2, v0', SHIFT1, READ1), 8),
+        ('register field offset', ('v_bfe_u32 v2, v0, s2, 3', SHIFT1, READ1), 8),
+        ('register field width', ('v_bfe_u32 v2, v0, 2, s2', SHIFT1, READ1), 8),
+        ('signed field', ('v_bfe_i32 v2, v0, 2, 3', SHIFT1, READ1), 8),
+        ('unknown group for a masked field', (AND_OR, SHIFT, READ1), None)):
+    got = run(*instructions, kind='cs', group=(size, 1, 1) if size else None)
     check(f'{label} refused', got == REFUSAL, repr(got))
 
 # Older probes may provide either no tracker or only part of the tracking state.
@@ -337,6 +372,25 @@ try:
         check(f'control: {label} refused without tracking', got == REFUSAL, repr(got))
 finally:
     G.UNIFORM_VALU = original
+
+# A uniform VGPR used as both operands doubles its recomputation text each time: the text stays bounded (a chain of
+# 22 doublings would otherwise grow to megabytes per instruction). The entry-block read copies the VGPR, so it needs no
+# expression; only a read past the entry block recomputes, and past the limit that chain has none.
+DOUBLE = 'v_add_nc_u32_e32 v7, v7, v7'
+got = run(MOVE, *[DOUBLE] * 3, READ, kind='cs', group=(64, 1, 1))
+check('short doubling chain stays readable', isinstance(got, list) and got[-1] == 's9 = v7;', repr(got)[:200])
+stage = G.Stage.__new__(G.Stage)
+stage.pipe, stage.lines, stage.attrs = Pipe(), [], {}
+stage.pipe.group = (64, 1, 1)
+stage.sym = {4 + i: ('desc', ('table', 0), 0, i) for i in range(4)}
+stage.sym[3] = ('fixed_buffer_word',)
+stage.used_s, stage.used_v, stage.masks, stage.exec_known, stage.kind = set(), set(), set(), True, 'cs'
+stage.ins = [(4 * i, 4, a.split()[0], a) for i, a in enumerate([MOVE] + [DOUBLE] * 22)]
+stage.translate()
+longest = max(map(len, stage.uniform_expr.values()), default=0)
+check('long doubling chain keeps a bounded recompute expression', longest <= 2 * G.UNIFORM_EXPR_LIMIT, str(longest))
+got = run(MOVE, *[DOUBLE] * 22, READ, kind='cs', group=(64, 1, 1))
+check('entry-block read of a long doubling chain copies the VGPR', isinstance(got, list) and got[-1] == 's9 = v7;', repr(got)[:200])
 
 print('Readfirstlane uniformity checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)

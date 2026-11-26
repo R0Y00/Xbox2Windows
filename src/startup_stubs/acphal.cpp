@@ -18,13 +18,15 @@ using u64 = std::uint64_t;
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
 
-// APU heap: one committed region; an APU address is an offset into it. A table of extents, sorted by
-// offset, tiles [heap_start, heap_bytes) and each extent is free or used. Allocation is first-fit in
-// address order, so while nothing has been freed it hands out the same offsets a bump allocator would;
-// a freed extent is merged with free neighbours. The table is static: when it is full a request that
-// needs a split fails like an exhausted heap. All state is guarded by heap_lock.
+// APU heap: one reserved region committed on demand; an APU address is an offset into it. A table of
+// extents, sorted by offset, tiles [heap_start, heap_bytes) and each extent is free or used. Allocation
+// is first-fit in address order, so while nothing has been freed it hands out the same offsets a bump
+// allocator would; a freed extent is merged with free neighbours and whole freed pages are decommitted.
+// The table is static: when it is full a request that needs a split fails like an exhausted heap. All
+// state is guarded by heap_lock.
 constexpr u64 heap_start = 0x10000;  // APU address 0 stays unused
 constexpr u64 heap_max_bytes = 0x100000000ull;  // the APU address space: 4 GiB
+constexpr u64 page_size = 0x1000;
 constexpr std::size_t max_extents = 4096;
 struct Extent {
     u64 start, size;
@@ -80,19 +82,27 @@ unsigned char* heap_take(u64 bytes, u64 alignment)
         const u64 tail = e.size - pad - bytes;
         const std::size_t extra = (pad ? 1 : 0) + (tail ? 1 : 0);
         if (extent_count + extra > max_extents) continue;
+        const u64 block_start = e.start + pad;
+        const u64 block_end = block_start + bytes;
+        const u64 page_begin = block_start & ~(page_size - 1);
+        const u64 page_end = (block_end + page_size - 1) & ~(page_size - 1);
+        if (page_end > page_begin &&
+            !VirtualAlloc(heap_base + page_begin, static_cast<SIZE_T>(page_end - page_begin), MEM_COMMIT,
+                          PAGE_READWRITE)) {
+            break;
+        }
         std::memmove(&extents[i + 1 + extra], &extents[i + 1], (extent_count - i - 1) * sizeof(Extent));
         std::size_t at = i;
         if (pad) extents[at++] = {e.start, pad, false};
-        extents[at++] = {e.start + pad, bytes, true};
-        if (tail) extents[at] = {e.start + pad + bytes, tail, false};
+        extents[at++] = {block_start, bytes, true};
+        if (tail) extents[at] = {block_end, tail, false};
         extent_count += extra;
-        result = heap_base + e.start + pad;
-        const u64 end = e.start + pad + bytes;
-        if (e.start + pad < high_water) {
-            zero_from = e.start + pad;
-            zero_bytes = (end < high_water ? end : high_water) - zero_from;
+        result = heap_base + block_start;
+        if (block_start < high_water) {
+            zero_from = block_start;
+            zero_bytes = (block_end < high_water ? block_end : high_water) - zero_from;
         }
-        if (end > high_water) high_water = end;
+        if (block_end > high_water) high_water = block_end;
     }
     ReleaseSRWLockExclusive(&heap_lock);
     if (zero_bytes) std::memset(heap_base + zero_from, 0, static_cast<std::size_t>(zero_bytes));  // fresh pages are zero
@@ -121,10 +131,19 @@ bool heap_give(const void* virtual_address)
                 std::memmove(&extents[lo + 1], &extents[lo + 2], (extent_count - lo - 2) * sizeof(Extent));
                 --extent_count;
             }
+            std::size_t free_idx = lo;
             if (lo > 0 && !extents[lo - 1].used) {
                 extents[lo - 1].size += extents[lo].size;
                 std::memmove(&extents[lo], &extents[lo + 1], (extent_count - lo - 1) * sizeof(Extent));
                 --extent_count;
+                free_idx = lo - 1;
+            }
+            const u64 free_begin = extents[free_idx].start;
+            const u64 free_end = free_begin + extents[free_idx].size;
+            const u64 decommit_begin = (free_begin + page_size - 1) & ~(page_size - 1);
+            const u64 decommit_end = free_end & ~(page_size - 1);
+            if (decommit_end > decommit_begin) {
+                VirtualFree(heap_base + decommit_begin, static_cast<SIZE_T>(decommit_end - decommit_begin), MEM_DECOMMIT);
             }
             done = true;
         }
@@ -178,8 +197,8 @@ extern "C" __declspec(noinline) long ApuCreateHeap(u64 rcx, u64 rdx, u64 r8, u64
     if (!heap_base) {
         const u64 bytes = ((cached + non_cached) + 0xFFFF) & ~u64{0xFFFF};
         // The whole heap must be APU-addressable (offsets below 4 GiB), so every extent, tail included, is
-        // representable. A larger request is refused up front without committing memory.
-        void* memory = bytes > heap_max_bytes ? nullptr : VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        // representable. A larger request is refused up front without reserving or committing memory.
+        void* memory = bytes > heap_max_bytes ? nullptr : VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_READWRITE);
         if (bytes > heap_max_bytes) {
             hr = static_cast<long>(0x80070057);  // E_INVALIDARG
         } else if (memory) {

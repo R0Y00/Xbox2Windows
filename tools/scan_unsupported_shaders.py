@@ -310,14 +310,14 @@ if PIXEL_VOP3_INT16_TERNARY:
         rf"\s+{INT16_SOURCE},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
     )
 # 64-bit VOP3 shifts (issue #928): a VGPR-pair destination, a 32-bit amount (VGPR, SGPR, inline integer or
-# literal) and a 64-bit value (VGPR pair, SGPR pair or inline integer), with at most one SGPR or literal source.
+# literal) and a 64-bit value (VGPR pair, SGPR pair, inline integer or 32-bit hex literal), with at most one SGPR or literal source.
 # This matches syntax only; pixel_aot also checks the pair ranges and that the sources are tracked.
 SHIFT64_AMOUNT = r"(?:v\d+|-?\d+)"
 SHIFT64_VALUE = r"(?:v\[\d+:\d+\]|-?\d+)"
 SUPPORTED_INSTRUCTIONS_REGEX.append(
     r"v_(?:lshlrev_b64|lshrrev_b64|ashrrev_i64)(?:_e64)?\s+v\[\d+:\d+\],\s+"
     rf"(?:{SHIFT64_AMOUNT},\s+{SHIFT64_VALUE}|(?:s\d+|0x[0-9a-f]{{1,8}}),\s+{SHIFT64_VALUE}"
-    rf"|{SHIFT64_AMOUNT},\s+s\[\d+:\d+\])"
+    rf"|{SHIFT64_AMOUNT},\s+s\[\d+:\d+\]|{SHIFT64_AMOUNT},\s+0x[0-9a-f]{{1,8}})"
 )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
