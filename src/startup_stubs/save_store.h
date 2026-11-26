@@ -13,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -145,8 +146,13 @@ public:
     {
         if (update >= capacity || !updates_[update]) return false;
         if (action.data.size() > max_staged_bytes - staged_bytes_[update]) return false;
-        staged_bytes_[update] += action.data.size();
-        staged_[update].push_back(std::move(action));
+        const std::size_t size = action.data.size();
+        try {
+            staged_[update].push_back(std::move(action));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        staged_bytes_[update] += size;
         return true;
     }
     // The staged actions in order; the update starts empty again.

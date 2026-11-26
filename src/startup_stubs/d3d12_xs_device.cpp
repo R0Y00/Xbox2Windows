@@ -2501,6 +2501,8 @@ struct Pass {
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
+    ID3D12Resource* bound_targets[8]{};
+    ID3D12Resource* bound_depth = nullptr;
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
     ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
@@ -2997,6 +2999,17 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 if ((pass.constant_words_bound[i] & mask) != mask)
                     return refuse("cached mesh root constants are incomplete", indirect_graphics_pipeline);
             }
+        } else if (translated) {
+            if (!pass.targets_bound || (!pass.target_count && pass.dsv_format == DXGI_FORMAT_UNKNOWN) ||
+                !pass.viewport_set || !pass.scissor_set) {
+                const char* code =
+                    (!pass.targets_bound || (!pass.target_count && pass.dsv_format == DXGI_FORMAT_UNKNOWN))
+                        ? indirect_other_refusal_code::no_render_target
+                        : indirect_other_refusal_code::missing_viewport_or_scissor;
+                return refuse("translated indirect draw requires bound target or depth view, viewport and scissor", indirect_other, code);
+            }
+            if (!pass.targets_single_sample)
+                return refuse("draw requires single-sample targets", indirect_other, indirect_other_refusal_code::multisample_target);
         } else if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             (!translated && pass.target_formats[0] != pass.indirect_graphics.target_format) ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set) {
@@ -3013,7 +3026,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
             return refuse("indirect rectangle list requires a non-indexed draw", indirect_other, indirect_other_refusal_code::rect_list_indexed);
         if (!mesh && !rect_list && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
             return refuse("indirect draw requires triangle-list or rectangle-list topology", indirect_other, indirect_other_refusal_code::unsupported_topology);
-        if (!pass.indirect_graphics.cached_mesh) {
+        if (!pass.indirect_graphics.cached_mesh && !translated) {
             const auto samples = pass.target0->GetDesc().SampleDesc;
             if (samples.Count != 1 || samples.Quality)
                 return refuse("draw requires a single-sample render target", indirect_other, indirect_other_refusal_code::multisample_target);
@@ -3487,6 +3500,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.depth_view_writable = false;
     pass.target_count = 0;
     pass.target0 = nullptr;
+    std::fill_n(pass.bound_targets, 8, nullptr);
+    pass.bound_depth = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     if (!list) return;
     static LONG refused, unresolved_logged;
@@ -3569,6 +3584,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         }
     }
     if (!count && !dsv_ptr) return;
+    std::copy_n(targets, 8, pass.bound_targets);
+    pass.bound_depth = dsv_target;
     if (red_producers().enabled()) {
         std::copy_n(targets, 8, pass.trace_targets);
         pass.trace_depth = dsv_target;

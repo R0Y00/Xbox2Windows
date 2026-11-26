@@ -84,8 +84,13 @@ ctest --preset dev --no-tests=error -R '^startup_present_producer_(warp|hardware
 ### Translated indirect triangles
 
 `X2W_TRANSLATED_INDIRECT_DRAW=1` lets a slot 57 cached translation record one non-indexed
-`ExecuteIndirect` Draw on a direct list with triangle-list topology, one single-sample colour
-target, an explicit viewport and scissor, and the root signature used to create the guest pipeline.
+`ExecuteIndirect` Draw on a direct list with triangle-list topology, single-sample bound colour
+and/or depth-stencil targets (up to 8 colour targets, colour plus depth-stencil, or depth-only),
+an explicit viewport and scissor, and the root signature used to create the guest pipeline.
+Sampled texture bindings must not alias any bound colour target or writable depth view, and a
+translated pipeline with depth or stencil writes is refused against a read-only depth view
+(`read_only_depth_write`). Non-translated desktop graphics pipelines keep the single colour-target
+requirement without a depth view.
 The translated path binds its usual pipeline, root and sampled textures, then forwards the placed
 desktop argument buffer and offset. Its producer supplies legal D3D12 draw arguments. The shim checks
 the placed buffer range without reading the draw fields or limiting the GPU-generated vertex count.
@@ -101,7 +106,7 @@ same resource that contains the indirect arguments, and copied placements with u
 the accepted resource directly as a desktop raw SRV and uses its recorded stride for the shader entry.
 
 Run `cmake --build --preset release --target startup_indirect_draw_indexed` and
-`ctest --preset release -j1 --no-tests=error -R '^startup_indirect_translated_draw_' -V`.
+`ctest --preset release -j1 --no-tests=error -R '^startup_indirect_translated_(draw|targets)_' -V`.
 The fixture compiles source-built desktop shaders and installs their translation-cache manifest.
 A compute writer records one triangle at a nonzero offset in a placed GPU buffer with separate
 title backing. A fenced readback compares the argument, guard words and every colour pixel.
@@ -110,7 +115,9 @@ binding the wrong root, using a short argument range or using a shader that read
 leaves the target clear. A second compute writer supplies distinguishing colours to a table buffer.
 The table's nonzero offset and stride select the second colour, the short view reads zero, and a
 non-aliased placement is refused. A raw descriptor over a recording-owned upload page reads the
-same colour and refuses a view that crosses its allocation.
+same colour and refuses a view that crosses its allocation. `startup_indirect_translated_targets_{warp,hardware}`
+additionally checks two-target MRT, colour plus depth-stencil, depth-only (zero colour targets with a
+depth view), refusal of zero attachments, and refusal of a sampled texture aliasing render target 1.
 
 ### Index views backed by a recording upload
 
@@ -9851,6 +9858,19 @@ a full-EXEC `v_cmp_*` from wave-uniform SGPRs or constants. A compare with a
 VGPR source, a different VCC write, or a narrowed EXEC at the branch
 invalidates the proof. The CPU-reference draws cover both outcomes for each
 branch polarity and a VCC-zero branch after a join.
+
+The `startup_mesh57_lane_spill_{warp,hardware}` tests cover the constant-lane
+`v_writelane_b32` / `v_readlane_b32` spill idiom in `translate_mesh57` (#2413 T7).
+A source-built program parks ordinary scalars in fixed wave64 lanes of a spill-only
+VGPR (including lane 63), reloads them, and uses the colour reload as vertex red.
+Raw `exec_lo` / `exec_hi` sources stay refused under the one-lane model. Host checks
+also refuse an unwritten slot, a register-selected lane, lane 64, ordinary vector use
+of the spill VGPR, and a spill into an exchange VGPR. The draw compares all 1,024
+pixels with a CPU rasterizer; zeroing the spilled colour assignment in HLSL (not the
+multi-decl) must change the image.
+Run `python -B tests/startup_mesh57_lane_spill_check.py` for host refusals, or
+`ctest --preset release --no-tests=error -R '^startup_mesh57_lane_spill' -V`
+for WARP and hardware.
 
 The `startup_mesh57_skeleton_wave_shift_{warp,hardware}` tests cover a single
 `s_lshl_b32` behind a forward EXEC-zero branch after the count exchange. From

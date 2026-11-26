@@ -1850,7 +1850,11 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             continue
         if name.startswith('ds_') or name in ('s_barrier', 's_sendmsg', 's_sendmsghalt'):
             raise Unsupported('slot 57 mesh: %s outside the group-memory exchanges' % name)
-        if name.startswith(('v_readlane', 'v_writelane')):
+        # Constant-lane v_writelane_b32 / v_readlane_b32 (#2413 T7, #2127): Stage lowers the idiom and
+        # refuses ordinary VGPR use, unwritten slots and non-constant lanes. The spill VGPR is not a
+        # per-lane value in this model, so it does not update the stale/pending sets below.
+        lane_spill = base_name in ('v_writelane_b32', 'v_readlane_b32')
+        if name.startswith(('v_readlane', 'v_writelane')) and not lane_spill:
             raise Unsupported('slot 57 mesh: lane spills are not covered')
         keep = ins[index]
         if base_name == 'v_readfirstlane_b32':
@@ -1867,7 +1871,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     writes_s.update(range(r[1], r[2] + 1))
         if 3 in writes_s or writes_s & lane:
             raise Unsupported('slot 57 mesh: the wave word s3 or the saved lane-0 mask is written')
-        if writes_s and name.startswith('v_') and keep[2] != 'x2w_mesh_group':
+        if (writes_s and name.startswith('v_') and keep[2] != 'x2w_mesh_group'
+                and base_name != 'v_readlane_b32'):
             raise Unsupported('slot 57 mesh: %s into an SGPR is not covered' % base_name)
         # Only the wave index of s3 is modelled.
         if not re.fullmatch(r's_bfe_u32 s\d+, s3, 0x40018', asm) and any(
@@ -1916,8 +1921,9 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 raise Unsupported('slot 57 mesh: an EXEC compare other than output count > thread index under '
                                   'exec = -1 is not covered')
             mask = count
-        elif writes_exec(name, ops) or re.search(r'\b(?:exec(?:_lo|_hi)?|src_execz|src_vccz)\b', asm) or (
-                name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm)):
+        elif (not lane_spill and (
+                writes_exec(name, ops) or re.search(r'\b(?:exec(?:_lo|_hi)?|src_execz|src_vccz)\b', asm) or (
+                    name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm)))):
             raise Unsupported('slot 57 mesh: %s on a wave mask is not covered' % base_name)
         # The thread index: v_mbcnt_lo(-1, wave << 6) then v_mbcnt_hi(-1, that) under exec = -1.
         if asm == 's_bfe_u32 %s, s3, 0x40018' % env['wave']:
@@ -1938,6 +1944,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             thread_high = index + 1
         elif thread in writes_v and index != thread_high:
             raise Unsupported('slot 57 mesh: the thread index register is rewritten')
+        if lane_spill:
+            reads_v, writes_v = set(), set()
         if keep[2] != 'x2w_mesh_group' and reads_v & stale:
             raise Unsupported('slot 57 mesh: v%d is read where it is not defined for every lane (an entry value, or '
                               'left different per wave by an exchange)' % min(reads_v & stale))
@@ -2014,7 +2022,11 @@ class Stage:
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
             self.mesh_wave_loads = {}
+            # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
+            # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
+            self.mesh_source_ins = list(self.ins)
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
+
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -2973,6 +2985,7 @@ class Stage:
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
+            self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform) for constant-lane SGPR spills
             self.vcc_events = {}
             self.entry_table_pointers = {
                 reg: sym[1] for reg, sym in init_sym.items()
@@ -6552,12 +6565,13 @@ class Stage:
         else:
             self.set_s(dst[1], self.u(ops[1]))
 
-    # ---- SGPR spill to VGPR lanes (#2125, item E) --------------------------------------------
+    # ---- SGPR spill to VGPR lanes (#2125 item E; mesh #2413 T7 / #2127) ----------------------
     # The compiler parks a scalar in one lane of a VGPR: `v_writelane_b32 vN, sM, k` writes sM into lane k
     # and `v_readlane_b32 sD, vN, k` reads it back (AMD RDNA 2 ISA reference, VOP3 lane ops; LLVM 15
     # AMDGPU spill lowering). Both ignore EXEC. With a constant k and a VGPR that no other instruction
     # touches, vN is only a table of scalar slots, so one scalar variable per (vN, k) is an exact model
     # and no other lane is ever read. Anything else keeps the one-lane model out of reach and is refused.
+    # Pixel stages are wave32 (lanes 0..31). Slot 57 mesh is wave64 (lanes 0..63), matching #2127.
     #
     # With branches the slot variable is assigned on the pixel's own path, while the hardware slot holds the last
     # write on the wave's path. The two paths differ only inside the region of a branch not proven uniform (an
@@ -6646,19 +6660,24 @@ class Stage:
             lane = int(ops[2], 0)
         except ValueError:
             raise Unsupported('%s requires a constant lane, got %s' % (name, ops[2])) from None
-        if not 0 <= lane < self.SPILL_LANES:
-            raise Unsupported('%s lane %d outside 0..%d' % (name, lane, self.SPILL_LANES - 1))
-        if getattr(self, 'kind', None) != 'ps':
-            raise Unsupported('%s is lowered in pixel stages only' % name)
+        kind = getattr(self, 'kind', None)
+        lanes = 64 if kind == 'ms' else self.SPILL_LANES
+        if not 0 <= lane < lanes:
+            raise Unsupported('%s lane %d outside 0..%d' % (name, lane, lanes - 1))
+        if kind not in ('ps', 'ms'):
+            raise Unsupported('%s is lowered in pixel and mesh stages only' % name)
         if not self.tracks_uniformity() or (getattr(self, 'has_branches', True) and
-                                            getattr(self, 'spill_reach', None) is None):
+                                            (kind != 'ps' or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
         return vreg[1], sreg, lane
 
     def require_spill_only(self, n, name):
         """Refuse unless every instruction naming v<n> is a lane write or read of it."""
-        for _, _, op, asm in getattr(self, 'ins', ()):
+        # Mesh: scan the pre-skeleton program. The accepted group-memory exchanges rewrite to
+        # x2w_mesh_* / s_nop, which would hide ordinary use of exchange VGPRs (v5 and temps).
+        source = getattr(self, 'mesh_source_ins', None) or getattr(self, 'ins', ())
+        for _, _, op, asm in source:
             if re.sub(r'_e(32|64)$', '', op) in ('v_writelane_b32', 'v_readlane_b32'):
                 continue
             for lo, hi, single in re.findall(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', asm):
@@ -6669,11 +6688,15 @@ class Stage:
     def op_v_writelane_b32(self, ops, mods):
         n, src, lane = self.spill_operands('v_writelane_b32', ops, mods)
         if src is None:
+            # Slot 57 mesh keeps ordinary scalar spills only (R0Y00 on #2637). Raw EXEC words are not
+            # proven under the one-lane model (exec_hi would be wrong under full EXEC; exec_lo under
+            # a lane-0 mask would reload per thread). mesh_entry_aot still models EXEC for #2127.
             if ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0'):
                 raise Unsupported('v_writelane_b32 source %s is a lane mask or m0' % ops[1])
-            value, sym, uniform = self.u(ops[1]), None, True
-            if re.fullmatch(r'0x[0-9a-f]{8}u', value):
-                sym = ('const', int(value[2:-1], 16))
+            else:
+                value, sym, uniform = self.u(ops[1]), None, True
+                if re.fullmatch(r'0x[0-9a-f]{8}u', value):
+                    sym = ('const', int(value[2:-1], 16))
         else:
             if self.is_lane_mask(ops[1]) or (self.sym.get(src[1]) or ('',))[0] not in ('', 'const', 'ud', 'fixed_buffer_word'):
                 raise Unsupported('v_writelane_b32 source s%d holds a lane mask or descriptor' % src[1])
