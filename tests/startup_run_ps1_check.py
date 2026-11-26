@@ -202,7 +202,6 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     want_output = STUB_LINES[:HEAD_LINES]
     if not fake_user_env and "-FakeUser" not in switches:
         want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
-    if want_output != STUB_LINES[:HEAD_LINES]:
         printed = unwrap_first_line(printed, want_output[0])
     if printed != want_output:
         found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
