@@ -271,6 +271,9 @@ for size in (1, 33, 64):
     check(f'wave index of a group of {size} accepted', got[-1] == 's9 = v1;', repr(got))
 got = run(WAVE, 's_cbranch_scc0 label_0010', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(64, 1, 1))
 check('wave index read past the entry block recomputed as zero', got[-1] == 's9 = 0u;', repr(got))
+# v0 overwritten by a constant is no thread id: the shift of a uniform value is itself uniform (200 >> 6).
+got = run('v_mov_b32_e32 v0, 200', WAVE, READ1, kind='cs', group=(64, 1, 1))
+check('shift of an overwritten v0 is a uniform integer chain', got[-1] == 's9 = v1;' and 'v1 = v0 >> (0x00000006u & 31);' in got, repr(got))
 for label, instructions, kind, group in (
         ('wave index of a group of 65', (WAVE, READ1), 'cs', (65, 1, 1)),
         ('wave index of a group of 128', (WAVE, READ1), 'cs', (128, 1, 1)),
@@ -279,7 +282,6 @@ for label, instructions, kind, group in (
         ('wave index in a graphics stage', (WAVE, READ1), 'ps', (64, 1, 1)),
         ('wave index without a stage kind', (WAVE, READ1), None, (64, 1, 1)),
         ('wave index of v1', ('v_lshrrev_b32_e32 v1, 6, v1', READ1), 'cs', (64, 1, 1)),
-        ('wave index after v0 is overwritten', ('v_mov_b32_e32 v0, 200', WAVE, READ1), 'cs', (64, 1, 1)),
         ('wave index after v0 is loaded', ('buffer_load_dword v[0:1], off, s[4:7], s2', WAVE, READ1), 'cs', (64, 1, 1)),
         ('wave index after v0 is swapped', ('v_swap_b32 v2, v0', WAVE, READ1), 'cs', (64, 1, 1)),
         ('wave index with an output modifier', ('v_lshrrev_b32_e64 v1, 6, v0 clamp', READ1), 'cs', (64, 1, 1)),
