@@ -111,6 +111,8 @@ PS_VARIANT_SOURCES = {
     'fma_mix low half': V_MIX_HEAD + 'v_fma_mix_f32 v4, v4, v4, -0 op_sel_hi:[1,1,0]\n' + V_MIX_REST,
     'fma_mix upper half': V_MIX_HEAD + 'v_fma_mix_f32 v4, v4, v4, -0 op_sel:[1,0,0] op_sel_hi:[1,1,0]\n' + V_MIX_REST,
     'fma_mix binary32 source': V_MIX_HEAD + 'v_fma_mix_f32 v4, v4, v4, -0\n' + V_MIX_REST,
+    # The first exported channel is a read too: the whole v4 (upper half undefined) goes out as channel x.
+    'upper half exported as first channel': V_MIX_HEAD + V_MIX_REST,
     'branch into p2': 's_mov_b32 m0, s2\ns_cbranch_vccz L0\nv_interp_p1ll_f16 v4, v0, attr0.x\nL0:\n'
         'v_interp_p2_f16 v4, v1, attr0.x, v4\nv_cvt_f32_f16 v4, v4\n' + V_TAIL,
     'unrelated read of v2': 's_mov_b32 m0, s2\nv_mov_b32 v8, v2\n' + V_BODY,
@@ -127,6 +129,7 @@ PS_VARIANTS = {name: bytes.fromhex(h) for name, h in (
     ('fma_mix low half', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e04040020cc0409021a05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('fma_mix upper half', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e04040820cc0409021a05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('fma_mix binary32 source', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e04040020cc0409020205170a7e06170c7e07170e7e0f1800f804050607000081bf'),
+    ('upper half exported as first channel', '0203fcbe040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e0405170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('branch into p2', '0203fcbe020086bf040042d70000020004005ad7000212040417087e0f1800f804040404000081bf'),
     ('unrelated read of v2', '0203fcbe0203107e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('unrelated write of v9', '0203fcbef202127e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
@@ -505,6 +508,7 @@ def barycentric_controls(expected):
     print('accepted: v_fma_mix_f32 reading the low half of a plain p2 result')
     refused('fma_mix upper half', PS_VARIANTS['fma_mix upper half'], 'upper 16 bits')
     refused('fma_mix binary32 source', PS_VARIANTS['fma_mix binary32 source'], 'upper 16 bits')
+    refused('upper half exported as first channel', PS_VARIANTS['upper half exported as first channel'], 'upper 16 bits')
 
     # 2. The omitted p1ll result and the upper half of the p2 result.
     refused('p1ll result read between the pair', PS_VARIANTS['p1ll result read between the pair'],
@@ -574,6 +578,15 @@ def check_compile(dxc):
     print('dxc vs_6_0 / ps_6_0: compiled (compr pair and the plain-export pair, both halves)')
 
 
+def mix_reference():
+    """reference() with channel x replaced by the binary32 product of its binary16 low half with itself (v_fma_mix_f32 with
+    both sources op_sel_hi set, op_sel clear and src2 zero); the other channels are unchanged."""
+    words = list(reference())
+    low = struct.unpack('<f', struct.pack('<I', words[0]))[0]
+    words[0] = f32_bits(low * low)
+    return tuple(words)
+
+
 def check_draw(dxc, renderer, adapter):
     expected = ','.join('%08x' % w for w in reference())
     vs, ps = pair()
@@ -594,6 +607,19 @@ def check_draw(dxc, renderer, adapter):
         if run.returncode == 0:
             raise AssertionError('high inverted: control read the reference words')
         print('high inverted: fails as expected', flush=True)
+        # v_fma_mix_f32 on the low half of a plain p2 result, read back against the ISA arithmetic (binary16 low half squared).
+        mix_words = ','.join('%08x' % w for w in mix_reference())
+        mix_ps = compile_hlsl(dxc, 'dxc', translate(PS_VARIANTS['fma_mix low half']).hlsl_ps(), 'ps_mix', 'ps_6_0', directory)
+        run = draw(renderer, adapter, vs_cso, mix_ps, mix_words)
+        if run.returncode:
+            raise AssertionError('fma_mix low half\n%s\n%s' % (run.stdout, run.stderr))
+        print('fma_mix low half: %s' % mix_words, flush=True)
+        # Controls: the plain pair against the mix reference and the mix program against the plain reference must mismatch.
+        if draw(renderer, adapter, vs_cso, ps_cso, mix_words).returncode == 0:
+            raise AssertionError('fma_mix: the plain pair read the mix reference words')
+        if draw(renderer, adapter, vs_cso, mix_ps, expected).returncode == 0:
+            raise AssertionError('fma_mix: the mix program read the plain reference words')
+        print('fma_mix low half, wrong references: fail as expected', flush=True)
         # The plain export: low and high halves of channels x..w, and the high bit inverted.
         for half in (0, 1):
             expected_plain = ','.join('%08x' % w for w in plain_reference(half))

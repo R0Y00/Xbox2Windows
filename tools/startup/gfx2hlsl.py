@@ -8397,7 +8397,9 @@ class Stage:
                 read = regs(ops[1])
                 pair = self.interp_f16_pair(n, ops)
             else:
-                read = set().union(*(regs(o) for o in ops)) if ops else set()
+                # `exp mrt0 v4, ...` parses with the target glued to the first channel: that channel is read too.
+                sources = ops[0].split()[-1:] + ops[1:] if n == 'exp' and ops else ops
+                read = set().union(*(regs(o) for o in sources)) if sources else set()
             low_reader = (n == 'v_cvt_f32_f16' and not mods and len(ops) == 2 and
                           all(re.fullmatch(r'v\d+', o) for o in ops))
             for r in sorted(read):
