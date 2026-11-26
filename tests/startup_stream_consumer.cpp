@@ -213,6 +213,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
+// Table controls bind away from the heap start or change the root/view heap after slot 35 without rebinding.
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -285,7 +286,25 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         const UINT alias[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 5, 0};
         std::memcpy(descriptors[1], alias, sizeof(alias));
     }
-    std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    const bool change_table_root = mode == "dispatch-table-root-changed";
+    const bool change_table_heap = mode == "dispatch-table-heap-changed";
+    StreamWord table_gpu = gpu;
+    if (mode == "dispatch-table-offset") {
+        const UINT increment = static_cast<UINT>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        if (increment < sizeof(descriptors[0])) return 73;
+        const StreamWord offset = StreamWord{2} * increment;
+        // The heap starts with the wrong pair, but both records are well-formed. The correct pair starts at index 2.
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptors[1], sizeof(descriptors[1]));
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[1])), descriptors[0], sizeof(descriptors[0]));
+        std::memcpy(reinterpret_cast<void*>(cpu + offset), descriptors, sizeof(descriptors));
+        table_gpu += offset;
+    } else {
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    }
+    void* other_heap = nullptr;
+    if (change_table_heap &&
+        (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)),
+                 word(&other_heap)))) || !other_heap || other_heap == heap)) return 72;
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
     if (heap_record)
         for (const UINT at : {0u, 32u, 64u})
@@ -367,7 +386,18 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                               mode == "dispatch-heap-word-past" ? at : mode == "dispatch-heap-word-placed" ? words * 4 : bytes, 0};
         std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
     }
-    invoke(list, 35, 1, gpu);
+    invoke(list, 35, 1, table_gpu);
+    if (change_table_root) {
+        invoke(list, 33, word(slot67_other_root));
+        invoke(list, 33, word(slot67_root));
+    }
+    if (change_table_heap) invoke(list, 32, 1, word(&other_heap));
+    if (change_table_root || change_table_heap) {
+        // Give Dispatch the expected entry values without rebinding slot 35.
+        invoke(list, 37, 0, constants[0], 0);
+        invoke(list, 39, 0, 1, word(&constants[1]), 1);
+    }
+    if (mode == "dispatch-table-offset") invoke(list, 32, 1, word(&heap));  // same heap keeps the offset table
     if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
@@ -376,8 +406,20 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
-        if (GetTickCount64() >= deadline) return 78;
+    // Render mode publishes the guest fence value after desktop queue completion.
+    const ULONGLONG deadline = GetTickCount64() + 10000;
+    for (;;) {
+        const auto completed = invoke(fence, 8);
+        const HRESULT removed = static_cast<HRESULT>(invoke(device, 37));
+        if (completed == ~UINT64{0} || FAILED(removed)) {
+            std::fprintf(stderr, "slot 67 Dispatch fence: device removed (0x%08lx)\n", static_cast<unsigned long>(removed));
+            return 78;
+        }
+        if (completed == 1) break;
+        if (GetTickCount64() >= deadline) {
+            std::fputs("slot 67 Dispatch fence: timed out\n", stderr);
+            return 78;
+        }
         Sleep(1);
     }
     if (indirect && !record.check_record(groups)) return 80;
