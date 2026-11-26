@@ -726,6 +726,25 @@ WORDS_O_SHIFT = bytes.fromhex(OFF_PROLOGUE_WORDS + '040394be' '050395be' '078416
 CASES['O-dword'] = (SOURCE_O_DWORD, WORDS_O_DWORD, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1))
 CASES['O-shift'] = (SOURCE_O_SHIFT, WORDS_O_SHIFT, USER7 | TGID_X | tidig(1), (32, 1, 1), (4, 1, 1))
 
+# Two groups reach the same load from different branch arms. Each of their lanes must read its group's word.
+SOURCE_JOIN_LOAD = OFF_PROLOGUE + """\
+s_cmp_eq_u32 s7, 0
+s_cbranch_scc0 1
+s_nop 0
+s_lshl_b32 s3, s7, 2
+buffer_load_dword v7, off, s[12:15], s3
+s_waitcnt vmcnt(0)
+v_readfirstlane_b32 s24, v7
+v_mov_b32_e32 v7, s24
+v_lshl_add_u32 v4, s7, 3, v0
+v_lshlrev_b32_e32 v4, 2, v4
+buffer_store_dword v7, v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_JOIN_LOAD = bytes.fromhex(OFF_PROLOGUE_WORDS + '078006bf 010084bf 000080bf 0782038f 000030e000070303 '
+                                '703f8cbf 0705307e 18020e7e 040046d707060104 82080834 001070e004070480 000081bf')
+CASES['join-load'] = (SOURCE_JOIN_LOAD, WORDS_JOIN_LOAD, USER7 | TGID_X, (8, 1, 1), (2, 1, 1))
+
 
 def root_blob(constants=2, table_range=False):
     """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
@@ -782,6 +801,10 @@ def expected(name):
     if name in ('I', 'I-raw'):
         return expected('A')
     out = [SENTINEL] * WORDS
+    if name == 'join-load':
+        for i in range(16):
+            out[i] = input_word(i // 8)
+        return out
     if name == 'O-dword':
         for group in range(4):
             out[2 + group] = KEY ^ group
@@ -1907,6 +1930,7 @@ def check_binary(llvm_mc):
 MBCNT_LANE = '(tid.x + 4u * (tid.y + 2u * tid.z))'
 MBCNT_COUNT = f'countbits(0x85241249u & ((1u << {MBCNT_LANE}) - 1u))'
 CONTROLS = {
+    'join-load-zero': ('join-load', 's24 = ul24_7;', 's24 = 0u;'),
     'swapped-axes': ('A', '    s7 = gid.x;\n    s8 = gid.y;\n', '    s7 = gid.y;\n    s8 = gid.x;\n'),
     'dropped-store': ('A', '    u0.Store(a, v5);\n', ''),
     'b-offset': ('B', '    a = (v4 + 8) & 0xfffffffcu;\n', '    a = (v4 + 0) & 0xfffffffcu;\n'),
@@ -1944,6 +1968,7 @@ CONTROLS = {
 
 # First bad word for controls with a pinned mismatch.
 CONTROL_MISMATCH = {
+    'join-load-zero': 'word=0 expected=8b02a7f1 actual=00000000',
     'f-second-fill': 'word=1 expected=00000094 actual=00000000',
     'd-mask': 'word=8 expected=00000008 actual=00000009',
     'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
@@ -2007,6 +2032,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             runs = [(CONTROLS[control][0], control)]
         else:
             runs = [(name, None) for name in CASES]
+            runs.append(('join-load', 'join-load-zero'))
             runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
             runs += [('masked-tid', 'mask-shift-dropped'), ('extracted-tid', 'extract-shift-dropped')]
         for name, mutation in runs:
