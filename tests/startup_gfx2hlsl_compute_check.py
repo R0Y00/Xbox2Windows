@@ -702,6 +702,26 @@ def input_word(i):
     return (0x8b02a7f1 + i * 0x413b1) & MASK  # tests/compute_check.cpp fills the read buffer this way
 
 
+# Read the shifted field after the first branch. A zero root constant skips the read and store.
+FIELD_TAIL = """\
+s_cmp_eq_u32 s4, 0
+s_cbranch_scc1 5
+v_readfirstlane_b32 s24, v1
+v_mov_b32_e32 v7, s24
+v_lshlrev_b32_e32 v4, 2, v0
+buffer_store_dword v7, v4, s[16:19], 0 offen
+s_endpgm
+"""
+FIELD_TAIL_WORDS = '048006bf 050085bf 0105307e 18020e7e 82000834 001070e004070480 000081bf'
+for name, form, encoded, size in (
+        ('masked-tid', 'v_and_or_b32 v2, v0, 3, s4\nv_lshrrev_b32_e32 v1, 2, v2',
+         '020071d700071100 8204022c', 128),
+        ('extracted-tid', 'v_bfe_u32 v2, v0, 2, 3\nv_lshrrev_b32_e32 v1, 1, v2',
+         '020048d500050d02 8104022c', 8)):
+    CASES[name] = (OFF_PROLOGUE + form + '\n' + FIELD_TAIL, bytes.fromhex(OFF_PROLOGUE_WORDS + encoded + FIELD_TAIL_WORDS),
+                   USER7, (size, 1, 1), (1, 1, 1))
+
+
 def formatted_input():
     # Every selected R8_UNORM field is an exact endpoint, while the UINT16 halves
     # are all distinct and the neighbouring bytes are nonzero.
@@ -726,6 +746,10 @@ def expected(name):
             out[4 * group:4 * group + 4] = [group, pair & MASK, pair >> 32, 0]
         return out
     _, _, _, local, groups = CASES[name]
+    if name in ('masked-tid', 'extracted-tid'):
+        for lane in range(local[0]):
+            out[lane] = (((lane & 3) | KEY) >> 2 if name == 'masked-tid' else (((lane >> 2) & 7) >> 1))
+        return out
     if name == 'address-carry':
         for group in range(groups[0]):
             total = group + 0xfffffffe
@@ -1144,6 +1168,12 @@ def check_off_stores():
 
 
 def check_controls():
+    for name in ('masked-tid', 'extracted-tid'):
+        translate(name).hlsl_cs()
+    # Shift by one to retain masked bit 1, or enable extracted bit 3 in a larger group.
+    masked = patch(CASES['masked-tid'][1], '8204022c', '8104022c')
+    refused('requires a proven uniform source', lambda: translate('masked-tid', code=masked))
+    refused('requires a proven uniform source', lambda: translate('extracted-tid', group=(16, 1, 1)))
     carry = translate('address-carry').hlsl_cs()
     assert 's21 = (scc ? 1u : 0u);' in carry
     lo, hi, end = (bytes.fromhex(x) for x in ('04051480', '80fd1580', '000081bf'))
@@ -1730,6 +1760,8 @@ CONTROLS = {
     'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
                           'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),
     'g-overlap': ('G', 'v7 = lds[(a + 144u)', 'v7 = lds[(v6 + 144u)'),
+    'mask-shift-dropped': ('masked-tid', 's24 = (ud0 >> 2u);', 's24 = ud0;'),
+    'extract-shift-dropped': ('extracted-tid', 's24 = 0u;', 's24 = v2;'),
     'n-dropped-broadcast': ('N', 'v3 = s20 ^ v2;', 'v3 = v2;'),  # lane i stores word[i], not word0 ^ word[i]
     'l-byte-offset': ('L-uint', 'a = v0 * ud2 + v1 + 2;', 'a = v0 * ud2 + 2;'),
     'l-swizzle': ('L-unorm', 'v6 = ((ud3 >> 3)', 'v6 = ((0u >> 3)'),
@@ -1743,6 +1775,8 @@ CONTROL_MISMATCH = {
     'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
     'd-x-only': 'word=16 expected=00000009 actual=00000007',
     'd-base': 'word=0 expected=00000007 actual=00000000',
+    'mask-shift-dropped': 'word=0 expected=0048d159 actual=01234567',
+    'extract-shift-dropped': 'word=4 expected=00000000 actual=00000001',
     'd-hi': 'word=5 expected=00000008 actual=00000009',
     'd-exec': 'word=2 expected=ffffffff actual=00000000',
     'g-swapped-offsets': 'word=0 expected=00000004 actual=00000000',
@@ -1800,6 +1834,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
         else:
             runs = [(name, None) for name in CASES]
             runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
+            runs += [('masked-tid', 'mask-shift-dropped'), ('extracted-tid', 'extract-shift-dropped')]
         for name, mutation in runs:
             run = run_case(name, dxc, runner, adapter, Path(tmp), mutation)
             print(run.stdout, end='')

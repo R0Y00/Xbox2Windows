@@ -310,6 +310,39 @@ for label, instructions, group in (
     got = run(*instructions, kind='cs', group=group)
     check(f'{label} refused', got == REFUSAL, repr(got))
 
+# Only bits that survive both the field operation and the final shift may vary across threads.
+AND_OR = 'v_and_or_b32 v2, v0, 3, s2'
+EXTRACT = 'v_bfe_u32 v2, v0, 2, 3'
+SHIFT = 'v_lshrrev_b32_e32 v1, 2, v2'
+SHIFT1 = 'v_lshrrev_b32_e32 v1, 1, v2'
+for label, op, shift, size, expression in (
+        ('masked low bits of a large group', AND_OR, SHIFT, 128, '(s2 >> 2u)'),
+        ('mask above a non-power-of-two group', 'v_and_or_b32 v2, v0, 8, s2', SHIFT1, 7, '(s2 >> 1u)'),
+        ('extracted bit cleared by shift', EXTRACT, SHIFT1, 8, '0u'),
+        ('empty extracted field', 'v_bfe_u32 v2, v0, 0, 0', SHIFT1, 64, '0u'),
+        ('narrow field of a large group', 'v_bfe_u32 v2, v0, 1, 2', SHIFT, 128, '0u')):
+    got = run(op, shift, READ1, kind='cs', group=(size, 1, 1))
+    check(f'{label} accepted at entry', got[-1] == 's9 = v1;', repr(got))
+    got = run(op, shift, 's_cbranch_scc0 label_0014', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(size, 1, 1))
+    check(f'{label} recomputed past entry', got[-1] == f's9 = {expression};', repr(got))
+for label, instructions, size in (
+        ('surviving masked bit', (AND_OR, SHIFT1, READ1), 4),
+        ('surviving extracted bit', (EXTRACT, SHIFT1, READ1), 9),
+        ('variable mask', ('v_and_or_b32 v2, v0, s2, s2', SHIFT, READ1), 4),
+        ('vector OR source', ('v_and_or_b32 v2, v0, 3, v1', SHIFT, READ1), 4),
+        ('predicate as OR source', (COMPARE, AND_OR, SHIFT, READ1), 4),
+        ('scalar overwritten before shift', (AND_OR, 's_mov_b32 s2, 5', SHIFT, READ1), 4),
+        ('scalar overwritten before recompute', (AND_OR, SHIFT, 's_mov_b32 s2, 5', 's_cbranch_scc0 label_0018',
+                                                 READ1, 's_endpgm', 's_endpgm'), 4),
+        ('overwritten thread id', ('v_swap_b32 v1, v0', EXTRACT, SHIFT1, READ1), 8),
+        ('overwritten field', (EXTRACT, 'v_mov_b32_e32 v2, v0', SHIFT1, READ1), 8),
+        ('register field offset', ('v_bfe_u32 v2, v0, s2, 3', SHIFT1, READ1), 8),
+        ('register field width', ('v_bfe_u32 v2, v0, 2, s2', SHIFT1, READ1), 8),
+        ('signed field', ('v_bfe_i32 v2, v0, 2, 3', SHIFT1, READ1), 8),
+        ('unknown group for a masked field', (AND_OR, SHIFT, READ1), None)):
+    got = run(*instructions, kind='cs', group=(size, 1, 1) if size else None)
+    check(f'{label} refused', got == REFUSAL, repr(got))
+
 # Older probes may provide either no tracker or only part of the tracking state.
 for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):
     s = G.Stage.__new__(G.Stage)
