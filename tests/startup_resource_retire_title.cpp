@@ -1291,4 +1291,3 @@ int main(int argc, char** argv)
     std::puts(on ? "release-retired title checks passed" : "switch-off title checks passed");
     return 0;
 }
-
