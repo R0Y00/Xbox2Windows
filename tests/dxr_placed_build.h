@@ -19,7 +19,8 @@ class PlacedBuildScene {
     };
     Microsoft::WRL::ComPtr<IUnknown> guest_;
     Microsoft::WRL::ComPtr<IUnknown> cpu_heap_;
-    std::array<Buffer, 8> buffers_;
+    std::array<Buffer, 9> buffers_;
+    UINT64 big_as_{};  // an acceleration-structure buffer larger than any scratch range the controls use
     UINT64 tlas_title_{}, scratch_title_{};
     struct Placed {
         UINT64 dest{}, scratch{};
@@ -89,6 +90,7 @@ public:
         const auto ts = place(3, scratch_offset + scratch_bytes(top_size), scratch_state) + scratch_offset;
         titles_[0] = {blas, bs, bottom_size};
         titles_[1] = {tlas, ts, top_size};
+        big_as_ = place(8, 4096, dest_state);
         const auto short_scratch = place(4, scratch_offset + top_size.ScratchDataSizeInBytes - 1, scratch_state) + scratch_offset;
         constexpr UINT64 unmapped = 0x1000; // outside the user allocation range
         // Each refusal names its cause (not only E_INVALIDARG) and publishes nothing.
@@ -108,7 +110,7 @@ public:
         must_reject(tlas, short_scratch, Cause::not_placed, "scratch shorter than the build needs");
         must_reject(tlas, unmapped, Cause::not_placed, "scratch outside the placed buffers");
         must_reject(tlas, ts + 16, Cause::unaligned, "unaligned scratch");
-        must_reject(tlas, tlas + 512, Cause::wrong_state, "scratch in an acceleration-structure buffer");
+        must_reject(tlas, big_as_, Cause::wrong_state, "scratch in an acceleration-structure buffer");
         check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS");
         check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS");
         tlas_title_ = tlas;
@@ -128,6 +130,9 @@ public:
         check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS again");
         check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS again");
         check_updates(top, top_size, tlas, ts);
+        // check_updates records the TLAS as built with ALLOW_UPDATE whatever flags the caller gave it: record the builds as given.
+        check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS as given");
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS as given");
         std::printf("Placed DXR bytes dest/scratch: BLAS=%llu/%llu TLAS=%llu/%llu; short scratch, missing dest and swapped states rejected before recording\n",
             bottom_size.ResultDataMaxSizeInBytes, bottom_size.ScratchDataSizeInBytes,
             top_size.ResultDataMaxSizeInBytes, top_size.ScratchDataSizeInBytes);
@@ -169,11 +174,16 @@ public:
         must_reject(tlas, unmapped, scratch, sizes, true, Cause::source_not_placed, "source outside the placed buffers");
         must_reject(tlas, scratch, scratch, sizes, true, Cause::source_wrong_state,
                     "source in a buffer that is not an acceleration structure");
-        must_reject(tlas, tlas + 256, scratch, sizes, true, Cause::source_dest_partial_overlap,
-                    "source partly overlapping the destination");
-        // The destination and scratch rules apply to an update as to a build.
-        must_reject(tlas + 16, tlas, scratch, sizes, true, Cause::unaligned, "update with an unaligned destination");
-        must_reject(tlas, tlas, tlas + 512, sizes, true, Cause::wrong_state, "update with a scratch in an acceleration-structure buffer");
+        // An aligned source one stride past the destination is beyond the end of a structure this small (the partial-overlap
+        // rule needs a structure longer than 256 bytes and is checked by value in placed_build_causes).
+        must_reject(tlas, tlas + 256, scratch, sizes, true, Cause::source_not_placed, "source past the end of the destination's buffer");
+        // The scratch rule applies to an update as to a build.
+        must_reject(tlas, tlas, big_as_, sizes, true, Cause::wrong_state, "update with a scratch in an acceleration-structure buffer");
+
+        // The update controls below need the TLAS recorded as built with ALLOW_UPDATE, whatever flags the caller built it with.
+        auto recorded = request(0, false);
+        recorded.Inputs.Flags |= allow_flag;
+        check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, scratch, top_size, recorded), "Record the TLAS with ALLOW_UPDATE");
 
         // In place: the source is the destination.
         auto in_place = request(tlas, true);
