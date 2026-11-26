@@ -1588,6 +1588,31 @@ VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
 MESH_LOOP_REFUSAL = 'slot 57 mesh: a loop outside the group-memory exchanges is not covered'
+# Scalar buffer loads a pre-exchange execz block may issue once per wave (#2660 accepted one s_buffer_load_dword).
+MESH_WAVE_BLOCK_LOADS = ('s_buffer_load_dword', 's_buffer_load_dwordx2', 's_buffer_load_dwordx4',
+                         's_buffer_load_dwordx8', 's_buffer_load_dwordx16', 's_load_dword', 's_load_dwordx2',
+                         's_load_dwordx4', 's_load_dwordx8', 's_load_dwordx16')
+
+
+def mesh_wave_block_scalar(name, asm):
+    """True for an instruction of a pre-exchange execz block that the lowering may run for every lane of a wave with
+    an active lane: a listed scalar buffer load or scalar ALU whose operands are SGPRs, SCC and constants only."""
+    if name in MESH_WAVE_BLOCK_LOADS:
+        pass
+    elif name.startswith('v_cmp_'):
+        # A per-lane compare whose only scalar effect is its VCC destination; the caller refuses a VCC live at the join.
+        return not re.search(r'\b(exec|m0|src_)', asm) and scalar_effects(name, asm)[2] <= VCC_KEYS
+    elif not name.startswith('s_') or name.startswith(EXECZ_REFUSED + NO_SCALAR_DESTINATION + (
+            's_load', 's_getpc', 's_setpc', 's_swappc', 's_call', 's_get', 's_set', 's_movrel', 's_rfe', 's_trap',
+            's_memtime', 's_memrealtime', 's_buffer_load', 's_scratch', 's_dcache', 's_gl1', 's_wqm', 's_quadmask',
+            's_denorm_mode', 's_round_mode')):
+        return name.startswith(('s_cmp_', 's_bitcmp')) and not re.search(r'\b(exec|vcc|m0|src_)', asm)
+    if re.search(r'\b(exec|m0|src_|ttmp|tba|tma|flat_scratch|xnack)', asm) or 'saveexec' in name:
+        return False
+    reads, must, may = scalar_effects(name, asm)
+    return all(reg in ('scc', 'vcc', 'vcc_hi') or re.fullmatch(r's\d+', reg) for reg in reads | must | may)
+
+
 MESH_TRIP_STEPS = ('s_add_u32', 's_add_i32', 's_sub_u32', 's_sub_i32')
 MESH_TRIP_MAX = 64
 
@@ -1861,7 +1886,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
         raise Unsupported(exchange_branch_refusal)
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
-    load_compare = None
+    load_compares = {}  # compare index -> thread VGPR of each accepted pre-exchange wave block
     execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 
     def live_at_join(reg, join):
@@ -1895,23 +1920,44 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     and ins[source + 1][2] == 's_lshl_b32' and ins[target][3] == 's_mov_b64 exec, -1'):
                 shift_branch = source
                 continue
-            if a_end <= source < target < count_at and load_compare is None:
-                loads = [i for i in range(source + 1, target) if ins[i][2] == 's_buffer_load_dword']
-                if len(loads) == 1:
-                    load = loads[0]
+            if a_end <= source < target < count_at:
+                loads = [i for i in range(source + 1, target) if ins[i][2] in MESH_WAVE_BLOCK_LOADS]
+                if loads:
                     compare = source - 1
                     while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
                         compare -= 1
                     match = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
-                    dst = parse(ins[load][3])[1][0]
-                    if (compare <= a_end or ins[compare - 1][3] != 's_mov_b64 exec, -1' or not match
-                            or targets.intersection(range(compare, target))
-                            or any(i != load and not (no_effect(i) or lane_only(i))
-                                   for i in range(source + 1, target))
-                            or not re.fullmatch(r's\d+', dst) or not live_at_join(dst, target)):
+                    scalar = [i for i in range(source + 1, target) if not (no_effect(i) or lane_only(i))]
+                    # The guest runs every scalar instruction of the block once per wave that has an active lane.
+                    # The lowering runs them for all lanes of such a wave, so they may only read and write SGPRs,
+                    # SCC and a VCC that is dead at the join: no EXEC, M0, branch, barrier, message, store or atomic.
+                    # A per-lane v_cmp into VCC is allowed under the same dead-at-join rule.
+                    written, masks = set(), set()
+                    for i in scalar:
+                        reads, must, may = scalar_effects(*ins[i][2:])
+                        written |= {reg for reg in must | may if re.fullmatch(r's\d+', reg)}
+                        masks |= ((must | may) & VCC_KEYS) | (must & {'scc'})  # every s_ op may-writes SCC
+                    live = sorted((reg for reg in written if live_at_join(reg, target)), key=lambda r: int(r[1:]))
+                    # EXEC is full at the compare when a reset precedes it with no EXEC or VCC use and no branch
+                    # target in between.
+                    reset = compare - 1
+                    while (reset > a_end and ins[reset][3] != 's_mov_b64 exec, -1'
+                           and not writes_exec(ins[reset][2], parse(ins[reset][3])[1])
+                           and not re.search(r'\b(exec|vcc)', ins[reset][3])):
+                        reset -= 1
+                    # A branch may land between the reset and the compare only from inside that range, none may
+                    # land between the compare and the execz branch, and the block itself is straight-line code.
+                    entries = [s for s, d in edges.items() if (reset < d <= compare and not reset <= s < d)
+                               or compare < d <= source]
+                    if (compare <= a_end or ins[reset][3] != 's_mov_b64 exec, -1' or not match or entries
+                            or targets.intersection(range(source + 1, target))
+                            or any(s in edges for s in range(source + 1, target))
+                            or any(live_at_join(reg, target) for reg in masks)
+                            or any(not mesh_wave_block_scalar(*ins[i][2:]) for i in scalar)):
                         raise Unsupported(exchange_branch_refusal if target == count_at else execz_effects)
-                    load_compare, load_bound, load_thread = compare, match[1], int(match[2])
-                    wave_loads[ins[source][0]] = (ins[compare][0], load_bound, ins[load][0], dst)
+                    load_compares[compare] = int(match[2])
+                    wave_loads[ins[source][0]] = (ins[compare][0], match[1],
+                                                  tuple(ins[i][0] for i in loads), tuple(live))
                     continue
             # The model skips per lane, while the guest skips per wave. The difference is invisible when
             # lanes with clear EXEC can only bypass predicated writes before the paths meet. A skipped
@@ -2093,8 +2139,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
             if mask is not None or mesh_vregs(ops) & stale:
                 raise Unsupported(exchange_branch_refusal)
             mask = 'count_entry'
-        elif index == load_compare:
-            if mask is not None or thread != load_thread or load_thread in stale:
+        elif index in load_compares:
+            if mask is not None or thread != load_compares[index] or thread in stale:
                 raise Unsupported(execz_effects)
             mask = 'wave_load'
         elif base_name.startswith('v_cmpx'):
@@ -3351,7 +3397,7 @@ class Stage:
         wave_limits = getattr(self, 'mesh_wave_limits', {})
         wave_loads = getattr(self, 'mesh_wave_loads', {})
         wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values()}
-        wave_load_sites = {load for _, _, load, _ in wave_loads.values()}
+        wave_load_sites = {load for _, _, loads, _ in wave_loads.values() for load in loads}
         execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
         try:
@@ -3665,10 +3711,12 @@ class Stage:
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
                         if off in wave_loads:
-                            dst = wave_loads[off][3]
-                            if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
-                                raise Unsupported(execz_effects)
-                            self.u(dst)  # declare the variable; refuses a symbol with no run-time value
+                            # An empty wave keeps the previous values of the scalars the block writes and the
+                            # join reads, so each must be wave-uniform and defined before the block.
+                            for dst in wave_loads[off][3]:
+                                if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
+                                    raise Unsupported(execz_effects)
+                                self.u(dst)  # declare the variable; refuses a symbol with no run-time value
                         cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
                                         or off in wave_limits or off in wave_loads)
                         if off in vcc_branches:
