@@ -93,6 +93,7 @@ def controls(llvm_mc):
     refused(shader(prefix=bad_min_lod), 'requires normalized clamp')
     refused(shader(prefix=missing_sampler), 'constant sampler')
     check_clamp_z()
+    check_wrap()
     check_point_xy()
     check_mip_point_preclamp()
     print('Four fixed-mip gather channels and unsupported encodings checked')
@@ -114,9 +115,8 @@ def check_clamp_z():
         assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
         # The title's own words are bound, CLAMP_Z included.
         assert f'smp 0 {word:#x} 0x0 0x4500000 0x0\n' in pipe.manifest(), pipe.manifest()
-    # The X and Y address modes are still checked: mirror in Y, wrap in X, each with CLAMP_Z set as well.
+    # Mirror modes in X or Y are still refused, with CLAMP_Z set as well (repeat is accepted: check_wrap).
     refused(shader(prefix=with_word0(0x0a)), 'requires normalized clamp')
-    refused(shader(prefix=with_word0(0x10 | 2 << 6)), 'requires normalized clamp')
     refused(shader(prefix=with_word0(0x13 | 2 << 6)), 'requires normalized clamp')
     # Other word 0 fields beside CLAMP_Z still refuse: anisotropy ratio (bits 11:9).
     refused(shader(prefix=with_word0(0x92 | 1 << 9)), 'requires normalized clamp')
@@ -131,6 +131,32 @@ def check_clamp_z():
 
 # Word 2 is moved as a literal (s_mov_b32 s26, 0x04500000: bilinear XY, point mip).
 FILTER_WORD2 = bytes.fromhex('ff039abe00005004')
+
+
+def check_wrap():
+    # CLAMP_X and CLAMP_Y (word 0 bits 2:0 and 5:3) of 0 are repeat: the native Gather wraps the footprint across the
+    # edge through the static sampler built from the same words, so every X/Y mix of repeat and clamp-to-last-texel
+    # translates, with or without CLAMP_Z, and the guest's words are bound as they are.
+    for word0 in (0x00, 0x02, 0x10, 0x40, 0x42 | 2 << 6, 0x50 | 1 << 6):
+        pipe = pipeline(shader(prefix=with_word0(word0)))
+        assert 't = r0.GatherRed(q0, float2(F(v0), F(v1)));' in pipe.hlsl_ps()
+        assert f'smp 0 {word0:#x} 0x0 0x4500000 0x0\n' in pipe.manifest(), pipe.manifest()
+    # Every other address mode stays refused: mirror, mirror-once, the half-border and border clamps, in X or in Y,
+    # next to repeat or clamp in the other axis.
+    for mode in (1, 3, 4, 5, 6, 7):
+        for word0 in (mode, mode | 2 << 3, mode << 3, 2 | mode << 3):
+            refused(shader(prefix=with_word0(word0)), 'requires normalized clamp')
+    # The substitution is only for the native Gather: the profile used by the other callers still sees repeat as it is.
+    assert G.gather_2d_profile_words((0x00, 0, 0x04500000, 0))[0] == 0x00
+    assert G.gather_2d_wrap_as_clamp((0x00, 0, 0x04500000, 0))[0] == 0x12
+    assert G.gather_2d_wrap_as_clamp((0x0a, 0, 0x04500000, 0))[0] == 0x0a
+    # Negative control: without the substitution repeat is refused, as before this change.
+    wrap_as_clamp = G.gather_2d_wrap_as_clamp
+    G.gather_2d_wrap_as_clamp = lambda words: tuple(words)
+    try:
+        refused(shader(prefix=with_word0(0x00)), 'requires normalized clamp')
+    finally:
+        G.gather_2d_wrap_as_clamp = wrap_as_clamp
 
 
 def with_word2(word, prefix=PREFIX):
@@ -179,10 +205,25 @@ def check_mip_point_preclamp():
         G.gather_2d_profile_words = profile
 
 
-def expected_taps(mip, component, uv):
+UV_PAIR = bytes.fromhex('f002007eff02027e0000803e')
+
+
+def with_uv(prefix, uv):
+    """The prefix with u and v moved by literals (v_mov_b32 v0, <u>; v_mov_b32 v1, <v>)."""
+    assert UV_PAIR in prefix
+    return prefix.replace(UV_PAIR, bytes.fromhex('ff02007e') + struct.pack('<f', uv[0]) +
+                          bytes.fromhex('ff02027e') + struct.pack('<f', uv[1]), 1)
+
+
+def expected_taps(mip, component, uv, wrap=(False, False)):
+    """The four texels of the bilinear footprint, in the order of the gather: each axis clamps to the last texel
+    or, for repeat, wraps to the opposite edge."""
     extent = SIDE >> mip
+
+    def address(i, repeat):
+        return i % extent if repeat else min(max(i, 0), extent - 1)
     x, y = (math.floor(coord * extent - 0.5) for coord in uv)
-    return tuple(texel(mip, min(max(i, 0), extent - 1), min(max(j, 0), extent - 1), component)
+    return tuple(texel(mip, address(i, wrap[0]), address(j, wrap[1]), component)
                  for i, j in ((x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y)))
 
 
@@ -193,7 +234,7 @@ def draw(dxc, renderer, adapter):
         dxil = directory / 'gather.dxil'
         case = directory / 'gather.case'
 
-        def run(mips, first, component, uv, code, *, mutant=False):
+        def run(mips, first, component, uv, code, *, mutant=False, wrap=(False, False), wrong=False):
             source = pipeline(code).hlsl_ps()
             # The offscreen vertex shader places TEXCOORD0 before SV_Position.
             source = source.replace('struct PSIn {', 'struct PSIn {\n    float4 uv : TEXCOORD0;', 1)
@@ -202,15 +243,15 @@ def draw(dxc, renderer, adapter):
             hlsl.write_text(source, encoding='ascii')
             subprocess.run([dxc, '-WX', '-T', 'ps_6_0', '-E', 'main', '-Fo', dxil, hlsl], check=True)
             # The renderer uploads fixture level zero at the first resident mip.
-            write_case(case, mips, first, [expected_taps(0, component, uv)] * SIDE**2)
+            write_case(case, mips, first, [expected_taps(0, component, uv, wrap)] * SIDE**2)
             proc = subprocess.run([renderer, adapter, '--check-pixel-gather', dxil, case],
                                   capture_output=True, text=True)
             output = proc.stdout + proc.stderr
-            print(f'{CHANNELS[component]}: mip {first}, {mips} resource mips, uv {uv}, mutant {mutant}\n{output}',
+            print(f'{CHANNELS[component]}: mip {first}, {mips} resource mips, uv {uv}, wrap {wrap}, mutant {mutant}, wrong sampler {wrong}\n{output}',
                   end='', flush=True)
             if proc.returncode == 77:
                 raise SystemExit(77)
-            if mutant:
+            if mutant or wrong:
                 assert proc.returncode == 1 and 'pixel_mismatch x=0 y=0' in output, output
             else:
                 assert proc.returncode == 0 and 'pixels=64 channels=256 max_absolute_error=0' in output, output
@@ -229,6 +270,19 @@ def draw(dxc, renderer, adapter):
         # The full sampler state of those pipelines, MIP_POINT_PRECLAMP included.
         run(3, 1, 1, uv, shader(2, prefix=with_word2(0x14000000, with_word0(0x92))))
         run(3, 1, 2, uv, shader(4), mutant=True)
+        # Repeat addressing (CLAMP_X = CLAMP_Y = 0): footprints that straddle u = 0 / 1 and v = 0 / 1 pull the texels of the
+        # opposite edge, one axis or both; out-of-range coordinates wrap too. The same draws with the clamp sampler read the
+        # clamped texels (the clamp control), and the clamp sampler against the repeat expectation must fail (wrong sampler).
+        for edge_uv in ((0.0, 0.5), (1.0, 0.5), (0.5, 0.0), (0.5, 1.0), (0.0, 0.0), (1.0, 1.0), (1.25, -0.5)):
+            for channel in range(4):
+                run(1, 0, channel, edge_uv, shader(1 << channel, prefix=with_uv(with_word0(0x00), edge_uv)), wrap=(True, True))
+            run(1, 0, 0, edge_uv, shader(1, prefix=with_uv(PREFIX, edge_uv)))
+            run(1, 0, 0, edge_uv, shader(1, prefix=with_uv(PREFIX, edge_uv)), wrap=(True, True), wrong=True)
+        # One axis at a time: repeat in X only (word 0 = clamp in Y), repeat in Y only.
+        run(1, 0, 1, (0.0, 0.0), shader(2, prefix=with_uv(with_word0(0x10), (0.0, 0.0))), wrap=(True, False))
+        run(1, 0, 1, (1.0, 1.0), shader(2, prefix=with_uv(with_word0(0x02), (1.0, 1.0))), wrap=(False, True))
+        # The repeat draw is not the clamp draw: a repeat expectation read with both axes clamped differs.
+        run(1, 0, 2, (0.0, 0.0), shader(4, prefix=with_uv(with_word0(0x00), (0.0, 0.0))), wrap=(False, False), wrong=True)
 
 
 if __name__ == '__main__':
