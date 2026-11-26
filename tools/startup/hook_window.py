@@ -58,6 +58,10 @@ class ReturnBook:
         kept.append((tid, slot, description, entry))
         self._pending[address] = kept
 
+    def pending(self, address):
+        """Whether any call is still waiting to return to this address (any thread)."""
+        return bool(self._pending.get(address))
+
     def take(self, address, tid, slot):
         """Descriptions of the calls that return here on this thread and slot."""
         items = self._pending.get(address, [])

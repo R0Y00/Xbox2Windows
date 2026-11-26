@@ -610,7 +610,7 @@ def main():
         struct.pack_into("<Q", ctx, 0xF8, addr)
         # After the final logged hit, let the restored instruction run at full speed unless
         # another hook still owns this breakpoint.
-        if (point and logged_hits[rva] == point[0] and addr not in hooks and not returns.get(addr)
+        if (point and logged_hits[rva] == point[0] and addr not in hooks and not returns.pending(addr)
                 and write(addr, breakpoints[addr])):
             del breakpoints[addr]
             retired.add(addr)

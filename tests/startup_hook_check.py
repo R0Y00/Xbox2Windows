@@ -165,6 +165,14 @@ def returns_bookkeeping():
     assert book.take(0x20, 1, 0x200) == ["CreateFileW", "NtCreateFile retrapped"]
     assert book.take(0x20, 1, 0x200) == []
 
+    # The launcher asks whether any call still returns to an address before it lets a hit-limited
+    # breakpoint run free: a returned call must not keep it armed, a waiting one must.
+    assert not book.pending(0x20) and not book.pending(0x99)
+    book.add(0x30, 1, 0x300, "waiting", 0x5000)
+    assert book.pending(0x30)
+    book.take(0x30, 1, 0x300)
+    assert not book.pending(0x30)
+
 
 def run(probe, scratch, name, options):
     logdir = scratch / name
