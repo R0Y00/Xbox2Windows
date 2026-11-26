@@ -479,7 +479,7 @@ def check_encoding(code, off, n, name, asm):
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0x700 or word1 & 0xe0000000:
             raise Unsupported('%s with neg/abs: not a 16-bit integer source modifier' % name)
-    if name in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32', *VOP3_ONLY_VEC_U):
+    if name in ('v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_sad_u32', 'v_msad_u8', *VOP3_ONLY_VEC_U):
         # VOP3A integer forms take no source abs/neg; refuse those bits here so neg on an inline
         # integer does not print as -N and get accepted as a negative constant.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -2462,6 +2462,25 @@ class Stage:
             self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
         self.emit('scc = %s;' % expr)
 
+    def record_scalar_uniformity(self, n, uniform):
+        if uniform:
+            self.varying_s.discard(n)
+            if self.defined_uniform_s is not None:
+                self.defined_uniform_s.add(n)
+            if self._uniform_written is not None:
+                self._uniform_written.add(n)
+        else:
+            self.varying_s.add(n)
+            if self.defined_uniform_s is not None:
+                self.defined_uniform_s.discard(n)
+            if self._uniform_written is not None:
+                self._uniform_written.discard(n)
+            if self.bad_sgprs is not None:
+                self.bad_sgprs.add(n)
+        # Only a proved assignment can add an SGPR to since_join. Unmodelled writes drop any stale mark.
+        if getattr(self, 'since_join', None) is not None:
+            (self.since_join.add if uniform else self.since_join.discard)(n)
+
     def set_s(self, n, expr, sym=None, scc=None, uniform=None):
         """Assign scalar register n at run time and/or symbolically.
 
@@ -2470,24 +2489,7 @@ class Stage:
         if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
             if uniform is None:
                 uniform = self.scalar_expr_uniform(expr)
-            if uniform:
-                self.varying_s.discard(n)
-                if self.defined_uniform_s is not None:
-                    self.defined_uniform_s.add(n)
-                if self._uniform_written is not None:
-                    self._uniform_written.add(n)
-            else:
-                self.varying_s.add(n)
-                if self.defined_uniform_s is not None:
-                    self.defined_uniform_s.discard(n)
-                if self._uniform_written is not None:
-                    self._uniform_written.discard(n)
-                if self.bad_sgprs is not None:
-                    self.bad_sgprs.add(n)
-            # Invariant: since_join gains an SGPR only here, when set_s proves it uniform; forget_writes drops any SGPR
-            # an instruction writes first, so a write through an unmodelled path never keeps a stale mark.
-            if getattr(self, 'since_join', None) is not None:
-                (self.since_join.add if uniform else self.since_join.discard)(n)
+            self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         getattr(self, 'float_const_s', {}).pop(n, None)
         if sym is not None:
@@ -3864,7 +3866,7 @@ class Stage:
                         self.u(ops[3])]
             else:
                 args = [self.u(o) for o in ops[1:1 + arity]]
-            if base in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32'):
+            if base in ('v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_sad_u32', 'v_msad_u8'):
                 pipe = getattr(self, 'pipe', None)
                 if pipe is not None and isinstance(getattr(pipe, 'uses_sad', None), set):
                     pipe.uses_sad.add(base)
@@ -4984,6 +4986,60 @@ class Stage:
             self.set_s(d, '0x%08xu' % value, ('const', value))
             return None
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
+        return None
+
+    def op_s_bfm_b64(self, ops, mods):
+        """s_bfm_b64: D.u64 = ((1ULL << S0.u[5:0]) - 1) << S1.u[5:0], SCC unchanged.
+
+        Unlike the mask-style 64-bit scalar ops (which keep one lane bit), this is a real 64-bit value, so both
+        destination words are written. The width is masked to six bits here and the offset inside shl64, which
+        also drops the bits shifted past bit 63; every HLSL shift count stays below 32."""
+        if mods:
+            raise Unsupported('s_bfm_b64 with %s' % (mods,))
+        if len(ops) != 3:
+            raise Unsupported('s_bfm_b64 with %d operands, expected 3' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[1] % 2 or dst[2] > 105:
+            raise Unsupported('s_bfm_b64 destination %s' % ops[0])
+        vals = []
+        for o in ops[1:]:
+            r = reg_range(o)
+            if o in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') or (
+                    r and (r[0] != 's' or r[1] != r[2] or r[1] > 105)):
+                raise Unsupported('s_bfm_b64 source %s' % o)
+            if r and r[1] in self.masks:
+                # A lane mask is not a number. Every source is read and checked before any destination state
+                # changes, so a source aliasing the destination cannot lose its mask flag first.
+                raise Unsupported('s_bfm_b64 source %s holds a lane mask' % o)
+            if r:
+                vals.append(self.is_const(r[1]))
+            else:
+                try:
+                    vals.append(int(o, 0))
+                except ValueError:
+                    vals.append(None)
+        d = dst[1]
+        if None in vals:
+            width, offset = self.u(ops[1]), self.u(ops[2])  # may refuse; still before any write
+        # Both words are uniform only if both sources are. Judged before the destination changes, so an aliased
+        # source is classified by its old value and an older proof for s[d] or s[d+1] cannot survive.
+        uniform = self.tracks_uniformity() and all(self.uniform_source(o) for o in ops[1:])
+        self.masks.discard(d)
+        self.masks.discard(d + 1)
+        if None not in vals:
+            value = (((1 << (vals[0] & 63)) - 1) << (vals[1] & 63)) & 0xffffffffffffffff
+            for i, word in enumerate((value & 0xffffffff, value >> 32)):
+                self.set_s(d + i, '0x%08xu' % word, ('const', word))
+            return None
+        # Both words come from locals computed before either destination is written, so a source may be the destination.
+        self.sym.pop(d, None)
+        self.sym.pop(d + 1, None)
+        if self.tracks_uniformity():
+            for word in (d, d + 1):
+                self.record_scalar_uniformity(word, uniform)
+        self.used_s.update((d, d + 1))
+        self.emit('{ uint bw = %s & 63u; uint2 t = shl64(bw >= 32u ? 0xffffffffu : (1u << (bw & 31u)) - 1u, '
+                  'bw >= 32u ? (1u << (bw & 31u)) - 1u : 0u, %s); s%d = t.x; s%d = t.y; }' % (width, offset, d, d + 1))
         return None
 
     def scalar_const(self, tok):
@@ -6325,6 +6381,9 @@ class Stage:
         key = self.fixed_table_image(ops[2], name) if self.kind == 'cs' else self.descriptor(ops[2])
         tex = self.pipe.resource(key, 'tex2d')
         return dst, addr, words, channels[masks[0]], tex
+
+    def op_image_gather4(self, ops, mods):
+        raise Unsupported('image_gather4 requires the guest implicit mip level')
 
     def op_image_gather4_lz(self, ops, mods):
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
@@ -8030,9 +8089,14 @@ VEC_U = {
     'v_ffbh_u32': (1, '({0} == 0u ? 0xffffffffu : 31u - firstbithigh({0}))'),
     'v_ffbh_i32': (1, '({0} == 0u || {0} == 0xffffffffu ? 0xffffffffu : 31u - firstbithigh(asint({0}) < 0 ? ~{0} : {0}))'),
     'v_bfrev_b32': (1, 'reversebits({0})'),
+    # Unsigned sums of absolute differences (AMD RDNA 2 ISA reference, VOP3 opcodes 0x15a to 0x15d and 0x171), all
+    # modulo 2^32. src1 is the reference: v_msad_u8 leaves out each byte lane whose src1 byte is zero, as in
+    # tools/pixel_aot.py.
     'v_sad_u8': (3, 'sad_u8({0}, {1}, {2})'),
+    'v_sad_hi_u8': (3, 'sad_hi_u8({0}, {1}, {2})'),
     'v_sad_u16': (3, 'sad_u16({0}, {1}, {2})'),
     'v_sad_u32': (3, 'sad_u32({0}, {1}, {2})'),
+    'v_msad_u8': (3, 'msad_u8({0}, {1}, {2})'),
     # Saturating 32-to-16-bit integer packs (AMD RDNA 2 ISA reference, VOP3A opcodes 0x36a and 0x36b; saturation
     # bounds per Mesa NIR pack_uvec2_to_uint / pack_ivec2_to_uint selected in ACO): src0 -> low 16 bits, src1 -> high 16 bits.
     'v_cvt_pk_u16_u32': (2, 'min({0}, 0xffffu) | (min({1}, 0xffffu) << 16u)'),
@@ -8683,6 +8747,24 @@ class Pipeline:
             out.append(
                 'uint sad_u32(uint a, uint b, uint c) {'
                 ' return (a > b ? a - b : b - a) + c; }')
+        # v_sad_hi_u8 and v_msad_u8 share the four-lane absolute-difference sum of sad_u8, so it is factored into
+        # sad4_u8, whose `masked` argument leaves out each byte lane whose src1 byte is zero (v_msad_u8's reference
+        # rule). The table formulas match tools/pixel_aot.py exactly: sad_hi_u8 is (sad4_u8(a, b, false) << 16) + c
+        # and msad_u8 is sad4_u8(a, b, true) + c, both modulo 2^32. sad_u8 above keeps its inlined four-term form so
+        # a translation that uses only v_sad_u8 is unchanged.
+        if 'v_sad_hi_u8' in self.uses_sad or 'v_msad_u8' in self.uses_sad:
+            out.append(
+                'uint sad4_u8(uint a, uint b, bool masked) {'
+                ' return (masked && ((b & 0xffu) == 0u) ? 0u : uint(abs(int(a & 0xffu) - int(b & 0xffu))))'
+                ' + (masked && (((b >> 8) & 0xffu) == 0u) ? 0u : uint(abs(int((a >> 8) & 0xffu) - int((b >> 8) & 0xffu))))'
+                ' + (masked && (((b >> 16) & 0xffu) == 0u) ? 0u : uint(abs(int((a >> 16) & 0xffu) - int((b >> 16) & 0xffu))))'
+                ' + (masked && (((b >> 24) & 0xffu) == 0u) ? 0u : uint(abs(int((a >> 24) & 0xffu) - int((b >> 24) & 0xffu)))); }')
+        if 'v_sad_hi_u8' in self.uses_sad:
+            out.append(
+                'uint sad_hi_u8(uint a, uint b, uint c) { return (sad4_u8(a, b, false) << 16u) + c; }')
+        if 'v_msad_u8' in self.uses_sad:
+            out.append(
+                'uint msad_u8(uint a, uint b, uint c) { return sad4_u8(a, b, true) + c; }')
         if self.uses_store_format_xyzw:
             legacy = ['        %sif (field == %du) fmt = %du;' % ('' if i == 0 else 'else ', field, code)
                       for i, (field, code) in enumerate(sorted(STORE_FORMAT_XYZW_LEGACY_FORMATS.items()))]
