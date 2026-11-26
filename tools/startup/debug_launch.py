@@ -120,13 +120,22 @@ def main():
     def print(*args, **kwargs):
         summary.append(" ".join(str(a) for a in args))
         builtins.print(*args, **kwargs)
-    timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
-    memory = int(float(opts.get("--memory-gib", 16)) * 2**30)
+    try:
+        timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
+        memory_gib = float(opts.get("--memory-gib", 16))
+        skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
+    except ValueError:
+        print("expected numeric --timeout and --memory-gib values and an integer --continue-asserts value")
+        return 2
     stop_first = opts.get("--stop-first-chance") == "1"
-    skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
     if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
         return 2
+    # The job always sets JOB_MEMORY (0x200), so a limit of 0 would deny the process any commit.
+    if not 1 <= memory_gib * 2**30 < 2**(8 * ctypes.sizeof(ctypes.c_size_t)):
+        print("expected a finite --memory-gib that is at least one byte and fits the Windows size_t limit")
+        return 2
+    memory = int(memory_gib * 2**30)
     asserts_seen = {}
     # X2W_NOP_SOFT_ASSERTS=1: after the first hit of a main-image int3 that is continued, replace the
     # trap byte with NOP. DBG_CONTINUE already bypasses the title's handler, so the visible behavior is

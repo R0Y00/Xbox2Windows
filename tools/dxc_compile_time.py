@@ -43,6 +43,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -584,8 +585,8 @@ def main(argv=None) -> int:
         parser.error("--repeat must be at least 1")
     if args.timeout is None:
         parser.error("--timeout is required; pass the local policy value, for example 90")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be a finite positive number")
     if args.dxc is None:
         parser.error("--dxc is required unless --list-variants is given")
     if not args.dxc.is_file():
