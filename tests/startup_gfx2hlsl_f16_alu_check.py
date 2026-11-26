@@ -18,6 +18,8 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
 sys.path.insert(0, os.path.join(here, '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
+sys.path.insert(0, here)
+import f16_packed_model as M  # noqa: E402
 
 failures = []
 
@@ -45,6 +47,10 @@ def fma16o(a, b, c):
         with_nan = a * b + c if not (math.isinf(a * b) and math.isinf(c) and (a * b > 0) != (c > 0)) else math.nan
         return with_nan
     exact = Fraction(a) * Fraction(b) + Fraction(c)
+    if exact == 0:
+        # IEEE round-to-nearest: -0 only when the product and the addend are both negative zeros, else +0.
+        both_neg = math.copysign(1, a) * math.copysign(1, b) < 0 and math.copysign(1, c) < 0 and a * b == 0 and c == 0
+        return -0.0 if both_neg else 0.0
     return h2f(f2h_exact(exact))
 
 
@@ -86,7 +92,7 @@ def run(asm, regs):
     dst, expr = re.fullmatch(r'(v\d+) = (.*);', s.lines[0]).groups()
     env = {f'v{i}': v for i, v in enumerate(regs)}
     env.update(
-        f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00), saturate=lambda x: min(max(x, 0.0), 1.0),
+        f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: 0x7e00 if math.isnan(x) else (f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00)), asuint=lambda x: x, saturate=lambda x: min(max(x, 0.0), 1.0),
         abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
         trunc=lambda x: float(int(x)), isnan=math.isnan,
         asint=lambda x: x - (1 << 32) if x >> 31 else x, float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
@@ -128,14 +134,138 @@ CASES = [
     ('v_cvt_i16_f16 v3, v0', [f2h(60000.0)], 0x7fff),
     ('v_cvt_u16_f16 v3, v0', [f2h(2.75) | HIGH], 2),
     ('v_cvt_u16_f16 v3, v0', [f2h(-1.5)], 0),
+    # SDWA binary16: a selected half of each source, the result in one half of the destination. v3 holds the old
+    # value 0x5a5a1234 where the other half is preserved.
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], THREE),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_0',
+     [0x3c00 << 16 | 0xabcd, TWO, 0, 0x5a5a1234], THREE),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1',
+     [ONE | HIGH, 0x4000 << 16 | 0x1234, 0, 0x5a5a1234], THREE),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], THREE << 16),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], THREE << 16 | 0x1234),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], 0x5a5a0000 | THREE),
+    ('v_sub_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_0',
+     [THREE << 16, ONE, 0, 0], TWO),
+    ('v_subrev_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_1',
+     [ONE, THREE << 16, 0, 0], TWO),
+    ('v_mul_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_1',
+     [THREE << 16, TWO << 16, 0, 0], f2h(6.0)),
+    ('v_add_f16_sdwa v3, -v0, |v1| dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE, f2h(-3.0), 0, 0], TWO),
+    # inf - inf is NaN: the lane keeps a NaN class in the selected half.
+    ('v_sub_f16_sdwa v3, v0, v1 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [0x7c00, 0x7c00, 0, 0], 0x7e00 << 16),
 ]
 for asm, regs, expected in CASES:
     dst, got = run(asm, regs + [0] * (4 - len(regs)))
     check(asm + ' ' + str(regs), got == expected, 'got %#x want %#x' % (got, expected))
+# The statement the lowering emits, evaluated over every lane of the SDWA draw fixtures (edge values, NaN, infinity,
+# signed zero, denormals, both halves, PAD and PRESERVE) against the exact-rational reference of the draw check. A NaN
+# has no portable sign or payload, so both sides compare the NaN class (the draw canonicalises the same way).
+sys.path.insert(0, here)
+import startup_gfx2hlsl_f16_alu_draw_check as D  # noqa: E402
+for cfg, lanes in D.SDWA_DRAW.items():
+    op, s0, s1, dsel, unused, m0, m1 = cfg[:7]
+    asm = '%s_sdwa v3, %s, %s dst_sel:%s dst_unused:%s src0_sel:%s src1_sel:%s' % (
+        op, D.sdwa_operand(m0, 0), D.sdwa_operand(m1, 1), dsel, unused, s0, s1)
+    bad = [(x, D.sdwa_reference(cfg, x), run(asm, [x[0], x[1], 0, x[2]])[1]) for x in lanes]
+    bad = [(x, want, got) for x, want, got in bad if D.canon_word(got) != want]
+    check('sdwa %s over %d lanes' % (D.sdwa_name(cfg), len(lanes)), not bad,
+          ' '.join('%08x,%08x,%08x want %08x got %08x' % (*x, want, got) for x, want, got in bad[:2]))
+
+
+def low16_stage():
+    s = stage()
+    s.low16_only_v, s.pinned_low16_v = {3}, set()  # v3 holds a d16 load: its upper half is undefined
+    return s
+
+
+SDWA = 'v_add_f16_sdwa v3, v0, v1 dst_sel:%s dst_unused:%s src0_sel:%s src1_sel:WORD_0'
+for sel, unused, src0, still_low16, label in (
+        ('WORD_0', 'UNUSED_PRESERVE', 'WORD_0', True, 'keeping the undefined upper half leaves it undefined'),
+        ('WORD_1', 'UNUSED_PRESERVE', 'WORD_0', False, 'a WORD_1 write over a defined low half is fully defined'),
+        ('WORD_0', 'UNUSED_PAD', 'WORD_0', False, 'UNUSED_PAD zeroes the upper half')):
+    s = low16_stage()
+    s.one('v_add_f16_sdwa', SDWA % (sel, unused, src0))
+    check('SDWA binary16 ' + label, (3 in s.low16_only_v) == still_low16)
+try:
+    low16_stage().one('v_add_f16_sdwa', 'v_add_f16_sdwa v4, v3, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD '
+                      'src0_sel:WORD_1 src1_sel:WORD_0')
+    check('SDWA binary16 refuses the undefined upper half of a d16 load as a source', False)
+except G.Unsupported:
+    check('SDWA binary16 refuses the undefined upper half of a d16 load as a source', True)
 check('clamp saturates the binary16 result', run('v_add_f16 v3, v0, v1 clamp', [THREE, TWO, 0, 0])[1] == ONE)
 
 for asm in ('v_add_f16 v3, v0, v1 op_sel:[1,0]', 'v_cvt_i16_f16 v3, v0 clamp', 'v_add_f16 v3, v0',
-            'v_fmaak_f16 v3, v0, v1', 'v_mul_f16 v3, v0, v1 mul:2'):
+            'v_fmaak_f16 v3, v0, v1', 'v_mul_f16 v3, v0, v1 mul:2',
+            # SDWA binary16: whole-word destination, byte fields, clamp, omod, integer sext and a constant
+            # source stay refused.
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 clamp dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 mul:2 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, sext(v0), v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, 1.0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0',
+            'v_min_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0'):
+    try:
+        stage().one(asm.split()[0], asm)
+        check('refuses ' + asm, False)
+    except G.Unsupported:
+        check('refuses ' + asm, True)
+
+# v_pk_{mul,add,fma}_f16: the lowering is evaluated over every selector pair and a value set built from NaN, inf, -0,
+# denormals, the binary16 limits and random words, and compared with the independent model in f16_packed_model.py.
+SEL = {2: ('v_pk_mul_f16', 'mul'), 3: ('v_pk_fma_f16', 'fma')}
+for name, op, arity in (('v_pk_mul_f16', 'mul', 2), ('v_pk_add_f16', 'add', 2), ('v_pk_fma_f16', 'fma', 3)):
+    samples = M.sample(arity, 150, arity)
+    bad = []
+    seen = {'swap': 0, 'zero_hi': 0, 'default_hi': 0}
+    for sel, hi in M.all_combos(arity):
+        mods = ' op_sel:[%s] op_sel_hi:[%s]' % (','.join(map(str, sel)), ','.join(map(str, hi)))
+        asm = '%s v3, %s%s' % (name, ', '.join('v%d' % i for i in range(arity)), mods)
+        for words in samples:
+            _, got = run(asm, list(words) + [0] * (4 - arity))
+            want = M.packed(op, words, sel, hi)
+            if not M.same(got, want):
+                bad.append((asm, [hex(w) for w in words], hex(got), hex(want)))
+            # The model must tell a wrong lowering from the right one: swapped lanes, zeroed high lane, default selectors.
+            swapped = (want & 0xffff) << 16 | want >> 16
+            seen['swap'] += not M.same(got, swapped)
+            seen['zero_hi'] += not M.same(got, want & 0xffff)
+            seen['default_hi'] += not M.same(got, M.packed(op, words, sel, [0] * arity))
+    check('%s matches the independent model on every selector pair (%d pairs x %d value sets)'
+          % (name, len(M.all_combos(arity)), len(samples)), not bad, str(bad[:2]))
+    check('%s: the value sets tell a swapped-lane, zeroed-high-lane or wrong-op_sel_hi lowering from the right one' % name,
+          all(seen.values()), str(seen))
+    # Default selectors (no modifier printed) are op_sel [0..] and op_sel_hi [1..].
+    plain = '%s v3, %s' % (name, ', '.join('v%d' % i for i in range(arity)))
+    check('%s with no modifier uses the default selectors' % name,
+          all(M.same(run(plain, list(w) + [0] * (4 - arity))[1], M.packed(op, w, [0] * arity, [1] * arity))
+              for w in samples))
+# Hand-checked words: 2*3 + 1 per lane, a high lane that reads the low half, inf*0 is NaN, overflow, -0.
+PK = [
+    ('v_pk_mul_f16 v3, v0, v1', [0x4000 | THREE << 16, 0x4200 | TWO << 16], 0x46004600),
+    ('v_pk_add_f16 v3, v0, v1 op_sel_hi:[0,1]', [ONE | THREE << 16, ONE | TWO << 16], f2h(2.0) | f2h(3.0) << 16),
+    ('v_pk_fma_f16 v3, v0, v1, v2', [TWO | TWO << 16, THREE | HALF << 16, ONE | ONE << 16], f2h(7.0) | f2h(2.0) << 16),
+    ('v_pk_mul_f16 v3, v0, v1', [0x7bff | 0x8000 << 16, 0x4000 | 0x3c00 << 16], 0x7c00 | 0x8000 << 16),
+    ('v_pk_mul_f16 v3, v0, v1', [0x8000 | 0x0000 << 16, 0x3c00 | 0xbc00 << 16], 0x80008000),
+]
+for asm, regs, expected in PK:
+    got = run(asm, regs + [0] * (4 - len(regs)))[1]
+    check(asm + ' ' + str([hex(r) for r in regs]), got == expected, 'got %#x want %#x' % (got, expected))
+check('inf * 0 is NaN in both lanes', M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0x7c00 | 0xfc00 << 16, 0 | 0x8000 << 16, 0, 0])[1] & 0xffff)
+      and M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0x7c00 | 0xfc00 << 16, 0 | 0x8000 << 16, 0, 0])[1] >> 16))
+for asm in ('v_pk_mul_f16 v3, v0, v1 neg_lo:[1,0]', 'v_pk_mul_f16 v3, v0, v1 neg_hi:[0,1]', 'v_pk_add_f16 v3, v0, v1 clamp',
+            'v_pk_mul_f16 v3, 2.0, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_add_f16 v3, s0, v1',
+            'v_pk_mul_f16 v3, v0, v1 op_sel:[1]', 'v_pk_fma_f16 v3, v0, v1 op_sel:[0,0]', 'v_pk_mul_f16 v3, v0, v1 op_sel:[2,0]',
+            'v_pk_mul_f16 v3, -v0, v1', 'v_pk_fma_f16 v3, v0, v1, v2 mul:2', 'v_pk_mul_f16 v[3:4], v0, v1'):
     try:
         stage().one(asm.split()[0], asm)
         check('refuses ' + asm, False)
