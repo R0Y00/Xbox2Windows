@@ -10,6 +10,7 @@ failures as one worker, an unexpected translator error must become <key>.fail, a
 pool must end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE_JOBS must fall
 back to the processor count.
 """
+import json
 import os
 import re
 import struct
@@ -102,11 +103,54 @@ endpgm = 0xbf810000
 mesh = struct.pack('<6I', 0xbf900009, *position, *primitive, endpgm)
 pixel = struct.pack('<3I', 0xf800080f, 0x03020100, endpgm)
 vertex = struct.pack('<3I', *position, endpgm)
-mesh57_fixture(mesh, pixel, 'slot 57 mesh code emission is unavailable')
-mesh57_fixture(mesh, b'', 'slot 57 mesh code emission is unavailable')
+mesh57_fixture(mesh, pixel, 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
+# A pair without a pixel stage is translated when the mesh has the accepted shape; this synthetic mesh does not.
+mesh57_fixture(mesh, b'', 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
 mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
+# A pixel stage whose only export is the null target (done, vm, no channels) is a depth-only stage and passes the role check.
+null_export = struct.pack('<3I', 0xf8001890, 0, endpgm)
+mesh57_fixture(mesh, null_export, 'slot 57 mesh with a depth-only pixel stage is not covered')
+# Controls: a position export, or a null export mixed with one, stays refused.
+mesh57_fixture(mesh, struct.pack('<3I', *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
+mesh57_fixture(mesh, struct.pack('<5I', 0xf8001890, 0, *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, vertex, 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, pixel, 'slot 57 mesh request key mismatch', tamper=True)
+
+
+def mesh57_resume_controls():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        key = 0x57
+        touch(d / 'req_0000000000000057.m57')
+        stem = d / f'{key:016x}'
+        touch(stem.with_suffix('.ms57.txt'))
+        ms, ps = (stem.with_suffix(suffix) for suffix in ('.ms57.cso', '.ps57.cso'))
+        # A container envelope is sufficient for an on-disk completeness check.
+        part = struct.pack('<4sI4s', b'DXIL', 4, b'test')
+        bytecode = struct.pack('<4s16sHHIII', b'DXBC', bytes(16), 1, 0, 36 + len(part), 1, 36) + part
+        prior = os.environ.pop('X2W_FXC', None)
+        try:
+            expect('slot 57 manifest alone is pending for bytecode', scan(d, False), [key])
+            touch(ms, bytecode)
+            expect('slot 57 with only mesh bytecode is pending', scan(d, False), [key])
+            touch(ps, bytecode)
+            expect('slot 57 with both complete containers is done', scan(d, False), [])
+            for stage in (ms, ps):
+                touch(stage, bytecode[:-1])
+                expect(f'{stage.suffixes[0]} with truncated bytecode is pending', scan(d, True), [key])
+                touch(stage, b'bad!' + bytecode[4:])
+                expect(f'{stage.suffixes[0]} with a bad container header is pending', scan(d, False), [key])
+                touch(stage, bytecode)
+            os.environ['X2W_FXC'] = ''
+            ps.unlink()
+            expect('slot 57 manifest-only mode finishes without pixel bytecode', scan(d, False), [])
+        finally:
+            os.environ.pop('X2W_FXC', None)
+            if prior is not None:
+                os.environ['X2W_FXC'] = prior
+
+
+mesh57_resume_controls()
 
 # Parallel --pending must give the same results as one worker. Sixteen RTV variants each name a
 # different missing base request, so each failure names its own base and a result reported against
@@ -139,6 +183,42 @@ with tempfile.TemporaryDirectory() as tmp:
         gfx2hlsl.translate_request = real
     fail = d / ('%016x.fail' % 9)
     expect('translator error recorded', fail.read_text().startswith('translator error: ZeroDivisionError') if fail.exists() else None, True)
+    # It names the function, file and line that raised it (the lambda above).
+    expect('translator error located', bool(re.fullmatch(
+        r'translator error: ZeroDivisionError: division by zero \(in <lambda>, %s line \d+\)\n'
+        % re.escape(Path(__file__).name), fail.read_text())) if fail.exists() else None, True)
+
+# An error raised inside a standard-library call is located at the code that made the call, not in the library.
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    touch(d / ('req_%016x.rtv' % 9))
+    real = gfx2hlsl.translate_request
+    gfx2hlsl.translate_request = lambda out_dir, key: json.loads('{')
+    try:
+        gfx2hlsl.translate_pending(str(d), jobs=1)
+    finally:
+        gfx2hlsl.translate_request = real
+    fail = d / ('%016x.fail' % 9)
+    expect('library error located at its caller', bool(re.fullmatch(
+        r'translator error: JSONDecodeError: .* \(in <lambda>, %s line \d+\)\n'
+        % re.escape(Path(__file__).name), fail.read_text())) if fail.exists() else None, True)
+
+# An operand refusal's .fail names the instruction that refused it; the refusal message itself is unchanged.
+sys.path.insert(0, str(ROOT / 'tests'))
+import startup_gfx2hlsl_dpp_quad_swap_check as quad  # noqa: E402
+
+AND_NEG = struct.pack('<III', (0b110101 << 26) | ((0x100 + 0x1b) << 16) | 1,  # v_and_b32_e64 v1, v30, -v30
+                      (256 + 30) | ((256 + 30) << 9) | (1 << 30), 0xbf810000)  # s_endpgm
+with tempfile.TemporaryDirectory() as tmp:
+    result = gfx2hlsl.translate_to(tmp, 3, quad.VS_WORDS, AND_NEG, quad.root_blob(), check=False)
+    expect('operand refusal result', result, "unsupported: operand '-v30' in v_and_b32_e64")
+    expect('operand refusal .fail', Path(tmp, '%016x.fail' % 3).read_text(), "operand '-v30' in v_and_b32_e64\n")
+    try:
+        gfx2hlsl.Pipeline(quad.VS_WORDS, AND_NEG, quad.root_blob())
+    except gfx2hlsl.Unsupported as error:
+        expect('the refusal message is unchanged', str(error), "operand '-v30'")
+    else:
+        failures.append('the negated v_and_b32 operand was not refused')
 
 # A broken process pool (a worker killed from outside) ends one pass, not the watcher.
 from concurrent.futures.process import BrokenProcessPool  # noqa: E402
