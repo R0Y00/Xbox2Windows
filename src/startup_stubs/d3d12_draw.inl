@@ -314,10 +314,11 @@ LONG pointer_like_qwords(const std::vector<unsigned char>& blob)
 SRWLOCK compute_request_lock = SRWLOCK_INIT;
 std::unordered_set<u64>& compute_keys_seen() { static std::unordered_set<u64> s; return s; }
 
-void publish_compute_request(const void* desc)
+// Returns the request key, or 0 when publishing is disabled or the description is refused.
+u64 publish_compute_request(const void* desc)
 {
     wchar_t marker[MAX_PATH];
-    if (!render_mode() || !cache_path(marker, L"req_", 0, L".c67")) return;  // publishing disabled
+    if (!render_mode() || !cache_path(marker, L"req_", 0, L".c67")) return 0;  // publishing disabled
     static LONG logged;
     const char* refusal = nullptr;
     u64 words[12]{};
@@ -356,7 +357,7 @@ void publish_compute_request(const void* desc)
     if (refusal) {
         InterlockedIncrement(&compute_requests_failed);
         if (first_calls(logged, 12)) log("x2w-draw compute request not written: %s", refusal);
-        return;
+        return 0;
     }
     const auto& [code, data, state_a, state_b] = copies;
     // Pointer words never reach .desc or the key; 9 and 10 are not followed (shortcut: two descriptions that
@@ -392,6 +393,7 @@ void publish_compute_request(const void* desc)
         log("x2w-draw compute request %016llx %s (code %llu bytes, data %llu bytes, state blocks %llu + %llu bytes, "
             "pointer-like blob qwords %ld)", key, present ? "already present" : written ? "published" : "not written",
             words[6], words[8], words[2], words[4], pointers);
+    return key;
 }
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
@@ -2387,10 +2389,12 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
 }
 
 // List slot 32, SetDescriptorHeaps. Track the title's shader-visible sampler
-// source while translated draws use their own physical descriptor heaps.
+// source while translated draws use their own physical descriptor heaps, and the
+// title memory of the view heap for a program that indexes the heap itself.
 void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
 {
     x2w_startup::SamplerSource source;
+    x2w_startup::ViewTable heap_records;
     x2w_startup::ViewHeapSelection view_heaps;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
@@ -2399,6 +2403,10 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
+                if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
+                                                                   heap.increment, heap.desktop_gpu);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
@@ -2413,6 +2421,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     pass.compute_tables.set_view_heap(view_heaps.compute);
     pass.source_view_heap = view_heaps.graphics;
     pass.title_samplers = source;
+    pass.title_view_heap = heap_records;
 }
 
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).
