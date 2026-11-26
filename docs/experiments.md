@@ -15174,7 +15174,8 @@ The startup compute translator accepts the full-mask FP32 image_store on
 dim:SQ_RSRC_IMG_2D_ARRAY with three full-width address VGPRs for x, y and layer.
 It emits an RWTexture2DArray<float4> store under the lane EXEC bit and records
 uav N tex2da float table P O channels 4 in the version 2 manifest.
-The startup runtime still needs the array UAV binding in #2742. Pixel arrays,
+The [startup runtime array UAV binding](experiments/startup-compute-array-uav.md)
+consumes this manifest. Pixel arrays,
 packed D16 arrays and the 1D, 3D and cube store forms remain refused.
 
 The standalone GPU fixture writes the same four words into mip zero of layer 1
