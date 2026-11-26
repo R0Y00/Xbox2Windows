@@ -4,6 +4,18 @@
 #include <array>
 #include <condition_variable>
 
+static std::atomic<bool> fail_action_allocation{false};
+void* operator new(std::size_t size)
+{
+    if (size == sizeof(x2w_save::Action) && fail_action_allocation.exchange(false)) {
+        throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+
 namespace {
 using Provider = decltype(&submit_provider);
 struct Block {
@@ -92,6 +104,14 @@ int run(bool system)
         call(16,provider_handle,ptr("profile"),ptr(&container)) ||
         call(23,container,0,ptr(&good)) || call(23,container,0,ptr(&bad))) return 1;
     unsigned char byte=0x11;
+    fail_action_allocation = true;
+    u64 failed_stage{};
+    try {
+        failed_stage = call(25,good,ptr("preference"),ptr(&byte),1);
+    } catch (const std::bad_alloc&) {
+        return 20; // The old path throws while holding save_lock.
+    }
+    if (fail_action_allocation || failed_stage != e_outofmemory) return 21;
     if (call(25,good,ptr("preference"),ptr(&byte),1) || call(27,good) || value()!=0x11) return 2;
     byte=0x77;
     if (call(25,good,ptr("preference"),ptr(&byte),1) || call(26,bad,ptr("absent"))) return 3;
