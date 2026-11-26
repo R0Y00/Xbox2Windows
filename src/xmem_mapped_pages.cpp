@@ -17,6 +17,7 @@
 
 #include <iterator>
 #include <limits>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <new>
@@ -862,6 +863,13 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
         if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
         how = "placeholder reserve";
     }
+#if X2W_TRACY
+    if (result && (type & MEM_COMMIT)) {
+        // A plot, not a pool: the title releases these ranges with Win32 calls that are not seen here.
+        static std::atomic<long long> committed;
+        X2W_PLOT("XMemVirtualAlloc commits (bytes, cumulative)", static_cast<std::int64_t>(committed += bytes));
+    }
+#endif
     const DWORD error = result ? 0 : GetLastError();
     x2w_local::logf("x2w-xmem XMemVirtualAlloc addr=%p size=0x%llx type=0x%lx attr=0x%llx prot=0x%lx -> %p (%s, err %lu)",
                     address, static_cast<unsigned long long>(bytes), static_cast<unsigned long>(type),
