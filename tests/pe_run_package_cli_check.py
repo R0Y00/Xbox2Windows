@@ -89,6 +89,18 @@ def _thread_error_mode() -> int:
     return get_mode()
 
 
+def _set_thread_error_mode(mode: int) -> int:
+    """Set the calling thread's error mode and return the previous one."""
+    kernel = pe_run_package.C.WinDLL("kernel32", use_last_error=True)
+    set_mode = kernel.SetThreadErrorMode
+    set_mode.argtypes = [pe_run_package.W.DWORD, pe_run_package.C.POINTER(pe_run_package.W.DWORD)]
+    set_mode.restype = pe_run_package.W.BOOL
+    previous = pe_run_package.W.DWORD()
+    if not set_mode(mode, pe_run_package.C.byref(previous)):
+        raise OSError(pe_run_package.C.get_last_error(), "SetThreadErrorMode failed")
+    return previous.value
+
+
 class _RecordingKernel:
     """kernel32 for pe_run_package.run whose LoadLibraryExW records the thread error mode of each call."""
 
@@ -119,6 +131,8 @@ class PeRunPackageCliTests(unittest.TestCase):
         # LoadLibraryExW. Without SEM_FAILCRITICALERRORS Windows shows a modal "Bad Image" dialog and the
         # load blocks until someone closes it. The flag must be set for the provider load only: the
         # thread's previous mode is back once the run returns, so the guest keeps the host's setting.
+        # The thread starts the run with mode 0: a host that already set the flag (as some CI runners
+        # do) would otherwise make the restore check pass whether or not the runner restores the mode.
         real_win_dll = pe_run_package.C.WinDLL
         modes = []
 
@@ -133,13 +147,18 @@ class PeRunPackageCliTests(unittest.TestCase):
             (pkg / "app.exe").write_bytes(_minimal_pe32_plus())
             mapper = Path(tmp) / "mapper.dll"
             mapper.write_bytes(b"")
-            before = _thread_error_mode()
-            with mock.patch.object(pe_run_package.C, "WinDLL", win_dll):
-                rc, stdout, stderr = _run_cli([
-                    str(mapper), str(pkg), "app.exe", "--preflight-only",
-                    "--shim", "kernel32.dll", str(system_kernel),
-                ])
-            after = _thread_error_mode()
+            original = _set_thread_error_mode(0)
+            try:
+                before = _thread_error_mode()
+                with mock.patch.object(pe_run_package.C, "WinDLL", win_dll):
+                    rc, stdout, stderr = _run_cli([
+                        str(mapper), str(pkg), "app.exe", "--preflight-only",
+                        "--shim", "kernel32.dll", str(system_kernel),
+                    ])
+                after = _thread_error_mode()
+            finally:
+                _set_thread_error_mode(original)
+        self.assertEqual(before, 0, "the thread error mode could not be cleared before the run")
         self.assertEqual(rc, 0, stderr)
         self.assertEqual(json.loads(stdout)["missing"], [])
         self.assertEqual([Path(path).name.casefold() for path, _ in modes], ["kernel32.dll"])
