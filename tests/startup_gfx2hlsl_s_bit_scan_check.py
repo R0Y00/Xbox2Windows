@@ -131,7 +131,9 @@ for name in OPCODES:
           repr(lines))
 
 # Refusals that must not widen: a 64-bit scan needs a register pair, 32-bit one register, and no lane-mask data.
-check('b64 refuses an inline constant source', refused('s_ff1_i32_b64', 3, 0x80))
+# s_ff0 keeps the pair-only SCALAR_BITS path (inline constants refused). s_ff1_i32_b64 also accepts a
+# zero-extended 32-bit immediate (#2022 Item F), so the pair-only refusal is checked on s_ff0.
+check('b64 refuses an inline constant source', refused('s_ff0_i32_b64', 3, 0x80))
 check('b32 refuses exec destination', refused('s_bcnt1_i32_b32', EXEC_LO, 2))
 check('b32 refuses m0 destination', refused('s_bcnt1_i32_b32', M0, 2))
 check('b32 refuses exec source', refused('s_bcnt1_i32_b32', 3, EXEC_LO))

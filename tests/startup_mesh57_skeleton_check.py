@@ -3,6 +3,7 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py depth <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
@@ -17,6 +18,10 @@ Without arguments: the fixture translates through the slot 57 request path, and 
 refused with its own message. `binary` compares the embedded words with llvm-mc. `draw` compiles the request
 path's output (ms_6_5, ps_6_0), draws it and compares the read-back target with a CPU rasteriser written here;
 a reference with one wrong pixel must fail.
+`depth` compiles the pair with a pixel stage that exports only to the null target (a depth-only pass), draws it
+twice into a depth buffer cleared to the sentinel 1.0 with depth test LESS, and compares colour (left cleared) and
+depth with the CPU rasteriser; a reference without the depth writes, and the same mesh with a null-export stage
+that does not discard, must each fail.
 The exchange mode uses the runtime-published request and the same pixel comparison.
 """
 import os
@@ -45,6 +50,21 @@ MESH = (
 PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\nv_interp_mov_f32 v2, p0, attr0.z\n'
              'v_interp_mov_f32 v3, p0, attr0.w\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n')
 PIXEL = 'c8020002 c8060102 c80a0202 c80e0302 f800180f 03020100 bf810000'.split()
+# A depth-only pixel stage: no colour output, only the null-target export (done, vm, no channel). Lanes whose flat
+# attribute 0 red is not above 0.5 leave EXEC, so the vm export kills them and they write no depth.
+DEPTH_PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_cmpx_lt_f32_e32 0.5, v0\n'
+                   'exp null off, off, off, off done vm\ns_endpgm\n')
+DEPTH_PIXEL = 'c8020002 7c2200f0 f8001890 00000000 bf810000'.split()
+NULL_EXPORT = DEPTH_PIXEL.index('f8001890')
+# The drawn stage with exp mrt0 v0, v0, v0, v0 inserted before its null export (after the v_cmpx), then the drawn
+# stage reading attribute 1, which the mesh does not export. The other mixed forms (mrtz, param0, pos0, both orders,
+# no EXEC narrowing) are covered by startup_mesh57_depth_only_check.py.
+DEPTH_PIXEL_MUTANTS = (
+    ('a colour write next to the drawn null export', DEPTH_PIXEL[:NULL_EXPORT] + ['f800000f', '00000000'] + DEPTH_PIXEL[NULL_EXPORT:],
+     'slot 57 pixel stage mixes the null export with another export'),
+    ('a depth-only pixel stage reading an attribute the mesh does not export', ['c8020402'] + DEPTH_PIXEL[1:],
+     'pixel stage reads attributes [1] the vertex stage does not export'),
+)
 
 # Overwrite red after the raw colour load; green, blue and alpha still come from its other three words.
 COLOUR_LOAD = 'buffer_load_dwordx4 v[20:23], v4, s[16:19], 0 offen offset:192'
@@ -407,6 +427,58 @@ REFUSALS = (
 )
 
 
+def depth_only_controls():
+    """A pixel stage that exports only to the null target is published as a depth-only pair."""
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, MESH, DEPTH_PIXEL)
+        expect('the depth-only pair translates', result, 'ok')
+        if result == 'ok':
+            names = sorted(p.name[16:] for p in Path(tmp).iterdir() if not p.name.startswith('req_'))
+            expect('depth-only pair source and manifest', names, ['.ms57.hlsl', '.ms57.txt', '.ps57.hlsl'])
+            manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+            # The pixel stage is bound but names no render target: an empty targets line, never 'ps none'.
+            expect('depth-only manifest stage information',
+                   [line for line in manifest if line.startswith(('params ', 'targets', 'wmask ', 'ps '))],
+                   ['params 1', 'targets '])
+            pixel = (Path(tmp) / ('%016x.ps57.hlsl' % key)).read_text()
+            expect('depth-only pixel stage has no output', ('void main(PSIn i)' in pixel, 'SV_Target' in pixel,
+                                                            'SV_Depth' in pixel), (True, False, False))
+            expect('depth-only pixel stage keeps the vm discard', pixel.count('discard;'), 1)
+            # The existing manifest reader (pending_keys): the pair is complete only with both bytecodes.
+            expect('depth-only manifest is enough in source-only mode', G.pending_keys(tmp, False), [])
+            part = struct.pack('<4sI4s', b'DXIL', 4, b'test')
+            bytecode = struct.pack('<4s16sHHIII', b'DXBC', bytes(16), 1, 0, 36 + len(part), 1, 36) + part
+            os.environ.pop('X2W_FXC')
+            (Path(tmp) / ('%016x.ms57.cso' % key)).write_bytes(bytecode)
+            expect('a depth-only pair without its pixel bytecode is pending (unlike ps none)', G.pending_keys(tmp, False), [key])
+            pixel_bytecode = Path(tmp) / ('%016x.ps57.cso' % key)
+            pixel_bytecode.write_bytes(bytecode)
+            expect('a depth-only pair with both bytecodes is done', G.pending_keys(tmp, False), [])
+            pixel_bytecode.write_bytes(bytecode[:-1])
+            expect('a depth-only pair with truncated pixel bytecode is pending', G.pending_keys(tmp, False), [key])
+            os.environ['X2W_FXC'] = ''
+    for what, pixel, reason in DEPTH_PIXEL_MUTANTS:
+        with tempfile.TemporaryDirectory() as tmp:
+            key, result = request(tmp, MESH, pixel)
+            expect(what, result, 'unsupported: ' + reason)
+            expect(what + ': only the refusal is published',
+                   sorted(p.name for p in Path(tmp).iterdir() if not p.name.startswith('req_')), ['%016x.fail' % key])
+    # A pair whose pixel stage is not the one the key was computed over, in both directions.
+    for what, keyed, stored in (('a colour stage stored under a depth-only key', DEPTH_PIXEL, PIXEL),
+                                ('a depth-only stage stored under a colour key', PIXEL, DEPTH_PIXEL)):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = G.mesh57_key(code(MESH), code(keyed), root())
+            for ext, data in (('.root', root()), ('.ps57', code(stored)), ('.m57', code(MESH))):
+                (Path(tmp) / ('req_%016x%s' % (key, ext))).write_bytes(data)
+            expect(what, G.translate_request(tmp, key), 'unsupported: slot 57 mesh request key mismatch')
+            expect(what + ': only the refusal is published',
+                   sorted(p.name for p in Path(tmp).iterdir() if not p.name.startswith('req_')), ['%016x.fail' % key])
+    # The mesh shapes the paired path refuses stay refused, with the same message, next to a depth-only pixel stage.
+    for what, mesh, reason in REFUSALS:
+        with tempfile.TemporaryDirectory() as tmp:
+            expect(what + ' (depth-only pair)', request(tmp, mesh, DEPTH_PIXEL)[1], 'unsupported: ' + reason)
+
+
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     with tempfile.TemporaryDirectory() as tmp:
@@ -511,6 +583,7 @@ def controls():
     # exp null off, off, off, off done vm; s_endpgm: a pixel stage without a colour output.
     with tempfile.TemporaryDirectory() as tmp:
         expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1], 'ok')
+    depth_only_controls()
     # The request path refuses a missing s_endpgm earlier; the walk takes the last instruction as the terminator
     # unread, so the pipeline refuses it too (s_nop in its place).
     try:
@@ -776,6 +849,94 @@ def draw(dxc, renderer, adapter, publisher=None):
     return 0
 
 
+# ---- depth: the depth-only pair drawn twice into a D32 target cleared to 1.0, depth test LESS ------------------
+# Per triangle and draw: (depth, kept). A kept triangle has attribute 0 red 1.0 at its three vertices, a killed one
+# 0.25, so the depth-only pixel stage keeps or discards all of its pixels. The four triangles cover: the second draw
+# behind the first, the second in front, a first draw killed, both killed.
+DEPTH_DRAWS = (((0.25, True), (0.75, True), (0.125, False), (0.5, False)),
+               ((0.75, True), (0.375, True), (0.625, True), (0.875, False)))
+
+
+def depth_scene(points, indices, draws, honour_kill=True):
+    """The upload of each draw and the expected colour and depth images (cleared to black and 1.0)."""
+    uploads, depth = [], [1.0] * (SIDE * SIDE)
+    words = [a | b << 10 | c << 20 for a, b, c in indices]
+    for draw in draws:
+        data = bytearray(buffer(points, [(0, 0, 0, 0)] * 12, words))
+        for t, (z, kept) in enumerate(draw):
+            for slot in indices[t]:
+                struct.pack_into('<f', data, 16 * slot + 8, z)
+                struct.pack_into('<f', data, 192 + 16 * slot, 1.0 if kept else 0.25)
+            if not (kept or not honour_kill):
+                continue
+            covered = rasterise(points, [(1, 1, 1, 1)] * 12, [indices[t]], 12, 1)
+            for i, pixel in enumerate(covered):
+                if pixel == (1, 1, 1, 1) and z < depth[i]:
+                    depth[i] = z
+        uploads.append(bytes(data))
+    colour = b''.join(bytes((0, 0, 0, 255)) for _ in range(SIDE * SIDE))
+    return uploads, colour, b''.join(struct.pack('<f', z) for z in depth)
+
+
+def draw_depth(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, _, indices = geometry()
+    uploads, colour, depth = depth_scene(points, indices, DEPTH_DRAWS)
+    _, _, unkilled = depth_scene(points, indices, DEPTH_DRAWS, honour_kill=False)
+    cleared = struct.pack('<f', 1.0) * (SIDE * SIDE)
+    pixels = lambda a, b: sum(a[i:i + 4] != b[i:i + 4] for i in range(0, len(a), 4))
+    written, killed = pixels(depth, cleared), pixels(depth, unkilled)
+    assert written > 100 and killed > 50, (written, killed)
+    # Depth is cleared to the sentinel 1.0 and every drawn depth is below it, so a discarded pixel keeps the sentinel.
+    covered = pixels(unkilled, cleared)
+    print('covered %d pixels: %d keep a written depth, %d keep the sentinel only because of the discard, '
+          '%d differ from a draw without the discard' % (covered, written, covered - written, killed))
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, MESH, DEPTH_PIXEL)
+        expect('the depth-only pair translates and compiles', result, 'ok')
+        # The same mesh with a null export and no discard: what a pass without the pixel stage would draw.
+        bare, bare_result = request(tmp, MESH, 'f8001890 00000000 bf810000'.split())
+        expect('the pixel stage without discard translates and compiles', bare_result, 'ok')
+        if result != 'ok' or bare_result != 'ok':
+            return 0
+        names = sorted(p.name[16:] for p in Path(tmp).iterdir() if p.name.startswith('%016x' % key))
+        expect('depth-only compiled files', names, ['.ms57.cso', '.ms57.hlsl', '.ms57.txt', '.ps57.cso', '.ps57.hlsl'])
+        manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+        uds = {tuple(fields[2:]): int(fields[1]) for fields in map(str.split, manifest) if fields and fields[0] == 'udsrc'}
+        constants = bytearray(1024)
+        struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '0'], len(indices))
+        struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '1'], len(points))
+        head = b''.join(bytes(constants) + upload for upload in uploads) + b'\xcd' * 160
+        path = Path(tmp) / 'depth.bin'
+        stems = {'depth-only pair': key, 'pixel stage without discard': bare}
+        # (label, pair, reference depth, depth mismatches). The colour target must stay cleared in every case.
+        cases = (('baseline', 'depth-only pair', depth, 0),
+                 ('a reference without the depth writes', 'depth-only pair', cleared, written),
+                 ('the discard dropped', 'pixel stage without discard', depth, killed))
+        for label, pair, ref_depth, depth_errors in cases:
+            name = str(Path(tmp) / ('%016x' % stems[pair]))
+            path.write_bytes(head + colour + ref_depth)
+            run = subprocess.run([renderer, adapter, '--mesh-depth-pair', name + '.ms57.cso', name + '.ps57.cso', str(path)],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            lines = set(run.stdout.splitlines())
+            message = 'Depth reference mismatch' if depth_errors else None
+            want = {'mesh_exports bytes=160 matched=1', 'pixels=1024 mismatches=0',
+                    'depth_pixels=1024 depth_mismatches=%d' % depth_errors}
+            clean = ('backend=%s debug_layer=unavailable' % adapter in lines or 'debug_errors=0 debug_warnings=0' in lines)
+            ok = (run.returncode == int(message is not None) and want <= lines and clean
+                  and (message is None or message in run.stderr))
+            print('%s (%s): depth mismatches want %d, exit=%d -> %s' % (label, pair, depth_errors, run.returncode,
+                                                                       'as expected' if ok else 'UNEXPECTED'))
+            if not ok or label == 'baseline':
+                print(run.stdout + run.stderr)
+            expect('depth draw: ' + label, ok, True)
+    return 0
+
+
 def draw_formatted(dxc, renderer, adapter):
     os.environ['X2W_DXC'] = dxc
     os.environ.pop('X2W_FXC', None)
@@ -879,6 +1040,8 @@ def main(argv):
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
         status = draw(*argv[2:])
+    elif argv[1:2] == ['depth'] and len(argv) == 5:
+        status = draw_depth(*argv[2:])
     elif argv[1:2] == ['formatted'] and len(argv) == 5:
         status = draw_formatted(*argv[2:])
     elif argv[1:2] == ['shift'] and len(argv) == 5:
