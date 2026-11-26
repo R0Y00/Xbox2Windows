@@ -445,10 +445,11 @@ def with_join_before_sample(data):
     return data[:off] + join + data[off:]
 
 
-def with_divergent_exec_before_sample(data):
-    """Clear exec_lo after the loads so the entry-mask proof is gone before the sample."""
+def with_divergent_exec_before_sample(data, word='8004febe'):
+    """Clear EXEC after the loads so the entry-mask proof is gone before the sample (s_mov_b64 exec, 0 by default;
+    8003febe is s_mov_b32 exec_lo, 0)."""
     off = next(o for o, _s, _n, a in G.decode(data) if 'image_sample_b' in a)
-    return data[:off] + bytes.fromhex('8003febe') + data[off:]
+    return data[:off] + bytes.fromhex(word) + data[off:]
 
 
 def with_branch_before_sample(data, sopp_op):
@@ -486,7 +487,14 @@ def controls():
             assert 'image_sample_b needs implicit derivatives' in str(error), (label, error)
         else:
             raise AssertionError('image_sample_b accepted after %s' % label)
-    # A cleared EXEC is an exact per-lane write: the quad program (no backward branch) keeps the proof.
+    # A 64-bit cleared EXEC is an exact per-lane write: the quad program (no backward branch) keeps the proof. The
+    # 32-bit form keeps lanes 32..63 of the old mask in wave64, so it is refused.
+    try:
+        G.Pipeline(VS_WORDS, with_divergent_exec_before_sample(plain, '8003febe'), root_blob()).hlsl_ps()
+    except G.Unsupported as error:
+        assert 'image_sample_b needs implicit derivatives' in str(error), error
+    else:
+        raise AssertionError('image_sample_b accepted after s_mov_b32 exec_lo, 0')
     cleared = G.Pipeline(VS_WORDS, with_divergent_exec_before_sample(plain), root_blob()).hlsl_ps()
     assert 'SampleBias' in cleared and 'exec = (0x00000000u) & 1;' in cleared, cleared
     print('uniform join before sample_b accepted; divergent EXEC and vcc/exec branches before sample_b refused')

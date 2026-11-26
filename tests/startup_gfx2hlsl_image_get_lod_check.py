@@ -58,8 +58,8 @@ def stage(dmask=1, dim=1, branch=False, divergent=False, join=False, cf_op=None,
         insert += sopp(4, 0)
     if join:  # uniform forward join; every lane still has the entry EXEC at the read
         insert += (bytes.fromhex('800380be') + bytes.fromhex('008006bf') + sopp(5, 1) + bytes.fromhex('810381be'))
-    if divergent:  # s_mov_b32 exec_lo, 0: the entry-mask proof is gone
-        insert += bytes.fromhex('8003febe')
+    if divergent:  # s_mov_b64 exec, 0: the entry-mask proof is gone
+        insert += bytes.fromhex('8004febe')
     if cf_op is not None:  # s_mov; s_cbranch_<op> +1; s_mov (vcc/exec: divergent CF)
         insert += bytes.fromhex('800380be') + sopp(cf_op, 1) + bytes.fromhex('810381be')
     if insert:
