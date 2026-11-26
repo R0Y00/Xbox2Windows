@@ -92,7 +92,7 @@ def run(asm, regs):
     dst, expr = re.fullmatch(r'(v\d+) = (.*);', s.lines[0]).groups()
     env = {f'v{i}': v for i, v in enumerate(regs)}
     env.update(
-        f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: 0x7e00 if x != x else f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00), saturate=lambda x: min(max(x, 0.0), 1.0),
+        f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: 0x7e00 if math.isnan(x) else (f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00)), asuint=lambda x: x, saturate=lambda x: min(max(x, 0.0), 1.0),
         abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
         trunc=lambda x: float(int(x)), isnan=math.isnan,
         asint=lambda x: x - (1 << 32) if x >> 31 else x, float=float, uint=lambda x: int(x) & 0xffffffff, int=int)
@@ -134,14 +134,86 @@ CASES = [
     ('v_cvt_i16_f16 v3, v0', [f2h(60000.0)], 0x7fff),
     ('v_cvt_u16_f16 v3, v0', [f2h(2.75) | HIGH], 2),
     ('v_cvt_u16_f16 v3, v0', [f2h(-1.5)], 0),
+    # SDWA binary16: a selected half of each source, the result in one half of the destination. v3 holds the old
+    # value 0x5a5a1234 where the other half is preserved.
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], THREE),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_0',
+     [0x3c00 << 16 | 0xabcd, TWO, 0, 0x5a5a1234], THREE),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1',
+     [ONE | HIGH, 0x4000 << 16 | 0x1234, 0, 0x5a5a1234], THREE),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], THREE << 16),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], THREE << 16 | 0x1234),
+    ('v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE | HIGH, TWO | HIGH, 0, 0x5a5a1234], 0x5a5a0000 | THREE),
+    ('v_sub_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_0',
+     [THREE << 16, ONE, 0, 0], TWO),
+    ('v_subrev_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_1',
+     [ONE, THREE << 16, 0, 0], TWO),
+    ('v_mul_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:WORD_1',
+     [THREE << 16, TWO << 16, 0, 0], f2h(6.0)),
+    ('v_add_f16_sdwa v3, -v0, |v1| dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [ONE, f2h(-3.0), 0, 0], TWO),
+    # inf - inf is NaN: the lane keeps a NaN class in the selected half.
+    ('v_sub_f16_sdwa v3, v0, v1 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+     [0x7c00, 0x7c00, 0, 0], 0x7e00 << 16),
 ]
 for asm, regs, expected in CASES:
     dst, got = run(asm, regs + [0] * (4 - len(regs)))
     check(asm + ' ' + str(regs), got == expected, 'got %#x want %#x' % (got, expected))
+# The statement the lowering emits, evaluated over every lane of the SDWA draw fixtures (edge values, NaN, infinity,
+# signed zero, denormals, both halves, PAD and PRESERVE) against the exact-rational reference of the draw check. A NaN
+# has no portable sign or payload, so both sides compare the NaN class (the draw canonicalises the same way).
+sys.path.insert(0, here)
+import startup_gfx2hlsl_f16_alu_draw_check as D  # noqa: E402
+for cfg, lanes in D.SDWA_DRAW.items():
+    op, s0, s1, dsel, unused, m0, m1 = cfg[:7]
+    asm = '%s_sdwa v3, %s, %s dst_sel:%s dst_unused:%s src0_sel:%s src1_sel:%s' % (
+        op, D.sdwa_operand(m0, 0), D.sdwa_operand(m1, 1), dsel, unused, s0, s1)
+    bad = [(x, D.sdwa_reference(cfg, x), run(asm, [x[0], x[1], 0, x[2]])[1]) for x in lanes]
+    bad = [(x, want, got) for x, want, got in bad if D.canon_word(got) != want]
+    check('sdwa %s over %d lanes' % (D.sdwa_name(cfg), len(lanes)), not bad,
+          ' '.join('%08x,%08x,%08x want %08x got %08x' % (*x, want, got) for x, want, got in bad[:2]))
+
+
+def low16_stage():
+    s = stage()
+    s.low16_only_v, s.pinned_low16_v = {3}, set()  # v3 holds a d16 load: its upper half is undefined
+    return s
+
+
+SDWA = 'v_add_f16_sdwa v3, v0, v1 dst_sel:%s dst_unused:%s src0_sel:%s src1_sel:WORD_0'
+for sel, unused, src0, still_low16, label in (
+        ('WORD_0', 'UNUSED_PRESERVE', 'WORD_0', True, 'keeping the undefined upper half leaves it undefined'),
+        ('WORD_1', 'UNUSED_PRESERVE', 'WORD_0', False, 'a WORD_1 write over a defined low half is fully defined'),
+        ('WORD_0', 'UNUSED_PAD', 'WORD_0', False, 'UNUSED_PAD zeroes the upper half')):
+    s = low16_stage()
+    s.one('v_add_f16_sdwa', SDWA % (sel, unused, src0))
+    check('SDWA binary16 ' + label, (3 in s.low16_only_v) == still_low16)
+try:
+    low16_stage().one('v_add_f16_sdwa', 'v_add_f16_sdwa v4, v3, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD '
+                      'src0_sel:WORD_1 src1_sel:WORD_0')
+    check('SDWA binary16 refuses the undefined upper half of a d16 load as a source', False)
+except G.Unsupported:
+    check('SDWA binary16 refuses the undefined upper half of a d16 load as a source', True)
 check('clamp saturates the binary16 result', run('v_add_f16 v3, v0, v1 clamp', [THREE, TWO, 0, 0])[1] == ONE)
 
 for asm in ('v_add_f16 v3, v0, v1 op_sel:[1,0]', 'v_cvt_i16_f16 v3, v0 clamp', 'v_add_f16 v3, v0',
-            'v_fmaak_f16 v3, v0, v1', 'v_mul_f16 v3, v0, v1 mul:2'):
+            'v_fmaak_f16 v3, v0, v1', 'v_mul_f16 v3, v0, v1 mul:2',
+            # SDWA binary16: whole-word destination, byte fields, clamp, omod, integer sext and a constant
+            # source stay refused.
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 clamp dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 mul:2 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, sext(v0), v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, 1.0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0',
+            'v_add_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0',
+            'v_min_f16_sdwa v3, v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0'):
     try:
         stage().one(asm.split()[0], asm)
         check('refuses ' + asm, False)

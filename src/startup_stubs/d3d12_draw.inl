@@ -353,7 +353,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-18";
+    constexpr char revision[] = "x2w-startup-shader-19";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -474,7 +474,7 @@ u64 publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-18cs";  // tools/startup/gfx2hlsl.py compute_key
+    constexpr char compute_revision[] = "x2w-startup-shader-19cs";  // tools/startup/gfx2hlsl.py compute_key
     u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
@@ -1943,6 +1943,29 @@ struct FormattedBufferDescriptor {
     std::uint32_t words[8] = {};
 };
 
+// Word 3 of a buffer descriptor as a formatted load decodes it (words[3]): the title's hardware word, or for a typed
+// buffer view the title created (words[0] its token) the word the driver builds from its format and component
+// mapping. Returns the refusal, with an unsupported FORMAT in format. Draws and compute Dispatch share it.
+const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
+{
+    if (words[0] == view_token_magic) {
+        ViewRecord record{};
+        AcquireSRWLockShared(&note_lock);
+        const bool known = words[1] < view_records().size();
+        if (known) record = view_records()[words[1]];
+        ReleaseSRWLockShared(&note_lock);
+        if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        std::memcpy(&view, record.desc, 40);
+        return x2w_startup::view_word3(view, words[3]);
+    }
+    if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code)) {
+        format = code;
+        return "unsupported FORMAT";
+    }
+    return x2w_startup::descriptor_word3_refusal(words[3]);
+}
+
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
     const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
@@ -1965,25 +1988,8 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
-        if (descriptor.words[0] == view_token_magic) {
-            // A typed buffer view the title created: the driver builds word 3 from its format and component mapping.
-            ViewRecord record{};
-            AcquireSRWLockShared(&note_lock);
-            const bool known = descriptor.words[1] < view_records().size();
-            if (known) record = view_records()[descriptor.words[1]];
-            ReleaseSRWLockShared(&note_lock);
-            if (!known || record.slot != 18 || record.desc_bytes < 40)
-                return refuse(ud.a, "missing hardware descriptor");
-            D3D12_SHADER_RESOURCE_VIEW_DESC view;
-            std::memcpy(&view, record.desc, 40);
-            if (const char* reason = x2w_startup::view_word3(view, descriptor.words[3])) return refuse(ud.a, reason);
-            descriptor.entry = entry;
-            continue;
-        }
-        const auto format = x2w_startup::formatted_buffer_code(descriptor.words[3]);
-        if (!x2w_startup::formatted_buffer_supported(format))
-            return refuse(ud.a, "unsupported FORMAT", format);
-        if (const char* reason = x2w_startup::descriptor_word3_refusal(descriptor.words[3])) return refuse(ud.a, reason);
+        std::uint32_t format = 0;
+        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
         descriptor.entry = entry;
     }
     return true;
