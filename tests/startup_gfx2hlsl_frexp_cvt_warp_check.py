@@ -157,7 +157,14 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                                                                                     run.stderr))
                     print('%s %s pixel %d: %s' % (kind, op, index, want), flush=True)
                     run = draw(renderer, adapter, vs, bad_ps, want)
-                    caught += run.returncode != 0
+                    if run.returncode:
+                        mismatch = f'startup_flat_param mismatch expected={want} actual='
+                        debug_ok = ('debug_layer=enabled' not in run.stdout
+                                    or 'debug_errors=0 debug_warnings=0' in run.stdout)
+                        if run.returncode != 1 or mismatch not in run.stderr or not debug_ok:
+                            raise AssertionError(f'{kind} {op} mutation failed before producing a readback\n'
+                                                 f'{run.stdout}\n{run.stderr}')
+                        caught += 1
                 if not caught:
                     raise AssertionError('%s %s: no pixel told the mutated lowering from the reference' % (kind, op))
                 print('%s %s mutation: %d pixels read other words' % (kind, op, caught), flush=True)

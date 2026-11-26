@@ -208,9 +208,12 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-18`. Revision 18 preserves the sign of zero in
-floating-point min, max, min3, max3 and med3. The matching compute (`x2w-startup-shader-18cs`) and fixed
-slot 57 mesh (`x2w-startup-mesh-57-3`) keys advance because those stages use the shared lowering.
+The shader cache revision is `x2w-startup-shader-19`. Revision 19 folds `s_mov_b32` from a scalar register that
+holds a plain constant, so later reads of the copy use the constant word. The matching compute
+(`x2w-startup-shader-19cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
+(`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
+Revisions before 19 read a register copied from a constant as a run-time value.
+Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
 Revisions before 17 lower `v_med3_f32` through a branchless median, which returns the smaller of the
 other two operands when a source is NaN.
 Revisions before 16 lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
@@ -2062,9 +2065,18 @@ These are measured on one executable; treat them as hypotheses for others.
   and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
   already lowers the same forms. The VOP2 select `v_cndmask_b32_sdwa` lowers the same way, with VCC as
-  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Float SDWA forms and a
+  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Most float SDWA forms and a
   `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
+  The one float exception is the binary16 arithmetic set `v_add_f16`, `v_sub_f16`, `v_subrev_f16` and
+  `v_mul_f16` (`_sdwa`). `src0_sel`/`src1_sel` accept `WORD_0`, `WORD_1` or `DWORD` (`DWORD` reads the
+  low half, as the 16-bit operation does); sources are single VGPRs, with `abs` and `neg`. The result
+  is rounded once to binary16 and written to `dst_sel:WORD_0` or `WORD_1`, with `UNUSED_PAD` zeroing the
+  other half (the default) and `UNUSED_PRESERVE` keeping the old one. Refused: `dst_sel:DWORD` and byte
+  selects, `sext()`, `clamp`, output modifiers, `UNUSED_SEXT`, and non-VGPR sources. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_f16_alu"`: the check covers the accepted and
+  refused forms, and the draws on WARP and hardware read back every selector and unused mode against a
+  CPU binary16 reference.
   The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
   too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
   the compare reads the extended value as its type. f32 SDWA compares stay refused (#1920). The
@@ -2078,7 +2090,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
   first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
   same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
-  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, as are `row_*`, `wave_*`, partial masks and `fi`. Run
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages and a changed EXEC are refused (branches and loops: see below), as are `row_*`, `wave_*`, partial masks and `fi`. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
   draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
   with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
@@ -2094,6 +2106,15 @@ These are measured on one executable; treat them as hypotheses for others.
   check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
   fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.
   [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
+- **DPP quad reads in branches and loops.** The quad swaps, broadcasts and pair broadcasts above also lower in a pixel
+  program with branches or loops when a whole-program check proves that the four threads of the quad reach the read
+  together: the `s_wqm exec, exec` runs before every branch and target, no other EXEC write can reach the read (an
+  exact-mask restore after the last read is fine), and every conditional branch that can reach it is wave-uniform
+  (SCC proven uniform; `s_cbranch_execz`/`execnz` under the whole-quad mask). A `vccz`/`vccnz` loop, SCC taken from a
+  lane mask, an EXEC write inside the loop and a late `s_wqm` are refused with the offset that breaks the proof. No
+  wave size is assumed. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_flow"`: the draws on
+  WARP and hardware run swap, broadcast and pair reads inside a five-pass scalar loop with an `if`, compare 16 x 16
+  pixels with a CPU reference, and require wrong-lane translations to fail.
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path

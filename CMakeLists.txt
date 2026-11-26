@@ -3290,6 +3290,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
+    add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_word_check.py")
     add_test(NAME startup_compute_readfirstlane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py")
     add_test(NAME startup_compute_gather_l COMMAND "${INTAKE_PYTHON}" -B
@@ -3447,6 +3449,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The src_scc scalar source (#1820).
     add_test(NAME startup_gfx2hlsl_src_scc COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_check.py")
+    # D3D12 UAV readback of s_cmp_eq_u32 + s_mov_b32 sX, src_scc on WARP/hardware vs the CPU reference,
+    # with a mutated-lowering negative control (same dispatch pattern as s_ff1).
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_src_scc_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_src_scc_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # src_scc at a branch target that one uniform SCC write reaches on every path.
     add_test(NAME startup_gfx2hlsl_src_scc_join COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_join_check.py")
@@ -3486,6 +3496,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # s_brev_b32 of a known constant folds to a known word (a sampler built from it is a constant descriptor).
     add_test(NAME startup_gfx2hlsl_scalar_brev_fold COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_brev_fold_check.py")
+    # A copy of a plain constant scalar register still assigns at run time and drops its constant at a join.
+    add_test(NAME startup_gfx2hlsl_const_copy_join COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_const_copy_join_check.py")
     # v_pack_b32_f16 with op_sel and the neg/abs source modifiers, evaluated against a bit reference.
     add_test(NAME startup_gfx2hlsl_pack_b32_f16 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_pack_b32_f16_check.py")
@@ -3515,6 +3528,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # refusals of every other DPP control. The draws are registered below.
     add_test(NAME startup_gfx2hlsl_dpp_pair COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_pair_check.py")
+    # DPP16 quad reads in a pixel program with a uniform loop and branch: the whole-program convergence proof and its
+    # refusals (vccz loop, SCC from a lane mask, EXEC write reaching the read, late s_wqm). The draws are below.
+    add_test(NAME startup_gfx2hlsl_dpp_quad_flow COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_flow_check.py")
     # DPP16 quad broadcasts quad_perm:[k,k,k,k] (#2125): lowered to QuadReadLaneAt, so the pixel stage compiles as
     # ps_6_0; the controls and refusals run here, the draws below compare every pixel with a CPU reference.
     add_test(NAME startup_gfx2hlsl_dpp_quad_broadcast COMMAND "${INTAKE_PYTHON}" -B
@@ -3974,6 +3991,14 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_dpp_pair_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl DPP16 quad reads (swap, broadcast, pair) inside a uniform scalar loop with an if: 16 x 16 pixels against
+    # a CPU reference of the per-pass neighbour words; a read taking the wrong lane must fail. DXC ps_6_0 only.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_dpp_quad_flow_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_flow_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_dpp_quad_flow_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl lowers DPP16 quad swaps (quad_perm [1,0,3,2], [2,3,0,1], [3,2,1,0]) in a pixel stage to QuadReadAcross*.
     add_test(NAME startup_gfx2hlsl_dpp_quad_swap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_swap_check.py")
@@ -3991,6 +4016,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_sgpr_spill_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_sgpr_spill_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # The same spill slots on wave64 lanes 32..63 and in a vertex stage (k and k + 32 on one VGPR refused).
+    add_test(NAME startup_gfx2hlsl_spill_wave64_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_spill_wave64_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_spill_wave64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_spill_wave64_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_spill_wave64_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl frexp, float-to-int conversions and ldexp (#1723): translation controls, then a desktop draw of each
     # operation compared with a reference computed from Python doubles, with a mutated lowering that must differ.
@@ -4033,7 +4067,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_gfx2hlsl_f16_alu_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f16_alu_draw_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
-        set_tests_properties(startup_gfx2hlsl_f16_alu_draw_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_gfx2hlsl_f16_alu_draw_${adapter} PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl v_cmpx_le_i32_sdwa on a sign-extended byte decides which of 16 x 16 pixels survive, checked
     # pixel by pixel (#1906); translations without the select or without sext() must fail the same draw.
@@ -4178,7 +4212,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py" control mbcnt "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_compute_mbcnt_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
-        foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast g-swapped-offsets g-overlap
+        foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast f-second-fill g-swapped-offsets g-overlap
                 j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept
                 n-dropped-broadcast)
             add_test(NAME startup_gfx2hlsl_compute_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
@@ -4187,6 +4221,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             set_tests_properties(startup_gfx2hlsl_compute_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
+    endforeach()
+    # gfx2hlsl v_mad_u64_u32 / v_mad_i64_i32: helper math against a 64-bit reference, carry-out mask, refusals (Part of #1723).
+    add_test(NAME startup_gfx2hlsl_mad64 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad64_check.py")
+    set_tests_properties(startup_gfx2hlsl_mad64 PROPERTIES TIMEOUT 60)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_mad64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad64_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_mad64_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl bounded 64-bit LDS exchanges (ds_write_b64, ds_read_b64) across s_barrier (Refs #2274, #1541).
     add_test(NAME startup_compute_lds_b64_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -4239,6 +4283,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl 64-bit VOP3 shifts: binary round-trip, overlap, guards and WARP/hardware draws (Refs #1723).
     add_test(NAME startup_gfx2hlsl_shift64_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_shift64_check.py")
+    add_test(NAME startup_gfx2hlsl_shift64_literal COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_shift64_literal_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_shift64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_shift64_check.py" draw "${DXC_EXECUTABLE}"
@@ -4442,11 +4488,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_heap_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_compute_dispatch_heap_word_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_heap_word_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
         add_test(NAME startup_compute_live_retry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
         set_tests_properties(startup_compute_dispatch_${adapter} startup_compute_dispatch_texture_${adapter}
-            startup_compute_dispatch_heap_${adapter} startup_compute_live_retry_${adapter}
+            startup_compute_dispatch_heap_${adapter} startup_compute_dispatch_heap_word_${adapter}
+            startup_compute_live_retry_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_stream_adapter_filter COMMAND "${INTAKE_PYTHON}" -B

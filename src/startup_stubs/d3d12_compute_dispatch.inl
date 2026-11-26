@@ -11,8 +11,15 @@
 
 struct ComputeTranslation {
     // Root parameter and byte offset (views), or parameter and word (entry values). A heap view names the root
-    // constant (parameter and word) that indexes its 32-byte record in the list's view heap.
-    struct Slot { int a, b; bool texture, heap; };
+    // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
+    // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
+    // at alone) is the index.
+    struct Slot {
+        int a, b;
+        bool texture, heap;
+        int word_param = -1, word_byte = 0;
+        std::uint32_t at = 0, times = 0;
+    };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
@@ -81,7 +88,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
             continue;
         }
         unsigned i = 0, x = 0, y = 0, z = 0, w = 0;
-        int a = 0, b = 0, used = 0;
+        int a = 0, b = 0, c = 0, d = 0, used = 0;
         const auto whole = [&] { return used == static_cast<int>(line.size()); };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
@@ -92,6 +99,12 @@ const char* load_compute_translation(ComputeTranslation& tr)
         else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.srvs.size())
             tr.srvs.push_back({a, b, false, true});
+        else if (std::sscanf(line.c_str(), "srv %u buf heap word table %d %d at %u%n", &i, &a, &b, &x, &used) == 4 && whole() &&
+                 i == tr.srvs.size())
+            tr.srvs.push_back({-1, 0, false, true, a, b, x});
+        else if (std::sscanf(line.c_str(), "srv %u buf heap word table %d %d at %u rootconst %d %d times %u%n", &i, &a, &b, &x,
+                     &c, &d, &y, &used) == 7 && whole() && i == tr.srvs.size())
+            tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
@@ -174,12 +187,34 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        // A heap record sits at the 32-bit byte offset the program computes, the root constant word shifted left by
-        // 5, in the title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.a < 0 || slot.b < 0 ? 0
-            : slot.heap ? pass.title_view_heap.record(std::uint32_t{pass.compute_constants.word(slot.a, slot.b)} << 5, 16)
-            : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
+        std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
+        if (slot.word_param >= 0) {
+            // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
+            // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
+            const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
+            if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
+                reason = "a table descriptor is not bound";
+                break;
+            }
+            std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
+            const std::uint32_t at = slot.at + index * slot.times;
+            const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+            const UINT stride = (words[1] >> 16) & 0x3fff;
+            if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
+                reason = "a heap index word is not in the list's upload memory";
+                break;
+            }
+            if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
+                reason = "a heap index word is outside its table buffer";
+                break;
+            }
+            std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
+        }
+        // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
+        // title memory of the list's view heap: a literal byte offset, as a table's is.
+        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
             reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";

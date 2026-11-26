@@ -119,6 +119,26 @@ bool title_backed(u64 title_handle, u64 bytes)
     ReleaseSRWLockShared(&descriptor_lock);
     return inside;
 }
+// True when the descriptor already holds a view created on the desktop: by its desktop shadow entry, or by a
+// materialized token the title copied into title memory with its own memory copy.
+bool descriptor_has_live_view(u64 desktop_handle, u64 title_handle)
+{
+    AcquireSRWLockShared(&note_lock);
+    const std::uint32_t* slot = shadow_slot(desktop_handle);
+    std::uint32_t id = slot ? *slot : 0;
+    bool live = id && id - 1 < view_records().size() && view_materialized()[id - 1];
+    ReleaseSRWLockShared(&note_lock);
+    if (live || title_handle == desktop_handle || !title_backed(title_handle, 32) ||
+        !x2w_local::readable(reinterpret_cast<const void*>(title_handle), 32))
+        return live;
+    std::uint32_t words[8];
+    std::memcpy(words, reinterpret_cast<const void*>(title_handle), sizeof(words));
+    if (words[0] != view_token_magic) return false;
+    AcquireSRWLockShared(&note_lock);
+    live = words[1] < view_records().size() && view_materialized()[words[1]];
+    ReleaseSRWLockShared(&note_lock);
+    return live;
+}
 
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
                    Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
