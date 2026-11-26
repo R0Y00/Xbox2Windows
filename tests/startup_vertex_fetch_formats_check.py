@@ -22,9 +22,10 @@ that word as an entry constant and the translation switches on it. Each format i
 xyz load with its own descriptor word, then descriptor words with swizzles and constants 0 and 1 run through
 the same translated body.
 Each TBUFFER format runs its matching reference and each wrong reference that changes a word in one renderer
-batch. The first mismatched word must match the predicted index and values. Mutated translations
-compile and dispatch separately.
+batch. The first mismatched word must match the predicted index and values. Each distinct vertex or compute
+source compiles once in the fixture's temporary directory. Mutated translations dispatch separately.
 """
+import hashlib
 import re
 import struct
 import subprocess
@@ -443,13 +444,15 @@ def runtime_gate_controls():
 
 
 def compile_fetch(directory, compiler, name, source):
-    hlsl, binary = directory / 'fetch.hlsl', directory / 'fetch.cso'
-    hlsl.write_text(source, encoding='ascii')
-    # Compile the vertex entry as the startup tools do, then the same body in the compute wrapper.
-    subprocess.run([compiler, '-T', 'vs_6_0', '-E', 'main', '-Fo', binary, hlsl], check=True)
-    with hlsl.open('a', encoding='ascii') as handle:
-        handle.write(wrapper(name))
-    subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'readback', '-Fo', binary, hlsl], check=True)
+    hlsl, output = directory / 'fetch.hlsl', directory / 'fetch.cso'
+    # Descriptor words can change without changing the vertex program. The readback wrapper
+    # also depends on the format, so key each stage by its complete input in this run's temporary directory.
+    for profile, entry, text in (('vs_6_0', 'main', source), ('cs_6_0', 'readback', source + wrapper(name))):
+        binary = directory / ('%s-%s.cso' % (profile, hashlib.sha256(text.encode('ascii')).hexdigest()))
+        if not binary.exists():
+            hlsl.write_text(text, encoding='ascii')
+            subprocess.run([compiler, '-T', profile, '-E', entry, '-Fo', output, hlsl], check=True)
+            output.replace(binary)
     return binary
 
 
