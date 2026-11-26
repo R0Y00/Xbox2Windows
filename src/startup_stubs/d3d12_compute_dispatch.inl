@@ -2,7 +2,7 @@
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
 // inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
-// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d float table <param> <byte> channels 4` outputs) named
+// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -23,6 +23,7 @@ struct ComputeTranslation {
         int word_param = -1, word_byte = 0;
         std::uint32_t at = 0, times = 0;
         Source source = root_constant;
+        bool array = false;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -125,6 +126,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.uavs.size())
             tr.uavs.push_back({a, b, true});
+        else if (std::sscanf(line.c_str(), "uav %u tex2da float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().array = true;
+        }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
         // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
@@ -136,7 +142,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
-                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D float texture"
+                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D/2D-array float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
     }
@@ -299,11 +305,20 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (!known || record.slot != 19) reason = "an output texture entry is not the token of an unordered access view";
             else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
                 reason = "an output texture view was not created on the desktop";
-            else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
+            else if (slot.array) {
+                // The layer in HLSL is relative to FirstArraySlice: retain the caller's complete view.
+                const auto& a = desc.Texture2DArray;
+                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+                    reason = "an output texture view is not a 2D array";
+                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1 ||
+                         a.PlaneSlice || a.MipSlice >= resource.MipLevels || a.FirstArraySlice >= resource.DepthOrArraySize ||
+                         !a.ArraySize || a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
+                    reason = "an output texture array view is outside the resource";
+            } else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
                                : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                 reason = "an output texture view is not 2D";
-            else if (x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
-            else if (!float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+            if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
+            if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
             // One state per resource here: a texture read and written by the same call is refused. Two outputs
             // of one texture (two mips) share the unordered access state.
             for (std::size_t input = 0; input < inputs && !reason; ++input)
