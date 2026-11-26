@@ -1,4 +1,4 @@
-"""Shared by the GPU checks: one D3D12 device per test and a compiler cache, instead of one process per case.
+"""Shared by the GPU checks: one D3D12 device per test instead of one offscreen_check process per case (issue #448).
 
 run(renderer, adapter, args)
     The same as subprocess.run([renderer, adapter, *args], capture_output=True, text=True), but the case goes to a long-lived
@@ -7,18 +7,10 @@ run(renderer, adapter, args)
     stderr are the text the one-shot call would print (the adapter banner comes with the first case only). Anything that goes
     wrong with the server (an older offscreen_check without `--serve`, a process that dies or hangs, X2W_FLAT_SERVER=0) falls
     back to the one-shot call, so a check never depends on the server.
-
-compile_cached(compiler, args_for, source, key_parts, output)
-    Content-addressed cache of compiled shader objects in out/hlsl-cache (or $X2W_HLSL_CACHE; X2W_HLSL_CACHE=0 turns it off).
-    The key is the source text, the compiler file (path, size, modification time) and the compile arguments, so a changed
-    source or a different compiler never hits. Failed compiles are never stored. Entries are published with an atomic rename,
-    so parallel ctest processes and the warp/hardware twins of a test can share it.
 """
 import atexit
-import hashlib
 import os
 import queue
-import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -139,30 +131,3 @@ def run(renderer, adapter, args):
         else:
             _servers[key] = False
     return subprocess.run([str(renderer), adapter, *args], capture_output=True, text=True)
-
-
-def compile_cached(compiler, args_for, source, key_parts, output):
-    """Compile `source` to `output` with args_for(output) unless an identical compile is cached; raises like subprocess.run(check=True)."""
-    root = os.environ.get('X2W_HLSL_CACHE')
-    cache = None if root == '0' else Path(root) if root else Path(__file__).resolve().parent.parent / 'out' / 'hlsl-cache'
-    entry = None
-    if cache is not None:
-        try:
-            stat = Path(compiler).stat()
-            digest = hashlib.sha256('\0'.join([str(Path(compiler).resolve()), str(stat.st_size), str(stat.st_mtime_ns),
-                                                *key_parts, source]).encode('utf-8')).hexdigest()
-            entry = cache / digest[:2] / (digest + '.cso')
-            if entry.is_file():
-                shutil.copyfile(entry, output)
-                return
-        except OSError:
-            entry = None
-    subprocess.run(args_for(output), check=True, capture_output=True, text=True)
-    if entry is not None:
-        try:
-            entry.parent.mkdir(parents=True, exist_ok=True)
-            temporary = entry.with_name('%s.%d.tmp' % (entry.name, os.getpid()))
-            shutil.copyfile(output, temporary)
-            os.replace(temporary, entry)
-        except OSError:
-            pass

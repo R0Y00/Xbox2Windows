@@ -121,35 +121,6 @@ class RunnerChecks(unittest.TestCase):
         self.addCleanup(setattr, R, 'SERVER_OFF', False)
         self.assertTrue(self.run_case(renderer, '--pass', 'a').stdout.startswith('ONESHOT '))
 
-    def test_compile_cache_hits_only_for_the_same_source_and_compiler(self):
-        calls = []
-        compiler = self.dir / 'dxc.exe'
-        compiler.write_text('compiler v1')
-        os.environ['X2W_HLSL_CACHE'] = str(self.dir / 'cache')
-        self.addCleanup(os.environ.pop, 'X2W_HLSL_CACHE')
-
-        def build(source, name='out.cso', fail=False):
-            def args_for(target):
-                calls.append(source)
-                code = 'import sys; sys.exit(1)' if fail else 'import sys; open(sys.argv[1], "w").write("cso of " + sys.argv[2])'
-                return [sys.executable, '-c', code, str(target), source]
-            target = self.dir / name
-            R.compile_cached(str(compiler), args_for, source, ['dxc', 'ps_6_0'], target)
-            return target.read_text()
-
-        self.assertEqual(build('a'), 'cso of a')
-        self.assertEqual(build('a', 'second.cso'), 'cso of a')
-        self.assertEqual(calls, ['a'])                                # the second build came from the cache
-        self.assertEqual(build('b'), 'cso of b')
-        compiler.write_text('compiler v2, a different file')
-        self.assertEqual(build('a'), 'cso of a')
-        self.assertEqual(calls, ['a', 'b', 'a'])                      # a changed compiler compiles again
-        with self.assertRaises(subprocess.CalledProcessError):
-            build('c', fail=True)
-        with self.assertRaises(subprocess.CalledProcessError):
-            build('c', fail=True)
-        self.assertEqual(calls.count('c'), 2)                         # a failed compile is never cached
-
 
 if __name__ == '__main__':
     unittest.main()
