@@ -2392,8 +2392,8 @@ These are measured on one executable; treat them as hypotheses for others.
   for a load. Before, the stage was refused and every draw through its pipeline was skipped.
   Two source-built pixel stages draw one texel of a 2x2 texture with two slices on WARP and
   hardware with DXC and FXC; a slice fixed to 0 and exchanged coordinates fail it
-  (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
-  and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
+  (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Multisampled
+  and 1D images are still refused here; cube sampling is lowered since #2943 (`startup_image_cube_`). Not covered: binding a single-slice 2D view to an array declaration
   in the draw path.
 - **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
   `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
@@ -2628,7 +2628,7 @@ These are measured on one executable; treat them as hypotheses for others.
   mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
-  gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
+  gather, clamp, 1D and `unorm` forms are refused; a cube lowers since #2943 ([note](experiments/startup-image-cube.md)). Only the translation is checked
   (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
 - `image_sample_b` in a pixel stage lowers to `SampleBias(sampler, uv, bias)` for 2D, 2D-array and 3D textures; the bias is the
   first address register. Offset, clamp, compare and gather forms, other stages, code after a branch, a sampler with a
