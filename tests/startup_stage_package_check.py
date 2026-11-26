@@ -93,6 +93,40 @@ def main():
             assert not (location / "new-run").exists()
         finally:
             junction.rmdir()
+
+        # The package can be named through an alias while the destination uses its real path.
+        # Both spellings must refer to the same tree for the separation check.
+        alias = root / "package-alias"
+        result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(alias), str(package)],
+                                capture_output=True, errors="replace", timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        try:
+            nested = package / "new" / "run"
+            result = call(powershell, alias, exe.name, nested)
+            assert result.returncode != 0 and "separate from PackageDir" in result.stderr, result.stdout + result.stderr
+            assert not nested.exists()
+            safe = root / "alias-safe-run"
+            result = call(powershell, alias, exe.name, safe)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert (safe / exe.name).read_bytes() == original[exe.name]
+        finally:
+            alias.rmdir()
+
+        # A path spelled inside the package can also lead outside through a junction.
+        outside_dir = root / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "outside.exe").write_bytes(b"outside executable")
+        escape = package / "escape"
+        result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(escape), str(outside_dir)],
+                                capture_output=True, errors="replace", timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        try:
+            refused = root / "escape-run"
+            result = call(powershell, package, "escape/outside.exe", refused)
+            assert result.returncode != 0 and "inside PackageDir" in result.stderr, result.stdout + result.stderr
+            assert not refused.exists()
+        finally:
+            escape.rmdir()
     print("safe startup staging: isolated executable/DLL copy, package preservation and overwrite/path guards passed")
 
 
