@@ -3808,6 +3808,10 @@ class Stage:
                     continue
                 # A write proves the mark again: every path from here on runs it. s_movreld can write any SGPR.
                 self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
+                if not self.scc_effect and ('scc' in scalar_effects(name, asm)[1] or name.startswith(('s_wqm', 's_quadmask'))):
+                    # The guest wrote SCC and the lowering emitted nothing for it: a later reader would see an older
+                    # value (descriptor_scc_reads follows every path from here to the reader).
+                    self.scc_effect = 'an SCC write that is not modelled'
                 if self.scc_effect:
                     scc_effects[off] = self.scc_effect
                 if self.scc_effect or not self.scc_verified:
@@ -5213,8 +5217,6 @@ class Stage:
             self.set_s(dst[1], '(scc ? 1u : 0u)')
             self.set_scc('false')  # 0 + a single bit never produces another carry.
             return None
-        if base in SCC_UNMODELLED and self.tracks_uniformity() and ops[0] != 'null':
-            self.scc_uniform = False
         pair = base.endswith('_b64')
         srcs = ops[1:]
         # 64-bit operands name the low register; exec/vcc name themselves.
@@ -5373,8 +5375,7 @@ class Stage:
                 raise Unsupported('%s into null on a lane mask' % base)
             if pair:
                 raise Unsupported('%s into null' % base)
-            if base in SCC_UNMODELLED and getattr(self, 'pc', None) not in getattr(self, 'address_carry_pairs', ()):
-                raise Unsupported('%s into null: SCC is not modelled' % base)
+        deferred_scc = None
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
@@ -5390,7 +5391,19 @@ class Stage:
             self.set_scc('(%s) < %s' % (expr, values[0]))
             self.address_carry_reader = self.address_carry_pairs[self.pc]
         elif base in SCC_UNMODELLED:
-            self.scc_verified = False
+            scc_text = add_sub_min_max_scc(base, values[0], values[1], expr)
+            if re.search(r'\bscc\b', scc_text):
+                # An operand is the incoming SCC (src_scc): the destination must read it before this instruction's own
+                # SCC replaces it, so the destination is written first and the SCC after, from sources it did not change.
+                if dname in ('m0', 'exec', 'exec_lo', 'vcc', 'vcc_lo', 'null') or any(
+                        reg_range(t) and dst and reg_range(t)[0] == 's' and dst[1] <= reg_range(t)[1] <= dst[2]
+                        for t in srcs):
+                    raise Unsupported('%s reads src_scc with a destination that is also a source or a special register'
+                                      % base)
+                deferred_scc = scc_text
+            else:
+                # From the sources, before the destination is written (it can be a source).
+                self.set_scc(scc_text)
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
@@ -5496,6 +5509,8 @@ class Stage:
                             self.uniform_source(high_source))
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
         self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
+        if deferred_scc is not None:
+            self.set_scc(deferred_scc)
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
             # Keep the runtime SGPR assignment intact while letting const_words() read inline float patterns
             # such as 0x40000000 (OPAQUE_BLACK, encoded as inline 244 / '2.0').
@@ -7369,7 +7384,7 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute FP32, a full 2D-array texel.
+        """Write a full 2D texel or, for compute, a full 2D-array texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
@@ -7399,8 +7414,6 @@ class Stage:
         array = dims[0] == 'SQ_RSRC_IMG_2D_ARRAY'
         if dims[0] != 'SQ_RSRC_IMG_2D' and (not array or self.kind != 'cs'):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
-        if array and d16:
-            raise Unsupported('compute image_store d16 requires a 2D image')
         try:
             mask = int(masks[0], 0)
         except ValueError:
@@ -8351,8 +8364,10 @@ class Stage:
             if n.startswith('s_cbranch') or n == 's_branch':
                 target = int(ops[0].split('_')[1], 16)
             if target is not None:
-                if target <= off:
-                    raise Unsupported('a backward branch in a program with v_interp_p1ll_f16 / v_interp_p2_f16')
+                # A backward branch needs no refusal of its own: every branch instruction is a boundary below, where
+                # the scan requires that no p1ll result is pending, no p2 result is stale and no destination has an
+                # undefined upper half. Nothing the scan tracks therefore travels along a back edge, and the loop head
+                # (also a boundary, entered with the same empty state) starts clean on every iteration.
                 targets.add(target)
 
         def regs(tok):
@@ -9464,6 +9479,22 @@ VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
 SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
                             's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
 
+
+def add_sub_min_max_scc(base, a, b, result):
+    """The SCC expression of s_add/s_sub/s_min/s_max_{i,u}32 over the source texts a and b and the result text.
+    s_add_u32: carry out; s_sub_u32: borrow (S0 < S1); s_add_i32 / s_sub_i32: signed overflow (the sign of the result
+    differs from the sign the operands imply); s_min / s_max: SCC = (D == S0), the first source was chosen."""
+    if base == 's_add_u32':
+        return '(%s) < (%s)' % (result, a)
+    if base == 's_sub_u32':
+        return '(%s) < (%s)' % (a, b)
+    if base == 's_add_i32':
+        return '(((((%s) ^ (%s)) & ((%s) ^ (%s))) >> 31) != 0)' % (a, result, b, result)
+    if base == 's_sub_i32':
+        return '(((((%s) ^ (%s)) & ((%s) ^ (%s))) >> 31) != 0)' % (a, b, a, result)
+    cast = 'int' if base.endswith('_i32') else ''
+    return '(%s(%s) %s %s(%s))' % (cast, a, '<=' if base.startswith('s_min') else '>=', cast, b)
+
 PACK_B16 = frozenset(('s_pack_ll_b32_b16', 's_pack_lh_b32_b16', 's_pack_hh_b32_b16'))
 SCA = {
     's_mov_b32': ('{0}', None), 's_mov_b64': ('{0}', None), 's_movk_i32': ('{0}', None),
@@ -10448,7 +10479,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-26'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-27'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -10458,7 +10489,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-26cs')
+    key = fnv(b'x2w-startup-shader-27cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key

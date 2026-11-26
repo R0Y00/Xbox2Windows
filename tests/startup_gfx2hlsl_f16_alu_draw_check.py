@@ -23,6 +23,7 @@ import re
 import struct
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 
@@ -638,19 +639,40 @@ def check_binary(llvm_mc):
     print('fixture words match llvm-mc')
 
 
+def draw_shaders(submit, name, lanes, pixel_words, pixel_text):
+    pixel = submit('ps', pixel_text, 'ps_' + name)
+    vertices = []
+    for index in range(0, len(lanes), 4):
+        chunk = lanes[index:index + 4]
+        source = G.Pipeline(vs_words(chunk), pixel_words, root_blob()).hlsl_vs()
+        vertices.append((index, chunk, submit('vs', source, 'vs_%s_%d' % (name, index))))
+    ps = pixel.result()
+    for index, chunk, vertex in vertices:
+        yield index, chunk, vertex.result(), ps
+
+
 def check_draw(dxc, renderer, adapter, fxc=None):
     controls()
     compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
     failures = []
-    with tempfile.TemporaryDirectory() as tmp:
+    # A case group needs one pixel shader and up to two vertex shaders. Only schedule the current group,
+    # and consume each compiler result in draw order so that a later failure cannot hide an earlier one.
+    with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(max_workers=3) as pool:
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:
+            stages = {}
+            profiles = {'vs': vs_profile, 'ps': ps_profile}
+
+            def submit(stage, source, stem):
+                profile = profiles[stage]
+                key = profile, source
+                if key not in stages:
+                    stages[key] = pool.submit(compile_hlsl, compiler, kind, source, stem + '_' + kind, profile, directory)
+                return stages[key]
+
             for op, lanes in DRAW.items():
-                ps = compile_hlsl(compiler, kind, draw_text(op), 'ps_%s_%s' % (op.replace(':', '_'), kind), ps_profile, directory)
-                for index in range(0, len(lanes), 4):
-                    chunk = lanes[index:index + 4]
-                    vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), ps_words(op), root_blob()).hlsl_vs(),
-                                      'vs_%s_%d_%s' % (op.replace(':', '_'), index, kind), vs_profile, directory)
+                shaders = draw_shaders(submit, op.replace(':', '_'), lanes, ps_words(op), draw_text(op))
+                for index, chunk, vs, ps in shaders:
                     expected = words_text(draw_word(op, x, index + n) for n, x in enumerate(chunk))
                     run = draw(renderer, adapter, vs, ps, expected)
                     if op == PK_KEYS[0] and index == 0:
@@ -666,13 +688,10 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     print('%s %s set %d: %s' % (kind, op, index // 4, expected), flush=True)
             for cfg, lanes in SDWA_DRAW.items():
                 name = sdwa_name(cfg)
-                ps = compile_hlsl(compiler, kind, sdwa_draw_text(cfg), 'ps_sdwa_%s_%s' % (name, kind), ps_profile,
-                                  directory)
-                for index in range(0, len(lanes), 4):
-                    chunk = lanes[index:index + 4]
-                    vs = compile_hlsl(compiler, kind,
-                                      G.Pipeline(vs_words(chunk), sdwa_ps_words(cfg), root_blob()).hlsl_vs(),
-                                      'vs_sdwa_%s_%d_%s' % (name, index, kind), vs_profile, directory)
+                shaders = draw_shaders(submit, 'sdwa_' + name, lanes, sdwa_ps_words(cfg), sdwa_draw_text(cfg))
+                for index, chunk, vs, ps in shaders:
+                    if cfg == SDWA_CONFIGS[0] and index == 0:
+                        control_vs, control_ps = vs, ps
                     expected = words_text(sdwa_reference(cfg, x) ^ SDWA_TAG for x in chunk)
                     run = draw(renderer, adapter, vs, ps, expected)
                     if run.returncode:
@@ -684,12 +703,9 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             # Wrong-value control: a drawn word that differs by one bit must be reported as a mismatch.
             cfg = SDWA_CONFIGS[0]
             chunk = SDWA_DRAW[cfg][:4]
-            ps = compile_hlsl(compiler, kind, sdwa_draw_text(cfg), 'ps_sdwa_control_%s' % kind, ps_profile, directory)
-            vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), sdwa_ps_words(cfg), root_blob()).hlsl_vs(),
-                              'vs_sdwa_control_%s' % kind, vs_profile, directory)
             wrong = [sdwa_reference(cfg, x) ^ SDWA_TAG for x in chunk]
             wrong[0] ^= 0x10000
-            if not draw(renderer, adapter, vs, ps, words_text(wrong)).returncode:
+            if not draw(renderer, adapter, control_vs, control_ps, words_text(wrong)).returncode:
                 failures.append('%s sdwa wrong-value control was accepted' % kind)
     if failures:
         raise AssertionError('draw mismatches: ' + ', '.join(failures))

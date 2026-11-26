@@ -403,7 +403,7 @@ static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32, height = 8;
     const bool fp32 = mode == "texture-array" || mode == "texture-array-2d";
-    const UINT layers = mode == "texture-array" ? 6 : 1;
+    const UINT layers = mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
     const UINT pitch = width * (fp32 ? 16 : 8), slice_bytes = pitch * height, bytes = slice_bytes * layers;
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {

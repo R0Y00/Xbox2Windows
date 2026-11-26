@@ -119,4 +119,28 @@ inline bool measure_placed_buffer(const void* address, std::uint64_t width, Plac
     return true;
 }
 
+// True when an uncovered buffer at [address, address + width) lies inside a MEM_PRIVATE
+// reservation at a 64 KiB-aligned offset, fits within its whole allocation size (nonzero and at
+// most max_allocation_bytes when nonzero), and has nonzero width. Used before committing a lazy
+// startup block (X2W_XMEM_LAZY_STARTUP) and re-measuring so an aligned nonzero offset with a
+// MEM_RESERVE prefix can still alias an eligible small block without committing ineligible or
+// out-of-bounds blocks.
+inline bool can_commit_lazy_placed_buffer(const void* address, std::uint64_t width,
+                                          std::uint64_t max_allocation_bytes)
+{
+    if (!address || !width) return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT ||
+        info.Type != MEM_PRIVATE || !info.AllocationBase)
+        return false;
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    const auto base = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+    if (start < base) return false;
+    const std::uint64_t offset = start - base;
+    if (offset & 0xFFFF) return false;
+    const std::uint64_t alloc_bytes = allocation_bytes(info.AllocationBase);
+    if (!alloc_bytes || (max_allocation_bytes && alloc_bytes > max_allocation_bytes)) return false;
+    return offset <= alloc_bytes && width <= alloc_bytes - offset;
+}
+
 } // namespace x2w_startup

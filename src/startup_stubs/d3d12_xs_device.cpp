@@ -2413,27 +2413,56 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 
 // Transient data the title addresses by GPU address (fetch tables, vertices, constants) is copied
 // from its memory into a desktop upload buffer; the copy's GPU address is bound instead.
-ID3D12Resource* upload_ring;
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset);
-D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
+// Chunks start at 16 MiB and append on demand (doubling up to the 256 MiB total cap), staying alive
+// for the process so previously returned (ID3D12Resource*, offset) and GPU virtual addresses remain valid.
+struct UploadRingChunk {
+    ID3D12Resource* resource = nullptr;
+    unsigned char* mapped = nullptr;
+    u64 capacity = 0;
+    u64 used = 0;
+};
+
+unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
-    u64 offset = 0;
-    return ring_copy(title_address, bytes, &offset) ? upload_ring->GetGPUVirtualAddress() + offset : 0;
-}
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset)
-{
-    constexpr u64 ring_bytes = u64{256} << 20;
-    ID3D12Resource*& ring = upload_ring;
-    static unsigned char* mapped;
-    static volatile LONG64 cursor;
+    constexpr u64 initial_chunk_bytes = u64{16} << 20;
+    constexpr u64 max_total_bytes = u64{256} << 20;
+    constexpr u64 max_alloc_bytes = max_total_bytes / 4;
+    if (resource) *resource = nullptr;
+    if (offset) *offset = 0;
+    if (bytes == 0 || bytes > max_alloc_bytes) return nullptr;
+    const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
+
     static SRWLOCK lock = SRWLOCK_INIT;
-    if (!ring) {
-        AcquireSRWLockExclusive(&lock);
-        if (!ring) {
+    static std::vector<UploadRingChunk> chunks;
+    static std::size_t active = 0;
+    static u64 total_bytes = 0;
+
+    AcquireSRWLockExclusive(&lock);
+    auto finish = [&](UploadRingChunk& chunk, u64 start) -> unsigned char* {
+        if (offset) *offset = start;
+        if (resource) *resource = chunk.resource;
+        ReleaseSRWLockExclusive(&lock);
+        return chunk.mapped + start;
+    };
+
+    if (!chunks.empty() && chunks[active].used + rounded <= chunks[active].capacity) {
+        UploadRingChunk& chunk = chunks[active];
+        const u64 start = chunk.used;
+        chunk.used += rounded;
+        return finish(chunk, start);
+    }
+
+    const u64 remaining = total_bytes < max_total_bytes ? max_total_bytes - total_bytes : 0;
+    if (rounded <= remaining) {
+        u64 chunk_bytes = chunks.empty() ? initial_chunk_bytes : chunks.back().capacity * 2;
+        if (chunk_bytes < rounded) chunk_bytes = rounded;
+        if (chunk_bytes > remaining) chunk_bytes = remaining;
+        auto* device = the_device ? device_of(the_device) : nullptr;
+        if (device) {
             const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
             D3D12_RESOURCE_DESC buffer{};
             buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            buffer.Width = ring_bytes;
+            buffer.Width = chunk_bytes;
             buffer.Height = 1;
             buffer.DepthOrArraySize = 1;
             buffer.MipLevels = 1;
@@ -2441,34 +2470,54 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset)
             buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             ID3D12Resource* created = nullptr;
             void* base = nullptr;
-            auto* device = device_of(the_device);
             if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&created)))) {
                 auto* budget = x2w_budget::committed(device, created, D3D12_HEAP_TYPE_UPLOAD);
                 if (SUCCEEDED(created->Map(0, nullptr, &base))) {
-                    mapped = static_cast<unsigned char*>(base);
-                    ring = created;
-                } else if (budget) {
-                    budget->end_use(); // The failed Map leaves the existing desktop reference held.
+                    try {
+                        chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, rounded});
+                        total_bytes += chunk_bytes;
+                        active = chunks.size() - 1;
+                        return finish(chunks[active], 0);
+                    } catch (const std::bad_alloc&) {
+                        created->Unmap(0, nullptr);
+                        if (budget) budget->end_use();
+                        created->Release();
+                    }
+                } else {
+                    if (budget) budget->end_use();
+                    created->Release();
                 }
             }
         }
-        ReleaseSRWLockExclusive(&lock);
     }
-    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return nullptr;
-    const u64 rounded = (bytes + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
-    u64 start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded))) % ring_bytes;
-    if (start + rounded > ring_bytes) start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded) + (ring_bytes - start))) % ring_bytes, start = 0;
-    *offset = start;
-    return mapped + start;
+
+    for (std::size_t step = 1; step <= chunks.size(); ++step) {
+        const std::size_t idx = (active + step) % chunks.size();
+        if (chunks[idx].capacity >= rounded) {
+            active = idx;
+            chunks[idx].used = rounded;
+            return finish(chunks[idx], 0);
+        }
+    }
+
+    ReleaseSRWLockExclusive(&lock);
+    return nullptr;
 }
 
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
+bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
 {
-    auto* dest = reserve_upload_ring(bytes, offset);
+    auto* dest = reserve_upload_ring(bytes, offset, resource);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
+{
+    u64 offset = 0;
+    ID3D12Resource* resource = nullptr;
+    return ring_copy(title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
 }
 
 // Number of contiguous readable bytes at address, up to wanted.
@@ -4988,9 +5037,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     // buffer is committed in it: one region-information call for a fully committed private
     // allocation, otherwise a region walk that stops at the end of the buffer. The GPU cannot fault in a lazily
     // mapped physical page (X2W_XMEM_LAZY_COMMIT), so the buffer's pages are committed first; a lazy startup
-    // block (X2W_XMEM_LAZY_STARTUP) is committed whole, as the heap opened on it is reused for the block.
+    // block (X2W_XMEM_LAZY_STARTUP) is committed whole only right before OpenExistingHeapFromAddress opens it.
     x2w_local::commit_lazy(address, static_cast<std::size_t>(desc->Width));
-    x2w_local::commit_lazy_block(address);
     x2w_startup::PlacedBufferRange range;
     const bool committed = x2w_startup::measure_placed_buffer(address, desc->Width, range);
     InterlockedIncrement64(&placed_buffer_calls);
@@ -5005,7 +5053,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? static_cast<D3D12_RESOURCE_STATES>(state) : D3D12_RESOURCE_STATE_COMMON;
     if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
         return E_INVALIDARG;
-    const UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
+    UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
     // X2W_D3D12_LINEAR_BUFFERS=1 or copy: shared or copied at submit (linear_buffer_backing.h). Where
     // neither keeps its guarantees, the default backing below is kept and the refusal recorded.
     X2wLinearBufferInfo linear{};
@@ -5042,9 +5090,33 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     HRESULT hr = S_OK;
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
     // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
-    // throws inside D3D12Core.
+    // throws inside D3D12Core. OpenExistingHeapFromAddress also wraps the entire allocation, so the
+    // opt-in X2W_D3D12_CAP_EXISTING_HEAP=1 skips allocations above 256 MiB (or of unknown size) to keep
+    // multi-GiB startup blocks out of WorkingSetSize/NonLocal. The cap is opt-in because a capped buffer
+    // falls back to a copied placement that CopyBufferRegion (slot 15) refuses as title_backed_source,
+    // losing a late guest write; the default keeps the formerly aliased path so contents stay authoritative.
+    // A buffer at an aligned nonzero offset inside an eligible lazy startup block leaves [base, address)
+    // MEM_RESERVE after the span-only commit_lazy; commit the eligible block before re-measuring so
+    // it can alias without touching unaligned or out-of-bounds allocations (and, with the cap, > 256 MiB).
+    static const bool cap_existing_heap = x2w_local::env_on("X2W_D3D12_CAP_EXISTING_HEAP");
+    if (!range.covered && !range.region_info && range.type == MEM_PRIVATE &&
+        initial_state != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
+        x2w_startup::can_commit_lazy_placed_buffer(address, desc->Width,
+                                                   cap_existing_heap ? x2w_startup::unplaced_max_span : 0)) {
+        x2w_local::commit_lazy_block(address);
+        if (x2w_startup::measure_placed_buffer(address, desc->Width, range)) {
+            if (range.region_info) InterlockedIncrement64(&placed_buffer_region_info);
+            InterlockedAdd64(&placed_buffer_queries, range.queries);
+            base = range.base;
+            offset = static_cast<char*>(address) - static_cast<char*>(base);
+        } else {
+            range.covered = false;
+        }
+    }
     if ((offset & 0xFFFF) || !range.covered || range.type != MEM_PRIVATE ||
-        initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
+        initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE ||
+        (cap_existing_heap && !x2w_startup::unplaced_existing_heap_allowed(x2w_startup::allocation_bytes(base))))
+        hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
         for (const auto& [known, h] : existing_heaps) {
@@ -5054,6 +5126,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             }
         }
         if (!heap) {
+            x2w_local::commit_lazy_block(address);
             ID3D12Device3* device3 = nullptr;
             hr = device_of(self)->QueryInterface(IID_PPV_ARGS(&device3));
             if (SUCCEEDED(hr)) {
