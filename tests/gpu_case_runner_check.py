@@ -59,7 +59,15 @@ if args and args[0] == "--serve":
         out, err, code = one(line.rstrip("\n").split("\t"))
         if mode == "die-at-%d" % index:
             os._exit(3)
+        if mode == "noisy-die-at-%d" % index:
+            sys.stdout.write("partial output %d\n" % index)
+            sys.stdout.flush()
+            sys.stderr.write("renderer diagnostic %d\n" % index)
+            sys.stderr.flush()
+            os._exit(3)
         if mode == "hang-at-%d" % index:
+            sys.stderr.write("hang diagnostic %d\n" % index)
+            sys.stderr.flush()
             import time
             time.sleep(60)
         if mode == "skew-at-%d" % index:
@@ -86,11 +94,27 @@ def launcher(directory, name, mode):
     return [sys.executable, str(fake), '--mode=' + mode]
 
 
+def running(pid):
+    """True while the process runs: a killed child nobody reaped (PID 1 of a container) stays a zombie, which is not running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        with open('/proc/%d/stat' % pid) as stat:
+            return stat.read().rsplit(')', 1)[1].split()[0] != 'Z'
+    except (OSError, IndexError):
+        return True
+
+
 class RunnerChecks(unittest.TestCase):
     def setUp(self):
         R._servers.clear()
         self.addCleanup(R._servers.clear)
         self.addCleanup(R._close_all)          # runs first: the servers of the test are closed before the table is emptied
+        patch = unittest.mock.patch.object(R, 'SERVER_OFF', False)   # X2W_FLAT_SERVER=0 in the environment must not turn served tests into one-shot calls
+        patch.start()
+        self.addCleanup(patch.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
@@ -146,6 +170,16 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(lost.returncode, 1)
         self.assertIn('timed out after 2 s', lost.stderr)
         self.assertLess(time.monotonic() - started, 4)               # one deadline for both streams, not one each
+        self.assertIn('hang diagnostic 0', lost.stderr)              # what it printed before hanging survives
+        self.assertIn('debug_layer=enabled', lost.stdout)            # and so does the adapter banner
+
+    def test_a_crash_keeps_the_diagnostics_and_the_banner(self):
+        lost = self.run_case(launcher(self.dir, 'noisy', 'noisy-die-at-0'), '--pass', 'a')
+        self.assertEqual(lost.returncode, 1)
+        self.assertIn('exited (code 3)', lost.stderr)
+        self.assertIn('renderer diagnostic 0', lost.stderr)
+        self.assertIn('partial output 0', lost.stdout)
+        self.assertTrue(lost.stdout.startswith('backend=warp debug_layer=enabled\nadapter=Fake\n'))
 
     def test_a_reply_with_the_wrong_case_number_fails_the_case(self):
         lost = self.run_case(launcher(self.dir, 'skew', 'skew-at-1'), '--pass', 'a')
@@ -191,9 +225,7 @@ class RunnerChecks(unittest.TestCase):
         R._close_all()                                               # the renderer is gone but its child holds stdout and stderr
         self.assertLess(time.monotonic() - started, 20)
         for _ in range(50):                                          # the child was killed with the group
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not running(pid):
                 break
             time.sleep(0.1)
         else:
@@ -201,8 +233,9 @@ class RunnerChecks(unittest.TestCase):
 
     def test_x2w_flat_server_zero_uses_one_shot_calls(self):
         renderer = launcher(self.dir, 'off', 'serve')
-        R.SERVER_OFF = True
-        self.addCleanup(setattr, R, 'SERVER_OFF', False)
+        patch = unittest.mock.patch.object(R, 'SERVER_OFF', True)
+        patch.start()
+        self.addCleanup(patch.stop)
         self.assertTrue(self.run_case(renderer, '--pass', 'a').stdout.startswith('ONESHOT '))
 
 

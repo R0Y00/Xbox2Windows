@@ -44,7 +44,7 @@ class _Server:
                                      stderr=subprocess.PIPE, text=True, bufsize=1,
                                      start_new_session=os.name == 'posix')   # own process group: a launcher's children die with it
         self.banner, self.banner_err, self.ready, self.returncode, self.stderr_text = '', '', False, None, ''
-        self.next_case = 0
+        self.next_case, self.lost_out, self.lost_err = 0, '', ''
         self.threads = [threading.Thread(target=self._pump, args=(self.proc.stdout, self.out, 'X2WCASE '), daemon=True),
                         threading.Thread(target=self._pump, args=(self.proc.stderr, self.err, 'X2WEND '), daemon=True)]
         for thread in self.threads:
@@ -104,6 +104,18 @@ class _Server:
                 return items
             items.append(item[0])
 
+    @staticmethod
+    def _drain_now(q):
+        """The text still queued, without waiting (the pumps have ended)."""
+        items = []
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                return items
+            if item is not None:
+                items.append(item[0])
+
     def case(self, args):
         """Send one case; the reply must carry exactly this case's number on both streams, else _Lost."""
         index, self.next_case = self.next_case, self.next_case + 1
@@ -114,6 +126,8 @@ class _Server:
         except OSError as error:
             raise _Lost('could not send the case: %s' % error)
         out, err = self._get(self.out, deadline), self._get(self.err, deadline)
+        self.lost_out = out[0] if out else ''       # what the renderer printed for this case, kept for a FAILED verdict
+        self.lost_err = err[0] if err else ''
         if out is None or err is None or out[1] is None or err[1] is None:
             try:                                    # a dying process closes its pipes a moment before it can be reaped
                 self.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
@@ -174,9 +188,10 @@ atexit.register(_close_all)
 
 def _failed(server, reason):
     """The FAILED verdict of a case whose server did not answer it."""
-    text = ''.join(server._drain(server.err)) if server.proc.poll() is not None else ''
-    server.kill()
-    return subprocess.CompletedProcess(server.proc.args, 1, '', 'gpu_case_runner: %s\n%s' % (reason, text))
+    server.kill()                                   # ends the pumps, so everything the renderer printed is in the queues
+    out = server.banner + server.lost_out + ''.join(server._drain_now(server.out))
+    err = server.banner_err + server.lost_err + ''.join(server._drain_now(server.err))
+    return subprocess.CompletedProcess(server.proc.args, 1, out, 'gpu_case_runner: %s\n%s' % (reason, err))
 
 
 def run(renderer, adapter, args):
