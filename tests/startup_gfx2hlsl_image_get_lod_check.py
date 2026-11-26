@@ -12,7 +12,7 @@ Fixture (synthetic): the recorded c_lz stage of startup_image_sample_c_check wit
 (image_get_lod; the decoder reads it back with a 2-register address), sampler word 2 loaded from a literal (mip
 filter point), and for the second form dmask 0x3.
 Checks: dmask 0x1, 0x2 and 0x3 lower to the two calls on the sampler, which carries its LOD limits. A uniform join
-before the read is accepted. Controls (refused): dmask 0x4, a 2D array, divergent EXEC, s_cbranch_vccz/execz before
+before the read is accepted. Controls (refused): dmask 0x4, a 2D array, s_cbranch_vccz/execz before
 the read, a sampler LOD bias, a sampler with mipmapping disabled, and the stage without op_image_get_lod
 (negative control: refused as on main).
   draw <dxc> [fxc]: also compile the dmask 0x3 stage with dxc ps_6_0 (and fxc ps_5_1).
@@ -98,7 +98,8 @@ def controls():
     assert call in text and 'v4 = U(t.x);' in text, text
     refused(stage(dmask=4), 'image_get_lod form')
     refused(stage(dim=5), 'image_get_lod form')  # SQ_RSRC_IMG_2D_ARRAY
-    refused(stage(divergent=True), 'image_get_lod needs implicit derivatives')
+    _, text = ps(stage(divergent=True))  # a cleared EXEC is an exact per-lane write: the quad program keeps the proof
+    assert call in text, text
     for op in (7, 9):  # vccnz, execnz back edge after the read
         refused(stage(back_op=op), 'image_get_lod needs implicit derivatives')
     for op in (6, 7, 8, 9):  # vccz, vccnz, execz, execnz
@@ -112,7 +113,7 @@ def controls():
     finally:
         G.Stage.op_image_get_lod = saved
     print('image_get_lod: CalculateLevelOfDetail / Unclamped for dmask 0x1, 0x2 and 0x3; uniform join/branch before '
-          'the read accepted; dmask 0x4, a 2D array, divergent EXEC, vcc/exec branches, a sampler bias and a '
+          'the read accepted, also after a cleared EXEC; dmask 0x4, a 2D array, vcc/exec branches, a sampler bias and a '
           'sampler without mipmapping refused; refused without the handler')
     return pipe
 

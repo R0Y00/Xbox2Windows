@@ -13,7 +13,9 @@ IntrinsicsAMDGPU.td lists the extra argument of AMDGPUSample_b as llvm_anyfloat_
 IMAGE_SAMPLE_B the gfx10 opcode 0x25. HLSL Texture.SampleBias(sampler, location, bias) adds the bias to the
 implicit mip level, so the lowering is tex.SampleBias(smp, uv, bias). D3D documents the bias range as -16.0 to 15.99;
 the ISA text states no hardware clamp, so values outside that range are an unverified difference. Accepted under the
-entry EXEC mask and wave-uniform control flow even after a uniform (scc) join or later loop; divergent EXEC or a
+entry EXEC mask and wave-uniform control flow even after a uniform (scc) join or later loop; an EXEC written per lane
+(v_cmpx, saveexec, a cleared EXEC) is followed exactly by the one-lane model, so it is accepted in a program without a
+backward branch (tests/startup_image_sample_b_flow_check.py draws it); divergent EXEC or a
 vcc/exec-conditioned branch before the sample stays refused.
 
 Each fixture is a source-built gfx1013 pixel stage: v0 = bias, v1 = u = 0.75, v2 = v = 0.25 and v3 = the slice (root
@@ -472,7 +474,6 @@ def controls():
     join_ps = G.Pipeline(VS_WORDS, with_join_before_sample(plain), root_blob()).hlsl_ps()
     assert 'SampleBias' in join_ps and bias_call(join_ps, 'float2') == (['v1', 'v2'], 'v0'), join_ps
     for label, mutate in (
-            ('divergent EXEC', with_divergent_exec_before_sample),
             ('s_cbranch_vccz', lambda d: with_branch_before_sample(d, 6)),
             ('s_cbranch_vccnz', lambda d: with_branch_before_sample(d, 7)),
             ('s_cbranch_execz', lambda d: with_branch_before_sample(d, 8)),
@@ -485,6 +486,9 @@ def controls():
             assert 'image_sample_b needs implicit derivatives' in str(error), (label, error)
         else:
             raise AssertionError('image_sample_b accepted after %s' % label)
+    # A cleared EXEC is an exact per-lane write: the quad program (no backward branch) keeps the proof.
+    cleared = G.Pipeline(VS_WORDS, with_divergent_exec_before_sample(plain), root_blob()).hlsl_ps()
+    assert 'SampleBias' in cleared and 'exec = (0x00000000u) & 1;' in cleared, cleared
     print('uniform join before sample_b accepted; divergent EXEC and vcc/exec branches before sample_b refused')
     # Address order: the bias register comes first and is the third SampleBias argument.
     expected = {

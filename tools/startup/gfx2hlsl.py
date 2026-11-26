@@ -977,6 +977,17 @@ UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
+# Image ops that take implicit derivatives of the pixel quad (see Stage.quad_vote).
+DERIVATIVE_OPS = ('image_sample_b', 'image_get_lod')
+# "Some lane of the 2x2 quad has bit 0 set": fine derivatives of a 0/1 value read the row neighbour (ddx_fine), then
+# the other row (ddy_fine). Exact for 0/1 and defined only where the quad runs the statement together (SM 5.0 and 6.0).
+QUAD_ANY_HLSL = [
+    'bool x2w_quad_any(uint bit) {',
+    '    float lane = (bit & 1u) != 0u ? 1.0 : 0.0;',
+    '    float row = (lane != 0.0 || ddx_fine(lane) != 0.0) ? 1.0 : 0.0;',
+    '    return row != 0.0 || ddy_fine(row) != 0.0;',
+    '}',
+]
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
@@ -3052,6 +3063,11 @@ class Stage:
             splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
+        # A pixel program with an implicit-derivative op and no backward branch decides its EXEC branches per quad
+        # (quad vote): see Stage.quad_vote. Loops keep the rules of the back-edge proof below.
+        self.quad_exec = getattr(self, 'kind', None) == 'ps' and not any(t <= pc for pc, t in branches) and any(
+            name in DERIVATIVE_OPS for _off, _n, name, _asm in self.ins)
+        self.uses_quad_vote = False
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
@@ -3089,6 +3105,8 @@ class Stage:
             self.uniform_cf = True
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
+            self.lane_exec_breaks = []      # (offset, what): the lane's EXEC bit may stop following the guest's from here
+            self.voted_branches = set()     # EXEC branches decided per quad (x2w_quad_any); they part no quad
             self.masks = set(init_masks)
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
@@ -3287,6 +3305,14 @@ class Stage:
                             cond_uniform = True
                         if cond_uniform:
                             self.uniform_branches.add(off)
+                        elif (cond in ('execz', 'execnz') and self.quad_exec and not self.exec_known
+                                and self.uniform_cf and not self.lane_exec_breaks):
+                            # Decided per quad (x2w_quad_any): every lane of a quad takes it together, so it parts no
+                            # quad and the derivative ops after it still see their four lanes. It reads the quad, so it
+                            # is only taken while the control flow so far is quad-uniform and every lane's EXEC bit
+                            # still follows the guest's.
+                            self.voted_branches.add(off)
+                            cond_uniform = True
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
@@ -3470,6 +3496,17 @@ class Stage:
 
     def pc_index(self):
         return next((i for i, ins in enumerate(self.ins) if ins[0] == self.pc), None)
+
+    def derivative_exec_ok(self):
+        """Whether an implicit-derivative op may rely on the EXEC the lanes hold here.
+
+        At the entry mask every lane runs the call. Past an EXEC write (v_cmpx, saveexec, a restore) the one-lane
+        model still follows the guest's bit of each lane exactly (EXEC is written per lane, set_v is EXEC guarded),
+        so a quad program (a pixel program with a derivative op and no backward branch) is proven as long as no
+        lane-exec break happened: an s_wqm of a narrowed EXEC (a no-op here, while the guest turns on the lanes of
+        every touched quad) or a discard under an unknown EXEC. The callers also need uniform_cf, which a branch
+        that parts a quad clears; an EXEC branch decided per quad (quad_vote) does not."""
+        return self.exec_known or (getattr(self, 'quad_exec', False) and not getattr(self, 'lane_exec_breaks', None))
 
     def uniform_source(self, tok):
         r = reg_range(tok)
@@ -3683,6 +3720,10 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
+            elif hasattr(self, 'lane_exec_breaks'):
+                # Any other s_wqm is a no-op here, while the guest turns on the inactive lanes of every touched quad
+                # (or writes a whole-quad mask somewhere): a lane's EXEC bit may be 0 where the guest's is 1.
+                self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -3738,6 +3779,11 @@ class Stage:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
+            if base[10:] in ('execz', 'execnz') and getattr(self, 'pc', None) in getattr(self, 'voted_branches', ()):
+                # The wave skips the block only when no lane is active; a quad with an active lane runs it whole, its
+                # other lanes masked (their VGPRs kept for the derivatives, writes guarded by EXEC), as the guest does.
+                self.uses_quad_vote = True
+                cond = ('!' if base.endswith('execz') else '') + 'x2w_quad_any(exec)'
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
@@ -5875,7 +5921,7 @@ class Stage:
                 # Elsewhere the plain sample is lowered to level 0, which would drop the bias, so the bias form is
                 # refused instead. A uniform join (scc with scc_uniform) or later loop does not drop the proof
                 # (M200-01 B/L). Divergent EXEC or a vcc/exec-conditioned branch before the sample stays refused.
-                if (self.kind != 'ps' or not self.exec_known or
+                if (self.kind != 'ps' or not self.derivative_exec_ok() or
                         not getattr(self, 'uniform_cf', True)):
                     raise Unsupported('image_sample_b needs implicit derivatives: pixel stage with the entry EXEC '
                                      'mask and wave-uniform control flow')
@@ -5892,7 +5938,7 @@ class Stage:
             if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
                 raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
             # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
-            if not self.exec_known or not getattr(self, 'uniform_cf', True):
+            if not self.derivative_exec_ok() or not getattr(self, 'uniform_cf', True):
                 raise Unsupported('image_get_lod needs implicit derivatives: pixel stage with the entry EXEC '
                                  'mask and wave-uniform control flow')
             if hasattr(self, 'derivative_sites'):
@@ -7710,6 +7756,8 @@ class Stage:
                               % next(f for f in flags if f.startswith('en:'))[3:])
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+            if hasattr(self, 'lane_exec_breaks'):
+                self.lane_exec_breaks.append((self.pc, 'a discard'))
         if target == 'null':
             return None  # the null target writes no render target; its only effect is the vm discard above
         if target == 'mrtz':
@@ -8750,7 +8798,8 @@ class Pipeline:
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
         depth = 'depth' in s.exports
-        out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};']
+        quad = QUAD_ANY_HLSL if getattr(s, 'uses_quad_vote', False) else []
+        out = self.common() + quad + ['struct PSIn {'] + self.interface(True) + ['};']
         if not targets and not depth:
             out += ['void main(PSIn i) {'] + s.declarations() + s.body() + ['}']
             return '\n'.join(out) + '\n'

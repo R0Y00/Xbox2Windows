@@ -16920,3 +16920,18 @@ or `scalar_wide_op()`). Reads where incoming SCC is unverified are refused: at s
 control-flow joins/branch targets, after descriptor-elided SCC writes, and after unmodeled SCC writers in
 `SCC_UNMODELLED` such as `s_add_u32` (after `s_add_u32` finishes reading its own sources). Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc$' -V`.
+
+
+## Startup translator: derivative image ops under a divergent EXEC
+
+`image_sample_b` and `image_get_lod` take implicit derivatives of the four lanes of a pixel quad. A pixel program
+with such an op and no backward branch now decides its `s_cbranch_execz` / `s_cbranch_execnz` per quad
+(`x2w_quad_any(exec)`: some lane of the 2x2 quad has its EXEC bit, from fine derivatives of the 0/1 bit), as the guest's
+wave skips a block only when no lane is active and runs it with the other lanes masked. A voted branch parts no quad,
+so it keeps `uniform_cf` (#2659); the vote reads the quad, so it is taken only while the control flow is quad-uniform
+and no lane-exec break (`s_wqm` of a narrowed EXEC, a discard under an unknown EXEC) came first. With that, a derivative
+op may sit under `v_cmpx`, inside an `execz` block, past an `execnz` kill branch, or after an EXEC restore. Still
+refused: any branch that can differ between lanes and is not an EXEC branch (VCC, SCC not proven uniform), loops with
+such a branch, and an `s_wqm` of a narrowed EXEC before the op.
+`tests/startup_image_sample_b_flow_check.py` and `tests/startup_image_get_lod_flow_check.py` draw each shape against a
+CPU reference (DXC ps_6_0 and FXC ps_5_1) with wrong-value controls.
