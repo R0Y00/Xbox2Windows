@@ -91,6 +91,9 @@ FIXTURES = {
                  (Fraction(-3, 8), Fraction(5, 8))),
 }
 REFUSED = {
+    # A constant 32-bit EXEC write is no more exact than a mask one: lanes 32..63 keep their old bits in wave64.
+    'exec_lo_const': (PROLOGUE + 's_mov_b32 exec_lo, -1\nv_add_f32_e32 v2, -0.5, v2\n' + QUERY + EXPORT,
+                      'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # A mask saved before s_wqm exec, exec has the guest's helper lanes off, while every thread here starts
     # with exec = 1: writing it back is a lane-exec break (review of ef786354).
     'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + QUERY + EXPORT,
@@ -117,6 +120,11 @@ REFUSED = {
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
+    'exec_lo_const': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003eff02067e0000803e8002187e80021a7ec103febef10404067fc08cbf080380f1020ac400703f'
+        '8cbf0f1800f80a0b0c0d000081bf'
+    ),
     'inside_y': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
         '121210ff1204060000003eff02067e0000803e8002187e80021a7e90000e2c800e847d6a2480be040088bff10404067fc0'
