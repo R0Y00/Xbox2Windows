@@ -27,6 +27,8 @@ GROUPS = 2
 WORDS = 2064
 BASE = 8  # words before group 0's results (as in half_mad_readback)
 STRIDE = 128  # words per group: 512 bytes, so the 66 results of one group never reach the next
+SHIFT = 9  # s_lshl_b32 amount giving the per-group byte base
+assert 4 * STRIDE == 1 << SHIFT
 
 PAIRS = [(0x3c00bc00, 0x80017fff), (0xfc007e00, 0x7d557c01), (0x12345678, 0xffff0001), (0x00008000, 0x80000000)]
 
@@ -167,7 +169,7 @@ def run_gpu(gpu, sdk):
         for a, b in PAIRS:
             # Same preamble as half_mad_readback in native_scalar_lds_check.py: s20:21 table, v8 = group * 512 bytes (STRIDE words).
             words = [sop1(3, 20, 4), sop1(3, 21, 128), 0xf408080a, 0xfa000020,
-                     scalar(0x1e, 7, 5, 137), vmove(8, 7), sop1(3, 126, 129)]
+                     scalar(0x1e, 7, 5, 128 + SHIFT), vmove(8, 7), sop1(3, 126, 129)]
             words += mov(1, a) + mov(2, b)
             want = []
             for sel in range(4):
