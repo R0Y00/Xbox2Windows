@@ -1,7 +1,7 @@
 """32-bit hex literal as the 64-bit source of v_lshlrev_b64, v_lshrrev_b64 and v_ashrrev_i64 (Refs #1723).
 
 A literal fills the low word. The high word is zero for the unsigned shifts and copies bit 31 for the signed
-shift (the same rule the scalar 64-bit operations use). Pure Python; run with no arguments.
+shift (the rule of s_mov_b64; the scalar shifts and bitfield extracts take it from this change). Pure Python; run with no arguments.
 """
 import struct
 import sys
@@ -33,7 +33,7 @@ def lowered(op, literal):
 def scalar_lowered(opcode):
     """s_<op> s[20:21], 0xffffffff, s9 as encoded (SOP2, source 255 plus a literal dword)."""
     stage = M.run_seq(M.encode_sop2(opcode, 20, 255, 9) + struct.pack('<I', 0xffffffff))
-    return [line for line in stage.lines if 'shr64' in line]
+    return [line for line in stage.lines if 'shr64' in line or 'bfe64' in line]
 
 
 def main():
@@ -41,6 +41,10 @@ def main():
           scalar_lowered(0x23)[0].startswith('{ uint2 t = shr64i(4294967295u, 4294967295u, s9);'))
     check('s_lshr_b64 literal 0xffffffff is zero-extended',
           scalar_lowered(0x21)[0].startswith('{ uint2 t = shr64u(4294967295u, 0u, s9);'))
+    check('s_bfe_i64 literal 0xffffffff is sign-extended',
+          'bfe64(4294967295u, 4294967295u, s9, 1u)' in scalar_lowered(0x2a)[0])
+    check('s_bfe_u64 literal 0xffffffff is zero-extended',
+          'bfe64(4294967295u, 0u, s9, 0u)' in scalar_lowered(0x29)[0])
     for op, helper, literal, low, high in CASES:
         want = ['{ uint2 t = %s(%s, %s, v2); v0 = t.x; v1 = t.y; }' % (helper, low, high)]
         check('%s with literal %s' % (op, literal), lowered(op, literal) == want)
