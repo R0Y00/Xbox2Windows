@@ -1039,6 +1039,9 @@ ULONG __stdcall release(Wrapper* self)
         if (self->own().kind == descriptor_heap_kind) retire_drop_heap_views(self);
         if (self->own().kind == resource_kind && self->own().title_memory) {
             drop_mesh_lease_owner(self);
+            // The last release ends the resource for existing_memory_buffer and address_resource_overlap (they skip
+            // refs <= 0) whether or not it has a placement entry: a refusal cached while it was live is stale.
+            x2w_startup::note_placement_change();
             retire_placement(self);
             if (self->own().retire_when_idle) retire_note_title_release(self);
             if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
