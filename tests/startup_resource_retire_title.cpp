@@ -23,6 +23,14 @@
 //     descriptor table. The readback must hold the sampled texels and a clear sentinel corner, the draw must record
 //     a retire hold (so removing it fails here), and after the final Release and the descriptor overwrite the
 //     texture leaves the budget only when the closed draw recording is dropped (case runs with the switch on).
+//   8 slot 19-21 view references (Slice 3a): a materialized RTV (20), DSV (21) and UAV (19, resource and counter) in a
+//     tracked heap slot holds one ref per slot; the same view written again adds nothing, and overwrite, descriptor
+//     copy and heap destruction release exactly what was added. Read through the retire probe (case runs with the
+//     switch on; the retire class still excludes non-SRV view textures, so the budget column cannot show these refs).
+//   9 slot 19-21 fallback (Slice 3a): the same view call in a tracked slot leaves a class texture in the retire class
+//     (a refused view adds no ref, so the released texture retires), while a descriptor in a heap the shim does not
+//     track keeps the retire_leave_class fallback and the texture is not freed. Runs in both modes; without the switch
+//     nothing is freed.
 #include "startup_stubs/resource_budget.h"
 
 #include <d3d12sdklayers.h>
@@ -45,6 +53,7 @@ struct RetireProbe {
     unsigned cache_entries;
     unsigned list_states;
     unsigned list_holds;
+    unsigned view_refs;  // tracked descriptor slots (18-21) holding the resource; slice 3a fixture probe
 };
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_budget_snapshot(x2w_budget::Snapshot*, SIZE_T);
@@ -218,18 +227,41 @@ struct Context {
         IUnknown* lists[] = {l.list.Get()};
         invoke<void>(q.queue.Get(), 10, 1u, lists);
     }
-    Res& make_committed(const char* name, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE)
+    Res& make_committed(const char* name, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE,
+                        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN)
     {
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC d = desc;
         d.Flags = flags;
+        if (format != DXGI_FORMAT_UNKNOWN) d.Format = format;
         Res& r = pool.emplace_back();
         r.name = name;
-        r.bytes = texture_bytes;
+        r.bytes = device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
         if (!require(invoke(guest, 127, &heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0u,
                             nullptr, &iid_resource[0], r.guest.GetAddressOf()), name))
             throw 4;
         return r;
+    }
+    Res& make_committed_buffer(const char* name, UINT64 bytes, D3D12_RESOURCE_FLAGS flags)
+    {
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        const D3D12_RESOURCE_DESC d{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+                                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
+        Res& r = pool.emplace_back();
+        r.name = name;
+        r.category = buffer;
+        r.bytes = device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+        if (!require(invoke(guest, 127, &heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0u,
+                            nullptr, &iid_resource[0], r.guest.GetAddressOf()), name))
+            throw 4;
+        return r;
+    }
+    ComPtr<IUnknown> make_descriptor_heap(const char* name, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count)
+    {
+        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{type, count, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        ComPtr<IUnknown> heap;
+        if (!require(invoke(guest, 14, &heap_desc, &__uuidof(ID3D12DescriptorHeap), heap.GetAddressOf()), name)) throw 4;
+        return heap;
     }
     Res& make_slot133(const char* name, void* address, DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM, UINT width = side)
     {
@@ -973,6 +1005,173 @@ bool case7_draw_samples_slot133_texture(Context& c, void* title_mem)
     return check_target("readback after the texture left the budget", target_bytes.data(), row_pitch);
 }
 
+// 8 (Slice 3a, Refs #2379): UAV/RTV/DSV descriptor slots 19-21 hold a retire reference on their resource(s) the way
+// slot-18 SRVs do. The refs are read through the retire probe: the retire class still excludes render-target,
+// depth-stencil and unordered-access textures (retire_classify), so no budget column can show the reference yet. A
+// materialized view in a tracked heap slot adds one ref - slot 19 one for its resource and one for its counter - and
+// writing the same view to the same slot again adds nothing. Overwriting the slot, copying another view over it, and
+// destroying its heap each release exactly the refs that were added; a view in a heap the shim does not shadow adds
+// none and keeps the retire_leave_class fallback.
+bool case8_view_slot_refs(Context& c)
+{
+    auto refs = [&](const char* stage, IUnknown* resource) {
+        RetireProbe probe{};
+        if (!x2w_d3d12_retire_probe(resource, nullptr, &probe)) {
+            std::printf("FAIL: %s: the retire probe reported nothing\n", stage);
+            return -1L;
+        }
+        return static_cast<long>(probe.view_refs);
+    };
+    auto check = [&](const char* stage, IUnknown* resource, long want) {
+        const long got = refs(stage, resource);
+        if (got == want) return true;
+        std::printf("FAIL: %s: %ld tracked slot refs, expected %ld\n", stage, got, want);
+        return false;
+    };
+
+    // RTV (slot 20): add on creation, no-op on the same view again, release on overwrite, copy and heap destruction.
+    Res& rtv_a = c.make_committed("R_rtv_a", D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    Res& rtv_b = c.make_committed("R_rtv_b", D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+    rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    ComPtr<IUnknown> rtv_heap = c.make_descriptor_heap("rtv heap", D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1);
+    const UINT64 rtv0 = invoke<UINT64>(rtv_heap.Get(), 9);
+    invoke<void>(c.guest, 20, rtv_a.guest.Get(), &rtv, rtv0);
+    if (!check("RTV created in a tracked slot", rtv_a.guest.Get(), 1)) return false;
+    invoke<void>(c.guest, 20, rtv_a.guest.Get(), &rtv, rtv0);  // the same view written again
+    if (!check("RTV written to the same slot again", rtv_a.guest.Get(), 1)) return false;
+    invoke<void>(c.guest, 20, rtv_b.guest.Get(), &rtv, rtv0);
+    if (!check("RTV overwrote the slot: previous resource", rtv_a.guest.Get(), 0) ||
+        !check("RTV overwrote the slot: new resource", rtv_b.guest.Get(), 1))
+        return false;
+    // A copy makes a second tracked slot name the same view, so the resource holds two refs.
+    ComPtr<IUnknown> rtv_copy = c.make_descriptor_heap("rtv copy heap", D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1);
+    const UINT64 rtv_copy0 = invoke<UINT64>(rtv_copy.Get(), 9);
+    invoke<void>(c.guest, 24, 1u, rtv_copy0, rtv0, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    if (!check("RTV copied into a second tracked heap", rtv_b.guest.Get(), 2)) return false;
+    invoke<void>(c.guest, 20, rtv_a.guest.Get(), &rtv, rtv0);
+    if (!check("copied slot overwritten: copy still holds the view", rtv_b.guest.Get(), 1)) return false;
+    rtv_copy.Reset();
+    if (!check("copy heap destroyed", rtv_b.guest.Get(), 0)) return false;
+    rtv_heap.Reset();
+    if (!check("RTV heap destroyed", rtv_a.guest.Get(), 0)) return false;
+
+    // An untracked destination: the view is forwarded to a desktop heap the shim never shadowed, so no ref is added.
+    D3D12_RENDER_TARGET_VIEW_DESC untracked_rtv = rtv;
+    const D3D12_DESCRIPTOR_HEAP_DESC desktop_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ComPtr<ID3D12DescriptorHeap> desktop_heap;
+    if (!require(c.device->CreateDescriptorHeap(&desktop_heap_desc, IID_PPV_ARGS(&desktop_heap)), "untracked rtv heap"))
+        return false;
+    invoke<void>(c.guest, 20, rtv_a.guest.Get(), &untracked_rtv, desktop_heap->GetCPUDescriptorHandleForHeapStart().ptr);
+    if (!check("RTV in an untracked slot", rtv_a.guest.Get(), 0)) return false;
+
+    // DSV (slot 21): the same accounting on a depth texture.
+    Res& dsv_a = c.make_committed("R_dsv_a", D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, DXGI_FORMAT_D32_FLOAT);
+    Res& dsv_b = c.make_committed("R_dsv_b", D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, DXGI_FORMAT_D32_FLOAT);
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    ComPtr<IUnknown> dsv_heap = c.make_descriptor_heap("dsv heap", D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1);
+    const UINT64 dsv0 = invoke<UINT64>(dsv_heap.Get(), 9);
+    invoke<void>(c.guest, 21, dsv_a.guest.Get(), &dsv, dsv0);
+    if (!check("DSV created in a tracked slot", dsv_a.guest.Get(), 1)) return false;
+    invoke<void>(c.guest, 21, dsv_b.guest.Get(), &dsv, dsv0);
+    if (!check("DSV overwrote the slot: previous resource", dsv_a.guest.Get(), 0) ||
+        !check("DSV overwrote the slot: new resource", dsv_b.guest.Get(), 1))
+        return false;
+    dsv_heap.Reset();
+    if (!check("DSV heap destroyed", dsv_b.guest.Get(), 0)) return false;
+
+    // UAV (slot 19): a texture UAV holds its view resource; a buffer UAV additionally names its counter resource, so
+    // both resources hold one ref. Desktop refuses a counter on a non-buffer UAV (DXGI_ERROR_INVALID_CALL), and the
+    // console makes UAVs of resources desktop does not allow, so the counter half is driven through a buffer UAV.
+    Res& uav_a = c.make_committed("R_uav_a", D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Res& uav_b = c.make_committed("R_uav_b", D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    ComPtr<IUnknown> uav_heap = c.make_descriptor_heap("uav heap", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+    const UINT64 uav0 = invoke<UINT64>(uav_heap.Get(), 9);
+    invoke<void>(c.guest, 19, uav_a.guest.Get(), nullptr, &uav, uav0);
+    if (!check("UAV created in a tracked slot: resource", uav_a.guest.Get(), 1)) return false;
+    invoke<void>(c.guest, 19, uav_a.guest.Get(), nullptr, &uav, uav0);  // the same view written again
+    if (!check("UAV written to the same slot again: resource", uav_a.guest.Get(), 1)) return false;
+    invoke<void>(c.guest, 19, uav_b.guest.Get(), nullptr, &uav, uav0);
+    if (!check("UAV overwrote the slot: previous resource", uav_a.guest.Get(), 0) ||
+        !check("UAV overwrote the slot: new resource", uav_b.guest.Get(), 1))
+        return false;
+    uav_heap.Reset();
+    if (!check("UAV heap destroyed: resource", uav_b.guest.Get(), 0)) return false;
+
+    // Slot 19 with a counter resource: one ref for the resource and one for the counter, released together.
+    Res& uav_buffer_a = c.make_committed_buffer("R_uav_buffer_a", 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Res& uav_buffer_b = c.make_committed_buffer("R_uav_buffer_b", 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Res& counter_a = c.make_committed_buffer("R_counter_a", 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Res& counter_b = c.make_committed_buffer("R_counter_b", 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC buffer_uav{};
+    buffer_uav.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    buffer_uav.Buffer.NumElements = 64;
+    buffer_uav.Buffer.StructureByteStride = 4;
+
+    ComPtr<IUnknown> counter_heap = c.make_descriptor_heap("counter uav heap", D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+    const UINT64 counter0 = invoke<UINT64>(counter_heap.Get(), 9);
+    invoke<void>(c.guest, 19, uav_buffer_a.guest.Get(), counter_a.guest.Get(), &buffer_uav, counter0);
+    if (!check("UAV with counter created: resource", uav_buffer_a.guest.Get(), 1) ||
+        !check("UAV with counter created: counter", counter_a.guest.Get(), 1))
+        return false;
+    invoke<void>(c.guest, 19, uav_buffer_a.guest.Get(), counter_a.guest.Get(), &buffer_uav, counter0);
+    if (!check("UAV with counter written again: resource", uav_buffer_a.guest.Get(), 1) ||
+        !check("UAV with counter written again: counter", counter_a.guest.Get(), 1))
+        return false;
+    invoke<void>(c.guest, 19, uav_buffer_b.guest.Get(), counter_b.guest.Get(), &buffer_uav, counter0);
+    if (!check("UAV with counter overwritten: previous resource", uav_buffer_a.guest.Get(), 0) ||
+        !check("UAV with counter overwritten: previous counter", counter_a.guest.Get(), 0) ||
+        !check("UAV with counter overwritten: new resource", uav_buffer_b.guest.Get(), 1) ||
+        !check("UAV with counter overwritten: new counter", counter_b.guest.Get(), 1))
+        return false;
+    counter_heap.Reset();
+    if (!check("UAV counter heap destroyed: resource", uav_buffer_b.guest.Get(), 0) ||
+        !check("UAV counter heap destroyed: counter", counter_b.guest.Get(), 0))
+        return false;
+    return true;
+}
+
+// 9 (Slice 3a): the view_slot fallback for slots 19-21. A view call whose destination descriptor slot shadow_slot()
+// tracks leaves the resource in the retire class and lets the slot accounting own it; the call here is refused because
+// the class texture lacks the use flag (a case the console allows: UAV of a depth texture, RTV of a non-render-target),
+// so no reference is added and the released texture still retires. In a heap the shim does not track, the same call
+// keeps the old fallback, retire_leave_class, so the texture is never freed under a descriptor the shim cannot follow.
+// Runs in both modes: with the switch off nothing retires, as before.
+bool case9_view_slot_fallback(Context& c, bool on, void* tracked_memory, void* untracked_memory)
+{
+    D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+    rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    // A guest heap: note_heap() shadows its slots, so the destination is tracked even though the view is refused.
+    Res& tracked = c.make_slot133("T_rtv_tracked", tracked_memory);
+    ComPtr<IUnknown> tracked_heap = c.make_descriptor_heap("fallback rtv heap", D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1);
+    invoke<void>(c.guest, 20, tracked.guest.Get(), &rtv, invoke<UINT64>(tracked_heap.Get(), 9));
+    c.release(tracked);
+    if (!c.sync(c.direct)) return false;
+    if (on) tracked.freed = true;
+    if (!c.settle("class texture with a refused RTV in a tracked slot",
+                  "a refused view in a tracked slot kept the texture out of the retire class"))
+        return false;
+    // A desktop heap the shim never saw: shadow_slot() has no entry, so the use keeps the retire_leave_class fallback.
+    Res& untracked = c.make_slot133("T_rtv_untracked", untracked_memory);
+    const D3D12_DESCRIPTOR_HEAP_DESC desktop_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ComPtr<ID3D12DescriptorHeap> desktop_heap;
+    if (!require(c.device->CreateDescriptorHeap(&desktop_heap_desc, IID_PPV_ARGS(&desktop_heap)), "fallback rtv heap"))
+        return false;
+    invoke<void>(c.guest, 20, untracked.guest.Get(), &rtv, desktop_heap->GetCPUDescriptorHandleForHeapStart().ptr);
+    c.release(untracked);
+    if (!c.sync(c.direct)) return false;
+    return c.settle("class texture with a refused RTV in an untracked slot",
+                    "the untracked-descriptor fallback did not keep the texture retained");
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1023,7 +1222,9 @@ int main(int argc, char** argv)
     auto* mem1 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     auto* mem2 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     auto* mem3 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!mem1 || !mem2 || !mem3) return 4;
+    auto* mem4 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    auto* mem5 = VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!mem1 || !mem2 || !mem3 || !mem4 || !mem5) return 4;
 
     Context c{guest.Get(), device.Get(), debug.Get()};
     try {
@@ -1065,15 +1266,25 @@ int main(int argc, char** argv)
             if (!case7_draw_samples_slot133_texture(c, mem1)) return 5;
             std::puts("7 translated draw: slot 133 texture sampled through a descriptor table, held until the recording drained");
         }
+        if (!case9_view_slot_fallback(c, on, mem4, mem5)) return 5;
+        std::puts("9 slot 19-21 fallback: a refused view in a tracked slot retires, an untracked slot keeps the texture");
+        if (on) {
+            if (!case8_view_slot_refs(c)) return 5;
+            std::puts("8 slot 19-21 refs: RTV/DSV/UAV (+counter) hold and release one ref per tracked slot");
+        }
     } catch (int code) {
         VirtualFree(mem1, 0, MEM_RELEASE);
         VirtualFree(mem2, 0, MEM_RELEASE);
         VirtualFree(mem3, 0, MEM_RELEASE);
+        VirtualFree(mem4, 0, MEM_RELEASE);
+        VirtualFree(mem5, 0, MEM_RELEASE);
         return code;
     }
     VirtualFree(mem1, 0, MEM_RELEASE);
     VirtualFree(mem2, 0, MEM_RELEASE);
     VirtualFree(mem3, 0, MEM_RELEASE);
+    VirtualFree(mem4, 0, MEM_RELEASE);
+    VirtualFree(mem5, 0, MEM_RELEASE);
     const UINT64 errors = debug ? debug->GetNumStoredMessages() : 0;
     std::printf("debug_errors_or_warnings=%llu\n", errors);
     if (errors || FAILED(device->GetDeviceRemovedReason())) return 4;

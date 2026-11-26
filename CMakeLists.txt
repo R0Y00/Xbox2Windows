@@ -1917,6 +1917,29 @@ add_custom_command(OUTPUT "${pixel_vs_linear}" COMMAND "${DXC_EXECUTABLE}" -T vs
 target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp tests/pixel_compare_render.cpp "${pixel_vs}"
     "${pixel_vs_linear}")
 target_sources(offscreen_check PRIVATE tests/desktop_gpu.cpp tests/mesh_entry_draw.cpp tests/mesh_shadow_draw.cpp)
+add_executable(meshlet_builder_check tests/meshlet_builder_check.cpp src/meshlet_builder.cpp)
+target_include_directories(meshlet_builder_check PRIVATE src)
+target_compile_features(meshlet_builder_check PRIVATE cxx_std_17)
+add_test(NAME meshlet_builder COMMAND meshlet_builder_check)
+set_tests_properties(meshlet_builder PROPERTIES TIMEOUT 30)
+
+set(meshlet_pipeline_headers)
+foreach(stage_spec IN ITEMS "as:as_6_5:ASMain" "ms:ms_6_5:MSMain" "vs:vs_6_0:VSMain" "ps:ps_6_0:PSMain")
+    string(REPLACE ":" ";" stage_parts "${stage_spec}")
+    list(GET stage_parts 0 stage_name)
+    list(GET stage_parts 1 stage_profile)
+    list(GET stage_parts 2 stage_entry)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/meshlet_pipeline_${stage_name}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage_profile} -E ${stage_entry}
+                -Vn meshlet_pipeline_${stage_name} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/meshlet_pipeline.hlsl"
+        DEPENDS src/shaders/meshlet_pipeline.hlsl VERBATIM)
+    list(APPEND meshlet_pipeline_headers "${header}")
+endforeach()
+target_sources(offscreen_check PRIVATE src/meshlet_builder.cpp src/mesh_shader_pipeline.cpp
+    tests/mesh_shader_pipeline_draw.cpp ${meshlet_pipeline_headers})
+target_include_directories(offscreen_check PRIVATE src)
 target_sources(offscreen_check PRIVATE tests/stream_root_srv.cpp)
 foreach(stage IN ITEMS vs ps)
     string(TOUPPER "${stage}" entry)
@@ -3105,6 +3128,13 @@ set_tests_properties(offscreen_invalid_operation_warp PROPERTIES TIMEOUT 45)
 
 add_test(NAME offscreen_capability_table_self_test COMMAND offscreen_check --self-test)
 set_tests_properties(offscreen_capability_table_self_test PROPERTIES TIMEOUT 45)
+foreach(adapter IN ITEMS hardware warp)
+    add_test(NAME mesh_shader_pipeline_${adapter} COMMAND offscreen_check ${adapter} --mesh-shader-pipeline)
+    add_test(NAME mesh_shader_pipeline_fallback_${adapter}
+        COMMAND offscreen_check ${adapter} --mesh-shader-pipeline-fallback)
+    set_tests_properties(mesh_shader_pipeline_${adapter} mesh_shader_pipeline_fallback_${adapter}
+        PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME descriptor_heap_paging_${adapter} COMMAND offscreen_check ${adapter} --descriptor-heap-paging)
     add_test(NAME descriptor_heap_paging_swapped_${adapter}

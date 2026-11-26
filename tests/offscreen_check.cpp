@@ -947,6 +947,16 @@ OperationResult run_mesh_amplified(const OperationContext& ctx)
                                                    ctx.argv[6]));
 }
 
+OperationResult run_mesh_shader_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shader_pipeline(ctx.device, false));
+}
+
+OperationResult run_mesh_shader_pipeline_fallback(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shader_pipeline(ctx.device, true));
+}
+
 OperationResult run_mesh_heap_sampler(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_heap_sampler_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5]));
@@ -1756,6 +1766,8 @@ const OperationSpec kOperations[] = {
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
+    {"--mesh-shader-pipeline", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline},
+    {"--mesh-shader-pipeline-fallback", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline_fallback},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-heap-sampler", 6, 6, nullptr, kNoGate, run_mesh_heap_sampler},
