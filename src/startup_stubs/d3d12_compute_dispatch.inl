@@ -4,15 +4,26 @@
 // inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
-// values come from the compute root constants of slots 37 and 39. Any other manifest line makes the translation
+// values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
+// bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
+// count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). Any other manifest line makes the translation
 // unavailable; a dispatch that cannot be bound completely is refused with one reason and records no Dispatch and
 // binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
 // syncs content).
 
 struct ComputeTranslation {
     // Root parameter and byte offset (views), or parameter and word (entry values). A heap view names the root
-    // constant (parameter and word) that indexes its 32-byte record in the list's view heap.
-    struct Slot { int a, b; bool texture, heap; };
+    // constant (parameter and word) that indexes its 32-byte record in the list's view heap, or, with word_param
+    // set, the table buffer (word_param, word_byte) whose word at byte at + root constant (a, b) * times (a < 0:
+    // at alone) is the index. An entry value that is not a root constant names input or output a by its source.
+    enum Source { root_constant, input_stride, input_word3, output_word3, output_stride, output_records };
+    struct Slot {
+        int a, b;
+        bool texture, heap;
+        int word_param = -1, word_byte = 0;
+        std::uint32_t at = 0, times = 0;
+        Source source = root_constant;
+    };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
@@ -81,17 +92,34 @@ const char* load_compute_translation(ComputeTranslation& tr)
             continue;
         }
         unsigned i = 0, x = 0, y = 0, z = 0, w = 0;
-        int a = 0, b = 0, used = 0;
+        int a = 0, b = 0, c = 0, d = 0, used = 0;
+        char name[16] = "";
         const auto whole = [&] { return used == static_cast<int>(line.size()); };
+        // The manifest names of the Source values after root_constant, in their order.
+        const auto source = [&] {
+            static const char* const names[] = {"stride", "descword3", "uav_descword3", "uav_stride", "uav_numrecords"};
+            for (int s = 0; s < 5; ++s)
+                if (!std::strcmp(name, names[s])) return static_cast<ComputeTranslation::Source>(s + 1);
+            return ComputeTranslation::root_constant;
+        };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
             tr.uds.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "udsrc %u %15s %d%n", &i, name, &a, &used) == 3 && whole() && i == tr.uds.size() &&
+                 source() != ComputeTranslation::root_constant)
+            tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
         else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
         else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.srvs.size())
             tr.srvs.push_back({a, b, false, true});
+        else if (std::sscanf(line.c_str(), "srv %u buf heap word table %d %d at %u%n", &i, &a, &b, &x, &used) == 4 && whole() &&
+                 i == tr.srvs.size())
+            tr.srvs.push_back({-1, 0, false, true, a, b, x});
+        else if (std::sscanf(line.c_str(), "srv %u buf heap word table %d %d at %u rootconst %d %d times %u%n", &i, &a, &b, &x,
+                     &c, &d, &y, &used) == 7 && whole() && i == tr.srvs.size())
+            tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
@@ -99,16 +127,27 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.push_back({a, b, true});
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
-        else if (std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 && whole() &&
+        // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
+        // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
+        else if (line.rfind("smpc", 0) == 0) return "a comparison sampler";
+        else if (line.rfind("smpheap", 0) == 0) return "a sampler from the sampler heap";
+        else if ((std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 ||
+                  std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D float texture"
-                  : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant"
+                  : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
     }
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
+    for (const ComputeTranslation::Slot& ud : tr.uds) {
+        const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
+        if (ud.source != ComputeTranslation::root_constant &&
+            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
+            return "an entry value names a descriptor that is not a buffer input or output";
+    }
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
@@ -142,6 +181,8 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         bool transition, texture, described;
         unsigned char desc[40];  // a texture view's description, as the title gave it with a desktop format
         Wrapper* wrapper;
+        std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
+        UINT stride;
     } views[40]{};
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     const auto type = list->GetType();
@@ -169,17 +210,40 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     }
     // A word no slot 37 or 39 call wrote since the compute root was set has no value to pass (it is not 0).
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i)
-        if (!pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1)) reason = "an entry value was not set since the compute root";
+        if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
+            reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        // A heap record sits at the 32-bit byte offset the program computes, the root constant word shifted left by
-        // 5, in the title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.a < 0 || slot.b < 0 ? 0
-            : slot.heap ? pass.title_view_heap.record(std::uint32_t{pass.compute_constants.word(slot.a, slot.b)} << 5, 16)
-            : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
+        std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
+        if (slot.word_param >= 0) {
+            // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
+            // writes there), at the dword-aligned 32-bit byte offset the program reads it at.
+            const u64 table_entry = pass.compute_tables.table(slot.word_param).record(static_cast<u64>(slot.word_byte), 16);
+            if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16)) {
+                reason = "a table descriptor is not bound";
+                break;
+            }
+            std::memcpy(words, reinterpret_cast<const void*>(table_entry), 16);
+            const std::uint32_t at = slot.at + index * slot.times;
+            const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+            const UINT stride = (words[1] >> 16) & 0x3fff;
+            if (words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource) {
+                reason = "a heap index word is not in the list's upload memory";
+                break;
+            }
+            if (u64{at} + 4 > u64{stride ? stride : 1} * words[2]) {
+                reason = "a heap index word is outside its table buffer";
+                break;
+            }
+            std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
+        }
+        // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
+        // title memory of the list's view heap: a literal byte offset, as a table's is.
+        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+            : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
             reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
@@ -247,9 +311,15 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             continue;
         }
         if (!output) {
-            const IndirectBufferView view = indirect_table_buffer(self, words);
-            if (!view.resource || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input is not a complete GPU-backed buffer range";
+            // Each condition of a complete GPU-backed buffer range has its own reason.
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason);
+            if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
+            if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
+                log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
+                    slot.heap ? "heap" : "table", slot.a, slot.b, entry);
             views[i] = {view.resource, view.offset, view.bytes, !view.upload};
+            views[i].stride = view.stride;
+            std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
         // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
@@ -267,6 +337,29 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
+        std::memcpy(views[i].words, words, sizeof(views[i].words));
+    }
+    // An entry value from a descriptor comes from the words its view was bound from in the loop above.
+    std::uint32_t values[32] = {};
+    for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
+        const ComputeTranslation::Slot& ud = tr->uds[i];
+        const View& view = views[ud.source >= ComputeTranslation::output_word3 ? inputs + ud.a : ud.a];
+        std::uint32_t format = 0, word[4];
+        switch (ud.source) {
+        case ComputeTranslation::root_constant: values[i] = pass.compute_constants.word(ud.a, ud.b); break;
+        case ComputeTranslation::input_stride: values[i] = view.stride; break;
+        case ComputeTranslation::input_word3:
+            std::memcpy(word, view.words, sizeof(word));
+            if (formatted_buffer_word3(word, format)) {
+                reason = "a formatted input has no word 3 the program decodes";
+                std::memcpy(words, view.words, sizeof(view.words));
+            }
+            values[i] = word[3];
+            break;
+        case ComputeTranslation::output_word3: values[i] = view.words[3]; break;
+        case ComputeTranslation::output_stride: values[i] = view.words[1] >> 16; break;  // unmasked: the program checks the swizzle bits
+        case ComputeTranslation::output_records: values[i] = view.words[2]; break;
+        }
     }
     // A texture the title filled in memory is brought up to date first. An upload recorded before a later one
     // fails only syncs content, as a draw sampling that texture would.
@@ -323,8 +416,6 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr, &desc, dest);
     }
-    std::uint32_t values[32] = {};
-    for (std::size_t i = 0; i < tr->uds.size(); ++i) values[i] = pass.compute_constants.word(tr->uds[i].a, tr->uds[i].b);
     if (!pass.heap_set) {
         x2w_startup::bind_translated_heaps(list, draw_heap, nullptr);
         pass.heap_set = true;
