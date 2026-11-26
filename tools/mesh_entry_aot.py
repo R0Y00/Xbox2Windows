@@ -16,6 +16,7 @@ import tempfile
 import zlib
 
 from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
+from mesh_param_link import hlsl_param_fields, hlsl_param_writes, merge_wave_params, validate_linkage
 from pixel_aot import MESH_WAVE64, container_code, disassemble
 from resource_inventory import parts
 
@@ -162,6 +163,7 @@ class Wave:
         self.counts = []
         self.positions = {}
         self.attributes = {}
+        self.params = {}
         self.indices = {}
         self.m0 = None
         self.written = set()
@@ -375,7 +377,7 @@ class Wave:
         self.s, self.pending, self.scc = merged, true_p | false_p, None
         return join
 
-    def scalar_op(self, op, args):
+    def scalar_op(self, op, args, *, dynamic_bitcmp=False):
         d, *src = args
         if op in (
             "s_load_dwordx4",
@@ -389,16 +391,31 @@ class Wave:
         if op in ("s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"):
             if len(args) != 2:
                 raise ValueError(f"Expected two operands for {op}")
-            a, b = (self.scalar(t, True) for t in args)
+            wide = op.endswith("_b64")
+            src0, src1 = args
+            if wide and (re.fullmatch(r"s\d+", src0) or src0 in ("exec_lo", "exec_hi", "vcc_lo", "vcc_hi")):
+                raise ValueError(f"Expected a 64-bit scalar operand for {op}")
+            if not wide and (src0.startswith("s[") or src0 in ("exec", "vcc")):
+                raise ValueError(f"Expected a 32-bit scalar operand for {op}")
+            if src1.startswith("s[") or src1 in ("exec", "vcc"):
+                raise ValueError(f"Expected a 32-bit bit-index operand for {op}")
+            a, b = (self.scalar(token, True) for token in args)
             if a is UNDEF or b is UNDEF:
                 self.scc = None
                 return
+            test_one = op.startswith("s_bitcmp1_")
+            if dynamic_bitcmp and not wide and {type(a), type(b)} <= {int, str} and str in (type(a), type(b)):
+                value = f"asuint({a})" if type(a) is str else f"{a & U32}u"
+                index = f"(asuint({b}) & 31u)" if type(b) is str else f"{b & 31}u"
+                cmp_op = "!=" if test_one else "=="
+                self.scc = Dyn(f"(({value} & (1u << {index})) {cmp_op} 0u)")
+                return
             if type(a) is not int or type(b) is not int:
                 raise ValueError("Dynamic scalar predicate")
-            mask = 63 if op.endswith("_b64") else 31
-            width = WAVE if op.endswith("_b64") else U32
+            mask = 63 if wide else 31
+            width = WAVE if wide else U32
             bit = ((a & width) >> (b & mask)) & 1
-            self.scc = bit == (1 if op.startswith("s_bitcmp1_") else 0)
+            self.scc = bit == test_one
             return
         if op.startswith("s_cmp_"):
             a, b = (self.scalar(t, True) for t in args)
@@ -744,7 +761,10 @@ class Wave:
         """Execute the wave, yielding at each group barrier."""
         jumps = {offset: i for i, (offset, _) in enumerate(decoded)}
         for _, line in decoded:
-            dest = line.partition(" ")[2].split(", ")[0]
+            op, _, tail = line.partition(" ")
+            if op.startswith(("s_cmp_", "s_bitcmp")):
+                continue
+            dest = tail.split(", ")[0]
             if re.fullmatch(r"s\d+", dest):
                 self.written.add(int(dest[1:]))
             elif dest.startswith("s["):
@@ -884,7 +904,7 @@ class Wave:
             elif op in ("ds_write_b32", "ds_read_b32"):
                 self.lds_op(op, tail)
             elif op == "exp":
-                m = re.fullmatch(r"(prim|pos[0-3]|param0),? (.+?)( done)?", tail)
+                m = re.fullmatch(r"(prim|pos[0-3]|param(?:[0-9]|1[0-2])),? (.+?)( done)?", tail)
                 if not m:
                     raise ValueError("Unsupported mesh export")
                 # A position export may leave done to a later clip or cull distance export.
@@ -910,14 +930,25 @@ class Wave:
                     elif m[1].startswith("pos") and len(operands) == 4:
                         values = [None if t == "off" else self.lane_value(t, lane) for t in operands]
                         self.position_exports.setdefault(i, []).append((m[1], values, bool(m[3])))
-                    elif m[1] == "param0" and len(operands) == 4 and all(re.fullmatch(r"v\d+", t) for t in operands):
-                        if i in self.attributes:
-                            raise ValueError("Duplicate vertex attribute")
-                        self.attributes[i] = [self.lane_value(t, lane) for t in operands]
+                    elif m[1].startswith("param") and len(operands) == 4 and all(re.fullmatch(r"v\d+", t) for t in operands):
+                        slot = int(m[1][5:])
+                        slot_map = self.params.setdefault(slot, {})
+                        if i in slot_map:
+                            raise ValueError("Duplicate vertex attribute" if slot == 0 else f"Duplicate vertex parameter param{slot}")
+                        vals = [self.lane_value(t, lane) for t in operands]
+                        slot_map[i] = vals
+                        if slot == 0:
+                            self.attributes[i] = vals
                     else:
                         raise ValueError("Unsupported live export")
             elif op.startswith("image_"):
                 self.image_op(op, tail, expressions)
+            elif op.startswith("s_bitcmp"):
+                # A runtime bit predicate is supported only as the input to a verified descriptor join.
+                next_is_join_branch = not arm and pc < stop and decoded[pc][1].split(" ", 1)[0] in (
+                    "s_cbranch_scc0", "s_cbranch_scc1",
+                )
+                self.scalar_op(op, args, dynamic_bitcmp=next_is_join_branch)
             elif op.startswith("s_"):
                 self.scalar_op(op, args)
             elif op.startswith("v_"):
@@ -1025,7 +1056,7 @@ def emit_compute_draw(bindings, expressions, positions, indices, attributes):
     return "\n".join(lines) + "\n"
 
 
-def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
+def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None, param_linkage=None):
     layout = None if vs_out_cntl is None else decode_vs_out_cntl(vs_out_cntl)
     if vertex_header is not None and (
         type(vertex_header) != int or not 0 <= vertex_header <= U32
@@ -1048,15 +1079,16 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = waves[0].counts[0]
     pos = waves[0].positions | waves[1].positions
-    attributes = waves[0].attributes | waves[1].attributes
-    if attributes and attributes.keys() != pos.keys():
-        raise ValueError("Incomplete vertex attribute")
+    params = merge_wave_params(waves, pos)
+    attributes = params.get(0, {})
     idx = waves[0].indices | waves[1].indices
     # The native mesh shader writes any allocation within the PSV0 bounds. Each of the
     # 128 threads exports at most one vertex and one primitive, so every allocated
     # slot must be exported exactly once and nothing outside the allocation may be.
     if compute_fallback and (nv, np) != (3, 1):
         raise ValueError("The compute fallback translates only a single three-vertex triangle")
+    if compute_fallback and (any(s != 0 for s in params) or (param_linkage is not None and param_linkage.semantic != "texcoord")):
+        raise ValueError("The compute fallback translates only param0")
     if (
         not 0 < nv <= limits[0]
         or not 0 < np <= limits[1]
@@ -1068,6 +1100,15 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     distances = vertex_distances(waves[0].position_exports | waves[1].position_exports, layout)
     if compute_fallback and layout and layout.vectors:
         raise ValueError("The compute fallback has no room for clip or cull distances")
+    exported_params = tuple(sorted(params))
+    validate_linkage(
+        exported_params,
+        pixel_attrs=param_linkage.pixel_attrs if param_linkage is not None else None,
+        flat=param_linkage.flat if param_linkage is not None else (),
+        f16_plain=param_linkage.f16_plain if param_linkage is not None else (),
+        distance_vectors=len(layout.fields()) if layout else 0,
+        semantic=param_linkage.semantic if param_linkage is not None else ("param" if any(s > 0 for s in exported_params) else "texcoord"),
+    )
     bindings = [
         "cbuffer Points : register(b0) { float4 pointData[32]; };",
         "cbuffer Matrices : register(b1) { float4 matrixData[32]; };",
@@ -1081,7 +1122,7 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
         "#ifdef TRACE_EXPORTS",
         "RWByteAddressBuffer trace : register(u0);",
         "#endif",
-        "struct Vertex {float4 position:SV_Position;" + ("float4 attr:TEXCOORD0;" if attributes else "")
+        "struct Vertex {float4 position:SV_Position;" + hlsl_param_fields(exported_params, param_linkage)
         + hlsl_fields(layout) + "};",
         '[outputtopology("triangle")]',
         f"[numthreads(128,1,1)] void main(uint id:SV_GroupIndex, out vertices Vertex v[{nv}], out indices uint3 p[{np}]) {{",
@@ -1099,8 +1140,12 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
                 "  }",
             ]
         )
-        if attributes:
-            lines.append(f"  if(id=={i}) v[{i}].attr={float4(attributes[i])};")
+        param_writes = hlsl_param_writes(f"v[{i}]", {s: d[i] for s, d in params.items()}, exported_params, float4, param_linkage)
+        if param_writes:
+            if len(param_writes) == 1 and param_writes[0].startswith(f"v[{i}].attr = "):
+                lines.append(f"  if(id=={i}) {param_writes[0].replace(' = ', '=')}")
+            else:
+                lines.append(f"  if(id=={i}) {{ {' '.join(param_writes)} }}")
         if i in distances:
             lines.append(f"  if(id=={i}) {{ {hlsl_writes(f'v[{i}]', distances[i])} }}")
     for i, tri in idx.items():
@@ -1175,10 +1220,10 @@ def decode_mesh(blob, library):
     return disassemble(code, library, offsets=True, features=MESH_WAVE64), limits
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None):
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False, vs_out_cntl=None, param_linkage=None):
     decoded, limits = decode_mesh(blob, library)
     return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback,
-                 vs_out_cntl=vs_out_cntl)
+                 vs_out_cntl=vs_out_cntl, param_linkage=param_linkage)
 
 
 def _same_path(left: Path, right: Path) -> bool:

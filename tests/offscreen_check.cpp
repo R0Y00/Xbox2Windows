@@ -794,21 +794,21 @@ OperationResult run_sampled_coverage(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
+OperationResult run_check_pixel_compare_mips(const OperationContext& ctx)
 {
 // Windows SDK 10.0.22621 does not declare the SM 6.8 capability query.
 #if defined(__ID3D12Device14_INTERFACE_DEFINED__)
-    const bool bias = std::strcmp(ctx.argv[2], "--check-pixel-compare-bias") == 0;
-    const D3D_SHADER_MODEL required = bias ? D3D_SHADER_MODEL_6_8 : D3D_SHADER_MODEL_6_7;
+    const bool level = std::strcmp(ctx.argv[2], "--check-pixel-compare-level") == 0;
+    const D3D_SHADER_MODEL required = level ? D3D_SHADER_MODEL_6_7 : D3D_SHADER_MODEL_6_8;
     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{required};
     if (FAILED(check_feature(ctx.device, D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel))) ||
         shaderModel.HighestShaderModel < required)
-        return {OutcomeKind::skip, bias ? "Comparison bias requires SM 6.8" : "Comparison LOD requires SM 6.7"};
-    if (bias) {
+        return {OutcomeKind::skip, level ? "Comparison LOD requires SM 6.7" : "Comparison bias/gradient requires SM 6.8"};
+    if (!level) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS21 options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS21, &options, sizeof(options))) ||
             !options.SampleCmpGradientAndBiasSupported)
-            return {OutcomeKind::skip, "Comparison bias requires SampleCmpGradientAndBiasSupported"};
+            return {OutcomeKind::skip, "Comparison bias/gradient requires SampleCmpGradientAndBiasSupported"};
     } else {
         D3D12_FEATURE_DATA_D3D12_OPTIONS14 options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options))) ||
@@ -819,7 +819,7 @@ OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 #else
     (void)ctx;
-    return {OutcomeKind::skip, "Comparison LOD/bias fixture requires Windows SDK 10.0.26100 headers"};
+    return {OutcomeKind::skip, "Comparison mip fixture requires Windows SDK 10.0.26100 headers"};
 #endif
 }
 
@@ -945,6 +945,16 @@ OperationResult run_mesh_amplified(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_amplified_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
                                                    ctx.argv[6]));
+}
+
+OperationResult run_mesh_shader_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shader_pipeline(ctx.device, false));
+}
+
+OperationResult run_mesh_shader_pipeline_fallback(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shader_pipeline(ctx.device, true));
 }
 
 OperationResult run_mesh_heap_sampler(const OperationContext& ctx)
@@ -1513,14 +1523,20 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
 
 // --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
 // pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
-// comma separated.
+// comma separated. An optional fourth argument sets the four entry constants (ud0..ud3) as four hex words;
+// without it they are all 0.
 OperationResult run_startup_flat_param(const OperationContext& ctx)
 {
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[5], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     std::uint32_t words[4]{};
-    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], words);
+    std::uint32_t constants[4]{};
+    if (ctx.argc == 7 && std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &constants[0], &constants[1], &constants[2],
+                                     &constants[3]) != 4)
+        return {OutcomeKind::fail, "entry constants are not four hex words"};
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], words, 1, 1,
+                             D3D12_CULL_MODE_NONE, FALSE, 3, ctx.argc == 7 ? constants : nullptr);
     if (std::memcmp(words, expected, sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_flat_param mismatch expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
                      expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
@@ -1692,7 +1708,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
-    {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
+    {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
@@ -1729,8 +1745,9 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
-    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
-    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
+    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
+    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
+    {"--check-pixel-compare-grad", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
     {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
     {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
@@ -1750,6 +1767,8 @@ const OperationSpec kOperations[] = {
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
+    {"--mesh-shader-pipeline", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline},
+    {"--mesh-shader-pipeline-fallback", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline_fallback},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-heap-sampler", 6, 6, nullptr, kNoGate, run_mesh_heap_sampler},

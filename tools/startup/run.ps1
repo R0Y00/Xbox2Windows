@@ -28,14 +28,16 @@ param(
     [switch]$HostCpu,                          # rewrite instructions the host processor lacks (X2W_HOST_CPU)
     [switch]$Translate,                        # with -Render: translate new shader requests during the run (gfx2hlsl.py --watch)
     [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
+    [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
     [switch]$TraceApi                          # log runtime provider method calls (X2W_TRACE_API)
 )
 $ErrorActionPreference = "Stop"
 $repo = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $runDir = Split-Path -Parent (Resolve-Path $Exe)
+$buildRoot = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $repo $BuildDir }
 foreach ($dll in "xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput") {
-    Copy-Item (Join-Path $repo "$BuildDir\$dll.dll") $runDir -Force
+    Copy-Item -LiteralPath (Join-Path $buildRoot "$dll.dll") -Destination $runDir -Force
 }
 $env:X2W_AUDIO_PERMISSIVE = "1"; $env:X2W_D3D12_DEVICE_NOOP = "1"; $env:X2W_D3D12_LIST_NOOP = "1"
 $env:X2W_D3D12_PERMISSIVE = "1"; $env:X2W_XMEM_PERMISSIVE = "1"; $env:X2W_RUNTIME_PROXY = "1"
@@ -55,6 +57,9 @@ if ($GpuMirror) { $env:X2W_XMEM_GPU_MIRROR = "1" }
 if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
 if ($TraceApi) { $env:X2W_TRACE_API = "1" }
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" }
+if ($LazyMemory) {
+    $env:X2W_XMEM_LAZY_COMMIT = "1"; $env:X2W_XMEM_LAZY_STARTUP = "1"; $env:X2W_XMEM_SHARED_VIEWS = "1"
+}
 if ($Render) {
     New-Item -ItemType Directory -Force $ShaderCache | Out-Null
     $env:X2W_D3D12_RENDER = "1"; $env:X2W_DRAW_NULL_IDENTITY = "1"

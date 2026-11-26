@@ -22,9 +22,10 @@ that word as an entry constant and the translation switches on it. Each format i
 xyz load with its own descriptor word, then descriptor words with swizzles and constants 0 and 1 run through
 the same translated body.
 Each TBUFFER format runs its matching reference and each wrong reference that changes a word in one renderer
-batch. The first mismatched word must match the predicted index and values. Mutated translations
-compile and dispatch separately.
+batch. The first mismatched word must match the predicted index and values. Each distinct vertex or compute
+source compiles once in the fixture's temporary directory. Mutated translations dispatch separately.
 """
+import hashlib
 import re
 import struct
 import subprocess
@@ -53,6 +54,9 @@ FORMATS = {
     'BUF_FMT_8_UINT': (5, 3, 1, 8, 'uint', 1),
     'BUF_FMT_8_8_UNORM': (14, 3, 2, 8, 'unorm', 2),
     'BUF_FMT_16_16_UNORM': (23, 6, 2, 16, 'unorm', 2),
+    # One dword: x, y, z are 10-bit fields (bits 9:0, 19:10, 29:20) and w the 2-bit field in bits 31:30. The field
+    # width is listed as 16 only so the stride and offset checks see sub-dword alignment; see PACKED_2101010.
+    'BUF_FMT_2_10_10_10_UNORM': (50, 6, 2, 16, 'unorm2101010', 4),
     'BUF_FMT_16_16_SNORM': (24, 6, 2, 16, 'snorm', 2),
     'BUF_FMT_16_16_UINT': (27, 6, 2, 16, 'uint', 2),
     'BUF_FMT_16_16_FLOAT': (29, 10, 10, 16, 'f16', 2),
@@ -64,6 +68,9 @@ FORMATS = {
     'BUF_FMT_32_32_32_FLOAT': (74, 16, 4, 32, 'f32', 3),
     'BUF_FMT_32_32_32_32_FLOAT': (77, 20, 8, 32, 'f32', 4),
 }
+
+
+PACKED_2101010 = ((0, 10), (10, 10), (20, 10), (30, 2))  # (low bit, width) of x, y, z, w
 
 
 def snorm_words(fields, unsigned=False, no_clamp=False):
@@ -79,6 +86,14 @@ def reference(name, vertex, *, offset=None, swap=False, shift=False, w_zero=Fals
     """The four compared words of one vertex, from the format definition. The keywords give wrong references."""
     _, stride, own_offset, bits, kind, count = FORMATS[name]
     address, size = vertex * stride + (own_offset if offset is None else offset), bits // 8
+    if kind == 'unorm2101010':
+        word = int.from_bytes(DATA[address + (1 if shift else 0):address + (1 if shift else 0) + 4], 'little')
+        fields = [(word >> low) & ((1 << width) - 1) for low, width in PACKED_2101010]
+        if swap:
+            fields[0], fields[1] = fields[1], fields[0]
+        if unorm_pow2:
+            fields = [round(f * ((1 << w) - 1) / (1 << w)) for f, (_, w) in zip(fields, PACKED_2101010)]
+        return fields
     fields = [int.from_bytes(DATA[address + size * i:address + size * (i + 1)], 'little') for i in range(count)]
     if shift and bits < 32:
         # Each field read one field higher, as a wrong shift would; the last reads past the element.
@@ -99,6 +114,8 @@ def reference(name, vertex, *, offset=None, swap=False, shift=False, w_zero=Fals
 def compared(name):
     """Return the integer readback scale for each normalized component."""
     _, _, _, bits, kind, count = FORMATS[name]
+    if kind == 'unorm2101010':
+        return [(1 << width) - 1 for _, width in PACKED_2101010]
     scale = {'unorm': (1 << bits) - 1, 'snorm': (1 << (bits - 1)) - 1}.get(kind)
     return [scale if i < count else None for i in range(4)]
 
@@ -142,6 +159,9 @@ void readback(uint id : SV_GroupIndex) {
 MUTATIONS = (
     ('BUF_FMT_8_8_8_8_UNORM', 'second byte from the third', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)'),
     ('BUF_FMT_8_8_8_8_UNORM', 'fourth byte as 255', 'U((w >> 24) / 255.0)', 'U(1.0)'),
+    ('BUF_FMT_2_10_10_10_UNORM', 'y from the x field', 'v5 = U(((w >> 10) & 1023) / 1023.0);', 'v5 = U((w & 1023) / 1023.0);'),
+    ('BUF_FMT_2_10_10_10_UNORM', 'z from the y field', 'v6 = U(((w >> 20) & 1023) / 1023.0);', 'v6 = U(((w >> 10) & 1023) / 1023.0);'),
+    ('BUF_FMT_2_10_10_10_UNORM', 'w over 4', 'v7 = U((w >> 30) / 3.0);', 'v7 = U((w >> 30) / 4.0);'),
     ('BUF_FMT_8_8_8_8_UINT', 'normalized green byte', 'v5 = (w >> 8) & 255u;', 'v5 = U(((w >> 8) & 255u) / 255.0);'),
     ('BUF_FMT_8_8_8_8_UINT', 'blue byte from green', 'v6 = (w >> 16) & 255u;', 'v6 = (w >> 8) & 255u;'),
     ('BUF_FMT_8_8_8_8_UINT', 'alpha byte from blue', 'v7 = w >> 24;', 'v7 = (w >> 16) & 255u;'),
@@ -410,8 +430,10 @@ RUNTIME = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12
 def runtime_gate(source):
     """Check that both FORMAT metadata and usable backing are required before submission."""
     assert 'formatted_buffers_ready(*tr, pass, formatted_buffers)' in source
+    decoder = source[source.index('const char* formatted_buffer_word3('):source.index('bool formatted_buffers_ready(')]
+    assert 'formatted_buffer_supported(' in decoder
     preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
-    for condition in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
+    for condition in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_word3('):
         assert condition in preflight, condition
     start = source.index('bool draw_translated(')
     gate = source.index('if (!have && formatted.entry)', start)
@@ -423,8 +445,15 @@ def runtime_gate(source):
 def runtime_gate_controls():
     source = RUNTIME.read_text(encoding='utf-8')
     runtime_gate(source)
+    decoder = source[source.index('const char* formatted_buffer_word3('):source.index('bool formatted_buffers_ready(')]
+    try:
+        runtime_gate(source.replace(decoder, decoder.replace('formatted_buffer_supported(', 'omitted')))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('descriptor decoder without FORMAT support checking must fail the control')
     preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
-    for dropped in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
+    for dropped in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_word3('):
         try:
             runtime_gate(source.replace(preflight, preflight.replace(dropped, 'omitted')))
         except AssertionError:
@@ -443,13 +472,15 @@ def runtime_gate_controls():
 
 
 def compile_fetch(directory, compiler, name, source):
-    hlsl, binary = directory / 'fetch.hlsl', directory / 'fetch.cso'
-    hlsl.write_text(source, encoding='ascii')
-    # Compile the vertex entry as the startup tools do, then the same body in the compute wrapper.
-    subprocess.run([compiler, '-T', 'vs_6_0', '-E', 'main', '-Fo', binary, hlsl], check=True)
-    with hlsl.open('a', encoding='ascii') as handle:
-        handle.write(wrapper(name))
-    subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'readback', '-Fo', binary, hlsl], check=True)
+    hlsl, output = directory / 'fetch.hlsl', directory / 'fetch.cso'
+    # Descriptor words can change without changing the vertex program. The readback wrapper
+    # also depends on the format, so key each stage by its complete input in this run's temporary directory.
+    for profile, entry, text in (('vs_6_0', 'main', source), ('cs_6_0', 'readback', source + wrapper(name))):
+        binary = directory / ('%s-%s.cso' % (profile, hashlib.sha256(text.encode('ascii')).hexdigest()))
+        if not binary.exists():
+            hlsl.write_text(text, encoding='ascii')
+            subprocess.run([compiler, '-T', profile, '-E', entry, '-Fo', output, hlsl], check=True)
+            output.replace(binary)
     return binary
 
 
