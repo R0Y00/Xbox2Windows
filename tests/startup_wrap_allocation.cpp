@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 
 using Microsoft::WRL::ComPtr;
 
@@ -168,6 +169,33 @@ int main(int argc, char** argv)
                       static_cast<void*>(nullptr), 0u, static_cast<const void*>(nullptr), &__uuidof(ID3D12Resource),
                       reinterpret_cast<void**>(out));
     });
+
+    const auto free_backing = [](void* ptr) { VirtualFree(ptr, 0, MEM_RELEASE); };
+    const std::unique_ptr<void, decltype(free_backing)> backing(
+        VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), free_backing);
+    if (!backing) {
+        std::puts("FAIL: could not allocate slot 133 fixture backing");
+        return 3;
+    }
+    auto* base = static_cast<char*>(backing.get());
+    buffer.Width = 256;
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = texture.Height = 4;
+    texture.DepthOrArraySize = texture.MipLevels = texture.SampleDesc.Count = 1;
+    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    const auto check_placement = [&](const char* name, void* address, const D3D12_RESOURCE_DESC& desc) {
+        check(name, [&](IUnknown** out) {
+            return invoke(device.Get(), 133, address, &desc, static_cast<UINT>(D3D12_RESOURCE_STATE_COMMON),
+                          static_cast<const void*>(nullptr), &__uuidof(ID3D12Resource), reinterpret_cast<void**>(out));
+        });
+    };
+    // The unaligned buffer address selects the desktop stand-in. Slot 133 also has a separate
+    // texture path, which creates a committed desktop texture before trying to wrap it.
+    check_placement("Device::slot133 placed buffer", base + 4, buffer);
+    check_placement("Device::slot133 placed texture", base + 2048, texture);
 
     if (failures) {
         std::printf("FAIL: %d check(s)\n", failures);

@@ -14,7 +14,7 @@ constexpr bool formatted_buffer_supported(std::uint32_t code)
 {
     switch (code) {
     case 1: case 5: case 14: case 22: case 23: case 24: case 27:
-    case 29: case 56: case 60: case 64: case 71: case 74: case 77:
+    case 29: case 50: case 56: case 60: case 64: case 71: case 74: case 77:
         return true;
     default:
         return false;
