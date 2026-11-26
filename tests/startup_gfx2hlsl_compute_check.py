@@ -877,6 +877,20 @@ def check_lane_mask_high_word():
     assert 'v5 = ud0;' in translate('A', code=splice_words(*chunks, bytes.fromhex('04020a7e'))).hlsl_cs()
 
 
+def check_lane_mask_high_word_copy_and_overwrite():
+    """A copy of a mask's high word is itself only a high word (no low-word tag, so no '& 1' on a numeric use in a one-thread
+    group), and a wide write over a tagged pair ends the tag (no false refusal of the new value)."""
+    save = bytes.fromhex('7e0494be')                      # s_mov_b64 s[20:21], exec
+    copy = bytes.fromhex('150396be')                      # s_mov_b32 s22, s21: the high word
+    use = bytes.fromhex('16821788')                       # s_or_b32 s23, s22, 2
+    cvt = bytes.fromhex('170c0a7e')                       # v_cvt_f32_u32 v5, s23
+    one = translate('A', code=splice_words(save, copy, use, cvt), group=(1, 1, 1)).hlsl_cs()
+    assert 's23 = s22 | 0x00000002u;' in one, one
+    refused('as numeric data', lambda: translate('A', code=splice_words(save, copy, use, cvt), group=(2, 1, 1)))
+    shifted = splice_words(save, bytes.fromhex('0407948f'), bytes.fromhex('15020a7e'))   # s_lshl_b64 s[20:21], s[4:5], s7 ; v_mov_b32 v5, s21
+    assert 'v5 = ' in translate('A', code=shifted, group=(4, 1, 1)).hlsl_cs()
+
+
 LANE_MASK_TAG = {
     'zero_s1': '800381be',           # s_mov_b32 s1, 0: the high word the one-lane model holds as 0
     'cmp_pair': '000084d491000200',  # v_cmp_gt_i32 s[0:1], 17, v0 (writes only the low word of the pair)
@@ -1187,6 +1201,7 @@ def check_controls():
     check_lane_mask_data()
     check_lane_mask_high_word()
     check_lane_mask_single_thread_group()
+    check_lane_mask_high_word_copy_and_overwrite()
     check_lane_mask_derived_word()
     check_lane_mask_scalar_data()
     check_lane_mask_tag_propagation()

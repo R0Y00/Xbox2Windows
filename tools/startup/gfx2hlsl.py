@@ -2978,6 +2978,7 @@ class Stage:
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.masks = set(init_masks)
+            self.mask_high = set()
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
@@ -3555,9 +3556,13 @@ class Stage:
             r = reg_range(tok)
             if not r or r[0] != 's':
                 continue
-            self.masks.add(r[1])
-            if r[2] > r[1]:
+            if r[2] > r[1]:   # a pair: low word, and the high word it carries
+                self.masks.add(r[1])
                 self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
+            elif low or saveexec or pair_select:
+                self.masks.add(r[1])
+            if r[2] == r[1] and high and not (saveexec or pair_select):
+                self.mask_high = getattr(self, 'mask_high', set()) | {r[1]}
 
     def lane_mask_exact(self):
         """True where the one-lane model of a wave mask is exact: a compute group of one thread has one participating lane
@@ -3592,6 +3597,10 @@ class Stage:
             masks = [high] if high else []
         tags = self.mask_source_tags(base, ops)
         result = self._lower(base, asm, ops, mods)
+        for tok in destinations(base, ops):   # an overwritten register no longer holds a mask's high word
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                getattr(self, 'mask_high', set()).difference_update(range(r[1], r[2] + 1))
         if masks and not self.lane_mask_exact():
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
         self.propagate_mask_tags(base, ops, tags)
