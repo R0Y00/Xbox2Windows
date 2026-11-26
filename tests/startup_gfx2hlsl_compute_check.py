@@ -849,7 +849,16 @@ def check_lane_mask_high_word():
     chunks = [bytes.fromhex(w) for w in ('0000 84d4 9100 0200'.replace(' ', ''),   # v_cmp_gt_i32 s[0:1], 17, v0
                                          '8004027d',                                 # v_cmp_lt_i32 vcc, 0, v2
                                          '6a008089')]                                # s_xor_b64 s[0:1], vcc, s[0:1]
-    refused('as numeric data', lambda: translate('A', code=splice_words(*chunks, bytes.fromhex('01020a7e'))))
+    for word in ('01020a7e',    # v_mov_b32 v5, s1
+                 '010a0a4a',    # v_add_nc_u32 v5, s1, v5
+                 '010c0a7e',    # v_cvt_f32_u32 v5, s1
+                 '010a0a36',    # v_and_b32 v5, s1, v5
+                 '01810780',    # s_add_u32 s7, s1, 1
+                 '018006bf',    # s_cmp_eq_u32 s1, 0
+                 '010387be'):   # s_mov_b32 s7, s1
+        refused('as numeric data', lambda: translate('A', code=splice_words(*chunks, bytes.fromhex(word))))
+    # The compare alone leaves its high word unknown: refused too (earlier, by the unknown-SGPR rule).
+    refused('s1', lambda: translate('A', code=splice_words(chunks[0], bytes.fromhex('010a0a4a'))))
     assert 'v5 = ud0;' in translate('A', code=splice_words(*chunks, bytes.fromhex('04020a7e'))).hlsl_cs()
 
 

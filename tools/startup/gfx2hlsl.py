@@ -3184,6 +3184,21 @@ class Stage:
             del self.uniform_expr[v]
         return regs
 
+    def mark_mask_high(self, reg):
+        """A wave64 lane mask was written into the SGPR pair reg (reg_range): the one-lane model holds only the low word's
+        bit, the high word is the other lanes' bits, so no numeric read of it is lowered (see lower())."""
+        if reg and reg[0] == 's' and reg[2] == reg[1] + 1:
+            self.mask_high = getattr(self, 'mask_high', set()) | {reg[1] + 1}
+
+    def reads_mask_high(self, toks):
+        """First single-register operand that is the high word of a wave64 lane mask, else None."""
+        high = getattr(self, 'mask_high', ())
+        for t in toks:
+            r = reg_range(t.strip().lstrip('-|').rstrip('|'))
+            if r and r[0] == 's' and r[1] == r[2] and r[1] in high:
+                return t.strip()
+        return None
+
     def lower(self, base, asm, ops, mods):
         """Lower one instruction; a vector ALU form that reads a lane mask as a number is refused.
 
@@ -3194,11 +3209,11 @@ class Stage:
         masks = []
         if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
             masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
-        if base.startswith('v_mov_b32'):   # the high word of a wave64 mask has no one-lane value
-            masks = [t for t in ops[1:] if reg_range(t) and reg_range(t)[0] == 's'
-                     and reg_range(t)[1] in getattr(self, 'mask_high', ())]
         if base.startswith('s_') and not MASK_AWARE_SALU_RE.match(base):
             masks = [t for t in (ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:]) if self.is_lane_mask(t.strip())]
+        if base.startswith(('v_', 's_')) and not masks:   # the high word of a wave64 mask has no one-lane value
+            high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:])
+            masks = [high] if high else []
         result = self._lower(base, asm, ops, mods)
         if masks:
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
@@ -4258,6 +4273,7 @@ class Stage:
         if pair:
             self.masks.add(d)
             self.set_s(d + 1, '0u')
+            self.mark_mask_high(r if r[2] > r[1] else (r[0], d, d + 1))
 
     def smem_soffset(self, tok, record_use=True):
         """Runtime expression for an SMEM scalar offset operand (s0..s105 or m0)."""
@@ -6785,6 +6801,7 @@ class Stage:
             # The carry is a per-lane bit: never a uniform scalar, whatever the scratch name hides.
             self.set_s(sdst[1], predicate, uniform=False)
             self.masks.add(sdst[1])
+            self.mark_mask_high(sdst)
 
     def op_v_add_co_u32(self, ops, mods):
         self.carry_out_op(ops, mods, 'add')
@@ -6844,6 +6861,7 @@ class Stage:
         else:
             self.set_s(sdst[1], predicate, uniform=False)
             self.masks.add(sdst[1])
+            self.mark_mask_high(sdst)
 
     def op_v_add_co_ci_u32(self, ops, mods):
         self.carry_in_out_op(ops, mods, 'add')
@@ -7016,6 +7034,7 @@ class Stage:
                 d = reg[1]
                 self.set_s(d, predicate)
                 self.masks.add(d)
+                self.mark_mask_high(reg)
             return None
 
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16)(_sdwa)?', base)
@@ -7085,6 +7104,7 @@ class Stage:
             d = reg[1]
             self.set_s(d, expr)
             self.masks.add(d)
+            self.mark_mask_high(reg)
 
     def export(self, asm):
         # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as
