@@ -1,24 +1,9 @@
-// X2W_D3D12_RELEASE_RETIRED_VIEWS=1 (with X2W_D3D12_RELEASE_RETIRED=1, Refs #2379): a released committed 2D texture that
-// only tracked slot-18 descriptor slots keep alive is freed once those slots hold null descriptors. The title never has
-// to overwrite them.
-//
+// Live SRVs keep retired textures available for later bindings (#2379).
 //   startup_resource_retire_views <warp|hardware> [keep]
-//
-// `keep` is the negative control: the views switch is off (or the retire switch is, with the views switch set), so a
-// released texture stays retained exactly as before and its descriptors keep naming it.
-//
-// The fixture reads the desktop descriptors the shim wrote: a compute shader on the fixture's own desktop queue loads
-// texel (0,0) through a slot of a guest heap (bound directly when the heap is shader-visible, copied into a probe
-// heap when it is not). A filled texture reads back non-zero, a null descriptor reads back zero.
-// Cases:
-//   1 single SRV in a shader-visible heap, never overwritten: freed after the release fences, descriptor null, view
-//     token in title descriptor memory cleared.
-//   2 the same texture also copied into a second (non-shader-visible) heap, release behind a gated queue: nothing is
-//     touched until the gate opens, then both copies are null and the texture is freed (copies are handled).
-//   3 a closed list recorded a CopyResource from the texture, submitted behind a gate: descriptors are nulled but the
-//     desktop object lives until the submission's fence, and the copy still reads the texels.
-//   4 a closed, never submitted list names the texture: nulled, retained until the recording is discarded.
-//   5 a live texture's descriptor is never touched.
+// `keep` runs without base retirement, as a control for the budget drop after explicit overwrite.
+// The legacy views switch may be on or off. Both settings preserve the original and copied slots.
+// The fixture uses the shim's descriptor creation and copying paths and reads the desktop descriptors
+// with a compute probe. The gated queue and the two recorded copies cover pending GPU work.
 #include "startup_stubs/resource_budget.h"
 
 #include <d3d12sdklayers.h>
@@ -417,75 +402,74 @@ D3D12_SHADER_RESOURCE_VIEW_DESC texture_view()
     return srv;
 }
 
-// 1: one SRV in a shader-visible heap, never overwritten.
-bool case1_single_view(Context& c, bool on, GuestHeap& visible)
+void overwrite_srv(Context& c, const GuestHeap& heap, UINT index)
 {
-    Res& T = c.make_committed("T1");
-    if (!c.fill_desktop(T.guest.Get(), 1)) return false;
     const auto srv = texture_view();
-    invoke<void>(c.guest, 18, T.guest.Get(), &srv, visible.cpu);
-    if (!c.slot_is(visible, 0, false, "case 1 control: live texture's descriptor") ||
-        Context::token_word(visible, 0, c.increment) != view_token_magic) {
-        std::puts("FAIL: case 1 control: live texture's view token missing");
-        return false;
-    }
-    c.release(T);
-    if (on) {
-        T.freed = true;
-        if (!c.settle("T1 freed with its descriptor never overwritten", "T1 kept although only a descriptor names it"))
-            return false;
-        if (!c.slot_is(visible, 0, true, "case 1: descriptor after the free")) return false;
-        if (Context::token_word(visible, 0, c.increment) == view_token_magic) {
-            std::puts("FAIL: case 1: view token still in title descriptor memory after the free");
-            return false;
-        }
-        return true;
-    }
+    invoke<void>(c.guest, 18, static_cast<IUnknown*>(nullptr), &srv, heap.cpu + c.increment * static_cast<UINT64>(index));
+}
+
+// 1: a later binding of the same slot after the last guest Release.
+bool case1_single_view(Context& c, bool retire_on, GuestHeap& visible)
+{
+    Res& texture = c.make_committed("T1");
+    if (!c.fill_desktop(texture.guest.Get(), 1)) return false;
+    const auto srv = texture_view();
+    invoke<void>(c.guest, 18, texture.guest.Get(), &srv, visible.cpu);
+    if (!c.slot_is(visible, 0, false, "case 1: live descriptor") ||
+        Context::token_word(visible, 0, c.increment) != view_token_magic) return false;
+
+    c.release(texture);
     for (int i = 0; i < 8; ++i)
-        if (!c.stays("T1 released, views switch off", "T1 freed without the views switch")) return false;
-    return c.slot_is(visible, 0, false, "case 1 control: descriptor with the views switch off");
+        if (!c.stays("T1 with a live slot", "T1 retired before its slot was overwritten")) return false;
+    if (!c.slot_is(visible, 0, false, "case 1: rebound descriptor after Release") ||
+        Context::token_word(visible, 0, c.increment) != view_token_magic) return false;
+
+    overwrite_srv(c, visible, 0);
+    if (!c.slot_is(visible, 0, true, "case 1: explicitly overwritten slot")) return false;
+    texture.freed = retire_on;
+    return c.settle("T1 after explicit overwrite", "unexpected backing lifetime after overwrite");
 }
 
 // 2: a copy in a second heap, release behind a gated queue.
-bool case2_copy_and_gate(Context& c, bool on, GuestHeap& visible, GuestHeap& staging)
+bool case2_copy_and_gate(Context& c, bool retire_on, GuestHeap& visible, GuestHeap& staging)
 {
-    Res& T = c.make_committed("T2");
-    if (!c.fill_desktop(T.guest.Get(), 2)) return false;
+    Res& texture = c.make_committed("T2");
+    if (!c.fill_desktop(texture.guest.Get(), 2)) return false;
     const auto srv = texture_view();
-    invoke<void>(c.guest, 18, T.guest.Get(), &srv, visible.cpu + c.increment);
+    invoke<void>(c.guest, 18, texture.guest.Get(), &srv, visible.cpu + c.increment);
     invoke<void>(c.guest, 24, 1u, staging.cpu, visible.cpu + c.increment, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     ComPtr<IUnknown> gate;
     if (!require(invoke(c.guest, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, &__uuidof(ID3D12Fence), gate.GetAddressOf()), "gate") ||
-        !require(invoke(c.gated.queue.Get(), 17, gate.Get(), UINT64{1}), "wait"))
-        return false;
-    c.release(T);
+        !require(invoke(c.gated.queue.Get(), 17, gate.Get(), UINT64{1}), "wait")) return false;
+
+    c.release(texture);
     for (int i = 0; i < 8; ++i)
-        if (!c.stays("T2 released behind a closed gate", "T2 freed before the release fences passed")) return false;
-    if (!c.slot_is(visible, 1, false, "case 2: original descriptor before the gate opens") ||
-        !c.slot_is(staging, 0, false, "case 2: copied descriptor before the gate opens"))
-        return false;
+        if (!c.stays("T2 behind a closed gate", "T2 retired before the release fences passed")) return false;
+    if (!c.slot_is(visible, 1, false, "case 2: original before the gate opens") ||
+        !c.slot_is(staging, 0, false, "case 2: copy before the gate opens")) return false;
     if (!require(invoke(gate.Get(), 10, UINT64{1}), "signal gate") || !c.sync(c.gated)) return false;
-    if (!on) {
-        for (int i = 0; i < 8; ++i)
-            if (!c.stays("T2 released, views switch off", "T2 freed without the views switch")) return false;
-        return c.slot_is(staging, 0, false, "case 2 control: copied descriptor with the views switch off");
-    }
-    T.freed = true;
-    if (!c.settle("T2 freed after the gate opened", "T2 kept after its fences passed")) return false;
-    return c.slot_is(visible, 1, true, "case 2: original descriptor after the free") &&
-           c.slot_is(staging, 0, true, "case 2: copied descriptor after the free");
+    if (!c.stays("T2 after its release fences", "T2 retired while both descriptors were live") ||
+        !c.slot_is(visible, 1, false, "case 2: original after the release fences") ||
+        !c.slot_is(staging, 0, false, "case 2: copy after the release fences")) return false;
+
+    overwrite_srv(c, visible, 1);
+    if (!c.stays("T2 with only its copy live", "T2 retired while its copy was live") ||
+        !c.slot_is(staging, 0, false, "case 2: copy after overwriting the original")) return false;
+    overwrite_srv(c, staging, 0);
+    if (!c.slot_is(staging, 0, true, "case 2: explicitly overwritten copy")) return false;
+    texture.freed = retire_on;
+    return c.settle("T2 after both slots were overwritten", "unexpected backing lifetime after overwriting both slots");
 }
 
-// 3 and 4: lists that name the texture.
-bool case3_list_holds(Context& c, bool on, GuestHeap& visible)
+// 3 and 4: lists that name the texture. Overwriting the slots cannot drop list or submission holds.
+bool case3_list_holds(Context& c, bool retire_on, GuestHeap& visible)
 {
     Res& T3 = c.make_committed("T3");
     Res& D3 = c.make_committed("D3");
     Res& T4 = c.make_committed("T4");
     Res& D4 = c.make_committed("D4");
     if (!c.fill_desktop(T3.guest.Get(), 3) || !c.fill_desktop(D3.guest.Get(), 99) || !c.fill_desktop(T4.guest.Get(), 4) ||
-        !c.fill_desktop(D4.guest.Get(), 99))
-        return false;
+        !c.fill_desktop(D4.guest.Get(), 99)) return false;
     const auto srv = texture_view();
     invoke<void>(c.guest, 18, T3.guest.Get(), &srv, visible.cpu + 2 * c.increment);
     invoke<void>(c.guest, 18, T4.guest.Get(), &srv, visible.cpu + 3 * c.increment);
@@ -494,30 +478,31 @@ bool case3_list_holds(Context& c, bool on, GuestHeap& visible)
     invoke<void>(submitted.list.Get(), 17, D3.guest.Get(), T3.guest.Get());
     invoke<void>(discarded.list.Get(), 17, D4.guest.Get(), T4.guest.Get());
     if (!c.close(submitted) || !c.close(discarded)) return false;
+
     c.release(T3);
     c.release(T4);
     for (int i = 0; i < 8; ++i)
-        if (!c.stays("T3/T4 released behind closed lists", "a texture left the budget while a closed list names it"))
-            return false;
-    if (on && (!c.slot_is(visible, 2, true, "case 3: descriptor of the listed texture T3") ||
-               !c.slot_is(visible, 3, true, "case 4: descriptor of the listed texture T4")))
-        return false;
+        if (!c.stays("T3/T4 behind closed lists", "a texture retired while its list was closed")) return false;
+    if (!c.slot_is(visible, 2, false, "case 3: slot with a closed list") ||
+        !c.slot_is(visible, 3, false, "case 4: slot with a closed list")) return false;
+
     ComPtr<IUnknown> gate;
     if (!require(invoke(c.guest, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, &__uuidof(ID3D12Fence), gate.GetAddressOf()), "gate3") ||
-        !require(invoke(c.gated.queue.Get(), 17, gate.Get(), UINT64{1}), "wait3"))
-        return false;
+        !require(invoke(c.gated.queue.Get(), 17, gate.Get(), UINT64{1}), "wait3")) return false;
     c.execute(c.gated, submitted);
-    if (!SUCCEEDED(c.reset_list(submitted))) return false;
+    if (!SUCCEEDED(c.reset_list(submitted)) ||
+        !c.slot_is(visible, 2, false, "case 3: live slot during an in-flight recording")) return false;
+    overwrite_srv(c, visible, 2);
+    overwrite_srv(c, visible, 3);
     for (int i = 0; i < 8; ++i)
-        if (!c.stays("T3 held by a gated submission", "T3 left the budget while its submission is in flight")) return false;
-    if (!SUCCEEDED(c.reset_list(discarded))) return false;  // discards the recording that was never submitted
-    if (on) T4.freed = true;
-    if (!c.settle("T4 freed after its recording was discarded", "T4 kept after its recording was discarded")) return false;
+        if (!c.stays("T3/T4 after overwrite", "a texture retired while its list or submission still held it")) return false;
+    if (!SUCCEEDED(c.reset_list(discarded))) return false;
+    T4.freed = retire_on;
+    if (!c.settle("T4 after its recording was discarded", "unexpected T4 lifetime after discarding the list")) return false;
     if (!require(invoke(gate.Get(), 10, UINT64{1}), "signal gate3") || !c.sync(c.gated)) return false;
-    if (on) T3.freed = true;
-    if (!c.settle("T3 freed after its submission's fence", "T3 kept after its submission's fence passed")) return false;
-    // The copy ran against the live texels, not against anything freed or nulled.
-    return c.holds(D3.guest.Get(), 3, "D3 copy of T3 recorded before the release");
+    T3.freed = retire_on;
+    if (!c.settle("T3 after its submission's fence", "unexpected T3 lifetime after the fence")) return false;
+    return c.holds(D3.guest.Get(), 3, "D3 copy of T3 recorded before Release and overwrite");
 }
 
 // 5: a live texture is never touched.
@@ -573,12 +558,11 @@ int main(int argc, char** argv)
     value[0] = 0;
     const bool views_on = GetEnvironmentVariableA("X2W_D3D12_RELEASE_RETIRED_VIEWS", value, sizeof(value)) == 1 && value[0] == '1';
     const bool keep_mode = argc == 3;
-    // The effective switch needs both; `keep` runs with either one missing.
-    if ((retire_on && views_on) == keep_mode) return 2;
-    const bool on = !keep_mode;
+    if (retire_on == keep_mode) return 2;
     DXGI_ADAPTER_DESC1 adapter_desc{};
     adapter->GetDesc1(&adapter_desc);
-    std::printf("adapter=%ls debug_layer=%s mode=%s\n", adapter_desc.Description, debug ? "enabled" : "off", keep_mode ? "keep" : "on");
+    std::printf("adapter=%ls debug_layer=%s retire=%s legacy_views=%s\n", adapter_desc.Description,
+                debug ? "enabled" : "off", retire_on ? "on" : "off", views_on ? "on" : "off");
 
     Context c{guest.Get(), device.Get()};
     try {
@@ -638,12 +622,12 @@ int main(int argc, char** argv)
         GuestHeap visible, staging;
         if (!c.make_heap(visible, 8, true) || !c.make_heap(staging, 1, false)) return 4;
 
-        if (!case1_single_view(c, on, visible)) return 5;
-        std::puts("1 single SRV in a shader-visible heap, never overwritten: freed with a null descriptor and a cleared token");
-        if (!case2_copy_and_gate(c, on, visible, staging)) return 5;
-        std::puts("2 copied descriptor behind a closed gate: untouched until the fences pass, then both copies null");
-        if (!case3_list_holds(c, on, visible)) return 5;
-        std::puts("3/4 listed texture: descriptors null, desktop object kept until the submission's fence or the discard");
+        if (!case1_single_view(c, retire_on, visible)) return 5;
+        std::puts("1 same slot rebind reads its texture after Release and permits retirement after overwrite");
+        if (!case2_copy_and_gate(c, retire_on, visible, staging)) return 5;
+        std::puts("2 original and copied slots read their texture after the release fences, retaining it through the final overwrite");
+        if (!case3_list_holds(c, retire_on, visible)) return 5;
+        std::puts("3/4 overwritten slots preserve list and submission holds, recorded copy reads the original texels");
         if (!case5_live_control(c, visible)) return 5;
         std::puts("5 live texture: descriptor untouched");
     } catch (int code) {
@@ -652,6 +636,6 @@ int main(int argc, char** argv)
     const UINT64 errors = debug ? debug->GetNumStoredMessages() : 0;
     std::printf("debug_errors_or_warnings=%llu\n", errors);
     if (errors || FAILED(device->GetDeviceRemovedReason())) return 4;
-    std::puts(on ? "release-retired views checks passed" : "views-off control checks passed");
+    std::puts(retire_on ? "live descriptor retirement checks passed" : "base retirement off: all retention controls passed");
     return 0;
 }

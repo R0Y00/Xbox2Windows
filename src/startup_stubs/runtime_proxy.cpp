@@ -832,8 +832,8 @@ std::string update_container(u64 update)
 {
     std::string name;
     AcquireSRWLockShared(&save_lock);
+    struct Unlock { ~Unlock() { ReleaseSRWLockShared(&save_lock); } } unlock;
     if (update >= save_update_handle) name = save_table.update_container(static_cast<std::size_t>(update - save_update_handle));
-    ReleaseSRWLockShared(&save_lock);
     return name;
 }
 #include "startup_stubs/save_read.inl"
