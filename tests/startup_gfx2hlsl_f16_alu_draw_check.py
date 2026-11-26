@@ -301,6 +301,233 @@ def ps_words(op):
     return PRE_WORDS + BODY_WORDS[op] + POST_WORDS
 
 
+# ---- SDWA binary16 arithmetic (v_add/sub/subrev/mul_f16_sdwa) -------------------------------------------------------
+# One configuration per draw group: four lanes run the same instruction (src0_sel, src1_sel, dst_sel, dst_unused and
+# the abs/neg spelling of the sources) over different words. Lane i reads v<i> and v<4+i>; the old value of the
+# destination is the third parameter word, copied into v<12+i> first so that UNUSED_PRESERVE has something to keep.
+# Every source word carries a different, non-NaN value in the half that is not selected.
+SDWA_BASE = ('WORD_0', 'UNUSED_PAD')
+SDWA_CONFIGS = [(op, s0, s1) + SDWA_BASE + ('', '') for op in ('v_add_f16',) for s0 in ('DWORD', 'WORD_0', 'WORD_1')
+                for s1 in ('DWORD', 'WORD_0', 'WORD_1')]
+SDWA_CONFIGS += [('v_add_f16', 'WORD_1', 'WORD_0', d, u, '', '') for d, u in
+                 (('WORD_1', 'UNUSED_PAD'), ('WORD_0', 'UNUSED_PRESERVE'), ('WORD_1', 'UNUSED_PRESERVE'))]
+SDWA_CONFIGS += [(op, 'WORD_1', 'WORD_0', 'WORD_1', 'UNUSED_PRESERVE', '', '')
+                 for op in ('v_sub_f16', 'v_subrev_f16', 'v_mul_f16')]
+SDWA_CONFIGS += [('v_add_f16', 'WORD_0', 'WORD_1', 'WORD_0', 'UNUSED_PRESERVE', '-', '|'),
+                 ('v_sub_f16', 'WORD_1', 'WORD_0', 'WORD_1', 'UNUSED_PAD', '-|', ''),
+                 ('v_mul_f16', 'WORD_0', 'WORD_0', 'WORD_0', 'UNUSED_PAD', '|', '-')]
+# Edge values of binary16 (zeros of both signs, the smallest and largest denormal, the smallest normal, the largest
+# finite value, infinities, quiet and signalling NaN, a NaN with payload) and the roundings that matter.
+EDGE_PAIRS = [(0x0000, 0x0000), (0x8000, 0x8000), (0x8000, 0x0000), (0x0001, 0x0001), (0x03ff, 0x0001),
+              (0x7bff, 0x7bff), (0x0000, 0x7c00), (0xfbff, 0xfbff), (0x7c00, 0x7c00), (0x7c00, 0xfc00),
+              (0x7e00, 0x3c00), (0x3c00, 0x7c01), (0x7fff, 0x7fff), (0x3c00, 0x1000), (0x3c01, 0x1000),
+              (0x0400, 0x8001)]
+SDWA_EDGE_CONFIGS = [(op, 'WORD_1', 'WORD_0', 'WORD_1', 'UNUSED_PRESERVE', '', '')
+                     for op in ('v_add_f16', 'v_sub_f16', 'v_subrev_f16', 'v_mul_f16')]
+GARBAGE = (0xabcd, 0x5a5a, 0xdead, 0x1234)
+OLD = (0x5a5a1234, 0xdead5678, 0x1234abcd, 0x2bcd3456)
+NAN_HALF = 0x7e00
+# The target is a float format: a result that fits in 16 bits reads back as binary32 zero or a subnormal and FXC drops it.
+# Both the drawn word and the expected word are XORed with a tag that keeps every lane a finite normal float (0x3f800000 would turn some 0x4000-class upper halves into infinity or NaN; the control below checks every lane).
+SDWA_TAG = 0x60000000
+
+
+def sdwa_place(value, selection, lane, salt):
+    """A register word holding value in the selected half and a different non-NaN value in the other."""
+    other = GARBAGE[(lane + salt) % 4]
+    return (value << 16) | other if selection == 'WORD_1' else (other << 16) | value
+
+
+def sdwa_lanes(cfg, pairs):
+    _op, s0, s1 = cfg[:3]
+    return [(sdwa_place(a, s0, i, 0), sdwa_place(b, s1, i, 1), OLD[i % 4]) for i, (a, b) in enumerate(pairs)]
+
+
+SDWA_DRAW = {}
+for _k, _cfg in enumerate(SDWA_CONFIGS):
+    SDWA_DRAW[_cfg] = sdwa_lanes(_cfg, [ARITH[(_i + _k) % 8] for _i in range(4)])
+for _cfg in SDWA_EDGE_CONFIGS:
+    SDWA_DRAW[_cfg + ('edge',)] = sdwa_lanes(_cfg, EDGE_PAIRS)
+
+
+def sdwa_name(cfg):
+    return '_'.join(p.lower().replace('unused_', '') for p in cfg[:5]) + ''.join(
+        '_' + {'-': 'neg', '|': 'abs', '-|': 'negabs', '': 'plain'}[m] for m in cfg[5:7]) + (
+        '_edge' if len(cfg) > 7 else '')
+
+
+def sdwa_operand(modifier, reg):
+    return {'': 'v%d', '-': '-v%d', '|': '|v%d|', '-|': '-|v%d|'}[modifier] % reg
+
+
+def sdwa_body_source(cfg):
+    op, s0, s1, dsel, unused, m0, m1 = cfg[:7]
+    lines = []
+    for lane in range(4):
+        dst = 12 + lane
+        lines.append('v_mov_b32 v%d, v%d\n' % (dst, 8 + lane))
+        lines.append('%s_sdwa v%d, %s, %s dst_sel:%s dst_unused:%s src0_sel:%s src1_sel:%s\n' % (
+            op, dst, sdwa_operand(m0, lane), sdwa_operand(m1, 4 + lane), dsel, unused, s0, s1))
+    return ''.join(lines)
+
+
+def half_special(op, a, b):
+    """Reference binary16 result word of a op b over words, from exact rationals and the IEEE special cases."""
+    def nan(x):
+        return (x & 0x7fff) > 0x7c00
+
+    def inf(x):
+        return (x & 0x7fff) == 0x7c00
+    if op == 'v_subrev_f16':
+        op, a, b = 'v_sub_f16', b, a
+    if op == 'v_sub_f16':
+        op, b = 'v_add_f16', b ^ 0x8000
+    if nan(a) or nan(b):
+        return NAN_HALF
+    sign_a, sign_b = a & 0x8000, b & 0x8000
+    if op == 'v_mul_f16':
+        if (inf(a) and (b & 0x7fff) == 0) or (inf(b) and (a & 0x7fff) == 0):
+            return NAN_HALF
+        if inf(a) or inf(b):
+            return 0x7c00 | (sign_a ^ sign_b)
+        value = exact(a) * exact(b)
+        return round_half(value) if value else (sign_a ^ sign_b)
+    if inf(a) and inf(b):
+        return NAN_HALF if sign_a != sign_b else a
+    if inf(a) or inf(b):
+        return a if inf(a) else b
+    value = exact(a) + exact(b)
+    if value == 0:
+        return 0x8000 if (a & 0x7fff) == 0 and (b & 0x7fff) == 0 and sign_a and sign_b else 0
+    return round_half(value)
+
+
+def sdwa_half_of(word, selection, modifier):
+    half = word >> 16 if selection == 'WORD_1' else word & 0xffff
+    if 'abs' in modifier or '|' in modifier:
+        half &= 0x7fff
+    if modifier.startswith('-'):
+        half ^= 0x8000
+    return half
+
+
+def sdwa_reference(cfg, lane, selection_swap=False, keep_swap=False, half_swap=False):
+    """Expected register word. The three flags build the deliberately wrong readings of the control mutants."""
+    op, s0, s1, dsel, unused, m0, m1 = cfg[:7]
+    w0, w1, old = lane
+    if selection_swap:
+        s0, s1 = ('WORD_0' if sel == 'WORD_1' else 'WORD_1' for sel in (s0, s1))
+    result = half_special(op, sdwa_half_of(w0, s0, m0), sdwa_half_of(w1, s1, m1))
+    if half_swap:
+        dsel = 'WORD_0' if dsel == 'WORD_1' else 'WORD_1'
+    if keep_swap:
+        unused = 'UNUSED_PAD' if unused == 'UNUSED_PRESERVE' else 'UNUSED_PRESERVE'
+    shift = 16 if dsel == 'WORD_1' else 0
+    kept = (old & ~(0xffff << shift)) & 0xffffffff if unused == 'UNUSED_PRESERVE' else 0
+    return canon_word(kept | (result << shift))
+
+
+def canon_half(h):
+    return NAN_HALF if (h & 0x7fff) > 0x7c00 else h
+
+
+def canon_word(word):
+    return canon_half(word & 0xffff) | (canon_half(word >> 16) << 16)
+
+
+# A NaN carries no portable sign or payload, so the drawn pair canonicalises every NaN half to 0x7e00 on both sides.
+NAN_HLSL = ('uint nanh(uint h) { return (h & 0x7fffu) > 0x7c00u ? 0x7e00u : h; }\n'
+            'uint nanc(uint w) { return nanh(w & 0xffffu) | (nanh(w >> 16u) << 16u); }\n')
+
+
+def sdwa_draw_text(cfg):
+    text = G.Pipeline(vs_words([(0, 0, 0)] * 4), sdwa_ps_words(cfg), root_blob()).hlsl_ps()
+    return NAN_HLSL + re.sub(r'F\(v(1[2-5])\)', r'F(nanc(v\1) ^ 0x%xu)' % SDWA_TAG, text)
+
+
+# Recorded llvm-mc (gfx1013) encodings of sdwa_body_source(cfg), by configuration name; `binary <llvm-mc>` compares.
+SDWA_BODY_WORDS = {
+    'v_add_f16_dword_dword_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004060609031a7ef90a1a64010406060a031c7ef90c1c64020406060b031e7ef90e1e6403040606'),
+    'v_add_f16_dword_word_0_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004060409031a7ef90a1a64010406040a031c7ef90c1c64020406040b031e7ef90e1e6403040604'),
+    'v_add_f16_dword_word_1_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004060509031a7ef90a1a64010406050a031c7ef90c1c64020406050b031e7ef90e1e6403040605'),
+    'v_add_f16_word_0_dword_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004040609031a7ef90a1a64010404060a031c7ef90c1c64020404060b031e7ef90e1e6403040406'),
+    'v_add_f16_word_0_word_0_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004040409031a7ef90a1a64010404040a031c7ef90c1c64020404040b031e7ef90e1e6403040404'),
+    'v_add_f16_word_0_word_1_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004040509031a7ef90a1a64010404050a031c7ef90c1c64020404050b031e7ef90e1e6403040405'),
+    'v_add_f16_word_1_dword_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004050609031a7ef90a1a64010405060a031c7ef90c1c64020405060b031e7ef90e1e6403040506'),
+    'v_add_f16_word_1_word_0_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004050409031a7ef90a1a64010405040a031c7ef90c1c64020405040b031e7ef90e1e6403040504'),
+    'v_add_f16_word_1_word_1_word_0_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640004050509031a7ef90a1a64010405050a031c7ef90c1c64020405050b031e7ef90e1e6403040505'),
+    'v_add_f16_word_1_word_0_word_1_pad_plain_plain': bytes.fromhex(
+        '0803187ef90818640005050409031a7ef90a1a64010505040a031c7ef90c1c64020505040b031e7ef90e1e6403050504'),
+    'v_add_f16_word_1_word_0_word_0_preserve_plain_plain': bytes.fromhex(
+        '0803187ef90818640014050409031a7ef90a1a64011405040a031c7ef90c1c64021405040b031e7ef90e1e6403140504'),
+    'v_add_f16_word_1_word_0_word_1_preserve_plain_plain': bytes.fromhex(
+        '0803187ef90818640015050409031a7ef90a1a64011505040a031c7ef90c1c64021505040b031e7ef90e1e6403150504'),
+    'v_sub_f16_word_1_word_0_word_1_preserve_plain_plain': bytes.fromhex(
+        '0803187ef90818660015050409031a7ef90a1a66011505040a031c7ef90c1c66021505040b031e7ef90e1e6603150504'),
+    'v_subrev_f16_word_1_word_0_word_1_preserve_plain_plain': bytes.fromhex(
+        '0803187ef90818680015050409031a7ef90a1a68011505040a031c7ef90c1c68021505040b031e7ef90e1e6803150504'),
+    'v_mul_f16_word_1_word_0_word_1_preserve_plain_plain': bytes.fromhex(
+        '0803187ef908186a0015050409031a7ef90a1a6a011505040a031c7ef90c1c6a021505040b031e7ef90e1e6a03150504'),
+    'v_add_f16_word_0_word_1_word_0_preserve_neg_abs': bytes.fromhex(
+        '0803187ef90818640014142509031a7ef90a1a64011414250a031c7ef90c1c64021414250b031e7ef90e1e6403141425'),
+    'v_sub_f16_word_1_word_0_word_1_pad_negabs_plain': bytes.fromhex(
+        '0803187ef90818660005350409031a7ef90a1a66010535040a031c7ef90c1c66020535040b031e7ef90e1e6603053504'),
+    'v_mul_f16_word_0_word_0_word_0_pad_abs_neg': bytes.fromhex(
+        '0803187ef908186a0004241409031a7ef90a1a6a010424140a031c7ef90c1c6a020424140b031e7ef90e1e6a03042414'),
+    'v_add_f16_word_1_word_0_word_1_preserve_plain_plain_edge': bytes.fromhex(
+        '0803187ef90818640015050409031a7ef90a1a64011505040a031c7ef90c1c64021505040b031e7ef90e1e6403150504'),
+    'v_sub_f16_word_1_word_0_word_1_preserve_plain_plain_edge': bytes.fromhex(
+        '0803187ef90818660015050409031a7ef90a1a66011505040a031c7ef90c1c66021505040b031e7ef90e1e6603150504'),
+    'v_subrev_f16_word_1_word_0_word_1_preserve_plain_plain_edge': bytes.fromhex(
+        '0803187ef90818680015050409031a7ef90a1a68011505040a031c7ef90c1c68021505040b031e7ef90e1e6803150504'),
+    'v_mul_f16_word_1_word_0_word_1_preserve_plain_plain_edge': bytes.fromhex(
+        '0803187ef908186a0015050409031a7ef90a1a6a011505040a031c7ef90c1c6a021505040b031e7ef90e1e6a03150504'),
+}
+
+
+def sdwa_ps_words(cfg):
+    return PRE_WORDS + SDWA_BODY_WORDS[sdwa_name(cfg)] + POST_WORDS
+
+
+def sdwa_controls(check):
+    check('sdwa model: 1 + 2 = 3', half_special('v_add_f16', F['1'], F['2']) == F['3'])
+    check('sdwa model: -0 + -0 is -0, -0 + +0 is +0, x - x is +0',
+          (half_special('v_add_f16', 0x8000, 0x8000), half_special('v_add_f16', 0x8000, 0),
+           half_special('v_sub_f16', F['1'], F['1'])) == (0x8000, 0, 0))
+    check('sdwa model: inf - inf, 0 * inf and NaN input give the NaN class',
+          (half_special('v_sub_f16', 0x7c00, 0x7c00), half_special('v_mul_f16', 0, 0x7c00),
+           half_special('v_add_f16', 0x7c01, F['1'])) == (NAN_HALF,) * 3)
+    check('sdwa model: 65504 + 65504 overflows to inf; the smallest denormal survives an add of zero',
+          (half_special('v_add_f16', 0x7bff, 0x7bff), half_special('v_add_f16', 0x0001, 0)) == (0x7c00, 0x0001))
+    check('sdwa model: ties to even (1 + 2^-11 stays, 1.0009765625 + 2^-11 rounds up)',
+          (half_special('v_add_f16', 0x3c00, 0x1000), half_special('v_add_f16', 0x3c01, 0x1000)) == (0x3c00, 0x3c02))
+    check('sdwa model: the smallest denormals add and a mixed product underflows to a signed zero',
+          (half_special('v_add_f16', 0x0001, 0x0001), half_special('v_mul_f16', 0x0001, 0x8001)) == (0x0002, 0x8000))
+    for cfg, lanes in SDWA_DRAW.items():
+        name = sdwa_name(cfg)
+        check('sdwa %s: four or sixteen lanes in groups of four' % name, len(lanes) % 4 == 0 and len(lanes) >= 4)
+        refs = [sdwa_reference(cfg, x) for x in lanes]
+        check('sdwa %s: every tagged word is a normal finite binary32' % name,
+              all(0 < ((r ^ SDWA_TAG) >> 23) & 0xff < 0xff for r in refs))
+        # A wrong lowering must change at least one lane of this configuration (the value-is-wrong control).
+        for label, flags in (('the other half of the sources', {'selection_swap': True}),
+                             ('the other destination half', {'half_swap': True}),
+                             ('preserve and pad exchanged', {'keep_swap': True})):
+            detected = any(sdwa_reference(cfg, x, **flags) != r for x, r in zip(lanes, refs))
+            check('sdwa %s: control "%s" detects a wrong lowering' % (name, label), detected)
+    check('sdwa draw: every configuration has an assembled body',
+          all(sdwa_name(cfg) in SDWA_BODY_WORDS for cfg in SDWA_DRAW) or not SDWA_BODY_WORDS)
+
+
 def reference(op, x, lane=0):
     if op in PK_KEYS:
         return pk_reference(op, x, lane)
@@ -368,6 +595,17 @@ def controls():
                 continue
             check('%s: translates to four lane results' % op,
                   all(('v%d = ' % r) in text for r in range(12, 16)))
+    sdwa_controls(check)
+    for cfg in SDWA_DRAW:
+        try:
+            text = sdwa_draw_text(cfg)
+        except G.Unsupported as e:
+            check('sdwa %s: translates (%s)' % (sdwa_name(cfg), e), False)
+            continue
+        check('sdwa %s: the four exports carry the float-target tag' % sdwa_name(cfg),
+              text.count('^ 0x%xu' % SDWA_TAG) == 4)
+        check('sdwa %s: translates to four lane results' % sdwa_name(cfg),
+              all(('v%d = ' % r) in text for r in range(12, 16)))
     if failures:
         raise SystemExit('FAILED: ' + ', '.join(failures))
 
@@ -381,6 +619,14 @@ def check_binary(llvm_mc):
         for i in range(0, 8, 4):
             if assemble(llvm_mc, vs_source(DRAW[op][i:i + 4])) != vs_words(DRAW[op][i:i + 4]):
                 raise AssertionError('vertex fixture for %s differs from llvm-mc' % op)
+    for cfg in SDWA_DRAW:
+        built = assemble(llvm_mc, sdwa_body_source(cfg))
+        if built != SDWA_BODY_WORDS[sdwa_name(cfg)]:
+            raise AssertionError('%s: assembled %s, recorded %s' % (sdwa_name(cfg), built.hex(),
+                                                                     SDWA_BODY_WORDS[sdwa_name(cfg)].hex()))
+        for i in range(0, len(SDWA_DRAW[cfg]), 4):
+            if assemble(llvm_mc, vs_source(SDWA_DRAW[cfg][i:i + 4])) != vs_words(SDWA_DRAW[cfg][i:i + 4]):
+                raise AssertionError('vertex fixture for %s differs from llvm-mc' % sdwa_name(cfg))
     print('fixture words match llvm-mc')
 
 
@@ -410,6 +656,33 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                               flush=True)
                         continue
                     print('%s %s set %d: %s' % (kind, op, index // 4, expected), flush=True)
+            for cfg, lanes in SDWA_DRAW.items():
+                name = sdwa_name(cfg)
+                ps = compile_hlsl(compiler, kind, sdwa_draw_text(cfg), 'ps_sdwa_%s_%s' % (name, kind), ps_profile,
+                                  directory)
+                for index in range(0, len(lanes), 4):
+                    chunk = lanes[index:index + 4]
+                    vs = compile_hlsl(compiler, kind,
+                                      G.Pipeline(vs_words(chunk), sdwa_ps_words(cfg), root_blob()).hlsl_vs(),
+                                      'vs_sdwa_%s_%d_%s' % (name, index, kind), vs_profile, directory)
+                    expected = words_text(sdwa_reference(cfg, x) ^ SDWA_TAG for x in chunk)
+                    run = draw(renderer, adapter, vs, ps, expected)
+                    if run.returncode:
+                        failures.append('%s sdwa %s set %d' % (kind, name, index // 4))
+                        print('%s sdwa %s set %d MISMATCH inputs %s\n%s' % (kind, name, index // 4, chunk,
+                                                                          run.stderr.strip()), flush=True)
+                        continue
+                    print('%s sdwa %s set %d: %s' % (kind, name, index // 4, expected), flush=True)
+            # Wrong-value control: a drawn word that differs by one bit must be reported as a mismatch.
+            cfg = SDWA_CONFIGS[0]
+            chunk = SDWA_DRAW[cfg][:4]
+            ps = compile_hlsl(compiler, kind, sdwa_draw_text(cfg), 'ps_sdwa_control_%s' % kind, ps_profile, directory)
+            vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), sdwa_ps_words(cfg), root_blob()).hlsl_vs(),
+                              'vs_sdwa_control_%s' % kind, vs_profile, directory)
+            wrong = [sdwa_reference(cfg, x) ^ SDWA_TAG for x in chunk]
+            wrong[0] ^= 0x10000
+            if not draw(renderer, adapter, vs, ps, words_text(wrong)).returncode:
+                failures.append('%s sdwa wrong-value control was accepted' % kind)
     if failures:
         raise AssertionError('draw mismatches: ' + ', '.join(failures))
 

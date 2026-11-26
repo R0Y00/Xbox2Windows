@@ -110,6 +110,7 @@ jobs:
               (["tests/startup_compute_image_store_d16_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_readfirstlane_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_heap_record_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_heap_word_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_gather_l_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_buffer_atomics_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_store_d16_x_check.py", "binary", "llvm-mc-15"], {}),
@@ -306,6 +307,7 @@ jobs:
             tests/startup_gfx2hlsl_readfirstlane_recompute_check.py \
             tests/startup_compute_readfirstlane_check.py \
             tests/startup_gfx2hlsl_heap_record_check.py \
+            tests/startup_gfx2hlsl_heap_word_check.py \
             tests/startup_gfx2hlsl_calculated_target_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \

@@ -2062,9 +2062,18 @@ These are measured on one executable; treat them as hypotheses for others.
   and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
   already lowers the same forms. The VOP2 select `v_cndmask_b32_sdwa` lowers the same way, with VCC as
-  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Float SDWA forms and a
+  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Most float SDWA forms and a
   `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
+  The one float exception is the binary16 arithmetic set `v_add_f16`, `v_sub_f16`, `v_subrev_f16` and
+  `v_mul_f16` (`_sdwa`). `src0_sel`/`src1_sel` accept `WORD_0`, `WORD_1` or `DWORD` (`DWORD` reads the
+  low half, as the 16-bit operation does); sources are single VGPRs, with `abs` and `neg`. The result
+  is rounded once to binary16 and written to `dst_sel:WORD_0` or `WORD_1`, with `UNUSED_PAD` zeroing the
+  other half (the default) and `UNUSED_PRESERVE` keeping the old one. Refused: `dst_sel:DWORD` and byte
+  selects, `sext()`, `clamp`, output modifiers, `UNUSED_SEXT`, and non-VGPR sources. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_f16_alu"`: the check covers the accepted and
+  refused forms, and the draws on WARP and hardware read back every selector and unused mode against a
+  CPU binary16 reference.
   The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
   too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
   the compare reads the extended value as its type. f32 SDWA compares stay refused (#1920). The

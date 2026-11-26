@@ -4224,7 +4224,64 @@ class Stage:
     # v_mov_b32 is the same path with the selected source as its result, v_cndmask_b32 selects with VCC,
     # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
     # dst_unused UNUSED_SEXT has no lowering.
+    def sdwa_half(self, base, ops, mods):
+        """SDWA binary16 add, sub, subrev and mul: a selected half of each source, one rounding, one half written back.
+
+        Sources: src0_sel/src1_sel WORD_0 or WORD_1 pick the half; DWORD reads the low half, as the 16-bit
+        operation does. Destination: dst_sel WORD_0 or WORD_1 with dst_unused UNUSED_PAD (other half zero) or
+        UNUSED_PRESERVE (other half of the old register kept). dst_sel DWORD stays refused: the upper half of a
+        16-bit result is not claimed (an open question, see the low-16-only contract), and a byte selection, sext(),
+        clamp and the output modifiers have no lowering here. Sources are VGPRs with the abs/neg modifiers.
+        """
+        _arity, _kind, text, _result = VEC_H[base]
+        fields = {}
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key in ('src0_sel', 'src1_sel', 'dst_sel', 'dst_unused') and value and key not in fields:
+                fields[key] = value
+            else:
+                raise Unsupported('%s SDWA with modifier %s' % (base, m))
+        if len(ops) != 3:
+            raise Unsupported('%s SDWA with %d operands, expected 3' % (base, len(ops)))
+        args = []
+        for index in range(2):
+            selection = fields.get('src%d_sel' % index)
+            if selection not in ('DWORD', 'WORD_0', 'WORD_1'):
+                raise Unsupported('%s SDWA src%d_sel %s' % (base, index, selection))
+            neg, token = self.split_neg(ops[1 + index])
+            absolute = False
+            while True:
+                if token.startswith('|') and token.endswith('|') and len(token) > 2:
+                    token = token[1:-1]
+                elif token.startswith('abs(') and token.endswith(')'):
+                    token = token[len('abs('):-1]
+                else:
+                    break
+                absolute = True
+            reg = reg_range(token)
+            if not reg or reg[0] != 'v' or reg[1] != reg[2]:
+                raise Unsupported('%s SDWA source %s: expected a single VGPR' % (base, ops[1 + index]))
+            word = self.u(token, low16_only=selection != 'WORD_1')
+            half = '(%s >> 16u)' % word if selection == 'WORD_1' else '(%s & 0xffffu)' % word
+            value = 'f16tof32(%s)' % half
+            if absolute:
+                value = 'abs(%s)' % value
+            args.append('(-%s)' % value if neg else value)
+        select = fields.get('dst_sel')
+        unused = fields.get('dst_unused', 'UNUSED_PAD')
+        if select not in ('WORD_0', 'WORD_1'):
+            raise Unsupported('%s SDWA dst_sel %s' % (base, select))
+        if unused not in ('UNUSED_PAD', 'UNUSED_PRESERVE'):
+            raise Unsupported('%s SDWA dst_unused %s' % (base, unused))
+        destination = reg_range(ops[0])[1]
+        result = '(f16rn(%s))' % text.format(*args)
+        # Keeping the old high half of a register whose high half is undefined leaves it undefined.
+        keep_low16 = select == 'WORD_0' and unused == 'UNUSED_PRESERVE' and destination in self.low16_only_v
+        self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
+
     def sdwa(self, base, ops, mods):
+        if base in ('v_add_f16', 'v_sub_f16', 'v_subrev_f16', 'v_mul_f16'):
+            return self.sdwa_half(base, ops, mods)
         if base in ('v_cvt_off_f32_i4', *VOP3_ONLY_VEC_U):
             raise Unsupported('SDWA form of %s' % base)
         fields = {}
@@ -4646,15 +4703,8 @@ class Stage:
             self.scc_effect = 'a lane-mask complement'
             if self.tracks_uniformity():
                 self.scc_uniform = False
-        if (base == 's_lshl_b32' and hasattr(self, 'heap_index') and re.fullmatch(r'0x[0-9a-f]+|[0-9]+', srcs[1])
-                and int(srcs[1], 0) == 5):
-            # index << 5 is the byte offset of a 32-byte resource-heap record. The index is named only when it is a
-            # root constant word (the dispatch knows it) or a word an s_buffer_load wrote (refused by name).
-            r = reg_range(srcs[0])
-            if syms[0] and syms[0][0] == 'ud' and self.pipe.uds[syms[0][1]][0] == 'rootconst':
-                self.heap_index[d] = self.pipe.uds[syms[0][1]]
-            elif r and r[0] == 's' and {**self.heap_index, **self.heap_index_was}.get(r[1]) == ('bufword',):
-                self.heap_index[d] = ('buffer',)
+        if hasattr(self, 'heap_index'):
+            self.mark_heap_index(base, d, srcs, syms)
         if is_mask:
             self.masks.add(d)
         if pair and base != 's_mov_b64':
@@ -4662,6 +4712,38 @@ class Stage:
         elif pair:
             self.set_s(d + 1, self.S(high) if high is not None else '0u', uniform=high_uniform)
         return None
+
+    def heap_word_offset(self, tok, sym):
+        """(param, word, scale, add) when tok, whose symbol before this instruction is sym, holds root constant word
+        (param, word) times scale plus add, modulo 2^32 (see mark_heap_index); else None."""
+        if sym and sym[0] == 'ud' and self.pipe.uds[sym[1]][0] == 'rootconst':
+            return self.pipe.uds[sym[1]][1:] + (1, 0)
+        r = reg_range(tok)
+        mark = {**self.heap_index, **self.heap_index_was}.get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
+        return mark[1:] if mark and mark[0] == 'rc' else None
+
+    def mark_heap_index(self, base, d, srcs, syms):
+        """Marks of SGPR d for heap_record. index << 5 is the byte offset of a 32-byte resource-heap record; the index
+        is named when it is a root constant word (the dispatch knows it) or a word an s_buffer_load wrote (see
+        op_s_buffer_load_dword). A root constant word times a literal plus a literal ('rc') is the byte offset such a
+        load may read the index word at: the same for every thread of the dispatch."""
+        lit = [int(t, 0) & 0xffffffff if re.fullmatch(r'0x[0-9a-f]+|[0-9]+', t) else None for t in srcs]
+        r = reg_range(srcs[0])
+        if base == 's_lshl_b32' and lit[1:] == [5]:
+            word = {**self.heap_index, **self.heap_index_was}.get(r[1]) if r and r[0] == 's' else None
+            if syms[0] and syms[0][0] == 'ud' and self.pipe.uds[syms[0][1]][0] == 'rootconst':
+                self.heap_index[d] = self.pipe.uds[syms[0][1]]
+            elif word and word[0] == 'bufword':
+                self.heap_index[d] = ('buffer',) + word[1:]
+        elif base in ('s_add_u32', 's_add_i32', 's_mul_i32') and len(srcs) == 2:
+            for i in (0, 1):
+                k = lit[1 - i]
+                offset = self.heap_word_offset(srcs[i], syms[i]) if k is not None else None
+                if offset:
+                    p, w, scale, add = offset
+                    self.heap_index[d] = (('rc', p, w, scale * k & 0xffffffff, add * k & 0xffffffff) if base == 's_mul_i32'
+                                          else ('rc', p, w, scale, add + k & 0xffffffff))
+                    break
 
     def set_exec_scc(self, expr):
         self.exec_known = False
@@ -4757,6 +4839,11 @@ class Stage:
             self.set_s(d, '0x%08xu' % value, ('const', value))
         else:
             self.set_s(d, result)
+        offset = self.heap_word_offset(ops[0], sym) if hasattr(self, 'heap_index') else None
+        if offset:
+            p, w, scale, plus = offset
+            self.heap_index[d] = ('rc', p, w, scale, plus + imm & 0xffffffff) if add else (
+                'rc', p, w, scale * imm & 0xffffffff, plus * imm & 0xffffffff)
         self.masks.discard(d)
         return None
 
@@ -5020,16 +5107,19 @@ class Stage:
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
     def heap_record(self, dst, base, token, imm, count):
-        """s_load_dwordx4 D, <resource heap pointer>, R in a compute program, where R is a root constant word
-        shifted left by 5 with no later write of R and no branch target in between: D is the buffer descriptor in
-        the 32-byte heap record that the root constant indexes. The manifest names the root constant; the dispatch
-        reads the record. Only this exact form is modelled."""
+        """s_load_dwordx4 D, <resource heap pointer>, R in a compute program, where R is an index shifted left by 5
+        with no later write of R and no branch target in between: D is the buffer descriptor in the 32-byte heap
+        record that the index names. The index is a root constant word, or a word an s_buffer_load read from an
+        unmodified table buffer at a literal byte offset or at a root constant word times a literal plus a literal
+        (the marks, see mark_heap_index, end at a branch target). The manifest names the root constant or where the
+        word is; the dispatch reads the word and the record. Only these exact forms are modelled."""
         what = 's_load of a resource heap record'
         r = reg_range(token)
         index = getattr(self, 'heap_index', {}).get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
         if index == ('buffer',):
-            raise Unsupported('%s whose index is read from a buffer' % what)
-        if not index or index[0] != 'rootconst':
+            raise Unsupported('%s whose index is read from a buffer other than a table buffer at a dispatch-constant '
+                              'offset' % what)
+        if not index or index[0] not in ('rootconst', 'buffer'):
             raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
         if count != 4:
             raise Unsupported('%s of %d dwords' % (what, count))
@@ -5037,8 +5127,9 @@ class Stage:
             raise Unsupported('%s with offset:%#x' % (what, imm))
         if self.sym.get(base[2]) != ('const', 0):
             raise Unsupported('%s through a pointer whose high word is not a constant zero' % what)
+        source = ('resheap',) + index[1:] if index[0] == 'rootconst' else ('resheap', 'word') + index[1:]
         for i in range(count):
-            self.sym[dst[1] + i] = ('desc', ('resheap',) + index[1:], 0, i)
+            self.sym[dst[1] + i] = ('desc', source, 0, i)
 
     def op_s_bfm_b32(self, ops, mods):
         """Fold constant bitfield masks: titles build inline sampler words with them."""
@@ -5262,6 +5353,19 @@ class Stage:
             if sreg and offset == ('s%d' % sreg[1]) and dst[1] <= sreg[1] < dst[2]:
                 self.emit('a = %s;' % offset)
                 offset = 'a'
+        # A word read from an unmodified table buffer at a literal offset or at a root constant word times a literal
+        # plus a literal is the same for the whole dispatch: heap_record names it by (table parameter, table byte,
+        # root constant parameter and word or None, scale, byte offset). Any other buffer word is only marked.
+        where = ()
+        if hasattr(self, 'heap_index'):
+            key, r, sreg = self.descriptor(ops[1]), reg_range(ops[1]), reg_range(token)
+            first = self.sym.get(r[1])
+            at = (None, None, 0, val) if is_lit else self.heap_word_offset(
+                token, self.sym.get(sreg[1]) if sreg and sreg[0] == 's' else None)
+            if (at and at[2] % 4 == 0 and (at[3] + extra) % 4 == 0  # a dword-aligned word for any root constant
+                    and first[0] == 'desc' and key[0][0] == 'table' and key not in getattr(self.pipe, 'modified', ())  # probes build a bare pipe
+                    and all(self.sym.get(r[1] + n) == first[:3] + (first[3] + n,) + first[4:] for n in range(4))):
+                where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,)
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
@@ -5269,7 +5373,7 @@ class Stage:
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
             if hasattr(self, 'heap_index'):
-                self.heap_index[dst[1] + i] = ('bufword',)
+                self.heap_index[dst[1] + i] = ('bufword',) + (where[:5] + ((where[5] + 4 * i) & 0xffffffff,) if where else ())
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -9294,6 +9398,11 @@ class ComputePipeline(Pipeline):
                 where = 'root %d' % source[1]
             elif source[0] == 'resheap' and len(source) == 3 and r['kind'] == 'buf':
                 where = 'heap rootconst %d %d' % source[1:]  # the 32-byte heap record that root constant word indexes
+            elif source[0] == 'resheap' and source[1] == 'word' and r['kind'] == 'buf':
+                # The record the word at byte `at` (+ root constant word * `times`) of table buffer <param> <byte> indexes.
+                table, byte, param, word, scale, at = source[2:]
+                where = 'heap word table %d %d at %d' % (table, byte, at) + (
+                    '' if param is None else ' rootconst %d %d times %d' % (param, word, scale))
             else:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))

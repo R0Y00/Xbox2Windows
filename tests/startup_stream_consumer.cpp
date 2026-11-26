@@ -163,7 +163,7 @@ static void* desktop_pipeline(void* device)
 //   code-zero, data-zero, no-root, code-unreadable, code-past-end, data-unreadable, state-unreadable,
 //   stateb-unreadable, desc-unreadable
 //   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-heap,
-//   dispatch-heap-outside: one creation, then dispatch_slot67 below
+//   dispatch-heap-outside, dispatch-heap-word*: one creation, then dispatch_slot67 below
 //   texture-store, texture-store-none, texture-store-denied, texture-store-occupied, texture-store-copied: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
@@ -196,6 +196,10 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // 32-byte heap record that holds the input descriptor (heap byte 64). Heap bytes 0 and 32 hold the output's
 // descriptor, so an index that is ignored or scaled by 16 names a buffer the dispatch refuses as an input.
 // dispatch-heap-outside sets the constant to 0x07ffffff, whose record is past any heap.
+// dispatch-heap-word runs the program of startup_gfx2hlsl_heap_word_check.py: the constant is 1 and picks the word
+// of the upload buffer at table byte 96 that holds the index, 2. dispatch-heap-word-outside makes that word
+// 0x07ffffff, dispatch-heap-word-past ends the buffer at that word, and dispatch-heap-word-placed names the placed
+// input buffer instead of upload memory.
 // Controls on the recorded state: dispatch-missing-word leaves out the slot 37 call; dispatch-root-changed sets
 // another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
 // dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
@@ -243,7 +247,8 @@ static int dispatch_slot67(void* device, const std::string& mode)
     if (heap_record)
         for (const UINT at : {0u, 32u, 64u})
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64], sizeof(descriptors[0]));
-    const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : 2u};
+    const bool heap_word = mode.rfind("dispatch-heap-word", 0) == 0;
+    const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : heap_word ? 1u : 2u};
     const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&] {
         invoke(list, 32, 1, word(&heap));
@@ -281,6 +286,20 @@ static int dispatch_slot67(void* device, const std::string& mode)
         bind();
     }
     if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
+    if (heap_word) {
+        // The index buffer of table byte 96, in this recording's upload memory (list slot 148). Byte 288 + 336 * 1
+        // holds the index, 2; every other word names record 0 or 1, the output's descriptor.
+        constexpr UINT bytes = 0x400, at = 0x270;
+        auto* const index = static_cast<UINT*>(reinterpret_cast<void*>(invoke(list, 148, bytes, 256)));
+        if (!index) return 81;
+        std::memset(index, 0, bytes);
+        index[0x120 / 4] = index[0x150 / 4] = 1;
+        index[at / 4] = mode == "dispatch-heap-word-outside" ? 0x07ffffffu : 2u;
+        const UINT64 address = reinterpret_cast<UINT64>(mode == "dispatch-heap-word-placed" ? buffers[0] : index);
+        const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32),
+                              mode == "dispatch-heap-word-past" ? at : mode == "dispatch-heap-word-placed" ? words * 4 : bytes, 0};
+        std::memcpy(reinterpret_cast<void*>(cpu + 96), view, sizeof(view));
+    }
     invoke(list, 35, 1, gpu);
     if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
