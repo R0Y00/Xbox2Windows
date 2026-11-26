@@ -27,6 +27,10 @@
 //     tracked heap slot holds one ref per slot; the same view written again adds nothing, and overwrite, descriptor
 //     copy and heap destruction release exactly what was added. Read through the retire probe (case runs with the
 //     switch on; the retire class still excludes non-SRV view textures, so the budget column cannot show these refs).
+//  10 struct-return ABI: descriptor heap slot 9 (GetCPUDescriptorHandleForHeapStart) returns its 8-byte handle in rax
+//     with only `this` in rcx. A live wrapper left in the second register must not select the (return buffer,
+//     object) form, which wrote the handle over the heap object; the hidden-pointer form still fills its buffer.
+//     Release builds of case 9 left a resource wrapper there and crashed at the heap's next Release.
 //   9 slot 19-21 fallback (Slice 3a): the same view call in a tracked slot leaves a class texture in the retire class
 //     (a refused view adds no ref, so the released texture retires), while a descriptor in a heap the shim does not
 //     track keeps the retire_leave_class fallback and the texture is not freed. Runs in both modes; without the switch
@@ -1172,6 +1176,43 @@ bool case9_view_slot_fallback(Context& c, bool on, void* tracked_memory, void* u
                     "the untracked-descriptor fallback did not keep the texture retained");
 }
 
+// 10: descriptor heap slot 9 returns an 8-byte structure. The title calls it with `this` in rcx and reads rax, so
+// the second register holds whatever the caller left there; an optimized caller computing the next call's arguments
+// can leave another live object there. That must not select the (return buffer, object) form, which wrote the
+// handle over the heap object's vtable and returned the heap's address. The hidden-pointer form, a stack buffer
+// first and the object second, still fills the buffer and returns it.
+bool case10_heap_start_abi(Context& c)
+{
+    ComPtr<IUnknown> heap = c.make_descriptor_heap("abi heap", D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1);
+    ComPtr<IUnknown> other = c.make_descriptor_heap("abi second heap", D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1);
+    const UINT64 want = invoke<UINT64>(heap.Get(), 9, static_cast<void*>(nullptr));
+    const UINT64 got = invoke<UINT64>(heap.Get(), 9, static_cast<void*>(other.Get()));
+    if (!want || got != want) {
+        std::printf("FAIL: heap start with a live object in the second argument: got %#llx, expected %#llx (heap %p)\n",
+                    static_cast<unsigned long long>(got), static_cast<unsigned long long>(want),
+                    static_cast<void*>(heap.Get()));
+        heap.Detach();  // its vtable slot may now hold a descriptor handle; never call through it again
+        return false;
+    }
+    using HiddenForm = D3D12_CPU_DESCRIPTOR_HANDLE*(WINAPI*)(D3D12_CPU_DESCRIPTOR_HANDLE*, IUnknown*);
+    const auto hidden = reinterpret_cast<HiddenForm>((*reinterpret_cast<void***>(heap.Get()))[9]);
+    D3D12_CPU_DESCRIPTOR_HANDLE buffer{};
+    const D3D12_CPU_DESCRIPTOR_HANDLE* returned = hidden(&buffer, heap.Get());
+    if (returned != &buffer || buffer.ptr != want) {
+        std::printf("FAIL: heap start through a return buffer: returned %p (buffer %p) holding %#llx, expected %#llx\n",
+                    static_cast<const void*>(returned), static_cast<void*>(&buffer),
+                    static_cast<unsigned long long>(buffer.ptr), static_cast<unsigned long long>(want));
+        return false;
+    }
+    const UINT64 again = invoke<UINT64>(heap.Get(), 9, static_cast<void*>(nullptr));
+    if (again != want) {
+        std::printf("FAIL: heap start changed after the calls above: got %#llx, expected %#llx\n",
+                    static_cast<unsigned long long>(again), static_cast<unsigned long long>(want));
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1228,6 +1269,8 @@ int main(int argc, char** argv)
 
     Context c{guest.Get(), device.Get(), debug.Get()};
     try {
+        if (!case10_heap_start_abi(c)) return 5;
+        std::puts("10 heap start ABI: a live object in the second register keeps the rax form; a return buffer is filled");
         c.desc = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
                   D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
         c.texture_bytes = device->GetResourceAllocationInfo(0, 1, &c.desc).SizeInBytes;

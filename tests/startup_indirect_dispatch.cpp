@@ -5,7 +5,7 @@
 #include <wrl/client.h>
 
 #include "adapter_name_filter.h"
-#include "desktop_gpu.h"
+#include "startup_indirect_writer.h"
 
 #include <algorithm>
 #include <array>
@@ -116,22 +116,6 @@ Method slot(IUnknown* object, unsigned index)
     return reinterpret_cast<Method>((*reinterpret_cast<void***>(object))[index]);
 }
 
-template <typename T>
-ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* object)
-{
-    // SetPrivateDataInterface unwraps a guest argument before the call reaches the shared desktop device.
-    constexpr GUID key{0x10a62244, 0x1615, 0x4953, {0xa2, 0x52, 0xbe, 0x42, 0x35, 0x27, 0xa0, 0x61}};
-    check(guest->SetPrivateDataInterface(key, object), "publish underlying object");
-    ComPtr<IUnknown> stored;
-    UINT bytes = sizeof(IUnknown*);
-    const HRESULT read = device->GetPrivateData(key, &bytes, stored.GetAddressOf());
-    check(guest->SetPrivateDataInterface(key, nullptr), "clear underlying object");
-    check(read, "retrieve underlying object");
-    ComPtr<T> result;
-    check(stored.As(&result), "query underlying object");
-    return result;
-}
-
 ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
 {
     const auto code = compile(constants ? "consume_constant_args" : "consume_args");
@@ -187,7 +171,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
     check(slot<Place>(guest, 133)(guest, static_cast<char*>(memory_backing.get()) + 4, &argument_desc,
                                   D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
                                   reinterpret_cast<void**>(guest_arguments.GetAddressOf())), "place guest argument buffer");
-    const auto arguments = native_object<ID3D12Resource>(device, guest, guest_arguments.Get());
+    const auto arguments = indirect_native_object<ID3D12Resource>(device, guest, guest_arguments.Get());
     auto result = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     void* memory = nullptr;
@@ -205,7 +189,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
                                      reinterpret_cast<void**>(guest_list.GetAddressOf())), "create guest command list");
     using Reset = HRESULT (WINAPI*)(IUnknown*, IUnknown*, void*, void*);
     check(slot<Reset>(guest_list.Get(), 139)(guest_list.Get(), allocator.Get(), nullptr, nullptr), "reset guest command list");
-    const auto native_list = native_object<ID3D12GraphicsCommandList>(device, guest, guest_list.Get());
+    const auto native_list = indirect_native_object<ID3D12GraphicsCommandList>(device, guest, guest_list.Get());
     auto* list = native_list.Get();
     transition(list, arguments.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(arguments.Get(), 0, upload.Get(), 0, argument_bytes);
@@ -216,9 +200,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
     if (writer) {
         transition(list, arguments.Get(), argument_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         argument_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        list->SetPipelineState(writer);
-        list->SetComputeRootUnorderedAccessView(0, arguments->GetGPUVirtualAddress());
-        list->Dispatch(1, 1, 1);
+        record_indirect_writer(list, writer, arguments.Get());
     }
     transition(list, arguments.Get(), argument_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), 0, arguments.Get(), 0, argument_bytes);
@@ -271,7 +253,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
         ComPtr<IUnknown> guest_queue;
         check(guest->CreateCommandQueue(&queue_desc, __uuidof(ID3D12CommandQueue),
                                         reinterpret_cast<void**>(guest_queue.GetAddressOf())), "create guest queue");
-        const auto queue = native_object<ID3D12CommandQueue>(device, guest, guest_queue.Get());
+        const auto queue = indirect_native_object<ID3D12CommandQueue>(device, guest, guest_queue.Get());
         ComPtr<ID3D12Fence> gate;
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "create gate fence");
         check(queue->Wait(gate.Get(), 1), "hold the guest queue on the gate");
