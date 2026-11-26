@@ -7,8 +7,9 @@
 // (package helpers). Dynamic QueryApiImpl is wrapped only when the provider module's basename is
 // xgameruntime.dll. The pre-link load notification only requests another scan. A worker scans
 // and rewrites linked modules outside the notification, keeping each module live while it is patched.
-// Enabled proxies remain loaded until process exit. Unbound delay-import IAT slots are left alone;
-// once a delay QueryApiImpl slot holds the real export, a later scan rewrites it to the proxy.
+// Enabled proxies remain loaded until process exit. Unbound delay-import IAT slots are left alone.
+// A later scan stores the proxy in a delay QueryApiImpl slot only when that slot still holds the
+// real export at the compare-exchange, and counts only that store.
 // GetProcAddress("QueryApiImpl") is always logged (the generic GPA log stays capped). The wrapper
 // hands out proxy objects whose methods log their first calls ("x2w-runtime") and forward to the
 // real object.
@@ -540,8 +541,9 @@ void log_query_status_once() noexcept
 }
 
 // Rewrite one module's regular GetProcAddress / xgameruntime.dll!QueryApiImpl IAT slots.
-// Unbound delay-import slots stay untouched. A delay QueryApiImpl slot that already holds the real
-// export is rewritten to the proxy. Caller must hold the module live (pin) for the rewrite.
+// Unbound delay-import slots stay untouched. A delay QueryApiImpl slot is rewritten only when the
+// compare-exchange still sees the real export; a thunk restored after the eligibility read is left
+// in place and is not counted. Caller must hold the module live (pin) for the rewrite.
 int patch_module(HMODULE module)
 {
     if (!module || !module_is_exe_or_package_helper(module)) return 0;
@@ -561,16 +563,22 @@ int patch_module(HMODULE module)
         if (hit.delay_import) {
             // Delay GetProcAddress stays unhooked (CRT delay helper uses its own lookup).
             if (hit.kind != x2w_runtime_patch::Kind::query_api_impl) return;
-            remember_real_query_from_export();
-            const QueryApi real = load_real_query();
-            if (!x2w_runtime_patch::delay_query_slot_is_bound(*slot, reinterpret_cast<ULONGLONG>(real), proxy))
-                return;
+            // The export is remembered once. Later quiet scans already have it.
+            if (!load_real_query()) remember_real_query_from_export();
+            const ULONGLONG real_bits = reinterpret_cast<ULONGLONG>(load_real_query());
+            // Skip the protection change when the slot is not the export. The store below still
+            // requires that same value: VirtualProtect can overlap a delay-loader restore.
+            if (!x2w_runtime_patch::delay_query_slot_is_bound(*slot, real_bits, proxy)) return;
             DWORD old = 0;
             if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return;
-            if (*slot != proxy) {
-                *slot = proxy;
+            if (x2w_runtime_patch::replace_bound_delay_query(
+                    reinterpret_cast<std::uint64_t*>(slot), real_bits, proxy,
+                    [](std::uint64_t* destination, std::uint64_t desired, std::uint64_t expected) noexcept {
+                        return static_cast<std::uint64_t>(InterlockedCompareExchange64(
+                            reinterpret_cast<volatile LONG64*>(destination), static_cast<LONG64>(desired),
+                            static_cast<LONG64>(expected)));
+                    }))
                 ++patched;
-            }
             VirtualProtect(slot, 8, old, &old);
             return;
         }
@@ -675,8 +683,8 @@ void patch_package_modules(bool announce)
             slots += n;
         }
     }
-    // Announce every load-driven scan; quiet periodic passes only speak when they rewrote a slot
-    // (bound delay QueryApiImpl after first use).
+    // Announce every load-driven scan. Quiet periodic passes speak only when a compare-exchange
+    // stored the proxy (bound delay QueryApiImpl after first use). A restored thunk adds nothing.
     if (announce) {
         if (slots > 0 || considered > 0)
             x2w_local::logf("x2w-runtime proxy: %d import(s) in %u of %u package module(s) (%u loaded scanned)", slots,

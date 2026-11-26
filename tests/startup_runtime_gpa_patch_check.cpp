@@ -2,8 +2,9 @@
 //
 // Which PE imports the stand-in notices on the EXE / package-helper import tables: GetProcAddress and
 // a direct xgameruntime.dll!QueryApiImpl on the regular import table, delay-import hits with
-// delay_import set, and ordinal thunks ignored. Bound delay QueryApiImpl slots (slot == real export)
-// are safe to rewrite; unbound thunks are not. A synthetic PE32+ image is walked; the mutated
+// delay_import set, and ordinal thunks ignored. A bound delay QueryApiImpl slot is replaced only when
+// the compare-exchange still sees the real export, and only that store is counted. A slot changed
+// back to its thunk before the exchange stays untouched. A synthetic PE32+ image is walked; the mutated
 // control classifies by import name alone (accepting QueryApiImpl from other.dll) and must fail.
 // No Windows loader and no game files.
 #include "startup_stubs/runtime_gpa_patch.h"
@@ -144,6 +145,54 @@ int main(int argc, char** argv)
     check("unbound thunk refused", !patch::delay_query_slot_is_bound(0x1400, real_export, proxy));
     check("already proxied refused", !patch::delay_query_slot_is_bound(proxy, real_export, proxy));
     check("empty real refused", !patch::delay_query_slot_is_bound(real_export, 0, proxy));
+
+    // Compare-exchange: write `desired` only when the slot still equals `expected`.
+    const auto cas = [](std::uint64_t* destination, std::uint64_t desired, std::uint64_t expected) noexcept {
+        const std::uint64_t previous = *destination;
+        if (previous == expected) *destination = desired;
+        return previous;
+    };
+    int replaced = 0;
+    std::uint64_t stays = real_export;
+    if (patch::replace_bound_delay_query(&stays, real_export, proxy, cas)) ++replaced;
+    check("slot still holding the real export is replaced", stays == proxy);
+    check("successful replacement counted", replaced == 1);
+
+    constexpr std::uint64_t thunk = 0x1400;
+    std::uint64_t restored = real_export;
+    // The delay loader puts the thunk back after the eligibility read and before the store.
+    const auto restore_thunk = [thunk](std::uint64_t* destination, std::uint64_t desired, std::uint64_t expected) noexcept {
+        *destination = thunk;
+        const std::uint64_t previous = *destination;
+        if (previous == expected) *destination = desired;
+        return previous;
+    };
+    int restored_replacements = 0;
+    if (patch::replace_bound_delay_query(&restored, real_export, proxy, restore_thunk)) ++restored_replacements;
+    check("slot restored to the thunk stays the thunk", restored == thunk);
+    check("restored thunk not counted", restored_replacements == 0);
+
+    int later = 0;
+    std::uint64_t again = real_export;
+    if (patch::replace_bound_delay_query(&again, real_export, proxy, cas)) ++later;
+    check("later real export is replaced", again == proxy);
+    check("later real export counted", later == 1);
+
+    std::uint64_t unbound_slot = thunk;
+    bool exchanged = false;
+    const auto note_exchange = [&](std::uint64_t*, std::uint64_t, std::uint64_t) noexcept {
+        exchanged = true;
+        return 0ull;
+    };
+    check("unbound thunk is left alone",
+          !patch::replace_bound_delay_query(&unbound_slot, real_export, proxy, note_exchange) && !exchanged &&
+              unbound_slot == thunk);
+    int already_replacements = 0;
+    std::uint64_t already = proxy;
+    if (patch::replace_bound_delay_query(&already, real_export, proxy, cas)) ++already_replacements;
+    check("proxy already installed stays", already == proxy);
+    check("proxy already installed is not counted", already_replacements == 0);
+    check("null slot refused", !patch::replace_bound_delay_query(nullptr, real_export, proxy, cas));
 
     auto image = build_image();
     int gpa = 0, query = 0, delay_hits = 0, regular_hits = 0;

@@ -6,8 +6,10 @@
 // This header lists the import shapes to notice — regular and delay-import tables. The stand-in
 // rewrites regular GetProcAddress / QueryApiImpl IAT slots on the EXE and package-directory helpers.
 // A delay IAT holds a delay-load thunk until first use; rewriting that thunk as if it were the
-// export is wrong. After the delay helper binds, the same slot holds the real export address and
-// may be rewritten to the proxy (see delay_query_slot_is_bound). Ordinal imports are ignored.
+// export is wrong. After the delay helper binds, the same slot holds the real export address.
+// replace_bound_delay_query stores the proxy only when a compare-exchange still sees that export,
+// so a thunk restored after the eligibility read stays in place and is not counted. Ordinal
+// imports are ignored.
 // Pure walk helpers — no Windows calls — so a source-built control can check them.
 #pragma once
 
@@ -58,6 +60,19 @@ inline bool delay_query_slot_is_bound(std::uint64_t slot_value, std::uint64_t re
                                       std::uint64_t proxy) noexcept
 {
     return real_query != 0 && slot_value != 0 && slot_value != proxy && slot_value == real_query;
+}
+
+// Store `proxy` only when `exchange` still observes `real_query`. `exchange(slot, desired, expected)`
+// returns the previous value and writes `desired` only when the slot equals `expected`
+// (InterlockedCompareExchange). An earlier read can see the export and the delay loader can then
+// put the thunk back; that exchange leaves the thunk and this function returns false, so the caller
+// does not count it. Returns true only when the proxy was stored.
+template <class Exchange>
+inline bool replace_bound_delay_query(std::uint64_t* slot, std::uint64_t real_query, std::uint64_t proxy,
+                                      Exchange exchange) noexcept
+{
+    if (!slot || !delay_query_slot_is_bound(*slot, real_query, proxy)) return false;
+    return exchange(slot, proxy, real_query) == real_query;
 }
 
 // Decide whether one named import of `dll_name` should be noticed. Ordinal imports are ignored.
@@ -184,7 +199,7 @@ int visit_imports_with(const unsigned char* base, std::size_t image_size, Classi
     }
 
     // DataDirectory[13] = delay imports (reported with delay_import=true; rewrite only when
-    // delay_query_slot_is_bound says the slot already holds the real export).
+    // replace_bound_delay_query still sees the real export at the store).
     const auto& delay_dir = dirs[13];
     if (delay_dir.virtual_address && delay_dir.size) {
         for (std::uint32_t at = delay_dir.virtual_address;; at += sizeof(DelayDesc)) {
