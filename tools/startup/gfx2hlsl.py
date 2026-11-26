@@ -3605,7 +3605,8 @@ class Stage:
         """A compare or carry-out into SGPR sN (the decoder prints a wave64 pair as s[N:N+1] by its low word only). In
         wave64 the destination is an even-aligned pair and s(N+1) holds the other 32 lanes, which no one-lane value
         has: tag s(N+1) as the high word. An odd sN is a wave32 destination (no high word); an even one that is a wave32
-        destination loses the numeric reads of s(N+1), a refusal and never a wrong value."""
+        destination loses the numeric reads of s(N+1), a refusal and never a wrong value. If s(N+1) already holds its own lane
+        mask (a wave32 compare or carry in the neighbouring register) the destination is not a pair: nothing is tagged."""
         if base.startswith('v_cmp') and not base.startswith('v_cmpx'):
             tok = ops[0] if ops else ''
         elif VOP3B_SDST.match(base) and len(ops) > 1:
@@ -3613,7 +3614,7 @@ class Stage:
         else:
             return
         r = reg_range(tok.strip())
-        if r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks and r[1] % 2 == 0:
+        if r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks and r[1] % 2 == 0 and r[1] + 1 not in self.masks:
             self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
 
     def lane_mask_exact(self):
@@ -3645,7 +3646,8 @@ class Stage:
         if base.startswith('s_') and not MASK_AWARE_SALU_RE.match(base):
             masks = [t for t in (ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:]) if self.is_lane_mask(t.strip())]
         if base.startswith(('v_', 's_')) and not masks:   # the high word of a wave64 mask has no one-lane value
-            high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:])
+            skip = 2 if VOP3B_SDST.match(base) else 1   # the carry-out of a VOP3b form is a destination, not a read
+            high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[skip:])
             masks = [high] if high else []
         tags = self.mask_source_tags(base, ops)
         result = self._lower(base, asm, ops, mods)
