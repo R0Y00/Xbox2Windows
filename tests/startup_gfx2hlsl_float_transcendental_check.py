@@ -9,8 +9,11 @@ Covers v_rcp_f32, v_rcp_iflag_f32, v_sqrt_f32, v_rsq_f32, v_exp_f32 and v_log_f3
 lower to 1.0 / x, sqrt, rsqrt, exp2 and log2. The fixture and runner are startup_gfx2hlsl_lane_alu.py: one operation
 per lane, alternating the e32 and e64 spellings, on flat parameters the compilers cannot fold. The references follow
 the AMD RDNA 2 ISA reference (v_exp_f32 and v_log_f32 are base 2). Every input is a power of two, or 0 and 9 for the
-square root, so every result is exact and the comparison does not depend on how many ulps an adapter's
-approximation may be off: it checks which function each operation is lowered to, not its precision.
+square root, so every result is exactly representable: the check tests which function each operation is lowered to,
+not its precision. Adapters need not return those results exactly. An NVIDIA GeForce RTX 4090 reads log2(0.125) as
+c03fffff, 1 ulp above -3.0 (#2797), so v_log_f32 accepts 4 ulps: the Direct3D 11.3 functional specification bounds
+log to 2^-21 relative error, or 2^-21 absolute for inputs in [0.5, 2], and both are at least 4 ulps of a binary32
+result in this fixture. The other operations stay exact. The mutation (the logarithm plus one) is off by far more.
 """
 import math
 import struct
@@ -78,6 +81,7 @@ FAMILY = {
     'accepted': ['v_rcp_f32 v1, v2', 'v_sqrt_f32_e64 v1, |v2|', 'v_rsq_f32_e64 v1, v2 clamp', 'v_exp_f32 v1, 1.0',
                  'v_log_f32_e64 v1, -v2 mul:2'],
     'refused': ['v_rcp_f32_e64 v1, v2 neg_lo:[1]', 'v_log_f32_e64 v1, v2 neg_hi:[1]'],
+    'ulps': {'v_log_f32': 4},
 }
 
 if __name__ == '__main__':

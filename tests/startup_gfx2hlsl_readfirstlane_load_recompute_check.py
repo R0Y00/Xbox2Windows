@@ -95,6 +95,11 @@ s.pipe.packed_position_vgpr = None
 check('temporary declared', '    uint ulc_7 = 0;' in s.declarations(), repr(s.declarations()))
 
 REFUSED = [
+    ('loop carries a narrowed EXEC into the load', JOIN + (SCALAR, LOAD, READ, 's_add_u32 s3, s3, 4',
+     'v_cmp_lt_f32_e32 vcc_lo, v0, v1', 's_and_b32 exec_lo, exec_lo, vcc_lo', 's_cmp_lt_u32 s3, 64',
+     's_cbranch_scc1 label_000c', 's_endpgm')),
+    ('EXEC write outside the textual back edge', JOIN + (SCALAR, LOAD, READ, 's_branch label_0020',
+     's_cbranch_scc1 label_000c', 's_endpgm', NARROW, 's_branch label_0018')),
     # Two definitions reach the read at a join.
     ('join of a load and another definition', ('s_cbranch_scc0 label_0014', SCALAR, LOAD, 's_branch label_0014',
                                                'v_mov_b32_e32 v7, 0', READ, 's_endpgm')),
@@ -125,6 +130,9 @@ REFUSED = [
 for label, instructions in REFUSED:
     got = run(*instructions)
     check(f'{label} refused', got == REFUSAL, repr(got))
+got = run(*JOIN, SCALAR, LOAD, READ, 's_add_u32 s3, s3, 4', 's_cmp_lt_u32 s3, 64',
+          's_cbranch_scc1 label_000c', NARROW, 's_endpgm')
+check('loop with unchanged EXEC accepts the load', isinstance(got, list) and 's9 = ulc_7;' in got, repr(got))
 got = run(*JOIN, SCALAR, LOAD, READ, kind='ps')
 check('graphics stage refused', got == REFUSAL, repr(got))
 

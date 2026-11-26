@@ -132,8 +132,9 @@ inline const char* parse_when(const char* p, double cursor, Entry& entry, bool* 
     const bool relative = p[1] == '+';
     p += relative ? 2 : 1;
     entry.at = std::strtod(p, &stop);
-    if (stop == p || !std::isfinite(entry.at) || (relative && !(entry.at >= 0))) return "bad time";
+    if (stop == p || (relative && !(entry.at >= 0))) return "bad time";
     if (relative) entry.at += cursor;
+    if (!std::isfinite(entry.at)) return "bad time";  // after the sum, so a relative time cannot overflow to infinity
     p = stop;
     entry.duration = default_duration;
     if (had_duration) *had_duration = *p == '+';
