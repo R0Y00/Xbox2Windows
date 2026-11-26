@@ -4362,11 +4362,12 @@ std::vector<std::pair<void*, ExistingHeap>> existing_heaps;
 
 // Lifetime boundary: one cross-adapter page alias per (heap, page) at a title address, kept for as long as
 // this module is loaded, because the GPU may still read a page the title keeps live for the device's
-// lifetime. The cache is a function-local static in indirect_address_alias() below, so it is destroyed
-// during this module's CRT teardown -- see startup_stubs/d3d12_teardown.h for the two detaches. On
-// process exit the display driver may already be stopped, so the placed buffers are detached and nothing
-// reaches it; FreeLibrary leaves the process and the driver alive and the pages release their objects
-// normally. The heap and page words are plain addresses, not owned.
+// lifetime. It is the function-local static of placed_page_aliases() below, so it is destroyed during
+// this module's CRT teardown -- see startup_stubs/d3d12_teardown.h for the two detaches. On process exit
+// the display driver may already be stopped, so the placed buffers are detached and nothing reaches it;
+// FreeLibrary leaves the process and the driver alive and the pages release their objects normally. The
+// heap and page words are plain addresses, not owned. Each owned buffer is accounted for on the path it
+// took and, with X2W_TEARDOWN_REPORT, reported as one x2w-teardown pages line.
 struct PlacedPageAliases {
     struct Page {
         ID3D12Heap* heap;
@@ -4376,13 +4377,52 @@ struct PlacedPageAliases {
     using iterator = std::array<Page, 64>::iterator;
     iterator begin() { return entries.begin(); }
     iterator end() { return entries.end(); }
+
+    // Test hook (startup_teardown_unload, #2572; the review of the ownership change asked for one):
+    // enters one alias for a heap and page the caller owns, where the translated indirect address route
+    // would keep it after its first call. False when that pair is already there or the cache is full. No
+    // real path calls it, and the entry keeps the heap as a key only, as the route does.
+    bool insert_for_test(ID3D12Heap* heap, u64 page, ID3D12Resource* resource)
+    {
+        if (!heap || !resource) return false;
+        for (const Page& entry : entries)
+            if (entry.heap == heap && entry.page == page) return false;
+        for (Page& entry : entries) {
+            if (entry.heap) continue;
+            entry.resource = resource;  // AddRef: the cache owns this reference
+            entry.page = page;
+            entry.heap = heap;
+            return true;
+        }
+        return false;
+    }
+
     ~PlacedPageAliases()
     {
-        if (!x2w_startup::d3d12_process_terminating) return;
-        for (auto& entry : entries) entry.resource.Detach();
+        const bool detach = x2w_startup::d3d12_process_terminating && !x2w_startup::teardown_guard_disabled("pages");
+        unsigned detached = 0, released = 0;
+        for (auto& entry : entries) {
+            if (!entry.resource) continue;
+            if (detach) {
+                entry.resource.Detach();
+                ++detached;
+            } else {
+                ++released;
+            }
+        }
+        x2w_startup::teardown_report("pages", detached, released);
     }
     std::array<Page, 64> entries{};
 };
+
+// The cache lives in its own accessor so the fixture probe can reach it, the way
+// indexed_validation_pipeline(device) exposes the validation pipeline. One function-local static, built
+// on the first translated indirect address.
+PlacedPageAliases& placed_page_aliases()
+{
+    static PlacedPageAliases pages{};
+    return pages;
+}
 
 IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 bytes)
 {
@@ -4408,7 +4448,7 @@ IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 by
     if (known == existing_heaps.end()) return {};
     auto* heap = known->second.real;
     using Page = PlacedPageAliases::Page;
-    static PlacedPageAliases pages{};
+    auto& pages = placed_page_aliases();
     auto it = std::find_if(pages.begin(), pages.end(), [&](const Page& entry) { return entry.heap == heap && entry.page == page; });
     if (it != pages.end()) return {it->resource.Get(), offset};
     it = std::find_if(pages.begin(), pages.end(), [](const Page& entry) { return !entry.heap; });
@@ -5365,16 +5405,19 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
     return TRUE;
 }
 
-// Fixture probe (startup_teardown_unload, #2572) for the two caches that keep desktop objects for a
-// device: the indexed-validation pipeline (d3d12_draw.inl, bit 0) and the rectangle-list argument
-// converter (rect_indirect_args.h, bit 1). Warms the selected caches the way their first real call
-// would -- the validation pipeline directly, the converter through one record-only conversion, nothing
-// executed -- and answers how many objects they now hold for `device`: the validation entry's device,
-// root signature and pipeline (3), plus the converter entry's root signature and pipeline (2). The
-// caller can warm one cache at a time to see each one release what it owns when the module is unloaded.
+// Fixture probe (startup_teardown_unload, #2572) for the four caches that keep desktop objects for a
+// device, one bit each: the indexed-validation pipeline (d3d12_draw.inl, bit 1) and the rectangle-list
+// argument converter (rect_indirect_args.h, bit 2), the placed page aliases of the translated indirect
+// address route (bit 4) and the draw-dump readbacks (bit 8). Warms the selected caches the way their
+// first real call would -- the validation pipeline directly, the converter through one record-only
+// conversion, an alias entry on a placed buffer of this device, a recorded readback -- and answers how
+// many objects they now hold for `device`: the validation entry's device, root signature and pipeline
+// (3), the converter entry's root signature and pipeline (2), the alias entry's placed buffer (1), the
+// readback entry's buffer and fence (2). The caller can warm one cache at a time to see each one release
+// what it owns when the module is unloaded.
 extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches)
 {
-    if (!device || !caches || (caches & ~3u)) return 0;
+    if (!device || !caches || (caches & ~15u)) return 0;
     UINT owned = 0;
     if (caches & 1u) {
         const auto& validation = indexed_validation_pipeline(device);
@@ -5382,29 +5425,139 @@ extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Devic
         if (validation.root) ++owned;
         if (validation.pipeline) ++owned;
     }
-    if (!(caches & 2u)) return owned;
+    if (caches & 2u) {
+        x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
+        x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                            IID_PPV_ARGS(&list))))
+            return owned;
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 256;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // convert() copies its 16 source words; an uninitialised buffer in the state it requires is enough.
+        x2w_startup::ComPtr<ID3D12Resource> source;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                   nullptr, IID_PPV_ARGS(&source))))
+            return owned;
+        const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
+        if (scratch && x2w_startup::rect_indirect_arguments().convert(list.Get(), source.Get(), 0, scratch.Get()))
+            owned += 2;  // the converter's root signature and pipeline for this device
+    }
+    if (!(caches & 12u)) return owned;
 
-    x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
-    x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                        IID_PPV_ARGS(&list))))
-        return owned;
-    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC buffer{};
-    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = 256;
-    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
-    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    // convert() copies its 16 source words; an uninitialised buffer in the state it requires is enough.
-    x2w_startup::ComPtr<ID3D12Resource> source;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                               nullptr, IID_PPV_ARGS(&source))))
-        return owned;
-    const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
-    if (scratch && x2w_startup::rect_indirect_arguments().convert(list.Get(), source.Get(), 0, scratch.Get()))
-        owned += 2;  // the converter's root signature and pipeline for this device
+    // The two caches below hold desktop objects, as their real entries do: draw_dump_after() creates the
+    // readback buffer on the desktop device, and execute() creates the fence on the desktop device it
+    // reads from the desktop queue. Two shapes of device reach this probe. A title gets a wrapper from
+    // D3D12XboxCreateDevice (attach_device wraps the created device), and the desktop device is then the
+    // one behind it. A fixture creates its device without a parameter block, so that entry returns a
+    // plain D3D12CreateDevice() result: an unwrapped desktop device. The handle itself is the desktop
+    // device then. removal_device is not a fallback: attach_device is where it is written, so on the
+    // unwrapped path it is null or names another device.
+    Wrapper* wrapper = as_wrapper(device);
+    ID3D12Device* desktop = wrapper ? device_of(wrapper) : device;
+
+    // Diagnostics for the fixture, off unless X2W_CACHE_PROBE_DEBUG is set: one line per step, so a probe
+    // that answers fewer objects than expected names the call that refused. Temporary, together with the
+    // two caches they measure.
+    char probe_debug[2]{};
+    const bool trace = GetEnvironmentVariableA("X2W_CACHE_PROBE_DEBUG", probe_debug, sizeof(probe_debug)) != 0;
+    if (trace)
+        std::fprintf(stderr, "x2w-cache-probe device=%p wrapper=%p desktop=%p caches=0x%x\n",
+                     static_cast<void*>(device), static_cast<void*>(wrapper), static_cast<void*>(desktop), caches);
+
+    if (caches & 4u) {
+        // One placed buffer on a heap of this device, entered where the translated indirect address route
+        // keeps its aliases. The page word is only the cache key: no title address is involved here, and
+        // the entry never dereferences the heap. The route's buffers carry ALLOW_CROSS_ADAPTER; sharing
+        // them across adapters needs a heap opened for it and plays no part in the lifetime measured
+        // here, so this buffer is an ordinary placed buffer.
+        D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_HEAP_DESC heap_desc{};
+        heap_desc.SizeInBytes = 65536;
+        heap_desc.Properties = properties;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        x2w_startup::ComPtr<ID3D12Heap> heap;
+        const HRESULT heap_hr = desktop->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe heap hr=0x%08lx\n", static_cast<unsigned long>(heap_hr));
+        if (FAILED(heap_hr)) return owned;
+        const D3D12_RESOURCE_DESC placed{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                                         {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        x2w_startup::ComPtr<ID3D12Resource> alias;
+        const HRESULT placed_hr = desktop->CreatePlacedResource(heap.Get(), 0, &placed, D3D12_RESOURCE_STATE_COMMON,
+                                                               nullptr, IID_PPV_ARGS(&alias));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe placed hr=0x%08lx\n", static_cast<unsigned long>(placed_hr));
+        if (FAILED(placed_hr)) return owned;
+        {
+            std::lock_guard lock(placed_mutex);
+            auto& pages = placed_page_aliases();
+            const bool entered = pages.insert_for_test(heap.Get(), 0x10000, alias.Get());
+            unsigned used = 0;
+            for (const auto& entry : pages)
+                if (entry.heap) ++used;
+            if (trace) std::fprintf(stderr, "x2w-cache-probe insert=%d used=%u/64\n", entered ? 1 : 0, used);
+            if (entered) {
+                // The route's heap belongs to the device's allocation, not to an alias entry: the shim
+                // keeps it for the device's lifetime. Leaving this reference is what keeps the placed
+                // buffer's memory valid past the probe and past this module (a heap must outlive the
+                // resources placed in it), and matches what the real entry's heap does.
+                heap.Detach();
+                ++owned;
+            }
+        }
+    }
+    if (caches & 8u) {
+        // One recorded draw readback: the READBACK buffer draw_dump_after() keeps and the queue fence
+        // execute() attaches once the copy is submitted. execute() builds both on the desktop device it
+        // reads from the desktop queue, so both are desktop objects here too.
+        D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 256;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        x2w_startup::ComPtr<ID3D12Resource> staging;
+        x2w_startup::ComPtr<ID3D12Fence> fence;
+        const HRESULT staging_hr = desktop->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                    IID_PPV_ARGS(&staging));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe readback hr=0x%08lx\n", static_cast<unsigned long>(staging_hr));
+        if (FAILED(staging_hr)) return owned;
+        const HRESULT fence_hr = desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe fence hr=0x%08lx\n", static_cast<unsigned long>(fence_hr));
+        if (FAILED(fence_hr)) return owned;
+        const bool recorded = draw_dumps().record_for_test(std::move(staging), std::move(fence));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe record=%d\n", recorded ? 1 : 0);
+        if (recorded) owned += 2;
+    }
     return owned;
+}
+
+// Fixture probe (startup_teardown_unload, #2572) for the ownership of the two caches above: hands the
+// caller one reference to an object a warmed entry owns, so the fixture can watch that reference go away
+// when the module is unloaded. `cache` and `slot`: 4/0 the placed buffer, 8/0 the readback buffer, 8/1 its
+// fence; null for anything else. The caller's reference keeps the object alive after the module is gone,
+// which is what makes its count readable then.
+extern "C" __declspec(dllexport) IUnknown* x2w_d3d12_cached_object_probe(UINT cache, UINT slot)
+{
+    IUnknown* object = nullptr;
+    if (cache == 4u) {
+        std::lock_guard lock(placed_mutex);
+        auto& pages = placed_page_aliases();
+        for (auto& entry : pages) {
+            if (!entry.resource) continue;
+            object = entry.resource.Get();
+            break;
+        }
+    } else if (cache == 8u) {
+        object = draw_dumps().owned_for_test(slot);
+    }
+    if (!object) return nullptr;
+    object->AddRef();
+    return object;
 }
 
 // Fixture probes (startup_resource_retire_title) for state the retire bookkeeping maintains for one resource. They read
