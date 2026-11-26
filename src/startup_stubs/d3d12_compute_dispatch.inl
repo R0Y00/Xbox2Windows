@@ -29,6 +29,7 @@ struct ComputeTranslation {
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
+    UINT heap_srvs = 0;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
@@ -133,6 +134,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
         }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
+        else if (std::sscanf(line.c_str(), "resheap %u %u%n", &x, &y, &used) == 2 && whole()) {
+            if (tr.heap_srvs || !x || x > x2w_startup::max_translated_resheap || y != x2w_startup::translated_resheap_space)
+                return "a resource heap range outside the supported layout";
+            tr.heap_srvs = x;
+        }
         // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
         // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
         else if (line.rfind("smpc", 0) == 0) return "a comparison sampler";
@@ -158,7 +164,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.heap_srvs)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -188,7 +194,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
-    } views[40]{};
+    };
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     const auto type = list->GetType();
     AcquireSRWLockExclusive(&draw_lock);
@@ -218,6 +224,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    std::vector<View> views(reason ? 0 : count + tr->heap_srvs);
+    if (!reason && dispatch.signature && tr->heap_srvs)
+        reason = "translated indirect Dispatch requires fixed-table raw buffers";
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
@@ -251,7 +260,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
         // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+        const u64 entry = slot.heap ? ((slot.word_param >= 0 || slot.a >= 0) && index < pass.title_view_heap_entries
+                                         ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
             : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
@@ -357,6 +367,25 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         views[i] = {placed.alias, offset, bytes, true};
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
+    for (UINT r = 0; r < tr->heap_srvs && !reason; ++r) {
+        std::memset(words, 0, sizeof(words));
+        const u64 entry = r < pass.title_view_heap_entries ? pass.title_view_heap.record(u64{r} << 5, 16) : 0;
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 16)) {
+            reason = "a heap record is outside the list's view heap";
+            break;
+        }
+        std::memcpy(words, reinterpret_cast<const void*>(entry), 16);
+        const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20);
+        if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+            reason = "an input buffer range is not 16-byte aligned in its resource";
+        if (reason && !tr->first_refusal)
+            log("x2w-draw compute %016llx first refused heap record %u, descriptor at 0x%llx", key, r, entry);
+        for (std::size_t output = inputs; output < count && !reason; ++output)
+            if (views[output].resource == view.resource) reason = "an output buffer is also an input";
+        views[count + r] = {view.resource, view.offset, view.bytes, !view.upload};
+        views[count + r].stride = view.stride;
+        std::memcpy(views[count + r].words, words, sizeof(views[count + r].words));
+    }
     if (dispatch.argument)
         for (std::size_t i = 0; i < count && !reason; ++i)
             if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
@@ -402,14 +431,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
         return reason;
     }
-    const UINT n = static_cast<UINT>(count);
+    const UINT n = static_cast<UINT>(count + tr->heap_srvs);
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
     if (first + n > draw_heap_size) {
         first = 0;
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
-    for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
+    for (std::size_t i = 0; i < n; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
@@ -419,7 +448,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
             continue;
         }
-        if (i < inputs) {
+        if (i < inputs || i >= count) {
             if (view.transition) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
