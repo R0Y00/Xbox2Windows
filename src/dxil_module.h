@@ -194,7 +194,9 @@ class DxilModule {
         Text res = "null";
         if (!resources.empty())
             res = node(list(groups[0]) + ", " + list(groups[1]) + ", " + list(groups[2]) + ", " + list(groups[3]));
-        const auto version = node("i32 1, i32 6"), model = node("!\"" + stage + "\", i32 6, i32 6");
+        // AMD's DXIL compiler (amdxc64.dll) dereferences Module::getNamedMetadata("llvm.ident") without a null check.
+        const auto ident = node("!\"x2w\""), version = node("i32 1, i32 6"),
+                   model = node("!\"" + stage + "\", i32 6, i32 6");
         const unsigned flags = features | (uses_wave ? 524288 : 0);
         Text properties = "null", signature = "null", view_state;
         if (stage == "cs") {
@@ -261,8 +263,8 @@ class DxilModule {
                    "readnone\n"
                    "declare %dx.types.Handle "
                    "@dx.op.annotateHandle(i32,%dx.types.Handle,%dx.types.ResourceProperties) nounwind readnone\n";
-        out << "!dx.version = !{" << version << "}\n!dx.valver = !{" << version << "}\n!dx.shaderModel = !{" << model
-            << "}\n";
+        out << "!llvm.ident = !{" << ident << "}\n!dx.version = !{" << version << "}\n!dx.valver = !{" << version
+            << "}\n!dx.shaderModel = !{" << model << "}\n";
         if (res != "null")
             out << "!dx.resources = !{" << res << "}\n";
         out << "!dx.entryPoints = !{" << entry << "}\n";

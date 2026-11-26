@@ -75,20 +75,22 @@ std::string x2w::direct_gfx1013_constant_pixel(std::string_view code) {
     out << R"(  ret void
 }
 declare void @dx.op.storeOutput.f32(i32,i32,i32,i8,float) nounwind
-!dx.version = !{!0}
-!dx.valver = !{!0}
-!dx.shaderModel = !{!1}
-!dx.viewIdState = !{!2}
-!dx.entryPoints = !{!3}
-!0 = !{i32 1, i32 0}
-!1 = !{!"ps", i32 6, i32 0}
-!2 = !{[2 x i32] [i32 0, i32 4]}
-!3 = !{void ()* @main, !"main", !4, null, null}
-!4 = !{null, !5, null}
-!5 = !{!6}
-!6 = !{i32 0, !"SV_Target", i8 9, i8 16, !7, i8 0, i32 1, i8 4, i32 0, i8 0, !8}
-!7 = !{i32 0}
-!8 = !{i32 3, i32 15}
+!llvm.ident = !{!0}
+!dx.version = !{!1}
+!dx.valver = !{!1}
+!dx.shaderModel = !{!2}
+!dx.viewIdState = !{!3}
+!dx.entryPoints = !{!4}
+!0 = !{!"x2w"}
+!1 = !{i32 1, i32 0}
+!2 = !{!"ps", i32 6, i32 0}
+!3 = !{[2 x i32] [i32 0, i32 4]}
+!4 = !{void ()* @main, !"main", !5, null, null}
+!5 = !{null, !6, null}
+!6 = !{!7}
+!7 = !{i32 0, !"SV_Target", i8 9, i8 16, !8, i8 0, i32 1, i8 4, i32 0, i8 0, !9}
+!8 = !{i32 0}
+!9 = !{i32 3, i32 15}
 )";
     return out.str();
 }
