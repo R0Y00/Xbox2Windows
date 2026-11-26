@@ -2503,6 +2503,8 @@ struct Pass {
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
+    ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
+    ID3D12Resource* bound_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
@@ -3578,6 +3580,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     }
     if (dsv_target) require_state(self, dsv_target, dsv_state);
     pass.target_count = count;
+    std::copy_n(targets, 8, pass.bound_targets);
+    pass.bound_depth = dsv_target;
     pass.dsv_format = dsv_format;
     const auto single_sample = [](ID3D12Resource* resource) {
         const auto samples = resource->GetDesc().SampleDesc;

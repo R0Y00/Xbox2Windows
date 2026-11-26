@@ -262,7 +262,7 @@ to check RGBA8 texel and alpha values, rebinding, and a mismatched 2D view on ha
 
 ## Offline vertex buffer stores
 
-`tools/startup/gfx2hlsl.py` lowers vertex-stage `buffer_store_dword`, `dwordx2`, `dwordx3` and `dwordx4` in the `off` form to `RWByteAddressBuffer.Store*`. The descriptor must come from a root-table slot, and the manifest becomes version 2 with a `uav <slot> table <param> <byte offset>` line. This is offline only: the shipped runtime refuses version 2 manifests, so no store runs in a game. Refused forms: `glc`, `slc`, `offen`, `idxen`, pixel stage, a descriptor also used for a load, a descriptor whose base was changed, and an immediate or inline offset that is not a multiple of four. A register offset is rounded down to a multiple of four.
+`tools/startup/gfx2hlsl.py` lowers vertex-stage `buffer_store_dword`, `dwordx2`, `dwordx3` and `dwordx4` in the `off` form to `RWByteAddressBuffer.Store*`. The descriptor must come from a root-table slot, and the manifest becomes version 2 with a `uav <slot> table <param> <byte offset>` line. This is offline only: the shipped runtime refuses the `raw` uav line by name (it binds only pixel-stage `tex2d` stores), so no buffer store runs in a game. Refused forms: `glc`, `slc`, `offen`, `idxen`, pixel stage, a descriptor also used for a load, a descriptor whose base was changed, and an immediate or inline offset that is not a multiple of four. A register offset is rounded down to a multiple of four.
 
 The descriptor modifications that compute buffer stores accept are accepted here too, with the same checks: the stride clear of DW1 and the structured-to-raw conversion (stride DW1[29:16] extracted, optionally clamped to at least 1, DW2 NUM_RECORDS scaled by it, DW3 OOB_SELECT set to 3, stride cleared), all four words from one descriptor load. The store and manifest are those of the unmodified descriptor. In the vertex stage, as in compute, a descriptor load through a pointer other than the untouched pair is tagged with the constant high word of a 32-bit table pointer, or otherwise with its own load, so the conversion cannot mix words of two loads. Any other modification stays refused. As for compute, matching out-of-range behavior would need a UAV view sized to the converted byte count; the runtime binds no vertex-stage UAV yet.
 
@@ -14551,6 +14551,23 @@ For binary32 arithmetic and compare sources, the translator reads the inline int
 ## Startup translator: explicit-LOD image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
+
+## Startup translator: binary32 arithmetic
+
+No check ran these binary32 operations of the `VEC_F` table in `tools/startup/gfx2hlsl.py` before: `v_add_f32`, `v_sub_f32`, `v_subrev_f32`, `v_mul_f32`, `v_mul_legacy_f32`, `v_min_f32`, `v_max_f32`, `v_fma_f32`, `v_mad_f32`, `v_mad_legacy_f32`, `v_med3_f32`, `v_min3_f32` and `v_max3_f32`. `tests/startup_gfx2hlsl_float_alu_check.py` draws them with the shared runner `tests/startup_gfx2hlsl_lane_alu.py`. Each draw applies one operation to each of four pixels' flat inputs, alternating the `_e32` and `_e64` spellings of the VOP2 forms, and compares the four result words exactly.
+
+The references follow the AMD RDNA 2 ISA reference: `v_subrev` is S1 - S0, the legacy multiply reads 0 when either factor is 0 even against an infinity or a NaN, and `v_med3_f32` is the middle value. Every input set has an exact result, so the check does not depend on rounding or on whether a compiler fuses a multiply and an add.
+
+Each operation has a wrong lowering whose first draw must read its own mutated words:
+- the add, subtract and multiply exchanged or reversed;
+- the legacy product doubled;
+- min and max exchanged;
+- `a * b - c` for the multiply-adds;
+- `max3` for `med3`.
+
+On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 52 draws matched through FXC `ps_5_1` and DXC `ps_6_0`, and all 26 mutated draws read their mutated words. Tests: `startup_gfx2hlsl_float_alu_controls`, `startup_gfx2hlsl_float_alu_warp` and `startup_gfx2hlsl_float_alu_hardware`.
+
+Not covered: inexact products. The translation writes both `v_fma_f32`, which rounds once, and `v_mad_f32`, which rounds the product and then the sum, as `a * b + c`. With `a = b = 1 + 2^-12` and `c = -(1 + 2^-11)`, a single rounding gives 2^-24 (`0x33800000`) and two roundings give 0. Through both FXC and DXC, both operations read 0 on WARP and `0x33800000` on the RX 6600. The result of either operation on an inexact product therefore depends on the adapter. NaN and signed-zero ordering in min, max and med3, and denormals, are not covered either.
 
 ## Startup translator: biased image sampling
 

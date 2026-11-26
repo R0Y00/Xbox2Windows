@@ -347,6 +347,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0)) {
         extern int draw_d16_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_d16_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
+        extern int draw_pixel_uavs(ID3D12Device*, void*, void*);
+        if (const int result = draw_pixel_uavs(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_VERTEX_FETCH", nullptr, 0)) {
         // TEXCOORD float3 in slot 0 and POSITION float3 in slot 1, 12 bytes each; vertices 0-2 are unused. Vertices
         // 3-8 are drawn from start vertex 3: positions cover pixels [1, 3) x [1, 3) of the 8x4 target, texture
@@ -492,6 +495,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         last = 2;
     }
     if (const int rc = submit(last)) return rc;
+    if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
+        extern int report_pixel_uavs(const char*);
+        if (const int rc = report_pixel_uavs(pixels)) return rc;
+    }
     if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_report();
         if (const int rc = root_heap_report()) return rc;
