@@ -3442,6 +3442,7 @@ class Stage:
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
+            self.wqm_count, self.execcopy_epoch = 0, {}
             # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
             self.uniform_cf = True
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
@@ -3909,13 +3910,25 @@ class Stage:
     def pc_index(self):
         return next((i for i, ins in enumerate(self.ins) if ins[0] == self.pc), None)
 
+    def helper_off_copy(self, tok, sym):
+        """Whether `tok` is a copy of EXEC saved before an `s_wqm_b64 exec, exec`: the guest's entry EXEC leaves the
+        helper lanes off, while every thread here starts with exec = 1, so writing it back would turn the guest's helper
+        lanes off (stale VGPRs) and keep the translation's on."""
+        r = reg_range(tok)
+        return bool(r and r[0] == 's' and sym == ('execcopy',)
+                    and getattr(self, 'execcopy_epoch', {}).get(r[1], 0) < getattr(self, 'wqm_count', 0))
+
     def exec_write_exact(self, srcs, syms):
         """Whether a scalar EXEC write takes every source from a lane mask (vcc, exec, a saved EXEC or a tagged mask) or
         from the all-zero / all-ones constants: then each lane's bit is the guest's. Any other source (a mask built
         from a number such as 1) selects guest lanes the one-lane model cannot tell apart."""
         for tok, sym in zip(srcs, syms):
             r = reg_range(tok)
-            if tok in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or sym == ('execcopy',) or (
+            if self.helper_off_copy(tok, sym):
+                return False
+            # The 64-bit forms only: in wave64 a 32-bit write (s_mov_b32 exec_lo, vcc_lo) keeps the old bits of lanes
+            # 32..63, while the model sets every lane.
+            if tok in ('exec', 'vcc') or sym == ('execcopy',) or (
                     r and r[0] == 's' and r[1] in getattr(self, 'masks', ())):
                 continue
             try:
@@ -4336,6 +4349,7 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
+                self.wqm_count = getattr(self, 'wqm_count', 0) + 1
                 if getattr(self, 'wqm_set_at', False) is None:
                     self.wqm_set_at = getattr(self, 'pc', None)  # where the quad-read flow proof starts
             elif hasattr(self, 'lane_exec_breaks'):
@@ -5197,6 +5211,8 @@ class Stage:
             if var == 'exec':
                 copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
+                    if hasattr(self, 'lane_exec_breaks') and self.helper_off_copy(srcs[0], syms[0]):
+                        self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
                     # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
                     self.wqm_exec = False  # and the copy can be older than the WQM
                     if hasattr(self, 'uniform_v'):
@@ -5262,6 +5278,9 @@ class Stage:
         if base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known:
             self.set_s(d, 'exec')
             self.sym[d] = ('execcopy',)
+            if not hasattr(self, 'execcopy_epoch'):
+                self.execcopy_epoch = {}
+            self.execcopy_epoch[d] = getattr(self, 'wqm_count', 0)   # the s_wqm count when the mask was saved
             self.masks.add(d)
             if pair:
                 self.sym.pop(d + 1, None)
@@ -10198,7 +10217,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-22'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-23'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -10208,7 +10227,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-22cs')
+    key = fnv(b'x2w-startup-shader-23cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key

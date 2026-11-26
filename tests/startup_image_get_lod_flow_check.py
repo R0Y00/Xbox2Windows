@@ -86,12 +86,27 @@ FIXTURES = {
                (Fraction(-3, 8), Fraction(5, 8))),
     'kill': (PROLOGUE + 'v_cmpx_eq_u32_e32 0, v8\ns_cbranch_execnz BB1\ns_endpgm\nBB1:\nv_add_f32_e32 v2, -0.5, v2\n'
              + QUERY + EXPORT, (Fraction(-3, 8), Fraction(5, 8))),
-    # The exact mask saved before s_wqm and restored before the op (the usual compiled pixel shader): a cleared lane
-    # still offers its address; nothing is drawn differently from the plain sample.
-    'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + QUERY + EXPORT,
-                (Fraction(1, 8), Fraction(5, 8))),
+    'inside_y': (PROLOGUE + 'v_lshrrev_b32_e32 v7, 16, v0\nv_cmp_eq_u32_e32 vcc, 0, v7\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n'
+                 'v_add_f32_e32 v2, -0.5, v2\n' + QUERY + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT,
+                 (Fraction(-3, 8), Fraction(5, 8))),
 }
 REFUSED = {
+    # A mask saved before s_wqm exec, exec has the guest's helper lanes off, while every thread here starts
+    # with exec = 1: writing it back is a lane-exec break (review of ef786354).
+    'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + QUERY + EXPORT,
+                   'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # The same restore, then u -= 0.5 on the lanes it leaves on: the guest's helper keeps its stale u, the
+    # translation's helper takes the new one (measured by the reviewer on WARP and an RX 9070 XT).
+    'restore_helper': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n'
+                      'v_add_f32_e32 v2, -0.5, v2\n' + QUERY + EXPORT,
+                   'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A kill export under v_cmpx before the op: the discard is a lane-exec break (it fails without it).
+    'discard_break': (PROLOGUE + 'v_cmpx_eq_u32_e32 0, v8\nexp null off, off, off, off vm\n' + QUERY + EXPORT,
+                   'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A 32-bit EXEC write keeps lanes 32..63 of the old mask in wave64: only the 64-bit forms are exact.
+    'exec_lo_mask': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_mov_b32 exec_lo, vcc_lo\n'
+                         'v_add_f32_e32 v2, -0.5, v2\n' + QUERY + EXPORT,
+                   'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     'vcc_inside': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccz BB1\n' + QUERY + 'BB1:\n' + EXPORT,
                    'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # A scalar write inside the block an EXEC branch can skip happens once for the wave in the guest; a quad that
@@ -102,6 +117,26 @@ REFUSED = {
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
+    'inside_y': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003eff02067e0000803e8002187e80021a7e90000e2c800e847d6a2480be040088bff10404067fc0'
+        '8cbf080380f1020ac4007e00fe88703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'restore_helper': (
+        '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff000008'
+        '0d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7e7e0cfe87f10404067fc08cbf080380f1020a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'discard_break': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003eff02067e0000803e8002187e80021a7e8010a47d901000f8000000007fc08cbf080380f1020a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'exec_lo_mask': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003eff02067e0000803e8002187e80021a7e8010847d6a03febef10404067fc08cbf080380f1020a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
     'join_pixel': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
         'f0121210ff1204060000003eff02067e0000803e8002187e80021a7e8010847d6a2480be010088bff10404067e00fe88'
@@ -197,8 +232,12 @@ def mutants(name, hlsl):
     write = re.search(r'\n\s*if \(exec & 1\) v2 = U\((-0\.5|F\(0x3fc00000u\)) \+ F\(v2\)\);', hlsl)
     if name.startswith('join'):
         return [('without the branch write', hlsl.replace(write.group(0), ''))]
-    if name in ('cmpx', 'inside', 'kill'):
-        return [('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', '')))]
+    if name in ('cmpx', 'inside', 'kill', 'inside_y'):
+        out = [('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', '')))]
+        if name == 'inside_y':
+            # The row that is off in the vote's x direction (y = 1) is only seen through the vertical derivative.
+            out.append(('vote without the vertical derivative', hlsl.replace('abs(ddy_fine(row))', '0.0')))
+        return out
     return []
 
 

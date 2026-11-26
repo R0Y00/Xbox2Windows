@@ -32,6 +32,8 @@ with a point sampler, mip filter point, MAX_LOD 2. u depends on x only, so the L
   inside       the sample inside the s_cbranch_execz block of x == 0, after u -= 0.5 there: the quad enters together,
                the helper column masked with its stale u: LOD 1
   kill         v_cmpx keeps x == 0, s_cbranch_execnz past an s_endpgm, u -= 0.5, sample: the quad goes on, LOD 1
+  inside_y     the same block entered by the row y == 0 only: the rows are told apart by the vertical derivative of the
+               vote, the other row's lanes follow and the quad stays together: LOD 1
   uni_loop     a loop of two passes on a constant SGPR counter (SCC proven uniform): sample, then u -= 0.5 on every
                lane; the second pass reads u = (-0.375, 0.125), LOD 0
 Refused: the sample inside or after a block a VCC branch skips (the guest takes a VCC branch once per wave, with EXEC
@@ -99,15 +101,29 @@ FIXTURES = {
                + SAMPLE + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(-3, 8), Fraction(5, 8)), -1),
     'kill': (PROLOGUE + CMPX + 's_cbranch_execnz BB1\ns_endpgm\nBB1:\n' + SUB + SAMPLE + EXPORT,
              (Fraction(-3, 8), Fraction(5, 8)), -1),
+    'inside_y': (PROLOGUE + 'v_lshrrev_b32_e32 v7, 16, v0\nv_cmp_eq_u32_e32 vcc, 0, v7\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n' + SUB
+                 + SAMPLE + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(-3, 8), Fraction(5, 8)), -1),
     'uni_loop': (PROLOGUE + 's_mov_b32 s30, 2\nBB1:\n' + SAMPLE + SUB + 's_add_i32 s30, s30, -1\ns_cmp_lg_u32 s30, 0\n'
                  's_cbranch_scc1 BB1\n' + EXPORT, (Fraction(-3, 8), Fraction(1, 8)), -1),
-    # The exact mask saved before s_wqm and restored before the op (the usual compiled pixel shader): a cleared lane
-    # still offers its address; nothing is drawn differently from the plain sample.
-    'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + SAMPLE + EXPORT,
-                (Fraction(1, 8), Fraction(5, 8)), -1),
 }
 # name: (source, text of the refusal)
 REFUSED = {
+    # A mask saved before s_wqm exec, exec has the guest's helper lanes off, while every thread here starts
+    # with exec = 1: writing it back is a lane-exec break (review of ef786354).
+    'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + SAMPLE + EXPORT,
+                   'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # The same restore, then u -= 0.5 on the lanes it leaves on: the guest's helper keeps its stale u, the
+    # translation's helper takes the new one (measured by the reviewer on WARP and an RX 9070 XT).
+    'restore_helper': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n'
+                      'v_add_f32_e32 v2, -0.5, v2\n' + SAMPLE + EXPORT,
+                   'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A kill export under v_cmpx before the op: the discard is a lane-exec break (it fails without it).
+    'discard_break': (PROLOGUE + 'v_cmpx_eq_u32_e32 0, v8\nexp null off, off, off, off vm\n' + SAMPLE + EXPORT,
+                   'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A 32-bit EXEC write keeps lanes 32..63 of the old mask in wave64: only the 64-bit forms are exact.
+    'exec_lo_mask': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_mov_b32 exec_lo, vcc_lo\n'
+                         'v_add_f32_e32 v2, -0.5, v2\n' + SAMPLE + EXPORT,
+                   'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # The wave takes a VCC branch once for all lanes and runs the block with EXEC unchanged, while a lane here follows
     # its own bit: it clears uniform_cf, so the sample after it is refused (#2659).
     'vcc_inside': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccz BB1\n' + SAMPLE + 'BB1:\n' + EXPORT,
@@ -133,6 +149,26 @@ REFUSED = {
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
+    'inside_y': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003ef302027eff02067e0000803e0902087e90000e2c800e847d6a2480be040088bff10404067fc0'
+        '8cbf280f94f0010ac4007e00fe88703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'restore_helper': (
+        '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff000008'
+        '0d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087e7e0cfe87f10404067fc08cbf280f94f0010a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'discard_break': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003ef302027eff02067e0000803e0902087e8010a47d901000f8000000007fc08cbf280f94f0010a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'exec_lo_mask': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003ef302027eff02067e0000803e0902087e8010847d6a03febef10404067fc08cbf280f94f0010a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
     'join_pixel': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
         'f0121210ff1204060000003ef302027eff02067e0000803e0902087e8010847d6a2480be010088bff10404067e00fe88'
@@ -292,7 +328,7 @@ def controls():
     for name, (_source, text) in REFUSED.items():
         refused(name, text)
     # The quad votes: the EXEC branches of inside, kill and join_pixel, one vote each; v_cmpx alone needs none.
-    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('restore', 0)):
+    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('inside_y', 1)):
         text = pipeline(name).hlsl_ps()
         assert text.count('x2w_quad_any(exec)') == votes, (name, text)
     # The gate is the vote's: with the EXEC rule of #2659 (the entry mask only) the divergent-EXEC fixtures are refused.
@@ -329,6 +365,9 @@ def mutants(name, hlsl):
         out.append(('without the branch write', hlsl.replace(write.group(0), '')))
     if name in ('cmpx', 'inside', 'kill'):
         out.append(('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', ''))))
+    if name == 'inside_y':
+        # The row that is off in the vote's x direction (y = 1) is only seen through the vertical derivative.
+        out.append(('vote without the vertical derivative', hlsl.replace('abs(ddy_fine(row))', '0.0')))
     out.append(('bias ignored', hlsl.replace(CALL, CALL.replace('F(v1))', '0.0)'))))
     for label, text in out:
         assert text != hlsl, (name, label)
