@@ -392,11 +392,11 @@ def check_draw(dxc, renderer, adapter, fxc=None):
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:
             for op, lanes in DRAW.items():
-                ps = compile_hlsl(compiler, kind, draw_text(op), 'ps_%s_%s' % (op, kind), ps_profile, directory)
+                ps = compile_hlsl(compiler, kind, draw_text(op), 'ps_%s_%s' % (op.replace(':', '_'), kind), ps_profile, directory)
                 for index in range(0, len(lanes), 4):
                     chunk = lanes[index:index + 4]
                     vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), ps_words(op), root_blob()).hlsl_vs(),
-                                      'vs_%s_%d_%s' % (op, index, kind), vs_profile, directory)
+                                      'vs_%s_%d_%s' % (op.replace(':', '_'), index, kind), vs_profile, directory)
                     expected = words_text(draw_word(op, x, index + n) for n, x in enumerate(chunk))
                     run = draw(renderer, adapter, vs, ps, expected)
                     if op == PK_KEYS[0] and index == 0:
