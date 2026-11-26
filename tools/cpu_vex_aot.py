@@ -1,4 +1,4 @@
-"""Recompile Windows x64 leaf functions that use VEX.128 16-bit packed-integer forms.
+"""Recompile Windows x64 leaf functions that use VEX.128 packed-integer word and byte forms.
 
 Profile: RCX and RDX hold the addresses of two 16-byte inputs and R8 the address of a 16-byte
 output; there is no return value. Memory operands are exactly [RCX], [RDX] or [R8] with a 16-byte
@@ -47,6 +47,8 @@ BINARY = {
     M.VPMULLW: "pmullw", M.VPMULHUW: "pmulhuw", M.VPMAXUW: "pmaxuw", M.VPMINUW: "pminuw",
     M.VPCMPEQW: "pcmpeqw", M.VPCMPGTW: "pcmpgtw",
     M.VPSIGNW: "psignw", M.VPMULHRSW: "pmulhrsw", M.VPHADDW: "phaddw",
+    M.VPANDN: "pandn", M.VPAVGB: "pavgb", M.VPMADDUBSW: "pmaddubsw", M.VPSHUFB: "pshufb",
+    M.VPADDB: "paddb", M.VPSUBB: "psubb", M.VPCMPEQB: "pcmpeqb", M.VPCMPGTB: "pcmpgtb",
 }
 SHIFTS = {M.VPSRAW: "psraw", M.VPSLLW: "psllw", M.VPSRLW: "psrlw"}
 MOVES = {M.VMOVDQU, M.VMOVDQA}
@@ -121,7 +123,38 @@ WORDWISE(pcmpgtw, word(a, i) > word(b, i) ? -1 : 0)
 
 V pxor(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] ^ b.b[i]; return r; }
 V pand(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] & b.b[i]; return r; }
+V pandn(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>((~a.b[i]) & b.b[i]); return r; }
 V por(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] | b.b[i]; return r; }
+// Wraparound byte add/subtract and byte-lane equality / signed greater-than compares.
+#define BYTEWISE(name, expr) \
+    V name(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>(expr); return r; }
+BYTEWISE(paddb, a.b[i] + b.b[i])
+BYTEWISE(psubb, a.b[i] - b.b[i])
+BYTEWISE(pcmpeqb, a.b[i] == b.b[i] ? 0xFFu : 0u)
+BYTEWISE(pcmpgtb, static_cast<std::int8_t>(a.b[i]) > static_cast<std::int8_t>(b.b[i]) ? 0xFFu : 0u)
+#undef BYTEWISE
+// Unsigned byte average rounded up: (a + b + 1) >> 1 without 8-bit overflow.
+V pavgb(const V& a, const V& b) {
+    V r;
+    for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>((static_cast<unsigned>(a.b[i]) + b.b[i] + 1u) >> 1);
+    return r;
+}
+// Unsigned byte * signed byte pairwise products added and saturated to signed 16-bit [-32768, 32767].
+V pmaddubsw(const V& a, const V& b) {
+    V r{};
+    for (int i = 0; i < 8; ++i) {
+        const std::int32_t lo = static_cast<std::int32_t>(a.b[2 * i]) * static_cast<std::int8_t>(b.b[2 * i]);
+        const std::int32_t hi = static_cast<std::int32_t>(a.b[2 * i + 1]) * static_cast<std::int8_t>(b.b[2 * i + 1]);
+        set_word(r, i, sat_s16(lo + hi));
+    }
+    return r;
+}
+// Byte shuffle: mask bit 7 zeroes the output byte, otherwise selects a[mask & 0x0f].
+V pshufb(const V& a, const V& b) {
+    V r;
+    for (int i = 0; i < 16; ++i) r.b[i] = (b.b[i] & 0x80u) ? 0u : a.b[b.b[i] & 0x0Fu];
+    return r;
+}
 
 // Interleave bytes or words from the low or high half of each source, first source first.
 V punpcklbw(const V& a, const V& b) { V r; for (int i = 0; i < 8; ++i) { r.b[2*i] = a.b[i]; r.b[2*i+1] = b.b[i]; } return r; }

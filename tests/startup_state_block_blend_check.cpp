@@ -52,6 +52,10 @@ int main()
     expect_target0("straight colour, one alpha", 0xE5010504, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC_ALPHA);
     expect_target0("premultiplied", 0xE5010501, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC_ALPHA);
     expect_target0("additive", 0xE1000104, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_ONE);
+    // Separate alpha with CONSTANT_ALPHA / ONE_MINUS_CONSTANT_ALPHA: the blend factor's alpha, which the
+    // device-independent read (no alpha blend factor feature) expresses as BLEND_FACTOR / INV_BLEND_FACTOR.
+    expect_target0("constant alpha on the alpha channel", x2w_cb_blend::control_word(4, 0, 5, 19, 0, 20, true, true), D3D12_BLEND_SRC_ALPHA,
+                   D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR);
 
     D3D12_BLEND_DESC blend{};
     const char* reason = nullptr;
@@ -142,6 +146,6 @@ int main()
         std::printf("startup_state_block_blend: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_state_block_blend: PASS (4 measured words, enable clear, 5 controls, dual source)\n");
+    std::printf("startup_state_block_blend: PASS (4 measured words, constant alpha, enable clear, 5 controls, dual source)\n");
     return 0;
 }

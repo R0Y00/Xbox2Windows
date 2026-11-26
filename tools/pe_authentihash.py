@@ -107,11 +107,15 @@ def authentihash(data: "bytes | memoryview") -> str:
     return digest.hexdigest()
 
 
-def main() -> None:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("image", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if args.image.is_dir():
+            raise ValueError(f"expected a regular file, got directory: {args.image}")
+        if not args.image.is_file():
+            raise ValueError(f"expected a regular file: {args.image}")
         with args.image.open("rb") as stream:
             try:
                 mapped = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
@@ -124,10 +128,11 @@ def main() -> None:
                 view.release()
                 if mapped:
                     mapped.close()
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, struct.error) as error:
         parser.exit(1, f"{args.image}: {error}\n")
     print(digest)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

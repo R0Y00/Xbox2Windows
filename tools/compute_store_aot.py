@@ -198,13 +198,15 @@ SCC_PRESERVING = ("s_cselect_b32", "s_mov_b32", "s_movk_i32", "s_load", "s_buffe
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
-# Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a 2D,
-# linear (non-swizzled) image of the listed format. The translator checks where the eight words were
+# Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a
+# linear (non-swizzled) image of the declared type and format. The translator checks where the eight words were
 # loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
 # 16-byte descriptor slots are bound to t0 for reads or u0 for writes.
 # Value: (HLSL texel type, channel count).
 IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4)}
 RGBA32_FLOAT = "R32G32B32A32_FLOAT"
+IMAGE_UAV_TYPES = {"1d": "RWTexture1D", "2d": "RWTexture2D", "2d-array": "RWTexture2DArray", "3d": "RWTexture3D"}
+FLOAT_IMAGE_SRV_TYPES = {"1d": "Texture1D<float4>", "2d": "Texture2D<float4>"}
 RGBA16_FLOAT = "R16G16B16A16_FLOAT"
 # image_gather4_l on the gfx1013 RGBA32 FLOAT SRV, with the sampler profile of pixel_aot.check_gather_sampler
 # (normalized coordinates, clamp to the last texel, point mip, no LOD bias). RDNA 2 MIMG gathers return one DMASK
@@ -243,9 +245,33 @@ MUBUF_ATOMIC_METHODS = {
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
     "inc": "CompareExchange", "dec": "CompareExchange", "csub": "CompareExchange",
+    "fmin": "CompareExchange", "fmax": "CompareExchange",
 }
 
 IMAGE_FLOAT_ATOMIC_OPS = ("fcmpswap", "fmin", "fmax")
+
+def float_min_max_cas(cas_prefix, value, op):
+    """Raw-word finite-normal binary32 min/max as an InterlockedCompareExchange loop.
+
+    Shared by the image (texel) and MUBUF (byte-address) atomic profiles; cas_prefix is the
+    call up to the opening parenthesis: the free intrinsic `InterlockedCompareExchange(dest)`
+    for a texel destination and the raw UAV method `outputData.InterlockedCompareExchange(off)`
+    for the byte-address destination. The caller guarantees every stored word and the operand
+    are finite-normal binary32, never NaN, subnormal or signed zero. The sign-dependent key
+    orders those values exactly as unsigned integers, so integer CAS reproduces the fmin/fmax
+    result bit-for-bit. The zero seed is outside the caller's domain and can only fetch the
+    observed word; it never writes.
+    """
+    comparison = "<" if op == "fmin" else ">"
+    return (f"    uint value = {value};",
+            "    uint valueKey = value ^ ((value & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+            "    uint observed = 0u;", "    uint expected;",
+            "    [allow_uav_condition] do {", "        expected = observed;",
+            "        uint oldKey = expected ^ ((expected & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+            f"        uint next = (valueKey {comparison} oldKey) ? value : expected;",
+            f"        {cas_prefix}, expected, next, observed);",
+            "    } while (observed != expected);")
+
 IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec|" + "|".join(IMAGE_FLOAT_ATOMIC_OPS)
 IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int", "R32_FLOAT": "uint"}
 
@@ -567,6 +593,20 @@ def descriptor_store_hlsl():
     )
 
 
+def linear_uav_address(tag, dims, idxen, offen, stride, offset, size):
+    """Address one lane's field within an indexed or shifted dispatch element."""
+    if not isinstance(tag, tuple):
+        return None
+    if idxen and not offen and tag[0] == "thread" and stride is not None and offset + size <= stride:
+        axis = tag[1]
+        return ("index", axis), axis, f"tid.{AXES[axis]} * {stride}u + {offset}u"
+    if offen and not idxen and tag[0] == "thread_bytes":
+        _, axis, shift = tag
+        if 2 <= shift <= 31 and offset + size <= 1 << shift and dims[axis] << shift <= 1 << 32:
+            return ("byte_offset", axis, shift), axis, f"(tid.{AXES[axis]} << {shift}u) + {offset}u"
+    return None
+
+
 def descriptor_load_hlsl():
     """One load function shared by every descriptor-format buffer_load_format opcode.
 
@@ -704,30 +744,51 @@ def heap_view_hlsl(table_offset, view_count, buffer_bytes):
     )
 
 
-def heap_store_view_hlsl(table_offset, view_count, output_bytes):
-    """Store raw UINT4 or four expanded half floats through the live side-table record."""
-    return f"""void store_heap_words4(uint slot, uint index, uint offset, bool d16, uint4 value) {{
-    if (slot >= {view_count}u) return;
-    uint record = {table_offset}u + slot * {HEAP_VIEW_RECORD_BYTES}u;
-    if (inputData.Load(record + 16u) != {HEAP_VIEW_LIVE}u) return;
-    uint4 view = inputData.Load4(record);
-    uint formatWord = d16 ? {descriptor_format_word(77):#x}u : {descriptor_format_word(75):#x}u;
-    if (view.w != formatWord || (view.y & 0xc000ffffu) != 0u) return;
-    uint stride = view.y >> 16u;
-    if (((view.x | stride) & 3u) != 0u || stride < offset + 16u || index >= view.z) return;
-    const uint bytes = {output_bytes}u;
-    if (view.x > bytes || offset + 16u > bytes - view.x) return;
-    if (index > (bytes - view.x - offset - 16u) / stride) return;
-    if (d16) value = asuint(f16tof32(uint4(value.x, value.x >> 16u, value.y, value.y >> 16u)));
-    outputData.Store4(view.x + index * stride + offset, value);
-}}
-"""
+def heap_store_view_hlsl(table_offset, view_count, output_bytes, *, components=4):
+    """Store UINT4 or expanded binary16 components through a live side-table record."""
+    width = 4 * components
+    if components in (1, 2):
+        sig = "void store_heap_word_d16(uint slot, uint index, uint offset, uint value)"
+        format_word = descriptor_format_word(22 if components == 1 else 64)  # BUF_FMT_32_FLOAT or BUF_FMT_32_32_FLOAT
+        fmt_check = f"    if (view.w != {format_word:#x}u || (view.y & 0xc000ffffu) != 0u) return;"
+        if components == 1:
+            write = "    outputData.Store(view.x + index * stride + offset, asuint(f16tof32(value & 0xffffu)));"
+        else:
+            write = ("    outputData.Store2(view.x + index * stride + offset, "
+                     "asuint(f16tof32(uint2(value & 0xffffu, value >> 16u))));")
+    elif components == 3:
+        sig = "void store_heap_xyz_d16(uint slot, uint index, uint offset, uint2 value)"
+        fmt_check = f"    if (view.w != {descriptor_format_word(74):#x}u || (view.y & 0xc000ffffu) != 0u) return;"
+        write = ("    uint3 halfWords = uint3(value.x & 0xffffu, value.x >> 16u, value.y & 0xffffu);\n"
+                 "    outputData.Store3(view.x + index * stride + offset, asuint(f16tof32(halfWords)));")
+    else:
+        sig = "void store_heap_words4(uint slot, uint index, uint offset, bool d16, uint4 value)"
+        fmt_check = (f"    uint formatWord = d16 ? {descriptor_format_word(77):#x}u : {descriptor_format_word(75):#x}u;\n"
+                     "    if (view.w != formatWord || (view.y & 0xc000ffffu) != 0u) return;")
+        write = ("    if (d16) value = asuint(f16tof32(uint4(value.x, value.x >> 16u, value.y, value.y >> 16u)));\n"
+                 "    outputData.Store4(view.x + index * stride + offset, value);")
+    return (
+        f"{sig} {{\n"
+        f"    if (slot >= {view_count}u) return;\n"
+        f"    uint record = {table_offset}u + slot * {HEAP_VIEW_RECORD_BYTES}u;\n"
+        f"    if (inputData.Load(record + 16u) != {HEAP_VIEW_LIVE}u) return;\n"
+        f"    uint4 view = inputData.Load4(record);\n"
+        f"{fmt_check}\n"
+        f"    uint stride = view.y >> 16u;\n"
+        f"    if (((view.x | stride) & 3u) != 0u || stride < offset + {width}u || index >= view.z) return;\n"
+        f"    const uint bytes = {output_bytes}u;\n"
+        f"    if (view.x > bytes || offset + {width}u > bytes - view.x) return;\n"
+        f"    if (index > (bytes - view.x - offset - {width}u) / stride) return;\n"
+        f"{write}\n"
+        f"}}\n"
+    )
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
+          image_uav_dimension="2d", image_srv_dimension="2d",
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
-          image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
+          image_uav_mip=None, image_float_domain=None, buffer_float_domain=None, cpu="gfx1013", lds_bytes=0,
           lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
           descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None, heap_view=None,
           heap_store_view=None, gather_mips=None):
@@ -749,12 +810,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     word index per formatted load, in program order, read by load_descriptor_format (see descriptor_load_hlsl).
     heap_view=(slot_word, table_offset, view_count, buffer_bytes) makes the same loads take the V# from a run-time view record
     instead of a constant format word (see heap_view_hlsl). It excludes load_format_constant.
-    heap_store_view uses the same t0 record layout for one indexed UINT4 or packed D16-to-FLOAT4 store to u0.
+    heap_store_view uses the same t0 record layout for one indexed UINT4, packed D16-to-FLOAT4, or
+    packed D16-to-FLOAT1 store to u0.
     Its fifth argument is the writable byte extent of u0. Root UAV descriptors carry no length.
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
     One full-mask plain image_load can read the same mip-zero UAV texel its
     lane will write. This path requires a dispatch with one Z group.
+    image_srv_dimension declares that view for a full-mask 1D mip load.
     A full-mask 2D D16 image_store requires an RGBA16 FLOAT UAV.
     mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
     wave_size is the caller's statement that the program runs as wave32 (32). A lane index is only
@@ -762,11 +825,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
+    image_uav_dimension declares the view for a store. The 1D, array and volume
+    stores are available for gfx1013 RGBA32 FLOAT.
     R32_UINT selects the 4-sample Texture2DMS profile for an SRV or the
     non-returning 2D integer atomic profile for a UAV. R32_SINT is UAV-only
     and selects signed min/max. R32_FLOAT declares a native atomic image carried as raw words
     in a desktop R32_UINT UAV. The caller guarantees finite-normal binary32 in the accessed texels
     and operand VGPRs by setting image_float_domain="finite-normal".
+    A raw fixed-address buffer_atomic_fmin/fmax also requires the caller's
+    buffer_float_domain="finite-normal" statement: every stored word and the operand VGPR
+    hold finite-normal binary32, never NaN, subnormal or signed zero.
     gather_mips declares the visible mip count of matching gfx1013 RGBA32 FLOAT native and desktop 2D views at t0
     for one image_gather4_l (see GATHER_HLSL).
     """
@@ -789,6 +857,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if (image_float and (not image_output or image_float_domain != "finite-normal")
             or (not image_float and image_float_domain is not None)):
         raise ValueError("The finite-normal image domain requires an R32_FLOAT atomic UAV and vice versa")
+    if buffer_float_domain is not None and buffer_float_domain != "finite-normal":
+        raise ValueError("Invalid buffer float domain")
     image_msaa = not image_output and image_format == "R32_UINT"
     if image_msaa and cpu != "gfx1030":
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
@@ -798,6 +868,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     float_image = rgba32_float_image or rgba16_float_image
     if image_format == RGBA16_FLOAT and not rgba16_float_image:
         raise ValueError("RGBA16 FLOAT requires a gfx1013 D16 image store UAV")
+    if image_uav_dimension not in IMAGE_UAV_TYPES:
+        raise ValueError("Unknown image UAV dimension")
+    if image_uav_dimension != "2d" and not (image_output and rgba32_float_image):
+        if image_uav_dimension == "1d":
+            raise ValueError("1D image UAVs require a gfx1013 RGBA32 FLOAT store binding")
+        raise ValueError("Array and 3D image UAVs require a gfx1013 RGBA32 FLOAT store binding")
+    if image_srv_dimension not in FLOAT_IMAGE_SRV_TYPES:
+        raise ValueError("Unknown image SRV dimension")
+    if image_srv_dimension == "1d" and not (rgba32_float_image and image_srv_descriptor is not None):
+        raise ValueError("1D image loads require a separate gfx1013 RGBA32 FLOAT SRV binding")
     # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only (add, umax, cmpswap; see lower()).
     gfx1013_image_atomic = cpu == "gfx1013" and image_atomic_type is not None and image_format == "R32_UINT"
     if image_output:
@@ -920,12 +1000,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         scalar[reg] = ("group", axis)
     vector = {axis: ("local", axis) for axis in range(local_axes) if axis == 0 or dims[axis] > 1}
     pending = set()
-    # VGPRs a buffer read still writes, with the word they receive (None when unknown);
+    # Pending VMEM results, with the word they receive (None when unknown);
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    heap_store_components = 4
     format_store_index = 0
     atomic_update = False
+    buffer_float_update = False
+    shared_atomic_offset = None
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
     staged_steps = []
     ds_step_count = 0
@@ -1064,6 +1147,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             else:
                 scalar[sdst_reg] = ("cond", cond_expr)
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
+            if cpu == "gfx1013" and atomic_update:
+                raise ValueError("gfx1013 buffer atomics require an unguarded program")
             saved = int(m[1])
             if vcc == ("invalid",) and guard_span is None and saved <= 105 and saved not in pending:
                 raise ValueError("Unverified lane guard compare")
@@ -2090,6 +2175,36 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  "    GroupMemoryBarrierWithGroupSync();\n"
                                  f"    uint {value} = {source} | {hlsl_word(values[1])};"))
             vector[dst] = ("alu", value)
+        elif m := re.fullmatch(r"v_(or_b32|add_nc_u32)_dpp v(\d+), v(\d+), v(\d+) row_shr:(\d+) "
+                               r"row_mask:0xf bank_mask:0xf( bound_ctrl:[01])?", line):
+            op, dst, src0, src1, shift = m[1], *map(int, m.groups()[1:5])
+            # LLVM 15 assembles bound_ctrl:0 and bound_ctrl:1 to the same set BOUND_CTRL bit and prints :1.
+            bound = m[6] is not None
+            # Rows are 16 of the guest's logical 1D lanes, indexed through group-shared memory.
+            if (cpu != "gfx1013" or max(dst, src0, src1) > 255 or not 1 <= shift <= 15
+                    or guard_span is not None or dims[1] != 1 or dims[2] != 1 or dims[0] % 16):
+                raise ValueError("Unsupported or masked DPP16 row shift")
+            # Without BOUND_CTRL a lane whose source is before its row start keeps its old destination.
+            values = [vector.get(reg) for reg in (src0, src1) + (() if bound else (dst,))]
+            if not all(is_word(value) for value in values):
+                raise ValueError("Unverified DPP16 operand")
+            step = dpp_step_count
+            dpp_step_count += 1
+            row_lane, inside = f"dpp{step}_row_lane", f"dpp{step}_inside"
+            source_thread = f"dpp{step}_source_thread"
+            source, value = f"dpp{step}_source", f"dpp{step}_value"
+            result = f"({source} {'|' if op == 'or_b32' else '+'} ({hlsl_word(values[1])}))"
+            slot = "dpp_stage"
+            staged_steps.append((slot, f"    uint {row_lane} = local.x & 15u;\n"
+                                 f"    bool {inside} = {row_lane} >= {shift}u;\n"
+                                 f"    {slot}[local.x] = {hlsl_word(values[0])};\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {source_thread} = {inside} ? local.x - {shift}u : local.x;\n"
+                                 f"    uint {source} = {inside} ? {slot}[{source_thread}] : 0u;\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {value} = "
+                                 + (f"{result};" if bound else f"{inside} ? {result} : ({hlsl_word(values[2])});")))
+            vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32|v_bcnt_u32_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
@@ -2420,17 +2535,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                f"        InterlockedCompareExchange({destination}, expected, next, observed);",
                                "    } while (observed != expected);"))
             elif op in ("fmin", "fmax"):
-                comparison = "<" if op == "fmin" else ">"
-                # The sign-dependent key orders finite-normal binary32 as unsigned integers.
-                # The zero seed is outside the caller's domain and can only fetch the old word.
-                stores.extend((f"    uint value = {value};",
-                               "    uint valueKey = value ^ ((value & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
-                               "    uint observed = 0u;", "    uint expected;",
-                               "    [allow_uav_condition] do {", "        expected = observed;",
-                               "        uint oldKey = expected ^ ((expected & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
-                               f"        uint next = (valueKey {comparison} oldKey) ? value : expected;",
-                               f"        InterlockedCompareExchange({destination}, expected, next, observed);",
-                               "    } while (observed != expected);"))
+                stores.extend(float_min_max_cas(f"InterlockedCompareExchange({destination}", value, op))
             elif compare_swap:
                 # RDNA stores VDATA on a match against VDATA+1. HLSL takes the comparison first.
                 # Numeric equality and bit equality agree for finite-normal binary32.
@@ -2489,14 +2594,31 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
-                               r"dim:SQ_RSRC_IMG_2D(?: unorm)?(?P<a16> a16)?(?P<d16> d16)?", line):
+                               r"dim:SQ_RSRC_IMG_(?P<dimension>1D|2D_ARRAY|2D|3D)(?: unorm)?(?P<a16> a16)?(?P<d16> d16)?", line):
             # A16 packs x/y into one dword and takes the mip from the low half of the next dword.
             mip, a16 = bool(m["mip"]), bool(m["a16"])
             d16 = bool(m["d16"])
             write = m["kind"] == "store"
             resinfo = m["kind"] == "get_resinfo"
+            dimension = m["dimension"].lower().replace("_", "-")
+            one_dimensional = dimension == "1d"
+            layered = dimension in ("2d-array", "3d")
+            if m["d16"] and dimension != "2d":
+                # D16 stores are 2D only; refuse other dimensions as an unmatched instruction.
+                raise ValueError(f"Unsupported compute instruction: {line}")
+            if layered and not write:
+                raise ValueError(f"Unsupported compute instruction: {line}")
+            view_dimension = image_uav_dimension if write else image_srv_dimension
+            if dimension != view_dimension:
+                view = "UAV" if write else "SRV"
+                raise ValueError(f"Unsupported compute instruction: image_{m['kind']}{'_mip' if mip else ''} "
+                                 f"dimension {dimension} does not match the {view_dimension} {view} view")
+            if layered and (not rgba32_float_image or a16 or mip or m["packed"]):
+                raise ValueError(f"Unsupported compute instruction: {line}")
             vaddr = [int(n) for n in re.findall(r"\d+", m["addr"])]
-            address_words = 1 if resinfo else (1 if a16 else 2) + int(mip)
+            # RDNA 2 ISA §8.2.3, Table 42 and LLVM 15 agree: full-width 1D stores take
+            # one address VGPR (X), and 1D mip loads take two (X, then mip).
+            address_words = 1 if resinfo else (1 if a16 or one_dimensional else 2) + int(mip) + int(layered)
             base, high = int(m["base"]), int(m["high"])
             dmask = int(m["mask"], 16)
             # DMASK selects components in XYZW order and packs them into consecutive VGPRs.
@@ -2504,7 +2626,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             data_words = 2 if d16 else len(channels)
             data = [int(n) for n in re.findall(r"\d+", m["data"])]
             first, last = data[0], data[-1]
-            uav_load = rgba32_float_image and image_output and m["kind"] == "load" and not mip
+            uav_load = rgba32_float_image and image_output and m["kind"] == "load" and not mip and dimension == "2d"
             if d16:
                 if not write or a16 or mip or m["packed"]:
                     raise ValueError("Unsupported compute instruction: D16 requires a 2D image_store "
@@ -2532,9 +2654,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             elif cpu == "gfx1013" and (not rgba32_float_image or a16 or m["packed"]
                                      or (m["kind"], mip) not in (("store", False), ("load", True))):
                 raise ValueError(f"Unsupported image {m['kind']} target: "
-                                 "gfx1013 requires full-width 2D RGBA32 FLOAT image_store or image_load_mip")
+                                 "gfx1013 requires full-width RGBA32 FLOAT image_store or image_load_mip")
             if rgba32_float_image and write and dmask != 0xf:
                 raise ValueError("gfx1013 RGBA32 FLOAT image_store requires full DMASK 0xf")
+            if one_dimensional and not write and dmask != 0xf:
+                raise ValueError("gfx1013 RGBA32 FLOAT 1D image_load_mip requires full DMASK 0xf")
             separate_srv = not write and not uav_load and image_srv_descriptor is not None
             if rgba32_float_image and image_output and m["kind"] == "load" and mip and not separate_srv:
                 raise ValueError("Unsupported image load target: image_load_mip requires a separate SRV")
@@ -2564,10 +2688,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if a16:
                     packed = hlsl_word(coordinates[0])
                     x, y = f"{packed} & 0xffffu", f"{packed} >> 16u"
+                elif one_dimensional:
+                    x = hlsl_word(coordinates[0])
                 else:
                     x, y = map(hlsl_word, coordinates[:2])
             if write:
-                # A D3D12 Texture2D UAV names one mip. Verify native and desktop mip selection agree.
+                # A D3D12 image UAV names one mip. Verify native and desktop mip selection agree.
                 level = coordinates[-1] if mip else 0
                 if not isinstance(level, int) or (level & 0xffff if a16 else level) != image_uav_mip:
                     raise ValueError("Image store mip does not match the UAV view")
@@ -2595,7 +2721,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     selected = dict(zip(channels, words))
                     texel = ", ".join(selected.get(channel, "0u") for channel in "xyzw")
                     value = f"uint4({texel})"
-                stores.append(f"    outputData[uint2({x}, {y})] = {value};")
+                if one_dimensional:
+                    address = x
+                elif layered:
+                    address = f"uint3({x}, {y}, {hlsl_word(coordinates[2])})"
+                else:
+                    address = f"uint2({x}, {y})"
+                stores.append(f"    outputData[{address}] = {value};")
                 continue
             if resinfo:
                 name = f"image_resinfo_{image_step_count}"
@@ -2614,7 +2746,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     if mip:
                         mip_word = hlsl_word(coordinates[-1])
                         lod = f"asint({mip_word}{' & 0xffffu' if a16 else ''})"
-                    load = f"imageData.Load(int3(asint({x}), asint({y}), {lod}))"
+                    address = (f"int2(asint({x}), {lod})" if one_dimensional
+                               else f"int3(asint({x}), asint({y}), {lod})")
+                    load = f"imageData.Load({address})"
                 if rgba32_float_image:
                     staged_steps.append((None, f"    uint4 {name} = asuint({load});"))
                 else:
@@ -2627,25 +2761,58 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 reg = first + index
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
-        elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_METHODS)})(_x2)? "
-                               r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?( glc)?", line):
-            if cpu != "gfx1030" or stride is not None or output_format is not None or image_output:
+        elif m := re.fullmatch(rf"buffer_atomic_(?P<op>{'|'.join(MUBUF_ATOMIC_METHODS)})(?P<wide>_x2)? "
+                               r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
+                               r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+                               r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?(?P<glc> glc)?", line):
+            op, wide, glc = m["op"], bool(m["wide"]), bool(m["glc"])
+            fixed = m["addr"] == "off" and not (m["idxen"] or m["offen"])
+            if cpu == "gfx1030" and not fixed:
+                raise ValueError(f"Unsupported compute instruction: {line}")
+            if output_format is not None or image_output or (cpu == "gfx1030" and stride is not None):
                 raise ValueError("Unsupported atomic reduction target or binding")
+            # One atomic per program, and no UAV write before it. The atomic itself is appended to
+            # stores, so a second atomic is refused here too. That keeps the single atomicOld or
+            # ignoredAtomic declaration below unique. On gfx1013, plain DWORD stores of the
+            # returned value may follow it.
             if stores:
                 raise ValueError("An atomic reduction must be the only UAV operation")
-            op, wide = m[1], bool(m[2])
-            if op == "csub" and (wide or not m[7]):
-                raise ValueError("Conditional subtract requires 32-bit glc")
-            if op != "csub" and m[7]:
-                raise ValueError(f"Unsupported compute instruction: {line}")
-            base, high = int(m[4]), int(m[5])
-            offset = int(m[6] or 0)
+            if cpu == "gfx1013":
+                if wide or op not in ("add", "umax", "cmpswap"):
+                    raise ValueError("Unsupported atomic reduction target or binding: "
+                                     "gfx1013 buffer atomics require 32-bit add, umax or cmpswap")
+                if guard_span is not None or image_descriptor is not None:
+                    raise ValueError("Unsupported atomic reduction target or binding: "
+                                     "gfx1013 requires an unguarded raw-buffer program")
+            else:
+                if op in ("fmin", "fmax") and (buffer_float_domain != "finite-normal" or wide or glc):
+                    raise ValueError("buffer_atomic fmin/fmax require a finite-normal domain, "
+                                     "a single 32-bit operand and no glc")
+                if op == "csub" and (wide or not glc):
+                    raise ValueError("Conditional subtract requires 32-bit glc")
+                if op != "csub" and glc:
+                    raise ValueError(f"Unsupported compute instruction: {line}")
+            base, high = int(m["base"]), int(m["high"])
+            offset = int(m["offset"] or 0)
             if (high != base + 3 or base % 4 or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified atomic reduction descriptor")
             if offset > 4095 or offset % (8 if wide else 4):
                 raise ValueError("Unverified atomic reduction address")
-            src, *last = map(int, re.findall(r"\d+", m[3]))
+            address = f"{offset}u"
+            if cpu == "gfx1013":
+                if fixed:
+                    shared_atomic_offset = offset
+                else:
+                    tag = vector.get(int(m["addr"][1:])) if re.fullmatch(r"v\d+", m["addr"]) else None
+                    access = linear_uav_address(tag, dims, m["idxen"], m["offen"], stride, offset, 4)
+                    if access is None:
+                        raise ValueError("Unverified per-thread atomic address")
+                    layout, axis, address = access
+                    if any(dims[other] > 1 for other in range(3) if other != axis):
+                        raise ValueError("Atomic address does not separate every invocation of the group")
+                    written_spans.append((offset, offset + 4))
+            src, *last = map(int, re.findall(r"\d+", m["data"]))
             width = 2 if wide else 1
             count = 2 * width if op == "cmpswap" else width
             if last != ([src + count - 1] if count > 1 else []) or src + count > 256:
@@ -2662,13 +2829,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 word = f"int64_t({word})" if wide else f"asint({word})"
             elif op == "sub":
                 word = f"({'0ull' if wide else '0u'} - {word})"
-            # Both overloads discard the old value. Raw UAV atomics on pairs require SM 6.6.
+            # Raw UAV atomics on pairs require SM 6.6.
             kind = ("int64_t" if signed else "uint64_t") if wide else ("int" if signed else "uint")
             method = MUBUF_ATOMIC_METHODS[op] + ("64" if wide else "")
             if op == "cmpswap":
-                # The ISA places replacement before compare, unlike the HLSL argument order.
+                # RDNA 2 MUBUF opcode 49 takes replacement in VDATA and compare in VDATA+1.
+                # HLSL takes compare first.
                 word = f"{operands[1]}, {word}"
-            if op in ("inc", "dec", "csub"):
+            if op in ("fmin", "fmax"):
+                # Raw-word finite-normal binary32 min/max on the raw UAV, under the caller's
+                # finite-normal domain statement. Reuses the image ordering.
+                stores.extend(float_min_max_cas(f"outputData.InterlockedCompareExchange({offset}u", word, op))
+            elif op in ("inc", "dec", "csub"):
                 one, zero = ("1ull", "0ull") if wide else ("1u", "0u")
                 if op == "inc":
                     desired = f"expected >= limit ? {zero} : expected + {one}"
@@ -2687,16 +2859,25 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                f"        outputData.Interlocked{method}({offset}u, expected, next, observed);",
                                "    } while (observed != expected);"))
             else:
-                stores.extend((f"    {kind} ignoredAtomic;",
-                               f"    outputData.Interlocked{method}({offset}u, {word}, ignoredAtomic);"))
+                result = "atomicOld" if glc else "ignoredAtomic"
+                stores.extend((f"    {kind} {result};",
+                               f"    outputData.Interlocked{method}({address}, {word}, {result});"))
+                if cpu == "gfx1013":
+                    # Without GLC the source is unchanged. This profile refuses consumers of
+                    # that register until an explicit rewrite instead of supplying an old value.
+                    vector.pop(src, None)
+                    if glc:
+                        loading[src] = ("alu", result)
             atomic_update = True
+            if op in ("fmin", "fmax"):
+                buffer_float_update = True
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(typed) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
-            if atomic_update:
+            if atomic_update and (cpu == "gfx1030" or not line.startswith("buffer_store_dword ")):
                 raise ValueError("An atomic reduction must be the only UAV operation")
             if image_output:
                 raise ValueError("Buffer stores require a raw UAV binding")
@@ -2721,8 +2902,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
                 if heap_store_view is not None:
-                    if channels not in ("xyzw", "d16_xyzw"):
-                        raise ValueError("Heap store view requires buffer_store_format_xyzw or buffer_store_format_d16_xyzw")
+                    if channels != "xyzw" and not packed:
+                        raise ValueError("Heap store view requires buffer_store_format_xyzw or a D16 formatted store")
                     if not any(tag == ("constant_word", heap_slot_word) and reg not in pending
                                for reg, tag in scalar.items()):
                         raise ValueError("Heap store view slot constant is not ready")
@@ -2771,6 +2952,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             addr = m["addr"]
             addr_regs = list(map(int, re.findall(r"\d+", addr)))
             tags = [vector.get(reg) for reg in addr_regs]
+            linear = (linear_uav_address(tags[0], dims, idxen, offen, stride, offset, span)
+                      if heap_store_view is None and len(tags) == 1 and (idxen or atomic_update) else None)
             if heap_store_view is not None:
                 if not formatted or len(tags) != 1 or not isinstance(tags[0], tuple) or tags[0][0] != "thread":
                     raise ValueError("Heap store view needs a formatted store indexed by dispatch thread ID")
@@ -2780,14 +2963,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             elif addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
                 store_layout = ("fixed",)
                 covered = set()
-            elif (stride is not None and idxen and not offen and len(addr_regs) == 1
-                    and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + span <= stride):
+            elif linear is not None:
                 # One index axis: every other group dimension must be one, so no two
                 # invocations of a group share an address.
-                index = tags[0][1]
-                store_layout = ("index", index)
+                store_layout, index, address = linear
                 covered = {index}
-                address = f"tid.{AXES[index]} * {stride}u + {offset}u"
             elif (stride is not None and idxen and offen and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
                     and all(isinstance(tag, tuple) for tag in tags)
                     and tags[0][0] == "thread" and tags[1][0] == "thread_bytes" and tags[0][1] != tags[1][1]):
@@ -2828,6 +3008,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unsupported store address")
             if any(dims[axis] > 1 for axis in range(3) if axis not in covered):
                 raise ValueError("Store address does not separate every invocation of the group")
+            if shared_atomic_offset is not None and (linear is None or offset <= shared_atomic_offset):
+                raise ValueError("Return record can overlap the fixed atomic address")
             if layout not in (None, store_layout):
                 raise ValueError("Stores use different address layouts")
             layout = store_layout
@@ -2846,16 +3028,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 source_shift = 16 if m["store_hi"] else 0
                 words[0] = (f"((outputData.Load({address}) & {keep:#x}u) | "
                             f"((({words[0]} >> {source_shift}u) & {mask:#x}u) << {byte_shift}u))")
-            elif partial and not descriptor_store:
+            elif partial and not descriptor_store and heap_store_view is None:
                 # Reserve the entire final DWORD, including the untouched high half. The indexed
                 # layout, aligned stride and overlap checks give that word a single writer.
                 final_address = address if count == 1 else f"{address} + 4u"
                 words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
             if heap_store_view is not None:
                 slot = hlsl_word(("constant_word", heap_slot_word))
-                supplied = words + ["0u"] * (4 - len(words))
-                mode = "true" if packed else "false"
-                stores.append(f"    store_heap_words4({slot}, {address}, {offset}u, {mode}, uint4({', '.join(supplied)}));")
+                heap_store_components = components
+                if channels in ("d16_x", "d16_xy"):
+                    stores.append(f"    store_heap_word_d16({slot}, {address}, {offset}u, {words[0]});")
+                elif channels == "d16_xyz":
+                    stores.append(f"    store_heap_xyz_d16({slot}, {address}, {offset}u, uint2({', '.join(words)}));")
+                else:
+                    supplied = words + ["0u"] * (4 - len(words))
+                    mode = "true" if packed else "false"
+                    stores.append(f"    store_heap_words4({slot}, {address}, {offset}u, {mode}, uint4({', '.join(supplied)}));")
             elif descriptor_store:
                 supplied = words + ["0u"] * (4 - len(words))
                 stores.append("    store_descriptor_format("
@@ -2873,6 +3061,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unused buffer descriptor format constant")
     if load_format_words is not None and format_load_index != len(load_format_words):
         raise ValueError("Unused buffer load format constant")
+    if buffer_float_domain is not None and not buffer_float_update:
+        raise ValueError("Unused buffer float domain")
     if heap_view is not None and not format_load_index:
         raise ValueError("Unused heap view binding")
     if heap_store_view is not None and (not layout or layout[0] != "heap_index" or len(stores) != 1):
@@ -2906,7 +3096,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
     if image_srv_descriptor is not None or (image_descriptor is not None and not image_output):
-        texture_type = ("Texture2DMS<uint, 4>" if image_msaa else "Texture2D<float4>" if rgba32_float_image
+        texture_type = ("Texture2DMS<uint, 4>" if image_msaa else FLOAT_IMAGE_SRV_TYPES[image_srv_dimension] if rgba32_float_image
                         else f"Texture2D<{IMAGE_FORMATS[image_format][0]}>")
         cbuffer += f"{texture_type} imageData : register(t0);\n"
     local = ""
@@ -2925,7 +3115,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         cbuffer += CVT_U32_F32_HELPER
     cbuffer += "".join(text for name, text in DOT_U_HELPERS.items() if f"{name}(" in body)
     uav_texel_type = image_atomic_type or ("float4" if float_image else "uint4")
-    uav = f"RWTexture2D<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
+    uav = f"{IMAGE_UAV_TYPES[image_uav_dimension]}<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
     # The helper reads outputData, so it follows the UAV declaration.
     descriptor_hlsl = descriptor_store_hlsl() if "store_descriptor_format(" in body else ""
     if "load_descriptor_format(" in body or "load_heap_view_format(" in body:
@@ -2933,7 +3123,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if heap_view is not None:
         descriptor_hlsl += heap_view_hlsl(heap_table, heap_count, heap_bytes)
     if heap_store_view is not None:
-        descriptor_hlsl += heap_store_view_hlsl(heap_table, heap_count, output_bytes)
+        descriptor_hlsl += heap_store_view_hlsl(heap_table, heap_count, output_bytes, components=heap_store_components)
     # GetDimensions on a raw buffer returns its size in bytes, the value of descriptor word 2.
     for name, view in (("uav_bytes", "outputData"), ("srv_bytes", "inputData")):
         if f"{name}(" in body:
@@ -2982,13 +3172,18 @@ def main():
                              "SLOT_WORD; the record table is at byte TABLE_OFFSET of the BUFFER_BYTES-byte t0 and holds COUNT views")
     parser.add_argument("--heap-store-view", nargs=5, type=lambda n: int(n, 0),
                         metavar=("SLOT_WORD", "TABLE_OFFSET", "COUNT", "TABLE_BUFFER_BYTES", "OUTPUT_BYTES"),
-                        help="select a UINT4 or D16-to-FLOAT4 store view from t0 and bound writes by OUTPUT_BYTES of u0")
+                        help="select a UINT4 or expanded D16 FLOAT1/FLOAT2/FLOAT3/FLOAT4 store view from t0 "
+                             "and bound writes by OUTPUT_BYTES of u0")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset of the 8-dword image descriptor bound to t0 or u0")
     parser.add_argument("--image-uav-mip", type=int,
                         help="Bind the image to u0 at this mip instead of binding a raw output descriptor")
+    parser.add_argument("--image-uav-dimension", choices=IMAGE_UAV_TYPES, default="2d",
+                        help="Declare the u0 view dimension for an image store")
+    parser.add_argument("--image-srv-dimension", choices=FLOAT_IMAGE_SRV_TYPES, default="2d",
+                        help="Declare the t0 view dimension for a gfx1013 RGBA32 FLOAT mip load")
     parser.add_argument("--image-srv-descriptor", type=lambda n: int(n, 0),
                         help="Separate image descriptor at t0 when u0 is a gfx1013 RGBA32 FLOAT image")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | IMAGE_ATOMIC_TYPES.keys()
@@ -2998,6 +3193,9 @@ def main():
                              "R16G16B16A16_FLOAT for gfx1013 D16 image stores)")
     parser.add_argument("--image-float-domain", choices=("finite-normal",),
                         help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
+    parser.add_argument("--buffer-float-domain", choices=("finite-normal",),
+                        help="Required for raw fixed-address buffer_atomic_fmin/fmax. Every stored word "
+                             "and the operand is finite-normal binary32, never NaN, subnormal or signed zero.")
     parser.add_argument("--wave-size", type=int, choices=(32,),
                         help="Caller's statement that the program runs as wave32, for lane indices in larger groups")
     parser.add_argument("--gather-mips", type=int,
@@ -3020,10 +3218,13 @@ def main():
                    source_stride=args.source_stride, source_format=args.source_format,
                    output_format=args.output_format,
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
+                   buffer_float_domain=args.buffer_float_domain,
+                   image_uav_dimension=args.image_uav_dimension,
                    image_uav_mip=args.image_uav_mip, image_float_domain=args.image_float_domain,
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
+                   image_srv_dimension=args.image_srv_dimension,
                    descriptor_format_constant=args.descriptor_format_constant,
                    rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant,
                    heap_view=tuple(args.heap_view) if args.heap_view else None, heap_store_view=args.heap_store_view,
