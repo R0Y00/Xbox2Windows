@@ -208,10 +208,22 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-17`. Earlier translations lower `v_med3_f32` through a
-branchless median, which returns the smaller of the other two operands when a source is NaN. The matching
-compute (`x2w-startup-shader-17cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
-because those stages use the shared lowering.
+Graphics and compute use cache revisions `x2w-startup-shader-28` and `x2w-startup-shader-28cs`.
+Revision 28 lowers `v_fma_mix*` through a `precise` `mad`, so a zero product keeps its sign.
+Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
+Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
+treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
+making a later VOP3 lane-mask read of vcc_hi refuse instead of lowering to bit 0. The two cache keys advance together.
+Revision 22 invalidates compute shaders that assumed the entry EXEC mask at a load reached on a later
+loop iteration after an EXEC write. The two cache keys advance together.
+Revision 21 refuses a compute lane-mask form that revision 20 translated (`s_and_b32 M, X, exec_lo` with X data).
+Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch.
+Revision 19 folds `s_mov_b32` from a scalar register that holds a plain constant, so later reads of the copy use the constant word. The fixed slot 57 mesh
+(`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
+Revisions before 19 read a register copied from a constant as a run-time value.
+Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
+Revisions before 17 lower `v_med3_f32` through a branchless median, which returns the smaller of the
+other two operands when a source is NaN.
 Revisions before 16 lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
 Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
 rounding mode.
@@ -545,8 +557,9 @@ Three census lines follow the five-second report whenever their counts changed
 - `x2w-d3d12 memory SRV refusals (slot 70): total N; <reason> n, ...; distinct shapes K` counts every
   refused slot 70 call by reason. It then prints one `x2w-d3d12 memory SRV refused shape i:` line per
   distinct `reason`, dimension, format, size, mips, layout and flags, for the reasons that depend on the
-  description (all but `null_destination`, `unreadable_resource`, `unreadable_view`, `null_address` and
-  `destination_outside_view_heaps`). The reasons include the partial-tile holds (`partial_tile_*`) and the
+  description (all but `null_destination`, `unreadable_resource`, `unreadable_view`, `null_address`,
+  `destination_outside_view_heaps` and the acceleration-structure holds `as_unaligned`, `as_not_placed` and
+  `as_wrong_state`). The reasons include the partial-tile holds (`partial_tile_*`) and the
   console-layout holds (`unsupported_desktop_format`, `console_layout_*`, `overlapping_resource`).
   Up to 128 shapes are kept; later shapes are only counted. The periodic report lists the shapes counted
   since it last ran.
@@ -785,6 +798,8 @@ are not copied. Keep using the package root as `-DataDir`, then run the staged e
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+Use `-BuildDir` to select their build directory; relative paths are relative to the repository root,
+and absolute paths are used as supplied. The default is `out/build/release`.
 It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
@@ -1258,7 +1273,8 @@ For a timeline instead of the counters, configure a separate build tree with `-D
 - **Client settings.** On-demand (nothing is recorded until a profiler connects), localhost only, no broadcast, no call stacks, no system tracing and no crash handler.
 - **Output.** One shared `TracyClient.dll` is linked into `d3d12_xs.dll`, `XCRDAPI.dll` and `xmem.dll`; copy it beside them.
 - **Zones.** `ExecuteCommandLists`, `Present` (with a frame mark), the frame-wait sleep, window present, desktop pipeline creation, `device_memory_srv` with its resource scans, each DirectStorage request, and the xmem page map and physical write. `src/startup_stubs/profile_zone.h` defines the macros.
-- **Off.** Without the option nothing is fetched, defined or linked, and the macros expand to nothing.
+- **Memory.** Three kinds of data for Tracy's Memory view, by name: the pool `XMemAlloc` (every block `XMemAlloc` returns until its `XMemFree`), one pool per instrumented DLL for its C++ heap (`<target> C++ heap`, `operator new`/`delete` replaced in `src/startup_stubs/tracy_new.cpp`), and the plot `XMemVirtualAlloc commits (bytes, cumulative)`. That last one is a plot because the title releases those ranges with Win32 calls the stand-in does not see. Memory the title takes straight from Win32 (`VirtualAlloc`, its own heaps) and what the graphics driver commits are not tracked; compare the pools with the `commit peak=` heartbeat to size that remainder. A profiler that connects late misses earlier allocations (on-demand client).
+- **Off.** Without the option nothing is fetched, defined or linked, and the macros expand to nothing or a no-op.
 
 To capture without a GUI, build Tracy's `capture` tool from the same checkout (`cmake -S <checkout>/capture -B <dir>`; that project fetches its own dependencies), start `capture -o run.tracy -a 127.0.0.1 -s <seconds>` and then the instrumented run. Open the file with the Tracy profiler, or export zone statistics with `csvexport`.
 
@@ -1385,11 +1401,11 @@ cmake --build --preset release --target startup_inflate_probe
 
 ## DirectStorage destinations that are not writable
 
-A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in walks the destination with `VirtualQuery`, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `VirtualQuery` per region the destination spans, per request that reaches the copy.
+A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in reads the attributes of the destination's pages without touching them, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. When every page is resident and plain read-write (`QueryWorkingSetEx`: valid, `PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`, no guard bit), the request goes ahead; otherwise the destination is walked with `VirtualQuery`, which also accepts copy-on-write pages. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `QueryWorkingSetEx` per 512 pages of the declared capacity, per request that reaches the copy, plus the `VirtualQuery` walk when a page is not resident and plain read-write. On the title's multi-gigabyte regions each `VirtualQuery` scans to the end of the region, about 10 ms of kernel time per request (#2684).
 
 Failed requests report distinct status HRESULTs where the cause is known (#1843). A destination smaller than the data (`destination capacity exceeded`) reports `0x8007007A` (`ERROR_INSUFFICIENT_BUFFER`); a file read at or past the end, or crossing it, reports `0x80070026` (`ERROR_HANDLE_EOF`); every other cause stays `E_FAIL`. The same code is the `HRESULT` of the first-failure record. `OpenFile` with a null path returns `E_INVALIDARG`, `CreateQueue` with a null descriptor returns `E_INVALIDARG`, and a null output pointer returns `E_POINTER`; the output is set to null on every refusal. `tests/startup_dstorage_destination_check.cpp` pins each code on the real stand-in.
 
-`tests/startup_dstorage_destination_check.cpp` (ctest `startup_dstorage_destination`) sends memory-source requests through the real queue: a read-only, a guard and a no-access middle page, and a capacity one page past the committed pages. Each must fail with the process alive and the bytes of the pages before the bad one still `0xAA`. Afterwards, requests into a fully writable (`PAGE_READWRITE`) buffer and a copy-on-write (`PAGE_WRITECOPY`) mapped view on the same queue must write every byte:
+`tests/startup_dstorage_destination_check.cpp` (ctest `startup_dstorage_destination`) sends memory-source requests through the real queue: a read-only, a guard and a no-access middle page, and a capacity one page past the committed pages. Each must fail with the process alive and the bytes of the pages before the bad one still `0xAA`; the guard page must still be `PAGE_GUARD` afterwards, and a vectored exception handler must see no guard-page exception. A copy-on-write page followed by a no-access page must be refused with the first page still shared (`QueryWorkingSetEx`) and unchanged. A writable destination whose capacity is three pages but whose data is one page must succeed with the two unwritten pages still `0xAA`, and a committed page that was never touched (not resident) must be accepted. Afterwards, requests into a fully writable (`PAGE_READWRITE`) buffer and a copy-on-write (`PAGE_WRITECOPY`) mapped view on the same queue must write every byte:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
@@ -1449,16 +1465,17 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
-| `X2W_XMEM_LAZY_STARTUP=1` | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks placed by `X2W_XMEM_STARTUP_BELOW_40` stay committed up front. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
+| `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
-| `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it, otherwise copied from title memory at each submission, otherwise the default backing is kept and the refusal recorded; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
+| `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it (private allocations larger than 256 MiB are skipped only with `X2W_D3D12_CAP_EXISTING_HEAP=1`), otherwise copied from title memory at each submission, otherwise the default backing is kept and the refusal recorded; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
+| `X2W_D3D12_CAP_EXISTING_HEAP=1` | opt-in 256 MiB (`unplaced_existing_heap_allowed`) allocation-size cap on `OpenExistingHeapFromAddress` in device slot 133 (`startup_slot133_heap_cap_*`). Unset (default), private allocations larger than 256 MiB keep the formerly aliased path: a capped copied placement is refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after recording and before submit. Set, allocations larger than 256 MiB skip `OpenExistingHeapFromAddress` so multi-GiB startup blocks are not pinned in `WorkingSetSize` and `NonLocal` GPU memory |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
-| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
@@ -1476,7 +1493,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
 | `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
-| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
+| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
@@ -1570,32 +1587,26 @@ unordered-access flag, and live in a default heap without heap flags:
   reusing the same title address or desktop pointer does not skip uploads or
   resolve a retired wrapper.
 
-`X2W_D3D12_RELEASE_RETIRED_VIEWS=1` (only with `X2W_D3D12_RELEASE_RETIRED=1`) ends the
-`view-refs` retention. Once a released class texture's release-time fences have passed,
-the drain (a try-lock, never blocking) replaces every tracked slot-18 descriptor slot
-that names it, in every heap and so every `CopyDescriptors*` copy, by a null SRV of the
-same dimension: the shadow entry and its ref are dropped, the desktop descriptor is
-rewritten with `CreateShaderResourceView(nullptr, ...)`, the view records naming the
-resource lose it, and the view token in title descriptor memory is cleared when it
-still carries that id. A draw that reads the slot afterwards binds a null texture
-(zeros). The texture is then freed by the normal rules: lists and submissions that hold
-it through `retire_hold` keep the desktop object until the recording is dropped or the
-submission's fence passes. No recorded list or submission reads a title heap's SRV
-descriptor (translated draws build their own descriptors from the tokens at draw time
-and hold what they sample), so the rewrite cannot reach GPU work. A slot that cannot be
-rewritten keeps its ref and the texture stays retained. Not covered: a title thread
-that writes the same slot at the moment of the drain, and a guest that uses the
-resource after its final release (unsupported with the switch, as before).
-`startup_resource_retire_views_*` reads the desktop descriptors back through a compute
-probe; the `keep` and `noretire` cases are the negative controls.
+A slot-18 descriptor and each tracked copy hold the resource until the slot is explicitly overwritten
+or its heap is destroyed. A later binding of that slot still reads the resource after the last guest
+Release and the release-time fences. A list or submission holding the resource keeps it alive after
+the slot is overwritten, until the recording is discarded or the submission retires.
+
+The legacy `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` setting only enables the retirement breakdown below and
+logs that clearing live slots is disabled. The memory-pressure A/B in
+[#2379](https://github.com/R0Y00/Xbox2Windows/issues/2379#issuecomment-7179801296) used the earlier
+experimental rewrite. `startup_resource_retire_views_*` checks GPU readback from the original and
+copied descriptors, and from a recorded copy behind a gated queue. It also checks retirement after
+explicit overwrite and normal completion, with the legacy setting on and off.
 
 `X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and
 `X2W_D3D12_BUDGET=1`) adds a diagnostic line to the heartbeat. It counts every
 resource whose final guest Release happened and whose desktop object is still
 alive, once, by the first cause that applies. Format: `reason=count/bytes(oldest Nf)`,
 bytes from the budget ticket, `oldest` in frames since the final Release:
-- `view-refs`: a tracked slot 18 descriptor still names it;
-  `view-refs-in-visible-heap` is the part with a descriptor in a shader-visible heap.
+- `view-refs`: a tracked descriptor slot still names it (a slot 18 SRV, and since
+  Slice 3a a slot 19 UAV, 20 RTV or 21 DSV); `view-refs-in-visible-heap` is the
+  slot-18 part with a descriptor in a shader-visible heap.
 - `list-hold`, `flight`: a closed or recording list, or a submission, holds a
   desktop reference.
 - `queued-waiting-fence`: queued, the release-time fence of a queue has not passed;
@@ -1613,24 +1624,46 @@ recorded and no line is built.
 
 Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
 targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
-described above. A resource leaves the class for good when a UAV/RTV/DSV view is
-created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
-an untracked descriptor slot or is copied out of tracked heaps, when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
-SRV keeps the resource only when the desktop created the view: desktop view
-creation returns `void`, so a removed device is the only failure it reports, and
-a slot whose creation failed is recorded without a reference. Tracked
-slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+described above. A descriptor slot the shim shadows (`HeapInfo::shadow`) holds one
+reference for each materialized view it names: a slot 18 SRV, and since Slice 3a
+also a slot 19 UAV (one for the view resource and one for its counter resource),
+a slot 20 RTV and a slot 21 DSV. `note_view` adds the references when a view is
+written into a tracked slot (writing the same view again adds nothing), and the
+same functions release exactly the references they added: `note_view` on an
+overwrite, `note_copy` when a copy moves another view over the slot or into
+another tracked slot, and the heap's `Release` through `retire_drop_heap_views`
+when the slot's heap is destroyed. A view the desktop did not create (a removed
+device) is recorded unmaterialized: it releases the slot's previous references
+and adds none. A resource leaves the class for good when a view call targets a
+descriptor slot no heap shadow tracks, or a copy moves a tracked view into an
+untracked heap (`retire_leave_class`, slots 18-21, a slot 19 counter too), when
+it is passed to MakeResident or Evict (slots 34 and 35), or when it is presented.
+Tracked views (including slot 70 `device_memory_srv`) keep the resource retained
 while any descriptor slot in `HeapInfo::shadow` names it (updated across
 `note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
 bound textures via `retire_hold`. Only wrappers can be in the class; a raw
 desktop pointer never is. Sampler feedback is not checked: no device slot of the
 stand-in reaches it.
 
+The 19-21 references free nothing on their own yet: the class still excludes a
+texture created with the render-target, depth-stencil or unordered-access flag
+(`retire_classify`), and desktop creates a UAV/RTV/DSV only on a resource that
+carries the matching flag. A class texture's 19-21 view call is therefore the
+console-only case the shim refuses (a UAV of a depth texture, an RTV of a texture
+without render-target); it records no view, adds no reference, and the texture
+still retires once it is released and its fences have passed. The accounting is
+the prerequisite for a later slice that admits those textures. The slots 19-21
+fallback is unchanged: in a heap the shim does not shadow the call keeps
+`retire_leave_class`, so nothing is freed under a descriptor the shim cannot
+follow. `X2W_D3D12_RELEASE_RETIRED_VIEWS` no longer clears live descriptors; it is a legacy
+diagnostic that logs that clearing is disabled and enables the retirement
+breakdown. A tracked descriptor reference in any of slots 18-21 keeps its resource
+until the slot is overwritten, copied over, or its heap is destroyed (#2679).
+
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
-passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
-recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+passed, all tracked descriptor references (slots 18-21) have dropped to zero, and
+no recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
 resolve destination (19), or translated draw SRV bind that the stand-in forwards
 makes the list hold a desktop reference to each resource of the class it names,
 source and destination, until the list is Reset, fails to Close or is destroyed. A list
@@ -1672,8 +1705,18 @@ and a translated draw that samples such a texture through a descriptor table (th
 token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
 a clear sentinel corner, and the texture leaves the budget only after the closed draw
 recording is dropped); the `_off_` case checks that an ordinary committed texture (no
-title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
-`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+title memory) still records its upload. Since Slice 3a the title fixture also drives the
+19-21 descriptor references: case 8 creates an RTV, a DSV and a UAV (and a buffer UAV with
+a counter resource) in tracked heap slots and checks through the retire probe that each
+materialized view adds one reference per slot - slot 19 one for its resource and one for
+its counter - that the same view written again adds nothing, and that overwrite, a
+`CopyDescriptorsSimple` copy and heap destruction each release exactly what was added
+(including a view in an untracked desktop heap, which adds none); case 9 checks the
+`view_slot` fallback in both switch modes: a refused RTV on a class texture in a tracked
+slot stays in the class and retires, while the same call into a descriptor slot the shim
+does not shadow keeps `retire_leave_class` and the texture stays retained. The fixture-only
+exports `x2w_d3d12_retire_probe` (which reports the resource's tracked slot references as
+`view_refs`), `x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
 `x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
@@ -1938,6 +1981,11 @@ exists succeeds. Names must be one plain path component of at most 128 bytes (no
 case) and a blob is at most 64 MiB. The storage root itself is trusted; a container directory or blob
 that is a symbolic link or, on Windows, a junction is refused by every operation.
 
+`X2W_STORAGE_PATH` is the root of the console drive, not the save folder. The title appends
+`x2w-gamesave` to it, so `S:\` stores the files under `S:\x2w-gamesave` while
+`S:\x2w-gamesave` stores them under `S:\x2w-gamesave\x2w-gamesave`. Point it at the drive root
+(or a folder mounted as a drive) and keep one path per profile set.
+
 Blob writes and deletes are kept with the update and reach the disk only when the update is
 submitted (the public API makes the whole update atomic at submit). An update closed without a
 submit changes nothing. At submit every write goes to a staging file and every delete is checked
@@ -2064,8 +2112,19 @@ These are measured on one executable; treat them as hypotheses for others.
   integer VOP1/VOP2 SDWA forms: a source selection is zero-extended, or sign-extended under `sext()`,
   and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
-  already lowers the same forms. Float SDWA forms and a `dst_unused:UNUSED_SEXT` destination still
+  already lowers the same forms. The VOP2 select `v_cndmask_b32_sdwa` lowers the same way, with VCC as
+  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Most float SDWA forms and a
+  `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
+  The one float exception is the binary16 arithmetic set `v_add_f16`, `v_sub_f16`, `v_subrev_f16` and
+  `v_mul_f16` (`_sdwa`). `src0_sel`/`src1_sel` accept `WORD_0`, `WORD_1` or `DWORD` (`DWORD` reads the
+  low half, as the 16-bit operation does); sources are single VGPRs, with `abs` and `neg`. The result
+  is rounded once to binary16 and written to `dst_sel:WORD_0` or `WORD_1`, with `UNUSED_PAD` zeroing the
+  other half (the default) and `UNUSED_PRESERVE` keeping the old one. Refused: `dst_sel:DWORD` and byte
+  selects, `sext()`, `clamp`, output modifiers, `UNUSED_SEXT`, and non-VGPR sources. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_f16_alu"`: the check covers the accepted and
+  refused forms, and the draws on WARP and hardware read back every selector and unused mode against a
+  CPU binary16 reference.
   The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
   too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
   the compare reads the extended value as its type. f32 SDWA compares stay refused (#1920). The
@@ -2079,7 +2138,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
   first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
   same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
-  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, as are `row_*`, `wave_*`, partial masks and `fi`. Run
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages and a changed EXEC are refused (branches and loops: see below), as are `row_*`, `wave_*`, partial masks and `fi`. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
   draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
   with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
@@ -2095,6 +2154,24 @@ These are measured on one executable; treat them as hypotheses for others.
   check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
   fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.
   [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
+- **DPP quad reads in branches and loops.** The quad swaps, broadcasts and pair broadcasts above also lower in a pixel
+  program with branches or loops when a whole-program check proves that the four threads of the quad reach the read
+  together: the `s_wqm exec, exec` runs before every branch and target, no other EXEC write can reach the read (an
+  exact-mask restore after the last read is fine), and every conditional branch that can reach it is wave-uniform
+  (SCC proven uniform; `s_cbranch_execz`/`execnz` under the whole-quad mask). A `vccz`/`vccnz` loop, SCC taken from a
+  lane mask, an EXEC write inside the loop and a late `s_wqm` are refused with the offset that breaks the proof. No
+  wave size is assumed. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_flow"`: the draws on
+  WARP and hardware run swap, broadcast and pair reads inside a five-pass scalar loop with an `if`, compare 16 x 16
+  pixels with a CPU reference, and require wrong-lane translations to fail.
+- **wave32 `vcc_hi`.** In wave32 only `vcc_lo` is the condition mask and compilers allocate `vcc_hi` like any other
+  scalar register. The decoder prints wave32 syntax, so the translator renames `vcc_hi` to an SGPR the program never
+  names only when that is exact in both wave sizes: no instruction names the 64-bit pair `vcc`, and either a VALU
+  compare or carry-out writes `vcc_hi` (or an odd SGPR), a VOP3 mask source reads one (a misaligned pair in wave64),
+  or no VALU instruction and no `vccz`/`vccnz` branch uses `vcc_lo` as a lane mask (in wave64 those see `vcc_hi` for lanes 32..63). Otherwise `vcc_hi` stays refused; scalar writes into `vcc_hi` or
+  `exec_hi` are now refusals instead of a Python TypeError. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
+  pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
+  compare bit, the carry or read `vcc_hi` as zero as failing controls.
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -2202,11 +2279,30 @@ These are measured on one executable; treat them as hypotheses for others.
   `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
   channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
   `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads
-  and stores the same image are refused by name. The runtime does not bind UAVs on the translated
-  graphics path yet: it logs and does not use a translation whose manifest has a `uav` line. A
+  and stores the same image are refused by name. A
   hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
   texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
+- **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d table P O` line
+  as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
+  view the title created at that table entry (`resolve_pixel_uavs` in `d3d12_draw.inl`), on
+  mip 0 of a 2D texture, and the texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
+  with their reason and nothing is bound in place of the view. When the manifest is loaded, the
+  translation is not used for another image kind, a buffer line (`uav N raw table P O`,
+  the vertex-stage store of #2059), a view qualifier (`float`, `uint`, `sint`, as in the compute line), another source, extra fields such as
+  `channels`, an index out of order or more than eight views. At draw time,
+  the draw is not translated for no table at the parameter, an entry outside the bound table, an
+  entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
+  array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
+  sRGB or non-colour format, a format without typed UAV store, and a texture that is also an SRV,
+  a render target or the depth texture of the draw; these checks run before any view of the draw is
+  written or any texture changes state. Indirect draws refuse a translation with a `uav` line. Compute UAVs and barriers between
+  draws that write and read the same texture are not covered. `tests/startup_pixel_uav_check.py`
+  draws the program above through the runtime with four 4x4 two-mip textures in which every word is
+  a distinct sentinel. The texel lands only in the texture the table names, and every other word of
+  the four textures stays unchanged; each refusal leaves every word unchanged. The exec-off variant
+  leaves the texel, and must fail once recompiled without its guard. Run
+  `ctest --preset release --no-tests=error -R '^startup_pixel_uav_' -V`.
 - **Explicit mip loads.** For 2D textures, 2D arrays and 3D textures, `image_load_mip` passes the final
   address register to `Texture.Load` as the mip level (`int4(x, y, slice, mip)` for an array, whose four
   registers are x, y, slice and mip). Ordinary `image_load` still reads mip zero.
@@ -2718,14 +2814,18 @@ longer exhausts the heap. While nothing has been freed the offsets are the ones 
 
 - A block is aligned in address (a power of two, 16 at least; 0, anything below 16 and a value that is not a power of two
   all mean 16). Size and alignment are 32 bits. `ApuCreateHeap` creates and publishes the heap under one lock, so
-  competing first calls cannot reset a heap that already has live blocks.
-- Null output is `E_POINTER`; size 0 is `E_INVALIDARG`; no
-  room, or a full extent table, is `E_OUTOFMEMORY`. A refused call leaves the heap and the optional
-  APU-address output as they were, and writes null to the virtual-address output when non-null.
+  competing first calls cannot reset a heap that already has live blocks. A heap whose 64 KiB-rounded size
+  exceeds 4 GiB is refused with `E_INVALIDARG` without committing memory, so every block fits the APU range.
+- Null or non-writable output (`virtual_address` or optional `apu_address`) is `E_POINTER` without
+  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, or a full extent table is
+  `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
+  and writes null to the virtual-address output when writable.
 - A block that is reused is zeroed, as fresh heap memory is.
 - `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
   already freed) is `E_INVALIDARG` and changes nothing.
-- `ApuIsVirtualAddressValid` and the two map calls still test the whole heap range, not live blocks.
+- `ApuIsVirtualAddressValid` and the two map calls read the published heap bounds under the heap lock and
+  test the allocatable 32-bit APU range `[0x10000, min(heap_bytes, 4 GiB))` (excluding the unused guard
+  range below `0x10000`), not live blocks.
 
 The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) returns `E_NOTIMPL`,
 rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
@@ -2820,11 +2920,13 @@ process's peak and current commit charge in MiB and the number of live 64 KiB ph
 (the heartbeat still calls them sections), so runs that stop at different points can be compared by
 memory spent rather than by elapsed time. A physical page holds a slot from its first use (a mapping
 or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
-experimental `x2w_xmem_page_stats` export.
+experimental `x2w_xmem_page_stats` export. A page-token write (`x2w_xmem_write_physical`) to a page
+that has no grant is refused with `ERROR_INVALID_PARAMETER`, like a mapping of it.
 
 The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
 its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
-committed, is zeroed on reuse, and is chosen before a fresh slot. The experimental `x2w_xmem_slab_stats`
+committed, is zeroed on reuse, and is chosen before a fresh slot; once all slots of a slab are freed and
+unpinned, the empty slab is closed and its commit is returned to the OS. The experimental `x2w_xmem_slab_stats`
 export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
 calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
 injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages
@@ -3182,10 +3284,26 @@ layouts"):
 
 ## Linear buffer backing (device slot 133, opt-in)
 
-By default slot 133 aliases a buffer only in private memory, through an existing heap cached by
-allocation base and opened without a `D3D12_FEATURE_EXISTING_HEAPS` query. Anything else gets a
+By default slot 133 aliases a buffer in private memory allocations of any size, through an existing heap cached by
+allocation base and opened without a `D3D12_FEATURE_EXISTING_HEAPS` query. The opt-in
+`X2W_D3D12_CAP_EXISTING_HEAP=1` limits that to allocations up to 256 MiB (`unplaced_existing_heap_allowed`):
+the default keeps the formerly aliased path for larger allocations because a capped copied placement is
+refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after
+recording and before submit, while the cap skips multi-GiB existing heaps to avoid pinning them. With
+`X2W_XMEM_LAZY_STARTUP=1`, `commit_lazy_block` runs only when the buffer is eligible to open an existing heap
+(checking `MEM_PRIVATE`, 64 KiB offset alignment, nonzero width, containment inside `allocation_bytes`, and the
+256 MiB cap when `X2W_D3D12_CAP_EXISTING_HEAP=1` via `can_commit_lazy_placed_buffer` before re-measuring an
+uncovered prefix, and right before
+`OpenExistingHeapFromAddress` opens the heap). Anything else gets a
 committed default buffer that does not alias the title memory, holds zeros and is reported as
-success (`not aliased` in the log). `X2W_D3D12_LINEAR_BUFFERS` changes this for one buffer kind: a
+success (`not aliased` in the log). `reserve_upload_ring` grows in demand
+chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
+bytes for the process; the allocator may use an older unused tail but
+refuses exhaustion or allocation failure rather than resetting live storage.
+`upload_reservation` exercises the shared cursor and returned-pointer contract
+without D3D12; on non-Windows hosts run
+`c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.
+`X2W_D3D12_LINEAR_BUFFERS` changes placement for one buffer kind: a
 buffer description with row-major or unknown layout and initial state `COMMON`
 (`src/startup_stubs/linear_buffer_backing.h`, [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914)).
 Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, keep the default backing.

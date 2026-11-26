@@ -93,6 +93,19 @@ WARNING_PROBE = "x2w warning prefix probe"
 WARNING_PREFIXES = {}
 
 
+def unwrap_first_line(printed, want):
+    """Join the leading lines of `printed` that PowerShell wrapped at its host width back into `want`.
+
+    The host wraps a long Write-Warning at the console width it finds (80 columns when it is not
+    attached to a wide console, which depends on load and on the parent), so the one warning can
+    arrive as two lines. Only a split of exactly `want` is joined; any other text is left as printed.
+    """
+    for count in range(1, len(printed) + 1):
+        if " ".join(printed[:count]) == want:
+            return [want, *printed[count:]]
+    return printed
+
+
 def warning_prefix(shell, env):
     """Return the prefix this shell puts before a Write-Warning message, such as "WARNING: ".
 
@@ -123,7 +136,7 @@ def alive(pid):
 
 
 def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
-             early_exit=False, trace_api_env=None):
+             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
@@ -137,9 +150,10 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
     (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit), encoding="utf-8")
     (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(early_exit=early_exit), encoding="utf-8")
-    (root / "bld").mkdir()
+    build = root / ("build [with spaces]" if absolute_build else "bld")
+    build.mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
-        (root / "bld" / f"{dll}.dll").write_bytes(b"")
+        (build / f"{dll}.dll").write_bytes(b"")
     exe, data, log = root / "run" / "t.exe", root / "data", root / "log"
     exe.parent.mkdir()
     exe.write_bytes(b"")
@@ -157,8 +171,12 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
     # goes first so the stub runs under the Python that runs this check.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    build_arg = str(build) if absolute_build else "bld"
+    if missing_build:
+        build_arg = str(root / "missing build")
     command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(startup / "run.ps1"),
-               "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log), "-BuildDir", "bld",
+               "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log),
+               "-BuildDir", build_arg,
                "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", *switches]
     if translate:
         command += ["-Render", "-Translate", "-ShaderCache", "cache"]
@@ -176,11 +194,15 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
         printed = [line.strip() for line in stdout if line.strip()]
         error_text = stderr.read().strip()
     found = []
+    for dll in DLLS:
+        if not (exe.parent / f"{dll}.dll").is_file():
+            found.append(f"stand-in {dll}.dll was not copied")
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
     want_output = STUB_LINES[:HEAD_LINES]
     if not fake_user_env and "-FakeUser" not in switches:
         want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
+        printed = unwrap_first_line(printed, want_output[0])
     if printed != want_output:
         found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
                      f"(stderr: {error_text!r})")
@@ -219,6 +241,9 @@ def run_problems(shell, script, work, first_only):
         found += run_case(shell, script, code, work)
         if found and first_only:
             return found
+    found += run_case(shell, script, 7, work, absolute_build=True)
+    if found and first_only:
+        return found
     found += run_case(shell, script, 0, work, switches=["-FakeUser"])
     found += run_case(shell, script, 0, work, fake_user_env=True)
     if found and first_only:
@@ -308,6 +333,9 @@ def shell_failures(shell, script, tmp):
         if mutant is None or not run_problems(shell, mutant, tmp, True):
             failures.append(f"{name}: mutant '{label}' was not detected")
     if shell:
+        missing = run_case(shell, script, 7, tmp, missing_build=True)
+        if not any("debugger [argv" in item and "was None" in item for item in missing):
+            failures.append(f"{name}: missing build directory did not prevent debugger startup")
         # Expire the live fixture tree after HasExited has been read. The launcher's
         # own taskkill then hits the missing PID and writes native stderr.
         kill = f"& {STOP} 2>&1 | Out-Null"
@@ -331,6 +359,21 @@ def shell_failures(shell, script, tmp):
     return failures
 
 
+def unwrap_problems():
+    """Controls for unwrap_first_line: a wrapped warning joins, any other text is left alone."""
+    want = "WARNING: Without -FakeUser, user API calls go to the host gaming runtime (docs/x.md)."
+    head = "WARNING: Without -FakeUser, user API calls go to the host gaming runtime"
+    cases = [
+        ("one line", [want, "a"], [want, "a"]),
+        ("wrapped at 80 columns", [head, "(docs/x.md).", "a"], [want, "a"]),
+        ("different text", [head, "(docs/other.md).", "a"], [head, "(docs/other.md).", "a"]),
+        ("missing warning", ["a"], ["a"]),
+    ]
+    return [f"unwrap_first_line {name}: got {got}, expected {expected}"
+            for name, printed, expected in cases
+            if (got := unwrap_first_line(printed, want)) != expected]
+
+
 def main():
     if sys.argv[1:] not in ([], ["--text-only"]):
         sys.exit("usage: startup_run_ps1_check.py [--text-only]")
@@ -345,7 +388,7 @@ def main():
         mode = "executed with " + ", ".join(Path(shell).stem.lower() for shell in shells)
         if not shells:
             mode = "text only: no PowerShell found"
-    failures = []
+    failures = unwrap_problems()
     with tempfile.TemporaryDirectory() as tmp:
         # Each shell works in its own scratch dirs, so PowerShell 5.1 and 7 run side by side.
         with ThreadPoolExecutor(max_workers=len(shells) or 1) as pool:
