@@ -15,6 +15,8 @@ struct PipelineInfo {
     D3D12_BLEND_DESC stream_blend{};
     bool has_stream_depth_stencil = false;
     D3D12_DEPTH_STENCIL_DESC stream_depth_stencil{};
+    bool has_stream_rasterizer = false;
+    D3D12_RASTERIZER_DESC stream_rasterizer{};
     DXGI_FORMAT stream_dsv_format = DXGI_FORMAT_UNKNOWN;
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
@@ -59,6 +61,33 @@ std::vector<std::uint8_t>& view_materialized() { static std::vector<std::uint8_t
 std::unordered_map<u64, std::uint32_t>& view_ids() { static std::unordered_map<u64, std::uint32_t> m; return m; }  // content hash -> view id
 LONG64 views_noted, views_distinct, descriptors_copied;
 
+// X2W_D3D12_VIEW_CENSUS=1 (diagnostic only, docs/startup-runtime.md): new distinct view records by slot, and one line
+// before an insertion that is expected to grow view_records or the view_ids buckets. All fields: note_lock held.
+bool view_census_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_D3D12_VIEW_CENSUS");
+    return on;
+}
+struct ViewCensus {
+    u64 distinct[6];  // slots 17..22
+    u64 grows_records, grows_ids;  // growths announced
+    u64 missed;                    // capacity or bucket count changed without an announcement
+};
+ViewCensus view_census{};
+
+std::size_t view_census_format(char* out, std::size_t capacity, const char* what)
+{
+    const ViewCensus& c = view_census;
+    const int n = std::snprintf(out, capacity,
+        "x2w-view-census %s: cbv=%llu srv=%llu uav=%llu rtv=%llu dsv=%llu sampler=%llu records=%llu capacity=%llu "
+        "ids=%llu buckets=%llu grows-records=%llu grows-ids=%llu missed=%llu",
+        what, c.distinct[0], c.distinct[1], c.distinct[2], c.distinct[3], c.distinct[4], c.distinct[5],
+        static_cast<u64>(view_records().size()), static_cast<u64>(view_records().capacity()),
+        static_cast<u64>(view_ids().size()), static_cast<u64>(view_ids().bucket_count()),
+        c.grows_records, c.grows_ids, c.missed);
+    return n < 0 ? 0 : (std::min)(static_cast<std::size_t>(n), capacity - 1);
+}
+
 // The shadow entry for a desktop CPU descriptor handle (note_lock held), or null.
 std::uint32_t* shadow_slot(u64 desktop_handle, std::uint32_t* room = nullptr)
 {
@@ -79,6 +108,38 @@ std::uint32_t shadow_id(u64 desktop_handle)
     return id;
 }
 
+// A descriptor slot that names a desktop resource: 18 SRV, 19 UAV, 20 RTV, 21 DSV. Slot 19 names two resources, the
+// view resource and the counter resource it may be paired with; slots 17 (CBV) and 22 (sampler) name none.
+bool view_slot_names_resource(std::uint32_t slot)
+{
+    return slot >= 18 && slot <= 21;
+}
+// The refs a materialized view record holds in a tracked descriptor slot: one for the slot's resource and, for a
+// slot-19 UAV, one more for its counter resource. One ref per slot, so the draw drain (retire_view_refs == 0) frees the
+// resource only once no tracked slot names it; repeated writes of the same view add nothing (note_view compares ids).
+void view_refs_add(std::uint32_t slot, u64 resource, u64 counter)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_add_view_ref(reinterpret_cast<const void*>(resource));
+    if (slot == 19 && counter) retire_add_view_ref(reinterpret_cast<const void*>(counter));
+}
+// Drops exactly the refs view_refs_add added for a materialized record: the overwrite in note_view, a copy that moves
+// another view over the slot (note_copy), and the destruction of the slot's heap (retire_drop_heap_views).
+void view_refs_release(std::uint32_t slot, u64 resource, u64 counter)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_release_view_ref(reinterpret_cast<const void*>(resource));
+    if (slot == 19 && counter) retire_release_view_ref(reinterpret_cast<const void*>(counter));
+}
+// The untracked-descriptor fallback: no slot can hold the resource for a view in a heap the shim does not shadow, so
+// the use takes the resource (and a slot-19 counter) out of the retire class for good, as before.
+void view_refs_leave_class(std::uint32_t slot, u64 resource, u64 counter, RetireLeft why)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_leave_class(reinterpret_cast<const void*>(resource), why);
+    if (slot == 19 && counter) retire_leave_class(reinterpret_cast<const void*>(counter), why);
+}
+
 constexpr std::uint32_t view_token_magic = 0x56573258;  // "X2WV"
 
 bool title_backed(u64 title_handle, u64 bytes)
@@ -90,11 +151,32 @@ bool title_backed(u64 title_handle, u64 bytes)
     ReleaseSRWLockShared(&descriptor_lock);
     return inside;
 }
+// True when the descriptor already holds a view created on the desktop: by its desktop shadow entry, or by a
+// materialized token the title copied into title memory with its own memory copy.
+bool descriptor_has_live_view(u64 desktop_handle, u64 title_handle)
+{
+    AcquireSRWLockShared(&note_lock);
+    const std::uint32_t* slot = shadow_slot(desktop_handle);
+    std::uint32_t id = slot ? *slot : 0;
+    bool live = id && id - 1 < view_records().size() && view_materialized()[id - 1];
+    ReleaseSRWLockShared(&note_lock);
+    if (live || title_handle == desktop_handle || !title_backed(title_handle, 32) ||
+        !x2w_local::readable(reinterpret_cast<const void*>(title_handle), 32))
+        return live;
+    std::uint32_t words[8];
+    std::memcpy(words, reinterpret_cast<const void*>(title_handle), sizeof(words));
+    if (words[0] != view_token_magic) return false;
+    AcquireSRWLockShared(&note_lock);
+    live = words[1] < view_records().size() && view_materialized()[words[1]];
+    ReleaseSRWLockShared(&note_lock);
+    return live;
+}
 
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
                    Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
                    const D3D12_DEPTH_STENCIL_DESC* depth_stencil = nullptr,
-                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN)
+                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN,
+                   const D3D12_RASTERIZER_DESC* rasterizer = nullptr)
 {
     PipelineInfo info;
     info.stream_translation = translation;
@@ -105,6 +187,10 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
     if (depth_stencil) {
         info.stream_depth_stencil = *depth_stencil;
         info.has_stream_depth_stencil = true;
+    }
+    if (rasterizer) {
+        info.stream_rasterizer = *rasterizer;
+        info.has_stream_rasterizer = true;
     }
     info.stream_dsv_format = dsv_format;
     info.path = path;
@@ -134,8 +220,26 @@ const PipelineInfo* pipeline_info(const Wrapper* w)
 void note_root_blob(Wrapper* w, const void* blob, std::size_t bytes)
 {
     if (!blob || !bytes || bytes > (1u << 20)) return;
+    std::vector<unsigned char> copy(static_cast<const unsigned char*>(blob), static_cast<const unsigned char*>(blob) + bytes);
+    // The blob the d3d12_xs serializer returned after removing the title's heap-indexing flags (see
+    // serialize_for_runtime in src/d3d12_xs_shim.cpp): the copy kept for shader translation gets that
+    // call's bits back, because the title's shaders take the heap pointers in the registers they add.
+    if (const std::uint32_t stripped = x2w_stripped_root_flags(blob, bytes); stripped && bytes >= 32 && !std::memcmp(copy.data(), "DXBC", 4)) {
+        std::uint32_t parts = 0;
+        std::memcpy(&parts, copy.data() + 28, 4);
+        for (std::uint32_t i = 0; i < parts && 32 + 4 * (i + 1) <= bytes; ++i) {
+            std::uint32_t at = 0;
+            std::memcpy(&at, copy.data() + 32 + 4 * i, 4);
+            if (std::size_t{at} + 8 + 24 <= bytes && !std::memcmp(copy.data() + at, "RTS0", 4)) {
+                std::uint32_t flags = 0;
+                std::memcpy(&flags, copy.data() + at + 8 + 20, 4);
+                flags |= stripped;
+                std::memcpy(copy.data() + at + 8 + 20, &flags, 4);
+            }
+        }
+    }
     AcquireSRWLockExclusive(&note_lock);
-    root_blobs()[w].assign(static_cast<const unsigned char*>(blob), static_cast<const unsigned char*>(blob) + bytes);
+    root_blobs()[w] = std::move(copy);
     ReleaseSRWLockExclusive(&note_lock);
 }
 // This index only lists active slot-133 wrappers. The existing resource record
@@ -151,11 +255,41 @@ PlacementIndex& placement_group(u64 width)
     return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
 }
 
+// Resources by the title memory they start at (note_lock held), for the memory SRV lookups. An entry stays
+// as long as the resource's record in resource_infos does (never pruned); every lookup applies its own
+// live-reference filter, so a released resource is skipped there and found again if it is referenced again.
+x2w_startup::AddressIndex<const Wrapper*>& resource_address_index() { static x2w_startup::AddressIndex<const Wrapper*> m; return m; }
+// X2W_RESOURCE_INDEX_CHECK=1 checks the index on every memory SRV call (check_resource_address_index);
+// =2 is the negative control: the same check with index inserts skipped, which it must report.
+int resource_index_check_mode()
+{
+    // Only "1" and "2" turn it on; anything else, including a value too long for the buffer, is off.
+    static const int mode = [] {
+        char v[4]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_RESOURCE_INDEX_CHECK", v, sizeof(v));
+        return n == 1 && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+    }();
+    return mode;
+}
+u64 resource_index_extent(const ResourceInfo& info)
+{
+    return (std::max)(info.bytes, info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0);
+}
+// The index entry of a resource whose record is already published (publish_placement's hook); may throw.
+void index_resource(const Wrapper* w, const ResourceInfo& info)
+{
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    if (!base || resource_index_check_mode() == 2) return;
+    resource_address_index().insert(base, resource_index_extent(info), w);
+}
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
-    resource_infos()[w] = ResourceInfo{*console, bytes};
+    const ResourceInfo info{*console, bytes};
+    // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
+    x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
+        resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);
 }
 void retire_placement(Wrapper* w)
 {
@@ -176,7 +310,7 @@ void retire_placement(Wrapper* w)
     ReleaseSRWLockExclusive(&note_lock);
 }
 
-PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes)
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes, bool aliases_only = false)
 {
     PlacedVertexView result{};
     if (!start || !bytes) return result;
@@ -189,7 +323,8 @@ PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes
         for (auto it = group.by_start.lower_bound(earliest); it != group.by_start.end() && it->first < end; ++it) {
             const auto* owner = it->second;
             const auto& info = resource_infos().at(owner);
-            if (info.placement_device != device) continue;
+            if (info.placement_device != device || (aliases_only && info.placement != Placement::aliased_buffer))
+                continue;
             const u64 base = it->first;
             if (base <= start && start - base >= info.bytes) continue;
             if (result.owner || start < base || bytes > info.bytes - (start - base)) {
@@ -250,12 +385,53 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         record.id = found->second;
     } else {
         record.id = static_cast<std::uint32_t>(view_records().size());
+        const bool census = view_census_enabled();
+        std::size_t capacity_before = 0, buckets_before = 0;
+        bool records_full = false, ids_full = false;
+        if (census) {
+            capacity_before = view_records().capacity();
+            buckets_before = view_ids().bucket_count();
+            records_full = view_records().size() == capacity_before;
+            // MSVC's rule: unordered_map rehashes when the new size would exceed the maximum load factor.
+            ids_full = static_cast<float>(view_ids().size() + 1) / static_cast<float>(buckets_before) >
+                       view_ids().max_load_factor();
+            // Logged before the allocation, so the last line survives an allocation that fails.
+            if (records_full || ids_full) {
+                view_census.grows_records += records_full;
+                view_census.grows_ids += ids_full;
+                char line[640];
+                view_census_format(line, sizeof(line),
+                                   records_full && ids_full ? "before growth of records and ids"
+                                   : records_full           ? "before growth of records"
+                                                            : "before growth of ids");
+                log("%s (new slot %u)", line, record.slot);
+            }
+        }
         view_records().push_back(record);
         view_materialized().push_back(created);
         view_ids()[hash] = record.id;
         ++views_distinct;
+        if (census) {
+            if (record.slot >= 17 && record.slot <= 22) ++view_census.distinct[record.slot - 17];
+            view_census.missed += !records_full && view_records().capacity() != capacity_before;
+            view_census.missed += !ids_full && view_ids().bucket_count() != buckets_before;
+        }
     }
-    if (std::uint32_t* slot = shadow_slot(dest_desktop)) *slot = record.id + 1;
+    if (std::uint32_t* slot_ptr = shadow_slot(dest_desktop)) {
+        const std::uint32_t prev = *slot_ptr;
+        *slot_ptr = record.id + 1;
+        // The same view written to the same slot again keeps its id and changes no reference count. A different view
+        // takes over the slot: the new record adds its refs, the previous materialized record drops its own.
+        if (prev != record.id + 1) {
+            if (materialized) view_refs_add(static_cast<std::uint32_t>(slot), resource, counter);
+            if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
+                view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
+                                  view_records()[prev - 1].counter);
+        }
+    } else if (view_slot_names_resource(static_cast<std::uint32_t>(slot)) && resource) {
+        // A descriptor no shadow slot tracks cannot hold the view: the use takes the resource out of the class.
+        view_refs_leave_class(static_cast<std::uint32_t>(slot), resource, counter, RetireLeft::view);
+    }
     ReleaseSRWLockExclusive(&note_lock);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
     if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
@@ -273,8 +449,39 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
     std::uint32_t* to = shadow_slot(dest_desktop, &dest_room);
     const std::uint32_t* from = shadow_slot(src_desktop, &src_room);
     if (to && count <= dest_room) {
-        if (from && count <= src_room) std::memmove(to, from, u64{count} * 4);
-        else std::memset(to, 0, u64{count} * 4);
+        if (from && count <= src_room) {
+            // Every copied-in view is now named by one more tracked slot; every view the destination named before is
+            // replaced. Slots 18-21 count one ref (slot 19 one for the resource and one for its counter).
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t src_id = from[i];
+                if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
+                    view_refs_add(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
+                                  view_records()[src_id - 1].counter);
+            }
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t old_id = to[i];
+                if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
+                    view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
+                                      view_records()[old_id - 1].counter);
+            }
+            std::memmove(to, from, u64{count} * 4);
+        } else {
+            for (UINT i = 0; i < count; ++i) {
+                const std::uint32_t old_id = to[i];
+                if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
+                    view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
+                                      view_records()[old_id - 1].counter);
+            }
+            std::memset(to, 0, u64{count} * 4);
+        }
+    } else if (from && count <= src_room) {
+        // The destination is not tracked: the copy puts the views where no shadow slot can hold them.
+        for (UINT i = 0; i < count; ++i) {
+            const std::uint32_t src_id = from[i];
+            if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
+                view_refs_leave_class(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
+                                      view_records()[src_id - 1].counter, RetireLeft::view_copy);
+        }
     }
     ReleaseSRWLockExclusive(&note_lock);
     const UINT stride = title_descriptor_stride(dest_title, increment);

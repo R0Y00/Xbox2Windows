@@ -11,7 +11,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -55,12 +57,21 @@ inline bool valid_name(std::string_view name) noexcept
             same = std::tolower(static_cast<unsigned char>(tail[i])) == suffix[i];
         if (same) return false;
     }
-    std::string stem(name.substr(0, name.find('.')));
-    for (char& c : stem) c = static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c);
-    while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+    std::string_view stem = name.substr(0, name.find('.'));
+    while (!stem.empty() && stem.back() == ' ') stem.remove_suffix(1);
+    const auto upper = [](char c) { return static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c); };
+    const auto matches = [&](std::string_view device) {
+        if (stem.size() != device.size()) return false;
+        for (std::size_t i = 0; i < stem.size(); ++i)
+            if (upper(stem[i]) != device[i]) return false;
+        return true;
+    };
     for (const char* device : {"CON", "PRN", "AUX", "NUL"})
-        if (stem == device) return false;
-    if (stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) && stem[3] >= '0' && stem[3] <= '9') return false;
+        if (matches(device)) return false;
+    if (stem.size() == 4 && stem[3] >= '0' && stem[3] <= '9') {
+        stem.remove_suffix(1);
+        if (matches("COM") || matches("LPT")) return false;
+    }
     return true;
 }
 
@@ -122,7 +133,7 @@ public:
     // Index of the update slot, or -1 (container not open, or no free update slot).
     long begin_update(std::size_t container)
     {
-        if (container >= capacity || names_[container].empty()) return -1;
+        if (container >= capacity || refs_[container] == 0) return -1;
         for (std::size_t i = 0; i < capacity; ++i)
             if (!updates_[i]) {
                 updates_[i] = static_cast<int>(container) + 1;
@@ -144,8 +155,13 @@ public:
     {
         if (update >= capacity || !updates_[update]) return false;
         if (action.data.size() > max_staged_bytes - staged_bytes_[update]) return false;
-        staged_bytes_[update] += action.data.size();
-        staged_[update].push_back(std::move(action));
+        const std::size_t size = action.data.size();
+        try {
+            staged_[update].push_back(std::move(action));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        staged_bytes_[update] += size;
         return true;
     }
     // The staged actions in order; the update starts empty again.
@@ -365,6 +381,7 @@ public:
     // not at all. All or nothing; a blob missing from the container is not_found.
     Status read_blobs(std::string_view container, const std::vector<std::string>& blobs, std::vector<std::vector<unsigned char>>& out) const
     {
+        // x2w-seam: store-read
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
         for (const std::string& blob : blobs)
@@ -376,8 +393,10 @@ public:
         FileLock publication;
         if (const Status locked = lock_container(publication, container, false); locked != Status::ok) return locked;
         std::vector<std::vector<unsigned char>> all(blobs.size());
-        for (std::size_t i = 0; i < blobs.size(); ++i)
+        for (std::size_t i = 0; i < blobs.size(); ++i) {
             if (const Status status = read_file(dir / blobs[i], all[i]); status != Status::ok) return status;
+            // x2w-seam: blob-read
+        }
         out = std::move(all);
         return Status::ok;
     }
@@ -419,9 +438,15 @@ public:
     // a commit from any process is listed whole or not at all. Regular files only, by name (byte
     // order), with their sizes; links, directories and names valid_name refuses are not listed.
     // not_found: no such container. busy: the publication point stayed locked for the whole lock
-    // timeout. too_large: a blob is over max_blob_bytes. `out` is replaced only on ok.
-    Status list_blobs(std::string_view container, std::vector<BlobEntry>& out) const
+    // timeout. too_large: a blob is over max_blob_bytes. `out` is replaced only on ok. With
+    // `payloads`, the listed blobs are also read under the same lock (one generation for names,
+    // sizes and bytes); it is replaced only on ok, in the order of `out`. `read_if`, when given, sees
+    // the listing first: when it returns false nothing is read and `payloads` is left empty.
+    Status list_blobs(std::string_view container, std::vector<BlobEntry>& out,
+                      std::vector<std::vector<unsigned char>>* payloads = nullptr,
+                      const std::function<bool(const std::vector<BlobEntry>&)>& read_if = {}) const
     {
+        // x2w-seam: store-read
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
         std::error_code ec;
@@ -456,6 +481,18 @@ public:
         }
         if (ec) return Status::io_error;
         std::sort(found.begin(), found.end(), [](const BlobEntry& a, const BlobEntry& b) { return a.name < b.name; });
+        if (payloads) {
+            std::vector<std::vector<unsigned char>> all;
+            if (!read_if || read_if(found)) {
+                all.resize(found.size());
+                for (std::size_t i = 0; i < found.size(); ++i) {
+                    if (const Status status = read_file(dir / found[i].name, all[i]); status != Status::ok) return status;
+                    found[i].bytes = all[i].size();
+                    // x2w-seam: blob-read
+                }
+            }
+            *payloads = std::move(all);
+        }
         out = std::move(found);
         return Status::ok;
     }

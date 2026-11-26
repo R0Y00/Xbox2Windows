@@ -45,7 +45,8 @@ README = "\n".join([
 
 
 def report(adapter="Example GPU 100", device="1111", driver="1.0", backend="hardware", lanes=32,
-           lane_range="32..32", model="0x66", wave64="SKIP", tier=11, bvh="PASS", debug="unavailable"):
+           lane_range="32..32", model="0x66", wave64="SKIP", tier=11, bvh="PASS", debug="unavailable",
+           shaders=None):
     """Return a report in the layout that tools/gpu-check/Run-GpuCheck.ps1 writes."""
     head = [f"backend={backend} debug_layer={debug}", f"adapter={adapter} vendor=10de device={device}",
             f"driver={driver}"]
@@ -60,6 +61,14 @@ def report(adapter="Example GPU 100", device="1111", driver="1.0", backend="hard
         ("bvh_wave64", wave64, head + w64),
         ("bvh_differential", bvh, head + diff),
     ]
+    if shaders:
+        # The replayed shader cases are one section; the runner lists every case in its block.
+        verdict = "1 fail" if shaders == "FAIL" else "0 fail"
+        cases.append(("gfx2hlsl_shaders", shaders, [
+            "translated compute shaders replayed from the package (compiler, case, result)",
+            f"cases: 2 pass, {verdict}, 0 skip of 2",
+            "dxc gfx2hlsl_compute/A PASS",
+            "dxc gfx2hlsl_compute/control-dropped-store " + ("FAIL: control not rejected: exit 0" if shaders == "FAIL" else "PASS: control rejected")]))
     lines = ["## Xbox2Windows GPU report", "", f"Source commit: {COMMIT}", "Windows build: 26100.1000",
              f"Backend: {backend}", "", "### Summary", "",
              f"- Adapter: {adapter} (vendor=10de device={device})", f"- Driver: {driver}",
@@ -172,6 +181,18 @@ class HardwareReportChecks(unittest.TestCase):
                 row = hardware_reports.matching_row(only_report(body), rows)
                 self.assertEqual(row.adapter if row else None, expected)
 
+    def test_replayed_shader_cases_are_one_section_that_can_fail(self):
+        """The shader section changes the pass and failure counts and nothing else in the report cells."""
+        plain = hardware_reports.summarize([comment(410, report())], README)
+        passing = hardware_reports.summarize([comment(411, report(shaders="PASS"))], README)
+        failing = hardware_reports.summarize([comment(412, report(shaders="FAIL"))], README)
+        entry = lambda summary: summary["unrecorded"][0]
+        cells = lambda summary: {k: v for k, v in entry(summary)["cells"].items() if k != "evidence"}
+        self.assertEqual(entry(passing)["passed"], entry(plain)["passed"] + 1)
+        self.assertEqual(cells(passing), cells(plain))
+        self.assertEqual(entry(failing)["failed"], ["gfx2hlsl_shaders"])
+        self.assertEqual(cells(failing), cells(plain))
+
     def test_markdown_lists_failed_and_skipped_separately(self):
         """A skipped test is not a failed one, and both are named on the one Tests line.
 
@@ -252,6 +273,31 @@ class HardwareReportChecks(unittest.TestCase):
                 self.assertEqual(summary["unrecorded"][1]["cells"]["bvh"], PASSED)
                 self.assertEqual([(item["comment_id"], item["reason"]) for item in summary["review"]],
                                  [(700, f"duplicate test section: {name}")])
+
+    def test_conflicting_backends_go_to_manual_review(self):
+        hardware = report()
+        warp = report(backend="warp", adapter="Microsoft Basic Render Driver", lanes=4, lane_range="4..4")
+        cases = [
+            (hardware.replace("Backend: hardware", "Backend: warp"),
+             "conflicting backends: report says warp, test sections say hardware"),
+            (warp.replace("Backend: warp", "Backend: hardware"),
+             "conflicting backends: report says hardware, test sections say warp"),
+            (hardware.replace("### bvh_wave64_hardware", "### bvh_wave64_warp"),
+             "conflicting backends: test sections name both hardware and warp"),
+        ]
+        for body, reason in cases:
+            with self.subTest(reason=reason):
+                summary = hardware_reports.summarize([comment(702, body + "\n\n" + warp)], README)
+                self.assertEqual([(item["adapter"], item["backend"], item["row"]) for item in summary["unrecorded"]],
+                                 [("Microsoft Basic Render Driver", "warp", "Microsoft WARP (software)")])
+                self.assertEqual([(item["comment_id"], item["reason"]) for item in summary["review"]],
+                                 [(702, reason)])
+
+    def test_section_suffix_supplies_a_missing_backend_header(self):
+        for backend in ("hardware", "warp"):
+            with self.subTest(backend=backend):
+                body = report(backend=backend).replace(f"Backend: {backend}\r\n", "")
+                self.assertEqual(only_report(body).backend, backend)
 
     def test_edited_reports_are_read_with_a_note(self):
         edited = report().replace(f"Source commit: {COMMIT}", "**Source commit:** `0123456`")

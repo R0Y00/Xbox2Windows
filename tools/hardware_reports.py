@@ -9,8 +9,8 @@ The tool reads the layout written by tools/gpu-check/Run-GpuCheck.ps1. For each 
 whose comment README.md does not link, it prints the adapter, driver, Windows build,
 source commit, debug-layer status and test results, the coverage row the report
 belongs to and suggested cells. Comments with results in another layout, such as an
-attached report file, a Linux translation-layer run, or repeated test sections, are
-listed for manual review.
+attached report file, a Linux translation-layer run, repeated test sections or
+conflicting hardware and WARP labels, are listed for manual review.
 The tool makes no network requests and does not edit README.md. A maintainer still
 checks every row against the original report.
 """
@@ -31,6 +31,7 @@ HEADER = "## Xbox2Windows GPU report"
 TABLE_HEADER = "| Adapter or backend | Default native lanes | Forced wave64 | BVH differential | Evidence |"
 EN_DASH = "\u2013"
 DUPLICATE_SECTION = "duplicate test section: "
+BACKEND_CONFLICT = "conflicting backends: "
 
 # Run-GpuCheck.ps1 reads its summary with these patterns. tests/hardware_reports_check.py
 # keeps both copies equal.
@@ -107,9 +108,12 @@ def load_comments(paths: list[Path]) -> list[dict]:
                 break
             value, index = decoder.raw_decode(text, index)
             for item in value if isinstance(value, list) else [value]:
-                if not isinstance(item, dict) or not isinstance(item.get("id"), int) or "body" not in item:
-                    raise ValueError(f"{path}: expected GitHub issue comment objects with id and body")
-                comments[item["id"]] = item
+                cid = item.get("id") if isinstance(item, dict) else None
+                if isinstance(cid, bool) or not isinstance(cid, int) or cid < 0 or "body" not in item:
+                    raise ValueError(
+                        f"{path}: expected GitHub issue comment objects with non-negative integer id and body"
+                    )
+                comments[cid] = item
     return [comments[key] for key in sorted(comments)]
 
 
@@ -151,13 +155,18 @@ def parse_segment(comment: dict, text: str) -> tuple[Report | None, str | None]:
             return None, f"{DUPLICATE_SECTION}{name}_{match.group(3)}"
         results[name] = match.group(5)
         blocks[name] = text_blocks(text[match.end():end])
+    section_backends = {match.group(3) for match in sections}
+    if len(section_backends) > 1:
+        return None, BACKEND_CONFLICT + "test sections name both hardware and warp"
+    backend = section_backends.pop()
+    for label in BACKEND_LINE.finditer(text, 0, sections[0].start()):
+        if label.group(1) != backend:
+            return None, f"{BACKEND_CONFLICT}report says {label.group(1)}, test sections say {backend}"
     joined = "\n".join(blocks.values())
     fields = {}
     for key, pattern in FIELD_PATTERNS.items():
         found = re.search(pattern, joined)
         fields[key] = found.group(1).strip() if found else None
-    backends = sorted({match.group(3) for match in sections})
-    backend = BACKEND_LINE.search(text)
     build = BUILD_LINE.search(text)
     adapter_filter = FILTER_LINE.search(text)
     report = Report(
@@ -167,7 +176,7 @@ def parse_segment(comment: dict, text: str) -> tuple[Report | None, str | None]:
         created=comment.get("created_at") or "",
         commit=commit.group(1),
         windows_build=build.group(1) if build else None,
-        backend=backend.group(1) if backend else "/".join(backends),
+        backend=backend,
         adapter_filter=adapter_filter.group(1) if adapter_filter else None,
         fields=fields,
         results=results,
@@ -181,8 +190,6 @@ def parse_segment(comment: dict, text: str) -> tuple[Report | None, str | None]:
     )
     if edited:
         report.notes.append("edited report layout; compare the cells with the comment")
-    if len(backends) > 1:
-        report.notes.append("sections name more than one backend")
     return report, None
 
 
@@ -212,9 +219,10 @@ def parse_comment(comment: dict) -> tuple[list[Report], str | None]:
             reports.append(report)
         elif reason:
             reasons.append(reason)
-    # A duplicate can hide evidence even when another pasted run is usable.
-    duplicate = next((reason for reason in reasons if reason.startswith(DUPLICATE_SECTION)), None)
-    return reports, duplicate if reports else next(iter(reasons), None)
+    # Keep ambiguous results visible even when another pasted run is usable.
+    if reports:
+        reasons = [reason for reason in reasons if reason.startswith((DUPLICATE_SECTION, BACKEND_CONFLICT))]
+    return reports, next(iter(reasons), None)
 
 
 def first_int(pattern: str, text: str) -> int | None:
@@ -441,6 +449,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
     args = parser.parse_args(argv)
     try:
+        if args.after is not None and args.after < 0:
+            raise ValueError(f"--after must be non-negative, got {args.after}")
+        for path in args.comments:
+            if path.is_dir():
+                raise IsADirectoryError(f"comments path is a directory: {path}")
+            if not path.is_file():
+                raise FileNotFoundError(f"comments file not found: {path}")
+        if args.readme.is_dir():
+            raise IsADirectoryError(f"--readme path is a directory: {args.readme}")
+        if not args.readme.is_file():
+            raise FileNotFoundError(f"--readme file not found: {args.readme}")
         comments = load_comments(args.comments)
         summary = summarize(comments, args.readme.read_text(encoding="utf-8"), args.after)
     except (OSError, ValueError) as error:
