@@ -6277,6 +6277,10 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_(store_aot_heap_view_load_|heap_view_controls$)' -V
 ```
 
+The 56 matching references and seven wrong references run in two shader batches, one for XY and one for
+XYZW. Each dispatch still checks all 320 words. Each wrong reference must report its first differing
+word, including the expected and actual values. The fourteen recompiled mutations run individually.
+
 ```sh
 python3 -B tests/compute_heap_view_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
@@ -9513,6 +9517,16 @@ and unproven wave masks remain unsupported. Use
 `python -B tests/startup_mesh57_skeleton_check.py` for translations and refusals.
 Append `draw <dxc> <offscreen_check> <warp|hardware>` for CPU-reference readback
 of the SCC paths and lane-masked if/else.
+
+The `startup_mesh57_loop_refusal` check is a source-built program with the same
+exchanges plus one deliberate back-edge after the count exchange
+(`tests/startup_mesh57_loop_refusal.s`). Tip refuses it with
+`slot 57 mesh: a loop outside the group-memory exchanges is not covered`. The
+mutant replaces that back-edge with a second `s_nop` and must not stop on that
+loop message. The oracle is an exact string match; a stub that only checks for
+any `unsupported:` result would accept a wrong reason and is rejected by the
+check. Host-only (no WARP/hardware draw). Run
+`python -B tests/startup_mesh57_loop_refusal_check.py`, or the matching CTest.
 
 A forward `s_cbranch_vccz` or `s_cbranch_vccnz` can also branch on the
 lane's VCC bit when EXEC is full and every incoming path last wrote VCC with
@@ -15721,6 +15735,23 @@ Command-list slot 14 (`Dispatch`) is recorded on the desktop list only when the 
 ```powershell
 cmake --build --preset dev --target startup_list_dispatch_check startup_list_dispatch_native
 ctest --preset dev --no-tests=error -R "^startup_list_dispatch" -V
+```
+
+## Startup translator: explicit-gradient image_sample_d
+
+`tools/startup/gfx2hlsl.py` lowers the gfx1013 `image_sample_d` form in a pixel stage to `tex.SampleGrad(smp, uv, ddx, ddy)`. The address dwords are ddx, then ddy (one register per coordinate axis each), then the coordinates: six registers for 2D, seven for a 2D array (slice last), nine for a volume (a contiguous nine-dword volume address encoded as a sixteen-register range is trimmed to nine). Only `dim:`, `dmask:` and the cache-policy bits `dlc`, `glc`, `slc` are accepted.
+
+Refused with a named reason: `image_sample_c_d` (it would need `SampleCmpGrad`, shader model 6.8; only `image_sample_c` and `_c_lz` are lowered), `image_sample_d_o` and every other offset, bias, clamp, `a16`, `tfe` or `lwe` form, an empty `dmask`, a 1D image, and an address count that does not match the dimension.
+
+The guest sampler LOD range is kept: a constant sampler carries MIN_LOD and MAX_LOD to the static sampler through the same `smpl` line as `image_sample`, `_l` and `_lz` (sampler words `(0, 0, 0x04000000, 0)` stay capped at mip 0), with the same refusals for a LOD bias and for MIN_LOD above MAX_LOD. A mip filter of 0 keeps the ordinary sampler, and a heap sampler is not validated and is logged once per module.
+
+Verified: the Python translation checks (address order, refusals, the LOD cap, fixture words against `llvm-mc`) and a D3D12 draw on WARP and hardware (`tests/startup_image_sample_d_draw_check.py`): four `SampleGrad` probes on a three-mip, two-slice fixture read back against a CPU reference, with a MAX_LOD 0 sampler and an implicit `Sample` as negative controls.
+
+```bash
+./out/pe-env/bin/python -B tests/startup_image_sample_d_check.py
+./out/pe-env/bin/python -B tests/startup_image_sample_d_check.py binary <llvm-mc>
+ctest --preset dev --no-tests=error -R "^startup_image_sample_d" -V
+ctest --preset dev --no-tests=error -R "^startup_image_sample_d_draw_(warp|hardware)$" -V
 ```
 
 ### Startup 24-bit multiplies, v_xnor_b32 and the funnel shifts

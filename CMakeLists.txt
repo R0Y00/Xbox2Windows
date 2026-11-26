@@ -3156,6 +3156,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_ngg_slice_check.py")
     add_test(NAME startup_image_sample_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_l_check.py")
+    add_test(NAME startup_image_sample_d COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_d_check.py")
+    # image_sample_d drawn on D3D12 (FXC 5_1 and DXC 6_0): GPU readback of the mip chosen by explicit gradients.
+    add_test(NAME startup_image_sample_d_draw_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_d_draw_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_image_sample_d_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_d_draw_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_image_sample_d_draw_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_image_gather_lz COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_gather_lz_check.py")
     add_test(NAME startup_compute_gather_lz COMMAND "${INTAKE_PYTHON}" -B
@@ -3207,6 +3218,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_op_refusals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_op_refusals_check.py")
     set_tests_properties(startup_gfx2hlsl_op_refusals PROPERTIES TIMEOUT 60)
+    # gfx2hlsl carries a descriptor pointer through s_add_u32 / s_addc_u32 with a literal offset (#1723).
+    add_test(NAME startup_gfx2hlsl_desc_ptr_prop COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_desc_ptr_prop_check.py")
+    set_tests_properties(startup_gfx2hlsl_desc_ptr_prop PROPERTIES TIMEOUT 60)
     # gfx2hlsl refuses a binary32 or integer vector operation with a source too few or too many.
     add_test(NAME startup_gfx2hlsl_operand_count COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_operand_count_check.py")
@@ -3345,6 +3360,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Slot 57 mesh requests (#2413): the one accepted group-memory shape translates; each mutation is refused.
     add_test(NAME startup_mesh57_skeleton COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py")
+    # Slot 57 mesh loop refusal outside the accepted exchanges (#2413 T6); mutant drops the back-edge.
+    add_test(NAME startup_mesh57_loop_refusal COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh57_loop_refusal_check.py")
     # Scalar SOPK accumulate: s_addk_i32 signed-overflow SCC and s_mulk_i32 against an integer reference.
     add_test(NAME startup_gfx2hlsl_sopk_accum COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sopk_accum_check.py")
@@ -10267,6 +10285,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(shader_rdna_cvt_pk_u8_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME shader_metadata_census COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/shader_census_check.py")
+    add_test(NAME shader_census_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/shader_census_cli_check.py")
     add_test(NAME shader_profile_audit_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/shader_profile_audit_check.py")
     add_test(NAME shader_profile_audit_cli_check COMMAND "${INTAKE_PYTHON}" -B
