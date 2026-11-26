@@ -9417,6 +9417,84 @@ On a multi-GPU system, set `$env:XBOX2WINDOWS_ADAPTER` to a case-insensitive par
 adapter's name, then run `startup_indirect_count_hardware`. The fixture prints the selected adapter,
 driver, GPU-written count and fenced result. An unmatched or overlong hardware selector fails the test.
 
+#### Batched indirect Dispatch on RDNA 1
+
+On an AMD Radeon RX 5700 XT (RDNA 1, vendor `1002`, device `731f`), Windows 11
+build 26200.9974, debug layer unavailable, desktop `ExecuteIndirect` with a
+12-byte Dispatch signature runs exactly one command whatever its
+`MaxCommandCount`, with or without a count buffer. A standalone D3D12 program
+without the shim ran three records `(2,1,1)`, `(1,2,1)`, `(1,1,3)` and got only
+the first one's groups. This held for the direct and compute queues, a root UAV
+and a descriptor table, `numthreads(1,1,1)` and `(64,1,1)`, records of 64
+groups, arguments in a DEFAULT or UPLOAD heap, a count buffer in the argument
+buffer or apart from it, and strides of 12 and 16. A single-command call also
+ignores its count buffer: a count word of 0 still ran the record. Three
+single-command calls without a count buffer were exact. WARP 10.0.26100.9818
+was exact in every case. Drivers 32.0.21045.29003, 32.0.21045.16010,
+32.0.21025.10016, 32.0.12033.1030 and 31.0.23013.1023 (Adrenalin 26.11.2 back
+to 23.12.1) behave the same. On the issue, an NVIDIA GeForce RTX 4060
+(32.0.15.9579), an Intel UHD Graphics 770 (32.0.101.5973) and WARP
+10.0.26100.9711 matched all nine standalone variants. No second RDNA 1 adapter
+has been measured, and the cause is not established.
+[Report](https://github.com/R0Y00/Xbox2Windows/issues/2626)
+
+With `X2W_SPLIT_INDIRECT_DISPATCH=1`, slot 61 splits a batched or counted
+Dispatch ([`split_indirect_dispatch.h`](../src/startup_stubs/split_indirect_dispatch.h)).
+It is opt-in: without the variable the native call runs on every adapter,
+RDNA 1 included, until a second RDNA 1 adapter has been measured. It applies
+only to a rootless Dispatch signature with a desktop compute pipeline and root;
+the translated compute path and the other indirect command kinds are
+unchanged. The count word and the records are copied into a scratch buffer. A
+compute pass rewrites record `i` as itself while `i < min(count, MaxCommandCount)`
+and as `(0,0,0)` otherwise. `MaxCommandCount` single-command calls without a
+count buffer then read the rewritten records.
+
+The pass replaces the compute root and pipeline. The compute state a title can
+set on the desktop list is the pipeline (slot 25), the root (slot 33) and root
+SRVs (slot 43); the other compute root setters are not forwarded. The split
+sets the pipeline again, and `restore_compute_root` sets the root with every
+view recorded by `bind_compute_root_view`. The indexed-draw validation pass
+uses the same restore. Slot 43 records its root SRVs through
+`bind_compute_root_view`. The fixture's result UAV is a desktop address that no
+guest slot can bind, so the fixture binds it through the export
+`x2w_d3d12_fixture_compute_root_uav`, which records it through the same
+function. A UAV bound on the desktop list directly is lost after the split: in
+an earlier fixture that did so, the split left the result at its sentinel.
+
+The scratch is kept with the recording's desktop allocator
+(`x2w_d3d12_recording_scratches` reports how many it holds) and is released
+only when that allocator is reset after every queue that ran it has passed its
+fence.
+
+`startup_indirect_count_(warp|hardware)` keep the native call. On the RX 5700
+XT (driver 32.0.21045.29003) the hardware test still fails at its first case
+(`result=0x31415929`, expected `0x31415935`), which shows the driver behavior.
+`startup_indirect_count_split_(warp|hardware)` run the same fixture with the
+split on. Each case checks the whole readback, sentinel and guard included:
+
+- GPU-written counts 2, 9 (above the maximum of 3), 0, 1 and 3; a zero count
+  leaves the result at its sentinel;
+- an omitted writer, no count buffer, and the five refusals;
+- a follow-up `Dispatch(1, 1, 2)` recorded on the desktop list after the split,
+  which adds 102 only if the consumer pipeline, its compute root and the result
+  UAV are still bound;
+- the scratch count after Close (one per accepted call with the split on, none
+  otherwise);
+- a submission through a guest queue that waits on a gate fence. The guest
+  allocator is reset while the work is pending, the recording must still hold
+  its scratch, and after the gate opens the records produce the count-2 result.
+
+Both pass on WARP 10.0.26100.9818 and the RX 5700 XT. Two local controls, not
+committed, each failed both: skipping `restore_compute_root` after the pass
+(first case, `result=0x31415926`, expected `0x31415935`), and not retaining the
+scratch with the recording ("recording holds 0 split scratch buffers after
+Close, expected 1").
+
+```powershell
+cmake --build --preset dev --target startup_indirect_dispatch
+ctest --preset dev --no-tests=error -R '^startup_indirect_count(_split)?_(warp|hardware)$' -V
+```
+
 #### Root constants in an indirect dispatch signature
 
 Device slot 41 also accepts a compute signature with a root signature, whose
@@ -15668,6 +15746,23 @@ and array views and for unreadable arguments. `startup_address_srv_hardware` and
 `startup_address_srv_warp` also match the five lines of their refused calls (zero address, other
 width, interior address, a buffer view, a destination off the heap) and show the descriptor unchanged.
 
+### Copied raw vertex-buffer SRVs
+
+`startup_copied_vertex_srv` publishes 512-byte and 256-byte raw views of the
+same source-built buffer into separate slots. It copies each view in turn to
+the bound table slot, compares the guest-visible descriptor bytes with the
+source slot, and draws a band with that binding. The vertex shader reads
+distinct words at byte offsets 224 and 288. All 32 pixels must show both words
+with the full view, only the first word with the stale short view, and both
+words again after copying the full view back. This covers the copy and lookup
+sequence through slot 24 for #2695. The descriptor producer in the executable's
+diagnostic run remains unidentified.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer
+ctest --preset release --no-tests=error -R '^startup_(copied_vertex_srv|address_buffer_srv|frame_copy)_(warp|hardware)$' -V
+```
+
 ```powershell
 cmake --build --preset release --target startup_memory_srv_report_check startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^(startup_memory_srv_report|startup_address_srv_)' -V
@@ -16314,6 +16409,13 @@ The log line `x2w-render compute dispatches: translated <n>, refused <n>, no tra
 
 Measured on three fixture programs. The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
 
+The `startup_compute_live_retry_warp` and `startup_compute_live_retry_hardware` tests keep the device and
+slot 67 pipeline alive across two fenced Dispatch calls. The first observes the missing translation and
+preserves all 320 output words. The test runs `gfx2hlsl.py --pending` while the process waits, then checks
+the second output against the source program once the one-second manifest poll interval has elapsed.
+A second run keeps the manifest absent and checks both refusals and both untouched outputs.
+Run the two backends with `ctest --preset release --no-tests=error -j 1 -R '^startup_compute_live_retry_(warp|hardware)$' -V`.
+
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
@@ -16708,3 +16810,14 @@ Linux controls, `form_coverage_check.check_sdwa_cvt_forms`, and Python reference
 ```powershell
 ctest --test-dir out/build/release --no-tests=error -R "^startup_gfx2hlsl_scalar_null_(controls|warp|hardware)$" -V
 ```
+## `src_scc` as a scalar source
+
+`s_mul_i32 s28, 1.0, src_scc` was refused as `operand 'src_scc'` (issue #1820), one of the refused shaders
+in the loading-screen cache (#870). Scalar source code 253 reads the SCC bit as the integer value 0 or 1
+(fitting in 16 bits, so `low16_only=True` returns the same expression), and the generated shader carries SCC
+as a `bool scc`, so `Stage.u()` lowers `src_scc` to `(scc ? 1u : 0u)` when a modeled writer has set SCC
+on every reaching path in the current block (`s_cmp_*` / `s_and_b32` etc. via `set_scc()`, `set_exec_scc()`,
+or `scalar_wide_op()`). Reads where incoming SCC is unverified are refused: at shader entry, across
+control-flow joins/branch targets, after descriptor-elided SCC writes, and after unmodeled SCC writers in
+`SCC_UNMODELLED` such as `s_add_u32` (after `s_add_u32` finishes reading its own sources). Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc$' -V`.
