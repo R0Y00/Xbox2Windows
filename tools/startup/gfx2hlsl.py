@@ -835,6 +835,12 @@ def scalar_free_span(ins, lo, hi):
     return True
 
 
+def vcc_read_after(ins, at):
+    """True when an instruction after offset `at` reads VCC. After an EXEC-narrowing loop the wave's VCC holds the last
+    compare, whose bits are 0 for every lane that left earlier; a lane running alone keeps its own last bit (1)."""
+    return any(key.startswith('vcc') for off, _n, name, asm in ins if off > at for key in scalar_effects(name, asm)[0])
+
+
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
@@ -3387,7 +3393,8 @@ class Stage:
         # Branches inside a block a forward s_cbranch_execz skips (and the close of a proven waterfall, waterfall_closes): execz_refusals has proven that block (a refused one
         # refuses the program), its loops and branches included, so they are not refused again as whole-wave decisions.
         execnz_loops = {pc for pc, to in branches if to <= pc and names[pc] == 's_cbranch_execnz'
-                        and scalar_free_span(self.ins, to, pc)} if getattr(self, 'kind', None) == 'cs' else set()
+                        and scalar_free_span(self.ins, to, pc) and not vcc_read_after(self.ins, pc)
+                        } if getattr(self, 'kind', None) == 'cs' else set()
         execz_covered = {off for pc, to in branches if to > pc and names[pc] == 's_cbranch_execz'
                          for off in offsets_between(self.ins, pc, to)} if getattr(self, 'kind', None) == 'cs' else set()
         self.mesh_allocation_block = None
