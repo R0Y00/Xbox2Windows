@@ -164,7 +164,7 @@ static void* desktop_pipeline(void* device)
 //   stateb-unreadable, desc-unreadable
 //   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-heap,
 //   dispatch-heap-outside: one creation, then dispatch_slot67 below
-//   texture-store, texture-store-none, texture-store-denied, texture-store-occupied: one creation, then texture_slot67 below
+//   texture-store, texture-store-none, texture-store-denied, texture-store-occupied, texture-store-copied: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
 static void* slot67_root;
@@ -343,8 +343,18 @@ static int texture_slot67(void* device, const std::string& mode)
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
     const D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
-    invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
-    if (mode == "texture-store-occupied") {
+    if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
+    if (mode == "texture-store-copied") {
+        // The view is created at another handle and its token copied into this slot by memcpy, as a title does; a
+        // refused creation at this slot then keeps that copied token.
+        invoke(device, 19, word(texture), 0, word(&view), cpu + 96);
+        std::memcpy(reinterpret_cast<void*>(cpu + 64), reinterpret_cast<void*>(cpu + 96), 32);
+        D3D12_RESOURCE_DESC plain = texture_desc;
+        plain.Flags = D3D12_RESOURCE_FLAG_NONE;
+        void* const other = make(D3D12_HEAP_TYPE_DEFAULT, plain, D3D12_RESOURCE_STATE_COMMON);
+        if (!other) return 79;
+        invoke(device, 19, word(other), 0, word(&view), cpu + 64);
+    } else if (mode == "texture-store-occupied") {
         // A second creation at the same handle, over a texture without unordered access, is refused and leaves the first view.
         D3D12_RESOURCE_DESC plain = texture_desc;
         plain.Flags = D3D12_RESOURCE_FLAG_NONE;
