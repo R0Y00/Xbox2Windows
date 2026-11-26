@@ -311,8 +311,12 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             continue;
         }
         if (!output) {
-            const IndirectBufferView view = indirect_table_buffer(self, words);
-            if (!view.resource || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input is not a complete GPU-backed buffer range";
+            // Each condition of a complete GPU-backed buffer range has its own reason.
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason);
+            if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
+            if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
+                log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
+                    slot.heap ? "heap" : "table", slot.a, slot.b, entry);
             views[i] = {view.resource, view.offset, view.bytes, !view.upload};
             views[i].stride = view.stride;
             std::memcpy(views[i].words, words, sizeof(views[i].words));

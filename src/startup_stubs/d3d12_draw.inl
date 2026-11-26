@@ -1855,12 +1855,19 @@ struct IndirectBufferView {
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
-IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false)
+// why, when given, receives the condition an empty result failed on.
+IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
+                                         const char** why = nullptr)
 {
+    const auto refuse = [why](const char* reason) {
+        if (why) *why = reason;
+        return IndirectBufferView{};
+    };
     constexpr u64 limit = 16u << 20;
     u64 address = 0, offset = 0, bytes = 0;
     UINT stride = 0;
     const Wrapper* owner = nullptr;
+    if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
         ViewRecord record{};
         AcquireSRWLockShared(&note_lock);
@@ -1876,7 +1883,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             std::memcpy(&view, record.desc, 40);
             owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
             if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
-                view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return {};
+                view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
             const bool raw = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW && !view.Buffer.StructureByteStride &&
                 view.Format == DXGI_FORMAT_R32_TYPELESS;
             const bool structured = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && view.Buffer.StructureByteStride &&
@@ -1884,57 +1891,69 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             const bool typed = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && !view.Buffer.StructureByteStride;
             const UINT element = raw ? 4 : structured ? view.Buffer.StructureByteStride :
                 typed ? x2w_startup::typed_buffer_format_bytes(view.Format) : 0;
-            if (!element || view.Buffer.FirstElement > UINT64_MAX / element) return {};
+            if (!element || view.Buffer.FirstElement > UINT64_MAX / element) return refuse("an input buffer view has no element size or overflows");
             offset = view.Buffer.FirstElement * element;
             bytes = u64{view.Buffer.NumElements} * element;
             stride = raw ? 0 : element;
             if (const auto base = reinterpret_cast<u64>(owner->own().title_memory)) {
-                if (offset > UINT64_MAX - base) return {};
+                if (offset > UINT64_MAX - base) return refuse("an input buffer view has no element size or overflows");
                 address = base + offset;
             }
+        } else {
+            return refuse("an input view token is not a buffer view of a desktop resource");
         }
     } else {
         address = words[0] | (u64{words[1] & 0xffff} << 32);
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
-    if (!bytes || bytes > limit || bytes % 4) return {};
+    if (!bytes) return refuse("an input buffer descriptor has zero records");
+    if (bytes > limit || bytes % 4) return refuse("an input buffer range is over 16 MiB or not whole dwords");
     ID3D12Resource* native = nullptr;
     bool upload = false;
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
             if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
-            return {};
+            return refuse("an input buffer view token names the list's upload memory");
         }
         const auto placed = placed_buffer_range(device, address, bytes);
-        if (placed.reject || (owner && owner != placed.owner)) return {};
+        if (placed.reject) return refuse("an input range crosses the end of a placed buffer");
+        if (owner && owner != placed.owner) return refuse("an input buffer view token's resource does not hold its range");
         if (!placed.owner) {
-            const auto alias = allow_address_alias && !list_upload_range(self, address, 1).resource
-                ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
+            const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
+            const auto alias = allow_address_alias && !in_upload ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
+            if (!alias.resource)
+                return refuse(in_upload ? "an input range crosses the end of its upload allocation"
+                                        : "an input is in title memory outside any placed buffer");
             return {alias.resource, alias.offset, bytes, stride};
         }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes))) return {};
+        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
+            return refuse("an input is in a placed buffer that does not alias title memory");
     } else if (owner && !owner->own().title_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
         D3D12_HEAP_PROPERTIES props{};
         D3D12_HEAP_FLAGS flags{};
         if (FAILED(native->GetHeapProperties(&props, &flags)) ||
-            (props.Type != D3D12_HEAP_TYPE_DEFAULT && props.Type != D3D12_HEAP_TYPE_UPLOAD)) return {};
+            (props.Type != D3D12_HEAP_TYPE_DEFAULT && props.Type != D3D12_HEAP_TYPE_UPLOAD))
+            return refuse("an input buffer view token's resource is not on a default or upload heap");
         upload = props.Type == D3D12_HEAP_TYPE_UPLOAD;
     }
-    if (!native || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT ||
-        !InterlockedCompareExchange(&owner->own().refs, 0, 0)) return {};
+    if (!native) return refuse("an input buffer descriptor has a null address");
+    if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return refuse("an input buffer range is not 16-byte aligned in its resource");
+    if (!InterlockedCompareExchange(&owner->own().refs, 0, 0)) return refuse("an input buffer's resource is released");
     const auto* info = resource_info(owner);
-    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) return {};
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return refuse("an input buffer's resource was not created in the common state");
     x2w_startup::ComPtr<ID3D12Device> native_device;
-    if (FAILED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device)) return {};
+    if (FAILED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device))
+        return refuse("an input buffer's resource is on another device");
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
-        offset > desc.Width || bytes > desc.Width - offset) return {};
+        offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
     return {native, offset, bytes, stride, upload};
 }
 
