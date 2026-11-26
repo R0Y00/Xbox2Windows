@@ -134,6 +134,7 @@ jobs:
               (["tests/startup_gfx2hlsl_interp_p2_hi_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_sgpr_spill_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/shader_signed_zero_minmax_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_compute_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_lds_b64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_lds_b128_check.py", "binary", "llvm-mc-15"], {}),
@@ -143,6 +144,7 @@ jobs:
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_dpp_quad_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_mad64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mul_hi_i32_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mul_mad_i24_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cube_check.py", "binary", "llvm-mc-15"], {}),
@@ -282,6 +284,7 @@ jobs:
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_int3_alu_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
+            tests/startup_gfx2hlsl_desc_vcc_check.py \
             tests/startup_gfx2hlsl_sload_const_offset_check.py \
             tests/startup_archive_requests_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
@@ -320,19 +323,23 @@ jobs:
             tests/startup_gfx2hlsl_spill_branches_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
             tests/startup_gfx2hlsl_neg_check.py \
+            tests/shader_signed_zero_minmax_check.py \
             tests/startup_gfx2hlsl_compute_check.py \
             tests/startup_compute_lds_b64_check.py \
             tests/startup_compute_lds_b128_check.py \
             tests/startup_compute_translate_check.py \
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_s_abs_check.py \
+            tests/startup_gfx2hlsl_s_quadmask_b64_check.py \
             tests/startup_gfx2hlsl_s_ff0_check.py \
             tests/startup_gfx2hlsl_s_bitset_check.py \
             tests/startup_gfx2hlsl_s_flbit_check.py \
             tests/startup_gfx2hlsl_s_ff1_check.py \
+            tests/startup_gfx2hlsl_src_scc_check.py \
             tests/startup_gfx2hlsl_s_quadmask_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
+            tests/startup_gfx2hlsl_mad64_check.py \
             tests/startup_gfx2hlsl_cmp_class_f16_sdwa_check.py \
             tests/startup_gfx2hlsl_mul_hi_i32_check.py \
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \
@@ -344,6 +351,7 @@ jobs:
             tests/startup_gfx2hlsl_sop2_complement_check.py \
             tests/startup_gfx2hlsl_pack_absdiff_check.py \
             tests/startup_gfx2hlsl_sopk_accum_check.py \
+            tests/startup_gfx2hlsl_bfm_b64_check.py \
             tests/startup_gfx2hlsl_f32_lg_check.py \
             tests/startup_gfx2hlsl_f32_nan_check.py \
             tests/startup_gfx2hlsl_f32_sdwa_check.py \
@@ -351,6 +359,7 @@ jobs:
             tests/startup_gfx2hlsl_sopk_signext_check.py \
             tests/startup_gfx2hlsl_mul_hi_check.py \
             tests/startup_gfx2hlsl_sad_check.py \
+            tests/startup_gfx2hlsl_sad_hi_msad_check.py \
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
             tests/startup_gfx2hlsl_s_bit_scan_check.py \
             tests/startup_gfx2hlsl_pack_b32_f16_check.py \
