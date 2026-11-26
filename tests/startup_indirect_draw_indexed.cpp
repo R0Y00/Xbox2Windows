@@ -1431,6 +1431,14 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
             slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, nullptr);
         }
 
+        ComPtr<ID3D12QueryHeap> query_heap;
+        ComPtr<ID3D12Resource> query_readback;
+        if (mode == Mode::depth_only) {
+            const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+            check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap)), "create depth-only occlusion query heap");
+            query_readback = make_buffer(device, sizeof(std::uint64_t), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+
         const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
         const D3D12_RECT scissor{0, 0, width, height};
         slot<Bind>(wrapped, 25)(wrapped, pso);
@@ -1441,7 +1449,12 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
         slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
+        if (mode == Mode::depth_only) list->BeginQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
         slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+        if (mode == Mode::depth_only) {
+            list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list->ResolveQueryData(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, query_readback.Get(), 0);
+        }
         check(slot<HRESULT(WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped), "close targets list");
 
         const D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -1458,6 +1471,21 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         check(fence->SetEventOnCompletion(1, done), "set targets fence event");
         WaitForSingleObject(done, INFINITE);
         CloseHandle(done);
+
+        if (mode == Mode::depth_only) {
+            std::uint64_t samples = 0;
+            const D3D12_RANGE query_range{0, sizeof(samples)};
+            check(query_readback->Map(0, &query_range, &memory), "map depth-only occlusion query");
+            std::memcpy(&samples, memory, sizeof(samples));
+            query_readback->Unmap(0, &untouched);
+            const auto expected_samples = static_cast<std::uint64_t>(width) * height;
+            if (samples != expected_samples) {
+                std::fprintf(stderr, "%s: expected %llu rasterized samples, got %llu\n",
+                             label, static_cast<unsigned long long>(expected_samples),
+                             static_cast<unsigned long long>(samples));
+                return false;
+            }
+        }
 
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         UINT64 bytes = 0;
