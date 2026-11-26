@@ -570,12 +570,13 @@ SCC_OPS = ('s_add_u32', 's_sub_u32', 's_add_i32', 's_sub_i32', 's_min_u32', 's_m
 
 
 def scc_fixture():
-    """Group g takes S0 = edge[g & 3], S1 = edge[g >> 2] (0, -1, INT_MAX, INT_MIN). Each s_add/s_sub/s_min/s_max forms is run
+    """Group (x, y) of the 4 x 4 grid takes S0 = edge[x], S1 = edge[y] (0, -1, INT_MAX, INT_MIN); the runner accepts at most 5 groups per axis. Each s_add/s_sub/s_min/s_max forms is run
     twice (the destination apart from S0, then the destination that is S0) and its SCC read right after; word 0 of the
     group holds the 16 SCC bits, word 1 a hash of the 16 results. RDNA 2 ISA: s_add_u32 carry out, s_sub_u32 borrow,
     s_add_i32 / s_sub_i32 signed overflow, s_min / s_max SCC = (D == S0)."""
     lines = ['s_mov_b32 s10, s6', 's_mov_b32 s11, 0', 's_load_dwordx8 s[12:19], s[10:11], 0x0', 's_waitcnt lgkmcnt(0)',
-             'v_lshlrev_b32 v4, 3, s7', 's_and_b32 s22, s7, 3', 's_lshr_b32 s23, s7, 2']
+             's_lshl_b32 s24, s8, 2', 's_add_u32 s24, s24, s7', 'v_lshlrev_b32 v4, 3, s24', 's_mov_b32 s22, s7',
+             's_mov_b32 s23, s8']
     for reg, index in (('s20', 's22'), ('s21', 's23')):
         lines.append('s_mov_b32 %s, 0' % reg)
         for n, value in ((1, '-1'), (2, '0x7fffffff'), (3, '0x80000000')):
@@ -623,18 +624,18 @@ def scc_reference(a, b):
     return bits, hashed
 
 WORDS_S = bytes.fromhex(
-    '06038abe80038bbe05030cf4000000fa7fc08cbf04001ad5830e00000783168707821790800394be168106bfc1141485'
-    '168206bfff141485ffffff7f168306bfff14148500000080800395be178106bfc1151585178206bfff151585ffffff7f'
-    '178306bfff1515850000008080039bbe80039cbe14151880818019851980198f1b191b881c181c891c811c8f14039abe'
-    '1a151a80818019851981198f1b191b881c1a1c891c811c8f14159880818019851982198f1b191b881c181c891c811c8f'
-    '14039abe1a159a80818019851983198f1b191b881c1a1c891c811c8f14151881818019851984198f1b191b881c181c89'
-    '1c811c8f14039abe1a151a81818019851985198f1b191b881c1a1c891c811c8f14159881818019851986198f1b191b88'
-    '1c181c891c811c8f14039abe1a159a81818019851987198f1b191b881c1a1c891c811c8f14159883818019851988198f'
-    '1b191b881c181c891c811c8f14039abe1a159a83818019851989198f1b191b881c1a1c891c811c8f1415988481801985'
-    '198a198f1b191b881c181c891c811c8f14039abe1a159a8481801985198b198f1b191b881c1a1c891c811c8f14151883'
-    '81801985198c198f1b191b881c181c891c811c8f14039abe1a151a8381801985198d198f1b191b881c1a1c891c811c8f'
-    '1415188481801985198e198f1b191b881c181c891c811c8f14039abe1a151a8481801985198f198f1b191b881c1a1c89'
-    '1c811c8f1b020a7e001070e0040504808408084a1c020a7e001070e004050480000081bf'
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0882188f1807188004001ad583300000070396be080397be800394be'
+    '168106bfc1141485168206bfff141485ffffff7f168306bfff14148500000080800395be178106bfc1151585178206bf'
+    'ff151585ffffff7f178306bfff1515850000008080039bbe80039cbe14151880818019851980198f1b191b881c181c89'
+    '1c811c8f14039abe1a151a80818019851981198f1b191b881c1a1c891c811c8f14159880818019851982198f1b191b88'
+    '1c181c891c811c8f14039abe1a159a80818019851983198f1b191b881c1a1c891c811c8f14151881818019851984198f'
+    '1b191b881c181c891c811c8f14039abe1a151a81818019851985198f1b191b881c1a1c891c811c8f1415988181801985'
+    '1986198f1b191b881c181c891c811c8f14039abe1a159a81818019851987198f1b191b881c1a1c891c811c8f14159883'
+    '818019851988198f1b191b881c181c891c811c8f14039abe1a159a83818019851989198f1b191b881c1a1c891c811c8f'
+    '1415988481801985198a198f1b191b881c181c891c811c8f14039abe1a159a8481801985198b198f1b191b881c1a1c89'
+    '1c811c8f1415188381801985198c198f1b191b881c181c891c811c8f14039abe1a151a8381801985198d198f1b191b88'
+    '1c1a1c891c811c8f1415188481801985198e198f1b191b881c181c891c811c8f14039abe1a151a8481801985198f198f'
+    '1b191b881c1a1c891c811c8f1b020a7e001070e0040504808408084a1c020a7e001070e004050480000081bf'
 )
 
 CASES = {
@@ -659,7 +660,7 @@ CASES = {
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
     'N': (SOURCE_N, WORDS_N, USER7 | tidig(1), (16, 1, 1), (1, 1, 1)),
-    'S': (scc_fixture(), WORDS_S, USER7 | TGID_X | tidig(1), (1, 1, 1), (16, 1, 1)),
+    'S': (scc_fixture(), WORDS_S, USER7 | TGID_X | TGID_Y | tidig(1), (1, 1, 1), (4, 4, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
