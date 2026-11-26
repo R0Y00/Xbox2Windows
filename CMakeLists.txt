@@ -11062,6 +11062,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/gpu_report_format_check.py")
     add_test(NAME hardware_reports COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/hardware_reports_check.py")
+    add_test(NAME tooling_hardware_reports_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/hardware_reports_cli_check.py")
+    set_tests_properties(tooling_hardware_reports_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME shader_corpus_report COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/shader_corpus_report_check.py")
     add_test(NAME xgameruntime_table COMMAND "${INTAKE_PYTHON}" -B
