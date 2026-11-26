@@ -5772,6 +5772,35 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_view_census_line(char* ou
     return view_census_line(out, capacity);
 }
 
+// Fixture only (startup_view_alloc): see view_allocation_gate.
+extern "C" __declspec(dllexport) void x2w_d3d12_fail_view_allocations(int site, LONG count)
+{
+    if (site >= 0 && site < view_allocation_sites) InterlockedExchange(&view_allocations_to_fail[site], count);
+}
+
+// Fixture probe (startup_view_alloc): the sizes of the three view containers, the id + 1 that the tracked slot of a
+// title descriptor handle names (0: none), and whether a resource is still in the retire class.
+struct ViewStoreProbe {
+    unsigned long long records, materialized, ids, records_capacity, materialized_capacity;
+    unsigned shadow, view_refs, retire_when_idle;
+};
+extern "C" __declspec(dllexport) void x2w_d3d12_view_probe(unsigned long long title_handle, void* resource, ViewStoreProbe* out)
+{
+    *out = {};
+    out->shadow = shadow_id(desktop_cpu_handle(title_handle));
+    AcquireSRWLockShared(&note_lock);
+    out->records = view_records().size();
+    out->materialized = view_materialized().size();
+    out->ids = view_ids().size();
+    out->records_capacity = view_records().capacity();
+    out->materialized_capacity = view_materialized().capacity();
+    ReleaseSRWLockShared(&note_lock);
+    if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind) {
+        out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
+        out->retire_when_idle = r->own().retire_when_idle;
+    }
+}
+
 // Fixture-only: the next `count` wrapper allocations fail as an exhausted heap would (#2653).
 extern "C" __declspec(dllexport) void x2w_d3d12_fail_wraps(LONG count)
 {

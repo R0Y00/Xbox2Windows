@@ -7023,7 +7023,7 @@ The `SUB_CO` fixture in `tests/compute_store_check.py` (`draw-sub-co`, `compute_
 
 `v_mac_f32_e32 vD, S0, vS1` (VOP2 `0x1f`) and `v_mac_f32_e64 vD, S0, S1` (VOP3) compute `D = S0 * S1 + D` as an unfused binary32 multiply-add: the intermediate product `S0 * S1` rounds to binary32 before the addition. `D` is both an input accumulator and the destination. Lowering uses `f32_mac(a, b, c)` with separate `precise float p = asfloat(a) * asfloat(b)` and `precise float r = p + asfloat(c)` so DXC does not contract the operation to FMA. NaN/Inf/denormal literal constants, uninitialized/unknown or pending `S0`/`S1`/`D`, `vD > 255`, source modifiers (`-`, `|.|`), `clamp`, `omod`, and bare `v_mac_f32` are refused.
 
-The `MAC_F32` fixture in `tests/compute_store_check.py` (`draw-mac-f32`, `compute_store_aot_mac_f32_${adapter}`) runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), including `4097 * 4097 + (-16785408)` and `(1 + 2^-23) * (1 + 2^-23) - (1 + 2^-22)` where unfused and fused results differ, and compares all 320 words against an independent Python model. Reference controls (fused FMA at word 0, `p - c` at word 2, accumulator zeroed at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (`mad()` fused multiply-add, `p - asfloat(c)`) must all fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mac_f32_(warp|hardware)$' -V`.
+The `MAC_F32` fixture in `tests/compute_store_check.py` (`draw-mac-f32`, `compute_store_aot_mac_f32_${adapter}`) runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), including `4097 * 4097 + (-16785408)` and `(1 + 2^-23) * (1 + 2^-23) - (1 + 2^-22)` where unfused and fused results differ, and compares all 320 words against an independent Python model. Reference controls (fused FMA at word 0, `p - c` at word 2, accumulator zeroed at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (`mad()` fused multiply-add, `p - asfloat(c)`) must all fail. DXIL lets the driver fuse `mad()` (`FMad`) or not, so on hardware the `mad()` mutation is first read back against the fused and the unfused model. Exactly one must match all 320 words; anything else fails the test. Where the unfused model matches (an RX 5700 XT and an RX 9070 XT, [#2730](https://github.com/R0Y00/Xbox2Windows/issues/2730)), the mutation equals the lowering, and the test logs it as inapplicable on that adapter. The full comparison, the reference controls and the other mutations stay mandatory. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mac_f32_(warp|hardware)$' -V`.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_i32_(warp|hardware)$' -V
@@ -15763,6 +15763,20 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+### Counted loop exit inside a compute EXEC-zero block (#2645 T2)
+
+The 112-byte gfx1013 fixture in `tests/startup_gfx2hlsl_compute_check.py` starts with eight
+lanes and keeps lanes 0–2 in two saved masks. At counter values 1, 2 and 3 it removes each
+remaining lane whose ID is below the counter. The wave exits when the second mask becomes
+empty. The wave and singleton traces both store `[9, 1, 2, 9, 9, 9, 9, 9]`.
+
+Reading the counter after restoring EXEC exposes the difference. The wave exits with 3 for
+every lane. In the singleton model lanes 0 and 1 exit early with 1 and 2. Lanes 3–7 skip the
+guarded block and take the latch until the counter reaches 4. The translator reports
+`loop exit crosses a backward s_cbranch_scc0` for the early exit in both variants.
+Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture.
+
 ### Startup compute formatted buffer reads
 
 The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using
@@ -16714,7 +16728,11 @@ would be folded at compile time and the lowering under test would never run. The
 `0x7fc00000`, `0x40400000`, `0x3fc00000` and `0x3f000000`; the expected words are `0x3f800000`,
 `0x40000000`, `0x3fc00000` and `0x3f800000`. The control that counts restores the branchless helper in the
 same pair and requires a mismatch on the NaN lane alone: `0x40000000` where the ISA asks `0x3f800000`, the
-other three lanes unchanged. A negative control that passes is reported as a failure, not accepted.
+other three lanes unchanged. A negative control that passes is reported as a failure, not accepted. The
+restored helper computes its median as `precise`. Without it, an RX 5700 XT (driver 32.0.21045.29003) folded
+the median against the constant bounds into a clamp and drew the ISA's `0x3f800000` on the NaN lane with FXC
+and DXC, so the defect escaped. With `precise` that adapter and WARP draw `0x40000000` there and match the
+other three lanes. [Issue](https://github.com/R0Y00/Xbox2Windows/issues/2730)
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
