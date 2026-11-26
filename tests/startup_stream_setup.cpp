@@ -131,13 +131,14 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
 
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
-    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, joined_table ? 2u : 1u, 0, 0, 0};
+    const bool vertex_srv_pair = GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0;
+    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, joined_table || vertex_srv_pair ? 2u : 1u, 0, 0, 0};
     D3D12_ROOT_PARAMETER textured_parameters[2]{};
     if (textured) {
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         table.DescriptorTable = {1, &srv};
-        table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        table.ShaderVisibility = vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = textured_parameters;
         if (joined_table || GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {

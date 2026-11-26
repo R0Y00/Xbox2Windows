@@ -8319,6 +8319,18 @@ word (plus an SCC-dependent branch token) against the same reference:
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_abs_dispatch_warp$' -V`.
 [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
 
+**Scalar 64-bit quad mask.** Startup translation lowers `s_quadmask_b64` so each
+output bit is the OR of one four-bit group of the 64-bit source: sixteen nibbles
+become bits 0..15 of `D.lo`, `D.hi` is 0, and `SCC = (D.lo | D.hi) != 0`, matching
+`pixel_aot`. Integer inline constants are interpreted at 64 bits.
+An encoded 32-bit literal zero-extends to 64 bits.
+Lane masks, descriptor-bearing SGPRs, and odd-aligned pairs are refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_quadmask_b64$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_quadmask_b64_check.py`). The fixture is
+CPU-only and compares negative inline constants with 32-bit literals that
+have the same low word.
+[Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
+
 **Scalar find-first-zero.** Startup translation lowers `s_ff0_i32_b32` to
 `firstbitlow(~S0)` (0xffffffff when every bit is set), matching `pixel_aot` /
 `ff0_i32_b32`. SCC is unchanged. Lane masks and descriptor-bearing sources are
@@ -15266,7 +15278,7 @@ against an integer reference on the CPU and separately checks refusal of
 lane masks and the discard destination. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_lshl_add$' -V`.
 
-`tools/startup/gfx2hlsl.py` now lowers six gfx1013 per-lane bit operations that it used to refuse: `v_bfe_i32`, `v_bcnt_u32_b32`, `v_ffbl_b32`, `v_ffbh_u32`, `v_ffbh_i32` and `v_bfrev_b32`. They become single HLSL expressions, so no helper function is added to the output: `countbits(a) + b`, `firstbitlow(a)`, `reversebits(a)`, and, for the two high scans, `a == 0u ? 0xffffffffu : 31u - firstbithigh(a)` (the signed form scans `~a` for a negative value and reads 0xffffffff for 0 and -1). `v_bfe_i32` takes the offset from bits 4:0 of source 1 and the width from bits 4:0 of source 2, reads 0 for a width of 0, and sign-extends the field from its top bit; when offset plus width passes 32, the bits above bit 31 repeat bit 31, which is an arithmetic shift of the whole word. The formulas and edge cases are the ones `tools/pixel_aot.py` already draws on WARP. `v_bfe_i32` and `v_bcnt_u32_b32` exist only as VOP3 on gfx1013 (llvm-mc 19 rejects `_e32`); the other four assemble in both `_e32` and `_e64`. Source modifiers, `clamp`, output modifiers, `op_sel` and a wrong operand count are refused with `Unsupported`; the operand count is now checked for every integer operation in this table, where a missing operand used to raise `IndexError`. Not lowered here: the 64-bit carry forms, `v_bfm_b32`, the 24-bit multiplies and `v_alignbit_b32`.
+`tools/startup/gfx2hlsl.py` now lowers six gfx1013 per-lane bit operations that it used to refuse: `v_bfe_i32`, `v_bcnt_u32_b32`, `v_ffbl_b32`, `v_ffbh_u32`, `v_ffbh_i32` and `v_bfrev_b32`. They become single HLSL expressions, so no helper function is added to the output: `countbits(a) + b`, `firstbitlow(a)`, `reversebits(a)`, and, for the two high scans, `a == 0u ? 0xffffffffu : 31u - firstbithigh(a)` (the signed form scans `~a` for a negative value and reads 0xffffffff for 0 and -1). `v_bfe_i32` takes the offset from bits 4:0 of source 1 and the width from bits 4:0 of source 2, reads 0 for a width of 0, and sign-extends the field from its top bit; when offset plus width passes 32, the bits above bit 31 repeat bit 31, which is an arithmetic shift of the whole word. The formulas and edge cases are the ones `tools/pixel_aot.py` already draws on WARP. `v_bfe_i32` and `v_bcnt_u32_b32` exist only as VOP3 on gfx1013 (llvm-mc 19 rejects `_e32`); the other four assemble in both `_e32` and `_e64`. Source modifiers, `clamp`, output modifiers, `op_sel` and a wrong operand count are refused with `Unsupported`; the operand count is now checked for every integer operation in this table, where a missing operand used to raise `IndexError`. Not lowered here: the 64-bit carry forms, the 24-bit multiplies and `v_alignbit_b32` (`v_bfm_b32` is lowered separately, see the next entry).
 
 `tests/startup_gfx2hlsl_bit_alu_check.py` translates a source-built pixel stage that applies each operation to four lanes (the VOP1 operations alternate `_e32` and `_e64`) and evaluates the generated text with a small 32-bit HLSL evaluator against a reference written from the ISA description with bit loops, string reversal and integer arithmetic. The grid holds 17,459 inputs for `v_bfe_i32` (every offset and width 0 to 31 for 17 base words, plus offsets and widths above 31), 324 for `v_bcnt_u32_b32` and 81 for each scan. Each lowering also has a mutation that must read a wrong word: no sign extension, a subtracted addend, 0 instead of 0xffffffff for zero, no `31u -`, a negative value scanned unchanged, and no bit reversal. On `origin/main` the check fails with `Unsupported: v_bfe_i32`. `binary <llvm-mc>` reassembles the fixtures (llvm-mc 19 here; the CI job passes llvm-mc 15). The `draw` mode compiles the translated pair with FXC and DXC and draws one pixel per four input sets through `offscreen_check --startup-flat-param`; the inputs travel as flat vertex parameters so the compilers cannot fold them. It also draws the first set of each operation with the mutated lowering and requires the mutated words in the readback. The evaluator and reference results above come from Linux. The draw mode passed at `48d9571d` on Windows 11 build 26300.9974 with DXC 1.8.2502.11 and the Windows SDK 10.0.26100 FXC, with the debug layer on and 0 errors and 0 warnings. It passed on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). On each adapter, all 34 draws (17 through FXC `ps_5_1` and 17 through DXC `ps_6_0`) matched the reference words, and all 12 mutated draws read their mutated words. Tests: `startup_gfx2hlsl_bit_alu_controls`, `startup_gfx2hlsl_bit_alu_warp` and `startup_gfx2hlsl_bit_alu_hardware`. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) `v_xor3_b32` (`D = S0 ^ S1 ^ S2`, the LLVM 15 and RDNA 2 definition, as in the compute lowering of #1573) joins the same check with 729 grid inputs and three draw sets whose three sources differ in every byte (0x13579bdf, 0x2468ace0, 0xfedcba98 and their rotations); its mutation drops the third operand and reads `src0 ^ src1`. Source modifiers, `clamp`, `op_sel` and a wrong operand count stay refused. `binary` matches the xor3 words with llvm-mc 23; the draw has not run on Windows for it yet.
 
@@ -15762,6 +15774,23 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_refusals$' -V
 python -B tools/startup/gfx2hlsl.py --refusals out/startup/shader_cache
 ```
 
+## Startup translator descriptor words in VCC
+
+An `s_load_dwordx4` from a descriptor table can end at `s[104:107]`
+because the translator tracks the four words symbolically (#2057). The same
+tracking applies when `s_mov_b64 vcc, s[n:n+1]` copies two descriptor words
+from an even-aligned pair into s106/s107. The source registers can then be
+overwritten. A load through `s[104:107]` requires four consecutive words of
+the same descriptor. Reading VCC as a mask before a new VCC definition is
+refused, including on a branch path that bypasses the definition.
+
+`startup_gfx2hlsl_desc_vcc` checks the symbol copy, descriptor validation, and
+mask refusals. The WARP and hardware variants assemble a direct and an aliased
+pixel shader and compare both readbacks with the same four words. The
+flat-parameter runner binds only entry constants, so the fixture supplies the
+buffer bytes through an HLSL load function after checking the translated
+resource key and load calls.
+
 ## Startup translator: SMEM offset operands
 
 `tools/startup/gfx2hlsl.py` accepts these offset operands for the scalar memory loads ([issue #1674](https://github.com/R0Y00/Xbox2Windows/issues/1674)):
@@ -15840,9 +15869,12 @@ The same checks exercise a [four-thread resource-index waterfall](../tests/start
 `v_readfirstlane_b32` selects a key and the following `v_cmpx_eq_i32` enables the lanes sharing that key. A saved
 copy of `exec_lo`, `s_andn2_wrexec_b32` and a backward `s_cbranch_scc1` serve the remaining lanes. Each participating
 lane can execute one visit with its own key when the body performs proven lane-local operations and its temporary
-scalars are dead at exit. The fixtures vary the active count from zero to four, restore EXEC, and check both an
+scalars are dead at exit, or are live at exit only when they are key-independent: a scalar written from constants or
+other loop-invariant inputs, without reading the key or a key-dependent scalar, holds the same value in every pass. The fixtures vary the active count from zero to four, restore EXEC, and check both an
 arithmetic result and a key-dependent byte offset in one fixed raw buffer. A read of the group's active mask,
-a store inside the loop, a live scalar or a key-selected descriptor keeps an instruction-specific refusal.
+a store inside the loop, a live-out scalar that depends on the key (or is computed from it) or a key-selected
+descriptor keeps an instruction-specific refusal. The fixtures include a key-independent live-out read after the loop
+(accepted, checked against a D3D12 WARP readback) and key-dependent live-outs (refused).
 
 ## Desktop audio render sink
 
@@ -15910,6 +15942,14 @@ with the full view, only the first word with the stale short view, and both
 words again after copying the full view back. This covers the copy and lookup
 sequence through slot 24 for #2695. The descriptor producer in the executable's
 diagnostic run remains unidentified.
+
+The same test also copies views of two independent placed buffers into one
+table. It checks both guest records after each copy, then reads the same
+byte offset of each buffer in one vertex shader. Swapping the two views
+exchanges the red and green channels, and restoring them restores both
+channels. As a control, both manifest bindings name the first record.
+That makes both channels match the first record in all 32 pixels while the
+guest records remain distinct.
 
 ```powershell
 cmake --build --preset release --target startup_stream_consumer
@@ -16505,6 +16545,15 @@ ctest --preset dev --no-tests=error -R '^(cpu_aot_switch_sal|cpu_aot_switch_shif
 The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequences (because ML64 assembles the `sal` mnemonic as `/4` `SHL`) across 24 translated functions covering all 12 `SAL` `Code` encodings (`SAL_RM{8,16,32,64}_{1,CL,IMM8}`), register and memory destinations, count-`1` all-16 `SETcc` checks, count->1 10-condition `SETcc` checks, `Jcc`, `CMOVcc`, narrow returns, and nonvolatile/stack-frame operands, plus 11 negative exports. [The differential check](../tests/cpu/switch_sal_check.py) verifies 28,024 `dev` and 28,024 `/O2` comparisons against native execution and the Python reference, four `/O2` mutated-C++ controls (`shift_dir`, `cf_mask`, `of_mask`, `cl_mask`), 11 MASM, 4 unit, and 7 PE-patched rejection controls, and records decoded mnemonics via `iced_x86.Mnemonic` to `FORM_COVERAGE_RECORD`.
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
+
+### Startup shader translator: `v_bfm_b32`
+
+`tools/startup/gfx2hlsl.py` now lowers the gfx1013 bit-field mask `v_bfm_b32` (a VOP3-only instruction: the bare and `_e64` spellings translate, `_e32` is refused) that it used to refuse. The result is a mask of S0[4:0] ones shifted left by S1[4:0], emitted as `(((1u << (a & 31)) - 1) << (b & 31))`, so a width of 0 gives 0 and a shift past the top drops the bits. `v_bfm_b32` is a row of `tests/startup_gfx2hlsl_bit_alu_check.py`: the emitted text runs on its integer evaluator over 1368 width/offset pairs against a plain-integer reference, a swapped width/offset mutation must read other words, and the `draw` mode renders the translated pixel stage on the adapter (FXC 5_1 and DXC 6_0) and reads the words back. Source modifiers, `clamp` and output modifiers are refused with `Unsupported`, as for the sibling integer operations. The WARP draw of the same formula is the existing `pixel_aot_bfm_<adapter>` test.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_bit_alu_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_bit_alu_(controls|warp)$' -V
+```
 
 ## Startup list Dispatch
 
