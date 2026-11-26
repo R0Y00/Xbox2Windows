@@ -1461,7 +1461,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
-| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
@@ -1573,24 +1573,17 @@ unordered-access flag, and live in a default heap without heap flags:
   reusing the same title address or desktop pointer does not skip uploads or
   resolve a retired wrapper.
 
-`X2W_D3D12_RELEASE_RETIRED_VIEWS=1` (only with `X2W_D3D12_RELEASE_RETIRED=1`) ends the
-`view-refs` retention. Once a released class texture's release-time fences have passed,
-the drain (a try-lock, never blocking) replaces every tracked slot-18 descriptor slot
-that names it, in every heap and so every `CopyDescriptors*` copy, by a null SRV of the
-same dimension: the shadow entry and its ref are dropped, the desktop descriptor is
-rewritten with `CreateShaderResourceView(nullptr, ...)`, the view records naming the
-resource lose it, and the view token in title descriptor memory is cleared when it
-still carries that id. A draw that reads the slot afterwards binds a null texture
-(zeros). The texture is then freed by the normal rules: lists and submissions that hold
-it through `retire_hold` keep the desktop object until the recording is dropped or the
-submission's fence passes. No recorded list or submission reads a title heap's SRV
-descriptor (translated draws build their own descriptors from the tokens at draw time
-and hold what they sample), so the rewrite cannot reach GPU work. A slot that cannot be
-rewritten keeps its ref and the texture stays retained. Not covered: a title thread
-that writes the same slot at the moment of the drain, and a guest that uses the
-resource after its final release (unsupported with the switch, as before).
-`startup_resource_retire_views_*` reads the desktop descriptors back through a compute
-probe; the `keep` and `noretire` cases are the negative controls.
+A slot-18 descriptor and each tracked copy hold the resource until the slot is explicitly overwritten
+or its heap is destroyed. A later binding of that slot still reads the resource after the last guest
+Release and the release-time fences. A list or submission holding the resource keeps it alive after
+the slot is overwritten, until the recording is discarded or the submission retires.
+
+The legacy `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` setting only enables the retirement breakdown below and
+logs that clearing live slots is disabled. The memory-pressure A/B in
+[#2379](https://github.com/R0Y00/Xbox2Windows/issues/2379#issuecomment-7179801296) used the earlier
+experimental rewrite. `startup_resource_retire_views_*` checks GPU readback from the original and
+copied descriptors, and from a recorded copy behind a gated queue. It also checks retirement after
+explicit overwrite and normal completion, with the legacy setting on and off.
 
 `X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and
 `X2W_D3D12_BUDGET=1`) adds a diagnostic line to the heartbeat. It counts every
