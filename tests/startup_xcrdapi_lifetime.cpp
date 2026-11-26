@@ -64,6 +64,21 @@ struct Fence {
     }
 };
 
+// Releases the queue from inside the worker's signal callback. The queue's final Release then runs on
+// the worker itself, which must free the object as it exits instead of trying to join itself.
+struct ReleasingFence {
+    void** vtable;
+    Object* queue;
+    volatile LONG signaled;
+    static long __stdcall signal(void* self, u64)
+    {
+        auto* fence = static_cast<ReleasingFence*>(self);
+        reinterpret_cast<ReleaseFn>(fence->queue->vtable[2])(fence->queue);
+        InterlockedExchange(&fence->signaled, 1);
+        return 0;
+    }
+};
+
 bool wait_fence(Fence& fence, DWORD timeout_ms)
 {
     const DWORD start = GetTickCount();
@@ -218,6 +233,42 @@ int main(int argc, char** argv)
     ok = expect(live(live_objects, status_kind) == 0, "releasing the queue left its status array alive") && ok;
     ok = expect(live_workers() == 0, "an unused queue's worker outlived the queue") && ok;
     ok = expect(live(live_objects, 0) == 1, "objects other than the factory singleton outlived every release") && ok;
+
+    // D. The last external reference can be released from the queue's own worker (a fence callback).
+    // The worker cannot join itself: it must stop, drop the entries that never ran, and free the queue.
+    void* file3 = nullptr;
+    void* status3 = nullptr;
+    void* queue3 = nullptr;
+    if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, data_path, nullptr, &file3) != 0 || !file3) return 2;
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 4, "WorkerRelease", nullptr, &status3) != 0 || !status3) return 2;
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue3) != 0 || !queue3) return 2;
+    auto* queue_3 = static_cast<Object*>(queue3);
+    auto* status_3 = static_cast<Object*>(status3);
+    void* release_vtable[11] = {};
+    release_vtable[10] = reinterpret_cast<void*>(&ReleasingFence::signal);
+    ReleasingFence releasing{};
+    releasing.vtable = release_vtable;
+    releasing.queue = queue_3;
+    alignas(8) unsigned char request3[0x48] = {};
+    *reinterpret_cast<unsigned char**>(request3 + 0x08) = destination.data();
+    *reinterpret_cast<unsigned*>(request3 + 0x18) = piece;
+    *reinterpret_cast<void**>(request3 + 0x20) = file3;
+    *reinterpret_cast<u64*>(request3 + 0x30) = piece;
+    reinterpret_cast<EnqueueRequestFn>(queue_3->vtable[3])(queue_3, request3);
+    reinterpret_cast<EnqueueStatusFn>(queue_3->vtable[4])(queue_3, status_3, 0);
+    reinterpret_cast<EnqueueSignalFn>(queue_3->vtable[5])(queue_3, &releasing, 0x200);
+    reinterpret_cast<ReleaseFn>(static_cast<Object*>(file3)->vtable[2])(file3);
+    reinterpret_cast<ReleaseFn>(status_3->vtable[2])(status3);
+    reinterpret_cast<SubmitFn>(queue_3->vtable[6])(queue_3);
+    const DWORD release_start = GetTickCount();
+    while ((!releasing.signaled || live(live_objects, queue_kind) || live_workers()) &&
+           GetTickCount() - release_start < completion_timeout_ms)
+        Sleep(2);
+    ok = expect(releasing.signaled != 0, "the releasing fence never ran") && ok;
+    ok = expect(live(live_objects, queue_kind) == 0, "a queue released from its own worker was not freed") && ok;
+    ok = expect(live_workers() == 0, "a queue's worker outlived a release from that worker") && ok;
+    ok = expect(live(live_objects, file_kind) == 0, "the worker-release queue left its file alive") && ok;
+    ok = expect(live(live_objects, status_kind) == 0, "the worker-release queue left its status array alive") && ok;
 
     reinterpret_cast<ReleaseFn>(factory->vtable[2])(factory);
     DeleteFileW(data_path);
