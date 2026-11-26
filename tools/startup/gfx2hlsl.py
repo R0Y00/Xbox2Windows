@@ -3099,6 +3099,9 @@ class Stage:
                             (v[0] == 'const' and len(v) == 2) or v[0] in ('ud', 'fixed_buffer_word')
                         )
                     }
+                if off in targets and self.exec_keep and name.startswith('s_'):
+                    # The join instruction itself runs with exec == 0 on the taken edge: a scalar read of a kept word ends it here.
+                    self.end_exec_keep_scalar_read(name, asm)
                 if name.startswith('s_cbranch') or name == 's_branch' or (
                         name == 's_setpc_b64' and self.calculated_pc.get(off) is not None):
                     b_target = self.calculated_pc[off] if name == 's_setpc_b64' else int(parse(asm)[1][0].split('_')[1], 16)
@@ -4078,19 +4081,30 @@ class Stage:
     def end_exec_keep(self, index, off, name, asm, targets):
         """Ends the R1 window: from the next join, branch or exec write on, a register kept after an execz join is
         joined again (a lane that skipped the arm is active again and would read the arm's stale word). A scalar
-        instruction reading a kept register ends it for that register at once: scalar work runs with exec == 0 too."""
+        instruction reading a kept register ends it for that register at once: scalar work runs with exec == 0 too.
+        A descriptor load that redefines a kept register on every path retires its marker without poisoning it."""
         prev_name, prev_asm = self.ins[index - 1][2], self.ins[index - 1][3]
+        if prev_name.startswith(('s_load', 's_buffer_load')):
+            dest = reg_range(parse(prev_asm)[1][0])
+            for reg in [r for r in self.exec_keep if dest and dest[0] == 's' and dest[1] <= r <= dest[2]]:
+                del self.exec_keep[reg]
+        if not self.exec_keep:
+            return
         if (off in targets or name.startswith('s_cbranch') or name in ('s_branch', 's_setpc_b64')
                 or writes_exec(prev_name, parse(prev_asm)[1])):
-            doomed = set(self.exec_keep)
+            self.retire_exec_keep(set(self.exec_keep))
         elif name.startswith('s_'):
-            doomed = set()
-            for tok in parse(asm)[1][1:]:
-                r = reg_range(tok)
-                if r and r[0] == 's':
-                    doomed |= {reg for reg in self.exec_keep if r[1] <= reg <= r[2]}
-        else:
-            return
+            self.end_exec_keep_scalar_read(name, asm)
+
+    def end_exec_keep_scalar_read(self, name, asm):
+        doomed = set()
+        for tok in parse(asm)[1][1:]:
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                doomed |= {reg for reg in self.exec_keep if r[1] <= reg <= r[2]}
+        self.retire_exec_keep(doomed)
+
+    def retire_exec_keep(self, doomed):
         for reg in doomed:
             if self.sym.get(reg) == self.exec_keep[reg]:
                 self.sym[reg] = ('joined at a branch target',)
