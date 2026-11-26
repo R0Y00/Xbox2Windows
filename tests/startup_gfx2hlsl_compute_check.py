@@ -1017,6 +1017,13 @@ def check_wave_branches():
                                   's_mov_b32 exec_lo, s0'))):
         refused('%s %s' % (name, WAVE_BRANCH), lambda lines=lines: translate('A', code=splice(*lines)))
     translate('A', code=splice('s_cmp_lt_u32 s7, 4', 's_cbranch_scc1 1', 'v_mov_b32 v3, 0')).hlsl_cs()
+    # Inside a block s_cbranch_execz skips the block's exec writes are proven, not a vccz / vccnz condition: lane 0 alone
+    # sets VCC, the wave still runs the move for lanes 1 and 2 (VCCZ is the whole register), the per-lane model skips it.
+    SPLICE.update({'v_mov_b32 v5, 7': '87020a7e', 's_cbranch_vccnz 1': '010087bf', 's_cbranch_execz 3': '030088bf'})
+    for branch in ('s_cbranch_vccz 1', 's_cbranch_vccnz 1'):
+        refused('%s %s' % (branch.split()[0], WAVE_BRANCH), lambda branch=branch: translate('A', code=splice(
+            cmp3, save, 's_cbranch_execz 3', 'v_cmp_gt_u32 vcc_lo, 1, v0', branch, 'v_mov_b32 v5, 7',
+            's_or_b32 exec_lo, exec_lo, s0')))
     # An execnz loop that only narrows EXEC and changes vector registers: a lane that left changes nothing.
     translate('A', code=splice('s_mov_b32 s0, exec_lo', *loop, 's_and_b32 exec_lo, exec_lo, vcc_lo',
                                's_cbranch_execnz 65532', 's_mov_b32 exec_lo, s0')).hlsl_cs()

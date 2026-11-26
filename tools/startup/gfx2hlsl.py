@@ -3391,8 +3391,9 @@ class Stage:
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
-        # Branches inside a block a forward s_cbranch_execz skips (and the close of a proven waterfall, waterfall_closes): execz_refusals has proven that block (a refused one
-        # refuses the program), its loops and branches included, so they are not refused again as whole-wave decisions.
+        # Inside a block a forward s_cbranch_execz skips, execz_refusals proves the exec writes (a lane whose bit was clear
+        # keeps it clear), so an s_cbranch_execnz there is the model's. It does not prove a vccz / vccnz / lane-data SCC
+        # condition: those stay refused (the wave decides on every lane's bit).
         execnz_loops = {pc for pc, to in branches if to <= pc and names[pc] == 's_cbranch_execnz'
                         and scalar_free_span(self.ins, to, pc) and not vcc_read_after(self.ins, pc)
                         } if getattr(self, 'kind', None) == 'cs' else set()
@@ -3705,8 +3706,8 @@ class Stage:
                                 regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
-                    self.branch_proven = (off in execz_covered or off in getattr(self, 'waterfall_closes', ())
-                                          or off in execnz_loops)
+                    self.branch_proven = (off in getattr(self, 'waterfall_closes', ()) or off in execnz_loops
+                                          or (off in execz_covered and base == 's_cbranch_execnz'))
                     term = self.one(name, asm)
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
