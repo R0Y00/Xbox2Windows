@@ -7698,7 +7698,7 @@ class Stage:
         # The binary16 compares read the low half of each source (or a binary16 inline constant): the half converts to
         # binary32 exactly (every finite half, denormals included, is a normal binary32; inf and NaN stay inf and NaN), so the
         # relation of the converted values is the relation of the halves. Their SDWA forms are not lowered here.
-        if typ == 'f16' and sdwa:
+        if typ == 'f16' and (sdwa or cond == 'ne'):  # 'ne' is the integer name; the binary16 one is neq
             raise Unsupported(base)
         # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
         # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
@@ -7716,6 +7716,11 @@ class Stage:
         # Conditions outside the table or dedicated lowering stay refused in both forms.
         if cond not in table:
             raise Unsupported(base)
+        if typ == 'f16':
+            # DXC folds x == x, x <= x and x >= x to true and x != x to false when both sources are the same register, which
+            # is wrong for a NaN half; the ordered forms read the NaN test on the bits (inline constants are never NaN).
+            table.update({'eq': '({2} && {0} == {1})', 'le': '({2} && {0} <= {1})', 'ge': '({2} && {0} >= {1})',
+                          'neq': '!({2} && {0} == {1})'})
         if sdwa:
             self.check_compare_sdwa_destination(base, writes_exec, ops)
         if len(ops) == 3:
@@ -7728,6 +7733,9 @@ class Stage:
         elif typ == 'f32':
             x, y = self.f(a), self.f(b)
         elif typ == 'f16':
+            # A lane mask is one lane bit here, not the 16-bit word the hardware would read as a half.
+            self.reject_lane_mask_data(base, a)
+            self.reject_lane_mask_data(base, b)
             x, y = self.half_operand(a, 'h'), self.half_operand(b, 'h')
         elif typ == 'i32':
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)

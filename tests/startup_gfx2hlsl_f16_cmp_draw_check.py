@@ -127,8 +127,36 @@ BODY_WORDS = {
 }
 
 
-def translate(rel):
-    return G.Pipeline(vs_words(sets(PAIRS[:4])), PRE_WORDS + BODY_WORDS[rel] + POST_WORDS, root_blob()).hlsl_ps()
+def same_source_words(rel):
+    """BODY_WORDS[rel] with every compare reading src0 for both sources (v_cmp_<rel>_f16 v0, v0): DXC folds a reflexive
+    float compare to a constant, which a NaN half must not follow. VOP3 (0xd4 opcode byte): src1 field is bits 9..17 of the
+    second dword; VOPC e32 (0x7d): VSRC1 is bits 9..16 of the first."""
+    data = BODY_WORDS[rel]
+    words = [int.from_bytes(data[i:i + 4], 'little') for i in range(0, len(data), 4)]
+    patched, i = [], 0
+    while i < len(words):
+        w = words[i]
+        if w >> 24 == 0xd4:  # VOP3 compare: two dwords
+            src0 = words[i + 1] & 0x1ff
+            patched += [w, (words[i + 1] & ~(0x1ff << 9)) | (src0 << 9)]
+            i += 2
+        elif w >> 24 == 0xd5:  # v_cndmask_b32_e64: two dwords, unchanged
+            patched += [w, words[i + 1]]
+            i += 2
+        else:  # VOPC e32 compare (0x7d...)
+            src0 = w & 0x1ff
+            patched.append((w & ~(0xff << 9)) | ((src0 & 0xff) << 9))
+            i += 1
+    return b''.join(x.to_bytes(4, 'little') for x in patched)
+
+
+def translate(rel, same=False):
+    body = same_source_words(rel) if same else BODY_WORDS[rel]
+    return G.Pipeline(vs_words(sets(PAIRS[:4])), PRE_WORDS + body + POST_WORDS, root_blob()).hlsl_ps()
+
+
+# Relations whose reflexive compare a compiler may fold (eq, le, ge true, neq false) and so need the NaN guard.
+SAME_SOURCE = ('eq', 'le', 'ge', 'neq')
 
 
 def mutants():
@@ -178,6 +206,11 @@ def controls():
             continue
         check('%s: translates to four lane results' % rel, all(('v%d = ' % r) in text for r in range(12, 16)))
         check('%s: reads the low half through f16tof32' % rel, rel == 'f' or 'f16tof32(v0 & 0xffffu)' in text or rel in ('o', 'u'))
+    for rel in SAME_SOURCE:
+        text = translate(rel, True)
+        check('%s: same-source compare keeps the NaN guard' % rel, '(v0 & 0x7fffu) <= 0x7c00u' in text)
+        check('%s: same-source model: NaN against itself' % rel,
+              reference(rel, (n, n)) == (ONE if rel == 'neq' else 0) and reference(rel, (one, one)) == (0 if rel == 'neq' else ONE))
     if failures:
         raise SystemExit('FAILED: ' + ', '.join(failures))
 
@@ -193,16 +226,16 @@ def check_binary(llvm_mc):
     print('fixture words match llvm-mc')
 
 
-def run_draws(kind, compiler, vs_profile, ps_profile, renderer, adapter, directory, label, rel, text, expect_fail):
+def run_draws(kind, compiler, vs_profile, ps_profile, renderer, adapter, directory, label, rel, text, expect_fail, same=False):
     """Draw every chunk of PAIRS; returns the failing chunk indexes (all of them must pass, or for a mutant some must fail)."""
     ps = compile_hlsl(compiler, kind, text, 'ps_%s_%s_%s' % (label, rel, kind), ps_profile, directory)
     bad = []
     for index in range(0, len(PAIRS), 4):
         chunk = PAIRS[index:index + 4]
-        pipe_ps = PRE_WORDS + BODY_WORDS[rel] + POST_WORDS
+        pipe_ps = PRE_WORDS + (same_source_words(rel) if same else BODY_WORDS[rel]) + POST_WORDS
         vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(sets(chunk)), pipe_ps, root_blob()).hlsl_vs(),
                           'vs_%s_%d_%s' % (rel, index, kind), vs_profile, directory)
-        expected = words_text(reference(rel, p) for p in chunk)
+        expected = words_text(reference(rel, (p[0], p[0]) if same else p) for p in chunk)
         run = draw(renderer, adapter, vs, ps, expected)
         if run.returncode:
             bad.append((index, chunk, run.stderr.strip()))
@@ -226,6 +259,23 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     print('%s %s MISMATCH chunk %d pairs %s\n%s' % (kind, rel, bad[0][0] // 4, bad[0][1], bad[0][2]), flush=True)
                 else:
                     print('%s v_cmp_%s_f16: %d pairs match' % (kind, rel, len(PAIRS)), flush=True)
+            for rel in SAME_SOURCE:
+                bad = run_draws(kind, compiler, vs_profile, ps_profile, renderer, adapter, directory, 'same', rel,
+                                translate(rel, True), False, True)
+                if bad:
+                    failures.append('%s v_cmp_%s_f16 v0, v0' % (kind, rel))
+                    print('%s %s same source MISMATCH chunk %d pairs %s\n%s' % (kind, rel, bad[0][0] // 4, bad[0][1], bad[0][2]), flush=True)
+                else:
+                    print('%s v_cmp_%s_f16 same source: %d pairs match' % (kind, rel, len(PAIRS)), flush=True)
+            if kind == 'dxc':  # DXC without -Gis is the compiler that folds x == x; the guard must not be dropped
+                text = translate('eq', True).replace('<= 0x7c00u', '<= 0xffffu')
+                bad = run_draws(kind, compiler, vs_profile, ps_profile, renderer, adapter, directory, 'same_noguard', 'eq',
+                                text, True, True)
+                if not bad:
+                    failures.append('%s control same-source eq without the NaN guard was not detected' % kind)
+                    print('%s control same-source eq without the NaN guard: NOT DETECTED' % kind, flush=True)
+                else:
+                    print('%s control same-source eq without the NaN guard: fails as expected' % kind, flush=True)
             for label, rel, mutate in mutants():
                 text = mutate(translate(rel))
                 if text == translate(rel):
