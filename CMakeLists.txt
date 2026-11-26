@@ -742,6 +742,9 @@ set_tests_properties(startup_placement_publish_shrink_control PROPERTIES WILL_FA
 add_executable(startup_resource_address_index_check tests/startup_resource_address_index_check.cpp)
 target_compile_features(startup_resource_address_index_check PRIVATE cxx_std_17)
 target_include_directories(startup_resource_address_index_check PRIVATE src)
+# The 180000 lookups walk std::multimap and std::map nodes; MSVC Debug iterator checks (level 2) made that take
+# minutes. The test checks the lookup answers, not iterator validity, so this one target runs without them.
+target_compile_definitions(startup_resource_address_index_check PRIVATE $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:_ITERATOR_DEBUG_LEVEL=0>)
 add_test(NAME startup_resource_address_index COMMAND startup_resource_address_index_check)
 add_test(NAME startup_resource_address_index_skip_control COMMAND startup_resource_address_index_check --mutate skip)
 add_test(NAME startup_resource_address_index_unsync_control COMMAND startup_resource_address_index_check --mutate unsync)
@@ -1455,7 +1458,7 @@ foreach(backend IN ITEMS warp hardware)
 endforeach()
 
 # #2653: a failed wrapper allocation returns E_OUTOFMEMORY with a null output from device creation and slots 8, 9, 14,
-# 16, 55, 73 and 127. `control` never arms the failure, so the fixture must report it.
+# 16, 55, 73, 127 and both paths through slot 133. `control` never arms the failure.
 add_executable(startup_wrap_allocation tests/startup_wrap_allocation.cpp)
 target_compile_features(startup_wrap_allocation PRIVATE cxx_std_17)
 target_link_libraries(startup_wrap_allocation PRIVATE d3d12_xs_shim d3d12 dxgi)
