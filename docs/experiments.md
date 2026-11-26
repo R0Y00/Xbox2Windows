@@ -8202,6 +8202,18 @@ against the same reference (including `flbit(0) == 0xffffffff`):
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_flbit_dispatch_warp$' -V`.
 [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
 
+**Scalar quad mask.** Startup translation lowers `s_quadmask_b32` so each
+output bit is the OR of one four-bit group of the source (8-bit result), with
+`SCC = (D != 0)`, matching `pixel_aot`. Lane masks and descriptor-bearing
+sources are refused. The 64-bit form stays refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_quadmask$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_quadmask_check.py`). The
+`_dispatch_warp` / `_dispatch_hardware` variants compile the translated
+expression into a compute shader and compare UAV readback for 0, a low
+nibble, bit 31 and `0x000f0000` (plus an SCC-dependent branch token):
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_quadmask_dispatch_warp$' -V`.
+[Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
+
 **Scalar immediate comparisons.** The startup translator sign-extends the
 16-bit field of `s_movk_i32` and `s_cmpk_*_i32`, and zero-extends the field
 of `s_cmpk_*_u32`. The source-built check covers all six relations against
@@ -9818,6 +9830,20 @@ loop message. The oracle is an exact string match; a stub that only checks for
 any `unsupported:` result would accept a wrong reason and is rejected by the
 check. Host-only (no WARP/hardware draw). Run
 `python -B tests/startup_mesh57_loop_refusal_check.py`, or the matching CTest.
+The `startup_mesh57_loop` check is a source-built program with the same
+exchanges plus one constant-trip scalar loop after the count exchange
+(`tests/startup_mesh57_loop.s`: `s_mov_b32 s40, 0`, then four iterations of
+`s_add_u32` / `s_cmp_lt_u32` / `s_cbranch_scc1`). `translate_mesh57` unrolls
+the proven trip count and publishes `ms_6_5`; vertex red is 1.0 when the final
+counter equals 4. Unsupported shapes still refuse with
+`slot 57 mesh: a loop outside the group-memory exchanges is not covered`: an
+unconditional back-edge, a data-dependent compare against a root constant, and
+a loop body that writes EXEC. The once-through mutant replaces the back-edge
+with `s_nop` so the counter stays 1 and red stays 0; the draw reference for the
+constant-trip image must fail on that mutant. Run
+`python -B tests/startup_mesh57_loop_check.py` on the host, and
+`ctest --preset release --no-tests=error -j 1 -V -R '^startup_mesh57_loop_(warp|hardware)$'`
+for WARP and hardware draws against the CPU rasteriser.
 
 A forward `s_cbranch_vccz` or `s_cbranch_vccnz` can also branch on the
 lane's VCC bit when EXEC is full and every incoming path last wrote VCC with
@@ -15531,6 +15557,14 @@ ctest --preset dev --no-tests=error -R '^(startup_gfx2hlsl_readfirstlane_(unifor
 python -B tests/startup_compute_readfirstlane_check.py --llvm-mc llvm-mc-15
 ```
 
+The same checks exercise a [four-thread resource-index waterfall](../tests/startup_compute_waterfall.py) for #2644.
+`v_readfirstlane_b32` selects a key and the following `v_cmpx_eq_i32` enables the lanes sharing that key. A saved
+copy of `exec_lo`, `s_andn2_wrexec_b32` and a backward `s_cbranch_scc1` serve the remaining lanes. Each participating
+lane can execute one visit with its own key when the body performs proven lane-local operations and its temporary
+scalars are dead at exit. The fixtures vary the active count from zero to four, restore EXEC, and check both an
+arithmetic result and a key-dependent byte offset in one fixed raw buffer. A read of the group's active mask,
+a store inside the loop, a live scalar or a key-selected descriptor keeps an instruction-specific refusal.
+
 ## Desktop audio render sink
 
 `startup_audio_output` drives a small WASAPI shared-mode render sink ([`audio_sink.h`](../src/startup_stubs/audio_sink.h)) with generated PCM blocks. It is the first slice of [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145). The sink takes `submit(format, frames, bytes)`, converts the block to the endpoint mix format (32-bit float or 16-bit PCM only) and records the first accepted block, the submitted format, per-block frame counts and peaks, consumed frames (submitted minus `GetCurrentPadding`), the `IAudioClock` position, the drained interval and the recovery. The fixture runs three cases in one process: no submission; eight 40 ms blocks with distinct amplitudes, one of them intentionally silent; and a producer that withholds the next block until the queue is empty, then resumes.
@@ -16360,6 +16394,24 @@ ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
 ctest --preset dev --no-tests=error -R '^startup_compute_tg_size_' -V
 ```
 
+## Explicit-level 1D image sampling in the startup translator
+
+[The startup translator](../tools/startup/gfx2hlsl.py) now lowers 1D `image_sample_lz` and `image_sample_l` onto `Texture1D.SampleLevel` alongside the existing implicit-level `image_sample` path (#1721):
+
+- `image_sample_lz` takes one address dword (`u`) and lowers to `tex.SampleLevel(smp, F(u), 0)`.
+- `image_sample_l` takes two address dwords (`u`, then the explicit `lod`) and lowers to `tex.SampleLevel(smp, F(u), F(lod))`.
+- Both explicit-level forms require a non-empty `dmask` and accept only `dim:SQ_RSRC_IMG_1D`, `dmask:*`, and the cache-policy modifiers (`glc`, `slc`, `dlc`). Plain `image_sample` on 1D keeps its existing rule (still refusing cache-policy bits), and layout or address modifiers (`unorm`, `r128`, `a16`, `d16`, `tfe`, `lwe`, reserved bits), wrong address counts, empty `dmask`, `image_sample_b`, and `image_load` on 1D stay refused.
+
+[The 1D image check](../tests/startup_gfx2hlsl_image_1d_check.py) builds synthetic MIMG instructions against the decoder layout and verifies `image_sample_lz`, `image_sample_l`, plain `image_sample`, 2D separation, cache-policy equivalence, empty `dmask`, and refused forms. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_image_1d($|_)' -V
+```
+
+The draw fixture binds a three-mip Texture1D with a distinct value per mip. With LOD
+inputs 1 and 2, the zero-level form reads level 0 and the explicit form reads the
+provided level. Forcing the explicit level to zero changes the level-2 readback.
+
 ## Startup translator: v_mad_u32_u16
 
 [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) now lowers the unmodified gfx1013 VOP3A instruction `v_mad_u32_u16` (`0x373` in [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py)) via `VEC_U` as `({0} & 0xffffu) * ({1} & 0xffffu) + {2}` (unsigned 32-bit wraparound). In `Stage.lower`, `S0` and `S1` are read with `low16_only=True` because only bits `[15:0]` of those operands are consumed (allowing odd-dmask `d16` `image_load` results in `S0`/`S1` and clearing `low16_only_v` on the 32-bit destination), while `S2` is read with `low16_only=False` (refusing `low16_only_v` sources) so all 32 bits of the addend are preserved. Modifiers (`op_sel`, `clamp`, `omod`, `abs`, `neg`) and wrong operand counts remain refused.
@@ -16578,3 +16630,17 @@ ctest --preset dev --no-tests=error -R '^(pixel_aot_sdwa_cvt_warp|pixel_aot_sdwa
 ```
 
 Linux controls, `form_coverage_check.check_sdwa_cvt_forms`, and Python reference/mutation checks ran locally; LLVM 15 `pixel_aot_binary` round-trips and Windows WARP/hardware D3D12 draws run in CI.
+
+## Startup translator: RDNA 2 scalar `null` operand and `Stage.scalar` destination guards
+
+`tools/startup/gfx2hlsl.py` lowers the RDNA 2 `null` scalar operand (`code 125`) and replaces `reg_range(...)[1]` `TypeError` crashes on non-SGPR scalar destinations with explicit `Unsupported` refusals (#2618, #1723, #2463):
+
+- **32-bit `null` source (`code 125`)**: `Stage.u`, `Stage.const_u32`, `Stage.uniform_source`, `Stage.scalar_const`, `SCALAR_CONST_FOLD`, `scalar_bitset`, `op_s_bfm_b32`, and `VOP3_ONLY_VEC_U` in `Stage.lower` read `null` as wave-uniform `0x00000000u`.
+- **32-bit `null` destination in `Stage.scalar` and `op_s_bfm_b32`**: plain 32-bit numeric/constant SALU writes to `null` discard the destination register write while still emitting modeled `SCC` updates (`s_and_b32`, `s_or_b32`, `s_xor_b32`, `s_andn2_b32`, `s_orn2_b32`, `s_not_b32`, `s_nand_b32`, `s_nor_b32`, `s_xnor_b32`, `s_lshl_b32`, `s_lshr_b32`, `s_ashr_i32`, `s_bfe_u32`, `s_absdiff_i32`) and leaving `SCC` unchanged for non-SCC operations (`s_mov_b32`, `s_movk_i32`, `s_brev_b32`, `s_mul_i32`, `s_bfm_b32`). `s_lshl1..4_add_u32`, `PACK_B16` / `s_sext_*` / `s_mul_hi_*`, and `s_cselect_b32` retain their pinned `null` destination refusals.
+- **Explicit `Unsupported` refusals replacing `TypeError`**: `_b64` operations (`s_and_b64 null, exec, s[0:1]`, etc.), lane-mask sources (`exec_lo`, `vcc_lo`, compare-mask SGPRs), `SCC_UNMODELLED` operations (`s_add_u32`, `s_sub_u32`, `s_add_i32`, `s_sub_i32`, `s_min_*`, `s_max_*`), and descriptor/pointer sources written to `null`, as well as unmodelled destinations (`vcc_hi`, `exec_hi`, `ttmp*`), raise specific `gfx2hlsl.Unsupported` reasons instead of `TypeError`.
+
+[`tests/startup_gfx2hlsl_scalar_null_check.py`](../tests/startup_gfx2hlsl_scalar_null_check.py) constructs synthetic gfx1013 SOP1/SOP2/SOPK/SOPC/VOP2/VOP3A/SMEM words (no game data), verifies all 14 32-bit SCC-writing SALU operations into `null` across boundary pairs, checks LLVM 15 `llvm-mc` / `libLLVM` round-trips, sweeps all 48 `SCA` ops plus `s_bfm_b32` against non-SGPR destinations, and runs D3D12 GPU verification across Microsoft WARP (`1414:008c`, driver `10.0.26100.9818`) and an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`) with the D3D12 debug layer enabled (`0` errors, `0` warnings): 4 pixel-stage draws (`FXC ps_5_1` + `DXC ps_6_0`) with 6 pixel mutations plus 4 runtime root-constant SALU+branch buffer runs with 4 HLSL mutations per adapter.
+
+```powershell
+ctest --test-dir out/build/release --no-tests=error -R "^startup_gfx2hlsl_scalar_null_(controls|warp|hardware)$" -V
+```
