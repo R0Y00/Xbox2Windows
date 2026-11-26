@@ -1202,23 +1202,26 @@ bool save_call(int slot, u64* args, u64* result)
         // reaches the disk before the update is submitted, and an update closed without a submit
         // leaves the save as it was. Only an open update is acted on; any other argument is
         // accepted and dropped as before.
-        std::string blob;
-        if (update_container(args[0]).empty() || !read_save_name(args[1], blob)) return true;
         x2w_save::Action action;
-        action.remove = slot == 26;
-        action.blob = blob;
-        if (!x2w_save::valid_name(blob)) {
-            *result = e_invalidarg;
-            return true;
-        }
-        if (!action.remove) {
-            const std::size_t size = static_cast<std::size_t>(args[3]);
-            if (size > x2w_save::max_blob_bytes || (size && x2w_local::probe_readable(static_cast<std::uintptr_t>(args[2]), size) != size)) {
+        try {
+            if (update_container(args[0]).empty() || !read_save_name(args[1], action.blob)) return true;
+            action.remove = slot == 26;
+            if (!x2w_save::valid_name(action.blob)) {
                 *result = e_invalidarg;
                 return true;
             }
-            const auto* bytes = reinterpret_cast<const unsigned char*>(args[2]);
-            if (size) action.data.assign(bytes, bytes + size);
+            if (!action.remove) {
+                const std::size_t size = static_cast<std::size_t>(args[3]);
+                if (size > x2w_save::max_blob_bytes || (size && x2w_local::probe_readable(static_cast<std::uintptr_t>(args[2]), size) != size)) {
+                    *result = e_invalidarg;
+                    return true;
+                }
+                const auto* bytes = reinterpret_cast<const unsigned char*>(args[2]);
+                if (size) action.data.assign(bytes, bytes + size);
+            }
+        } catch (const std::bad_alloc&) {
+            *result = e_outofmemory;
+            return true;
         }
         AcquireSRWLockExclusive(&save_lock);
         const bool staged = args[0] >= save_update_handle && save_table.stage(static_cast<std::size_t>(args[0] - save_update_handle), std::move(action));
