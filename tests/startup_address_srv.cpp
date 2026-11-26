@@ -12,6 +12,7 @@ using Word = std::uint64_t;
 Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0);
 extern "C" __declspec(dllimport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes);
 extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void* base, UINT width, UINT height);
+extern "C" __declspec(dllimport) void x2w_d3d12_fail_wraps(LONG count);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 struct ViewAt {
@@ -20,6 +21,17 @@ struct ViewAt {
     Word tail[2];
 };
 static_assert(offsetof(ViewAt, address) == 0x28 && sizeof(ViewAt) == 0x40);
+
+bool failed_publication_keeps_view(void* guest, const D3D12_RESOURCE_DESC& desc, const ViewAt& view, Word cpu)
+{
+    const auto* slot = reinterpret_cast<const void*>(cpu);
+    std::array<unsigned char, 32> previous;
+    std::memcpy(previous.data(), slot, previous.size());
+    x2w_d3d12_fail_wraps(1);
+    invoke(guest, 70, ptr(&desc), ptr(&view), cpu);
+    x2w_d3d12_fail_wraps(0);
+    return std::memcmp(previous.data(), slot, previous.size()) == 0;
+}
 
 bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1, Word address = 0, Word bytes = 0)
 {
@@ -570,6 +582,7 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 
     raw.address = ptr(buf1);
     raw.view.Buffer.FirstElement = 4;
+    if (!failed_publication_keeps_view(guest, desc, raw, cpu)) return 54;
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(2);
 
@@ -661,7 +674,9 @@ int draw_single_element_srvs(void* guest, void* list)
     const auto rgba = texel(DXGI_FORMAT_R8G8B8A8_UNORM, 0);
     publish(rgba, view_of(rgba, ptr(memory[0]))); draw(0);
     const auto swizzled = texel(DXGI_FORMAT_R8G8B8A8_UNORM, 0x105);
-    publish(swizzled, view_of(swizzled, ptr(memory[1]))); draw(1);
+    const auto second_view = view_of(swizzled, ptr(memory[1]));
+    if (!failed_publication_keeps_view(guest, swizzled, second_view, cpu)) return 54;
+    publish(swizzled, second_view); draw(1);
     std::memcpy(memory[0], c, 4);  // rewritten, then published again at the same address
     publish(rgba, view_of(rgba, ptr(memory[0]))); draw(2);
     std::memcpy(memory[0], d, 4);  // rewritten without a new publication: column 3 must read it

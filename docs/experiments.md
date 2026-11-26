@@ -5573,6 +5573,88 @@ because their per-lane regions can overlap. The fixtures compare every UAV
 word and detect a wrong qword offset, a missing data word, or reversed dual
 read offsets at word 0.
 
+### Group-shared LDS on gfx1013
+
+`--cpu gfx1013 --lds-bytes N` declares a group LDS allocation of N bytes (a multiple of 4, at most the
+32 KiB D3D12 groupshared limit) and lowers LDS as `groupshared uint lds[N / 4]`, shared by every thread of
+the group ([#1541](https://github.com/R0Y00/Xbox2Windows/issues/1541)). gfx1013 has no private LDS
+profile, so the allocation alone selects this mode; without it, DS instructions and `s_barrier` are
+refused as before. `v_lshlrev_b32 vD, k, vL` on a local-ID VGPR gives an address word
+`local << k`, and the existing integer ALU subset combines address words. Each DS instruction reads its
+byte address from a VGPR, adds the instruction offset (`offset0`/`offset1` in elements of the access
+size, times 64 for the `st64` forms), and accesses word `(address >> 2) + i`. The accepted forms are:
+
+- `ds_write_b32`, `ds_read_b32`, `ds_write_b64`, `ds_read_b64`, `ds_write_b128` and `ds_read_b128`;
+- `ds_write2_b32`, `ds_read2_b32`, `ds_write2st64_b32`, `ds_read2st64_b32`, `ds_write2_b64`,
+  `ds_read2_b64`, `ds_write2st64_b64` and `ds_read2st64_b64`, with two different offsets;
+- the non-returning `ds_add_u32`, `ds_sub_u32`, `ds_and_b32`, `ds_or_b32`, `ds_xor_b32`, `ds_min_u32` and
+  `ds_max_u32`, as HLSL `Interlocked*` operations (`ds_sub_u32` adds the negated value);
+- `s_barrier`.
+
+The profile is one guest wave per group. A group of at most 32 threads is one wave at either guest wave
+width and needs no statement. A group of 33 to 64 threads needs `--wave-size 64`, the caller's statement that
+the program runs as wave64; that statement is accepted only with a shared LDS allocation. Larger groups, and
+groups of more than 32 threads under `--wave-size 32`, are several guest waves and are refused.
+
+Within that one wave, DS instructions take effect in program order: every DS instruction is followed by
+`GroupMemoryBarrierWithGroupSync()`, so a read sees the writes of every earlier instruction from all lanes
+and a later write cannot overtake an earlier read. The HLSL barrier waits for the whole group, which on the
+desktop may run as several host waves; with one guest wave this reproduces the guest order. With several
+guest waves the per-instruction barriers would also order DS operations between waves before `s_barrier`,
+which the guest program does not guarantee, so that case is left until it has its own native comparison.
+`s_barrier` becomes the same barrier and adds one only where no DS barrier precedes it. Barriers need
+uniform control flow, so a DS instruction or `s_barrier` after a lane guard is refused.
+
+The caller guarantees the LDS input contract, which is not checked:
+- every access is in bounds and aligned: b32 accesses to 4 bytes, wider ones to their size;
+- every word that a read or an atomic touches was written earlier in the group;
+- no two lanes of one non-atomic write store to the same word.
+
+Outside the contract, each access is still guarded by `index < N / 4`: a word past the allocation reads as
+zero and is not written, and the low two address bits are dropped. That rule keeps an access from reaching
+other words; it is not compared with hardware. Not lowered yet: the returning (`_rtn`) forms, whose results depend on the
+order of lanes that update one word; `ds_write_b96`/`ds_read_b96`; byte, short and d16 accesses; signed
+min/max; float atomics; and `ds_permute`/`ds_bpermute` and the other lane-routing forms on gfx1013.
+
+`compute_store_aot_lds_shared` runs eight 64-thread wave64 programs with a 1024-byte allocation on one and
+two groups (one group for the four-word programs), and compares every UAV word with a CPU reference. Each lane
+writes its own words, and after a barrier reads another lane's:
+- the next lane's word and the mirrored lane's word (`63 - l`);
+- pairs 64 words apart through `write2`/`read2` and `st64`;
+- a qword and qword pairs, written with `ds_write2_b64` and read with `ds_read2st64_b64`, and the other way
+  round;
+- a 16-byte record of the next lane.
+
+A counter program sets seven words, has every lane add, subtract, AND, OR, XOR, take the minimum and take
+the maximum of its index or a mixed word, and reads them back. With two groups, each group's sums cover
+only its own threads, which shows that each group has its own LDS. Three mutations of the programs must
+mismatch at the first word they change:
+- the next-but-one lane, at word 0;
+- an `st64` read spelled as a plain `read2`, at word 1;
+- `ds_min_u32` in place of `ds_max_u32`, at word 11.
+
+The translation controls check the barrier count, the `Interlocked*` methods, the allocation guard on every
+access and the rejections listed above. The one-wave controls accept a 32-thread group without a statement
+and refuse 64 threads without one, 64 threads and a 32 x 2 group under wave32, 128 threads under wave64, and
+the wave64 statement without a shared allocation or on gfx1030. Every program is also assembled and disassembled with LLVM 15 for gfx1013, and the CLI must emit the
+same HLSL.
+
+Measured on `b96960b` with this change, Windows 10 build 19045:
+
+| Adapter | Result | Debug layer |
+|---|---|---|
+| WARP 1.0.22 (the app-local `d3d10warp.dll`) | passed | enabled |
+| NVIDIA GeForce RTX 3080, driver 32.0.15.9174 | passed | enabled |
+
+The mutations mismatched at their expected words on both adapters. Of the gfx1013 forms in
+`tools/form_coverage.py`, the test adds only `s_barrier`, because the gfx1030 private-LDS fixtures already
+record the DS mnemonics.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_shared_(warp|hardware)$' -V
+```
+
 An optional `--constant-descriptor BYTE_OFFSET` binds a second table entry to
 b0. It must be distinct from the 16-byte u0 descriptor. The translator accepts
 aligned immediate `s_buffer_load_dword`, `s_buffer_load_dwordx2`, and
@@ -15320,6 +15402,28 @@ covers a nested `if`, an `if`/`else` whose arms have their own `s_cbranch_execz`
 restore reads a mask saved inside the block. The proof starts at the branch, so it is not run for a block that
 a branch from outside enters.
 
+A definition of an SGPR or `vcc` that is live at the join is still accepted when exec absorbs every read of
+it. With the block's exec writes proven, a skipped lane's exec bit is clear at the join, in the wave and in
+the model. In the straight run that starts at the join, which only the block enters, and before any exec
+write in it, `W & exec` and `exec & W` (`s_and`) give that lane 0, and `~(W & exec)` (`s_nand`) and
+`W | ~exec` (`s_orn2` with exec second) give it 1, whatever the block left in W. The search follows every path
+from the join until W is written again. Any other read keeps the refusal: a copy, a data read, a branch on
+`vccz`, an absorbed form after an exec write or a branch target, or one at a join that a loop re-enters. The
+reason names the first such read the search meets. `m0` and SCC have implicit readers and are not accepted
+this way. Case N runs a compare in a block whose join computes `s_and_b32 s23, vcc_lo, exec_lo` before it restores
+exec; its control `n-unmasked` drops the AND, so the two lanes that skip the block store with a stale `vcc`.
+`s_nand` on a lane mask is still refused by the lane-mask lowering itself.
+
+A mask that the block only narrows is also accepted. When every write of W in the block is
+`s_andn2 W, W, X` and the exec-write pass shows X clear for a skipped lane at that instruction, on every path
+from the branch, the lane keeps its bit of W, so W at the join holds the model's bit. A read after the join is
+then proven when it is a bitwise mask operation that takes bit n of its result from bit n of W, in the same
+half of the wave, and writes that result to the exec word of that half or back to W, such as the restore
+`s_mov_b32 exec_lo, W`. A copy of W into another register, a data read, a write of W of another form, X not
+known clear, or a block that a branch from outside enters keeps the refusal. Case O narrows the saved mask
+with `s_andn2_b32 s0, s0, exec_lo` in the block and the join moves s0 into exec; its control `o-mask-kept`
+drops the narrowing, so the lanes the block handled store again.
+
 Each instruction's reads and writes come from its printed operands, checked against the repository
 decoder's spelling:
 - `v_cmpx` prints no destination (its e64 form prints an unused SDST field), so all of its operands are reads;
@@ -15327,7 +15431,7 @@ decoder's spelling:
 - `v_div_fmas` reads `vcc`;
 - the high half of a mask is tracked apart from the low half.
 
-One live definition is accepted, the lane mask of the compiler's if-conversion: a 32-bit mask M (`vcc_lo` or one
+A third live definition is accepted, the lane mask of the compiler's if-conversion: a 32-bit mask M (`vcc_lo` or one
 SGPR) that `s_mov_b32 M, 0` zeroes before the branch, with only straight-line code between the zeroing and the
 branch, and that the block sets only with `s_mov_b32 M, exec_lo` or `s_and_b32 M, X, exec_lo` (either operand
 order). Exec only narrows in the block, so each such write leaves the bit of a lane whose exec bit is clear at 0.
@@ -15338,9 +15442,10 @@ be the lane select of `v_cndmask`, the carry-in of `v_addc`, `v_subb`, `v_add_co
 as a data operand see the other lanes' bits, which the one-lane model does not have, and keep the refusal.
 
 The block is still refused in these cases:
-- a definition that is live at the join, other than the lane mask above (or one of its conditions fails: zeroing
-  with a value other than 0 or missing, a branch or a branch target between the zeroing and the branch, a write
-  of M that is not from exec, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
+- a definition that is live at the join, unless the absorbed-read or narrowed-mask rule proves every read of it
+  or it is the lane mask above; a lane mask with a failed condition stays refused (zeroing with a value other
+  than 0 or missing, a branch or a branch target between the zeroing and the branch, a write of M that is not
+  from exec, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
 - any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
   some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
   the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven

@@ -11,12 +11,16 @@ HEX = r"0x[0-9a-f]+"
 
 def check_refusal_lines(log):
     prefix = r"x2w-d3d12 Device::slot70 "
-    expected = [
+    buffer_unavailable = (
         prefix
         + r"unavailable buffer at the supplied address: reason=buffer_unavailable "
         + r"res\{dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "
-        + r"view\{dim=1 fmt=39 map=0x1688 first=0 count=4 stride=0 flags=0x1 \(buffer views are not supported\)\} "
-        + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
+        + r"view\{dim=1 fmt=39 map=0x1688 first=FIRST count=4 stride=0 flags=0x1 \(buffer views are not supported\)\} "
+        + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1"
+    )
+    expected = [
+        buffer_unavailable.replace("FIRST", "4"),  # injected wrapper allocation failure
+        buffer_unavailable.replace("FIRST", "0"),  # unaligned interior address
         prefix
         + r"unavailable acceleration structure at the supplied address: reason=as_wrong_state "
         + r"res\{dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "
