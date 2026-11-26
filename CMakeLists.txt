@@ -262,7 +262,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(xmem_lazy_commit_off PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE ENVIRONMENT "X2W_XMEM_LAZY_COMMIT=0")
     add_test(NAME xmem_lazy_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_startup_check.py" "$<TARGET_FILE:xmem_shim>")
-    set_tests_properties(xmem_lazy_startup PROPERTIES TIMEOUT 60
+    set_tests_properties(xmem_lazy_startup PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE
         ENVIRONMENT "X2W_XMEM_LAZY_COMMIT=1;X2W_XMEM_LAZY_STARTUP=1")
     # Control: with X2W_XMEM_LAZY_STARTUP off, the startup blocks are committed as before.
     add_test(NAME xmem_lazy_startup_off COMMAND "${INTAKE_PYTHON}" -B
