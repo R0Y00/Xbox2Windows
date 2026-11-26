@@ -1403,7 +1403,7 @@ def mesh_run(ins, at, what, patterns, env):
 MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
 # Vector ALU forms that take a lane mask as a per-lane select or carry, which the one-lane model handles.
 MASK_AWARE_VALU = frozenset({'v_cndmask_b32', 'v_cndmask_b16', 'v_readlane_b32', 'v_writelane_b32', 'v_readfirstlane_b32'})
-MASK_AWARE_VALU_RE = re.compile(r'^v_cmpx?_|_co(_ci)?_|addc|subb|_co$|^v_mad_[iu]64_[iu]32$')
+MASK_AWARE_VALU_RE = re.compile(r'^v_cmpx?_|_co(_ci)?_|addc|subb|_co$|^v_mad_[iu]64_[iu]32$|^v_(cndmask|readlane|writelane|readfirstlane)_')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
