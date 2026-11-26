@@ -15091,6 +15091,25 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_image_store(_warp|_hardware)?$' -V
 ```
 
+### Startup compute 2D array image store
+
+The startup compute translator also accepts `image_store` on
+`dim:SQ_RSRC_IMG_2D_ARRAY`, and the pixel-stage descriptor path lowers it the
+same way. The full-mask store takes three full-width address VGPRs, x, y and
+layer, binds `RWTexture2DArray<float4>` and emits
+`wN[uint3(x, y, layer)] = asfloat(uint4(...))` under the lane's EXEC bit; the
+version 2 compute manifest records `uav N tex2da float table P O channels 4`.
+The layer is not clamped, exactly as in the 2D-array sample and load forms: the
+bound view's array size is the limit. `SQ_RSRC_IMG_1D`, `SQ_RSRC_IMG_3D` and
+`SQ_RSRC_IMG_CUBE` stay refused with the existing "only 2D images are lowered"
+message. The runtime view type is the caller's: the compute dispatch stand-in
+still binds a 2D view, so this lowering is offline-only. The fixture writes the
+same four data words from two groups into mip zero of layer 1 (middle of a
+four-layer array) and of layer 3 (its last entry), compares all 5,376 words of
+every layer and mip, and requires an omitted store and a store one layer off to
+change 64 and 128 words respectively. It also refuses a two- or four-register
+address and the 1D, 3D and cube dimensions.
+
 ### Explicit-LOD 2D gather
 
 The startup pixel and compute translators lower gfx1013 `image_gather4_l` on a
