@@ -48,6 +48,8 @@ struct MeshletBufferData {
 
 // Partitions an indexed triangle list into meshlets bounded by max_vertices and max_primitives,
 // emitting per-meshlet bounding spheres and normal cones for amplification shader culling.
+// max_vertices must be in [3, 256] (a triangle can need three vertex slots) and max_primitives in [1, 256];
+// no meshlet exceeds either limit.
 MeshletBufferData build_meshlets(
     const std::vector<MeshletVertex>& vertices,
     const std::vector<std::uint32_t>& indices,
