@@ -1401,6 +1401,9 @@ def mesh_run(ins, at, what, patterns, env):
 
 
 MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
+# Vector ALU forms that take a lane mask as a per-lane select or carry, which the one-lane model handles.
+MASK_AWARE_VALU = frozenset({'v_cndmask_b32', 'v_cndmask_b16', 'v_readlane_b32', 'v_writelane_b32', 'v_readfirstlane_b32'})
+MASK_AWARE_VALU_RE = re.compile(r'^v_cmpx?_|_co(_ci)?_|addc|subb|_co$|^v_mad_[iu]64_[iu]32$')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
@@ -3175,6 +3178,21 @@ class Stage:
         return regs
 
     def lower(self, base, asm, ops, mods):
+        """Lower one instruction; a vector ALU form that reads a lane mask as a number is refused.
+
+        The model keeps one lane's bit of a wave mask. A vector ALU source that reads the mask as a number (the
+        llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
+        The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
+        The check runs after the form's own refusals, so those keep their messages."""
+        masks = []
+        if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
+            masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
+        result = self._lower(base, asm, ops, mods)
+        if masks:
+            raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
+        return result
+
+    def _lower(self, base, asm, ops, mods):
         pc = getattr(self, 'pc', None)
         calculated = getattr(self, 'calculated_pc', {})
         if pc in calculated:

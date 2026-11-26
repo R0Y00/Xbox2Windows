@@ -804,6 +804,25 @@ def check_mbcnt():
     assert 'uav 0 table 1 0' in translate('D').manifest()
 
 
+LANE_MASK_DATA = (
+    ('v_cvt_f32_u32 v5, vcc_lo', '6a0c0a7e'),   # the llvm.amdgcn.ballot word converted to float
+    ('v_add_nc_u32 v5, vcc_lo, v5', '6a0a0a4a'),
+)
+
+
+def check_lane_mask_data():
+    """A wave mask read as a number holds every lane's bit on hardware; the one-lane model has only its own."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    select = bytes.fromhex('800a0a02')    # v_cndmask_b32 v5, 0, v5, vcc_lo: the mask as a per-lane select
+    assert 'vcc = ' in translate('A', code=splice_words(compare, select)).hlsl_cs()
+    for _, word in LANE_MASK_DATA:
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
+
+
+def splice_words(*chunks, at=STORE_A):
+    return WORDS_A[:at] + b''.join(chunks) + WORDS_A[at:]
+
+
 def check_descriptor_scc():
     # Case A loads the input descriptor into s[12:15] and stores through s[16:19].
     # Read s20's lane bit into the stored value. The SCC branches skip both dwords of the lane select.
@@ -1064,6 +1083,7 @@ def check_controls():
     check_lds()
     check_descriptor_scc()
     check_mbcnt()
+    check_lane_mask_data()
     check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.

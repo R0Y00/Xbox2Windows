@@ -187,6 +187,8 @@ EARLIER = {
     'compare into SGPR': 'v_mov_b32 data operand s2 is a lane mask',
     'saved exec': 'v_mov_b32 data operand s2 is a lane mask',
     'mask in the entry block': 'v_mov_b32 data operand s2 is a lane mask',
+    'median of three of a lane mask': 'v_med3_f32 reads lane mask s2 as numeric data',
+    'unsigned to float conversion of a mask': 'v_cvt_f32_u32 reads lane mask s2 as numeric data',
 }
 for label, instructions in REFUSED:
     got = run(*instructions)
