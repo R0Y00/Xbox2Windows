@@ -1462,6 +1462,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
+| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Slots 19-21 are never rewritten: their reference keeps the resource until the slot is overwritten or its heap is destroyed. Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
@@ -1590,8 +1591,9 @@ explicit overwrite and normal completion, with the legacy setting on and off.
 resource whose final guest Release happened and whose desktop object is still
 alive, once, by the first cause that applies. Format: `reason=count/bytes(oldest Nf)`,
 bytes from the budget ticket, `oldest` in frames since the final Release:
-- `view-refs`: a tracked slot 18 descriptor still names it;
-  `view-refs-in-visible-heap` is the part with a descriptor in a shader-visible heap.
+- `view-refs`: a tracked descriptor slot still names it (a slot 18 SRV, and since
+  Slice 3a a slot 19 UAV, 20 RTV or 21 DSV); `view-refs-in-visible-heap` is the
+  slot-18 part with a descriptor in a shader-visible heap.
 - `list-hold`, `flight`: a closed or recording list, or a submission, holds a
   desktop reference.
 - `queued-waiting-fence`: queued, the release-time fence of a queue has not passed;
@@ -1609,24 +1611,45 @@ recorded and no line is built.
 
 Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
 targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
-described above. A resource leaves the class for good when a UAV/RTV/DSV view is
-created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
-an untracked descriptor slot or is copied out of tracked heaps, when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
-SRV keeps the resource only when the desktop created the view: desktop view
-creation returns `void`, so a removed device is the only failure it reports, and
-a slot whose creation failed is recorded without a reference. Tracked
-slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+described above. A descriptor slot the shim shadows (`HeapInfo::shadow`) holds one
+reference for each materialized view it names: a slot 18 SRV, and since Slice 3a
+also a slot 19 UAV (one for the view resource and one for its counter resource),
+a slot 20 RTV and a slot 21 DSV. `note_view` adds the references when a view is
+written into a tracked slot (writing the same view again adds nothing), and the
+same functions release exactly the references they added: `note_view` on an
+overwrite, `note_copy` when a copy moves another view over the slot or into
+another tracked slot, and the heap's `Release` through `retire_drop_heap_views`
+when the slot's heap is destroyed. A view the desktop did not create (a removed
+device) is recorded unmaterialized: it releases the slot's previous references
+and adds none. A resource leaves the class for good when a view call targets a
+descriptor slot no heap shadow tracks, or a copy moves a tracked view into an
+untracked heap (`retire_leave_class`, slots 18-21, a slot 19 counter too), when
+it is passed to MakeResident or Evict (slots 34 and 35), or when it is presented.
+Tracked views (including slot 70 `device_memory_srv`) keep the resource retained
 while any descriptor slot in `HeapInfo::shadow` names it (updated across
 `note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
 bound textures via `retire_hold`. Only wrappers can be in the class; a raw
 desktop pointer never is. Sampler feedback is not checked: no device slot of the
 stand-in reaches it.
 
+The 19-21 references free nothing on their own yet: the class still excludes a
+texture created with the render-target, depth-stencil or unordered-access flag
+(`retire_classify`), and desktop creates a UAV/RTV/DSV only on a resource that
+carries the matching flag. A class texture's 19-21 view call is therefore the
+console-only case the shim refuses (a UAV of a depth texture, an RTV of a texture
+without render-target); it records no view, adds no reference, and the texture
+still retires once it is released and its fences have passed. The accounting is
+the prerequisite for a later slice that admits those textures. The slots 19-21
+fallback is unchanged: in a heap the shim does not shadow the call keeps
+`retire_leave_class`, so nothing is freed under a descriptor the shim cannot
+follow. `X2W_D3D12_RELEASE_RETIRED_VIEWS` still replaces only slot 18 SRVs by null
+descriptors: a 19-21 reference is never rewritten, so it keeps its resource until
+the slot is overwritten or its heap is destroyed.
+
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
-passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
-recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+passed, all tracked descriptor references (slots 18-21) have dropped to zero, and
+no recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
 resolve destination (19), or translated draw SRV bind that the stand-in forwards
 makes the list hold a desktop reference to each resource of the class it names,
 source and destination, until the list is Reset, fails to Close or is destroyed. A list
@@ -1668,8 +1691,18 @@ and a translated draw that samples such a texture through a descriptor table (th
 token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
 a clear sentinel corner, and the texture leaves the budget only after the closed draw
 recording is dropped); the `_off_` case checks that an ordinary committed texture (no
-title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
-`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+title memory) still records its upload. Since Slice 3a the title fixture also drives the
+19-21 descriptor references: case 8 creates an RTV, a DSV and a UAV (and a buffer UAV with
+a counter resource) in tracked heap slots and checks through the retire probe that each
+materialized view adds one reference per slot - slot 19 one for its resource and one for
+its counter - that the same view written again adds nothing, and that overwrite, a
+`CopyDescriptorsSimple` copy and heap destruction each release exactly what was added
+(including a view in an untracked desktop heap, which adds none); case 9 checks the
+`view_slot` fallback in both switch modes: a refused RTV on a class texture in a tracked
+slot stays in the class and retires, while the same call into a descriptor slot the shim
+does not shadow keeps `retire_leave_class` and the texture stays retained. The fixture-only
+exports `x2w_d3d12_retire_probe` (which reports the resource's tracked slot references as
+`view_refs`), `x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
 `x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
