@@ -16,6 +16,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parent / 'tools' / 'startup' / 'gfx2hlsl.py'
 
+# Templates that refuse a short form in their own body (before the shared SCA arity guard).
+OWN_ARITY = frozenset(('s_bfm_b32', 's_mul_hi_u32', 's_mul_hi_i32'))
+
 
 def load(text=None):
     spec = importlib.util.spec_from_loader('gfx2hlsl_table', loader=None)
@@ -91,17 +94,19 @@ for op in TWO_SOURCE:
         changed.append(op)
 check('a complete form is never refused for its operand count', not changed, repr(changed[:4]))
 
-# Negative control: with the guard removed the short form raises IndexError again. One template keeps its own
-# arity check (s_bfm_b32 spells "expected 3" in its body), so it refuses either way and is excluded here rather
-# than counted as a survivor.
+# Negative control: with the guard removed the short form raises IndexError again. Templates that keep
+# their own arity check refuse either way and are excluded here rather than counted as survivors.
 stripped = load(SOURCE.read_text(encoding='utf-8').replace('        if len(srcs) < needed:',
                                                           '        if False:'))
 control = [op for op in TWO_SOURCE if refusal(stripped, op, needed_sources(stripped, op) - 1) == 'IndexError']
-check('control: without the guard the short form raises IndexError', len(control) >= len(TWO_SOURCE) - 1,
+check('control: without the guard the short form raises IndexError',
+      len(control) >= len(TWO_SOURCE) - len(OWN_ARITY),
       '%d of %d' % (len(control), len(TWO_SOURCE)))
 kept = [op for op in TWO_SOURCE if op not in control]
-check('the one template with its own arity check still refuses without the guard',
-      all(refusal(stripped, op, needed_sources(stripped, op) - 1).startswith(op) for op in kept), repr(kept))
+check('templates with their own arity check still refuse without the guard',
+      set(kept) <= OWN_ARITY and all(
+          refusal(stripped, op, needed_sources(stripped, op) - 1).startswith(op) for op in kept),
+      repr(kept))
 
 print('scalar table arity checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)
