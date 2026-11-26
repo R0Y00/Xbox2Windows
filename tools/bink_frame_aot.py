@@ -1,6 +1,7 @@
 """Translate the frame allocator, binding its direct calls to the existing Bink translations."""
 import argparse
 from pathlib import Path
+import tempfile
 
 from iced_x86 import Mnemonic as M, OpKind as K, Register as R
 import pefile
@@ -64,15 +65,55 @@ extern "C" __declspec(dllexport) uint32_t frame_allocate(word context, word fram
 """ + code + "\n}\n"
 
 
+def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.image.is_dir():
+        raise IsADirectoryError(f"image path is a directory: {args.image}")
+    if not args.image.is_file():
+        raise FileNotFoundError(f"image file not found: {args.image}")
+    if args.output.suffix.lower() != ".cpp":
+        parser.error("choose a distinct .cpp output")
+    if args.output.is_symlink():
+        raise ValueError(f"output path must not be a symlink: {args.output}")
+    if args.output.is_dir():
+        raise IsADirectoryError(f"output path is a directory: {args.output}")
+    for parent in args.output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"output parent is not a directory: {parent}")
+    if args.output.resolve() == args.image.resolve() or (args.output.exists() and args.image.samefile(args.output)):
+        parser.error("choose a distinct .cpp output")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write ASCII content to a sibling temp file and atomically replace path, leaving 0 temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        tmp_path.replace(path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args(argv)
-    if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
-        parser.error("choose a distinct .cpp output")
     try:
-        args.output.write_text(generate(args.image), encoding="ascii")
+        _validate_args(args, parser)
+        _write_atomic(args.output, generate(args.image))
     except (OSError, ValueError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
     return 0
