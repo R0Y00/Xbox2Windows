@@ -178,8 +178,10 @@ DRAW = {
 
 
 # ---- 32-bit HLSL expression evaluator (supports uint/int, abs(), and sad_u* helpers) -------------------------
-TOKEN = re.compile(r'\s*(0x[0-9a-fA-F]+u?|\d+u?|[A-Za-z_]\w*|<<|>>|<=|>=|==|!=|\|\||[-+*&|^~!<>?:(),])')
-LEVELS = [['||'], ['|'], ['^'], ['&'], ['==', '!='], ['<', '>', '<=', '>='], ['<<', '>>'], ['+', '-'], ['*']]
+# `&&` and the `true`/`false` literals are what the bool `masked` argument of the shared sad4_u8 helper needs
+# (tests/startup_gfx2hlsl_sad_hi_msad_check.py); no existing sad_u* helper uses them.
+TOKEN = re.compile(r'\s*(0x[0-9a-fA-F]+u?|\d+u?|[A-Za-z_]\w*|<<|>>|<=|>=|==|!=|\|\||&&|[-+*&|^~!<>?:(),])')
+LEVELS = [['&&'], ['||'], ['|'], ['^'], ['&'], ['==', '!='], ['<', '>', '<=', '>='], ['<<', '>>'], ['+', '-'], ['*']]
 
 
 class HlslExpr:
@@ -217,6 +219,8 @@ class HlslExpr:
         return node
 
     def unary(self):
+        if self.peek() in ('true', 'false'):
+            return ('bool', self.take() == 'true')
         token = self.take()
         if token in ('~', '-', '!'):
             return ('u' + token, self.unary())
@@ -239,6 +243,8 @@ class HlslExpr:
     def run(self, env, node=None):
         node = node or self.tree
         kind = node[0]
+        if kind == 'bool':
+            return int(node[1]), False
         if kind == 'num':
             return node[1] & MASK, node[2]
         if kind == 'var':
@@ -260,6 +266,8 @@ class HlslExpr:
             return int({'==': x == y, '!=': x != y, '<': x < y, '>': x > y, '<=': x <= y, '>=': x >= y}[kind]), True
         if kind == '||':
             return int(bool(a or b)), True
+        if kind == '&&':
+            return int(bool(a) and bool(b)), True
         return {'|': a | b, '^': a ^ b, '&': a & b, '+': a + b, '-': a - b, '*': a * b}[kind] & MASK, both
 
     def call(self, name, args):

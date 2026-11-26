@@ -307,7 +307,46 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     auto* queue = frame.queue;
     auto* fence = frame.fence;
     if (export_word) invoke(list, 40, 0, 1, arg(&export_word), 0);
-    if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
+    char index_probe[32]{};
+    GetEnvironmentVariableA("X2W_TEST_INDEX_PROBE", index_probe, sizeof(index_probe));
+    void* index_resource = nullptr;
+    if (index_probe[0]) {
+        bool initial_visible = false, final_visible = false;
+        const bool wide_indices = !std::strcmp(index_probe, "late-visible-r32");
+        if (!std::strcmp(index_probe, "visible")) initial_visible = final_visible = true;
+        else if (!std::strcmp(index_probe, "late-visible") || wide_indices) final_visible = true;
+        else if (!std::strcmp(index_probe, "late-clipped")) initial_visible = true;
+        else if (std::strcmp(index_probe, "clipped")) return 70;
+        D3D12_FEATURE_DATA_EXISTING_HEAPS capability{};
+        if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &capability, sizeof(capability))) || !capability.Supported)
+            return 77;
+        void* index_memory = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!index_memory) return 71;
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(index_memory), arg(&desc),
+                D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&index_resource)))) ||
+            !index_resource || invoke(index_resource, 11) != arg(index_memory)) return 72;
+        const auto write = [&](bool visible) {
+            const UINT first = visible ? 0 : 3;
+            if (wide_indices) {
+                auto* words = static_cast<std::uint32_t*>(index_memory);
+                words[0] = 9; // Not part of the draw. A binding that misses the start offset sees this index.
+                for (UINT i = 0; i < 3; ++i) words[i + 1] = first + i;
+            } else {
+                auto* words = static_cast<std::uint16_t*>(index_memory);
+                for (UINT i = 0; i < 3; ++i) words[i] = static_cast<std::uint16_t>(first + i);
+            }
+        };
+        write(initial_visible);
+        const D3D12_INDEX_BUFFER_VIEW index_view{arg(index_memory), wide_indices ? 16u : 6u,
+                                                wide_indices ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+        const D3D12_RECT full{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        invoke(list, 22, 1, arg(&full));
+        invoke(list, 47, arg(&index_view));
+        invoke(list, 13, 3, 1, wide_indices ? 1 : 0, 0, 0);
+        write(final_visible);
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
         extern int draw_placed_vertices(ID3D12Device*, void*, void*);
@@ -335,6 +374,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0)) {
         extern int draw_formatted_view(void*, void*);
         if (const int result = draw_formatted_view(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV", nullptr, 0)) {
+        extern int draw_copied_vertex_buffer_srv(void*, void*);
+        if (const int result = draw_copied_vertex_buffer_srv(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
@@ -347,6 +389,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0)) {
         extern int draw_d16_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_d16_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
+        extern int draw_pixel_uavs(ID3D12Device*, void*, void*);
+        if (const int result = draw_pixel_uavs(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_VERTEX_FETCH", nullptr, 0)) {
         // TEXCOORD float3 in slot 0 and POSITION float3 in slot 1, 12 bytes each; vertices 0-2 are unused. Vertices
         // 3-8 are drawn from start vertex 3: positions cover pixels [1, 3) x [1, 3) of the 8x4 target, texture
@@ -492,6 +537,11 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         last = 2;
     }
     if (const int rc = submit(last)) return rc;
+    if (index_resource) invoke(index_resource, 2); // The backing heap can outlive the resource.
+    if (GetEnvironmentVariableW(L"X2W_TEST_PIXEL_UAV", nullptr, 0)) {
+        extern int report_pixel_uavs(const char*);
+        if (const int rc = report_pixel_uavs(pixels)) return rc;
+    }
     if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_report();
         if (const int rc = root_heap_report()) return rc;

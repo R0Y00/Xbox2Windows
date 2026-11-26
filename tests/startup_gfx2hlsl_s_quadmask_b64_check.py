@@ -4,8 +4,8 @@ usage: startup_gfx2hlsl_s_quadmask_b64_check.py
 
 RDNA 2 ISA SOP1: each output bit is the OR of one four-bit group of the 64-bit
 source. Sixteen nibbles collapse into bits 0..15 of D.lo; D.hi is 0.
-SCC = (D.lo | D.hi) != 0. Matches pixel_aot. A 32-bit SOP1 literal/inline
-zero-extends (high word 0). Lane masks and descriptor sources are refused.
+SCC = (D.lo | D.hi) != 0. Matches pixel_aot. Negative integer inline constants
+extend to 64 bits and 32-bit literals zero-extend. Lane masks and descriptor sources are refused.
 The reference is plain Python; the translated text is evaluated on the CPU.
 """
 import re
@@ -117,7 +117,15 @@ def controls():
         if (out['s4'], out['s5'], int(bool(out['scc']))) != (want_lo, 0, int(want_lo != 0)):
             bad = (hex(word), (out['s4'], out['s5'], out['scc']), (want_lo, 0, int(want_lo != 0)))
             break
-    check('s_quadmask_b64 zero-extended immediate', bad is None, str(bad))
+    check('s_quadmask_b64 zero-extended literal', bad is None, str(bad))
+
+    # SSRC 193 and 208 decode as the inline integers -1 and -16. The same
+    # low DWORD encoded as a literal must leave the upper eight result bits clear.
+    for ssrc, want in ((193, 0xffff), (208, 0xfffe)):
+        lines, _ = translate(sop1('s_quadmask_b64', 4, ssrc))
+        out = run(lines, {'scc': 0})
+        actual = (out['s4'], out['s5'], int(bool(out['scc'])))
+        check('s_quadmask_b64 negative inline SSRC %d' % ssrc, actual == (want, 0, 1), str(actual))
 
     lines, sym = translate(sop1('s_quadmask_b64', 4, 2),
                            sym={2: ('const', 0x000f0000), 3: ('const', 0x00f00000)})
