@@ -19,6 +19,8 @@ SAVE = ('s_mov_b32 s21, exec_lo', '7e0395be')
 HEAD = ('v_readfirstlane_b32 s22, v5', '05052c7e')
 COMPARE = ('v_cmpx_eq_i32_e32 s22, v5', '160a247d')
 ADD = ('s_add_u32 s23, s22, 17', '16911780')
+CONST = ('s_mov_b32 s23, 17', '910397be')
+USE_CONST = ('v_add_nc_u32 v7, s23, v7', '170e0e4a')
 XOR = ('v_xor_b32_e32 v7, s23, v0', '17000e3a')
 CLOSE = ('s_andn2_wrexec_b32 s21, s21', '154795be')
 RESTORE = ('s_mov_b32 exec_lo, s26', '1a03febe')
@@ -54,6 +56,11 @@ def controls(llvm_mc=None):
         (program(body=(('s_mov_b32 s23, s22', '160397be'), ('s_lshl_b32 s23, s23, 1', '1781178f'),
                        ('s_or_b32 s23, s23, 1', '17811788'), ('s_and_b32 s23, s23, 31', '179f1787'),
                        ('v_add_nc_u32_e32 v7, s23, v0', '17000e4a'))), None),
+        # A body scalar that does not depend on the key holds one value in every iteration: read after the loop.
+        (program(body=(CONST, XOR), after_restore=(USE_CONST,)), None),
+        (program(body=(CONST, ('s_add_u32 s23, s23, s22', '17161780'), XOR), after_restore=(USE_CONST,)),
+         'body scalar is live'),
+        (program(body=(CONST, XOR), after_restore=(('v_mov_b32_e32 v7, s22', '16020e7e'),)), 'body scalar is live'),
         (program(body=(STORE,)), 'body instruction buffer_store_dword'),
         (program(body=(('v_mbcnt_lo_u32_b32 v7, exec_lo, 0', '070065d77e000100'),)), 'body instruction v_mbcnt'),
         (program(after_restore=(live,)), 'body scalar is live'),
@@ -79,9 +86,10 @@ def controls(llvm_mc=None):
 
 
 def dispatch(directory, dxc, runner, adapter):
-    for label, body in (('arithmetic', (ADD, XOR)), ('fixed-buffer', FIXED_LOAD)):
+    for label, body in (('arithmetic', (ADD, XOR)), ('fixed-buffer', FIXED_LOAD), ('invariant', (CONST, XOR))):
         src, shader = directory / 'waterfall.hlsl', directory / 'waterfall.cso'
-        src.write_text(translate(program(body=body)), encoding='ascii')
+        after = (USE_CONST,) if label == 'invariant' else ()
+        src.write_text(translate(program(body=body, after_restore=after)), encoding='ascii')
         subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
         cases = []
         inputs = [(n, (64, 32, 64, 96)) for n in range(5)]
@@ -93,12 +101,16 @@ def dispatch(directory, dxc, runner, adapter):
             output = [13] * 4
             for lane, key in enumerate(keys[:active]):
                 output[lane] = (((key + 17) & MASK) ^ lane) if label == 'arithmetic' else source[key // 4]
+                if label == 'invariant':  # the body scalar is 17 in every pass: v7 = (17 ^ lane) + 17
+                    output[lane] = (17 ^ lane) + 17
+            if label == 'invariant':
+                output = [o if i < active else 13 + 17 for i, o in enumerate(output)]  # the add runs for every lane
             case = directory / ('waterfall-%d.case' % len(cases))
             words = [1, *output, *([SENTINEL] * (WORDS - 4)), active, *([0] * 15), *source]
             case.write_bytes(struct.pack('<%dI' % len(words), *words))
             cases.append((case, 'keys %s, %d active' % (keys, active), None))
             if active == 4 and keys[0] != keys[1]:
-                wrong = (output[0] ^ 1) if label == 'arithmetic' else output[0]
+                wrong = (output[0] ^ 1) if label != 'fixed-buffer' else output[0]
                 words[2] = wrong  # lane 1 using lane 0's key
                 case = directory / 'waterfall-wrong.case'
                 case.write_bytes(struct.pack('<%dI' % len(words), *words))

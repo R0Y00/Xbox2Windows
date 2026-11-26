@@ -377,6 +377,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV", nullptr, 0)) {
         extern int draw_copied_vertex_buffer_srv(void*, void*);
         if (const int result = draw_copied_vertex_buffer_srv(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0)) {
+        extern int draw_copied_vertex_srv_pair(void*, void*);
+        if (const int result = draw_copied_vertex_srv_pair(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
