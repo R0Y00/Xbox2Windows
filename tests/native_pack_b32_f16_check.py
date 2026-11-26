@@ -23,6 +23,11 @@ from startup_gfx2hlsl_pack_b32_f16_check import ref
 from native_compute_clear_check import write_request
 from native_scalar_lds_check import scalar, sop1, vmove
 
+GROUPS = 2
+WORDS = 2064
+BASE = 8  # words before group 0's results (as in half_mad_readback)
+STRIDE = 128  # words per group: 512 bytes, so the 66 results of one group never reach the next
+
 PAIRS = [(0x3c00bc00, 0x80017fff), (0xfc007e00, 0x7d557c01), (0x12345678, 0xffff0001), (0x00008000, 0x80000000)]
 
 
@@ -142,6 +147,15 @@ def run_ir(dumper):
           'pass; swapped-half and neg-before-abs variants differ from the emitted bits' % cases)
 
 
+def group_offsets(count):
+    """Word indices written by each workgroup; they must be disjoint and inside the result buffer."""
+    offsets = [[BASE + group * STRIDE + i for i in range(count)] for group in range(GROUPS)]
+    flat = [i for group in offsets for i in group]
+    assert len(set(flat)) == len(flat), 'two workgroups write the same word'
+    assert 0 <= min(flat) and max(flat) < WORDS, 'a store falls outside the result buffer'
+    return offsets
+
+
 def run_gpu(gpu, sdk):
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -151,9 +165,9 @@ def run_gpu(gpu, sdk):
         sa = struct.pack('<7I', 0, 0, 0, 32 | 1 << 16, 1, 0, 0x80 | 5 << 1)
         checked = 0
         for a, b in PAIRS:
-            # Same preamble as half_mad_readback in native_scalar_lds_check.py: s20:21 table, v8 = group * 256 bytes.
+            # Same preamble as half_mad_readback in native_scalar_lds_check.py: s20:21 table, v8 = group * 512 bytes (STRIDE words).
             words = [sop1(3, 20, 4), sop1(3, 21, 128), 0xf408080a, 0xfa000020,
-                     scalar(0x1e, 7, 5, 136), vmove(8, 7), sop1(3, 126, 129)]
+                     scalar(0x1e, 7, 5, 137), vmove(8, 7), sop1(3, 126, 129)]
             words += mov(1, a) + mov(2, b)
             want = []
             for sel in range(4):
@@ -174,13 +188,14 @@ def run_gpu(gpu, sdk):
             if run.returncode == 77:
                 sys.exit(77)
             run.check_returncode()
-            expected = [0x69696969] * 2064
-            for group in range(2):
-                expected[8 + group * 64:8 + group * 64 + len(want)] = want
+            offsets = group_offsets(len(want))
+            expected = [0x69696969] * WORDS
+            for group in range(GROUPS):
+                expected[offsets[group][0]:offsets[group][-1] + 1] = want
             actual = struct.unpack('<2064I', dest.read_bytes())
             bad = [(i, hex(x), hex(y)) for i, (x, y) in enumerate(zip(actual, expected)) if x != y][:10]
             assert not bad, (hex(a), hex(b), bad)
-            checked += 2 * len(want)
+            checked += GROUPS * len(want)
     print('pack_b32_f16 GPU: %d packed words matched the model bit for bit' % checked)
 
 
