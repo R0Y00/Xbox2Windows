@@ -25,6 +25,10 @@ using std::to_string;
 using Word = uint32_t;
 using Name = std::string_view;
 
+static bool binary16_alu(std::string_view name) {
+    return name == "v_add_f16" || name == "v_sub_f16" || name == "v_subrev_f16" || name == "v_mul_f16";
+}
+
 [[noreturn]] void refuse(unsigned pc, const string &reason) {
     std::ostringstream out;
     out << "native compute +0x" << std::hex << pc << ": " << reason;
@@ -106,6 +110,8 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.enc = Encoding::Sopk;
         i.op = (a >> 23) & 31;
         i.dst = (a >> 16) & 127;
+        // s_setreg_imm32_b32 carries the written value in a literal word.
+        lit = i.op == 0x15;
     } else if ((a >> 30) == 2) {
         i.enc = Encoding::Sop2;
         i.op = (a >> 23) & 127;
@@ -229,6 +235,14 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
+        // These four binary16 ops are not in the admitted SDWA/DPP sets below.
+        // Name the form before that path reports a generic operand-profile refusal.
+        if (direct && !graphics && binary16_alu(encoded.name)) {
+            if (i.src[0] == 249)
+                refuse(pc, "unsupported " + string(encoded.name) + " SDWA form");
+            if (i.src[0] == 250)
+                refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
+        }
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;

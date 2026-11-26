@@ -24,6 +24,15 @@ struct DirectCompute {
     unsigned exchange_words = 0;
     bool uses_exchange = false;
     bool wave64 = false;
+    // Binary16 add, sub, subrev and mul are lowered only while MODE stays at
+    // the contract this path implements: round-to-nearest-even, f16 denormals
+    // kept on input and output, and FP16_OVFL clear. mode_bits holds the
+    // fields this path tracks (round in [3:0], denorm in [7:4], FP16_OVFL in
+    // bit 23). A guest branch together with a MODE write makes the value at
+    // the arithmetic unprovable.
+    bool half_binary = false;
+    bool half_mode_known = true;
+    unsigned mode_bits = 0xf0;
     std::vector<bool> scc_live;
     unsigned label_number = 0;
     bool pixel_stage = false;
@@ -911,6 +920,60 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
             return true;
         }
+        if (n == "v_add_f16" || n == "v_sub_f16" || n == "v_subrev_f16" || n == "v_mul_f16") {
+            // The graphics frontend shares this ALU. Leave those programs on the
+            // existing refusal; this lowering is the direct compute path.
+            if (graphics_input)
+                return false;
+            if (i.subword || i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + (i.subword ? " SDWA form" : " DPP form"));
+            if (i.clamp || i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " clamp or omod");
+            // op_sel bits 11..14 select a high half. Bit 15 is clamp, already refused.
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " high-half op_sel");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            auto half_bits = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                string bits;
+                if (r >= 240 && r <= 248) {
+                    // Inline floats are f32 patterns. The f16 operation consumes the
+                    // binary16 rounding of that value.
+                    constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
+                                                0xc000, 0x4400, 0xc400, 0x3118};
+                    bits = to_string(halves[r - 240]);
+                } else if (r == 255)
+                    bits = to_string(i.literal & 65535u);
+                else if (r >= 128 && r <= 192)
+                    bits = to_string((r - 128) & 65535u);
+                else if (r >= 193 && r <= 208)
+                    bits = to_string((192u - r) & 65535u);
+                else
+                    bits = ir.binary("and", operand32(i, r), "65535");
+                if (i.abs & (1u << j))
+                    bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j))
+                    bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto widen = [&](const string &bits) {
+                return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
+            };
+            auto a = widen(half_bits(0));
+            auto b = widen(half_bits(1));
+            if (n == "v_subrev_f16")
+                std::swap(a, b);
+            const char *op = n == "v_mul_f16" ? "fmul" : n == "v_add_f16" ? "fadd" : "fsub";
+            auto widened = ir.value(string(op) + " float " + a + ", " + b);
+            auto bits = ir.value("bitcast float " + widened + " to i32");
+            // f32 has a 24-bit significand, which covers a correctly rounded f16
+            // add, sub or mul (2*11+2). Round with the same integer nearest-even
+            // conversion v_cvt_f16_f32 uses. The low 16 bits are the result and
+            // the high half is zero, matching RDNA 2.
+            vector_write(i.dst, ir.binary("and", packed_half_rne(bits), "65535"));
+            return true;
+        }
         const auto rule = alu_rules.find(n);
         const bool byte_to_float =
             n.size() == 16 && n.substr(0, 15) == "v_cvt_f32_ubyte" && n.back() >= '0' && n.back() <= '3';
@@ -1787,6 +1850,54 @@ struct DirectCompute {
         if (!previous.empty())
             write(i.dst, select(source_enabled, read(i.dst), previous));
     }
+    // Returns true when the instruction is a MODE write this path has accepted
+    // (including a no-op that leaves the implemented contract in place).
+    bool consume_half_mode(const Inst &i) {
+        if (!half_binary || graphics_input)
+            return false;
+        constexpr unsigned f16_bits = 0x8000ccu; // round16 [3:2], denorm16 [7:6], FP16_OVFL
+        constexpr unsigned contract = 0xf0u;     // denorm32 = denorm16 = 3 (keep)
+        auto bad = [&]() { refuse(i.pc, "unsupported binary16 rounding or denormal mode"); };
+        auto accept = [&](unsigned updated) {
+            if ((updated ^ contract) & f16_bits)
+                bad();
+            // A write that moves a bit this path does not model (f32 round or
+            // f32 denorm) keeps the previous refusal.
+            if ((updated ^ mode_bits) & ~f16_bits)
+                return false;
+            mode_bits = updated;
+            return true;
+        };
+        const auto &n = i.name;
+        if (n == "s_round_mode" || n == "s_denorm_mode") {
+            // Both immediates use [1:0] for f32 and [3:2] for f16/f64. Bits above
+            // the low nibble are ignored by the instruction.
+            const unsigned nibble = i.a & 15u;
+            const unsigned mask = n == "s_round_mode" ? 0xfu : 0xf0u;
+            const unsigned field = n == "s_round_mode" ? nibble : nibble << 4;
+            if (!half_mode_known && ((field ^ mode_bits) & mask & f16_bits))
+                bad();
+            return accept((mode_bits & ~mask) | field);
+        }
+        if (n != "s_setreg_b32" && n != "s_setreg_imm32_b32")
+            return false;
+        // SIMM16 = {size[4:0], offset[4:0], hwRegId[5:0]}. hwRegId 1 is MODE.
+        const unsigned simm = i.a & 0xffffu;
+        const unsigned hw = simm & 63u;
+        const unsigned offset = (simm >> 6) & 31u;
+        const unsigned size = ((simm >> 11) & 31u) + 1u;
+        if (hw != 1u || offset >= 32u || size > 32u - offset)
+            return false;
+        const unsigned mask = size == 32u ? 0xffffffffu : ((1u << size) - 1u) << offset;
+        if ((mask & f16_bits) == 0)
+            return false;
+        // The SGPR form, and any form reached from more than one path, does not
+        // prove the bits that this lowering implements.
+        if (n == "s_setreg_b32" || !half_mode_known)
+            bad();
+        const unsigned updated = (mode_bits & ~mask) | ((i.literal << offset) & mask);
+        return accept(updated);
+    }
     NativeComputeShader lower(unsigned entry, unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
         const unsigned lds_words = ((flags >> 15) & 511) * 128;
         const bool uses_lds = std::any_of(analysis.program.code.begin(), analysis.program.code.end(),
@@ -1795,6 +1906,21 @@ struct DirectCompute {
             ir.globals << "@lds = internal addrspace(3) global [" << lds_words << " x i32] undef, align 4\n";
         initialize(user, flags, x, y, z);
         const auto &p = analysis.program;
+        mode_bits = 0xf0;
+        bool mode_write = false, conditional = false;
+        for (size_t k = 0; k < p.code.size(); ++k) {
+            if (!p.reached[k])
+                continue;
+            const auto &op = p.code[k];
+            if (binary16_alu(op.name))
+                half_binary = true;
+            if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
+                op.name == "s_setreg_imm32_b32")
+                mode_write = true;
+            if (op.branch() && op.op != 2)
+                conditional = true;
+        }
+        half_mode_known = !(half_binary && mode_write && conditional);
         const bool writes_uavs = std::any_of(p.code.begin(), p.code.end(), [](const Inst &i) {
             return i.name.substr(0, 12) == "buffer_store" || i.name.substr(0, 13) == "buffer_atomic" ||
                    (i.enc == Encoding::Image && i.op == 8);
@@ -1855,6 +1981,8 @@ struct DirectCompute {
                 if ((i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt") && writes_uavs)
                     barrier(2);
             }
+            else if (consume_half_mode(i))
+                continue;
             else if (i.enc == Encoding::Sopp)
                 refuse(i.pc, "unsupported compute control instruction " + string(i.name));
             else if (i.enc == Encoding::Image)
