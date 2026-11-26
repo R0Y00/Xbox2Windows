@@ -2686,7 +2686,7 @@ class Stage:
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
             self.low16_only_v.discard(n)
 
-    def set_v(self, n, expr, *, low16_only=False, align4=False):
+    def record_v_write(self, n, *, low16_only=False, align4=False):
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
@@ -2696,7 +2696,6 @@ class Stage:
                 self.align4_v.add(n)
             else:
                 self.align4_v.discard(n)
-        self.last_v = (n, expr)
         if low16_only:
             if not isinstance(self.low16_only_v, set):
                 self.low16_only_v = set()
@@ -2704,6 +2703,10 @@ class Stage:
         else:
             self.clear_low16(n)
         self.used_v.add(n)
+
+    def set_v(self, n, expr, *, low16_only=False, align4=False):
+        self.record_v_write(n, low16_only=low16_only, align4=align4)
+        self.last_v = (n, expr)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
         temps = getattr(self, 'uniform_temps', None)
         if temps is not None:  # a uniform load past the entry block (one()): every lane keeps the words
@@ -10786,6 +10789,8 @@ class ComputePipeline(Pipeline):
     size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
     (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
+    stage_type = Stage
+
     def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
         from compute_store_aot import checked_group, entry_registers
         try:
@@ -10811,7 +10816,7 @@ class ComputePipeline(Pipeline):
         self.lod_unvalidated = set()
         # LLVM AMDGPUUsage, COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE on gfx10: 128 dwords per unit.
         self.lds_words = ((rsrc2 >> 15) & 0x1ff) * 128
-        self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
+        self.cs = self.stage_type(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
     def resource(self, key, kind):
         if key in self.uavs:
@@ -10983,7 +10988,7 @@ def compute_entry(state_a):
     return words[6], (words[3] & 0xffff, words[3] >> 16, words[4] & 0xffff)
 
 
-def load_compute_request(out_dir, key, refusals=None):
+def load_compute_request(out_dir, key, refusals=None, *, pipeline_type=ComputePipeline):
     """The ComputePipeline of a slot 67 request, after checking the files against .desc and the key."""
     name = os.path.join(out_dir, 'req_%016x' % key)
     try:
@@ -11005,7 +11010,7 @@ def load_compute_request(out_dir, key, refusals=None):
     if S_ENDPGM not in struct.unpack('<%dI' % (len(code) // 4), code):
         raise Unsupported('compute code without s_endpgm')
     rsrc2, group = compute_entry(parts['.sa'])
-    return ComputePipeline(code, parts['.root'], rsrc2, group, refusals=refusals)
+    return pipeline_type(code, parts['.root'], rsrc2, group, refusals=refusals)
 
 
 def compute_refusals(out_dir, key):
