@@ -4,6 +4,7 @@ usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -88,6 +89,18 @@ def masked_vertex_red():
                       '8afe7e14 7e0e0280 befe04c1')
     at = mesh.index('f80008cf')
     return mesh[:at] + ['bf880004'] + mesh[at:]  # s_cbranch_execz skips both vertex exports
+
+
+# The first six threads select the shift for their entire guest wave. The second wave keeps 64/255.
+SHIFT_ASM = """s_mov_b32 s40, 0x3e808081
+v_cmp_gt_u32_e32 vcc, 6, v0
+s_and_saveexec_b64 s[20:21], vcc
+s_cbranch_execz 2
+s_lshl_b32 s40, 0x1fc00000, 1
+s_mov_b64 exec, -1
+v_mov_b32 v7, s40"""
+SHIFT_WORDS = 'bea803ff 3e808081 7d880086 be94246a bf880002 8f2881ff 1fc00000 befe04c1 7e0e0228'
+SHIFT_MESH = vertex_red(SHIFT_WORDS)
 
 
 # s_mov_b32 s40, 0.5; v_cmp_ge_f32_e64 vcc_lo, s40, 1.0
@@ -246,6 +259,17 @@ REFUSALS = (
     # s_mov_b32 s40, 1 replaces the then-arm v_mov inside the s_cbranch_execz range.
     ('an EXEC-zero branch that skips a scalar write', mutate('7e0e02f2', 'bea80381', mesh=masked_vertex_red()),
      'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('EXEC-zero skips a scalar memory load', vertex_red(SHIFT_WORDS.replace('8f2881ff 1fc00000', 'f4000a00 fa000000')),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('a shift with a mask from an unproven thread register',
+     vertex_red(SHIFT_WORDS.replace('7d880086', '7e100300 7d881086')),  # v_mov v8,v0; compare against v8
+     'slot 57 mesh: scalar shift needs a proven wave EXEC predicate'),
+    ('a path enters the scalar shift without the compare or saveexec',
+     vertex_red(SHIFT_WORDS.replace('7d880086', 'bf008080 bf850003 7d880086')),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('a shift without an immediate full EXEC restore',
+     vertex_red(SHIFT_WORDS.replace('befe04c1', 'bf800000 befe04c1')),  # branch to s_nop before the restore
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
     # s_cmp_eq_i32 0, 0; s_cbranch_scc1 .end (over the two-dword primitive export).
     ('a uniform branch that skips the primitive export',
      MESH[:PRIMITIVE_EXPORT] + ['bf008080', 'bf850002'] + MESH[PRIMITIVE_EXPORT:],
@@ -386,6 +410,9 @@ def binary(mc):
     expect('rewritten descriptor words match llvm-mc',
            assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\ns_mov_b32 s19, 0\n' + FORMAT_LOAD)), REWRITTEN_FORMAT)
     expect('pixel words match llvm-mc', assemble(mc, PIXEL_ASM), PIXEL)
+    shift = mesh.replace('v_cmpx_gt_i32 s14, v0', SHIFT_ASM + '\nv_cmpx_gt_i32 s14, v0')
+    shift = shift.replace('exp pos0', 'v_mov_b32 v20, v7\nexp pos0')
+    expect('scalar shift mesh words match llvm-mc', assemble(mc, shift), SHIFT_MESH)
 
 
 # ---- draw: four triangles in a 32x32 target, vertices stored out of order ----------------------
@@ -605,6 +632,60 @@ def draw_formatted(dxc, renderer, adapter):
     return 0
 
 
+def draw_shift(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    # The first provoking vertex (thread 39) shares a guest wave with active thread 5 across the
+    # host's possible 32-lane boundary. The last two triangles are in the all-empty guest wave.
+    triangles = [tuple(slot + offset for slot in tri) for tri, offset in zip(indices, (32, 0, 64, 64))]
+    words = [a | b << 10 | c << 20 for a, b, c in triangles]
+    with tempfile.TemporaryDirectory() as tmp:
+        key, status = request(tmp, SHIFT_MESH)
+        if status != 'ok':
+            raise AssertionError(status)
+        base = Path(tmp) / ('%016x' % key)
+        pipe = G.MeshPipeline(code(SHIFT_MESH), code(PIXEL), root())
+        constants = bytearray(1024)
+        for slot, count in enumerate((len(triangles), 128)):
+            struct.pack_into('<I', constants, 4 * pipe.uds.index(('rootconst', 0, slot)), count)
+        head = bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+
+        def reference(per_lane):
+            red = list(colours)
+            for tri in triangles:
+                for tid in tri:
+                    active = tid < 6 if per_lane else tid // 64 == 0
+                    slot = tid % 16
+                    red[slot] = (255 if active else 64, *colours[slot][1:])
+            return rasterise(points, red, triangles, 128, len(triangles))
+
+        correct, per_lane = reference(False), reference(True)
+        different = sum(a != b for a, b in zip(correct, per_lane))
+        assert different > 0
+        source = base.with_suffix('.ms57.hlsl').read_text()
+        predicate = '(tid & ~63u) >= 6u'
+        assert source.count(predicate) == 1
+        mutated = Path(tmp) / 'per-lane.hlsl'
+        mutated.write_text(source.replace(predicate, '(exec & 1) == 0'))
+        mutant = Path(tmp) / 'per-lane.cso'
+        subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True)
+        case = Path(tmp) / 'shift.bin'
+        for shader, image, mismatch in ((base.with_suffix('.ms57.cso'), correct, 0),
+                                        (mutant, correct, different), (mutant, per_lane, 0)):
+            case.write_bytes(head + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed', shader, base.with_suffix('.ps57.cso'), case],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            if (run.returncode != int(bool(mismatch))
+                    or not re.search(rf'\bpixels={SIDE * SIDE} mismatches={mismatch}\b', run.stdout)):
+                raise AssertionError(run.stdout + run.stderr)
+            print(f'{shader.name}: {mismatch} pixels differ from the reference')
+    return 0
+
+
 def main(argv):
     status = 0
     if argv[1:2] == ['binary'] and len(argv) == 3:
@@ -613,6 +694,8 @@ def main(argv):
         status = draw(*argv[2:])
     elif argv[1:2] == ['formatted'] and len(argv) == 5:
         status = draw_formatted(*argv[2:])
+    elif argv[1:2] == ['shift'] and len(argv) == 5:
+        status = draw_shift(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
     elif len(argv) == 1:

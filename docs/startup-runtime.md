@@ -1105,7 +1105,7 @@ Archive each run's logs together with a copy of `shader_cache/`, and leave the c
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
 
-**Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies the graphics, RTV variant and slot 67 compute requests of the old cache under the keys of the current revision, computed with `pipeline_key` and `compute_key` of the `gfx2hlsl.py` next to it. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
+**Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies graphics, RTV variant, slot 67 compute and slot 57 mesh requests under their current keys. It uses `pipeline_key`, `compute_key` and `mesh57_key` from the adjacent `gfx2hlsl.py` and updates each RTV variant with its new graphics key. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
 
 ```powershell
 .\out\pe-env\Scripts\python.exe -B tools\startup\shader_cache_rekey.py out\startup\shader_cache out\startup\shader_cache_rekeyed
@@ -1113,11 +1113,11 @@ When the translator handles more, the next `--pending` pass retries the waiting 
 robocopy out\startup\shader_cache_rekeyed out\startup\shader_cache /XC /XN /XO
 ```
 
-1. The re-key step only reads the old cache and writes request files (`req_*`) only, never results or `.fail`. A file already in the new directory is left as it is, so a second run writes nothing. It reads every request before it writes: if a part is missing or unreadable, or an RTV variant is malformed or names a base that is not in the cache, it prints how many, writes nothing and exits with 1. Slot 57 and slot 86 mesh requests have their own key strings and are not re-keyed. `X2W_TRANSLATE_JOBS` sets the number of hashing processes.
+1. The re-key step reads the old cache and writes only request files (`req_*`). A file already in the new directory is left as it is, so a second run writes nothing. It reads every request before it writes. If a part is missing or unreadable, or an RTV variant is malformed or names a base that is not in the cache, it prints how many, writes nothing and exits with 1. A slot 57 request requires `.ps57`, `.root` and the `.m57` ready marker. The `.ps57` file is empty when there is no pixel stage. Slot 86 mesh requests are only counted. `X2W_TRANSLATE_JOBS` sets the number of hashing processes.
 2. `--pending` translates the re-keyed requests offline, as it does for a running title's cache.
 3. The `robocopy` switches skip every file that already exists in the cache, so results the runtime or a later pass wrote are kept. A `robocopy` exit code below 8 means success: 1 is set when files were copied, and 2 is set because the cache holds files that the new directory does not. A code of 8 or more is a failure. On Linux, run the same steps with `./out/pe-env/bin/python` and merge with `cp -rn out/startup/shader_cache_rekeyed/. out/startup/shader_cache/`, which also keeps existing files.
 
-`tests/startup_shader_cache_rekey_check.py` checks the tool on synthetic requests only: the names match the current keys, a newer revision gives other names, a second run and a current cache change nothing, and an incomplete request or an RTV variant without its base writes nothing. Re-keying recovers the requests, not the translations: some re-keyed pipelines can still fail to translate, which is separate from the cache key. Nothing here shows that a title runs.
+`tests/startup_shader_cache_rekey_check.py` checks the tool on synthetic requests only: the names match the current keys, a newer graphics and compute revision gives other names for those requests, a second run and a current cache change nothing, and an incomplete request or an RTV variant without its base writes nothing. Re-keying recovers the requests, not the translations: some re-keyed pipelines can still fail to translate, which is separate from the cache key. Nothing here shows that a title runs.
 
 When `fxc` is available, a request that later translates loses its `.fail`. In manifest-only mode (`X2W_FXC` empty) the old `.fail` stays, so on a kept cache the `.fail` categories in `triage.md` can include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
 
@@ -1343,11 +1343,13 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it, otherwise copied from title memory at each submission, otherwise the default backing is kept and the refusal recorded; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
+| `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1366,6 +1368,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 | `X2W_STOP_AT=<rva>[,...]` | the startup debugger stops at a main-image breakpoint at one of these addresses even while `-ContinueAsserts` steps over the others, and writes every thread's stack to `threads_stop.txt` |
 | `X2W_LOG_AT=<rva>[@<max hits>][:<item>[;<item>...]][,...]` | logs the elapsed time, thread ID, main-image instruction RVA, hit number and selected values to `files.txt`. RVAs and offsets are hexadecimal. The hit limit is decimal and defaults to 16 per RVA. Items are `rax`, `rcx`, `rdx`, `rbx`, `rsp`, `rbp`, `rsi`, `rdi`, `r8` through `r15`, or `[reg+hex]` / `[reg-hex]` for a qword read (`unreadable` on failure). Omit the item list to log all 16 registers. At the limit the debugger restores the original instruction unless another hook shares the breakpoint. INT3 events that other threads raised before the restore are resumed at the restored instruction, not logged, and counted on a separate `LOG_AT late hits resumed after the limit` summary line. Malformed entries (including a repeated item, compared by register and offset) and unusable breakpoints are reported in `events.txt`. The end summary lists logged hits per RVA. Fixture: `ctest --preset dev --no-tests=error -R '^startup_debug' -V`. |
+| `X2W_NOP_SOFT_ASSERTS=1` | after `-ContinueAsserts` steps over a main-image `int3` for the first time, the startup debugger replaces its `cc` byte with a `NOP`, so a routine that traps once per chunk runs at native speed. The patch lasts for the life of the process and only targets RVAs of the main image; `X2W_STOP_AT` sites are never patched. `DBG_CONTINUE` already bypasses the title's handler, so the visible behavior is unchanged. Once a site is patched it no longer raises an exception and `asserts_seen` stops counting it, so the `--continue-asserts N` budget no longer measures real hits at that site |
 | `X2W_DUMP_AT=<seconds>[,...]` | the startup debugger writes every thread's stack to `threads_<seconds>.txt` at those times, for a run that stalls before a watchdog or the timeout ends it |
 | `X2W_VALLOC_MIN=<hex bytes>` | the startup debugger logs each virtual-memory allocation of at least that size to `files.txt` (`VALLOC`), with the requested address (0 for any, unreadable for an incomplete read), size, type, protection and the main-image and stand-in return addresses on the caller's stack |
 | `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
@@ -1531,6 +1534,48 @@ title memory) still records its upload. The fixture-only exports `x2w_d3d12_reti
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
 physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
+
+## D3D12 view census
+
+The stand-in keeps one record per distinct view: slot, resource, counter,
+description bytes and whether the desktop view was created. Records are not
+removed. `X2W_D3D12_VIEW_CENSUS=1` shows which slot adds them. It changes no
+record, id or descriptor binding.
+
+The heartbeat adds a line:
+
+`x2w-view-census distinct by slot: cbv= srv= uav= rtv= dsv= sampler= records= capacity= ids= buckets= grows-records= grows-ids= missed=`
+
+- `cbv` to `sampler`: new records from device slots 17 to 22.
+- `records`, `capacity`: size and capacity of the record vector.
+- `ids`, `buckets`: size and bucket count of the hash map from content to id.
+
+Before an insertion that is expected to grow either container, the same fields
+are logged as `x2w-view-census before growth of <records|ids|records and ids>`,
+with the slot of the new record. The values are those before the growth. The line
+is written before the allocation, so it is in the log when that allocation fails,
+also when no further heartbeat follows. The growth is predicted: from the
+vector's capacity, and for the map from the MSVC rehash rule (the new size over
+the bucket count exceeds the maximum load factor). `missed` counts capacity or
+bucket changes that no line announced.
+
+The census counts distinct byte contents, not distinct views. It does not say
+why two records differ (for example a changing address, or description bytes
+that the view type does not use), and it does not measure the size of the
+containers in bytes or reduce it.
+
+`startup_view_census_<warp|hardware>` calls slots 17, 18 and 22 of the device.
+A repeated descriptor must add no record and grow nothing. A stream of 200,000
+distinct constant buffer views, 3,000 buffer SRVs and 100 samplers must be
+counted by slot, with one log line per announced growth. Both streams run under
+a job commit limit 256 MiB above the commit held after setup. `off` checks that
+nothing is reported without the switch; in `vary` the repeated stream changes
+every call, and the fixture must fail. Slots 19 to 21 are not exercised.
+
+```powershell
+cmake --build --preset dev --target startup_view_census
+ctest --preset dev --no-tests=error -R "^startup_view_census" -V
+```
 
 ## Input script
 
@@ -2956,6 +3001,50 @@ layouts"):
 
 - `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
 - `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
+
+## Linear buffer backing (device slot 133, opt-in)
+
+By default slot 133 aliases a buffer only in private memory, through an existing heap cached by
+allocation base and opened without a `D3D12_FEATURE_EXISTING_HEAPS` query. Anything else gets a
+committed default buffer that does not alias the title memory, holds zeros and is reported as
+success (`not aliased` in the log). `X2W_D3D12_LINEAR_BUFFERS` changes this for one buffer kind: a
+buffer description with row-major or unknown layout and initial state `COMMON`
+(`src/startup_stubs/linear_buffer_backing.h`, [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914)).
+Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, keep the default backing.
+
+| Value | Backing |
+|---|---|
+| unset or `0` | the default above; none of the linear-buffer code runs |
+| `1` | shared when the adapter reports `D3D12_FEATURE_EXISTING_HEAPS` (queried once, before any open) and the buffer lies in one committed private allocation at a 64 KiB-aligned offset; otherwise copied; otherwise the default backing, with the refusal recorded |
+| `copy` | copied; otherwise the default backing, with the refusal recorded |
+
+- Shared: a cross-adapter buffer placed on the private allocation's heap, cached by base. The GPU reads and writes title memory; nothing is copied.
+- An XMem view is never shared. A heap opened from a view keeps it mapped, and XMem's unmap of those pages then fails with error 87. Sharing reports `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` (`0x80070032`) and the buffer is copied. A buffer across several allocations, or at an unaligned offset, reports `E_INVALIDARG`. Both are decided before any D3D12 call.
+- Copied: a committed default buffer that is refreshed from title memory at each submission through a command-queue wrapper, just before the title's lists run, not at bind or record. Only bytes that changed since the last upload are copied, through an upload staging buffer.
+  - **Internal queue.** Every refresh runs on one internal COPY queue per device, which never waits on a title fence. It signals an internal fence value, and each buffer remembers the value of its last refresh.
+  - **Consumer wait.** Every submission through a queue wrapper, of any type (direct, compute or copy), first makes its queue `Wait` for the highest such value among the live copied buffers that has not completed. A consumer on any queue therefore runs after every refresh enqueued before it, wherever that refresh came from. So when one CPU write is followed by submissions on two queues, both read the new bytes, even if the first is still held behind a title fence.
+  - **Producer wait.** A refresh's copy is also ordered behind earlier GPU access to the backing. Simultaneous access allows concurrent operations on one buffer only on disjoint ranges, so the copy must not overlap an earlier submission that still reads or writes it. Each queue wrapper signals a user fence of its own after the title's lists. Before a refresh's copy executes, the internal queue `Wait`s for every queue's latest user fence value that has not completed (`producer_waits`). The wrappers cannot tell which buffers a submission reads, because titles bind them by GPU virtual address, so every earlier submission counts as a user of every copied backing. This conservative choice can idle the GPU between a frame's submissions and the next refresh.
+  - **Unsafe refresh refused.** A submission whose refresh has no safe completion order is refused (`unsafe_refresh_refusals`, logged). That is the case when the refresh would have to wait for an earlier submission, on any queue including its own, that sits behind a title `Wait` (queue slot 17) on a fence that has not been reached, or for one whose user fence `Signal` failed. Waiting could deadlock: the fence may be signalled only by work that itself waits for the refresh, such as queue 2 signalling a fence that queue 1 waits on. Not waiting would let the copy overlap that read, because the blocked queue is not known to stay blocked until the copy finishes; the CPU or another queue may reach the fence meanwhile. The decision is made right before the refresh would be enqueued, and nothing of the submission reaches the GPU: no refresh, no consumer `Wait`, none of the title's lists and no user fence `Signal`. The staging buffers and refresh list are free again, no buffer's upload record or refresh state changes, and a recorded copy's GPU write stays pending on its recording. The next submission copies whatever still differs. The title's own `Signal` and `Wait` on its queues do not pass through this path, so a later `Signal` still releases the earlier queue. A submission with no changed bytes is never refused. A title `Wait` issued on the desktop queue past the wrapper is not seen, and that queue is waited for.
+  - **Queue order lock.** A title can call slot 17 and `ExecuteCommandLists` on one queue from two threads at once. Each queue's linear-buffer record has an order lock, so the record of which submissions sit behind which title `Wait` matches the desktop queue's order. Slot 17 holds it from the desktop `Wait` through recording that `Wait`. A submission holds it from the title's `ExecuteCommandLists` through its user fence `Signal`, before `draw_lock` and `allocator_lock` in render mode. Without it, a submission could reach the desktop queue behind a `Wait` but take its user value before that `Wait` was recorded. Another queue's refresh would then wait for that blocked submission instead of being refused. The lock is not held across the refresh, so staging waits and fixture pauses run without it. Nothing under it waits on the CPU for the GPU. The title's `Signal` does not take it, so a queue whose submission was refused can still signal the fence its blocked peer waits on.
+  - **Own refresh.** A submission also waits for the refresh it enqueued itself, even if the title released that buffer meanwhile.
+  - **Staging reuse.** A staging buffer is reused only after the internal fence value of the copy that read it has completed.
+  - **No internal queue.** If the internal queue or its fence cannot be created, copied placements keep the default backing with that HRESULT recorded.
+  - In render mode the refresh and the consumer `Wait` run before the wrapper takes its draw and allocator locks, so they precede every list of the submission, including the producer fences `red_producers` adds and each split submission of mesh XMem recordings.
+  - Budgets (`X2W_D3D12_BUDGET=1`) count the linear backings as the default backing counts its own. A shared buffer counts as placed memory on its heap, whose backing-heap ticket is in use while a buffer on it is held. A copied buffer counts as a committed buffer. Staging buffers count as upload memory and live for the process.
+  - A copied buffer that a recorded copy writes (list `CopyBufferRegion` or `CopyResource`, `list_copy.inl`) keeps the GPU's bytes once that recording is submitted and is no longer refreshed, as the default backing behaves for it. The title memory never receives those bytes, and a refresh spanning them would copy older title bytes over them. Info and totals report it (`gpu_written`). Until the submission the write is pending on the recording, with the texture writes of `list_copy.inl`: a `Reset` or a failed `Close` drops it, and the buffer stays refreshed. The recording's own submission still refreshes the buffer first, and its queue waits for that refresh before the copy runs.
+  - **Publish order.** Two submissions on different threads can stage one buffer's bytes at different times and execute their copies in one order but publish the upload record in the other. A buffer remembers the internal fence value of its newest applied publish. An older publish that arrives after a newer one drops the record (`reordered_publishes`), and the next submission copies the whole buffer.
+  - **Title memory reads.** Every live copied buffer is snapshotted, not only those the submitted lists read. Its title memory is probed again right before it is staged, and staged under a fault guard. A buffer whose memory the title freed after the snapshot is skipped and counted (`unreadable`); a read that faults anyway is counted (`copy_faults`) and fails that buffer's refresh. A buffer released after the snapshot whose pages are still mapped is staged for that submission, which may read it.
+  - The lock that guards the backing is held only to choose and publish. Waiting for a staging fence (a full pool), creating staging or a refresh list, recording it and `ExecuteCommandLists` all happen without it. A `Release`, the fixture exports and another queue's submission therefore never wait behind them.
+- Kept default: where neither path keeps its guarantees, slot 133 keeps the default backing above and returns what it returns without the switch. On the console `CreatePlacedResourceX` does not fail, and a title that received a failure faulted on the null object. The refusal HRESULT is recorded instead:
+  - a GPU-written use (`ALLOW_UNORDERED_ACCESS`) that cannot be shared records the sharing HRESULT, or `DXGI_ERROR_UNSUPPORTED` when sharing was not attempted. The copy has no point at which GPU writes reach title memory;
+  - without the internal refresh queue: `E_NOT_VALID_STATE` (`0x8007139f`) under `X2W_TEST_SUBMIT_FENCE_FAIL=1`, else the HRESULT of creating the queue or its fence;
+  - when the copy's default buffer cannot be created, that HRESULT;
+  - when the mesh XMem lease path is on (`X2W_MESH86_XMEM_SRV` or `X2W_MESH_INDIRECT_XMEM`) and the placement is one it takes: XMem pages (`MEM_MAPPED`) with console flags 0. `HRESULT_FROM_WIN32(ERROR_BUSY)` (`0x800700aa`) means the placement was deferred to the lease path, which mirrors and publishes that default copied placement. The two never back one placement.
+- A submission whose refresh cannot be staged still runs. This happens when the staging pool stays full of in-flight buffers past a 5 s wait (`DXGI_ERROR_WAS_STILL_DRAWING`) or when staging cannot be created. That buffer keeps its last upload and is reported stale until a later refresh succeeds. The first failures are logged (`x2w-d3d12 linear buffers: refresh of <resource> failed <hr>; the submission runs with its last upload (stale)`) and every one is counted.
+
+A shared or copied placement logs `x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer ... existing-heaps=<hr> share=<hr> -> <hr> shared|copied at submit`. A kept default logs the usual slot 133 line with `(kept default backing: linear refusal <hr>, use=... type=... existing-heaps=<hr> share=<hr>)` appended. `x2w_d3d12_linear_buffer_info` reports path 3 with `refusal_hr`, and `stale`, `refresh_failures` and `last_refresh_hr` for a copied buffer. A refused submission logs `x2w-d3d12 linear buffers: submission on queue <queue> refused: its refresh would have to wait for queue <queue> (<reason>), so it has no safe completion order; none of its lists ran` (the first eight). `x2w_d3d12_linear_buffer_totals` counts `kept_default`, `refresh_failures` and `unsafe_refresh_refusals`. Fixtures read the same facts through `x2w_d3d12_linear_buffer_info` and `x2w_d3d12_linear_buffer_totals` (`src/startup_stubs/linear_buffer_report.h`). Fixture-only switches: `X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1` makes the feature query report no support, as an adapter with `EXISTING_HEAPS = 0` does. `X2W_TEST_LINEAR_REFRESH_FAIL=<n>` makes staging requests 2, 2 + n, 2 + 2n and so on fail with `E_OUTOFMEMORY`. `X2W_TEST_LINEAR_STAGING_LIMIT=<n>` shrinks the staging pool from 256 buffers to `n`. `x2w_d3d12_linear_buffer_internal_queue` hands fixtures the internal queue, so they can hold refreshes in flight behind a fence of their own. `x2w_d3d12_linear_buffer_test_pause` parks the next refresh at one point (before staging, after staging, or after its copy executed and before it is published), so a fixture can order two threads' refreshes or release a buffer while one is parked. Point 3 instead parks the next title `Wait` (queue slot 17) after the desktop `Wait` and before it is recorded, while it holds that queue's order lock. `X2W_TEST_LINEAR_BUFFER_MUTANT=<name>` removes one guarantee for a negative control. Results and commands: [Production slice: slot 133 linear buffers](experiments.md#production-slice-slot-133-linear-buffers-1914).
+
+Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs (`list_root_srv`) still take `upload_from_title` at bind. Neither reads the slot 133 backing. Shared buffers and their heaps live for the process, like every wrapper, so a private range under one cannot be released.
 
 ## Buffer memory SRVs (device slot 70)
 

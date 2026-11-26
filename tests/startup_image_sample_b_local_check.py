@@ -1,7 +1,7 @@
 """image_sample_b (sample with an LOD bias) in tools/startup/gfx2hlsl.py.
 
 The fixture is the source-built pixel stage of startup_image_sample_l_check.py (v0 = 0.5, v1 = 0.25, v2 = 1.0,
-v3 = 2.0; texture from descriptor table 0, all-zero constant sampler) with its MIMG opcode set to 0x25, which the
+v3 = 2.0; texture from descriptor table 0) with its MIMG opcode set to 0x25, which the
 decoder names image_sample_b (LLVM MIMGInstructions.td, gfx10 IMAGE_SAMPLE_B). The bias is the FIRST address dword,
 before the coordinates (LLVM AMDGPUImageDimIntrinsics: sample_b has ExtraAddrArgs [bias]), so v[0:2] is
 bias v0, u v1, v v2 and the lowering must be SampleBias(q0, float2(F(v1), F(v2)), F(v0)).
@@ -54,7 +54,12 @@ def main():
     code = program(0x25)
     asm = G.decode(code)[10][3]
     assert asm == 'image_sample_b v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D', asm
-    ps = ps_text(code)
+    refused(code, 'mipmapping disabled')
+    # Set the sampler's mip filter to point for the positive bias case.
+    sampler = bytes.fromhex('80039abe')
+    assert code.count(sampler) == 1
+    point = bytes.fromhex('ff039abe00000004')
+    ps = ps_text(code.replace(sampler, point))
     assert 't = r0.SampleBias(q0, float2(F(v1), F(v2)), F(v0));' in ps, ps
     for comp, reg in zip('xyzw', range(4, 8)):
         assert 'v%d = U(t.%s);' % (reg, comp) in ps, ps
@@ -68,12 +73,12 @@ def main():
         refused(code, 'image_sample_b')
     finally:
         G.Stage.op_image_sample_b = saved
-    refused(program(0x25, prefix_branch=True), 'image_sample_b outside straight-line code')
+    refused(program(0x25, prefix_branch=True).replace(sampler, point), 'image_sample_b outside straight-line code')
     assert G.decode(program(0x25, prefix_branch=True))[9][3].startswith('s_cbranch_scc0')
     a16 = bytearray(program(0x25))
     a16[0x34:0x38] = struct.pack('<I', struct.unpack_from('<I', a16, 0x34)[0] | 1 << 30)  # A16 (second dword bit 30)
     assert G.decode(bytes(a16))[10][3].endswith(' a16'), G.decode(bytes(a16))[10][3]
-    refused(bytes(a16), 'image_sample_b form')
+    refused(bytes(a16).replace(sampler, point), 'image_sample_b form')
     print('image_sample_b: SampleBias with the bias from the first address dword; controls: refused without the '
           'handler, after a branch, with a16; plain sample unchanged')
 
