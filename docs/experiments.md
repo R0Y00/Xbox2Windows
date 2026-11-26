@@ -4550,19 +4550,21 @@ python3 -B tests/compute_mimg_float_store_d16_check.py --binary llvm-mc-15 llvm-
 
 ### gfx1013 2D image atomics
 
-The gfx1013 profile accepts `image_atomic_add`, `image_atomic_umax` and
-`image_atomic_cmpswap` on a 2D `R32_UINT` UAV at mip 0 and lowers them with
-the gfx1030 image atomic lowering described below. The emitted HLSL is
-identical for both targets. The atomics return nothing: `glc` and the other
-cache, `a16`, `d16`, `tfe`, `lwe` and `r128` flags stay refused, as on gfx1030.
-On gfx1013 every other image atomic (`sub`, `and`, `or`, `xor`, `umin`,
+The gfx1013 profile accepts `image_atomic_add`, `image_atomic_umin`,
+`image_atomic_umax` and `image_atomic_cmpswap` on a 2D `R32_UINT` UAV at mip 0
+and lowers them with the gfx1030 image atomic lowering described below. The
+emitted HLSL is identical for both targets. The atomics return nothing: `glc`
+and the other cache, `a16`, `d16`, `tfe`, `lwe` and `r128` flags stay refused, as
+on gfx1030. On gfx1013 every other image atomic (`sub`, `and`, `or`, `xor`,
 `swap`, `inc`, `dec`) is refused by name. So are the signed and float formats,
 a nonzero UAV mip, array and 3D dimensions, a second atomic and a store to the
-same image.
+same image. `umin` stays unsigned (`InterlockedMin` without `asint`); the
+minmax operand `0x80000011` makes unsigned ordering differ from signed `smin`
+on the CPU reference (M200-01 A).
 
 The fixtures are the gfx1030 cases with the gfx1013 profile. One add writes
 unique texels, a contended add sends two lanes to each texel of one row, and a
-`umax` and a `cmpswap` each write unique texels. Each runs with one and two
+`umin`, a `umax` and a `cmpswap` each write unique texels. Each runs with one and two
 groups, and the readback compares all 336 words of a three-mip texture with a
 CPU reference, including the untouched texels and mips. For each case and
 group count, one mutant must mismatch at the first word its reference
@@ -4849,6 +4851,86 @@ ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_msaa_(warp|
 ```sh
 python3 -B tests/compute_mimg_msaa_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
+
+### Experimental gfx1030 2D per-instruction minimum LOD
+
+The ordinary pixel path accepts the following full-width, non-comparison
+`dmask:0xf` Texture2D forms with sequential VGPRs. The output is four VGPRs,
+and the existing `vmcnt(0)` rule applies. Coordinates must retain whole-quad
+provenance. The offset is a known canonical packed XY DWORD, with signed
+six-bit fields at bits 5:0 and 13:8, limited to the DXIL range `[-8, 7]`.
+
+| Instruction | gfx1030 opcode | Active address DWORDs | Desktop HLSL |
+| --- | --- | --- | --- |
+| `image_sample_cl` | `0x21` | `u, v, clamp` | `Sample(s, uv, int2(0, 0), clamp)` |
+| `image_sample_cl_o` | `0x31` | `offset, u, v, clamp` | `Sample(s, uv, offset, clamp)` |
+| `image_sample_b_cl` | `0x26` | `bias, u, v, clamp` | `SampleBias(s, uv, bias, int2(0, 0), clamp)` |
+| `image_sample_b_cl_o` | `0x36` | `offset, bias, u, v, clamp` | `SampleBias(s, uv, bias, offset, clamp)` |
+
+`--cpu gfx1030 --sample-clamp-mips N` opts into this experiment. The caller
+must bind matching float 2D views of 1 to 16 visible mips and a normalized
+clamp-to-edge sampler with point XY and mip filters, zero sampler bias and
+minimum LOD, and maximum LOD at or above the last view mip. The instruction
+clamp must be a known finite float in `[0, N-1]`. The instruction bias, when
+present, must be a known float in the HLSL range `[-16, 15.99]`. The draw
+cases use integral LODs and avoid point mip ties. Fractional and near-tie
+native rounding remain unmeasured. Comparison, explicit gradient, gather,
+NSA, `a16`, `d16`, runtime LOD operands and other sampler profiles are outside
+this experiment.
+
+**Source discrepancy.** The [AMD RDNA 2 reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture),
+Table 44, says `_CL` clamps computed LOD “to be no larger than this value.”
+Table 43 and section 8.2.5 describe the address order. LLVM 15.0.7's
+[AMDGPU intrinsic definitions](https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/include/llvm/IR/IntrinsicsAMDGPU.td)
+append the operand named `clamp` after the coordinates, and its
+[MIMG instruction table](https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/lib/Target/AMDGPU/MIMGInstructions.td)
+assigns the four opcodes above. Those LLVM definitions establish the operand
+order and encoding. In Mesa 25.1.0, the
+[SPIR-V reader](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/compiler/spirv/spirv_to_nir.c)
+maps `MinLod` to `nir_tex_src_min_lod`. The
+[ACO selector](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/compiler/aco_instruction_selection.cpp)
+selects the four `_cl` forms, and the
+[Mesa AMD LLVM builder](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/llvm/ac_llvm_build.c)
+appends `min_lod` to the `.cl` intrinsics. The
+[Vulkan scale-factor rules](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#textures-level-of-detail-operation)
+and [Direct3D per-sample MinLOD rules](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#5.9.4.5.4%20Per-sample%20MinLOD%20Clamp)
+define a lower bound on the biased LOD. The desktop experiment follows the
+compiler mapping and uses the native DXIL `Sample` and `SampleBias` clamp
+operands. AMD's pinned LLPC independently maps SPIR-V `MinLod` to the same
+AMDGPU intrinsics. [AMD LLPC SPIR-V reader](https://github.com/GPUOpen-Drivers/llpc/blob/40cb8d95ad8d6f7f1652e3fd47d39667594cce08/llpc/translator/lib/SPIRV/SPIRVReader.cpp#L7814) ·
+[AMD LLPC image builder](https://github.com/GPUOpen-Drivers/llpc/blob/40cb8d95ad8d6f7f1652e3fd47d39667594cce08/lgc/builder/ImageBuilder.cpp)
+
+The fixture checks four LLVM intrinsic-to-ISA argument orders with distinct
+literal words and four source assembly-to-container CLI round trips. The
+CPU model selects `max(implicit LOD + bias, clamp)` before point mip selection
+and predicts all 64 RGBA pixels from three spatially distinct mips. The
+translated shader and independent desktop `SampleLevel` oracle use the same
+texture, sampler and CPU reference. Controls drop the clamp, force the clamp
+as the LOD, drop the bias, apply it after the clamp, or remove the offset.
+For example, dropping the `_cl` clamp first changes pixel `(0,0)` red from
+`0.5` to `0.25` in the CPU model. The offline DXC check verifies the clamp,
+bias and nonzero offset operands in the emitted DXIL.
+
+```bash
+python3 -B tests/pixel_sample_clamp_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_sample_clamp_(controls|compile)$' -V
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_sample_clamp_(warp|hardware)$' -V
+```
+
+**Native publication gate.** Before publishing opcode support or recording
+form coverage, capture the rendered mip identifiers from a source-built
+native gfx1030 pixel shader for all four opcodes. Use the same sampler and
+spatial mips, confirm the native instruction in the submitted shader's
+disassembly, and record device target, driver, shader hash and full readback.
+Use cases where the computed LOD is below and above the operand, plus the
+negative bias case that distinguishes bias-before-clamp from the opposite
+order. Desktop DXIL readback tests the Direct3D implementation. The test
+registration omits form coverage records while the native direction remains
+unresolved.
 
 ### gfx1030 2D image gathers
 
@@ -8722,6 +8804,48 @@ python3 -B tests/pixel_compare_sample_check.py binary llvm-mc-15 llvm-objcopy-15
 ctest --preset dev --no-tests=error -R '^pixel_aot_compare_sample_(warp|hardware)$' -V
 ```
 
+### gfx1030 2D comparison sample LOD and bias
+
+`image_sample_c_l` and `image_sample_c_l_o` lower to `SampleCmpLevel`.
+`image_sample_c_b` and `image_sample_c_b_o` lower to `SampleCmpBias`.
+The forms accept a contiguous sequence of full-width address VGPRs with an
+optional packed XY offset, an instruction bias for `_b`, the reference, U and V,
+and an explicit LOD for `_l`. Bias and LOD each accept binary32 `+0.0` and `1.0`
+when known statically. The bias forms require whole-quad UVs. The matching
+comparison sampler uses point XY and mip filtering, clamp-to-edge addressing,
+`MIN_LOD = 0`, `MAX_LOD = 1`, and no sampler LOD bias. Bind a 2D R32_FLOAT view
+with both mips visible and a desktop comparison sampler with the same LOD range.
+The forms use `dmask:0x1` and the existing reference range, offset and wait rules.
+
+The synthetic fixture uses different depth patterns in its 8×8 and 4×4 mips.
+It draws at 8×8 and 16×16 with a mip-zero footprint of one texel per pixel, so
+explicit LOD 1 and instruction bias +1 each select the second mip. A CPU model
+predicts all RGBA values, including where the signed offset `(1, -2)` clamps to
+an edge. Zeroing the LOD or bias selects mip zero. Zeroing the offset changes the
+lookup in mip one. Each mutated draw must match its own full CPU reference and
+first differ from the original reference at the predicted pixel and values.
+
+LLVM 15 assembles and disassembles the four forms and checks that the container
+CLI emits the same HLSL as the text path. The optional `compile` command runs
+DXC and computes the expected first differences on the CPU.
+
+```sh
+python3 -B tests/pixel_compare_lod_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+python -B tests/pixel_compare_lod_check.py compile level dxc
+python -B tests/pixel_compare_lod_check.py compile bias dxc
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_lod_(level|bias)_(warp|hardware)$' -V
+```
+
+The Level tests require PS 6.7 and `AdvancedTextureOpsSupported`. The Bias tests
+require PS 6.8 and `SampleCmpGradientAndBiasSupported`. The renderer uses the
+Windows SDK 10.0.26100 headers for these capability queries. CTest reports an
+unsupported profile, SDK header set or device capability as a skip (77).
+Intel Arc B390 and WARP passed the Level tests. WARP passed the Bias tests.
+Arc B390 reported the Bias capability unavailable and skipped those tests.
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:
@@ -9597,7 +9721,27 @@ vertex red. The draw checks a vertex in the upper half of a partially active
 wave and vertices in a second, empty wave that retain the previous value.
 It also compiles a per-lane branch and checks its different image. The proof
 requires a straight path from the count exchange and an immediate EXEC
-restore. Scalar memory operations in the skipped region remain unsupported.
+restore.
+
+Between the group-index and count exchanges, one forward EXEC-zero block can
+contain a single `s_buffer_load_dword` whose SGPR result is live at the join.
+Full EXEC followed by `v_cmpx_gt_u32_e32` must select the proven thread indices
+below a wave-uniform SGPR bound. The translator evaluates
+`(tid & ~63u) < bound` at the compare and branches around the load when the
+guest wave is empty. A mixed wave gets the loaded word in every lane. Vector
+instructions inside the block still follow per-lane EXEC. The proof requires a
+wave-uniform address and a defined, wave-uniform previous value. It refuses
+other scalar instructions inside the block, wider loads, non-buffer scalar
+loads, stores, atomics and branches into the block.
+
+The slot 57 skeleton `draw` fixture uses bound 6 and vertices from threads 39
+and 5 in the mixed wave. Their flat red is 255, and only thread 5 gets green
+255 from the lane-predicated write. The empty wave keeps red 64 and green 0.
+Its byte address is 736, beyond the 512 bytes of input and the renderer's
+80-byte trace padding. The CPU reference reads byte 480
+only for the mixed wave, reuses that word across its lanes, then rasterizes
+the triangles. Swapping the two waves' red values in the reference must
+change every covered pixel.
 
 The `startup_mesh57_formatted_load_{warp,hardware}` tests use one
 `buffer_load_format_x` to set vertex red. The fixture supplies descriptor word 3
@@ -14996,6 +15140,17 @@ python -B tests/startup_compute_store_format_xyzw_check.py binary llvm-mc-15
 
 Not covered here: hardware adapters, the `llvm-mc-15` `binary` step, formats with fewer than four channels (they write nothing), `OOB_SELECT` 1, a dispatch against a host view shorter than the guest range (the guard is checked only as emitted text), and runtime binding of the three entry constants.
 
+### Startup compute address carry
+
+The startup compute translator accepts a numeric `s_add_u32 sN, a, b` followed
+immediately by `s_add_u32 sN+1, 0, src_scc` when both execute in the same
+basic block. The first add produces the low word and unsigned carry. The second
+stores the carry as the high word and clears SCC. A branch directly to the high
+add, a lane-mask addend or symbolic descriptor arithmetic keeps the refusal.
+The `address-carry` fixture
+adds group IDs 0 through 3 to `0xfffffffe` and reads back both words and the
+final SCC. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|warp|hardware)$' -V`.
+
 ### First active lane at compute entry
 
 The startup compute translator accepts `s_ff1_i32_b32 sN, exec_lo` in the
@@ -15947,6 +16102,26 @@ Building on #2443 (Slice 1), `X2W_D3D12_RELEASE_RETIRED=1` extends desktop objec
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
 ```
+
+## Source `abs` modifiers (`|src|` and `-|src|`) on `v_cndmask_b32_e64` in the startup translator
+
+`Stage.u_src` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py#L1506-L1521) now strips `|...|` after `split_neg(tok)` for `v_cndmask_b32_e64` data sources (`src0` and `src1`, both VGPRs and SGPRs), clearing the `off_diag.py` refusal `operand '|v0|' at v_cndmask_b32_e64 v0, v0, |v0|, s30`. Per the RDNA2 VOP3A source-modifier order, `abs` clears bit 31 (`& 0x7fffffffu`) first and `neg` flips bit 31 (`^ 0x80000000u`) second:
+
+- `|src|` emits `(src & 0x7fffffffu)`
+- `-|src|` (and `neg(|src|)`) emits `((src & 0x7fffffffu) ^ 0x80000000u)` (forces bit 31 to `1`)
+- `-src` keeps `(src ^ 0x80000000u)`
+
+`check_encoding()` still refuses `ABS` on inline or literal immediates (`v_cndmask_b32_e64 ABS on an immediate`), `Stage.u()` still refuses `|vN|` when `vN` is in `low16_only_v` (whole-word 32-bit read), `op_v_cndmask_b32` still refuses `abs`/`neg` on the mask operand (`src2`), `v_cndmask_b32` stays out of `UNIFORM_VALU`, and other integer instructions keep using `Stage.u()` so unexpected `|...|` modifiers remain refused.
+
+```powershell
+out\pe-env\Scripts\python.exe -B tests\startup_gfx2hlsl_cndmask_abs_check.py
+out\pe-env\Scripts\python.exe -B tests\startup_gfx2hlsl_cndmask_abs_check.py draw dxc.exe out\build\dev\offscreen_check.exe warp fxc.exe
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_abs_(controls|warp|hardware)$' -V
+```
+
+### Measured results and open scope
+
+[`tests/startup_gfx2hlsl_cndmask_abs_check.py`](../tests/startup_gfx2hlsl_cndmask_abs_check.py) decodes synthetic VOP3A bytes with `G.decode()` (no game data) covering `v_cndmask_b32_e64 v0, v0, |v0|, s30`, `|v0|` / `-|v0|` on `src0` and `src1`, SGPR `|s4|` / `-|s4|`, `neg(|v0|)`, and 17 refusal controls, then evaluates the emitted HLSL across 11 32-bit patterns (`+0.0`, `-0.0`, `+1.0`, `-1.0`, `+qNaN`, `-qNaN`, `+inf`, `-inf`, `-denormal`, `0x12345678`, `0x92345678`) under both mask states (`22/22` exact matches; both order-reversed and `abs`-dropped mutations mismatch on `22/22` cases). On WARP (`Microsoft Basic Render Driver` `1414:008c`, driver `10.0.26100.9818`, `debug_layer=unavailable`) with FXC (`ps_5_1`) and DXC (`ps_6_0`), all 44 positive draws (22 FXC + 22 DXC) matched bit-for-bit and all 8 mutated draws (4 reverse-order + 4 drop-abs) failed with their expected wrong words. Physical GPU (`startup_gfx2hlsl_cndmask_abs_hardware`) and title shader execution remain unverified here.
 
 ## Binary16 SDWA arithmetic, rounding, scaling and conversions in pixel_aot
 

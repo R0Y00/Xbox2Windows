@@ -451,7 +451,13 @@ bool stream_input_layout(const unsigned char* subobject, std::string& text)
 {
     D3D12_INPUT_LAYOUT_DESC layout;
     std::memcpy(&layout, subobject + 8, sizeof(layout));
-    if (!layout.NumElements) return true;
+    if (!layout.NumElements) {
+        // Declared without elements. The value of a fetched input here is unverified, so the zero-fill translation
+        // is an experimental opt-in (X2W_STREAM_ZERO_FILL=1); by default nothing is published and the fetch is refused.
+        const char* zero_fill = std::getenv("X2W_STREAM_ZERO_FILL");
+        if (zero_fill && zero_fill[0] == '1') text = "ia1 0\n";
+        return true;
+    }
     if (layout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT ||
         !x2w_local::readable(layout.pInputElementDescs, sizeof(D3D12_INPUT_ELEMENT_DESC) * layout.NumElements)) return false;
     text = "ia1 " + std::to_string(layout.NumElements) + "\n";

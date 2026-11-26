@@ -139,6 +139,49 @@ POST_COUNT = MESH.index('7d28000e')
 GROUP_END = MESH.index('05000006') + 1
 PRIMITIVE_EXPORT = MESH.index('f8000941')
 
+WAVE_LOAD_ASM = """s_mov_b32 s40, 0x3e808081
+s_lshl_b32 s41, s6, 8
+s_mov_b32 s42, 6
+v_mov_b32 v7, 0
+s_mov_b64 exec, -1
+v_cmpx_gt_u32_e32 s42, v0
+s_mov_b32 s42, 0
+s_cbranch_execz 4
+s_buffer_load_dword s40, s[16:19], s41 offset:0x1e0
+v_mov_b32 v7, 1.0
+s_waitcnt lgkmcnt(0)
+s_mov_b64 exec, -1"""
+WAVE_LOAD_PREFIX = 'bea803ff 3e808081 8f298806 beaa0386 7e0e0280 befe04c1 7da8002a beaa0380'
+WAVE_LOAD_BODY = 'f4200a08 520001e0 7e0e02f2 bf8cc07f'
+
+
+def wave_load_mesh(prefix=WAVE_LOAD_PREFIX, body=WAVE_LOAD_BODY, *, exports='7e280228 7e2a0307'):
+    """Insert the scalar load before the count exchange and export its value as vertex red."""
+    body = body.split()
+    before = MESH.index('be8d0308')
+    wait = MESH.index('bf8c3f70')
+    return (MESH[:before] + prefix.split() + [branch(0xbf88, 0, len(body) + 1)] + body + ['befe04c1']
+            + MESH[before:wait + 1] + exports.split() + MESH[wait + 1:])
+
+
+WAVE_LOAD_MESH = wave_load_mesh()
+WAVE_LOAD_REFUSAL = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
+WAVE_LOAD_REFUSALS = (
+    ('different EXEC compare', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7d28002a'))),
+    ('missing full EXEC reset', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'bf800000'))),
+    ('different compare index', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7da80e2a'))),
+    ('EXEC write between compare and branch', wave_load_mesh(WAVE_LOAD_PREFIX.replace('beaa0380', 'befe04c1'))),
+    ('branch into load block', wave_load_mesh('bf840009 ' + WAVE_LOAD_PREFIX)),
+    ('branch to the EXEC-zero instruction', wave_load_mesh('bf840008 ' + WAVE_LOAD_PREFIX)),
+    ('second live scalar write',
+     wave_load_mesh(body=WAVE_LOAD_BODY + ' beab0386', exports='7e280228 7e2a022b')),
+    ('ordinary SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4000a05'))),
+    ('wider SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4240a08'))),
+    ('buffer store', wave_load_mesh(body=WAVE_LOAD_BODY + ' f4600a08 520001e0')),
+    ('buffer atomic', wave_load_mesh(body=WAVE_LOAD_BODY + ' e0c81000 80040700')),
+    ('dead scalar result', wave_load_mesh(exports='7e2a0307')),
+)
+
 
 def count_entry_red(*extra_words):
     wait = MESH.index('bf8c3f70')
@@ -399,6 +442,26 @@ def controls():
                 expect(what + ' guards the position export', bool(re.search(
                     r'if \(exec & 1\) \{[^\n]*o\.pos = [^\n]*mesh_vertex = true;', text)), True)
     with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, WAVE_LOAD_MESH)
+        expect('pre-exchange wave load translates', result, 'ok')
+        if result == 'ok':
+            text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('the branch uses the wave predicate captured at the compare',
+                   ('wave_any = (tid & ~63u) < ' in text, 'pc = (!wave_any) ?' in text), (True, True))
+            expect('the scalar buffer read is inside a branched fall-through',
+                   bool(re.search(r'\[branch\] if \(pc == \d+\) \{[^}]*s40 = [^\n]*\.Load\(', text)), True)
+        for what, mesh in WAVE_LOAD_REFUSALS:
+            expect(what, request(tmp, mesh)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+        # The accepted mesh opcodes cannot produce a lane-varying numeric SGPR here.
+        # Inject that analysis fact at the Stage boundary to exercise the uniformity refusal.
+        from unittest.mock import patch
+
+        uniform_source = G.Stage.uniform_source
+        with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's42' and uniform_source(stage, token)):
+            expect('non-uniform wave load bound', request(tmp, WAVE_LOAD_MESH)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+        with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's41' and uniform_source(stage, token)):
+            expect('unproven wave load address', request(tmp, WAVE_LOAD_MESH)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+    with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, FORMATTED_MESH)
         expect('formatted mesh translates', result, 'ok')
         if result == 'ok':
@@ -476,6 +539,9 @@ def binary(mc):
     shift = mesh.replace('v_cmpx_gt_i32 s14, v0', SHIFT_ASM + '\nv_cmpx_gt_i32 s14, v0')
     shift = shift.replace('exp pos0', 'v_mov_b32 v20, v7\nexp pos0')
     expect('scalar shift mesh words match llvm-mc', assemble(mc, shift), SHIFT_MESH)
+    wave_load = mesh.replace('s_mov_b32 s13, s8', WAVE_LOAD_ASM + '\ns_mov_b32 s13, s8')
+    wave_load = wave_load.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
+    expect('pre-exchange wave load words match llvm-mc', assemble(mc, wave_load), WAVE_LOAD_MESH)
 
 
 # ---- draw: four triangles in a 32x32 target, vertices stored out of order ----------------------
@@ -535,6 +601,63 @@ def rasterise(points, colours, indices, verts, prims):
                 if inside:
                     image[y * SIDE + x] = colour
     return image
+
+
+def draw_wave_load(directory, renderer, adapter):
+    key, result = request(directory, WAVE_LOAD_MESH)
+    expect('pre-exchange wave load compiles', result, 'ok')
+    if result != 'ok':
+        return 0
+    base = Path(directory) / ('%016x' % key)
+    points, colours, indices = geometry()
+    # Provoking threads 39 and 5 share the mixed wave; threads 67 and 70 are
+    # in the empty wave. Every vertex keeps its original low-four-bit slot.
+    triangles = [tuple(slot + wave for slot in tri) for tri, wave in zip(indices, (32, 0, 64, 64))]
+    words = [a | b << 10 | c << 20 for a, b, c in triangles]
+    data = bytearray(buffer(points, colours, words))
+    struct.pack_into('<f', data, 480, 1.0)
+    constants = bytearray(1024)
+    uds = G.MeshPipeline(code(WAVE_LOAD_MESH), code(PIXEL), root()).uds
+    for slot, count in enumerate((len(triangles), 128)):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
+
+    bound, old = 6, 64
+    wave_red = {}
+    reads = []
+    for first in range(0, 128, 64):
+        wave_red[first] = old
+        if first < bound:
+            address = 480 + 4 * first
+            reads.append(address)
+            wave_red[first] = round(struct.unpack_from('<f', data, address)[0] * 255)
+    expect('only the mixed wave reads; the empty wave address is past the SRV',
+           (reads, len(data) + 80 < 480 + 4 * 64, wave_red), ([480], True, {0: 255, 64: 64}))
+
+    def reference(swap):
+        rendered = list(colours)
+        for tri in triangles:
+            for tid in tri:
+                first, slot = tid & ~63, tid & 15
+                red = wave_red[first ^ (64 if swap else 0)]
+                rendered[slot] = (red, 255 if tid < bound else 0, *colours[slot][2:])
+        return rasterise(points, rendered, triangles, 128, len(triangles))
+
+    correct, swapped = reference(False), reference(True)
+    different = sum(a != b for a, b in zip(correct, swapped))
+    expect('swapping old and loaded red changes every covered pixel', different,
+           sum(pixel != (0, 0, 0, 255) for pixel in correct))
+    expect('the wave load covers pixels', different > 0, True)
+    path = Path(directory) / 'wave-load.bin'
+    for label, image, status, mismatches in (
+            ('wave load', correct, 0, 0), ('swapped wave load selection', swapped, 1, different)):
+        path.write_bytes(bytes(constants) + bytes(data) + b'\xcd' * 80 + b''.join(map(bytes, image)))
+        run = subprocess.run([renderer, adapter, '--mesh-indexed', base.with_suffix('.ms57.cso'),
+                              base.with_suffix('.ps57.cso'), path], capture_output=True, text=True)
+        if run.returncode == 77:
+            print(run.stdout + run.stderr)
+            return 77
+        expect(label, (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout), (status, True))
+    return 0
 
 
 def publish_request(directory, publisher, adapter):
@@ -649,6 +772,8 @@ def draw(dxc, renderer, adapter, publisher=None):
                 print(r.stdout + r.stderr)
                 return 77
             expect('draw of ' + what, (r.returncode, 'pixels=1024 mismatches=0' in r.stdout), (0, True))
+        if publisher is None:
+            return draw_wave_load(tmp, renderer, adapter)
     return 0
 
 
