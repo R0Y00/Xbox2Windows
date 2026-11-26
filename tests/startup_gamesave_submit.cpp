@@ -2,12 +2,16 @@
 // XAsync service can reject Begin, delay notification or enter the callback inline.
 #include "../src/startup_stubs/runtime_proxy.cpp"
 #include <array>
+#include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 
-static std::atomic<bool> fail_action_allocation{false};
+static std::atomic<std::size_t> fail_allocation_size{0};
 void* operator new(std::size_t size)
 {
-    if (size == sizeof(x2w_save::Action) && fail_action_allocation.exchange(false)) {
+    std::size_t expected = size;
+    if (size && fail_allocation_size.compare_exchange_strong(expected, 0)) {
         throw std::bad_alloc();
     }
     if (void* p = std::malloc(size ? size : 1)) return p;
@@ -104,14 +108,21 @@ int run(bool system)
         call(16,provider_handle,ptr("profile"),ptr(&container)) ||
         call(23,container,0,ptr(&good)) || call(23,container,0,ptr(&bad))) return 1;
     unsigned char byte=0x11;
-    fail_action_allocation = true;
-    u64 failed_stage{};
-    try {
-        failed_stage = call(25,good,ptr("preference"),ptr(&byte),1);
-    } catch (const std::bad_alloc&) {
-        return 20; // The old path throws while holding save_lock.
+    const std::array<unsigned char, 1025> large_blob{};
+    for (const auto data_size : {std::size_t{1}, large_blob.size()}) {
+        fail_allocation_size = data_size == 1 ? sizeof(x2w_save::Action) : data_size;
+        u64 failed_stage{};
+        try {
+            failed_stage = call(25,good,ptr("preference"),ptr(large_blob.data()),data_size);
+        } catch (const std::bad_alloc&) {
+            return 20;
+        }
+        if (fail_allocation_size || failed_stage != e_outofmemory) {
+            std::fprintf(stderr, "staging %zu bytes: pending allocation=%zu, HRESULT=0x%08llx\n",
+                         data_size, fail_allocation_size.load(), static_cast<unsigned long long>(failed_stage));
+            return 21;
+        }
     }
-    if (fail_action_allocation || failed_stage != e_outofmemory) return 21;
     if (call(25,good,ptr("preference"),ptr(&byte),1) || call(27,good) || value()!=0x11) return 2;
     byte=0x77;
     if (call(25,good,ptr("preference"),ptr(&byte),1) || call(26,bad,ptr("absent"))) return 3;
