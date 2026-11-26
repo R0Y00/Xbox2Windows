@@ -192,6 +192,15 @@ def host():
     expect('exact oracle rejects that wrong reason', other == want, False)
     expect('exact oracle matches the named loop refusal', want == 'unsupported: ' + LOOP_REASON, True)
 
+    # Signedness comes from the compare alone: signed update + unsigned compare across bit 31 is not
+    # a finite unroll within MESH_TRIP_MAX (review on #2630).
+    expect('signed update / unsigned compare across bit 31 is not a finite trip count',
+           G.mesh_trip_count(0x7fffffff, 's_add_i32', 1, 's_cmp_gt_u32', 4, 's_cbranch_scc1', True),
+           None)
+    expect('unsigned compare after signed update from -3 is one trip',
+           G.mesh_trip_count((-3) & 0xffffffff, 's_add_i32', 1, 's_cmp_lt_u32', 0, 's_cbranch_scc1', True),
+           1)
+
     if FAILED:
         print('startup_mesh57_loop: %d failed' % len(FAILED))
         return 1
@@ -240,8 +249,12 @@ def draw(dxc, renderer, adapter):
             if r.returncode == 77:
                 print(r.stdout + r.stderr)
                 return 77
+            # Require a real draw-reference mismatch (not an unrelated PSO/command failure).
             expect('once-through mutant fails the constant-trip reference',
-                   (r.returncode != 0) or ('mismatches=0' not in r.stdout), True)
+                   (r.returncode != 0
+                    and 'Draw reference mismatch' in r.stderr
+                    and 'mismatches=' in r.stdout
+                    and 'mismatches=0' not in r.stdout), True)
 
         wrong = list(image)
         at = next(i for i, pixel in enumerate(image) if pixel != (0, 0, 0, 255))
