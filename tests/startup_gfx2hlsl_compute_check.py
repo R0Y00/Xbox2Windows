@@ -397,9 +397,59 @@ L_WORD3 = {
     'L-unorm': (1 << 12) | 1 | (4 << 3) | (7 << 6) | (5 << 9),  # one, X, W, Y
 }
 
+# Case N: v_readfirstlane_b32 of a buffer load whose address is the same for every lane (offset 0, no VGPR), xored
+# into each lane's own read-buffer word. Lane i stores word0 ^ word[i]. SOURCE_N_VARYING loads the readfirstlane
+# source at a per-lane offset (v0), which is not provably uniform and must be refused.
+SOURCE_N = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+buffer_load_dword v1, off, s[12:15], 0
+s_waitcnt vmcnt(0)
+v_readfirstlane_b32 s20, v1
+v_lshlrev_b32 v4, 2, v0
+buffer_load_dword v2, v4, s[12:15], 0 offen
+s_waitcnt vmcnt(0)
+v_xor_b32 v3, s20, v2
+buffer_store_dword v3, v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_N = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '000030e000010380'
+    '703f8cbf' '0105287e' '82000834' '001030e004020380'
+    '703f8cbf' '1404063a' '001070e004030480' '000081bf')
+N_LOAD = bytes.fromhex('000030e000010380')
+N_LOAD_VARYING = bytes.fromhex('001030e000010380')
+WORDS_N_VARYING = WORDS_N.replace(N_LOAD, N_LOAD_VARYING, 1)
+
+# Each group uses its ID as a low addend, overwrites that SGPR, and stores the
+# low word, high word and SCC left by the high add. The fourth word stays untouched.
+SOURCE_CARRY = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0
+s_waitcnt lgkmcnt(0)
+s_mul_i32 s20, s7, 1
+s_add_u32 s20, s20, -2
+s_add_u32 s21, 0, src_scc
+s_cselect_b32 s22, 1, 0
+s_lshl_b32 s23, s7, 4
+v_mov_b32_e32 v4, s23
+v_mov_b32_e32 v8, s20
+v_mov_b32_e32 v9, s21
+v_mov_b32_e32 v10, s22
+buffer_store_dwordx3 v[8:10], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_CARRY = bytes.fromhex(
+    '06038abe 80038bbe 05030cf4000000fa 7fc08cbf 07811493 14c21480 80fd1580 81801685'
+    ' 0784178f 1702087e 1402107e 1502127e 1602147e 00107ce004080480 000081bf')
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
+    'address-carry': (SOURCE_CARRY, WORDS_CARRY, USER7 | TGID_X, (1, 1, 1), (4, 1, 1)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | TGID_Z | tidig(2), (5, 2, 1), (4, 1, 3)),
     'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
@@ -412,6 +462,7 @@ CASES = {
     'K': (SOURCE_K, WORDS_K, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
+    'N': (SOURCE_N, WORDS_N, USER7 | tidig(1), (16, 1, 1), (1, 1, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -598,6 +649,11 @@ def expected(name):
             out[4 * group:4 * group + 4] = [group, pair & MASK, pair >> 32, 0]
         return out
     _, _, _, local, groups = CASES[name]
+    if name == 'address-carry':
+        for group in range(groups[0]):
+            total = group + 0xfffffffe
+            out[4 * group:4 * group + 3] = [total & 0xffffffff, total >> 32, 0]
+        return out
     if name in L_WORD3:
         data = formatted_input()
         for lane in range(16):
@@ -609,6 +665,9 @@ def expected(name):
                 one = 0x3f800000
                 result = (one, one if data[at] == 255 else 0, one, 0)
             out[4 * lane:4 * lane + 4] = result
+        return out
+    if name == 'N':
+        out[:16] = [input_word(0) ^ input_word(lane) for lane in range(16)]
         return out
     producer_offsets = {'G': (1, 32), 'G-offset0-only': (31, 0), 'G-offset1-only': (0, 31)}
     if name in producer_offsets:
@@ -979,6 +1038,18 @@ def check_off_stores():
 
 
 def check_controls():
+    carry = translate('address-carry').hlsl_cs()
+    assert 's21 = (scc ? 1u : 0u);' in carry
+    lo, hi, end = (bytes.fromhex(x) for x in ('04051480', '80fd1580', '000081bf'))
+    for near_miss in (
+            lo + bytes.fromhex('81809e80') + hi,             # intervening s_sub_u32 writes SCC
+            lo + bytes.fromhex('000080bf') + hi,             # non-adjacent
+            bytes.fromhex('010084bf') + lo + hi,             # branch into the high add
+            bytes.fromhex('06811480') + hi,                  # elided descriptor arithmetic
+            lo + bytes.fromhex('81fd1580'),                  # high addend is one
+            lo + bytes.fromhex('80fd1680')):                 # high register is not the next SGPR
+        refused('src_scc', lambda: translate('address-carry', code=near_miss + end))
+    refused('lane mask', lambda: translate('address-carry', code=bytes.fromhex('7e811480') + hi + end))
     ff1 = bytes.fromhex('7e1385be')
     end = bytes.fromhex('000081bf')
     # A write to EXEC can disable lane zero; a backward branch can re-enter
@@ -986,7 +1057,8 @@ def check_controls():
     for code in (bytes.fromhex('8003febe') + ff1 + end,
                  ff1 + bytes.fromhex('feff82bf') + end):
         refused('compute entry EXEC mask', lambda: translate('A', code=code))
-    refused('requires compute exec_lo', lambda: translate('A', code=bytes.fromhex('6a1385be') + end))
+    # vcc_lo is a lane mask; general-scalar ff1 (#2022 Item F) still refuses it.
+    refused('lane mask', lambda: translate('A', code=bytes.fromhex('6a1385be') + end))
     assert 's5 = 0u;' in translate('A-ff1').hlsl_cs()
     assert expected('A-ff1') != expected('A')
     check_lds()
@@ -1021,7 +1093,7 @@ def check_controls():
         assert stage.entry == entry + ['v0 = tid.x;'], (hex(rsrc2), stage.entry)
     # Entry refusals.
     end = bytes.fromhex('000081bf')
-    refused('TG_SIZE_EN', lambda: G.ComputePipeline(end, root_blob(), USER7 | TG_SIZE_EN, (1, 1, 1)))
+    refused('TG_SIZE_EN', lambda: G.ComputePipeline(end, root_blob(), USER7 | TG_SIZE_EN, (8, 4, 2)))
     refused('thread-ID component count', lambda: G.ComputePipeline(end, root_blob(), USER7 | (3 << 11), (1, 1, 1)))
     refused('gives 6 user SGPRs', lambda: G.ComputePipeline(end, root_blob(), 6 << 1, (1, 1, 1)))
     refused('thread group', lambda: G.ComputePipeline(end, root_blob(), USER7, (1024, 2, 1)))
@@ -1385,6 +1457,9 @@ def check_controls():
     refused('compute d16 image load requires validated SRV formats',
             lambda: pipeline.cs.image(['v12', 'v[0:1]', 's[24:31]'],
                                       ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))
+    # A readfirstlane of a buffer load at a uniform address translates; at a per-lane address it is refused.
+    assert 's20 = v1;' in translate('N').hlsl_cs()
+    refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
     print('compute entry, numthreads, masked bit counts, manifest, offen store forms and the store, descriptor, execz and sample '
           'refusals pass')
 
@@ -1429,6 +1504,7 @@ CONTROLS = {
     'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
                           'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),
     'g-overlap': ('G', 'v7 = lds[(a + 144u)', 'v7 = lds[(v6 + 144u)'),
+    'n-dropped-broadcast': ('N', 'v3 = s20 ^ v2;', 'v3 = v2;'),  # lane i stores word[i], not word0 ^ word[i]
     'l-byte-offset': ('L-uint', 'a = v0 * ud2 + v1 + 2;', 'a = v0 * ud2 + 2;'),
     'l-swizzle': ('L-unorm', 'v6 = ((ud3 >> 3)', 'v6 = ((0u >> 3)'),
     'l-integer-one': ('L-uint', 'c1 = w >> 16; c2 = 0u; c3 = 1u; one = 1u;', 'c1 = w >> 16; c2 = 0u; c3 = 1u;'),

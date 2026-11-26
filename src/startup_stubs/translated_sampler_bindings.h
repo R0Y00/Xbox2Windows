@@ -120,12 +120,12 @@ inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = constants;
-    D3D12_DESCRIPTOR_RANGE view_ranges[2]{};
-    UINT range_count = 0;
-    if (srvs || !uavs) view_ranges[range_count++] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0};
-    if (uavs) view_ranges[range_count++] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, uavs, 0, 0, srvs};
+    // A compute program's outputs (u0..) follow its resources in the same table.
+    const D3D12_DESCRIPTOR_RANGE view_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0},
+                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, uavs, 0, 0, srvs}};
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[1].DescriptorTable = {range_count, view_ranges};
+    // A range of no descriptors does not serialize: a program without resources starts the table at its outputs.
+    parameters[1].DescriptorTable = {(srvs ? 1u : 0u) + (uavs ? 1u : 0u), srvs ? view_ranges : view_ranges + 1};
     const D3D12_DESCRIPTOR_RANGE sampler_range{
         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, translated_sampler_count, 0, translated_sampler_space, 0};
     UINT count = sampler_root_parameter(srvs + uavs);

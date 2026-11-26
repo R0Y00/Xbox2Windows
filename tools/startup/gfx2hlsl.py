@@ -881,6 +881,12 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+MODIFIER_FREE_HANDLERS = frozenset((
+    'op_v_mov_b32', 'op_v_cvt_pkrtz_f16_f32', 'op_v_interp_p1_f32',
+    'op_v_interp_p2_f32', 'op_v_interp_mov_f32',
+))
+
+
 def smem_mods(mods):
     """Non-negative 21-bit signed immediate byte offset from SMEM modifiers, refusing unknown or negative forms."""
     imm = None
@@ -907,6 +913,8 @@ UNIFORM_VALU = frozenset((
     'v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32',
     'v_mul_f32', 'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_med3_f32', 'v_mov_b32',
 ))
+
+UNIFORM_LOADS = frozenset(('buffer_load_dword', 'buffer_load_format_x'))
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
@@ -1396,7 +1404,7 @@ MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
-def mesh_skeleton(ins, vcc_branches, wave_limits):
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
@@ -1523,6 +1531,33 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
         raise Unsupported(exchange_branch_refusal)
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
+    load_compare = None
+    execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
+
+    def live_at_join(reg, join):
+        pending, seen = [join], set()
+        while pending:
+            i = pending.pop()
+            if i >= len(ins) or i in seen:
+                continue
+            seen.add(i)
+            if i == count_at:
+                if reg in (env['prims'], env['verts']):
+                    return True
+                if reg != env['b_tmp']:
+                    pending.append(b_end)
+                continue
+            name, asm = ins[i][2:]
+            reads, writes, _ = scalar_effects(name, asm)
+            if reg in reads:
+                return True
+            if reg not in writes:
+                if i in edges:
+                    pending.append(edges[i])
+                if name not in ('s_branch', 's_endpgm'):
+                    pending.append(i + 1)
+        return False
+
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
@@ -1530,6 +1565,24 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
                     and ins[source + 1][2] == 's_lshl_b32' and ins[target][3] == 's_mov_b64 exec, -1'):
                 shift_branch = source
                 continue
+            if a_end <= source < target < count_at and load_compare is None:
+                loads = [i for i in range(source + 1, target) if ins[i][2] == 's_buffer_load_dword']
+                if len(loads) == 1:
+                    load = loads[0]
+                    compare = source - 1
+                    while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
+                        compare -= 1
+                    match = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
+                    dst = parse(ins[load][3])[1][0]
+                    if (compare <= a_end or ins[compare - 1][3] != 's_mov_b64 exec, -1' or not match
+                            or targets.intersection(range(compare, target))
+                            or any(i != load and not (no_effect(i) or lane_only(i))
+                                   for i in range(source + 1, target))
+                            or not re.fullmatch(r's\d+', dst) or not live_at_join(dst, target)):
+                        raise Unsupported(exchange_branch_refusal if target == count_at else execz_effects)
+                    load_compare, load_bound, load_thread = compare, match[1], int(match[2])
+                    wave_loads[ins[source][0]] = (ins[compare][0], load_bound, ins[load][0], dst)
+                    continue
             # The model skips per lane, while the guest skips per wave. The difference is invisible when
             # lanes with clear EXEC can only bypass predicated writes before the paths meet. A skipped
             # s_branch may land at the execz target or past it over instructions without effect (the
@@ -1540,7 +1593,7 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
                         or (name == 's_branch' and edges[i] >= target
                             and all(no_effect(k) for k in range(target, edges[i])))
                         or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))):
-                    raise Unsupported('slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes')
+                    raise Unsupported(execz_effects)
         elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
             raise Unsupported('slot 57 mesh: a branch bypasses an export')
 
@@ -1691,6 +1744,10 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
             if mask is not None or mesh_vregs(ops) & stale:
                 raise Unsupported(exchange_branch_refusal)
             mask = 'count_entry'
+        elif index == load_compare:
+            if mask is not None or thread != load_thread or load_thread in stale:
+                raise Unsupported(execz_effects)
+            mask = 'wave_load'
         elif base_name.startswith('v_cmpx'):
             count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
             if (base_name != 'v_cmpx_gt_i32' or not after or mask is not None or count is None
@@ -1743,6 +1800,23 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
     return out
 
 
+def adjacent_address_carries(ins, targets):
+    """Map each candidate low add to its high-word carry read in the same basic block."""
+    pairs = {}
+    for index, (high_pc, _, name, asm) in enumerate(ins):
+        if name != 's_add_u32' or 'src_scc' not in asm or not index or high_pc in targets:
+            continue
+        low_pc, _, low_name, low_asm = ins[index - 1]
+        if low_name != 's_add_u32':
+            continue
+        low = parse(low_asm)[1]
+        if len(low) == 3 and re.fullmatch(r's\d+', low[0]):
+            reg = int(low[0][1:])
+            if reg < 105 and parse(asm)[1] == ['s%d' % (reg + 1), '0', 'src_scc']:
+                pairs[low_pc] = high_pc
+    return pairs
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -1764,6 +1838,8 @@ class Stage:
     bad_sgprs = None
     _uniform_written = None
     raw_code = b''
+    address_carry_pairs = ()
+    address_carry_reader = None
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -1776,7 +1852,8 @@ class Stage:
         if kind == 'ms':
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits)
+            self.mesh_wave_loads = {}
+            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -1858,9 +1935,10 @@ class Stage:
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
-        then one SGPR per enabled group-ID axis (SV_GroupID), and v0..v2 holding SV_GroupThreadID. Where the root
-        parameters sit inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not
-        place (s0-s3 and any past the root's span) have no known value, so any numeric read of them is refused."""
+        then one SGPR per enabled group-ID axis (SV_GroupID), optional TG_SIZE when TG_SIZE_EN is set (only accepted
+        for at most 32 threads per group, #2274), and v0..v2 holding SV_GroupThreadID. Where the root parameters sit
+        inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not place (s0-s3 and
+        any past the root's span) have no known value, so any numeric read of them is refused."""
         user, groups, threads = self.pipe.entry
         if root_end > user:
             raise Unsupported('root signature needs s4-s%d, COMPUTE_PGM_RSRC2 gives %d user SGPRs' % (root_end - 1, user))
@@ -1872,6 +1950,9 @@ class Stage:
             self.used_s.add(n)
             self.entry_uniform_s.add(n)
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
+        tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
+        if tg_size is not None:
+            self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
             self.entry.append('v%d = tid.%s;' % (i, 'xyz'[i]))
@@ -1888,6 +1969,8 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'tg_size':
+                raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
@@ -2532,6 +2615,10 @@ class Stage:
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
         wave_limits = getattr(self, 'mesh_wave_limits', {})
+        wave_loads = getattr(self, 'mesh_wave_loads', {})
+        wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values()}
+        wave_load_sites = {load for _, _, load, _ in wave_loads.values()}
+        execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
         try:
             self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
@@ -2549,6 +2636,8 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
+        if getattr(self, 'kind', None) == 'cs':
+            self.address_carry_pairs = adjacent_address_carries(self.ins, targets)
         # Forward edges reach each block in disassembly order. A back edge could
         # repeat a pointer advance before the next table load.
         self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
@@ -2593,6 +2682,7 @@ class Stage:
 
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
+            self.address_carry_reader = None
             uniform_vcc_compares = set()
             self.lines = []
             self.blocks = []          # (offset, [lines], terminator)
@@ -2626,6 +2716,8 @@ class Stage:
             }
             self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+            self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
+            self.heap_index_was = {}  # the marks the current instruction's destinations held before it
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
             self.defined_uniform_s = set(init_entry_uniform)
             self.bad_sgprs = set()
@@ -2654,6 +2746,7 @@ class Stage:
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
+                    self.heap_index.clear()  # another path into the join may hold a different word
                     pre_uniform = {
                         r for r in (self.defined_uniform_s if self.since_join is None else self.since_join)
                         if r not in self.varying_s and r not in self.masks
@@ -2743,6 +2836,17 @@ class Stage:
                     if off in refused:
                         raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
+                    if off in wave_load_compares:
+                        bound = wave_load_compares[off]
+                        if not self.uniform_source(bound) or int(bound[1:]) not in self.defined_uniform_s:
+                            raise Unsupported(execz_effects)
+                        # Capture the bound at the compare, before any intervening SGPR write.
+                        self.emit('wave_any = (tid & ~63u) < %s;' % self.u(bound))
+                    if off in wave_load_sites:
+                        offset = smem_offset(parse(asm)[1][2])
+                        if not self.uniform_source(offset) or (
+                                re.fullmatch(r's\d+', offset) and int(offset[1:]) not in self.defined_uniform_s):
+                            raise Unsupported(execz_effects)
                     if off in vcc_compares and all(
                         not mesh_vregs([tok]) and self.uniform_source(tok)
                         for tok in parse(asm)[1][1:]
@@ -2750,7 +2854,13 @@ class Stage:
                         uniform_vcc_compares.add(off)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
-                        cond_uniform = (cond in ('scc0', 'scc1') and self.scc_uniform) or off in wave_limits
+                        if off in wave_loads:
+                            dst = wave_loads[off][3]
+                            if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
+                                raise Unsupported(execz_effects)
+                            self.u(dst)  # declare the variable; refuses a symbol with no run-time value
+                        cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
+                                        or off in wave_limits or off in wave_loads)
                         if off in vcc_branches:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
@@ -2766,6 +2876,8 @@ class Stage:
                     term = self.one(name, asm)
                     if off in wave_limits:
                         term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
+                    if off in wave_loads:
+                        term = ('branch', '!wave_any', term[2])
                 except Unsupported as reason:
                     if refusals is None:
                         if not hasattr(reason, 'instruction'):
@@ -2925,7 +3037,26 @@ class Stage:
                     sources = [re.sub(r'^-(?=[^\d.])', '', tok).strip('|') for tok in sources]
                 if sources and all(self.uniform_source(tok) for tok in sources):
                     dst = candidate[1]
+        # A compute load through a read-only descriptor (a descriptor is never both loaded and stored) with a uniform
+        # address reads the same dword in every lane. Entry block only: the value has no recomputable expression.
+        loaded = (dst is None and base in UNIFORM_LOADS and len(ops) == 4 and self.tracks_uniformity() and
+                  getattr(self, 'kind', None) == 'cs' and not getattr(self, 'past_entry', True) and
+                  getattr(self, 'exec_known', False) and
+                  all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods) and
+                  not ('idxen' in mods and 'offen' in mods) and (ops[1] == 'off') == ('idxen' not in mods and 'offen' not in mods) and
+                  (ops[1] == 'off' or self.uniform_source(ops[1])) and self.uniform_source(ops[3]))
+        if loaded:
+            candidate = reg_range(ops[0])
+            if candidate and candidate[0] == 'v' and candidate[1] == candidate[2]:
+                dst = candidate[1]
+            else:
+                loaded = False
         self.last_v = None
+        if hasattr(self, 'heap_index'):  # unit probes build a Stage without the tracking state
+            # Any write ends a register's mark; the lowering below sets the new one, if any.
+            wrote = scalar_destinations(name, asm)
+            wrote = set(self.heap_index) if 'any' in wrote else wrote & set(self.heap_index)
+            self.heap_index_was = {r: self.heap_index.pop(r) for r in wrote}
         term = self.lower(base, asm, ops, mods)
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
@@ -2945,7 +3076,7 @@ class Stage:
                 # Proven sources are scalars, constants and VGPRs; each VGPR needs its own current expression.
                 expr = self.last_v[1] if self.last_v and self.last_v[0] == dst else None
                 vs = [int(n) for n in re.findall(r'\bv(\d+)\b', expr or '')]
-                if expr is None or any(n not in self.uniform_expr for n in vs):
+                if expr is None or loaded or any(n not in self.uniform_expr for n in vs):
                     self.uniform_expr.pop(dst, None)
                 else:
                     self.uniform_expr[dst] = re.sub(r'\bv(\d+)\b', lambda m: '(%s)' % self.uniform_expr[int(m[1])],
@@ -3154,6 +3285,8 @@ class Stage:
             return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
+            if mods and handler.__name__ in MODIFIER_FREE_HANDLERS:
+                raise Unsupported('%s with %s' % (base, mods))
             return handler(ops, mods)
         if base in MUBUF_ATOMIC_OPS:
             return self.buffer_atomic(base, ops, mods)
@@ -3219,6 +3352,11 @@ class Stage:
                 c0, c1 = self.const_u32(ops[1]), self.const_u32(ops[2])
                 args = [self.u(ops[1], low16_only=c1 is not None and (c1 & 0xffff0000) == 0),
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
+            elif base == 'v_mad_u32_u16':
+                # S0 and S1 read only bits [15:0]; S2 reads all 32 bits.
+                args = [self.u(ops[1], low16_only=True),
+                        self.u(ops[2], low16_only=True),
+                        self.u(ops[3])]
             else:
                 args = [self.u(o) for o in ops[1:1 + arity]]
             if base in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32'):
@@ -3227,7 +3365,7 @@ class Stage:
                     pipe.uses_sad.add(base)
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
-            return self.scalar(base, ops)
+            return self.scalar(base, ops, mods) if mods else self.scalar(base, ops)
         if base == 's_addc_u32':
             # Only the high word of an advanced descriptor pointer; the carry is not modelled.
             hi = reg_range(ops[1]) if len(ops) == 3 else None
@@ -3248,10 +3386,13 @@ class Stage:
     # lane k of its own quad (RDNA 2 ISA, "DPP": a lane reads lane (lane & ~3) | perm[lane & 3] of the row; LLVM 15
     # AMDGPU DPP quad_perm). A pixel stage's four consecutive lanes are a 2x2 pixel quad (lane = x & 1 | (y & 1) << 1),
     # which is what SM 6.0 QuadReadLaneAt(value, k) reads, so the stage is compiled as ps_6_0 (Stage.needs_sm6).
-    # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
-    # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
-    # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (pair
-    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
+    # Accepted only where the whole quad is proven active: the entry straight-line prefix of a pixel stage that ran
+    # s_wqm exec, exec and whose EXEC is still that mask (helper lanes are active, so no source lane is off). A later
+    # uniform loop or forward branch elsewhere in the stage does not drop the proof: every path still reaches the
+    # broadcast with the same EXEC and cannot jump back to the prefix. bound_ctrl then has nothing to
+    # decide (the source lane is never disabled), so it is accepted and ignored. A broadcast after a branch target,
+    # after EXEC changed, or with divergent EXEC stays refused, as do other DPP controls (pair broadcasts, row shifts,
+    # mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
@@ -3273,9 +3414,12 @@ class Stage:
             raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
         if fields.get('bound_ctrl', '1') != '1':
             raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
-        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', [])
-                or not getattr(self, 'exec_known', False)):
+        if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        # A branch to offset zero also makes the nominal entry block re-entrant.
+        if (getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))) or
+                not getattr(self, 'exec_known', False)):
+            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
@@ -3427,7 +3571,7 @@ class Stage:
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
-    # v_mov_b32 is the same path with the selected source as its result,
+    # v_mov_b32 is the same path with the selected source as its result, v_cndmask_b32 selects with VCC,
     # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
     # dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
@@ -3456,6 +3600,11 @@ class Stage:
                 self.reject_lane_mask_data(base, ops[1])
             elif self.is_lane_mask(ops[1].removeprefix('sext(').removesuffix(')')):
                 raise Unsupported('v_mov_b32 SDWA %s of lane mask %s' % (fields.get('src0_sel'), ops[1]))
+        elif base == 'v_cndmask_b32' and len(ops) == 4 and ops[3] == 'vcc_lo':
+            # The VOP2 select: its lane mask is always VCC, printed as the fourth operand, and read like the
+            # plain select's mask (op_v_cndmask_b32).
+            mask = self.u(ops[3]).replace('{', '{{').replace('}', '}}')
+            arity, text = 2, '(%s & 1) ? {1} : {0}' % mask
         else:
             raise Unsupported('SDWA form of %s' % base)
         sources = []
@@ -3559,7 +3708,7 @@ class Stage:
                 return i
         return None
 
-    def scalar(self, base, ops):
+    def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
         # refusal. s_movk_i32 keeps its own exact check for the immediate it folds.
@@ -3568,6 +3717,11 @@ class Stage:
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
+        if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
+            # The immediately preceding numeric add emitted the carry; no branch can enter here.
+            self.set_s(reg_range(ops[0])[1], '(scc ? 1u : 0u)')
+            self.set_scc('false')  # 0 + a single bit never produces another carry.
+            return None
         if base in SCC_UNMODELLED and self.tracks_uniformity():
             self.scc_uniform = False
         dst = reg_range(ops[0])
@@ -3584,13 +3738,14 @@ class Stage:
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         lane_complement = False
-        # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
-        word_pack = base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
+        # s_mul_hi_{u,i}32 need the whole 32-bit word of each source, like the halfword pack.
+        word_pack = base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_mul_hi_i32')
         word_absdiff = base == 's_absdiff_i32'
         if shift_add or word_complement or word_pack or word_absdiff:
-            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
+            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_{u,i}32 into an
             # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
-            mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
+            mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+                         if base in ('s_mul_hi_u32', 's_mul_hi_i32')
                          else self.is_lane_mask(dname))
             # Bit i of ~(S0 op S1) depends only on bit i of each source, so with every source a lane mask the lane's
             # bit of the result is exact. Only an SGPR destination is taken; a mixed mask and plain word is not.
@@ -3608,6 +3763,8 @@ class Stage:
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
+            if base in ('s_mul_hi_u32', 's_mul_hi_i32') and len(srcs) != 2:
+                raise Unsupported('%s with %d operands, expected 3' % (base, len(ops)))
             if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
                 raise Unsupported('%s destination %s' % (base, dname))
             for source in srcs:
@@ -3622,6 +3779,21 @@ class Stage:
             r = reg_range(t)
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
+        tg_srcs = [
+            reg for tok in ops[1:] for r in (reg_range(tok),) if r and r[0] == 's'
+            for reg in range(r[1], r[2] + 1) if self.sym.get(reg) == ('tg_size',)
+        ]
+        if tg_srcs:
+            # Wave-ID bits TG_SIZE[11:6] (mask 0xfc0) are identically 0 for <= 32 threads per group (1 wave).
+            if (base == 's_and_b32' and not mods and len(srcs) == 2
+                    and dst and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105):
+                other = (srcs[1] if syms[0] == ('tg_size',) and syms[1] != ('tg_size',)
+                         else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
+                         else None)
+                if other is not None and self.const_u32(other) == 0xfc0:
+                    self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                    return None
+            raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
@@ -3691,6 +3863,15 @@ class Stage:
             self.used_s.add(reg_range(srcs[absorbed])[1])
         values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
         expr = text.format(*values)
+        if base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs:
+            for tok in srcs:
+                self.reject_lane_mask_data(base, tok)
+                r = reg_range(tok)
+                if r and r[1] in getattr(self, 'join_masks', ()):
+                    raise Unsupported('address carry on a lane mask joined at a branch target')
+            # Compute carry before writing the low register, which can also be an addend.
+            self.set_scc('(%s) < %s' % (expr, values[0]))
+            self.address_carry_reader = self.address_carry_pairs[self.pc]
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
@@ -3776,6 +3957,15 @@ class Stage:
             self.scc_effect = 'a lane-mask complement'
             if self.tracks_uniformity():
                 self.scc_uniform = False
+        if (base == 's_lshl_b32' and hasattr(self, 'heap_index') and re.fullmatch(r'0x[0-9a-f]+|[0-9]+', srcs[1])
+                and int(srcs[1], 0) == 5):
+            # index << 5 is the byte offset of a 32-byte resource-heap record. The index is named only when it is a
+            # root constant word (the dispatch knows it) or a word an s_buffer_load wrote (refused by name).
+            r = reg_range(srcs[0])
+            if syms[0] and syms[0][0] == 'ud' and self.pipe.uds[syms[0][1]][0] == 'rootconst':
+                self.heap_index[d] = self.pipe.uds[syms[0][1]]
+            elif r and r[0] == 's' and {**self.heap_index, **self.heap_index_was}.get(r[1]) == ('bufword',):
+                self.heap_index[d] = ('buffer',)
         if is_mask:
             self.masks.add(d)
         if pair and base != 's_mov_b64':
@@ -4137,7 +4327,30 @@ class Stage:
                 self.sym[dst[1] + i] = ('const', 0, 'unassigned')
             self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
             return
+        if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
+            return self.heap_record(dst, base, token, imm, count)
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
+
+    def heap_record(self, dst, base, token, imm, count):
+        """s_load_dwordx4 D, <resource heap pointer>, R in a compute program, where R is a root constant word
+        shifted left by 5 with no later write of R and no branch target in between: D is the buffer descriptor in
+        the 32-byte heap record that the root constant indexes. The manifest names the root constant; the dispatch
+        reads the record. Only this exact form is modelled."""
+        what = 's_load of a resource heap record'
+        r = reg_range(token)
+        index = getattr(self, 'heap_index', {}).get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
+        if index == ('buffer',):
+            raise Unsupported('%s whose index is read from a buffer' % what)
+        if not index or index[0] != 'rootconst':
+            raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
+        if count != 4:
+            raise Unsupported('%s of %d dwords' % (what, count))
+        if imm is not None:
+            raise Unsupported('%s with offset:%#x' % (what, imm))
+        if self.sym.get(base[2]) != ('const', 0):
+            raise Unsupported('%s through a pointer whose high word is not a constant zero' % what)
+        for i in range(count):
+            self.sym[dst[1] + i] = ('desc', ('resheap',) + index[1:], 0, i)
 
     def op_s_bfm_b32(self, ops, mods):
         """Fold constant bitfield masks: titles build inline sampler words with them."""
@@ -4299,6 +4512,8 @@ class Stage:
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i), uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
+            if hasattr(self, 'heap_index'):
+                self.heap_index[dst[1] + i] = ('bufword',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -5631,16 +5846,80 @@ class Stage:
                    % (rest, shift, bits, value, shift))
 
     def op_s_ff1_i32_b32(self, ops, mods):
-        if self.kind != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':
-            raise Unsupported('s_ff1_i32_b32 requires compute exec_lo')
+        """Find first set bit in a 32-bit scalar; SCC unchanged (#2022 Item F).
+
+        The compute-entry special case on `exec_lo` still folds to lane 0. Every other accepted
+        source uses `firstbitlow` (0xffffffff when the word is zero), matching `pixel_aot`.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b32 with %d operands, expected 2 unmodified' % len(ops))
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
-            raise Unsupported('s_ff1_i32_b32 requires one SGPR destination')
-        if self.past_entry or not self.exec_known:
-            raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
-        # At dispatch entry even the last partial wave starts at lane zero.
-        # FF1 reports its index and leaves SCC unchanged.
-        self.set_s(dst[1], '0u', ('const', 0))
+            raise Unsupported('s_ff1_i32_b32 destination %s' % ops[0])
+        if ops[1] == 'exec_lo':
+            if self.kind != 'cs':
+                raise Unsupported('s_ff1_i32_b32 of exec_lo outside compute')
+            if getattr(self, 'past_entry', False) or not getattr(self, 'exec_known', False):
+                raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
+            # At dispatch entry even the last partial wave starts at lane zero.
+            self.set_s(dst[1], '0u', ('const', 0))
+            return None
+        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            # firstbitlow of zero is -1; otherwise the lowest set bit index.
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_ff1_i32_b32 source %s' % ops[1])
+        if src[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_ff1_i32_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        self.set_s(dst[1], 'firstbitlow(%s)' % self.u(ops[1]))
+        return None
+
+    def op_s_ff1_i32_b64(self, ops, mods):
+        """Find first set bit of a 64-bit source; SCC unchanged (#2022 Item F).
+
+        A 32-bit SOP1 literal or inline constant zero-extends to 64 bits (high word 0)
+        and folds. An SGPR pair uses the same 64-bit firstbitlow scan as SCALAR_BITS
+        (`_ctz64` / #2072). Kept as a Stage method so immediates are not refused by the
+        pair-only SCALAR_BITS template.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b64 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_ff1_i32_b64 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            # Encoding: one 32-bit literal/inline; the ISA zero-extends it (hi = 0).
+            value = int(ops[1], 0) & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != 1:
+            raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
+        if any(r in self.masks for r in range(src[1], src[2] + 1)):
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        lo, hi = self.S(src[1]), self.S(src[2])
+        self.masks.discard(dst[1])
+        self.set_s(dst[1], _ctz64(lo, hi))
+        return None
 
     def op_s_abs_i32(self, ops, mods):
         """Signed absolute value; SCC = result != 0 (#1723).
@@ -5677,6 +5956,43 @@ class Stage:
         expr = '(asint(%s) < 0 ? (0u - %s) : %s)' % ((self.u(ops[1]),) * 3)
         self.set_s(dst[1], expr, scc='$ != 0')
         return None
+
+    def op_s_flbit_i32_b32(self, ops, mods):
+        """Find first bit high (leading-zero count); SCC unchanged (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot dpp_ffbh_u32: D = S0 == 0 ? 0xffffffff : 31 - firstbithigh(S0).
+        Lane masks and descriptor-bearing SGPRs are refused.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_flbit_i32_b32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_flbit_i32_b32 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_flbit_i32_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            folded = 0xffffffff if value == 0 else 31 - (value.bit_length() - 1)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_flbit_i32_b32 source %s' % ops[1])
+        if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+            raise Unsupported('s_flbit_i32_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_flbit_i32_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            folded = 0xffffffff if value == 0 else 31 - (value.bit_length() - 1)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src_u = self.u(ops[1])
+        self.set_s(dst[1], '(%s == 0u ? 0xffffffffu : 31u - firstbithigh(%s))' % (src_u, src_u))
+        return None
+
 
     # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
     def op_x2w_mesh_lane0(self, ops, mods):
@@ -5903,11 +6219,15 @@ class Stage:
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         attr, comp = self.note_attr(ops[2], 'linear')
         self.set_v(reg_range(ops[0])[1], 'U(i.param%d.%s)' % (attr, comp))
 
@@ -6721,13 +7041,15 @@ class Stage:
                 raise Unsupported('branch into the middle of a block (+0x%x)' % off)
             return index[off]
         out.append('    uint pc = 0;')
+        wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
         for i, (off, lines, term) in enumerate(self.blocks):
             if off == getattr(self, 'mesh_allocation_block', None):
                 out.append('    {')
             else:
-                out.append('    %sif (pc == %d) {' % ('else ' if loops and i else '', i))
+                attribute = '[branch] ' if off in wave_load_blocks else ''
+                out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
             out += ['        ' + line for line in lines]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
             if not term:
@@ -6755,6 +7077,8 @@ class Stage:
         if getattr(self, 'spill_slots', None):
             lines.append('    uint %s;' % ', '.join('sp%d_%d = 0' % k for k in sorted(self.spill_slots)))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
+        if getattr(self, 'mesh_wave_loads', {}):
+            lines.append('    bool wave_any = false;')
         if getattr(self, 'used_atomic', None):
             if 'uint' in self.used_atomic:
                 lines.append('    uint ao = 0;')
@@ -6860,7 +7184,7 @@ VEC_U_TO_F = {
 # operands are uints; the result is a uint expression
 VEC_U = {
     'v_add_nc_u32': (2, '{0} + {1}'), 'v_sub_nc_u32': (2, '{0} - {1}'), 'v_subrev_nc_u32': (2, '{1} - {0}'),
-    'v_mul_lo_u32': (2, '{0} * {1}'), 'v_mul_hi_u32': (2, 'mul_hi_u32({0}, {1})'), 'v_and_b32': (2, '{0} & {1}'), 'v_or_b32': (2, '{0} | {1}'), 'v_xor_b32': (2, '{0} ^ {1}'),
+    'v_mul_lo_u32': (2, '{0} * {1}'), 'v_mul_hi_u32': (2, 'mul_hi_u32({0}, {1})'), 'v_mul_hi_i32': (2, 'mul_hi_i32({0}, {1})'), 'v_and_b32': (2, '{0} & {1}'), 'v_or_b32': (2, '{0} | {1}'), 'v_xor_b32': (2, '{0} ^ {1}'),
     'v_not_b32': (1, '~{0}'), 'v_lshlrev_b32': (2, '{1} << ({0} & 31)'), 'v_lshrrev_b32': (2, '{1} >> ({0} & 31)'),
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
@@ -6874,6 +7198,7 @@ VEC_U = {
     'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_mad_i32_i24': (3, 'asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8) + {2}'),
+    'v_mad_u32_u16': (3, '({0} & 0xffffu) * ({1} & 0xffffu) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_xor3_b32': (3, '{0} ^ {1} ^ {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
     'v_xad_u32': (3, '({0} ^ {1}) + {2}'), 'v_bfi_b32': (3, '({0} & {1}) | (~{0} & {2})'),
@@ -6959,8 +7284,9 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((({1} >> 16) & 127) >= 32 ? 0xffffffffu : ((1u << (({1} >> 16) & 31)) - 1))', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
-    # s_mul_hi_u32: high 32 bits of the unsigned 64-bit product; SCC unchanged.
+    # s_mul_hi_{u,i}32: high 32 bits of the unsigned/signed 64-bit product; SCC unchanged.
     's_mul_hi_u32': ('mul_hi_u32({0}, {1})', None),
+    's_mul_hi_i32': ('mul_hi_i32({0}, {1})', None),
     # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
     's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
     's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
@@ -7029,7 +7355,8 @@ SCALAR_BITS = {
     's_bcnt0_i32_b64': (True, lambda lo, hi: '(64u - countbits(%s) - countbits(%s))' % (lo, hi), '$ != 0'),
     's_bcnt1_i32_b64': (True, lambda lo, hi: '(countbits(%s) + countbits(%s))' % (lo, hi), '$ != 0'),
     's_ff0_i32_b64': (True, lambda lo, hi: _ctz64('(~%s)' % lo, '(~%s)' % hi), None),
-    's_ff1_i32_b64': (True, _ctz64, None),
+    # s_ff1_i32_b64 stays on Stage.op_s_ff1_i32_b64 (immediates + SGPR pairs) so SCALAR_BITS
+    # does not overwrite the zero-extended immediate fold from #2022 Item F.
     's_flbit_i32_b64': (True, _clz64, None),
     's_flbit_i32_i64': (True, _flbit_i64, None),
 }
@@ -7159,10 +7486,17 @@ class Pipeline:
         # one is enabled). Without hardware inputs the model assumes the center pair alone: v0, v1.
         self.persp_center_vgpr = 0
         if ps_hw_inputs is not None:
+            # SPI_PS_INPUT_ADDR allocates the entry VGPRs in bit order; SPI_PS_INPUT_ENA chooses which of the
+            # allocated inputs are loaded. Every enabled input is also allocated (LLVM AMDGPUAsmPrinter
+            # getSIProgramInfo: "all enabled inputs are tagged in InputAddr as well"; SIISelLowering
+            # processPSInputArgs marks an input allocated, then enabled only when it is used).
             ena, addr = ps_hw_inputs
-            if ena != addr or not 0 <= ena <= 0xffff:
+            if not (0 <= ena <= 0xffff and 0 <= addr <= 0xffff):
                 raise Unsupported('unverified pixel input enable/address combination')
-            self.persp_center_vgpr = (2 if addr & 1 else 0) if addr & 2 else None
+            if ena & ~addr:
+                raise Unsupported('contradictory pixel input enable/address masks: an enabled input is not allocated')
+            # Layout from the address mask; an input allocated but not enabled holds no loaded value.
+            self.persp_center_vgpr = (2 if addr & 1 else 0) if ena & 2 else None
             if ena & (1 << 15):
                 # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
                 # line stipple through sample coverage each occupy one VGPR.
@@ -7313,6 +7647,8 @@ class Pipeline:
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
                ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
+               'uint mul_hi_i32(uint a, uint b) { return mul_hi_u32(a, b) - ((a >> 31) != 0u ? b : 0u)'
+               ' - ((b >> 31) != 0u ? a : 0u); }',
                # a * b + c for binary16 inputs with one rounding (#2073). The first form recovered the binary32 sum error
                # with a floating-point TwoSum; an NVIDIA driver (RTX 3070 Ti, 32.0.16.2101) simplified that error term to
                # zero despite `precise`, so ties rounded the wrong way. fma16_rne works on the encodings in 32-bit integer
@@ -7709,10 +8045,16 @@ class ComputePipeline(Pipeline):
     def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
         from compute_store_aot import checked_group, entry_registers
         try:
-            self.entry = entry_registers(rsrc2)  # (user SGPRs, {axis: group-ID SGPR}, thread-ID VGPRs)
+            tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
+                          and 0 <= rsrc2 < (1 << 32) and bool((rsrc2 >> 10) & 1))
+            self.entry = entry_registers(rsrc2 & ~(1 << 10) if tg_size_en else rsrc2)
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
+        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32:
+            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
+        user, groups, _ = self.entry
+        self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
@@ -7766,10 +8108,14 @@ class ComputePipeline(Pipeline):
                 where = 'table %d %d' % (source[1], off or 0)
             elif source[0] == 'root':
                 where = 'root %d' % source[1]
+            elif source[0] == 'resheap' and len(source) == 3 and r['kind'] == 'buf':
+                where = 'heap rootconst %d %d' % source[1:]  # the 32-byte heap record that root constant word indexes
             else:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for (source, off), r in self.uavs.items():
+            if source[0] != 'table':
+                raise Unsupported('store through %s' % (source,))
             where = 'table %d %d' % (source[1], off)
             if r['kind'] == 'raw':
                 lines.append('uav %d %s' % (r['index'], where))
@@ -7810,10 +8156,16 @@ def fnv(data, h=1469598103934665603):
     return h
 
 
-def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
-    """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
+def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
+    """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout.
+
+    A pipeline with a stream description (req_<key>.psin) also hashes its pixel input masks: b'psin1' and then
+    SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
+    signature and input layout but different masks are then two requests with their own results. Without a
+    description the key is unchanged."""
     key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-17'))))
-    return fnv(layout, key) if layout else key
+    key = fnv(layout, key) if layout else key
+    return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
 
 def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
@@ -8003,14 +8355,15 @@ def has_complete_mesh57_bytecode(path):
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
-                 ps_attr_map=None):
+                 ps_attr_map=None, ps_hw_inputs=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
+                        ps_hw_inputs=ps_hw_inputs)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -8099,27 +8452,21 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
         decoded[kind] = ins
         return kind
 
-    name = os.path.join(out_dir, 'req_%016x' % key)
-    request = ''
-    formats = ()
-    base = key
-    if os.path.isfile(name + '.rtv'):
-        with open(name + '.rtv', encoding='ascii') as file:
-            request = file.read(256)
-        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
-            raise Unsupported('invalid RTV variant request')
-        base, *formats = map(int, request.split()[1:])
-        if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
-            raise Unsupported('invalid RTV variant values')
-        name = os.path.join(out_dir, 'req_%016x' % base)
+    request, base, formats, description = request_source(out_dir, key)
+    name = os.path.join(out_dir, 'req_%016x' % base)
     a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     if pair_info is not None and not request:
         import hashlib
         pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
     # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
     layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
-    if (request or validate_base_key) and pipeline_key(a, b, root, layout) != base:
-        raise Unsupported('RTV variant source key mismatch' if request else 'shader request source key mismatch')
+    if request or validate_base_key:
+        # The masks of a stream description are part of the key (pipeline_key).
+        masks = read_ps_inputs(description, base)
+        if pipeline_key(a, b, root, layout, masks) != base:
+            raise Unsupported('RTV variant source key mismatch' if request else
+                              'pixel input description names another pipeline' if masks is not None else
+                              'shader request source key mismatch')
     fetch = attr_map = None
     if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
         # Slot 86 records complete containers in canonical (VS, PS) order.
@@ -8142,6 +8489,98 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
     else:
         kinds = {classify_stage(a): a, classify_stage(b): b}
     return kinds, root, formats, request, fetch, decoded, attr_map
+
+
+def request_source(out_dir, key):
+    """The source of a graphics request: (rtv1 line or '', source key, RTV formats, stream description path).
+
+    A base request is its own source. An RTV variant (req_<key>.rtv) names its source pipeline and is translated
+    from that pipeline's blobs and stream description, req_<source>.psin. This is the one place that names the
+    description a request depends on: the translation reads its masks from that path, and pending_keys checks
+    the same path to withdraw a published result or retry a failure after the description changes or, for a
+    result recorded as translated with it (dependency_record), is removed. The path is returned whether or not the
+    file exists. An invalid variant line is refused by name."""
+    name = os.path.join(out_dir, 'req_%016x' % key)
+    request = ''
+    formats = ()
+    base = key
+    if os.path.isfile(name + '.rtv'):
+        with open(name + '.rtv', encoding='ascii') as file:
+            request = file.read(256)
+        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
+            raise Unsupported('invalid RTV variant request')
+        base, *formats = map(int, request.split()[1:])
+        if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
+            raise Unsupported('invalid RTV variant values')
+    return request, base, formats, os.path.join(out_dir, 'req_%016x.psin' % base)
+
+
+def request_ps_inputs(out_dir, key):
+    """The pixel input masks (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR) of one graphics request, or None.
+
+    They come from the stream description request_source() names: req_<key>.psin, the separately captured
+    description of exactly that pipeline (see read_ps_inputs), or for an RTV variant its source pipeline's. The
+    masks are part of the request's identity: the key must equal pipeline_key() of the stage blobs, root
+    signature, input layout and these masks, so a description copied from another pipeline, left stale after a
+    stage change or rewritten with another mask pair is refused, never applied. No file means no captured
+    description: the translation keeps its model without hardware inputs."""
+    _, base, _, description = request_source(out_dir, key)
+    masks = read_ps_inputs(description, base)
+    if masks is None:
+        return None
+    name = os.path.join(out_dir, 'req_%016x' % base)
+    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+    layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
+    if pipeline_key(a, b, root, layout, masks) != base:
+        raise Unsupported('pixel input description names another pipeline')
+    return masks
+
+
+def dependency_record(out_dir, key):
+    """<key>.psdep: written when a graphics request is translated with a stream description, before its manifest.
+
+    It marks a result as known to depend on the description request_source() names, so pending_keys can withdraw
+    that result when the description is removed. A legacy request that never had a description has no record, and
+    its inputs are not read again. The record holds the description line the result was translated with."""
+    return os.path.join(out_dir, '%016x.psdep' % key)
+
+
+def record_dependency(out_dir, key, base, masks):
+    path = dependency_record(out_dir, key)
+    line = 'psin1 %016x ena=0x%04x addr=0x%04x\n' % (base, *masks)
+    with suppress(FileNotFoundError, UnicodeError), open(path) as existing:
+        if existing.read() == line:
+            return
+    temporary = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        with open(temporary, 'w') as record:
+            record.write(line)
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.remove(temporary)
+
+
+def read_ps_inputs(path, key):
+    """The (enable, address) masks in the stream description at `path` (req_<key>.psin), one ASCII line
+    'psin1 <key> ena=<mask> addr=<mask>' (the key as 16 hex digits, the masks as 0x-prefixed 16-bit values), or
+    None without the file. The line must name `key`; a malformed line or a missing mask is refused by name."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, 'rb') as file:
+        line = file.read(128)
+    fields = line.decode('ascii', 'replace').split()
+    if not re.fullmatch(rb'psin1 [0-9a-f]{16}(?: (?:ena|addr)=0x[0-9a-f]{1,4}){0,2}\n?', line):
+        raise Unsupported('invalid pixel input description')
+    masks = dict(field.split('=') for field in fields[2:])
+    if len(masks) != len(fields) - 2:
+        raise Unsupported('invalid pixel input description')
+    if int(fields[1], 16) != key:
+        raise Unsupported('pixel input description names another pipeline')
+    for field, label in (('ena', 'enable'), ('addr', 'address')):
+        if field not in masks:
+            raise Unsupported('pixel input %s mask missing from the stream description' % label)
+    return int(masks['ena'], 16), int(masks['addr'], 16)
 
 
 def mesh57_key(ms, ps, root):
@@ -8170,11 +8609,13 @@ def translate_mesh57(out_dir, key):
     if ps:
         pixel = decode(strip_header(ps))
         # A pixel shader with no colour output ends in a null-target export (LLVM SILateBranchLowering, Mesa ACO create_fs_null_export): depth-only.
-        null_only = {a.split()[1] for _, _, op, a in pixel if op == 'exp'} == {'null'}
+        targets = {a.split()[1] for _, _, op, a in pixel if op == 'exp'}
+        null_only = targets == {'null'}
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
-        if null_only:
-            raise Unsupported('slot 57 mesh with a depth-only pixel stage is not covered')
+        # The slot 57 depth-only profile is the null export alone; the general pixel path keeps its mixed forms.
+        if 'null' in targets and not null_only:
+            raise Unsupported('slot 57 pixel stage mixes the null export with another export')
     pipe = MeshPipeline(ms, ps or None, root)
     sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
     if ps:
@@ -8220,15 +8661,32 @@ def translate_request(out_dir, key):
             open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
             return 'unsupported: %s' % reason
     try:
-        kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
+        try:
+            _, base, _, description = request_source(out_dir, key)
+            if os.path.isfile(dependency_record(out_dir, key)) and not os.path.isfile(description):
+                raise Unsupported('pixel input description missing for a request translated with one')
+            kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
+            ps_inputs = request_ps_inputs(out_dir, key)
+            if ps_inputs is not None:
+                record_dependency(out_dir, key, base, ps_inputs)  # before the manifest is published
+        except Unsupported:
+            # A result published earlier was translated from sources or masks this request no longer confirms.
+            with suppress(FileNotFoundError):
+                os.remove(os.path.join(out_dir, '%016x.txt' % key))
+            raise
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch,
-                        ps_attr_map=attr_map)
+    result = translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
+                          vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
+    if ps_inputs is not None and result == 'ok':
+        # An unchanged manifest is not rewritten; mark it as checked against this description (pending_keys).
+        with suppress(FileNotFoundError):
+            os.utime(os.path.join(out_dir, '%016x.txt' % key))
+    return result
 
 
 REFUSALS_CAVEAT = ('Counts after the first refusal are approximate. Skipped instructions leave later state '
@@ -8279,7 +8737,8 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, _, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        kinds, root, formats, request, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        ps_inputs = request_ps_inputs(out_dir, key)
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
         return refusals
@@ -8299,7 +8758,7 @@ def request_refusals(out_dir, key, pair_info=None):
         if set(kinds) != {'vs', 'ps'}:
             raise Unsupported('stages %s' % sorted(kinds))
         pipe = Pipeline(kinds['vs'], kinds['ps'], root, rtv_formats=formats, vs_fetch=fetch,
-                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map)
+                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
         op = 'hlsl_vs'
         pipe.hlsl_vs()
         op = 'hlsl_ps'
@@ -8550,8 +9009,21 @@ def pending_keys(out_dir, skip_failed):
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
         ready_bytecode = has_complete_mesh57_bytecode if mesh else has_bytecode
         manifest = result + ('.ms57.txt' if mesh else '.txt')
-        # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if os.path.isfile(manifest):
+        # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008). The stream
+        # description the translation reads (request_source: the request's own, or an RTV variant's source
+        # pipeline's) is a dependency like the request file. Rewritten after the result was published, the result
+        # is checked again, so one translated with other masks is not kept in silence; rewritten after a refusal,
+        # the request is retried.
+        described = None
+        lost = False
+        if m.group(2) in ('a', 'rtv'):
+            with suppress(Unsupported, OSError, UnicodeError):  # no description, or a variant line refused later
+                described = os.path.getmtime(request_source(out_dir, key)[3])
+            # A result translated with a description recorded it (dependency_record). With that description gone,
+            # the result is checked again and withdrawn; a legacy request without a record is not read again.
+            lost = described is None and os.path.isfile(result + '.psdep')
+        if os.path.isfile(manifest) and not lost and not (
+                described is not None and described > os.path.getmtime(manifest)):
             if manifest_only or all(ready_bytecode(result + s) for s in stages):
                 continue
             if mesh and has_complete_mesh57_bytecode(result + '.ms57.cso'):
@@ -8559,8 +9031,12 @@ def pending_keys(out_dir, skip_failed):
                     if b'ps none' in published.read().splitlines():
                         continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
-        # A repeated pass retries a failure only once its request is rewritten.
-        if skip_failed and os.path.exists(fail) and os.path.getmtime(fail) >= os.path.getmtime(os.path.join(out_dir, name)):
+        # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
+        # still published without its recorded description is checked even with an older .fail, which a success on
+        # the manifest-only path leaves in place.
+        recheck = lost and os.path.isfile(manifest)
+        if skip_failed and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= max(
+                os.path.getmtime(os.path.join(out_dir, name)), described or 0):
             continue
         keys.append(key)
     return keys
