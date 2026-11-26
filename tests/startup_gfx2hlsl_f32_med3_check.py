@@ -33,7 +33,7 @@ text against the ISA rule, not against the instruction. This limit is recorded i
 
 Controls, all on the emitted HLSL text (no compiler, no GPU):
   - the preamble defines `med3_32` with the encoding test on all three sources, the `>` of `0x7f800000u` and
-    `min(min(a, b), c)` for the NaN branch; no line calls a `med3(` helper;
+    the signed-zero `minmax_zero32` min3 chain for the NaN branch; no line calls a `med3(` helper;
   - the binary32 table points `v_med3_f32` at `med3_32` and the integer forms are unchanged;
   - every lane of the fixture lowers to `U(med3_32(F(v1), F(v2), F(v3)))` reading s44..s47, which the entry
     constant buffer fills at draw time;
@@ -87,7 +87,9 @@ BRANCHLESS_NAN = 0x40000000
 
 MED3_32 = ('float med3_32(float a, float b, float c) {\n'
            '    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);\n'
-           '    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));\n'
+           '    return top > 0x7f800000u\n'
+           '        ? minmax_zero32(minmax_zero32(a, b, false), c, false)\n'
+           '        : minmax_zero32(minmax_zero32(a, b, false), minmax_zero32(minmax_zero32(a, b, true), c, false), true);\n'
            '}')
 BRANCHLESS = 'float med3_32(float a, float b, float c) {\n    return max(min(a, b), min(max(a, b), c));\n}'
 OLD_ISNAN = ('float med3_32(float a, float b, float c) {\n'

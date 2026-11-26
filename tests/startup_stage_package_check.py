@@ -12,7 +12,7 @@ def call(powershell, package, exe, run):
     return subprocess.run(
         [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
          "-PackageDir", str(package), "-Exe", str(exe), "-RunDir", str(run)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, encoding="utf-8", errors="replace", timeout=30,
     )
 
 
@@ -22,7 +22,8 @@ def stage_from_changed_location(powershell, root, package, location):
          r"$ErrorActionPreference = 'Stop'; Set-Location -LiteralPath $env:X2W_TEST_LOCATION; "
          r"& $env:X2W_TEST_SCRIPT -PackageDir $env:X2W_TEST_PACKAGE -Exe 'bin\child.exe' -RunDir 'package-run'"],
         cwd=root, env=dict(os.environ, X2W_TEST_LOCATION=str(location), X2W_TEST_SCRIPT=str(SCRIPT),
-                           X2W_TEST_PACKAGE=str(package)), capture_output=True, text=True, timeout=30,
+                           X2W_TEST_PACKAGE=str(package)),
+        capture_output=True, encoding="utf-8", errors="replace", timeout=30,
     )
 
 
@@ -84,7 +85,7 @@ def main():
 
         junction = root / "link"
         result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(junction), str(location)],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, errors="replace", timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
         try:
             result = call(powershell, package, exe.name, junction / "new-run")

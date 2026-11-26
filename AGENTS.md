@@ -167,6 +167,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_neg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_interp_p2_hi_check.py
+./out/pe-env/bin/python -B tests/shader_signed_zero_minmax_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_image_store_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
@@ -175,6 +176,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_abs_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_ff0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_bitset_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_flbit_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_ff1_check.py

@@ -9,7 +9,7 @@ import tempfile
 from startup_stream_draw_check import gfx2hlsl, pixel, vertex
 
 
-def prepare_draw_cache(directory, consumer, hlsl, modes, binding):
+def prepare_draw_cache(directory, consumer, hlsl, modes, binding, *, vertex_hlsl=None):
     cache = directory / "cache"
     cache.mkdir()
     vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
@@ -27,12 +27,17 @@ def prepare_draw_cache(directory, consumer, hlsl, modes, binding):
     source.write_text(hlsl)
     subprocess.run([env["X2W_FXC"], "/nologo", "/T", "ps_5_0", "/E", "main", "/Fo",
                     manifest.with_suffix(".ps.cso"), source], check=True)
+    if vertex_hlsl is not None:
+        source = manifest.with_suffix(".vs.hlsl")
+        source.write_text(vertex_hlsl, encoding="ascii")
+        subprocess.run([env["X2W_FXC"], "/nologo", "/T", "vs_5_0", "/E", "main", "/Fo",
+                        manifest.with_suffix(".vs.cso"), source], check=True)
     return env, args, output
 
 
-def draw_texture(directory, consumer, backend, hlsl, modes, view_kind="tex2d", *, binding=None):
+def draw_texture(directory, consumer, backend, hlsl, modes, view_kind="tex2d", *, binding=None, vertex_hlsl=None):
     binding = binding or f"srv 0 {view_kind} table 0 0"
-    env, args, output = prepare_draw_cache(directory, consumer, hlsl, modes, binding)
+    env, args, output = prepare_draw_cache(directory, consumer, hlsl, modes, binding, vertex_hlsl=vertex_hlsl)
     result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
     print(result.stdout, end="")
     if result.returncode == 77:
