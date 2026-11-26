@@ -2501,8 +2501,6 @@ struct Pass {
     UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
-    ID3D12Resource* bound_targets[8]{};
-    ID3D12Resource* bound_depth = nullptr;
     ID3D12Resource* trace_targets[8]{};
     ID3D12Resource* trace_depth = nullptr;
     ID3D12Resource* bound_targets[8]{};  // the last accepted bind: targets [0, target_count) and the depth texture
@@ -3584,8 +3582,6 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         }
     }
     if (!count && !dsv_ptr) return;
-    std::copy_n(targets, 8, pass.bound_targets);
-    pass.bound_depth = dsv_target;
     if (red_producers().enabled()) {
         std::copy_n(targets, 8, pass.trace_targets);
         pass.trace_depth = dsv_target;
