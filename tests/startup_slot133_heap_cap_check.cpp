@@ -1,18 +1,24 @@
-// Slot 133 existing-heap cap (<= 256 MiB), deferred commit_lazy_block, and incremental
-// reserve_upload_ring growth (Refs #1199, Fixes #2765).
+// Slot 133 existing-heap cap (opt-in X2W_D3D12_CAP_EXISTING_HEAP=1, <= 256 MiB), deferred
+// commit_lazy_block, and incremental reserve_upload_ring growth (Refs #1199, Fixes #2765).
 //
-//   startup_slot133_heap_cap_check <warp|hardware> [unbounded]
+//   startup_slot133_heap_cap_check <warp|hardware> [cap]
 //
 // 1. With X2W_XMEM_LAZY_COMMIT=1 and X2W_XMEM_LAZY_STARTUP=1:
 //    - Allocate a 260 MiB (> 256 MiB) MEM_PRIVATE lazy startup block via XMemVirtualAlloc.
-//    - Place a 64 KiB aligned buffer at +0 and a 64 KiB unaligned buffer at +2 MiB + 16 via slot 133:
-//      neither opens an existing_heap (x2w-budget heap stays 0/0, desktop resources lack
-//      ALLOW_CROSS_ADAPTER) and untouched pages of the 260 MiB block remain MEM_RESERVE.
-//    - With `unbounded` (X2W_D3D12_UNBOUNDED_EXISTING_HEAP=1), the aligned placement opens the
-//      260 MiB heap and commits the block (opt-in override).
-//    - Meanwhile, <= 256 MiB blocks (4 MiB VirtualAlloc and 64 MiB XMemVirtualAlloc lazy block at +0)
-//      open existing_heap (aliased) cleanly.
-// 2. reserve_upload_ring incremental growth:
+//    - Default (no `cap`): the aligned 64 KiB placement at +0 opens the 260 MiB existing heap
+//      (aliased, ALLOW_CROSS_ADAPTER) and commits the block. A guest CopyBufferRegion (list slot 15)
+//      recorded from it into a readback buffer must observe a late CPU write made after recording
+//      and before submit (fenced readback, every byte 0x59): a capped copied placement would be
+//      refused as title_backed_source and lose that write, so the cap stays opt-in.
+//    - With `cap` (X2W_D3D12_CAP_EXISTING_HEAP=1): place a 64 KiB aligned buffer at +0 and a
+//      64 KiB unaligned buffer at +2 MiB + 16 via slot 133: neither opens an existing_heap
+//      (x2w-budget heap stays 0/0, desktop resources lack ALLOW_CROSS_ADAPTER) and untouched
+//      pages of the 260 MiB block remain MEM_RESERVE.
+//    - Meanwhile, <= 256 MiB blocks (4 MiB VirtualAlloc and 64 MiB XMemVirtualAlloc lazy block at
+//      +2 MiB with an untouched [0, 2 MiB) MEM_RESERVE prefix) open existing_heap (aliased) cleanly,
+//      verified with a late A-to-B CPU write and GPU readback; unaligned and out-of-bounds nonzero
+//      offsets in a 64 MiB lazy block leave untouched pages MEM_RESERVE.
+// 2. reserve_upload_ring incremental growth (cap variant):
 //    - First upload (64x64 RGBA8 CopyResource) commits 16 MiB (not 256 MiB) in x2w-budget upload.
 //    - A second small upload (32x32 RGBA8) reuses the same 16 MiB chunk.
 //    - Uploading a 2048x2048 RGBA8 (16 MiB) texture exceeds chunk 0 and appends a 32 MiB chunk
@@ -131,7 +137,7 @@ ComPtr<IDXGIAdapter1> pick_adapter(IDXGIFactory4* factory, bool warp)
     return nullptr;
 }
 
-bool load_shims(bool unbounded)
+bool load_shims(bool cap)
 {
     SetEnvironmentVariableA("X2W_XMEM_LAZY_COMMIT", "1");
     SetEnvironmentVariableA("X2W_XMEM_LAZY_STARTUP", "1");
@@ -139,7 +145,7 @@ bool load_shims(bool unbounded)
     SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1");
     SetEnvironmentVariableA("X2W_D3D12_LIST_NOOP", "1");
     SetEnvironmentVariableA("X2W_D3D12_RENDER", "1");
-    SetEnvironmentVariableA("X2W_D3D12_UNBOUNDED_EXISTING_HEAP", unbounded ? "1" : nullptr);
+    SetEnvironmentVariableA("X2W_D3D12_CAP_EXISTING_HEAP", cap ? "1" : nullptr);
 
     wchar_t exe_dir[MAX_PATH]{};
     const DWORD n = GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
@@ -224,7 +230,57 @@ bool verify_texture_box(ID3D12Device* device, ID3D12CommandQueue* own_queue, ID3
     return true;
 }
 
-int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, bool unbounded)
+bool verify_buffer_pattern(ID3D12Device* device, ID3D12CommandQueue* own_queue, ID3D12CommandAllocator* own_alloc,
+                           ID3D12GraphicsCommandList* own_list, ID3D12Fence* own_fence, UINT64& own_val,
+                           ID3D12Resource* real_buf, UINT64 bytes, int seed, const char* label)
+{
+    const D3D12_HEAP_PROPERTIES rb_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto rb_desc = buffer_desc(bytes);
+    ComPtr<ID3D12Resource> rb;
+    if (!require(device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)),
+                 "buffer readback"))
+        return false;
+
+    if (!require(own_alloc->Reset(), "own alloc reset") || !require(own_list->Reset(own_alloc, nullptr), "own list reset"))
+        return false;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {real_buf, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE};
+    own_list->ResourceBarrier(1, &b);
+    own_list->CopyBufferRegion(rb.Get(), 0, real_buf, 0, bytes);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    own_list->ResourceBarrier(1, &b);
+    if (!require(own_list->Close(), "own list close")) return false;
+    ID3D12CommandList* lists[] = {own_list};
+    own_queue->ExecuteCommandLists(1, lists);
+    if (!require(own_queue->Signal(own_fence, ++own_val), "own signal")) return false;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) return false;
+    const bool waited = SUCCEEDED(own_fence->SetEventOnCompletion(own_val, ev)) &&
+                        WaitForSingleObject(ev, wait_ms) == WAIT_OBJECT_0;
+    CloseHandle(ev);
+    if (!check(waited, "own fence wait")) return false;
+
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
+    if (!require(rb->Map(0, &range, &mapped), "buffer readback map")) return false;
+    const auto* got = static_cast<const std::uint8_t*>(mapped);
+    UINT mismatches = 0;
+    for (UINT64 i = 0; i < bytes; ++i) {
+        if (got[i] != pattern_byte(seed, i)) ++mismatches;
+    }
+    rb->Unmap(0, nullptr);
+    if (mismatches) {
+        std::printf("FAIL: %s readback mismatches=%u\n", label, mismatches);
+        return false;
+    }
+    return true;
+}
+
+int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, bool cap)
 {
     const GUID& resource_iid = __uuidof(ID3D12Resource);
     D3D12_FEATURE_DATA_EXISTING_HEAPS existing{};
@@ -271,30 +327,113 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
         return 4;
     }
 
-    if (unbounded) {
+    if (!cap) {
         if (!existing_supported) {
-            std::puts("skipping unbounded existing-heap check: D3D12_FEATURE_EXISTING_HEAPS=0");
+            std::puts("skipping default aliased existing-heap check: D3D12_FEATURE_EXISTING_HEAPS=0");
             large_aligned.Reset();
             VirtualFree(large_block, 0, MEM_RELEASE);
             return 77;
         }
         Snapshot s{};
         if (!snap(s)) return 4;
-        if (!check((large_aligned_real->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) != 0,
-                   "unbounded opt-in opens aliased placement on 260 MiB block") ||
-            !check(s.live[heap].bytes == large_bytes && s.live[heap].objects == 1,
-                   "unbounded opt-in accounts 260 MiB heap") ||
-            !check(s.live[placed].objects == 1, "unbounded opt-in accounts placed buffer") ||
-            !check(mem_state(large_block + 128 * mib) == MEM_COMMIT,
-                   "unbounded opt-in commits lazy block right before OpenExistingHeapFromAddress")) {
+        // A failed placement check does not stop the late-write case below: with the cap forced on,
+        // the copied fallback is refused by slot 15 and the readback sentinel survives, which is the
+        // loss this fixture exists to catch. Any failure still fails the run.
+        bool aliased_ok = check((large_aligned_real->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) != 0,
+                                "default keeps aliased placement on 260 MiB block");
+        aliased_ok &= check(s.live[heap].bytes == large_bytes && s.live[heap].objects == 1,
+                            "default accounts 260 MiB heap");
+        aliased_ok &= check(s.live[placed].objects == 1, "default accounts placed buffer");
+        aliased_ok &= check(mem_state(large_block + 128 * mib) == MEM_COMMIT,
+                            "default commits lazy block right before OpenExistingHeapFromAddress");
+
+        // R0Y00's late-write case: record a guest CopyBufferRegion (list slot 15) from the aliased
+        // buffer into a readback buffer, change the title memory after recording and before submit,
+        // and require the fenced readback to hold the late bytes. The default alias keeps the
+        // contents authoritative; a capped copied placement is refused as title_backed_source
+        // (list_copy.inl sync_title_source) and the readback keeps its 0x6d sentinel.
+        std::memset(large_block, 0x2a, static_cast<std::size_t>(page));
+        const D3D12_COMMAND_QUEUE_DESC late_qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+        const unsigned late_list_desc[] = {static_cast<unsigned>(D3D12_COMMAND_LIST_TYPE_DIRECT), 2, 1, 0};
+        ComPtr<IUnknown> late_queue, late_alloc, late_list, late_fence;
+        if (!require(invoke(guest, 8, &late_qd, &__uuidof(ID3D12CommandQueue), late_queue.GetAddressOf()),
+                     "late-write guest queue") ||
+            !require(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, &__uuidof(ID3D12CommandAllocator),
+                            late_alloc.GetAddressOf()),
+                     "late-write guest allocator") ||
+            !require(invoke(guest, 73, late_list_desc, late_alloc.Get(), nullptr, &__uuidof(ID3D12GraphicsCommandList),
+                            late_list.GetAddressOf()),
+                     "late-write guest list") ||
+            !require(invoke(guest, 36, UINT64{0}, D3D12_FENCE_FLAG_NONE, &__uuidof(ID3D12Fence),
+                            late_fence.GetAddressOf()),
+                     "late-write guest fence") ||
+            !require(invoke(late_list.Get(), 139, late_alloc.Get(), nullptr), "late-write guest list reset"))
+            return 4;
+        const auto late_real_fence = desktop_object<ID3D12Fence>(guest, device, late_fence.Get());
+        if (!late_real_fence) return 4;
+
+        const D3D12_HEAP_PROPERTIES late_rb_heap{D3D12_HEAP_TYPE_READBACK};
+        const auto late_rb_desc = buffer_desc(page);
+        ComPtr<ID3D12Resource> late_readback;
+        if (!require(device->CreateCommittedResource(&late_rb_heap, D3D12_HEAP_FLAG_NONE, &late_rb_desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&late_readback)),
+                     "late-write readback buffer"))
+            return 4;
+        void* primed = nullptr;
+        const D3D12_RANGE prime_range{0, static_cast<SIZE_T>(page)};
+        if (!require(late_readback->Map(0, &prime_range, &primed), "late-write readback prime map")) return 4;
+        std::memset(primed, 0x6d, static_cast<std::size_t>(page));
+        late_readback->Unmap(0, nullptr);
+
+        // Slot 15 takes the raw desktop readback pointer as its destination (copy_endpoint).
+        invoke<void>(late_list.Get(), 15, reinterpret_cast<UINT64>(late_readback.Get()), UINT64{0},
+                     reinterpret_cast<UINT64>(large_aligned.Get()), UINT64{0}, UINT64{page});
+        if (!require(invoke(late_list.Get(), 9), "late-write list close")) return 4;
+
+        // The late guest write: after recording, before submit.
+        std::memset(large_block, 0x59, static_cast<std::size_t>(page));
+
+        IUnknown* late_lists[] = {late_list.Get()};
+        invoke<void>(late_queue.Get(), 10, 1u, late_lists);
+        UINT64 late_val = 1;
+        if (!require(invoke(late_queue.Get(), 14, late_fence.Get(), late_val), "late-write queue signal")) return 4;
+        HANDLE late_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!late_ev) return 4;
+        const bool late_waited = SUCCEEDED(late_real_fence->SetEventOnCompletion(late_val, late_ev)) &&
+                                 WaitForSingleObject(late_ev, wait_ms) == WAIT_OBJECT_0;
+        CloseHandle(late_ev);
+        if (!check(late_waited, "late-write fence wait")) return 4;
+
+        void* late_mapped = nullptr;
+        const D3D12_RANGE late_read_range{0, static_cast<SIZE_T>(page)};
+        if (!require(late_readback->Map(0, &late_read_range, &late_mapped), "late-write readback map")) return 4;
+        const auto* late_got = static_cast<const std::uint8_t*>(late_mapped);
+        UINT64 late_stale = 0, late_first = 0;
+        std::uint8_t late_first_byte = 0;
+        for (UINT64 i = 0; i < page; ++i) {
+            if (late_got[i] != 0x59) {
+                if (!late_stale) { late_first = i; late_first_byte = late_got[i]; }
+                ++late_stale;
+            }
+        }
+        late_readback->Unmap(0, nullptr);
+        if (late_stale) {
+            std::printf("FAIL: late write lost on 260 MiB buffer: %llu of %llu readback bytes are not 0x59 "
+                        "(first at offset %llu = 0x%02x; 0x6d is the readback sentinel, 0x2a the pre-record "
+                        "contents; a capped copied placement is refused as title_backed_source)\n",
+                        static_cast<unsigned long long>(late_stale), static_cast<unsigned long long>(page),
+                        static_cast<unsigned long long>(late_first), late_first_byte);
             return 5;
         }
+        if (!aliased_ok) return 5;
         large_aligned.Reset();
-        std::puts("PASS (unbounded opt-in)");
+        std::puts("PASS (default aliased + late write)");
         return 0;
     }
 
-    // Normal mode: > 256 MiB block must NOT open an existing_heap and untouched pages remain MEM_RESERVE.
+    // Cap mode (X2W_D3D12_CAP_EXISTING_HEAP=1): > 256 MiB block must NOT open an existing_heap and
+    // untouched pages remain MEM_RESERVE.
     if (!check((large_aligned_real->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) == 0,
                "260 MiB aligned buffer must fall back (not aliased)")) {
         VirtualFree(large_block, 0, MEM_RELEASE);
@@ -345,6 +484,21 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
     large_unaligned.Reset();
     if (!check(VirtualFree(large_block, 0, MEM_RELEASE) != 0, "release 260 MiB lazy block")) return 4;
 
+    const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    ComPtr<ID3D12CommandQueue> own_queue;
+    ComPtr<ID3D12CommandAllocator> own_alloc;
+    ComPtr<ID3D12GraphicsCommandList> own_list;
+    ComPtr<ID3D12Fence> own_fence;
+    if (!require(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&own_queue)), "own queue") ||
+        !require(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&own_alloc)), "own alloc") ||
+        !require(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, own_alloc.Get(), nullptr,
+                                           IID_PPV_ARGS(&own_list)),
+                 "own list") ||
+        !require(own_list->Close(), "own list close") ||
+        !require(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&own_fence)), "own fence"))
+        return 4;
+    UINT64 own_val = 0, guest_val = 0;
+
     if (existing_supported) {
         // <= 256 MiB (4 MiB VirtualAlloc) MUST open an existing_heap (aliased) and reuse it.
         constexpr SIZE_T small_block_bytes = 4 * mib;
@@ -374,17 +528,77 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
         small_a.Reset();
         small_b.Reset();
 
-        // <= 256 MiB lazy startup block (64 MiB) commits lazily on demand when OpenExistingHeapFromAddress runs.
+        // Negative controls on a <= 256 MiB lazy startup block (64 MiB): unaligned and out-of-bounds
+        // nonzero offsets must NOT commit the whole lazy block or open an existing_heap.
         constexpr SIZE_T mid_bytes = 64 * mib;
+        auto* const mid_ctrl = static_cast<char*>(
+            g_xmem_virtual_alloc(nullptr, mid_bytes, 0x20403000, 0x181, PAGE_READWRITE));
+        if (!check(mid_ctrl != nullptr, "XMemVirtualAlloc 64 MiB control block") ||
+            !check(mem_state(mid_ctrl) == MEM_RESERVE && mem_state(mid_ctrl + 1 * mib) == MEM_RESERVE &&
+                       mem_state(mid_ctrl + 4 * mib) == MEM_RESERVE,
+                   "64 MiB control block starts lazy")) {
+            if (mid_ctrl) VirtualFree(mid_ctrl, 0, MEM_RELEASE);
+            return 4;
+        }
+        ComPtr<IUnknown> mid_unaligned;
+        if (!require(invoke(guest, 133, mid_ctrl + 2 * mib + 0x100, &buf_64k, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                            &resource_iid, mid_unaligned.GetAddressOf()),
+                     "slot 133 unaligned nonzero offset in 64 MiB lazy block")) {
+            VirtualFree(mid_ctrl, 0, MEM_RELEASE);
+            return 4;
+        }
+        const auto mid_unaligned_real = desktop_object<ID3D12Resource>(guest, device, mid_unaligned.Get());
+        Snapshot after_ctrl_unaligned{};
+        if (!snap(after_ctrl_unaligned)) return 4;
+        if (!check(mid_unaligned_real &&
+                       (mid_unaligned_real->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) == 0,
+                   "64 MiB unaligned nonzero offset is not aliased") ||
+            !check(after_ctrl_unaligned.live[heap].objects == 0,
+                   "64 MiB unaligned nonzero offset does not open existing_heap") ||
+            !check(mem_state(mid_ctrl) == MEM_RESERVE && mem_state(mid_ctrl + 1 * mib) == MEM_RESERVE &&
+                       mem_state(mid_ctrl + 4 * mib) == MEM_RESERVE,
+                   "64 MiB unaligned nonzero offset leaves untouched pages MEM_RESERVE")) {
+            VirtualFree(mid_ctrl, 0, MEM_RELEASE);
+            return 5;
+        }
+        const auto buf_128k = buffer_desc(2 * page);
+        ComPtr<IUnknown> mid_oob;
+        if (!require(invoke(guest, 133, mid_ctrl + mid_bytes - page, &buf_128k, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                            &resource_iid, mid_oob.GetAddressOf()),
+                     "slot 133 out-of-bounds aligned offset in 64 MiB lazy block")) {
+            VirtualFree(mid_ctrl, 0, MEM_RELEASE);
+            return 4;
+        }
+        const auto mid_oob_real = desktop_object<ID3D12Resource>(guest, device, mid_oob.Get());
+        Snapshot after_ctrl_oob{};
+        if (!snap(after_ctrl_oob)) return 4;
+        if (!check(mid_oob_real && (mid_oob_real->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) == 0,
+                   "64 MiB out-of-bounds aligned offset is not aliased") ||
+            !check(after_ctrl_oob.live[heap].objects == 0,
+                   "64 MiB out-of-bounds aligned offset does not open existing_heap") ||
+            !check(mem_state(mid_ctrl) == MEM_RESERVE && mem_state(mid_ctrl + 1 * mib) == MEM_RESERVE &&
+                       mem_state(mid_ctrl + 4 * mib) == MEM_RESERVE,
+                   "64 MiB out-of-bounds aligned offset leaves untouched pages MEM_RESERVE")) {
+            VirtualFree(mid_ctrl, 0, MEM_RELEASE);
+            return 5;
+        }
+        mid_unaligned.Reset();
+        mid_oob.Reset();
+        if (!check(VirtualFree(mid_ctrl, 0, MEM_RELEASE) != 0, "release 64 MiB control block")) return 4;
+
+        // <= 256 MiB lazy startup block (64 MiB) at nonzero aligned offset (+2 MiB): [0, 2 MiB) starts
+        // MEM_RESERVE before slot 133, commits whole when eligible, aliases, and sees late A-to-B CPU writes.
         auto* const mid_block = static_cast<char*>(
             g_xmem_virtual_alloc(nullptr, mid_bytes, 0x20403000, 0x181, PAGE_READWRITE));
         if (!check(mid_block != nullptr, "XMemVirtualAlloc 64 MiB block") ||
-            !check(mem_state(mid_block + 1 * mib) == MEM_RESERVE, "64 MiB startup block starts lazy"))
+            !check(mem_state(mid_block) == MEM_RESERVE && mem_state(mid_block + 1 * mib) == MEM_RESERVE &&
+                       mem_state(mid_block + 2 * mib) == MEM_RESERVE,
+                   "64 MiB startup block starts lazy"))
             return 4;
         ComPtr<IUnknown> mid_buf;
-        if (!require(invoke(guest, 133, mid_block, &buf_64k, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        if (!require(invoke(guest, 133, mid_block + 2 * mib, &buf_64k, D3D12_RESOURCE_STATE_COMMON, nullptr,
                             &resource_iid, mid_buf.GetAddressOf()),
-                     "slot 133 aligned buffer in 64 MiB lazy block"))
+                     "slot 133 aligned +2 MiB buffer in 64 MiB lazy block"))
             return 4;
         const auto mid_real = desktop_object<ID3D12Resource>(guest, device, mid_buf.Get());
         Snapshot after_64m{};
@@ -393,12 +607,22 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
                    "64 MiB <= 256 MiB lazy block buffer is aliased") ||
             !check(after_64m.live[heap].bytes == mid_bytes && after_64m.live[heap].objects == 1,
                    "64 MiB block opens existing_heap") ||
-            !check(mem_state(mid_block + 1 * mib) == MEM_COMMIT,
+            !check(mem_state(mid_block) == MEM_COMMIT && mem_state(mid_block + 1 * mib) == MEM_COMMIT &&
+                       mem_state(mid_block + 2 * mib) == MEM_COMMIT,
                    "64 MiB lazy block committed right before OpenExistingHeapFromAddress")) {
             return 5;
         }
+        auto* const mid_cpu = reinterpret_cast<std::uint8_t*>(mid_block + 2 * mib);
+        for (UINT64 i = 0; i < page; ++i) mid_cpu[i] = pattern_byte(10, i);
+        if (!verify_buffer_pattern(device, own_queue.Get(), own_alloc.Get(), own_list.Get(), own_fence.Get(), own_val,
+                                   mid_real.Get(), page, 10, "64 MiB +2 MiB initial A"))
+            return 5;
+        for (UINT64 i = 0; i < page; ++i) mid_cpu[i] = pattern_byte(11, i);
+        if (!verify_buffer_pattern(device, own_queue.Get(), own_alloc.Get(), own_list.Get(), own_fence.Get(), own_val,
+                                   mid_real.Get(), page, 11, "64 MiB +2 MiB late write B"))
+            return 5;
         mid_buf.Reset();
-        std::printf("existing_heaps <= 256 MiB aliased cleanly (4 MiB + 64 MiB lazy)\n");
+        std::printf("existing_heaps <= 256 MiB aliased cleanly (4 MiB + 64 MiB lazy +2 MiB A-to-B)\n");
     } else {
         std::puts("skipping <= 256 MiB existing_heap check: D3D12_FEATURE_EXISTING_HEAPS=0");
     }
@@ -412,7 +636,6 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
                "upload budget starts at 0/0 before any upload"))
         return 5;
 
-    const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     const unsigned list_desc[] = {static_cast<unsigned>(D3D12_COMMAND_LIST_TYPE_DIRECT), 2, 1, 0};
     ComPtr<IUnknown> queue, allocator, allocator2, list, fence;
     if (!require(invoke(guest, 8, &qd, &__uuidof(ID3D12CommandQueue), queue.GetAddressOf()), "guest queue") ||
@@ -429,20 +652,6 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
         return 4;
     const auto real_fence = desktop_object<ID3D12Fence>(guest, device, fence.Get());
     if (!real_fence) return 4;
-
-    ComPtr<ID3D12CommandQueue> own_queue;
-    ComPtr<ID3D12CommandAllocator> own_alloc;
-    ComPtr<ID3D12GraphicsCommandList> own_list;
-    ComPtr<ID3D12Fence> own_fence;
-    if (!require(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&own_queue)), "own queue") ||
-        !require(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&own_alloc)), "own alloc") ||
-        !require(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, own_alloc.Get(), nullptr,
-                                           IID_PPV_ARGS(&own_list)),
-                 "own list") ||
-        !require(own_list->Close(), "own list close") ||
-        !require(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&own_fence)), "own fence"))
-        return 4;
-    UINT64 own_val = 0, guest_val = 0;
 
     const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
     const auto make_slot133_tex = [&](UINT w, UINT h, int seed, std::vector<std::uint8_t>& backing,
@@ -556,13 +765,13 @@ int run_check(IUnknown* guest, ID3D12Device* device, ID3D12InfoQueue* debug, boo
 int main(int argc, char** argv)
 {
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
-        (argc == 3 && std::strcmp(argv[2], "unbounded"))) {
-        std::puts("usage: startup_slot133_heap_cap_check <warp|hardware> [unbounded]");
+        (argc == 3 && std::strcmp(argv[2], "cap"))) {
+        std::puts("usage: startup_slot133_heap_cap_check <warp|hardware> [cap]");
         return 2;
     }
     const bool warp = std::strcmp(argv[1], "warp") == 0;
-    const bool unbounded = argc == 3;
-    if (!load_shims(unbounded)) return 3;
+    const bool cap = argc == 3;
+    if (!load_shims(cap)) return 3;
 
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -605,5 +814,5 @@ int main(int argc, char** argv)
     std::printf("adapter=%ls driver=%llu.%llu.%llu.%llu debug_layer=%s\n", desc.Description,
                 driver >> 48, (driver >> 32) & 0xffff, (driver >> 16) & 0xffff, driver & 0xffff,
                 debug ? "enabled" : "off");
-    return run_check(guest.Get(), device.Get(), debug.Get(), unbounded);
+    return run_check(guest.Get(), device.Get(), debug.Get(), cap);
 }

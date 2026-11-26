@@ -5053,7 +5053,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? static_cast<D3D12_RESOURCE_STATES>(state) : D3D12_RESOURCE_STATE_COMMON;
     if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
         return E_INVALIDARG;
-    const UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
+    UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
     // X2W_D3D12_LINEAR_BUFFERS=1 or copy: shared or copied at submit (linear_buffer_backing.h). Where
     // neither keeps its guarantees, the default backing below is kept and the refusal recorded.
     X2wLinearBufferInfo linear{};
@@ -5090,13 +5090,32 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     HRESULT hr = S_OK;
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
     // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
-    // throws inside D3D12Core. OpenExistingHeapFromAddress also wraps the entire allocation, so
-    // allocations above 256 MiB (or of unknown size) are skipped unless X2W_D3D12_UNBOUNDED_EXISTING_HEAP=1
-    // is set, preventing multi-GiB startup blocks from being pinned in WorkingSetSize/NonLocal.
-    static const bool unbounded_existing_heap = x2w_local::env_on("X2W_D3D12_UNBOUNDED_EXISTING_HEAP");
+    // throws inside D3D12Core. OpenExistingHeapFromAddress also wraps the entire allocation, so the
+    // opt-in X2W_D3D12_CAP_EXISTING_HEAP=1 skips allocations above 256 MiB (or of unknown size) to keep
+    // multi-GiB startup blocks out of WorkingSetSize/NonLocal. The cap is opt-in because a capped buffer
+    // falls back to a copied placement that CopyBufferRegion (slot 15) refuses as title_backed_source,
+    // losing a late guest write; the default keeps the formerly aliased path so contents stay authoritative.
+    // A buffer at an aligned nonzero offset inside an eligible lazy startup block leaves [base, address)
+    // MEM_RESERVE after the span-only commit_lazy; commit the eligible block before re-measuring so
+    // it can alias without touching unaligned or out-of-bounds allocations (and, with the cap, > 256 MiB).
+    static const bool cap_existing_heap = x2w_local::env_on("X2W_D3D12_CAP_EXISTING_HEAP");
+    if (!range.covered && !range.region_info && range.type == MEM_PRIVATE &&
+        initial_state != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
+        x2w_startup::can_commit_lazy_placed_buffer(address, desc->Width,
+                                                   cap_existing_heap ? x2w_startup::unplaced_max_span : 0)) {
+        x2w_local::commit_lazy_block(address);
+        if (x2w_startup::measure_placed_buffer(address, desc->Width, range)) {
+            if (range.region_info) InterlockedIncrement64(&placed_buffer_region_info);
+            InterlockedAdd64(&placed_buffer_queries, range.queries);
+            base = range.base;
+            offset = static_cast<char*>(address) - static_cast<char*>(base);
+        } else {
+            range.covered = false;
+        }
+    }
     if ((offset & 0xFFFF) || !range.covered || range.type != MEM_PRIVATE ||
         initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE ||
-        (!unbounded_existing_heap && !x2w_startup::unplaced_existing_heap_allowed(x2w_startup::allocation_bytes(base))))
+        (cap_existing_heap && !x2w_startup::unplaced_existing_heap_allowed(x2w_startup::allocation_bytes(base))))
         hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);

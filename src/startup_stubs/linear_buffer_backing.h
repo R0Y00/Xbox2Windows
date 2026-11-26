@@ -319,25 +319,34 @@ public:
         record.info.use = uav ? gpu_written : gpu_read;
         record.info.feature_hr = S_FALSE;
         record.info.share_hr = S_FALSE;
-        const UINT64 offset = static_cast<UINT64>(static_cast<char*>(address) - static_cast<char*>(range.base));
+        PlacedBufferRange local_range = range;
+        UINT64 offset = static_cast<UINT64>(static_cast<char*>(address) - static_cast<char*>(local_range.base));
         ID3D12Resource* resource = nullptr;
         if (linear_buffer_mode() == LinearBufferMode::automatic) {
-            static const bool unbounded_existing_heap = x2w_local::env_on("X2W_D3D12_UNBOUNDED_EXISTING_HEAP");
+            static const bool cap_existing_heap = x2w_local::env_on("X2W_D3D12_CAP_EXISTING_HEAP");
             record.info.feature_hr = feature(device);
             const bool allowed = SUCCEEDED(record.info.feature_hr) || linear_detail::mutant("ignore-feature");
+            if (allowed && !local_range.covered && !local_range.region_info && local_range.type == MEM_PRIVATE &&
+                can_commit_lazy_placed_buffer(address, width, cap_existing_heap ? unplaced_max_span : 0)) {
+                x2w_local::commit_lazy_block(address);
+                if (measure_placed_buffer(address, width, local_range))
+                    offset = static_cast<UINT64>(static_cast<char*>(address) - static_cast<char*>(local_range.base));
+                else
+                    local_range.covered = false;
+            }
             if (!allowed)
                 record.info.share_hr = record.info.feature_hr;
-            else if (!range.covered || (offset & 0xFFFF))
+            else if (!local_range.covered || (offset & 0xFFFF))
                 record.info.share_hr = E_INVALIDARG;  // decided without D3D12: each failed open throws in D3D12Core
-            else if (range.type == MEM_MAPPED)
+            else if (local_range.type == MEM_MAPPED)
                 record.info.share_hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);  // an open heap would pin the view
-            else if (range.type != MEM_PRIVATE)
+            else if (local_range.type != MEM_PRIVATE)
                 record.info.share_hr = E_INVALIDARG;
-            else if (!unbounded_existing_heap && !unplaced_existing_heap_allowed(allocation_bytes(range.base)))
+            else if (cap_existing_heap && !unplaced_existing_heap_allowed(allocation_bytes(local_range.base)))
                 record.info.share_hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
             else
-                record.info.share_hr = share(device, range, offset, width, uav, &resource, &record.info.heap_generation,
-                                             backing_budget);
+                record.info.share_hr = share(device, local_range, offset, width, uav, &resource,
+                                             &record.info.heap_generation, backing_budget);
         }
         HRESULT hr = S_OK;
         if (SUCCEEDED(record.info.share_hr) && record.info.share_hr != S_FALSE) {
