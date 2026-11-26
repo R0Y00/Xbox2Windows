@@ -7255,7 +7255,7 @@ SCALAR_BITS = {
     's_bcnt0_i32_b64': (True, lambda lo, hi: '(64u - countbits(%s) - countbits(%s))' % (lo, hi), '$ != 0'),
     's_bcnt1_i32_b64': (True, lambda lo, hi: '(countbits(%s) + countbits(%s))' % (lo, hi), '$ != 0'),
     's_ff0_i32_b64': (True, lambda lo, hi: _ctz64('(~%s)' % lo, '(~%s)' % hi), None),
-    's_ff1_i32_b64': (True, _ctz64, None),
+    # s_ff1_i32_b64: Stage.op_s_ff1_i32_b64 owns immediates here; live SGPR pairs stay with #2072.
     's_flbit_i32_b64': (True, _clz64, None),
     's_flbit_i32_i64': (True, _flbit_i64, None),
 }
