@@ -35,6 +35,8 @@ GROUPS = (2, 1, 1)
 ONE_PATH_LINE = 's25 = uint(max(F((U(2.0 * F((U(float(s20))))))), 0.0));'
 LOOP_LINE = 's24 = uint(max(F((U(2.0 * F((U(float(s22))))))), 0.0));'
 POST_LOOP_LINE = 's26 = s22;'
+CONST_SHIFT_LINE = 's29 = (0x0000003cu) >> (0x00000002u & 31);'
+INT_LINE = 's28 = (s27 + (s27)) << (0x00000001u & 31);'
 
 
 def opcode(table, name):
@@ -93,8 +95,14 @@ def build_words():
     ws += sopp('s_cbranch_scc1', loop_idx - (len(ws) + 1))
     ws += vop1('v_mov_b32_e32', 'v9', 's22') + vop1('v_readfirstlane_b32', 's26', 'v9')
     ws += sop2('s_lshl_b32', 's27', 's7', 2) + vop2('v_add_nc_u32_e32', 'v4', 's27', 'v0')
+    # Pure integer ops on a uniform scalar, read past the entry block: (s27 + s27) << 1 (RF1).
+    ws += (vop1('v_mov_b32_e32', 'v10', 's27') + vop2('v_add_nc_u32_e32', 'v10', 's27', 'v10')
+           + vop2('v_lshlrev_b32_e32', 'v10', 1, 'v10') + vop1('v_readfirstlane_b32', 's28', 'v10'))
+    # A VGPR overwritten by a constant, then shifted: 60 >> 2 is the same in every lane (RF1).
+    ws += (vop1('v_mov_b32_e32', 'v11', 60) + vop2('v_lshrrev_b32_e32', 'v11', 2, 'v11')
+           + vop1('v_readfirstlane_b32', 's29', 'v11'))
     ws += sop2('s_add_u32', 's25', 's25', 's21') + sop2('s_add_u32', 's25', 's25', 's23')
-    ws += sop2('s_add_u32', 's25', 's25', 's26')
+    ws += sop2('s_add_u32', 's25', 's25', 's26') + sop2('s_add_u32', 's25', 's25', 's28') + sop2('s_add_u32', 's25', 's25', 's29')
     ws += vop2('v_add_nc_u32_e32', 'v5', 's25', 'v4') + vop2('v_lshlrev_b32_e32', 'v4', 2, 'v4')
     # buffer_store_dword v5, v4, s[16:19], 0 offen; s_endpgm
     ws += list(struct.unpack('<2I', bytes.fromhex('001070e004050480'))) + sopp('s_endpgm')
@@ -120,6 +128,13 @@ PATCHES = (
     ('loop counter updated from lane mask',
      [(pack_hex(*sop2('s_add_u32', 's22', 's22', 1)), pack_hex(*sop1('s_mov_b32', 's22', 'vcc_lo')))],
      'v_readfirstlane_b32 requires a proven uniform source'),
+    # RF1 negative controls: the integer chain stays refused when a source differs between lanes.
+    ('integer chain from the thread id',
+     [(pack_hex(*vop1('v_mov_b32_e32', 'v10', 's27')), pack_hex(*vop1('v_mov_b32_e32', 'v10', 'v0')))],
+     'v_readfirstlane_b32 requires a proven uniform source'),
+    ('integer chain with a lane-mask scalar',
+     [(pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 's27', 'v10')), pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 'vcc_lo', 'v10')))],
+     'v_readfirstlane_b32 requires a proven uniform source'),
 )
 
 
@@ -136,7 +151,8 @@ def expected():
         s21 = 9 if gx == 0 else 5
         s23 = 0 + 2 + 4 + 6  # sum over uniform loop iterations i=0..3
         s26 = 4
-        combined = (s25 + s21 + s23 + s26) & MASK
+        s28 = ((gx * 4) * 2) << 1
+        combined = (s25 + s21 + s23 + s26 + s28 + (60 >> 2)) & MASK
         for tx in range(LOCAL[0]):
             idx = gx * LOCAL[0] + tx
             out[idx] = (combined + idx) & MASK
@@ -184,7 +200,7 @@ def check_binary(llvm_mc):
 def controls(llvm_mc=None):
     pipe = translate()
     hlsl = pipe.hlsl_cs()
-    for snippet in (ONE_PATH_LINE, LOOP_LINE, POST_LOOP_LINE, 'u0.Store(a, v5);'):
+    for snippet in (ONE_PATH_LINE, LOOP_LINE, POST_LOOP_LINE, INT_LINE, CONST_SHIFT_LINE, 'u0.Store(a, v5);'):
         assert hlsl.count(snippet) == 1, (snippet, hlsl)
     assert 'uav 0 table 1 16' in pipe.manifest().splitlines(), pipe.manifest()
 
@@ -201,9 +217,11 @@ def controls(llvm_mc=None):
 
 
 CONTROLS = {
-    'dropped-one-path': (ONE_PATH_LINE, 's25 = 0u;', 'word=0 expected=0000008b actual=00000019'),
-    'dropped-loop-read': (LOOP_LINE, 's24 = 0u;', 'word=0 expected=0000008b actual=0000007f'),
-    'dropped-post-loop': (POST_LOOP_LINE, 's26 = 0u;', 'word=0 expected=0000008b actual=00000087'),
+    'dropped-one-path': (ONE_PATH_LINE, 's25 = 0u;', 'word=0 expected=0000009a actual=00000028'),
+    'dropped-loop-read': (LOOP_LINE, 's24 = 0u;', 'word=0 expected=0000009a actual=0000008e'),
+    'dropped-int-read': (INT_LINE, 's28 = 0u;', 'word=4 expected=000000ac actual=0000009c'),
+    'dropped-const-shift': (CONST_SHIFT_LINE, 's29 = 0u;', 'word=0 expected=0000009a actual=0000008b'),
+    'dropped-post-loop': (POST_LOOP_LINE, 's26 = 0u;', 'word=0 expected=0000009a actual=00000096'),
 }
 
 

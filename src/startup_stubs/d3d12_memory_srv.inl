@@ -412,6 +412,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     if (!native_resource) return nullptr;
 
     Wrapper* w = wrap(native_resource.Get(), resource_kind);
+    if (!w) return nullptr;
     w->own().title_memory = reinterpret_cast<void*>(page_start);
     D3D12_RESOURCE_DESC rdesc{};
     rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -539,6 +540,7 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
         }
     }
     Wrapper* resource = wrap(nullptr, resource_kind);
+    if (!resource) return nullptr;
     resource->own().title_memory = reinterpret_cast<void*>(address);
     resource->own().tiled_address_srv = true;
     note_resource(resource, &desc, bytes);

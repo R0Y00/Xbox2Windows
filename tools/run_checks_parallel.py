@@ -1,7 +1,11 @@
 """Run independent Python check scripts side by side and fail if any of them fails.
 
 Usage:
-    python tools/run_checks_parallel.py [-j N] tests/a_check.py tests/b_check.py ...
+    python tools/run_checks_parallel.py [-j N] [--from-dir DIR] tests/a_check.py tests/b_check.py ...
+
+`--from-dir DIR` also runs the commands listed in `DIR/*.txt` (see `read_check_files`), after
+the scripts given on the command line. `merge_checks(inline, directory)` does the same for
+the pairs passed to `run_checks`.
 
 Each script runs as `python -B <script>` from the current directory. Output is printed one
 script at a time, in the order given, so a failure log stays readable. The exit status is 1
@@ -17,6 +21,7 @@ import argparse
 import concurrent.futures
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -35,6 +40,92 @@ def _validate_script_path(raw_path: str) -> str:
     if not path.is_file():
         raise ValueError(f"script path is not a regular file: {raw_path}")
     return raw_path
+
+
+def _split_windows(line):
+    """Split on whitespace; quotes group text inside a word and are dropped, backslashes stay."""
+    words, current, quote, started = [], [], None, False
+    for char in line:
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                current.append(char)
+        elif char in "\"'":
+            quote, started = char, True
+        elif char.isspace():
+            if started:
+                words.append("".join(current))
+                current, started = [], False
+        else:
+            current.append(char)
+            started = True
+    if quote:
+        raise ValueError("No closing quotation")
+    if started:
+        words.append("".join(current))
+    return words
+
+
+def split_command(line, windows=None):
+    """Split a listed line like a shell would, but keep backslashes in Windows paths.
+
+    POSIX splitting treats a backslash as an escape and would turn `C:\\x2w\\a.py` into
+    `C:x2wa.py`. On Windows the line is split without escapes; quotes group words, also inside
+    one (`--llvm="C:\\Program Files\\a.dll"`), and are removed.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return shlex.split(line)
+    return _split_windows(line)
+
+
+def read_check_files(directory):
+    """Return the check commands listed in `directory/*.txt`, files in name order.
+
+    One command per line: a script path, optionally followed by its arguments (split like a
+    shell would). Blank lines and lines starting with `#` are ignored. A missing directory, an
+    unreadable file, a script that does not exist, or the same command listed twice all raise,
+    so a typo cannot silently drop a check.
+    """
+    root = Path(directory)
+    if not root.is_dir():
+        raise FileNotFoundError(f"check list directory does not exist: {directory}")
+    commands = []
+    seen = {}
+    for listing in sorted(root.glob("*.txt")):
+        for number, line in enumerate(listing.read_text(encoding="utf-8").splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            where = f"{listing}:{number}"
+            try:
+                command = split_command(line)
+            except ValueError as exc:
+                raise ValueError(f"{where}: {exc}") from exc
+            try:
+                _validate_script_path(command[0])
+            except (ValueError, OSError) as exc:
+                raise type(exc)(f"{where}: {exc}") from exc
+            key = tuple(command)
+            if key in seen:
+                raise ValueError(f"{where}: duplicate of {seen[key]}: {line}")
+            seen[key] = where
+            commands.append(command)
+    return commands
+
+
+def merge_checks(inline, directory):
+    """Return the inline `(command, extra_env)` pairs followed by the listed checks.
+
+    Listed commands already present inline are dropped, so an entry can move from the inline
+    list to a file without running twice. The listed commands keep their sorted file order.
+    """
+    inline = list(inline)
+    known = {tuple(command) for command, _ in inline}
+    return inline + [(command, {}) for command in read_check_files(directory)
+                     if tuple(command) not in known]
 
 
 def run_one(check):
@@ -84,11 +175,18 @@ def run_checks(checks, jobs=None):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2)
-    parser.add_argument("scripts", nargs="+")
+    parser.add_argument("--from-dir", metavar="DIR",
+                        help="also run the checks listed in DIR/*.txt")
+    parser.add_argument("scripts", nargs="*")
     args = parser.parse_args(argv)
+    if not args.scripts and not args.from_dir:
+        parser.error("the following arguments are required: scripts (or --from-dir)")
     try:
         scripts = [_validate_script_path(script) for script in args.scripts]
-        return run_checks([([script], None) for script in scripts], jobs=args.jobs)
+        checks = [([script], None) for script in scripts]
+        if args.from_dir:
+            checks = merge_checks(checks, args.from_dir)
+        return run_checks(checks, jobs=args.jobs)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         detail = str(exc)
         msg = f"{detail}\n" if detail else f"{type(exc).__name__}\n"
