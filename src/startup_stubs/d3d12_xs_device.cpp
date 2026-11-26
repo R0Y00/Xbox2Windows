@@ -4270,18 +4270,19 @@ void* __stdcall descriptor_heap_get_desc(void* a, void* b)
     return result;
 }
 // The title returns structures of at most 8 bytes in rax (this in rcx), larger ones through a hidden
-// pointer passed first. If the second argument is a wrapper, the hidden-pointer form is used instead.
+// pointer passed first. receiver() decides which argument is the object: a wrapper first is the object
+// even when the caller left another live wrapper in the second register, which a call passing only
+// `this` does not set. Only the (return buffer, object) form writes through the first argument.
 template <class T, class Get>
 std::uint64_t small_result(void* a, void* b, const char* method, Get get)
 {
-    if (Wrapper* w = as_wrapper(b)) {
-        const T value = get(w);
-        *static_cast<T*>(a) = value;
-        return reinterpret_cast<std::uint64_t>(a);
-    }
-    Wrapper* w = as_wrapper(a);
-    if (!w) fail(method, a, b);
+    void* result = nullptr;
+    Wrapper* w = receiver(a, b, &result, method);
     const T value = get(w);
+    if (w != a) {
+        *static_cast<T*>(result) = value;
+        return reinterpret_cast<std::uint64_t>(result);
+    }
     std::uint64_t bits = 0;
     static_assert(sizeof(T) <= sizeof(bits));
     std::memcpy(&bits, &value, sizeof(T));

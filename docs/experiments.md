@@ -15170,26 +15170,17 @@ ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
 
 ### Startup compute 32-bit float image store
 
-The startup compute translator also accepts a 2D 32-bit `image_store` (with or
-without the integer-coordinate `unorm` modifier) when all four DMASK bits are
-set, coordinates are two full-width VGPRs, data comes from four consecutive
-VGPRs and the eight image descriptor words come from an unmodified fixed table
-offset. The translator emits `asfloat(uint4(...))` into a `RWTexture2D<float4>`
-under the lane's EXEC bit and records `uav N tex2d float table P O channels 4`
-in the version 2 compute manifest. Pixel-stage 2D `image_store` also accepts
-`unorm`.
+The startup compute translator accepts the full-mask FP32 image_store on
+dim:SQ_RSRC_IMG_2D_ARRAY with three full-width address VGPRs for x, y and layer.
+It emits an RWTexture2DArray<float4> store under the lane EXEC bit and records
+uav N tex2da float table P O channels 4 in the version 2 manifest.
+The startup runtime still needs the array UAV binding in #2742. Pixel arrays,
+packed D16 arrays and the 1D, 3D and cube store forms remain refused.
 
-The standalone dispatch reuses the source and CPU reference from the
-[gfx1013 2D float store fixture](#gfx1013-2d-float-image-stores-and-mip-loads).
-Two groups write 16 texels to mip zero of an `R32G32B32A32_FLOAT` UAV while
-comparing all 1,344 words across three mips. A second program masks out the
-second row. Omitting the store, swapping R/B, swapping RG/BA and dropping the
-EXEC guard produce 64, 32, 64 and 32 mismatches respectively.
-
-```powershell
-cmake --build --preset release --target offscreen_check
-ctest --preset release --no-tests=error -R '^startup_compute_image_store(_warp|_hardware)?$' -V
-```
+The standalone GPU fixture writes the same four words into mip zero of layer 1
+and layer 3 of a four-layer allocation. It compares all 5,376 words and detects
+64 differences with the store omitted and 128 with the layer changed. Use the
+startup_compute_image_store CTests above to repeat the comparison.
 
 ### Explicit-LOD 2D gather
 

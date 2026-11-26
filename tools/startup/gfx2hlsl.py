@@ -1566,6 +1566,17 @@ def mesh_run(ins, at, what, patterns, env):
 
 
 MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
+# Vector ALU forms that take a lane mask as a per-lane select or carry, which the one-lane model handles.
+MASK_AWARE_VALU = frozenset({'v_cndmask_b32', 'v_cndmask_b16', 'v_readlane_b32', 'v_writelane_b32', 'v_readfirstlane_b32'})
+MASK_AWARE_VALU_RE = re.compile(r'_co(_ci)?_|addc|subb|_co$|^v_mad_[iu]64_[iu]32$|^v_(cndmask|readlane|writelane|readfirstlane)_')
+# Scalar ALU forms that move or combine lane masks bit by bit, which the one-lane model handles (s_ff1_i32_b32 refuses
+# anything but exec_lo at the entry mask itself). Any other scalar op that
+# reads a lane mask (s_cmp*, s_cmpk*, s_bcnt*, s_lshr, s_add ...) reads the whole wave's word as a number.
+MASK_AWARE_SALU_RE = re.compile(r'^s_(mov|and|or|xor|andn2|orn2|nand|nor|xnor|not|cselect|wqm|cbranch|and_saveexec|or_saveexec|'
+                                r'xor_saveexec|andn2_saveexec|orn2_saveexec|nand_saveexec|nor_saveexec|xnor_saveexec|'
+                                r'ff1|bitset[01]|setpc|getpc|swappc|branch|waitcnt|endpgm|nop)(_|$)')
+# Scalar ops whose result is a lane mask when a source is one (a copy or a bitwise combination), unlike s_ff1 or s_bitset.
+MASK_COPY_SALU_RE = re.compile(r'^s_(mov|and|or|xor|andn2|orn2|nand|nor|xnor|not|wqm)_b(32|64)$')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
@@ -2698,6 +2709,7 @@ class Stage:
                 uniform = self.scalar_expr_uniform(expr)
             self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
+        getattr(self, 'mask_high', set()).discard(n)
         getattr(self, 'float_const_s', {}).pop(n, None)
         if isinstance(self.align4_s, set):
             if sym is not None and sym[0] == 'const':
@@ -3430,6 +3442,7 @@ class Stage:
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
+            self.mask_high = set()
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
@@ -4170,7 +4183,123 @@ class Stage:
             del self.uniform_expr[v]
         return regs
 
+    MASK_NAMES_LOW = ('vcc', 'vcc_lo', 'exec', 'exec_lo')
+    MASK_NAMES_HIGH = ('vcc', 'vcc_hi', 'exec', 'exec_hi')
+
+    def mask_source_tags(self, base, ops):
+        """(low, high): whether a source operand of the instruction carries a lane-mask word. low = a mask's low word
+        (vcc/exec, an SGPR in self.masks, a pair that starts in one); high = the high word of a wave64 mask (vcc_hi,
+        exec_hi, a pair holding one, an SGPR in self.mask_high). Read before the instruction runs: it may overwrite
+        its own source."""
+        dests = destinations(base, ops)
+        srcs = ops[len(dests):] if dests and ops[:len(dests)] == dests else list(ops)
+        masks, high_regs = getattr(self, 'masks', ()), getattr(self, 'mask_high', ())
+        low = high = False
+        for tok in (t.strip().lstrip('-|').rstrip('|') for t in srcs):
+            low |= tok in self.MASK_NAMES_LOW
+            high |= tok in self.MASK_NAMES_HIGH and tok not in ('vcc_lo', 'exec_lo')
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                start_tagged = r[1] in masks
+                low |= start_tagged
+                high |= any(n in high_regs for n in range(r[1], r[2] + 1)) or (start_tagged and r[2] > r[1])
+        return low, high
+
+    def propagate_mask_tags(self, base, ops, tags):
+        """After an instruction ran: the SGPRs it wrote carry the lane-mask tag of what they were made from. This is the one
+        place the tag moves. A compare or carry writes its single-word mask itself (the decoder
+        names a wave64 compare destination s0, not s[0:1]); a mask-only scalar op (mov, bitwise, cselect, saveexec)
+        copies the tag of its sources to its destination, both words of a b64 pair; any other write cleared the tag
+        already (set_s). self.masks holds the low word, self.mask_high the high word of a wave64 pair: no numeric read of
+        either is lowered (lower())."""
+        low, high = tags
+        self.tag_compare_pair(base, ops)
+        saveexec = base.startswith('s_') and 'saveexec' in base
+        if MASK_COPY_SALU_RE.match(base) and not base.startswith('s_wqm') and not (low or high):
+            # (s_wqm is a no-op in _lower(): it writes nothing, so the old mask stays in its destination.)
+            # a 32-bit copy of plain data: the destination no longer holds a lane mask, whatever an earlier path or join
+            # left. A 64-bit pair copy keeps its tag: scalar() lowers every b64 move as a mask copy (the lane bit only),
+            # so the truncated word must stay refused as numeric data.
+            for tok in destinations(base, ops):
+                r = reg_range(tok)
+                if r and r[0] == 's' and r[2] == r[1]:
+                    self.masks.discard(r[1])
+        scalar = bool(MASK_COPY_SALU_RE.match(base)) and (low or high)
+        pair_select = base.startswith('s_cselect') and base.endswith('b64')
+        if not (saveexec or scalar or pair_select):
+            return
+        for tok in destinations(base, ops):
+            r = reg_range(tok)
+            if not r or r[0] != 's':
+                continue
+            if r[2] > r[1]:   # a pair: low word, and the high word it carries
+                self.masks.add(r[1])
+                self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
+            elif low or saveexec or pair_select:
+                self.masks.add(r[1])
+            if r[2] == r[1] and high and not (saveexec or pair_select):
+                self.mask_high = getattr(self, 'mask_high', set()) | {r[1]}
+
+    def tag_compare_pair(self, base, ops):
+        """A compare or carry-out into SGPR sN (the decoder prints a wave64 pair as s[N:N+1] by its low word only). In
+        wave64 the destination is an even-aligned pair and s(N+1) holds the other 32 lanes, which no one-lane value
+        has: tag s(N+1) as the high word. An odd sN is a wave32 destination (no high word); an even one that is a wave32
+        destination loses the numeric reads of s(N+1), a refusal and never a wrong value. If s(N+1) already holds its own lane
+        mask (a wave32 compare or carry in the neighbouring register) the destination is not a pair: nothing is tagged."""
+        if base.startswith('v_cmp') and not base.startswith('v_cmpx'):
+            tok = ops[0] if ops else ''
+        elif VOP3B_SDST.match(base) and len(ops) > 1:
+            tok = ops[1]
+        else:
+            return
+        r = reg_range(tok.strip())
+        if r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks and r[1] % 2 == 0 and r[1] + 1 not in self.masks:
+            self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
+
+    def lane_mask_exact(self):
+        """True where the one-lane model of a wave mask is exact: a compute group of one thread has one participating lane
+        per wave, so the lane's bit is the whole mask and its high word is 0. Anywhere else the mask holds other lanes'
+        bits that a numeric read would see."""
+        group = getattr(getattr(self, 'pipe', None), 'group', None)
+        return getattr(self, 'kind', None) == 'cs' and bool(group) and group[0] * group[1] * group[2] == 1
+
+    def reads_mask_high(self, toks):
+        """First single-register operand that is the high word of a wave64 lane mask, else None."""
+        high = getattr(self, 'mask_high', ())
+        for t in toks:
+            r = reg_range(t.strip().lstrip('-|').rstrip('|'))
+            if r and r[0] == 's' and r[1] == r[2] and r[1] in high:
+                return t.strip()
+        return None
+
     def lower(self, base, asm, ops, mods):
+        """Lower one instruction; a vector ALU form that reads a lane mask as a number is refused.
+
+        The model keeps one lane's bit of a wave mask. A vector ALU source that reads the mask as a number (the
+        llvm.amdgcn.ballot word) sees every lane's bit on hardware, so the lowered word would be silently wrong.
+        The mask-aware forms (select, carry, readlane) and v_mov_b32 (which the readfirstlane proofs handle) pass.
+        The check runs after the form's own refusals, so those keep their messages."""
+        masks = []
+        if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
+            masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
+        if base.startswith('s_') and not MASK_AWARE_SALU_RE.match(base):
+            masks = [t for t in (ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:]) if self.is_lane_mask(t.strip())]
+        if base.startswith(('v_', 's_')) and not masks:   # the high word of a wave64 mask has no one-lane value
+            skip = 2 if VOP3B_SDST.match(base) else 1   # the carry-out of a VOP3b form is a destination, not a read
+            high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[skip:])
+            masks = [high] if high else []
+        tags = self.mask_source_tags(base, ops)
+        result = self._lower(base, asm, ops, mods)
+        for tok in destinations(base, ops):   # an overwritten register no longer holds a mask's high word
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                getattr(self, 'mask_high', set()).difference_update(range(r[1], r[2] + 1))
+        if masks and not self.lane_mask_exact():
+            raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
+        self.propagate_mask_tags(base, ops, tags)
+        return result
+
+    def _lower(self, base, asm, ops, mods):
         pc = getattr(self, 'pc', None)
         calculated = getattr(self, 'calculated_pc', {})
         if pc in calculated:
@@ -7002,16 +7131,16 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write one four-channel 2D texel from pixel FP32 or compute packed FP16 data.
+        """Write a full 2D texel or, for compute FP32, a full 2D-array texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
-        source, VADDR the integer texel address (x, y for dim 2D) and SRSRC the image descriptor; the
-        channels selected by DMASK are written in order from consecutive VDATA registers. HLSL's typed UAV
-        store writes every channel of the view, so only DMASK 0xf is exact here; a partial mask would need a
-        read-modify-write and is refused. The data is stored as float4, so the bound view must be of a
-        float or normalized format (the runtime side is not part of this lowering). The store runs under the
-        lane's exec bit, like the other per-lane writes, and D3D drops UAV writes from helper lanes as the
-        hardware drops them for lanes outside exec.
+        source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
+        the image descriptor; the channels selected by DMASK are written in order from consecutive VDATA
+        registers. HLSL's typed UAV store writes every channel of the view, so only DMASK 0xf is exact here;
+        a partial mask would need a read-modify-write and is refused. The data is stored as float4, so the
+        bound view must be of a float or normalized format (the runtime side is not part of this lowering).
+        The store runs under the lane's exec bit, like the other per-lane writes, and D3D drops UAV writes
+        from helper lanes as the hardware drops them for lanes outside exec.
         """
         name = 'image_store'
         if self.kind not in ('ps', 'cs'):
@@ -7029,8 +7158,11 @@ class Stage:
         masks = [m[6:] for m in mods if m.startswith('dmask:')]
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % name)
-        if dims[0] != 'SQ_RSRC_IMG_2D':
+        array = dims[0] == 'SQ_RSRC_IMG_2D_ARRAY'
+        if dims[0] != 'SQ_RSRC_IMG_2D' and (not array or self.kind != 'cs'):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
+        if array and d16:
+            raise Unsupported('compute image_store d16 requires a 2D image')
         try:
             mask = int(masks[0], 0)
         except ValueError:
@@ -7047,8 +7179,10 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
-        if len(cs) != 2:
-            raise Unsupported('%s with %d address registers: x and y expected' % (name, len(cs)))
+        address = 3 if array else 2
+        if len(cs) != address:
+            raise Unsupported('%s with %d address registers: %s expected'
+                              % (name, len(cs), 'x, y and layer' if array else 'x and y'))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         if self.kind == 'cs':
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
@@ -7062,8 +7196,9 @@ class Stage:
             value = 'float4(%s)' % ', '.join(rgba)
         else:
             value = 'asfloat(uint4(%s))' % ', '.join(words)
-        image = self.pipe.uav(key, 'tex2d')
-        body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
+        image = self.pipe.uav(key, 'tex2da' if array else 'tex2d')
+        index = 'uint%d(%s)' % (address, ', '.join(self.u(c) for c in cs))
+        body = '%s[%s] = %s;' % (image, index, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
@@ -9524,7 +9659,7 @@ class Pipeline:
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
-            out.append('%s %s%d : register(u%d);' % ({'tex2d': 'RWTexture2D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
+            out.append('%s %s%d : register(u%d);' % ({'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:
@@ -9962,7 +10097,7 @@ class ComputePipeline(Pipeline):
             if r['kind'] == 'raw':
                 lines.append('uav %d %s' % (r['index'], where))
             else:
-                lines.append('uav %d tex2d float %s channels 4' % (r['index'], where))
+                lines.append('uav %d %s float %s channels 4' % (r['index'], r['kind'], where))
         lines += self.sampler_lines()
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
@@ -10047,7 +10182,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-23'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-24'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -10057,7 +10192,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-23cs')
+    key = fnv(b'x2w-startup-shader-24cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
