@@ -65,6 +65,7 @@ RWByteAddressBuffer u0 : register(u0);
 # The heap record program's body with the index read through r0 (the table buffer) and the input through r1.
 MAIN = H.MAIN.replace('    s6 = ud2 << (0x00000005u & 31);\n', """\
     s6 = ud2 * 0x00000150u;
+    scc = (s6 + 0x00000120u) < (s6);
     s6 = s6 + 0x00000120u;
     s6 = r0.Load(s6 + 0);
     s6 = s6 << (0x00000005u & 31);

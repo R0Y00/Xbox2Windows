@@ -3712,6 +3712,10 @@ class Stage:
                     continue
                 # A write proves the mark again: every path from here on runs it. s_movreld can write any SGPR.
                 self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
+                if not self.scc_effect and ('scc' in scalar_effects(name, asm)[1] or name.startswith(('s_wqm', 's_quadmask'))):
+                    # The guest wrote SCC and the lowering emitted nothing for it: a later reader would see an older
+                    # value (descriptor_scc_reads follows every path from here to the reader).
+                    self.scc_effect = 'an SCC write that is not modelled'
                 if self.scc_effect:
                     scc_effects[off] = self.scc_effect
                 if self.scc_effect or not self.scc_verified:
@@ -4989,8 +4993,6 @@ class Stage:
             self.set_s(dst[1], '(scc ? 1u : 0u)')
             self.set_scc('false')  # 0 + a single bit never produces another carry.
             return None
-        if base in SCC_UNMODELLED and self.tracks_uniformity() and ops[0] != 'null':
-            self.scc_uniform = False
         pair = base.endswith('_b64')
         srcs = ops[1:]
         # 64-bit operands name the low register; exec/vcc name themselves.
@@ -5149,8 +5151,6 @@ class Stage:
                 raise Unsupported('%s into null on a lane mask' % base)
             if pair:
                 raise Unsupported('%s into null' % base)
-            if base in SCC_UNMODELLED and getattr(self, 'pc', None) not in getattr(self, 'address_carry_pairs', ()):
-                raise Unsupported('%s into null: SCC is not modelled' % base)
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
@@ -5166,7 +5166,8 @@ class Stage:
             self.set_scc('(%s) < %s' % (expr, values[0]))
             self.address_carry_reader = self.address_carry_pairs[self.pc]
         elif base in SCC_UNMODELLED:
-            self.scc_verified = False
+            # From the sources, before the destination is written (it can be a source).
+            self.set_scc(add_sub_min_max_scc(base, values[0], values[1], expr))
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
@@ -9198,6 +9199,22 @@ VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
 # trusting it.
 SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
                             's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
+
+
+def add_sub_min_max_scc(base, a, b, result):
+    """The SCC expression of s_add/s_sub/s_min/s_max_{i,u}32 over the source texts a and b and the result text.
+    s_add_u32: carry out; s_sub_u32: borrow (S0 < S1); s_add_i32 / s_sub_i32: signed overflow (the sign of the result
+    differs from the sign the operands imply); s_min / s_max: SCC = (D == S0), the first source was chosen."""
+    if base == 's_add_u32':
+        return '(%s) < (%s)' % (result, a)
+    if base == 's_sub_u32':
+        return '(%s) < (%s)' % (a, b)
+    if base == 's_add_i32':
+        return '(((((%s) ^ (%s)) & ((%s) ^ (%s))) >> 31) != 0)' % (a, result, b, result)
+    if base == 's_sub_i32':
+        return '(((((%s) ^ (%s)) & ((%s) ^ (%s))) >> 31) != 0)' % (a, b, a, result)
+    cast = 'int' if base.endswith('_i32') else ''
+    return '(%s(%s) %s %s(%s))' % (cast, a, '<=' if base.startswith('s_min') else '>=', cast, b)
 
 PACK_B16 = frozenset(('s_pack_ll_b32_b16', 's_pack_lh_b32_b16', 's_pack_hh_b32_b16'))
 SCA = {

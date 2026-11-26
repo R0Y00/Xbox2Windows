@@ -432,14 +432,6 @@ def controls():
         ('s_or_b32', 's_or_b32 null, vcc_lo, s0', 's_or_b32 into null on a lane mask'),
         ('s_nand_b32', 's_nand_b32 null, vcc_lo, exec_lo', 's_nand_b32 on a lane mask'),
         ('s_bfm_b32', 's_bfm_b32 null, vcc_lo, 4', 's_bfm_b32 into null on a lane mask'),
-        ('s_add_u32', 's_add_u32 null, s0, s1', 's_add_u32 into null: SCC is not modelled'),
-        ('s_add_i32', 's_add_i32 null, s0, s1', 's_add_i32 into null: SCC is not modelled'),
-        ('s_sub_u32', 's_sub_u32 null, s0, s1', 's_sub_u32 into null: SCC is not modelled'),
-        ('s_sub_i32', 's_sub_i32 null, s0, s1', 's_sub_i32 into null: SCC is not modelled'),
-        ('s_min_u32', 's_min_u32 null, s0, s1', 's_min_u32 into null: SCC is not modelled'),
-        ('s_min_i32', 's_min_i32 null, s0, s1', 's_min_i32 into null: SCC is not modelled'),
-        ('s_max_u32', 's_max_u32 null, s0, s1', 's_max_u32 into null: SCC is not modelled'),
-        ('s_max_i32', 's_max_i32 null, s0, s1', 's_max_i32 into null: SCC is not modelled'),
         ('s_and_b32', 's_and_b32 null, s16, 0xff', 'scc from descriptor data'),
         ('s_add_u32', 's_add_u32 null, s10, 4', 'scc from descriptor data'),
         ('s_mov_b32', 's_mov_b32 null, s16', 's_mov_b32 into null on descriptor data'),
@@ -452,6 +444,20 @@ def controls():
             check(f'refuses {asm} ({exc})', str(exc) == expected_reason and not st.lines)
         else:
             raise AssertionError(f'{asm} unexpectedly accepted: {st.lines}')
+
+    # A null destination keeps only the SCC the operation computes (no register is written, nothing else is emitted).
+    for asm, scc_line in (
+            ('s_add_u32 null, s0, s1', 'scc = (s0 + s1) < (s0);'),
+            ('s_sub_u32 null, s0, s1', 'scc = (s0) < (s1);'),
+            ('s_add_i32 null, s0, s1', 'scc = (((((s0) ^ (s0 + s1)) & ((s1) ^ (s0 + s1))) >> 31) != 0);'),
+            ('s_sub_i32 null, s0, s1', 'scc = (((((s0) ^ (s1)) & ((s0) ^ (s0 - s1))) >> 31) != 0);'),
+            ('s_min_u32 null, s0, s1', 'scc = ((s0) <= (s1));'),
+            ('s_max_u32 null, s0, s1', 'scc = ((s0) >= (s1));'),
+            ('s_min_i32 null, s0, s1', 'scc = (int(s0) <= int(s1));'),
+            ('s_max_i32 null, s0, s1', 'scc = (int(s0) >= int(s1));')):
+        st = ProbeStage()
+        st.one(asm.split()[0], asm)
+        check(f'{asm} computes only its SCC {st.lines}', st.lines == [scc_line])
 
     # SGPR holding a compare mask must also be refused when combined into null.
     st_mask = ProbeStage()
