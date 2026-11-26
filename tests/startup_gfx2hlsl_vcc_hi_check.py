@@ -16,10 +16,11 @@ scalar write into vcc_hi or exec_hi is now a refusal instead of a TypeError.
 
 The draw fixture PS (packed screen position v0 = x | y << 16):
   v_cmp_gt_u32_e64 vcc_hi, v0, 0x50005         ; v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi -> 2.0 where v0 > 0x50005
-  v_add_co_u32 v3, vcc_hi, v0, 0xfff7fff8      ; v_add_co_ci_u32_e64 v4, s3, 0, 0, vcc_hi -> the carry of v3
+  v_add_co_u32 v3, vcc_hi, v0, 0xfff7fff8      ; v_add_co_ci_u32_e64 v4, s3, v0, 2.0, vcc_hi -> + the carry
   s_mov_b32 vcc_hi, 0x1234 ; s_add_u32 s0, vcc_hi, 16 ; v5 = s0 + v0
 The reference below computes the same words with Python integers. The selected words are 1.0 and 2.0, not the
-integers 1 and 2: with FXC the constant denormal word 1 came back as 0 on WARP (DXC kept it). Mutations (the compare bit not read, the carry
+integers 1 and 2, and the carry rides on v0 + 0x40000000: with FXC a word that can only be 0 or 1 came back as
+0 on WARP where it was 1 (DXC kept it), a denormal export artifact, not a translation error. Mutations (the compare bit not read, the carry
 lost, vcc_hi read as zero) must fail the draw.
 """
 import re
@@ -47,13 +48,13 @@ FIXTURES = {
     'PS': ('''v_cmp_gt_u32_e64 vcc_hi, v0, 0x50005
 v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
 v_add_co_u32 v3, vcc_hi, v0, 0xfff7fff8
-v_add_co_ci_u32_e64 v4, s3, 0, 0, vcc_hi
+v_add_co_ci_u32_e64 v4, s3, v0, 0x40000000, vcc_hi
 s_mov_b32 vcc_hi, 0x1234
 s_add_u32 s0, vcc_hi, 16
 v_add_nc_u32_e32 v5, s0, v0
 exp mrt0 v2, v3, v4, v5 done vm
 s_endpgm
-''', '6b00c4d400ff010005000500020001d5f2e8ad01036b0fd700ff0100f8fff7ff040328d58000ad01ff03ebbe341200006b900080'
+''', '6b00c4d400ff010005000500020001d5f2e8ad01036b0fd700ff0100f8fff7ff040328d500e9ad01ff03ebbe341200006b900080'
          '00000a4a0f1800f802030405000081bf', None),
     # Only scalar writes of vcc_hi and no VALU VCC write: exact in either wave size.
     'SCALAR_ONLY': ('''s_mov_b32 vcc_hi, 0x1234
@@ -118,7 +119,8 @@ def image():
         for x in range(WIDTH):
             v0 = x | y << 16
             total = v0 + 0xfff7fff8
-            out += [0x40000000 if v0 > 0x50005 else 0x3f800000, total & MASK, total >> 32, (0x1244 + v0) & MASK]
+            out += [0x40000000 if v0 > 0x50005 else 0x3f800000, total & MASK, (v0 + 0x40000000 + (total >> 32)) & MASK,
+                    (0x1244 + v0) & MASK]
     return out
 
 
@@ -156,7 +158,8 @@ def controls():
     reference = image()
     check('reference covers both compare outcomes and both carries',
           {reference[i] for i in range(0, len(reference), 4)} == {0x3f800000, 0x40000000}
-          and {reference[i] for i in range(2, len(reference), 4)} == {0, 1})
+          and {(reference[i] - 0x40000000 - (i // 4) % WIDTH - ((i // 4 // WIDTH) << 16)) & MASK
+               for i in range(2, len(reference), 4)} == {0, 1})
 
 
 def draw(renderer, adapter, vs, ps, expected):
