@@ -1532,18 +1532,48 @@ LONG draw_dump_frame()
     }();
     return frame;
 }
+struct DrawDumpPixel {
+    bool enabled{};
+    UINT x{}, y{};
+};
+// X2W_DRAW_DUMP_PIXEL=<x>,<y>: keep one texel after each translated draw of the dumped frame
+// instead of the whole target. The report names the draw ordinal, the manifest key and the value.
+DrawDumpPixel draw_dump_pixel()
+{
+    static const DrawDumpPixel pixel = [] {
+        DrawDumpPixel value{};
+        char text[64]{};
+        if (!GetEnvironmentVariableA("X2W_DRAW_DUMP_PIXEL", text, sizeof(text))) return value;
+        unsigned x = 0, y = 0;
+        char trailing = 0;
+        if (std::sscanf(text, "%u,%u%c", &x, &y, &trailing) != 2) return value;
+        value.enabled = true;
+        value.x = x;
+        value.y = y;
+        return value;
+    }();
+    return pixel;
+}
 void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT count)
 {
     Pass& pass = pass_of(self);
     const LONG wanted = draw_dump_frame();
+    const DrawDumpPixel pixel = draw_dump_pixel();
     if (!wanted || frame_number < wanted || frame_number > wanted + 1 || !pass.target0 || draw_dumps().full()) return;
     const D3D12_RESOURCE_DESC desc = pass.target0->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-        !x2w_draw_bmp::supported(desc.Format)) return;
+        (!x2w_draw_bmp::supported(desc.Format) && !(pixel.enabled && x2w_startup::pixel_history_supported(desc.Format)))) return;
+    if (pixel.enabled && (pixel.x >= desc.Width || pixel.y >= desc.Height)) return;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rows = 0;
     UINT64 row_bytes = 0, total = 0;
-    device_of(the_device)->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+    if (pixel.enabled) {
+        footprint.Footprint = {desc.Format, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+        rows = 1;
+        total = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    } else {
+        device_of(the_device)->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+    }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1564,13 +1594,22 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
     dump.key = key;
     dump.count = count;
     dump.format = desc.Format;
+    dump.frame = frame_number;
+    dump.pixel = pixel.enabled;
+    dump.pixel_x = pixel.x;
+    dump.pixel_y = pixel.y;
     if (!draw_dumps().record(list, std::move(dump))) return;
     require_state(self, pass.target0, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION target{readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     target.PlacedFootprint = footprint;
     D3D12_TEXTURE_COPY_LOCATION source{pass.target0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     source.SubresourceIndex = 0;
-    list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    if (pixel.enabled) {
+        const D3D12_BOX box{pixel.x, pixel.y, 0, pixel.x + 1, pixel.y + 1, 1};
+        list->CopyTextureRegion(&target, 0, 0, 0, &source, &box);
+    } else {
+        list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    }
     require_state(self, pass.target0, D3D12_RESOURCE_STATE_RENDER_TARGET);
 }
 void draw_dump_flush()
@@ -1580,6 +1619,30 @@ void draw_dump_flush()
     if (completed.empty()) return;
     char folder[MAX_PATH] = ".";
     GetEnvironmentVariableA("X2W_DRAW_DUMP_DIR", folder, sizeof(folder));
+    if (draw_dump_pixel().enabled) {
+        static std::vector<x2w_startup::PixelHistorySample> samples;
+        std::sort(completed.begin(), completed.end(), [](const DrawDump& a, const DrawDump& b) { return a.index < b.index; });
+        for (const DrawDump& dump : completed) {
+            void* mapped = nullptr;
+            if (FAILED(dump.buffer->Map(0, nullptr, &mapped))) continue;
+            x2w_startup::PixelHistorySample sample{};
+            sample.draw = dump.index;
+            sample.frame = dump.frame;
+            sample.x = dump.pixel_x;
+            sample.y = dump.pixel_y;
+            sample.key = dump.key;
+            sample.count = dump.count;
+            sample.format = dump.format;
+            x2w_startup::pixel_history_decode(sample, static_cast<const unsigned char*>(mapped) + dump.footprint.Offset);
+            const D3D12_RANGE no_writes{};
+            dump.buffer->Unmap(0, &no_writes);
+            samples.push_back(sample);
+        }
+        std::sort(samples.begin(), samples.end(), [](const auto& a, const auto& b) { return a.draw < b.draw; });
+        const bool written = x2w_startup::pixel_history_write(folder, samples.data(), samples.size());
+        log("x2w-draw pixel history: %s %zu samples at %s", written ? "wrote" : "could not write", samples.size(), folder);
+        return;
+    }
     int written = 0;
     for (const DrawDump& dump : completed) {
         const int index = static_cast<int>(dump.index);

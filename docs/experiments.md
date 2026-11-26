@@ -83,6 +83,25 @@ cmake --build --preset dev --target startup_present_producer
 ctest --preset dev --no-tests=error -R '^startup_present_producer_(warp|hardware)$' -V
 ```
 
+## Per-draw texel history
+
+`X2W_DRAW_DUMP_FRAME=<n>` with `X2W_DRAW_DUMP_PIXEL=<x>,<y>` keeps one texel of render target 0 after
+each translated draw of that frame instead of copying the whole target. The completed reads are
+written to `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: `draw=` is the copy ordinal, `frame=` is the
+frame that recorded it, `x=` and `y=` name the texel, `key=` is the translated manifest key, and
+`rgba=` is decoded for R8G8B8A8/B8G8R8A8 UNORM or sRGB.
+The same 48-copy bound as the full dump applies. A reader can follow the value after every draw and
+name the one that last changed the texel.
+
+`startup_pixel_history` builds three draws on a 4x4 target. The first and third are scissored to the
+top-left texel; only the second covers the watched texel (1, 1). The report must name draw 2 with its
+manifest key, and the control that omits draw 2 must leave the texel black at draw 3.
+
+```powershell
+cmake --build --preset dev --target startup_pixel_history
+ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V
+```
+
 ### Translated indirect triangles
 
 `X2W_TRANSLATED_INDIRECT_DRAW=1` lets a slot 57 cached translation record one non-indexed
@@ -9699,7 +9718,30 @@ an earlier fixture that did so, the split left the result at its sentinel.
 The scratch is kept with the recording's desktop allocator
 (`x2w_d3d12_recording_scratches` reports how many it holds) and is released
 only when that allocator is reset after every queue that ran it has passed its
-fence.
+fence. The rewrite's root signature and pipeline are kept for the life of the
+process in an instance that is never destroyed. In #2683 the instance was a
+function-local static: on an RX 9070 XT (driver 32.0.32029.2010) its destructor
+released the pipeline during DLL detach and the process exited with 0xC0000409
+in `amdxc64.dll` after every readback had passed. A never-destroyed instance
+exited 0 in 3 of 3 runs there.
+[Review](https://github.com/R0Y00/Xbox2Windows/pull/2683)
+On the same adapter and driver, with this change merged onto main,
+`startup_indirect_count_split_hardware` passed and 6 of 6 direct runs exited 0;
+with only `split_indirect_dispatch.h` restored to the static, 4 of 4 runs ended
+in 0xC0000409, the dump showing the static's destructor in
+`_execute_onexit_table` at DLL detach.
+[Measurement](https://github.com/R0Y00/Xbox2Windows/pull/2734)
+
+The cache is process-owned and released only by process exit. Explicitly
+unloading and reloading `d3d12_xs.dll` in a live host is not a supported path:
+each load allocates a new cache and nothing tears the previous one down outside
+the loader lock. Supporting it needs that teardown and its own coverage. The
+kept root signature and pipeline each hold a reference to their device: on the
+RX 5700 XT and WARP 10.0.26100.9818 the device count went from 1 to 3 with both
+objects created, and stayed at 2 after the application released its own
+reference. So a cached device is never destroyed, and `entry_for`, which matches
+devices by pointer, cannot see a new device at a reused address while an entry
+holds those objects. An entry whose build failed holds neither.
 
 `startup_indirect_count_(warp|hardware)` keep the native call. On the RX 5700
 XT (driver 32.0.21045.29003) the hardware test still fails at its first case
