@@ -8,7 +8,8 @@ The shader builds a one-path SGPR ``s20`` across a uniform forward branch whose 
 reads it through ``v_readfirstlane_b32`` at the join, runs a four-iteration uniform loop whose counter ``s22`` is
 incremented uniformly and read back via ``v_readfirstlane_b32`` both inside the loop and after loop exit, and stores
 one combined word per thread across two four-thread groups ``(4, 1, 1) x (2, 1, 1)`` so both arms of the branch
-run on the GPU.
+run on the GPU. The waterfall fixtures also exercise a lane-varying key. They restore the incoming threads
+after selecting zero to four lanes, then read back per-key arithmetic and a load from one fixed raw buffer.
 """
 import argparse
 from pathlib import Path
@@ -23,6 +24,7 @@ sys.path.insert(0, str(HERE.parent / 'tools'))
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 
 import disasm_rdna2 as D  # noqa: E402
+import startup_compute_waterfall as waterfall
 from startup_gfx2hlsl_compute_check import (  # noqa: E402
     CASES, G, KEY, MASK, SENTINEL, STRIDE, WORDS, patch, refused, root_blob,
 )
@@ -194,7 +196,8 @@ def controls(llvm_mc=None):
 
     if llvm_mc:
         check_binary(llvm_mc)
-    print('Compute readfirstlane one-path, loop-counter and refusal checks passed')
+    waterfall.controls(llvm_mc)
+    print('Compute readfirstlane one-path, loop-counter, waterfall and refusal checks passed')
 
 
 CONTROLS = {
@@ -231,18 +234,24 @@ def dispatch(dxc, runner, adapter):
             print(proc.stdout, end='')
             if proc.returncode == 77:
                 return 77
+            diagnostics = []
+            for line in proc.stderr.splitlines():
+                if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                    print(line, file=sys.stderr)
+                else:
+                    diagnostics.append(line)
             if mutation:
                 want = CONTROLS[mutation][2]
-                first = proc.stderr.strip().splitlines()[:1]
+                first = diagnostics[:1]
                 if proc.returncode != 1 or first != [want]:
                     raise AssertionError('control %s: expected exit 1 with %r, got exit %d %r'
                                          % (mutation, want, proc.returncode, proc.stderr))
                 print('control %s (%s): rejected at %s' % (mutation, adapter, first[0]))
-            elif proc.returncode or proc.stderr:
+            elif proc.returncode or diagnostics:
                 raise AssertionError('baseline (%s): %s' % (adapter, proc.stderr or 'exit %d' % proc.returncode))
             else:
                 print('baseline (%s): all %d words match' % (adapter, WORDS))
-    return 0
+        return waterfall.dispatch(td, dxc, runner, adapter)
 
 
 def main(argv):

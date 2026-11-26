@@ -785,6 +785,8 @@ are not copied. Keep using the package root as `-DataDir`, then run the staged e
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+Use `-BuildDir` to select their build directory; relative paths are relative to the repository root,
+and absolute paths are used as supplied. The default is `out/build/release`.
 It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
@@ -1258,7 +1260,8 @@ For a timeline instead of the counters, configure a separate build tree with `-D
 - **Client settings.** On-demand (nothing is recorded until a profiler connects), localhost only, no broadcast, no call stacks, no system tracing and no crash handler.
 - **Output.** One shared `TracyClient.dll` is linked into `d3d12_xs.dll`, `XCRDAPI.dll` and `xmem.dll`; copy it beside them.
 - **Zones.** `ExecuteCommandLists`, `Present` (with a frame mark), the frame-wait sleep, window present, desktop pipeline creation, `device_memory_srv` with its resource scans, each DirectStorage request, and the xmem page map and physical write. `src/startup_stubs/profile_zone.h` defines the macros.
-- **Off.** Without the option nothing is fetched, defined or linked, and the macros expand to nothing.
+- **Memory.** Three kinds of data for Tracy's Memory view, by name: the pool `XMemAlloc` (every block `XMemAlloc` returns until its `XMemFree`), one pool per instrumented DLL for its C++ heap (`<target> C++ heap`, `operator new`/`delete` replaced in `src/startup_stubs/tracy_new.cpp`), and the plot `XMemVirtualAlloc commits (bytes, cumulative)`. That last one is a plot because the title releases those ranges with Win32 calls the stand-in does not see. Memory the title takes straight from Win32 (`VirtualAlloc`, its own heaps) and what the graphics driver commits are not tracked; compare the pools with the `commit peak=` heartbeat to size that remainder. A profiler that connects late misses earlier allocations (on-demand client).
+- **Off.** Without the option nothing is fetched, defined or linked, and the macros expand to nothing or a no-op.
 
 To capture without a GUI, build Tracy's `capture` tool from the same checkout (`cmake -S <checkout>/capture -B <dir>`; that project fetches its own dependencies), start `capture -o run.tracy -a 127.0.0.1 -s <seconds>` and then the instrumented run. Open the file with the Tracy profiler, or export zone statistics with `csvexport`.
 
@@ -2057,7 +2060,9 @@ These are measured on one executable; treat them as hypotheses for others.
   integer VOP1/VOP2 SDWA forms: a source selection is zero-extended, or sign-extended under `sext()`,
   and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
-  already lowers the same forms. Float SDWA forms and a `dst_unused:UNUSED_SEXT` destination still
+  already lowers the same forms. The VOP2 select `v_cndmask_b32_sdwa` lowers the same way, with VCC as
+  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Float SDWA forms and a
+  `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
   The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
   too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
@@ -2195,11 +2200,30 @@ These are measured on one executable; treat them as hypotheses for others.
   `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
   channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
   `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads
-  and stores the same image are refused by name. The runtime does not bind UAVs on the translated
-  graphics path yet: it logs and does not use a translation whose manifest has a `uav` line. A
+  and stores the same image are refused by name. A
   hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
   texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
+- **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d table P O` line
+  as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
+  view the title created at that table entry (`resolve_pixel_uavs` in `d3d12_draw.inl`), on
+  mip 0 of a 2D texture, and the texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
+  with their reason and nothing is bound in place of the view. When the manifest is loaded, the
+  translation is not used for another image kind, a buffer line (`uav N raw table P O`,
+  the vertex-stage store of #2059), a view qualifier (`float`, `uint`, `sint`, as in the compute line), another source, extra fields such as
+  `channels`, an index out of order or more than eight views. At draw time,
+  the draw is not translated for no table at the parameter, an entry outside the bound table, an
+  entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
+  array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
+  sRGB or non-colour format, a format without typed UAV store, and a texture that is also an SRV,
+  a render target or the depth texture of the draw; these checks run before any view of the draw is
+  written or any texture changes state. Indirect draws refuse a translation with a `uav` line. Compute UAVs and barriers between
+  draws that write and read the same texture are not covered. `tests/startup_pixel_uav_check.py`
+  draws the program above through the runtime with four 4x4 two-mip textures in which every word is
+  a distinct sentinel. The texel lands only in the texture the table names, and every other word of
+  the four textures stays unchanged; each refusal leaves every word unchanged. The exec-off variant
+  leaves the texel, and must fail once recompiled without its guard. Run
+  `ctest --preset release --no-tests=error -R '^startup_pixel_uav_' -V`.
 - **Explicit mip loads.** For 2D textures, 2D arrays and 3D textures, `image_load_mip` passes the final
   address register to `Texture.Load` as the mip level (`int4(x, y, slice, mip)` for an array, whose four
   registers are x, y, slice and mip). Ordinary `image_load` still reads mip zero.

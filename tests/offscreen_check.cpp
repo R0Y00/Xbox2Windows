@@ -1322,8 +1322,10 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
-    const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
-    const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
+    const bool array_mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
+    const bool one_dimensional_mips = std::strcmp(ctx.argv[2], "--startup-image-1d-mips") == 0;
+    const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
+    const bool one_dimensional = one_dimensional_mips || std::strcmp(ctx.argv[2], "--startup-image-1d") == 0;
     const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
     float z = 0.0f;
     if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
@@ -1340,8 +1342,8 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1,
-                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0, two_dimensional);
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array,
+                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1680,6 +1682,7 @@ const OperationSpec kOperations[] = {
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},

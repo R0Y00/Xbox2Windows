@@ -260,7 +260,7 @@ def draw(directory, compiler, renderer, backend, mode):
         wrong_view = table.copy()
         wrong_view[TABLE_BYTE // 4 + 5 * 8 + 3] = wrong_format
         add(f"wrong format {wrong_format:#x}", 5, table_words=wrong_view)
-    if check_references(f"heap-store {mode}", renderer, backend, cso, references, allow_hardware_skip=True) == 77:
+    if check_references(f"heap-store {mode}", renderer, backend, cso, references, allow_skip=backend == "hardware") == 77:
         return 77
     width_str = {"d16_x": "4u", "d16_xy": "8u", "d16_xyz": "12u"}.get(mode, "16u")
     format_guard = {"d16_x": f"{FLOAT1:#x}u", "d16_xy": f"{FLOAT2:#x}u",
