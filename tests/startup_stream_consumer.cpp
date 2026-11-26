@@ -217,10 +217,12 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 {
     constexpr UINT words = 320;
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const bool root_srv = mode.rfind("dispatch-root-srv", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, indirect ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, (indirect || root_srv) ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
+    UINT* const buffer2 = memory + 0x20000 / sizeof(UINT);
     for (UINT i = 0; i < words; ++i) {
         buffers[0][i] = 0x8b02a7f1u + i * 0x413b1u;
         buffers[1][i] = 0xc5c5c5c5u;
@@ -248,7 +250,19 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
-    if (mode == "dispatch-input-copied") {
+    void* placed2 = nullptr;
+    if (root_srv) {
+        for (UINT i = 0; i < words; ++i) buffer2[i] = 0x3c6ef372u + i * 0x19660du;
+        for (UINT i = 0; i < 64; ++i) {
+            buffers[0][words + i] = 0xdeadbeefu + i;
+            buffer2[words + i] = 0xfeedfaceu + i;
+        }
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffer2), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                word(&__uuidof(ID3D12Resource)), word(&placed2))))) return 71;
+    }
+    if (mode == "dispatch-input-copied" || mode == "dispatch-root-srv-copied") {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         void* copied = nullptr;
@@ -343,6 +357,40 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
         std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
     }
+    if (root_srv && mode != "dispatch-root-srv-unset") {
+        UINT64 addr0 = reinterpret_cast<UINT64>(buffers[0]);
+        UINT64 addr1 = reinterpret_cast<UINT64>(buffer2);
+        if (mode == "dispatch-root-srv-offset") {
+            addr0 += 16;
+            addr1 += 32;
+        } else if (mode == "dispatch-root-srv-upload") {
+            auto* const up = static_cast<UINT*>(reinterpret_cast<void*>(invoke(list, 148, words * sizeof(UINT), 256)));
+            if (!up) return 81;
+            std::memcpy(up, buffers[0], words * sizeof(UINT));
+            addr0 = reinterpret_cast<UINT64>(up) + 16;
+        } else if (mode == "dispatch-root-srv-null") {
+            addr0 = 0;
+        } else if (mode == "dispatch-root-srv-unaligned") {
+            addr0 += 2;
+        } else if (mode == "dispatch-root-srv-unaligned-16") {
+            addr0 += 4;
+        } else if (mode == "dispatch-root-srv-unmapped" || mode == "dispatch-root-srv-copied") {
+            addr0 = between;
+        } else if (mode == "dispatch-root-srv-same-buffer") {
+            addr0 = reinterpret_cast<UINT64>(buffers[1]);
+        }
+        invoke(list, 43, 2, addr0);
+        if (mode != "dispatch-root-srv-unset-second") invoke(list, 43, 3, addr1);
+    }
+    if (mode == "dispatch-root-srv-root-changed") {
+        invoke(list, 33, word(slot67_other_root));
+        invoke(list, 33, word(slot67_root));
+    } else if (mode == "dispatch-root-srv-same-root") {
+        invoke(list, 33, word(slot67_root));
+    } else if (mode == "dispatch-root-srv-reset") {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+        bind();
+    }
     if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);
     invoke(list, 39, 0, 1, word(&constants[1]), 1);
@@ -352,7 +400,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
         bind();
     }
-    if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
+    if (heap_record || root_srv) invoke(list, 39, 0, 1, word(&constants[2]), 2);
     if (heap_word) {
         // The index buffer of table byte 96, in this recording's upload memory (list slot 148). Byte 288 + 336 * 1
         // holds the index, 2; every other word names record 0 or 1, the output's descriptor.
@@ -372,7 +420,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
-    else if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    else if (mode != "dispatch-none" && mode != "dispatch-root-srv-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;

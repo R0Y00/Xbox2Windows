@@ -1,7 +1,8 @@
 // Translated compute programs at Dispatch (list slot 14). A device slot 67 pipeline is a placeholder that keeps
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
-// <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
-// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
+// <key>.cs.cso. Bound from the compute tables recorded by slot 35 and compute root SRVs recorded by slot 43: raw
+// buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
+// outputs) named by hardware buffer descriptors or 64-bit root SRV addresses, and 2D textures
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
@@ -24,6 +25,7 @@ struct ComputeTranslation {
         std::uint32_t at = 0, times = 0;
         Source source = root_constant;
         bool array = false;
+        bool root = false;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -112,6 +114,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
         else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "srv %u buf root %d%n", &i, &a, &used) == 2 && whole() && a >= 0 &&
+                 i == tr.srvs.size()) {
+            tr.srvs.push_back({a, 0});
+            tr.srvs.back().root = true;
+        }
         else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.srvs.size())
             tr.srvs.push_back({a, b, false, true});
@@ -151,7 +158,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
     for (const ComputeTranslation::Slot& ud : tr.uds) {
         const auto& slots = ud.source >= ComputeTranslation::output_word3 ? tr.uavs : tr.srvs;
         if (ud.source != ComputeTranslation::root_constant &&
-            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture))
+            (ud.a < 0 || static_cast<std::size_t>(ud.a) >= slots.size() || slots[ud.a].texture || slots[ud.a].root))
             return "an entry value names a descriptor that is not a buffer input or output";
     }
     x2w_startup::ComPtr<ID3DBlob> code;
@@ -169,6 +176,74 @@ const char* load_compute_translation(ComputeTranslation& tr)
     log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
         tr.srvs.size(), tr.uavs.size());
     return nullptr;
+}
+
+// Resolve a compute root SRV (`srv <i> buf root <param>`) from the guest address recorded by slot 43 for <param>
+// to the end of its backing upload allocation or aliased placed buffer (up to the 16 MiB compute raw buffer limit).
+IndirectBufferView compute_root_srv_buffer(Wrapper* self, const Pass& pass, int param, std::uint32_t (&words)[8],
+                                           const char** why)
+{
+    const auto refuse = [why](const char* reason) {
+        if (why) *why = reason;
+        return IndirectBufferView{};
+    };
+    if (why) *why = nullptr;
+    const auto* root_params = pass.compute_root_wrapper ? root_info(pass.compute_root_wrapper) : nullptr;
+    if (!root_params || param < 0 || static_cast<std::size_t>(param) >= root_params->size() ||
+        static_cast<std::size_t>(param) >= pass.compute_root_srvs.size() ||
+        (*root_params)[param].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
+        return refuse("a compute root input is not a shader resource view parameter");
+    if (!(pass.compute_root_srv_set & (u64{1} << param)))
+        return refuse("a compute root SRV was not set since the compute root");
+    const u64 address = pass.compute_root_srvs[param];
+    words[0] = static_cast<std::uint32_t>(address);
+    words[1] = static_cast<std::uint32_t>(address >> 32);
+    if (!address) return refuse("a compute root SRV has a null address");
+    if (address % 4) return refuse("a compute root SRV address is not 4-byte aligned");
+    constexpr u64 limit = 16u << 20;
+    if (const auto allocation = list_upload_tail(self, address); allocation.resource) {
+        if (allocation.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+            return refuse("a compute root SRV range is not 16-byte aligned in its resource");
+        const u64 bytes = (std::min)(allocation.bytes, limit) & ~u64{3};
+        if (bytes < 4)
+            return refuse("a compute root SRV has fewer than 4 aligned bytes in its upload allocation");
+        words[2] = static_cast<std::uint32_t>(bytes);
+        return {allocation.resource, allocation.offset, bytes, 0, true};
+    }
+    Wrapper* device = self->own().list_device;
+    const auto first = placed_buffer_range(device, address, 4);
+    if (first.reject) return refuse("a compute root SRV crosses the end of a placed buffer");
+    if (!first.owner) return refuse("a compute root SRV is in title memory outside any placed buffer");
+    if (!InterlockedCompareExchange(&first.owner->own().refs, 0, 0))
+        return refuse("a compute root SRV's resource is released");
+    const auto* info = resource_info(first.owner);
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return refuse("a compute root SRV's resource was not created in the common state");
+    const u64 base = reinterpret_cast<u64>(first.owner->own().title_memory);
+    if (!base || address < base || address - base >= info->bytes)
+        return refuse("a compute root SRV range is outside its desktop buffer");
+    const u64 offset = address - base;
+    if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+        return refuse("a compute root SRV range is not 16-byte aligned in its resource");
+    const u64 bytes = (std::min)(info->bytes - offset, limit) & ~u64{3};
+    if (bytes < 4)
+        return refuse("a compute root SRV has fewer than 4 aligned bytes in its placed buffer");
+    const auto placed = placed_buffer_range(device, address, bytes);
+    if (placed.reject || placed.owner != first.owner)
+        return refuse("a compute root SRV crosses the end of a placed buffer");
+    auto* native = static_cast<ID3D12Resource*>(placed.owner->own().real);
+    if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
+        return refuse("a compute root SRV is in a placed buffer that does not alias title memory");
+    x2w_startup::ComPtr<ID3D12Device> native_device;
+    if (!native || FAILED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) ||
+        native_device.Get() != device_of(device))
+        return refuse("a compute root SRV's resource is on another device");
+    const auto desc = native->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        offset > desc.Width || bytes > desc.Width - offset)
+        return refuse("a compute root SRV range is outside its desktop buffer");
+    words[2] = static_cast<std::uint32_t>(bytes);
+    return {native, offset, bytes, 0, false};
 }
 
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
@@ -221,12 +296,22 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        if (dispatch.signature && (slot.heap || slot.texture)) {
+        if (dispatch.signature && (slot.heap || slot.texture || slot.root)) {
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
         }
         std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
+        if (!output && slot.root) {
+            const IndirectBufferView view = compute_root_srv_buffer(self, pass, slot.a, words, &reason);
+            if (reason && !tr->first_refusal)
+                log("x2w-draw compute %016llx first refused input %zu (root %d), address 0x%llx", key, i, slot.a,
+                    u64{words[0]} | (u64{words[1]} << 32));
+            views[i] = {view.resource, view.offset, view.bytes, !view.upload};
+            views[i].stride = view.stride;
+            std::memcpy(views[i].words, words, sizeof(views[i].words));
+            continue;
+        }
         if (slot.word_param >= 0) {
             // The index word is read now from the recording's upload memory, where the title wrote it (no GPU command
             // writes there), at the dword-aligned 32-bit byte offset the program reads it at.

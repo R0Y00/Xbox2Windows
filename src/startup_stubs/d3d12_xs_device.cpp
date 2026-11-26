@@ -1596,6 +1596,25 @@ x2w_upload::Allocation list_upload_range(Wrapper* self, UINT64 address, UINT64 b
     ReleaseSRWLockShared(&allocator_lock);
     return allocation;
 }
+x2w_upload::Allocation list_upload_tail(Wrapper* self, UINT64 address)
+{
+    x2w_upload::Allocation allocation{};
+    AcquireSRWLockShared(&allocator_lock);
+    const auto& state = self->own();
+    if (state.list_open && state.list_uploads) {
+        for (auto it = state.list_uploads->allocations.rbegin(); it != state.list_uploads->allocations.rend(); ++it) {
+            if (address < it->cpu) continue;
+            const UINT64 offset = address - it->cpu;
+            if (offset < it->bytes) {
+                allocation = {static_cast<uintptr_t>(address), it->gpu + offset, it->bytes - offset, it->resource,
+                              it->offset + offset};
+                break;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&allocator_lock);
+    return allocation;
+}
 UINT64 list_upload_gpu(Wrapper* self, UINT64 address, UINT64 bytes) { return list_upload_range(self, address, bytes).gpu; }
 
 // Fixture lookup. The full range must belong to this list's open recording.
@@ -2601,6 +2620,8 @@ struct Pass {
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
     x2w_root_constants::Store compute_constants;  // compute root constants (slots 37 and 39)
+    std::array<u64, 64> compute_root_srvs{};      // title address of each compute root SRV (slot 43)
+    u64 compute_root_srv_set = 0;                 // bit per compute root parameter set by slot 43 since slot 33 / Reset
     Wrapper* compute_root_wrapper = nullptr;      // compute root signature last set by slot 33
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
@@ -2730,6 +2751,8 @@ void retire_drop_recording(Wrapper* list)
 void reset_list_dynamic_state(Wrapper* self)
 {
     if (!self->own().pass) return;
+    pass_of(self).compute_root_srvs.fill(0);
+    pass_of(self).compute_root_srv_set = 0;
     pass_of(self).stencil_reference = 0;
     pass_of(self).viewport_set = false;
     pass_of(self).scissor_set = false;
@@ -2837,7 +2860,11 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
     // A different root signature invalidates the title's cached compute root arguments.
-    if (pass.compute_root_wrapper != w) pass.compute_constants.clear();
+    if (pass.compute_root_wrapper != w) {
+        pass.compute_constants.clear();
+        pass.compute_root_srvs.fill(0);
+        pass.compute_root_srv_set = 0;
+    }
     pass.compute_root_wrapper = w;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
@@ -3864,6 +3891,10 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
 {
     auto* list = recording(self);
     auto& pass = pass_of(self);
+    if (list && pass.compute_root_wrapper && parameter < pass.compute_root_srvs.size()) {
+        pass.compute_root_srvs[parameter] = address;
+        pass.compute_root_srv_set |= u64{1} << parameter;
+    }
     const auto* params = pass.compute_params;
     if (!list || !params || parameter >= params->size() || parameter >= pass.desktop_compute_upload_srvs.size() ||
         (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
