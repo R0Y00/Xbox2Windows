@@ -114,6 +114,11 @@ REFUSED = {
              + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # s_wqm of a narrowed EXEC is a no-op here while the guest turns the quad back on: a lane-exec break.
     'wqm_break': (PROLOGUE + CMPX + 's_wqm_b64 exec, exec\n' + SUB + SAMPLE + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A scalar write inside the block an EXEC branch can skip happens once for the wave in the guest; a quad that
+    # votes to skip it would miss it (review of the first version): the branch is not voted, the op is refused.
+    'scalar_in_block': (PROLOGUE + 's_mov_b32 s28, -1.0\nv_cmp_eq_u32_e32 vcc, 2, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n'
+                        's_mov_b32 s28, 0\nBB1:\ns_or_b64 exec, exec, s[0:1]\nv_mov_b32_e32 v1, s28\n'
+                        + SAMPLE + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
@@ -171,6 +176,9 @@ WORDS_HEX = {
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
         'f0121210ff1204060000003ef302027eff02067e0000803e0902087e7fc08cbf280f94f0010ac400703f8cbf8010847d'
         'faff87bf703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'scalar_in_block': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087ef3039cbe8210847d6a2480be010088bf80039cbe7e00fe881c02027e7fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
 }
 BRANCH = re.compile(r'^(s_c?branch\w*) (BB\d+)$')

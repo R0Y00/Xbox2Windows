@@ -981,11 +981,13 @@ UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
 DERIVATIVE_OPS = ('image_sample_b', 'image_get_lod')
 # "Some lane of the 2x2 quad has bit 0 set": fine derivatives of a 0/1 value read the row neighbour (ddx_fine), then
 # the other row (ddy_fine). Exact for 0/1 and defined only where the quad runs the statement together (SM 5.0 and 6.0).
+# The derivatives are arithmetic operands, not operands of a short-circuit ||: a DXC build for some GPUs moved a derivative
+# under the condition of an ||, where only some lanes ran it (measured on a hardware adapter).
 QUAD_ANY_HLSL = [
     'bool x2w_quad_any(uint bit) {',
     '    float lane = (bit & 1u) != 0u ? 1.0 : 0.0;',
-    '    float row = (lane != 0.0 || ddx_fine(lane) != 0.0) ? 1.0 : 0.0;',
-    '    return row != 0.0 || ddy_fine(row) != 0.0;',
+    '    float row = (lane + abs(ddx_fine(lane)) != 0.0) ? 1.0 : 0.0;',
+    '    return row + abs(ddy_fine(row)) != 0.0;',
     '}',
 ]
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
@@ -3306,7 +3308,8 @@ class Stage:
                         if cond_uniform:
                             self.uniform_branches.add(off)
                         elif (cond in ('execz', 'execnz') and self.quad_exec and not self.exec_known
-                                and self.uniform_cf and not self.lane_exec_breaks):
+                                and self.uniform_cf and not self.lane_exec_breaks
+                                and self.skipped_block_vector_only(off, int(parse(asm)[1][0].split('_')[1], 16))):
                             # Decided per quad (x2w_quad_any): every lane of a quad takes it together, so it parts no
                             # quad and the derivative ops after it still see their four lanes. It reads the quad, so it
                             # is only taken while the control flow so far is quad-uniform and every lane's EXEC bit
@@ -3496,6 +3499,25 @@ class Stage:
 
     def pc_index(self):
         return next((i for i, ins in enumerate(self.ins) if ins[0] == self.pc), None)
+
+    def skipped_block_vector_only(self, branch, target):
+        """Whether the instructions a forward EXEC branch can skip are per-lane vector work only.
+
+        The guest takes the branch once for the whole wave, so a scalar write, a mask write or a branch inside the block
+        happens once for the wave when any quad takes the block. A quad that votes to skip it would miss that effect while
+        a later read in the same wave sees it. Only vector ALU/memory/export instructions and waits, which each lane
+        applies to its own registers, are allowed between the branch and its target; s_endpgm too (a quad that ends
+        reads nothing later)."""
+        if target <= branch:
+            return False
+        for off, _n, name, _asm in self.ins:
+            if branch < off < target and not (
+                    (name.startswith('v_') and not name.startswith(('v_cmp', 'v_readlane', 'v_readfirstlane',
+                                                                    'v_writelane')))
+                    or name.startswith(('image_', 'buffer_', 'tbuffer_', 'global_', 'flat_', 'exp'))
+                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt', 's_endpgm')):
+                return False
+        return True
 
     def derivative_exec_ok(self):
         """Whether an implicit-derivative op may rely on the EXEC the lanes hold here.

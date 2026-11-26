@@ -90,6 +90,11 @@ FIXTURES = {
 REFUSED = {
     'vcc_inside': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccz BB1\n' + QUERY + 'BB1:\n' + EXPORT,
                    'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    # A scalar write inside the block an EXEC branch can skip happens once for the wave in the guest; a quad that
+    # votes to skip it would miss it (review of the first version): the branch is not voted, the op is refused.
+    'scalar_in_block': (PROLOGUE + 's_mov_b32 s28, -1.0\nv_cmp_eq_u32_e32 vcc, 2, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n'
+                        's_mov_b32 s28, 0\nBB1:\ns_or_b64 exec, exec, s[0:1]\nv_mov_b32_e32 v1, s28\n'
+                        + QUERY + EXPORT, 'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
@@ -127,6 +132,9 @@ WORDS_HEX = {
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
         'f0121210ff1204060000003eff02067e0000803e8002187e80021a7e8010847d030086bf7fc08cbf080380f1020ac400'
         '703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'scalar_in_block': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7ef3039cbe8210847d6a2480be010088bf80039cbe7e00fe881c02027e7fc08cbf080380f1020ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
 }
 CALL = ('t = float4(r0.CalculateLevelOfDetail(q0, float2(F(v2), F(v3))), '
