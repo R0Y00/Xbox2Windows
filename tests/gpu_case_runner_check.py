@@ -36,6 +36,11 @@ def one(args):
         return "skip: nothing\n", "", 77
     return "", "Unknown GPU operation or invalid arguments: %s\n" % op, 2
 
+if mode == "grandchild":          # a launcher child that keeps the pipes open after the renderer is gone
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "grandchild.pid"), "w") as pid_file:
+        pid_file.write(str(child.pid))
 banner = "backend=%s debug_layer=enabled\nadapter=Fake\n" % adapter
 if args and args[0] == "--serve":
     if mode == "no-serve":
@@ -176,6 +181,23 @@ class RunnerChecks(unittest.TestCase):
         for server in made:
             self.assertIsNotNone(server.proc.poll())
             self.assertTrue(all(s.closed for s in (server.proc.stdin, server.proc.stdout, server.proc.stderr)))
+
+    @unittest.skipUnless(os.name == 'posix', 'process groups')
+    def test_a_launcher_child_holding_the_pipes_does_not_block_the_end_of_the_test(self):
+        renderer = launcher(self.dir, 'grand', 'grandchild')
+        self.assertEqual(self.run_case(renderer, '--pass', 'a').returncode, 0)
+        pid = int((self.dir / 'grandchild.pid').read_text())
+        started = time.monotonic()
+        R._close_all()                                               # the renderer is gone but its child holds stdout and stderr
+        self.assertLess(time.monotonic() - started, 20)
+        for _ in range(50):                                          # the child was killed with the group
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail('the launcher child is still alive')
 
     def test_x2w_flat_server_zero_uses_one_shot_calls(self):
         renderer = launcher(self.dir, 'off', 'serve')

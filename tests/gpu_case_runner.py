@@ -16,6 +16,7 @@ run(renderer, adapter, args)
 import atexit
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -40,7 +41,8 @@ class _Server:
     def __init__(self, renderer, adapter):
         self.out, self.err = queue.Queue(), queue.Queue()
         self.proc = subprocess.Popen([*_command(renderer), adapter, '--serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True, bufsize=1)
+                                     stderr=subprocess.PIPE, text=True, bufsize=1,
+                                     start_new_session=os.name == 'posix')   # own process group: a launcher's children die with it
         self.banner, self.banner_err, self.ready, self.returncode, self.stderr_text = '', '', False, None, ''
         self.next_case = 0
         self.threads = [threading.Thread(target=self._pump, args=(self.proc.stdout, self.out, 'X2WCASE '), daemon=True),
@@ -123,19 +125,32 @@ class _Server:
             raise _Lost('the renderer answered case %s/%s to case %d' % (out[1], err[1], index))
         return subprocess.CompletedProcess(self.proc.args, out[2], self.banner + out[0], self.banner_err + err[0])
 
+    def _kill_tree(self):
+        """Kill the renderer and everything it started (a Wine or shell launcher leaves a child that keeps the pipes open)."""
+        try:
+            if os.name == 'posix':
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            else:
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.proc.pid)], capture_output=True)
+        except OSError:
+            pass
+        self.proc.kill()
+
     def _release(self):
-        """Wait for the process and close every pipe, so nothing is left open after any exit."""
+        """Wait for the process, end its group, join the pump threads and close the pipes, so nothing is left behind."""
         self.proc.wait()
+        self._kill_tree()
         for thread in self.threads:                 # the pumps end at the end of the pipes
             thread.join(timeout=5)
-        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
-            try:
-                stream.close()
-            except OSError:
-                pass
+        for stream, thread in ((self.proc.stdin, None), (self.proc.stdout, self.threads[0]), (self.proc.stderr, self.threads[1])):
+            if thread is None or not thread.is_alive():     # closing a pipe a pump is still reading would block
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
     def kill(self):
-        self.proc.kill()
+        self._kill_tree()
         self._release()
 
     def close(self):
@@ -144,7 +159,7 @@ class _Server:
             self.proc.stdin.close()
             self.proc.wait(timeout=30)
         except (OSError, ValueError, subprocess.TimeoutExpired):     # already closed, or it does not end
-            self.proc.kill()
+            self._kill_tree()
         self._release()
 
 
