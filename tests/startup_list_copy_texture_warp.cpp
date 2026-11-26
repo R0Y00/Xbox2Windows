@@ -211,6 +211,33 @@ int main(int argc, char** argv)
         std::puts("2 the readback buffer changed");
         return 17;
     }
+    // 3. Refuse either unaligned edge without losing the valid copy and readback on the same list.
+    const D3D12_RESOURCE_DESC bc_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 8, 8, 1, 3,
+                                      DXGI_FORMAT_BC1_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN};
+    void* bc = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, bc_desc, D3D12_RESOURCE_STATE_COMMON);
+    if (!bc || !ok(invoke(list, 139, arg(allocator), 0))) return 18;
+    const auto bc_mip = subresource(bc, 2);
+    const auto bc_up = footprint(upload, 0, DXGI_FORMAT_BC1_UNORM);
+    const auto bc_out = footprint(readback, 0, DXGI_FORMAT_BC1_UNORM);
+    const D3D12_BOX bad_right{0, 0, 0, 2, 4, 1};
+    const D3D12_BOX bad_bottom{0, 0, 0, 4, 2, 1};
+    const D3D12_BOX whole_block{0, 0, 0, 4, 4, 1};
+    invoke(list, 16, arg(&bc_mip), 0, 0, 0, arg(&bc_up), arg(&bad_right));
+    invoke(list, 16, arg(&bc_mip), 0, 0, 0, arg(&bc_up), arg(&bad_bottom));
+    invoke(list, 16, arg(&bc_mip), 0, 0, 0, arg(&bc_up), arg(&whole_block));
+    copy(bc_out, bc_mip);
+    if (!ok(invoke(list, 9)) || !submit()) return 19;
+    LONG forwarded3 = 0, refused3 = 0;
+    x2w_d3d12_list_copy_texture_stats(&forwarded3, &refused3);
+    std::printf("3 BC1 mip: forwarded +%ld refused +%ld (expected +2, +2)\n", forwarded3 - forwarded2, refused3 - refused2);
+    if (forwarded3 - forwarded2 != 2 || refused3 - refused2 != 2) return 20;
+    if (!ok(invoke(readback, 8, 0, 0, arg(&memory))) || !memory) return 21;
+    const auto* block = static_cast<const std::uint8_t*>(memory);
+    bool block_ok = block[8] == sentinel;
+    for (UINT i = 0; i < 8; ++i) block_ok = block_ok && block[i] == image_byte(0, 0, i);
+    invoke(readback, 9, 0, 0);
+    if (!block_ok) return 22;
+
     std::puts("ok");
     return 0;
 }
