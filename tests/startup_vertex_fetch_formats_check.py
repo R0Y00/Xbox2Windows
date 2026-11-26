@@ -411,8 +411,10 @@ RUNTIME = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12
 def runtime_gate(source):
     """Check that both FORMAT metadata and usable backing are required before submission."""
     assert 'formatted_buffers_ready(*tr, pass, formatted_buffers)' in source
+    decoder = source[source.index('const char* formatted_buffer_word3('):source.index('bool formatted_buffers_ready(')]
+    assert 'formatted_buffer_supported(' in decoder
     preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
-    for condition in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
+    for condition in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_word3('):
         assert condition in preflight, condition
     start = source.index('bool draw_translated(')
     gate = source.index('if (!have && formatted.entry)', start)
@@ -424,8 +426,15 @@ def runtime_gate(source):
 def runtime_gate_controls():
     source = RUNTIME.read_text(encoding='utf-8')
     runtime_gate(source)
+    decoder = source[source.index('const char* formatted_buffer_word3('):source.index('bool formatted_buffers_ready(')]
+    try:
+        runtime_gate(source.replace(decoder, decoder.replace('formatted_buffer_supported(', 'omitted')))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('descriptor decoder without FORMAT support checking must fail the control')
     preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
-    for dropped in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
+    for dropped in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_word3('):
         try:
             runtime_gate(source.replace(preflight, preflight.replace(dropped, 'omitted')))
         except AssertionError:
