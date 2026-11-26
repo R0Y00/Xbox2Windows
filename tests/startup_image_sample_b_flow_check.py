@@ -113,6 +113,15 @@ FIXTURES = {
     # helper's -1 would give mip 1 and no bias mip 2.
     'bias_lane': (PROLOGUE + 'v_mov_b32_e32 v14, -2.0\nv_cmp_eq_u32_e32 vcc, 0, v8\nv_cndmask_b32_e32 v1, v1, v14, vcc\n'
                   + branch_on_x(0, '-0.5') + SAMPLE + EXPORT, (Fraction(-3, 8), Fraction(5, 8)), -2),
+    # The bias is written INSIDE the divergent block. The drawn lane (x = 0) writes +1: LOD 1 + 1 = 2 (mip 2); without the
+    # write its -1 gives mip 0.
+    'bias_in_block': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\nv_mov_b32_e32 v1, 1.0\n'
+                          'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + SAMPLE + EXPORT,
+                      (Fraction(1, 8), Fraction(5, 8)), 1),
+    # Only the helper column (x = 1) writes +1: the drawn lane keeps -1 (mip 0); a write by every lane gives mip 2.
+    'bias_in_block_helper': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 1, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\nv_mov_b32_e32 v1, 1.0\n'
+                          'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + SAMPLE + EXPORT,
+                             (Fraction(1, 8), Fraction(5, 8)), -1),
 }
 # name: (source, text of the refusal)
 REFUSED = {
@@ -214,6 +223,12 @@ WORDS_HEX = {
     'bias_lane': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087ef5021c7e8010847d011d02028010847d6a2480be010088bff10404067e00fe887fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
+    'bias_in_block': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087e8010847d6a2480be010088bff202027e7e00fe887fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'bias_in_block_helper': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087e8110847d6a2480be010088bff202027e7e00fe887fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
 }
 BRANCH = re.compile(r'^(s_c?branch\w*) (BB\d+)$')
 
@@ -294,7 +309,7 @@ def controls():
     for name, (_source, text) in REFUSED.items():
         refused(name, text)
     # The quad votes: the EXEC branches of inside, kill and join_pixel, one vote each; v_cmpx alone needs none.
-    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('restore', 0), ('wqm', 1), ('bias_lane', 1)):
+    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('restore', 0), ('wqm', 1), ('bias_lane', 1), ('bias_in_block', 1), ('bias_in_block_helper', 1)):
         text = pipeline(name).hlsl_ps()
         assert text.count('x2w_quad_any(exec)') == votes, (name, text)
     # The gate is the vote's: with the EXEC rule of #2659 (the entry mask only) the divergent-EXEC fixtures are refused.
@@ -331,6 +346,11 @@ def mutants(name, hlsl):
         out.append(('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', ''))))
     if name == 'wqm':
         out.append(('s_wqm as a no-op', hlsl.replace('exec = x2w_quad_any(exec) ? 1u : 0u;', '')))
+    wr = re.search(r'\n\s*if \(exec & 1\) v1 = 0x3f800000u;', hlsl)
+    if name == 'bias_in_block':
+        out.append(('without the block write', hlsl.replace(wr.group(0), '')))
+    if name == 'bias_in_block_helper':
+        out.append(('every lane writes the bias', hlsl.replace(wr.group(0), wr.group(0).replace('if (exec & 1) ', ''))))
     if name == 'bias_lane':
         out.append(('the helper column bias', hlsl.replace(CALL, CALL.replace('F(v1))', '-1.0)'))))
     out.append(('bias ignored', hlsl.replace(CALL, CALL.replace('F(v1))', '0.0)'))))
