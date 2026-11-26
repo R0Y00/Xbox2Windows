@@ -36,7 +36,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, G, compile_hlsl, root_blob
@@ -296,9 +296,7 @@ def controls():
         records = [cache / ('%016x.psdep' % key) for key in (t, v)]
         check('both results record the description line they were translated with',
               all(r.is_file() and r.read_text() == describe(t, TARGET) for r in records))
-        for path in fails:
-            with suppress(FileNotFoundError):
-                path.unlink()
+        # The failures of the wrong-pair cycle stay: on the manifest-only path a success does not remove them.
         description.unlink()
         check('a removed description queues the base and its RTV variant', pending(cache) == sorted([t, v]))
         watch_pass(cache)

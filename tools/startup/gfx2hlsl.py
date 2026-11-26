@@ -8690,8 +8690,11 @@ def pending_keys(out_dir, skip_failed):
                     if b'ps none' in published.read().splitlines():
                         continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
-        # A repeated pass retries a failure only once its request or its stream description is rewritten.
-        if skip_failed and os.path.exists(fail) and os.path.getmtime(fail) >= max(
+        # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
+        # still published without its recorded description is checked even with an older .fail, which a success on
+        # the manifest-only path leaves in place.
+        recheck = lost and os.path.isfile(manifest)
+        if skip_failed and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= max(
                 os.path.getmtime(os.path.join(out_dir, name)), described or 0):
             continue
         keys.append(key)
