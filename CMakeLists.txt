@@ -3355,6 +3355,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_s_flbit_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl lowers s_ff1_i32_b32/b64 of a general scalar (#2022 Item F): CPU evaluation and refusals.
+    add_test(NAME startup_gfx2hlsl_s_ff1 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_ff1_check.py")
     # gfx2hlsl lowers v_cube{id,sc,tc,ma}_f32: device-free translation controls.
     add_test(NAME startup_gfx2hlsl_cube_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_check.py")

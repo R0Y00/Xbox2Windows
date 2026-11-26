@@ -8115,6 +8115,15 @@ destination with a known bit index folds. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitset$' -V`
 (or `python3 -B tests/startup_gfx2hlsl_s_bitset_check.py`). The fixture is
 CPU-only; Windows WARP/hardware draws are left for an independent retest.
+**Scalar find-first-one.** Startup translation lowers `s_ff1_i32_b32` and
+`s_ff1_i32_b64` of a general scalar to `firstbitlow` (and a lo-then-hi scan for
+the 64-bit form), matching `pixel_aot` / Mesa. The compute-entry special case
+on `exec_lo` still folds to lane 0. SCC is unchanged. Lane masks and
+descriptor-bearing sources are refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_ff1$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_ff1_check.py`). The fixture is
+CPU-only; Windows WARP/hardware draws are left for an independent retest.
+[Refs #2022](https://github.com/R0Y00/Xbox2Windows/issues/2022) Item F.
 
 **Scalar find-first-bit-high.** Startup translation lowers `s_flbit_i32_b32` to
 `S0 == 0 ? 0xffffffff : 31 - firstbithigh(S0)`, matching `pixel_aot` /

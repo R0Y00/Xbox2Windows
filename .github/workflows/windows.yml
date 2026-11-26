@@ -304,6 +304,7 @@ jobs:
             tests/startup_gfx2hlsl_s_abs_check.py \
             tests/startup_gfx2hlsl_s_bitset_check.py \
             tests/startup_gfx2hlsl_s_flbit_check.py \
+            tests/startup_gfx2hlsl_s_ff1_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \
