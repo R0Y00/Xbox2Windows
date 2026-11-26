@@ -271,6 +271,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_getpc_refusal_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_arity_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_hi_msad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_pk_int16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_null_check.py
 ```
