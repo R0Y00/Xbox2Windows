@@ -2985,7 +2985,7 @@ class Stage:
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
-            self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform) for constant-lane SGPR spills
+            self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform, proven) for constant-lane SGPR spills
             self.vcc_events = {}
             self.entry_table_pointers = {
                 reg: sym[1] for reg, sym in init_sym.items()
@@ -2994,7 +2994,7 @@ class Stage:
             self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
-            self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform)
+            self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform, proven)
             self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
             self.heap_index_was = {}  # the marks the current instruction's destinations held before it
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
@@ -5375,9 +5375,32 @@ class Stage:
             return None
         return source[1], index
 
+    def spill_word_proven(self, reg, sym):
+        """True when the descriptor word held in s<reg> would pass the formatted-load provenance proof here: it is
+        still in the entry block, or it is a word of one untouched local table load (or an already proven reload)."""
+        if sym[0] != 'desc' or not getattr(self, 'past_entry', False):
+            return True
+        return self.formatted_descriptor_from_block(('s', reg, reg), sym)
+
     def formatted_descriptor_from_block(self, reg, first):
-        """Require one untouched local load and a table pointer that no incoming path can rewrite."""
+        """Require one untouched local load and a table pointer that no incoming path can rewrite. A word written
+        by a v_readlane_b32 reload counts when every v_writelane_b32 that can supply it passed this same proof."""
+        if not first:
+            return False
         start, end = self.descriptor_block_first, self.descriptor_instruction_index
+        reloads = {}
+        for w in range(reg[1], reg[2] + 1):
+            for at in range(end - 1, start - 1, -1):
+                _, _, name, asm = self.ins[at]
+                if w in self.descriptor_scalar_writes(name, parse(asm)[1]):
+                    if re.sub(r'_e(32|64)$', '', name) == 'v_readlane_b32':
+                        reloads[w] = at
+                    break
+        if reloads:
+            return all(
+                getattr(self, 'reload_proven', {}).get(reloads[w], False) if w in reloads else
+                self.formatted_descriptor_from_block(('s', w, w), self.sym.get(w)) for w in range(reg[1], reg[2] + 1))
+        width = reg[2] - reg[1] + 1
         block = self.ins[start:end]
         words = set(range(reg[1], reg[2] + 1))
         for index in range(len(block) - 1, -1, -1):
@@ -5387,7 +5410,7 @@ class Stage:
                 continue
             m = re.fullmatch(r's_load_dwordx(4|8|16)', name)
             load = reg_range(args[0])
-            if not m or not load or load[1] + first[3] != reg[1] or int(m.group(1)) < first[3] + 4:
+            if not m or not load or load[1] + first[3] != reg[1] or int(m.group(1)) < first[3] + width:
                 return False
             base = reg_range(args[1])
             if not base or base[0] != 's':
@@ -6584,8 +6607,13 @@ class Stage:
     # the write lies in such a region that the read is outside (a loop or arm the wave can run after this pixel
     # left it). Several writes: the value is chosen by the path, so every write must lie outside every such region;
     # the reload then keeps a constant only if all of them stored it, and is not claimed uniform.
+    # Compute stages (cs) use the same proof, branches included. A spilled descriptor or pointer word (SPILL_SYMBOLS) is a
+    # symbol with no run-time value: the slot carries the symbol, the reload restores it, and the word keeps the
+    # provenance the formatted loads require (formatted_descriptor_from_block follows a reload to the writes that supply it).
     SPILL_LANES = 64
-    SPILL_STAGES = ('ps', 'vs', 'ms')
+    SPILL_STAGES = ('ps', 'vs', 'ms', 'cs')
+    # Symbols a spill carries by identity: the SGPR holds no run-time value in the translation, so the slot holds none either.
+    SPILL_SYMBOLS = ('desc', 'ptr', 'ptrhi')
 
     def spill_reaching(self, cfg):
         """Instruction index of each v_readlane_b32 -> the v_writelane_b32 indices that can supply its (VGPR, lane), or
@@ -6649,8 +6677,11 @@ class Stage:
                 raise Unsupported('v_readlane_b32 reads v%d lane %d outside the region of the branch at %#x that writes '
                                   'it, which is not proven uniform' % (n, lane, off))
         stored = [self.spill_writes[w] for w in sorted(writes)]
-        sym = stored[0][0] if all(s == stored[0][0] for s, _ in stored) else None
-        return sym, len(stored) == 1 and stored[0][1]
+        sym = stored[0][0] if all(s[0] == stored[0][0] for s in stored) else None
+        if sym is None and any(s[0] is not None and s[0][0] in self.SPILL_SYMBOLS for s in stored):
+            # A descriptor or pointer word has no run-time variable: only the same symbol on every path can be reloaded.
+            raise Unsupported('v_readlane_b32 joins different descriptor or pointer words of v%d lane %d' % (n, lane))
+        return sym, len(stored) == 1 and stored[0][1], all(s[2] for s in stored)
 
     def spill_operands(self, name, ops, mods):
         if mods or len(ops) != 3:
@@ -6668,12 +6699,12 @@ class Stage:
         if not 0 <= lane < self.SPILL_LANES:
             raise Unsupported('%s lane %d outside 0..%d' % (name, lane, self.SPILL_LANES - 1))
         if kind not in self.SPILL_STAGES:
-            raise Unsupported('%s is lowered in pixel, vertex and mesh stages only' % name)
+            raise Unsupported('%s is lowered in pixel, vertex, mesh and compute stages only' % name)
         if not self.tracks_uniformity() or (getattr(self, 'has_branches', True) and
-                                            (kind != 'ps' or getattr(self, 'spill_reach', None) is None)):
+                                            (kind not in ('ps', 'cs') or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
-        if kind in ('ps', 'vs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
+        if kind in ('ps', 'vs', 'cs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
             self.require_spill_lanes_apart(vreg[1], name)
         return vreg[1], sreg, lane
 
@@ -6716,20 +6747,31 @@ class Stage:
             if ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0'):
                 raise Unsupported('v_writelane_b32 source %s is a lane mask or m0' % ops[1])
             else:
-                value, sym, uniform = self.u(ops[1]), None, True
+                value, sym, uniform, proven = self.u(ops[1]), None, True, False
                 if re.fullmatch(r'0x[0-9a-f]{8}u', value):
                     sym = ('const', int(value[2:-1], 16))
         else:
-            if self.is_lane_mask(ops[1]) or (self.sym.get(src[1]) or ('',))[0] not in ('', 'const', 'ud', 'fixed_buffer_word'):
+            held = self.sym.get(src[1]) or ('',)
+            carried = held[0] in self.SPILL_SYMBOLS and getattr(self, 'kind', None) == 'cs'
+            if not carried and (self.is_lane_mask(ops[1]) or held[0] not in ('', 'const', 'ud', 'fixed_buffer_word')):
                 raise Unsupported('v_writelane_b32 source s%d holds a lane mask or descriptor' % src[1])
-            value = self.S(src[1])
-            sym = self.sym.get(src[1]) if (self.sym.get(src[1]) or ('',))[0] == 'const' else None
-            uniform = self.uniform_source(ops[1])
+            if carried:
+                # A descriptor or pointer word of a compute stage: the slot holds the symbol itself, so the reload
+                # restores the same word. Nothing is emitted: the translation has no run-time value for it.
+                if not names_one_value(held):
+                    raise Unsupported('v_writelane_b32 source s%d holds a modified descriptor or pointer word' % src[1])
+                value, sym, uniform, proven = None, held, True, self.spill_word_proven(src[1], held)
+            else:
+                value = self.S(src[1])
+                sym = held if held[0] == 'const' else None
+                uniform = self.uniform_source(ops[1])
+                proven = False
         slots = self.__dict__.setdefault('spill_slots', {})
-        slots[(n, lane)] = (sym, uniform)
+        slots[(n, lane)] = (sym, uniform, proven)
         if getattr(self, 'spill_reach', None) is not None:
-            self.spill_writes[self.descriptor_instruction_index] = (sym, uniform)
-        self.emit('sp%d_%d = %s;' % (n, lane, value))
+            self.spill_writes[self.descriptor_instruction_index] = (sym, uniform, proven)
+        if value is not None:
+            self.emit('sp%d_%d = %s;' % (n, lane, value))
 
     def op_v_readlane_b32(self, ops, mods):
         if len(ops) != 3 or reg_range(ops[1]) is None or reg_range(ops[1])[0] != 'v':
@@ -6738,13 +6780,15 @@ class Stage:
         if dst is None:
             raise Unsupported('v_readlane_b32 requires an SGPR destination')
         if getattr(self, 'has_branches', False):
-            sym, uniform = self.spill_join(n, lane)
+            sym, uniform, proven = self.spill_join(n, lane)
         else:
             slot = getattr(self, 'spill_slots', {}).get((n, lane))
             if slot is None:
                 raise Unsupported('v_readlane_b32 reads v%d lane %d before any v_writelane_b32 wrote it' % (n, lane))
-            sym, uniform = slot
+            sym, uniform, proven = slot
         self.set_s(dst[1], 'sp%d_%d' % (n, lane), sym=sym, uniform=uniform)
+        if getattr(self, 'descriptor_instruction_index', None) is not None:  # unit probes build a Stage without translate()
+            self.__dict__.setdefault('reload_proven', {})[self.descriptor_instruction_index] = proven
 
     def op_v_mov_b32(self, ops, mods):
         if len(ops) != 2:

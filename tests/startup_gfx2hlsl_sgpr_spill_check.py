@@ -181,7 +181,8 @@ def controls():
         reason = refused(program)
         check('refused: %s (%s)' % (label, reason), reason is not None)
     check('a vertex stage is accepted', refused(ok, kind='vs') is None, str(refused(ok, kind='vs')))
-    check('refused: compute stage (%s)' % refused(ok, kind='cs'), refused(ok, kind='cs') is not None)
+    check('a compute stage is accepted', refused(ok, kind='cs') is None, str(refused(ok, kind='cs')))
+    check('refused: a kind outside pixel, vertex, mesh and compute (%s)' % refused(ok, kind='gs'), refused(ok, kind='gs') is not None)
     wave64 = ['v_writelane_b32 v10, s0, 40', 'v_writelane_b32 v10, s1, 63', 'v_readlane_b32 s2, v10, 40']
     check('wave64 lanes 40 and 63 are accepted', refused(wave64) is None, str(refused(wave64)))
     check('refused: a shader with branches (%s)' % refused(ok, branches=True), refused(ok, branches=True) is not None)
