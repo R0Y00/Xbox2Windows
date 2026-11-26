@@ -208,7 +208,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-Graphics and compute use cache revisions `x2w-startup-shader-24` and `x2w-startup-shader-24cs`.
+Graphics and compute use cache revisions `x2w-startup-shader-25` and `x2w-startup-shader-25cs`.
+Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
 Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
 treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
 making a later VOP3 lane-mask read of vcc_hi refuse instead of lowering to bit 0. The two cache keys advance together.
