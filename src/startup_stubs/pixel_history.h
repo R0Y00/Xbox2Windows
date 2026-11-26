@@ -14,6 +14,7 @@ namespace x2w_startup {
 struct PixelHistorySample {
     std::uint64_t draw{};
     long frame{};
+    unsigned x{}, y{};
     std::uint64_t key{};
     unsigned count{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
@@ -64,9 +65,9 @@ inline bool pixel_history_write(const char* folder, const PixelHistorySample* sa
     std::fprintf(file, "x2w-pixel-history 1 samples=%zu\n", count);
     for (std::size_t i = 0; i < count; ++i) {
         const PixelHistorySample& sample = samples[i];
-        std::fprintf(file, "draw=%llu frame=%ld key=%016llx count=%u format=%d raw=%08x",
-                     static_cast<unsigned long long>(sample.draw), sample.frame, static_cast<unsigned long long>(sample.key),
-                     sample.count, static_cast<int>(sample.format), sample.raw);
+        std::fprintf(file, "draw=%llu frame=%ld x=%u y=%u key=%016llx count=%u format=%d raw=%08x",
+                     static_cast<unsigned long long>(sample.draw), sample.frame, sample.x, sample.y,
+                     static_cast<unsigned long long>(sample.key), sample.count, static_cast<int>(sample.format), sample.raw);
         if (sample.rgba)
             std::fprintf(file, " rgba=%u,%u,%u,%u", sample.channels[0], sample.channels[1], sample.channels[2],
                          sample.channels[3]);

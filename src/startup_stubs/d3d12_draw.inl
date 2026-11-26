@@ -1610,6 +1610,8 @@ void draw_dump_flush()
             x2w_startup::PixelHistorySample sample{};
             sample.draw = dump.index;
             sample.frame = dump.frame;
+            sample.x = dump.pixel_x;
+            sample.y = dump.pixel_y;
             sample.key = dump.key;
             sample.count = dump.count;
             sample.format = dump.format;

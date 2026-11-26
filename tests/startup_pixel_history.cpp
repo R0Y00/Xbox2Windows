@@ -166,6 +166,8 @@ void record_draw(Target& target, ComputeCommands& commands, ID3D12RootSignature*
     recorded.key = key;
     recorded.sample.draw = draw;
     recorded.sample.frame = 7;
+    recorded.sample.x = 1;
+    recorded.sample.y = 1;
     recorded.sample.key = key;
     recorded.sample.count = 3;
     recorded.sample.format = format;
@@ -250,7 +252,8 @@ int main(int argc, char** argv)
     const bool first_black = has_rgba(first, 0, 0, 0, 0);
     const bool second_green = has_rgba(second, 0, 255, 0, 255);
     const bool third_green = has_rgba(third, 0, 255, 0, 255);
-    const bool second_key = second.find("key=2222222222222222") != std::string::npos && second.find("frame=7") != std::string::npos;
+    const bool second_key = second.find("key=2222222222222222") != std::string::npos && second.find("frame=7") != std::string::npos &&
+                            second.find("x=1 y=1") != std::string::npos;
     bool ok = first_black && second_green && third_green && second_key;
 
     // Negative control: without the second draw the watched texel stays black at draw 3.
