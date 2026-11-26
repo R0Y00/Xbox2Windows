@@ -1,6 +1,6 @@
 """Draw textures published by address (device slot 70) whose texels are in a console layout.
 
-  <consumer> <backend>               eleven textures, each drawn once; every pixel of the 512x128 target is
+  <consumer> <backend>               fourteen textures, each drawn once; every pixel of the 512x128 target is
                                      compared with the texel the view names; then two held descriptions
                                      and one texture whose address is announced as XG rows after it
                                      was published
@@ -145,6 +145,11 @@ CASES = [
     ("RGBA8 100x40 linear chain, mip 0", 100, 40, 4, RGBA8, 0x100, 0),
     ("RGBA8 100x40 linear chain, mip 2", 100, 40, 4, RGBA8, 0x100, 2),
     ("BC1 200x96 linear", 200, 96, 1, BC1, 0x100, 0),
+    # Linear one-dimensional textures (a trailing "1d"): one row per mip, each mip padded to 256 bytes and
+    # stored from the smallest up, so mip 0 of the 300-texel chain starts at 1536, not at 0.
+    ("RGBA8 300 1D linear", 300, 1, 1, RGBA8, 0x100, 0, "1d"),
+    ("RGBA8 300 1D linear chain, mip 0", 300, 1, 4, RGBA8, 0x100, 0, "1d"),
+    ("RGBA8 300 1D linear chain, mip 2", 300, 1, 4, RGBA8, 0x100, 2, "1d"),
 ]
 
 
@@ -195,18 +200,25 @@ LATE = (("RGBA8 96x40 4 KiB standard, XG rows after publication", 96, 40, 1, RGB
 
 
 def check(directory, consumer, backend, case, extra=None, held=None, late=False, unpadded=False):
-    name, width, height, mips, fmt, layout, viewed = case
+    name, width, height, mips, fmt, layout, viewed, *dimension = case
+    one_d = dimension == ["1d"]
     backing, images = build(width, height, mips, fmt, layout, unpadded)
     source = directory / "texels.bin"
     source.write_bytes(backing)
     w, h = max(1, width >> viewed), max(1, height >> viewed)
-    hlsl = ("Texture2D<float4> t : register(t0);\n"
-            "float4 main(float4 p : SV_Position) : SV_Target {\n"
-            f"  return t.Load(int3(uint(p.x) % {w}, uint(p.y) % {h}, 0));\n}}\n")
+    if one_d:
+        hlsl = ("Texture1D<float4> t : register(t0);\n"
+                "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                f"  return t.Load(int2(uint(p.x) % {w}, 0));\n}}\n")
+    else:
+        hlsl = ("Texture2D<float4> t : register(t0);\n"
+                "float4 main(float4 p : SV_Position) : SV_Target {\n"
+                f"  return t.Load(int3(uint(p.x) % {w}, uint(p.y) % {h}, 0));\n}}\n")
     trap_log = directory / "trap.log"
+    desc = f"{width},{height},{mips},{fmt},{layout},{viewed}" + (",1d" if one_d else "")
     modes = {"X2W_TEST_CONSOLE_VIEW": str(source), "X2W_TRAP_LOG": str(trap_log),
-             "X2W_TEST_CONSOLE_DESC": f"{width},{height},{mips},{fmt},{layout},{viewed}", **(extra or {})}
-    actual = draw_texture(directory, consumer, backend, hlsl, modes)
+             "X2W_TEST_CONSOLE_DESC": desc, **(extra or {})}
+    actual = draw_texture(directory, consumer, backend, hlsl, modes, "tex1d" if one_d else "tex2d")
     if actual is None:
         return 77
     if len(actual) != TARGET_W * TARGET_H * 4:
@@ -239,19 +251,25 @@ def check(directory, consumer, backend, case, extra=None, held=None, late=False,
         raise AssertionError(f"{name}: no 'published console layout' line in the log")
     if unpadded:
         if not wrong:
-            raise AssertionError(f"{name}: rows written without the 256-byte pitch drew exactly; the pitch is not checked")
-        print(f"{backend} {name}, rows without the 256-byte pitch: published, {wrong} of {TARGET_W * TARGET_H} pixels differ")
+            raise AssertionError(f"{name}: texels written without the 256-byte padding drew exactly; the padding is not checked")
+        print(f"{backend} {name}, without the 256-byte padding: published, {wrong} of {TARGET_W * TARGET_H} pixels differ")
         return 0
     print(f"{backend} {name}: {TARGET_W * TARGET_H} RGBA pixels exact")
     return 0
 
 
 def check_linear_unpadded(directory, consumer, backend):
-    """The linear cases' negative control: the first linear texture with its rows written one mip wide
-    (400 bytes) instead of at the 256-byte pitch (512). The runtime reads the padded pitch, so the draw must
-    differ from the texels; an exact draw means the linear cases do not test the pitch."""
-    case = next(c for c in CASES if c[5] == 0x100)
-    return check(directory, consumer, backend, case, unpadded=True)
+    """The linear cases' negative control. The first 2D linear texture has its rows written one mip wide
+    (400 bytes) instead of at the 256-byte pitch (512), and the 1D chain viewed at mip 2 has its mips packed
+    without padding, so mip 2 starts at 152 instead of 256. The runtime reads the padded layout, so each draw
+    must differ from the texels; an exact draw means the linear cases do not test the padding."""
+    for name in ("RGBA8 100x40 linear", "RGBA8 300 1D linear chain, mip 2"):
+        case = next(c for c in CASES if c[0] == name)
+        with tempfile.TemporaryDirectory() as temporary:
+            result = check(Path(temporary), consumer, backend, case, unpadded=True)
+        if result:
+            return result
+    return 0
 
 
 GATE_PAYLOADS = 18
@@ -371,8 +389,7 @@ if __name__ == "__main__":
         usage = "usage: startup_address_console_check.py <consumer> <backend> [" + " | ".join(modes) + "]\n"
         sys.exit(usage + "\n\n".join(__doc__.split("\n\n")[:2]))
     if len(sys.argv) == 4 and sys.argv[3] == "linear-unpadded":
-        with tempfile.TemporaryDirectory() as temporary:
-            sys.exit(check_linear_unpadded(Path(temporary), sys.argv[1], sys.argv[2]))
+        sys.exit(check_linear_unpadded(None, sys.argv[1], sys.argv[2]))
     if len(sys.argv) == 4:
         with tempfile.TemporaryDirectory() as temporary:
             sys.exit(check_gate(Path(temporary), sys.argv[1], sys.argv[2], sys.argv[3]))

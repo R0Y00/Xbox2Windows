@@ -49,6 +49,13 @@ D3D12_RESOURCE_DESC texture(UINT width, UINT height, UINT mips, UINT slices, DXG
     return d;
 }
 
+D3D12_RESOURCE_DESC texture_1d(UINT width, UINT mips, UINT slices, DXGI_FORMAT format, UINT layout)
+{
+    D3D12_RESOURCE_DESC d = texture(width, 1, mips, slices, format, layout);
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    return d;
+}
+
 // One format per element size: 1, 2, 4, 8 and 16 bytes.
 constexpr DXGI_FORMAT by_size[5] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
                                     DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT};
@@ -162,7 +169,7 @@ void check_tile64()
 
 void check_distinct_and_round_trip()
 {
-    struct Shape { UINT width, height, mips, slices; DXGI_FORMAT format; UINT layout; };
+    struct Shape { UINT width, height, mips, slices; DXGI_FORMAT format; UINT layout; bool one_d = false; };
     const Shape shapes[] = {
         {1000, 520, 10, 1, DXGI_FORMAT_BC1_UNORM, 0x105}, {300, 200, 9, 2, DXGI_FORMAT_R8_UNORM, 0x109},
         {512, 1056, 1, 1, DXGI_FORMAT_BC1_UNORM, 0x105},   {1024, 2112, 1, 1, DXGI_FORMAT_R16_UNORM, 0x105},
@@ -171,9 +178,11 @@ void check_distinct_and_round_trip()
         {2048, 2048, 12, 1, DXGI_FORMAT_BC5_UNORM, 0x109},
         {100, 10, 3, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, 0x100}, {257, 129, 9, 2, DXGI_FORMAT_R8_UNORM, 0x100},
         {256, 256, 7, 1, DXGI_FORMAT_R32_FLOAT, 0x100},          {64, 64, 4, 3, DXGI_FORMAT_BC1_UNORM, 0x100},
+        {300, 1, 9, 1, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0x100, true}, {4096, 1, 13, 1, DXGI_FORMAT_R8_UNORM, 0x100, true},
     };
     for (const Shape& s : shapes) {
-        const D3D12_RESOURCE_DESC d = texture(s.width, s.height, s.mips, s.slices, s.format, s.layout);
+        const D3D12_RESOURCE_DESC d = s.one_d ? texture_1d(s.width, s.mips, s.slices, s.format, s.layout)
+                                              : texture(s.width, s.height, s.mips, s.slices, s.format, s.layout);
         const std::string name = std::to_string(s.width) + "x" + std::to_string(s.height) + " layout " + std::to_string(s.layout);
         if (!x2w_startup::gfx10::supports(d)) {
             fail(name + ": refused");
@@ -225,6 +234,11 @@ void check_refusals()
     d = good; d.Width = 16385; refused("too wide", d);
     d = good; d.DepthOrArraySize = 0; refused("no slices", d);
     d = good; d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101); d.MipLevels = 2; refused("256 B chain", d);
+    if (!x2w_startup::gfx10::supports(texture_1d(300, 9, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x100)))
+        fail("linear 1D RGBA8 chain refused");
+    refused("1D in a 4 KiB swizzle mode", texture_1d(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x105));
+    d = texture_1d(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x100); d.Height = 2; refused("1D two rows high", d);
+    refused("1D block-compressed", texture_1d(256, 1, 1, DXGI_FORMAT_BC1_UNORM, 0x100));
 }
 
 // The linear mode by hand: a 100x10 R16G16B16A16 texture with three mips. Each mip's pitch is its
@@ -261,6 +275,9 @@ void check_address_textures()
     expect("64 KiB display R16 chain", texture(512, 512, 10, 1, DXGI_FORMAT_R16_UNORM, 0x10a), true);
     expect("desktop layout RGBA8", texture(1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0), false);
     expect("linear mode R8", texture(256, 128, 1, 1, DXGI_FORMAT_R8_UNORM, 0x100), true);
+    expect("linear 1D RGBA8 sRGB", texture_1d(512, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0x100), true);
+    expect("linear 1D array", texture_1d(512, 1, 4, DXGI_FORMAT_R8G8B8A8_UNORM, 0x100), false);
+    expect("desktop layout 1D", texture_1d(512, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0), false);
     expect("XOR mode", texture(256, 256, 1, 1, DXGI_FORMAT_BC7_UNORM, 0x119), false);
     expect("row-major desktop layout", texture(256, 256, 1, 1, DXGI_FORMAT_BC7_UNORM, 1), false);
     expect("unknown element size", texture(256, 256, 1, 1, DXGI_FORMAT_R32G32B32_FLOAT, 0), false);
@@ -343,6 +360,29 @@ void check_address_textures()
     v.Texture3D.MipLevels = 4;
     v.Texture3D.ResourceMinLODClamp = 1.0f;
     if (x2w_startup::address_view_fits(vol, v)) fail("3D volume view explicit LOD clamp");
+
+    const D3D12_RESOURCE_DESC row = texture_1d(300, 9, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x100);
+    v = {};
+    v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+    v.Texture1D.MipLevels = 9;
+    if (!x2w_startup::address_view_fits(row, v)) fail("whole 1D chain view");
+    v.Texture1D.MostDetailedMip = 8;
+    v.Texture1D.MipLevels = 1;
+    if (!x2w_startup::address_view_fits(row, v)) fail("last 1D mip view");
+    v.Texture1D.MipLevels = 2;
+    if (x2w_startup::address_view_fits(row, v)) fail("1D view past the chain");
+    v.Texture1D.MostDetailedMip = 0;
+    v.Texture1D.MipLevels = 1;
+    v.Texture1D.ResourceMinLODClamp = 1.0f;
+    if (x2w_startup::address_view_fits(row, v)) fail("1D view explicit LOD clamp");
+    v.Texture1D.ResourceMinLODClamp = 0.0f;
+    if (x2w_startup::address_view_fits(texture(300, 1, 9, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x100), v))
+        fail("1D view on a 2D texture");
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.Texture2D.MipLevels = 1;
+    if (x2w_startup::address_view_fits(row, v)) fail("2D view on a 1D texture");
 }
 } // namespace
 
@@ -382,7 +422,7 @@ int addrlib_linear_check()
     create.callbacks.freeSysMem = free_sys_mem;
     create.regValue.gbAddrConfig = 0x40 | 4u | (4u << 8);
     if (AddrCreate(&create, &created) != ADDR_OK) return 1;
-    struct Shape { UINT width, height, mips, slices; DXGI_FORMAT format; };
+    struct Shape { UINT width, height, mips, slices; DXGI_FORMAT format; bool one_d = false; };
     const Shape shapes[] = {
         {1, 1, 1, 1, DXGI_FORMAT_R8_UNORM},              {300, 7, 1, 1, DXGI_FORMAT_R8_UNORM},
         {257, 129, 9, 2, DXGI_FORMAT_R8_UNORM},          {100, 10, 3, 2, DXGI_FORMAT_R16G16B16A16_FLOAT},
@@ -390,11 +430,15 @@ int addrlib_linear_check()
         {33, 17, 6, 3, DXGI_FORMAT_R16_UNORM},           {200, 100, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB},
         {48, 40, 4, 2, DXGI_FORMAT_R32G32B32A32_FLOAT},  {64, 64, 4, 3, DXGI_FORMAT_BC1_UNORM},
         {128, 64, 6, 1, DXGI_FORMAT_BC7_UNORM},
+        {300, 1, 9, 1, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, true}, {4096, 1, 13, 1, DXGI_FORMAT_R8_UNORM, true},
+        {1000, 1, 10, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, true},
     };
     unsigned compared = 0, mismatches = 0;
     for (const Shape& s : shapes) {
-        const D3D12_RESOURCE_DESC d = texture(s.width, s.height, s.mips, s.slices, s.format, 0x100);
-        const std::string name = std::to_string(s.width) + "x" + std::to_string(s.height) + " format " +
+        const D3D12_RESOURCE_DESC d = s.one_d ? texture_1d(s.width, s.mips, s.slices, s.format, 0x100)
+                                              : texture(s.width, s.height, s.mips, s.slices, s.format, 0x100);
+        const AddrResourceType type = s.one_d ? ADDR_RSRC_TEX_1D : ADDR_RSRC_TEX_2D;
+        const std::string name = std::string(s.one_d ? "1D " : "") + std::to_string(s.width) + "x" + std::to_string(s.height) + " format " +
                                  std::to_string(s.format) + ", " + std::to_string(s.mips) + " mips";
         if (!x2w_startup::gfx10::supports(d)) {
             fail(name + ": refused");
@@ -408,7 +452,7 @@ int addrlib_linear_check()
         info_out.size = sizeof info_out;
         info_in.flags.texture = 1;
         info_in.swizzleMode = ADDR_SW_LINEAR;
-        info_in.resourceType = ADDR_RSRC_TEX_2D;
+        info_in.resourceType = type;
         info_in.bpp = l.bytes_per_element * 8;
         info_in.width = (s.width + l.texels - 1) / l.texels;
         info_in.height = (s.height + l.texels - 1) / l.texels;
@@ -427,7 +471,7 @@ int addrlib_linear_check()
         in.size = sizeof in;
         in.flags.texture = 1;
         in.swizzleMode = ADDR_SW_LINEAR;
-        in.resourceType = ADDR_RSRC_TEX_2D;
+        in.resourceType = type;
         in.bpp = info_in.bpp;
         in.unalignedWidth = info_in.width;
         in.unalignedHeight = info_in.height;
@@ -481,6 +525,6 @@ int main(int argc, char** argv)
         std::printf("startup_gfx10_layout: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 13 round trips, 1 linear chain, 11 refusals, 19 address descriptions, 27 views)\n");
+    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 15 round trips, 1 linear chain, 14 refusals, 22 address descriptions, 33 views)\n");
     return 0;
 }

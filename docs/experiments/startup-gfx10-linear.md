@@ -53,5 +53,4 @@ ctest --preset dev --no-tests=error -R '^startup_address_console_(warp|hardware|
 - The rule is addrlib's desktop GFX10 rule. That the console stores `0x100` textures with the same
   256-byte pitch is inferred from the layout word naming `ADDR_SW_LINEAR`; no console hardware
   measurement backs it.
-- One-dimensional linear textures need a 1D view in `address_view_fits` and a 1D desktop texture
-  for the upload. They are not covered here.
+- One-dimensional linear textures are covered in [startup-gfx10-linear-1d.md](startup-gfx10-linear-1d.md).

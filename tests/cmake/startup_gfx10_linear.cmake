@@ -9,8 +9,8 @@ if(XBOX2WINDOWS_ADDRLIB_DIR)
 endif()
 add_test(NAME startup_gfx10_layout_linear_addrlib COMMAND startup_gfx10_layout_check --addrlib)
 set_tests_properties(startup_gfx10_layout_linear_addrlib PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
-# The negative control for the linear cases of startup_address_console: rows written without the 256-byte
-# pitch must not draw exactly.
+# The negative control for the linear cases of startup_address_console: a 2D texture and a 1D chain written
+# without the 256-byte padding must not draw exactly.
 if(STARTUP_FXC AND EXISTS "${INTAKE_PYTHON}" AND TARGET startup_stream_consumer)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_address_console_linear_unpadded_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
