@@ -4,7 +4,8 @@ param(
     [ValidateSet('hardware', 'warp')]
     [string]$Backend = 'hardware',
     [string]$ReportPath,
-    [Alias('Adapter')][string]$AdapterFilter
+    [Alias('Adapter')][string]$AdapterFilter,
+    [switch]$NoShaders
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,6 +70,73 @@ foreach ($test in 'dual-uav', 'texture-mips', 'bvh-waves', 'bvh-wave64', 'bvh-di
         Name = "${caseName}_${Backend}"
         Status = $status
         Details = $details
+    })
+}
+
+function Invoke-ShaderCase {
+    param([string]$Id, [string]$Expect, [string]$Mismatch)
+    $files = foreach ($extension in 'cso', 'case') { Join-Path $PSScriptRoot "cases/$Id.$extension" }
+    foreach ($file in $files) {
+        if (-not (Test-Path -LiteralPath $file)) { return [pscustomobject]@{ Status = 'FAIL'; Note = "missing $file" } }
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo.FileName = $binary
+    $process.StartInfo.Arguments = "$Backend --compute-store-case `"$($files[0])`" `"$($files[1])`""
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    try {
+        if ($AdapterFilter -and $Backend -eq 'hardware') { $process.StartInfo.EnvironmentVariables['XBOX2WINDOWS_ADAPTER'] = $AdapterFilter }
+        [void]$process.Start()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(60000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            return [pscustomobject]@{ Status = 'FAIL'; Note = 'timed out after 60 seconds' }
+        }
+        $code = $process.ExitCode
+        # Adapter enumeration notices are not diagnostics of the case.
+        $lines = @(($stderr.Result -split "`r?`n") | Where-Object { $_ -and -not $_.StartsWith('XBOX2WINDOWS_ADAPTER: skipping ') })
+    } catch {
+        return [pscustomobject]@{ Status = 'FAIL'; Note = $_.Exception.Message }
+    } finally {
+        $process.Dispose()
+    }
+    if ($code -eq 77) { return [pscustomobject]@{ Status = 'SKIP'; Note = 'capability skip (exit 77)' } }
+    $first = if ($lines.Count) { $lines[0] } else { '' }
+    if ($Expect -eq 'pass') {
+        if ($code -eq 0 -and -not $lines.Count) { return [pscustomobject]@{ Status = 'PASS'; Note = '' } }
+        return [pscustomobject]@{ Status = 'FAIL'; Note = "exit $code $first" }
+    }
+    # A mutation control must be rejected: a card that reproduces the unmutated result would hide a real difference.
+    $rejected = $code -eq 1 -and ($lines | Where-Object { $_ -like '*expected=*' }) -and (-not $Mismatch -or $first -eq $Mismatch)
+    if ($rejected) { return [pscustomobject]@{ Status = 'PASS'; Note = 'control rejected' } }
+    return [pscustomobject]@{ Status = 'FAIL'; Note = "control not rejected: exit $code $first" }
+}
+
+# Compiled gfx2hlsl compute cases recorded by tools/record_gpu_cases.py: each one is dispatched on this adapter and
+# its output words are compared inside offscreen_check. They need no compiler here. One report section sums them up.
+$manifest = Join-Path $PSScriptRoot 'cases/manifest.tsv'
+if (-not $NoShaders -and (Test-Path -LiteralPath $manifest)) {
+    $rows = @(Get-Content -LiteralPath $manifest | Where-Object { $_ })
+    $shaderLines = [System.Collections.Generic.List[string]]::new()
+    $counts = @{ PASS = 0; FAIL = 0; SKIP = 0 }
+    $shaderLines.Add('translated compute shaders replayed from the package (compiler, case, result)')
+    foreach ($row in $rows) {
+        $field = $row -split "`t"
+        $result = Invoke-ShaderCase -Id $field[0] -Expect $field[2] -Mismatch $field[3]
+        $counts[$result.Status]++
+        $shaderLines.Add(("{0} {1} {2}{3}" -f $field[1], $field[0], $result.Status, $(if ($result.Note) { ": $($result.Note)" } else { '' })))
+    }
+    $shaderLines.Insert(1, "cases: $($counts.PASS) pass, $($counts.FAIL) fail, $($counts.SKIP) skip of $($rows.Count)")
+    $shaderStatus = if ($counts.FAIL) { 'FAIL' } elseif ($counts.PASS) { 'PASS' } else { 'SKIP' }
+    if ($shaderStatus -eq 'FAIL') { $failed = $true }
+    $cases.Add([pscustomobject]@{
+        Name = "gfx2hlsl_shaders_${Backend}"
+        Status = $shaderStatus
+        Details = ($shaderLines -join [Environment]::NewLine)
     })
 }
 
