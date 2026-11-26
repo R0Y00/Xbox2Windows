@@ -165,11 +165,12 @@ check('reading src_scc after s_add_u32 is refused',
                      + encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC)
                      + encode_sopp(SOPP_ENDPGM)) == 'src_scc with unverified SCC')
 
-# 6. Across a control-flow join: branch skips s_nop 0 to target 0x10; incoming SCC at the join is unverified,
-#    so src_scc there is refused unless a modeled writer runs inside the joined block first.
+# 6. Across a control-flow join: branch skips an SCC write to target 0x0c, so the two paths into the join carry
+#    different SCC writes and src_scc there is refused unless a modeled writer runs inside the joined block first.
+#    (A skipped block without an SCC write keeps SCC proven: startup_gfx2hlsl_src_scc_join_check.py.)
 join_refused = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)     # 0x00
                 + encode_sopp(SOPP_CBRANCH_SCC0, simm=1)          # 0x04 -> label_0x0c (skip 1 dword at 0x08)
-                + encode_sopp(SOPP_NOP, simm=0)                   # 0x08
+                + encode_sopc(SOPC_CMP_EQ_U32, S4, S5)            # 0x08
                 + encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC)    # 0x0c (branch target / join)
                 + encode_sopp(SOPP_ENDPGM))                       # 0x10
 check('src_scc across a control-flow join is refused',

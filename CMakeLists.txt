@@ -1516,9 +1516,16 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_dispatch_${backend} COMMAND startup_indirect_dispatch ${backend})
     add_test(NAME startup_indirect_root_constants_${backend} COMMAND startup_indirect_dispatch ${backend} constants)
     add_test(NAME startup_indirect_count_${backend} COMMAND startup_indirect_dispatch ${backend} count)
-    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} startup_indirect_count_${backend} PROPERTIES TIMEOUT 30)
+    # The same cases with the opt-in split of a batched or counted Dispatch into single commands
+    # (split_indirect_dispatch.h), plus the follow-up Dispatch and the pending-allocator reset. The plain count tests
+    # keep the native call.
+    add_test(NAME startup_indirect_count_split_${backend} COMMAND startup_indirect_dispatch ${backend} count)
+    set_tests_properties(startup_indirect_count_split_${backend} PROPERTIES ENVIRONMENT "X2W_SPLIT_INDIRECT_DISPATCH=1")
+    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} startup_indirect_count_${backend}
+                         startup_indirect_count_split_${backend} PROPERTIES TIMEOUT 30)
 endforeach()
-set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware startup_indirect_count_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware startup_indirect_count_hardware
+                     startup_indirect_count_split_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
 # Occlusion queries recorded through command-list slots 28 to 30 reach the readback buffer (#870).
 add_executable(startup_list_queries tests/startup_list_queries.cpp tests/desktop_gpu.cpp)
@@ -3434,6 +3441,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The src_scc scalar source (#1820).
     add_test(NAME startup_gfx2hlsl_src_scc COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_check.py")
+    # src_scc at a branch target that one uniform SCC write reaches on every path.
+    add_test(NAME startup_gfx2hlsl_src_scc_join COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_join_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_src_scc_join_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_src_scc_join_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_src_scc_join_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # image_sample_c_lz with sampler word 2 bits 28-30 set (#1723).
     add_test(NAME startup_gfx2hlsl_sample_c_lz_mip COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sample_c_lz_mip_check.py")
@@ -4038,6 +4054,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     add_test(NAME startup_gfx2hlsl_mad_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad_check.py")
+    add_test(NAME shader_signed_zero_minmax_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/shader_signed_zero_minmax_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME shader_signed_zero_minmax_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/shader_signed_zero_minmax_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(shader_signed_zero_minmax_${adapter} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+    endforeach()
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_mad_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad_check.py" dispatch "${DXC_EXECUTABLE}"
@@ -4373,8 +4397,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_heap_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_compute_live_retry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
         set_tests_properties(startup_compute_dispatch_${adapter} startup_compute_dispatch_texture_${adapter}
-            startup_compute_dispatch_heap_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            startup_compute_dispatch_heap_${adapter} startup_compute_live_retry_${adapter}
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_stream_adapter_filter COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
@@ -4520,6 +4548,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_buffer_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_copied_vertex_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_copied_vertex_srv_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_copied_vertex_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_mubuf_descriptor_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mubuf_descriptor_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -11008,6 +11040,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(runtime_bink_heap_aot_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME bink_frame_aot_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bink_frame_aot_check.py")
+    add_test(NAME runtime_bink_frame_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/bink_frame_aot_cli_check.py")
+    set_tests_properties(runtime_bink_frame_aot_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME cpu_stdio_exe_aot_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu_stdio_exe_aot_check.py")
     # Documented in the AGENTS platform-independent list but never registered here, so ctest did

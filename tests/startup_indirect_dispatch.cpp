@@ -16,6 +16,8 @@
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_fixture_compute_root_uav(void*, UINT, UINT64);
+extern "C" __declspec(dllimport) UINT x2w_d3d12_recording_scratches(void*);
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -25,6 +27,13 @@ using Words = std::vector<std::uint32_t>;
 bool constants = false;
 // The `count` mode runs a three-record argument buffer behind a GPU-written count word (max count 3).
 bool counted = false;
+// X2W_SPLIT_INDIRECT_DISPATCH=1 (the startup_indirect_count_split_* tests): the shim splits a batched or counted
+// Dispatch into single-command calls over a scratch copy of the records (split_indirect_dispatch.h).
+bool split = false;
+// The follow-up case records one more Dispatch(1, 1, 2) on the desktop list after the counted ExecuteIndirect, with
+// the state the shim left there. It adds 1 + 101 = 102 to the result only if the consumer pipeline, its compute root
+// and the result UAV are still bound, also after the split replaced them for its own pass.
+constexpr std::uint32_t follow_up_term = 102;
 constexpr UINT max_commands = 3;
 Words initial;
 UINT argument_bytes = 0;
@@ -62,6 +71,10 @@ void write_count2() { write_records(2); }
 void write_count9() { write_records(9); }
 [numthreads(1, 1, 1)]
 void write_count0() { write_records(0); }
+[numthreads(1, 1, 1)]
+void write_count1() { write_records(1); }
+[numthreads(1, 1, 1)]
+void write_count3() { write_records(3); }
 
 [numthreads(1, 1, 1)]
 void write_args() { data.Store3(4, uint3(4, 3, 2)); }
@@ -148,9 +161,13 @@ enum class Rejection { none, unmapped, short_range, placeholder, other_root, par
 // The constants mode also refuses a rooted signature with two records (rooted_multi) or a count buffer
 // (rooted_count_buffer): batching is rootless-only in this slice.
 // The other-root control binds `other_guest_root`, which lacks the signature's constants.
+// Count mode only: `follow_up` adds the follow-up Dispatch above. `retire` submits through a guest queue held
+// behind a gate fence, resets the guest allocator while that work is still pending, and requires the recording's
+// split scratch to be held until the gate opens and the records run.
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, ID3D12RootSignature* guest_root,
          ID3D12RootSignature* other_guest_root, ID3D12PipelineState* writer, IUnknown* consumer,
-         ID3D12CommandSignature* signature, const Words& record, Rejection rejection)
+         ID3D12CommandSignature* signature, const Words& record, Rejection rejection, bool follow_up = false,
+         bool retire = false)
 {
     const UINT total_bytes = static_cast<UINT>(initial.size() * sizeof(std::uint32_t));
     auto upload = make_buffer(device, total_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -210,7 +227,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
     using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
     slot<Bind>(guest_list.Get(), 25)(guest_list.Get(), consumer);
     slot<Bind>(guest_list.Get(), 33)(guest_list.Get(), rejection == Rejection::other_root ? other_guest_root : guest_root);
-    list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
+    // Bound through the shim, which sets it again after a compute pass of its own (the split of a batched Dispatch).
+    // If the shim has no matching UAV parameter for the bound guest root, bind on the desktop list as before.
+    if (!x2w_d3d12_fixture_compute_root_uav(guest_list.Get(), 0, result->GetGPUVirtualAddress()))
+        list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
     auto* argument = rejection == Rejection::unmapped ? nullptr : guest_arguments.Get();
     UINT64 offset = counted ? 2 * sizeof(std::uint32_t) : argument_offset;
@@ -229,19 +249,54 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
                                             argument, offset,
                                             rejection == Rejection::rooted_count_buffer ? argument : nullptr,
                                             rejection == Rejection::rooted_count_buffer ? sizeof(std::uint32_t) : 0);
+    if (follow_up) list->Dispatch(1, 1, 2);
     transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), argument_bytes, result.Get(), 0, result_bytes);
     using Close = HRESULT (WINAPI*)(IUnknown*);
     check(slot<Close>(guest_list.Get(), 9)(guest_list.Get()), "close guest command list");
+    // Each run records on a fresh guest allocator: an accepted counted call holds one split scratch when the split is on.
+    const bool accepted = rejection == Rejection::none || rejection == Rejection::no_count_buffer;
+    const UINT scratches = counted && split && accepted ? 1 : 0;
+    if (counted && x2w_d3d12_recording_scratches(guest_list.Get()) != scratches) {
+        std::fprintf(stderr, "recording holds %u split scratch buffers after Close, expected %u\n",
+                     x2w_d3d12_recording_scratches(guest_list.Get()), scratches);
+        return false;
+    }
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
-    check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)), "create queue");
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create completion fence");
-    ID3D12CommandList* submitted[]{list};
-    queue->ExecuteCommandLists(1, submitted);
-    check(queue->Signal(fence.Get(), 1), "signal completion fence");
-    check(fence->SetEventOnCompletion(1, nullptr), "wait for completion");
+    if (retire) {
+        // The shim tracks this submission's fence, so the allocator reset below must not release the scratch the
+        // split calls read: the desktop queue waits on the gate before it can run them.
+        ComPtr<IUnknown> guest_queue;
+        check(guest->CreateCommandQueue(&queue_desc, __uuidof(ID3D12CommandQueue),
+                                        reinterpret_cast<void**>(guest_queue.GetAddressOf())), "create guest queue");
+        const auto queue = native_object<ID3D12CommandQueue>(device, guest, guest_queue.Get());
+        ComPtr<ID3D12Fence> gate;
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "create gate fence");
+        check(queue->Wait(gate.Get(), 1), "hold the guest queue on the gate");
+        using Submit = void (WINAPI*)(IUnknown*, UINT, IUnknown* const*);
+        IUnknown* submitted_list = guest_list.Get();
+        slot<Submit>(guest_queue.Get(), 10)(guest_queue.Get(), 1, &submitted_list);
+        const HRESULT reset = allocator->Reset();
+        const UINT held = x2w_d3d12_recording_scratches(guest_list.Get());
+        check(gate->Signal(1), "open the gate");
+        check(queue->Signal(fence.Get(), 1), "signal completion fence");
+        check(fence->SetEventOnCompletion(1, nullptr), "wait for completion");
+        std::printf("retire: allocator reset while pending -> 0x%08lx, recording holds %u split scratch buffers\n",
+                    static_cast<unsigned long>(reset), held);
+        if (FAILED(reset) || held != scratches) {
+            std::fprintf(stderr, "split scratch was released before its submission retired\n");
+            return false;
+        }
+    } else {
+        ComPtr<ID3D12CommandQueue> queue;
+        check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)), "create queue");
+        ID3D12CommandList* submitted[]{list};
+        queue->ExecuteCommandLists(1, submitted);
+        check(queue->Signal(fence.Get(), 1), "signal completion fence");
+        check(fence->SetEventOnCompletion(1, nullptr), "wait for completion");
+    }
     check(device->GetDeviceRemovedReason(), "GPU completion");
 
     const D3D12_RANGE read{0, total_bytes};
@@ -262,9 +317,11 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
                 for (std::uint32_t y = 0; y < expected[3 + 3 * i]; ++y)
                     for (std::uint32_t x = 0; x < expected[2 + 3 * i]; ++x)
                         expected[result_word] += 1 + x + 10 * y + 100 * z;
-        std::printf("%s: count word=%u, executed=%u, result=0x%08x (expected 0x%08x)\n",
+        if (follow_up) expected[result_word] += follow_up_term;
+        std::printf("%s%s%s: count word=%u, executed=%u, result=0x%08x (expected 0x%08x)\n",
                     rejection == Rejection::none ? (writer ? "GPU writer" : "omitted writer")
                                                   : rejection == Rejection::no_count_buffer ? "no count buffer" : "refused call",
+                    follow_up ? " + follow-up Dispatch" : "", retire ? " + retired allocator" : "",
                     observed[1], executed, observed[result_word], expected[result_word]);
         for (std::size_t i = 0; i < expected.size(); ++i) {
             if (observed[i] == expected[i]) continue;
@@ -304,6 +361,10 @@ int main(int argc, char** argv) try
     constants = argc == 3 && std::strcmp(argv[2], "constants") == 0;
     counted = argc == 3 && std::strcmp(argv[2], "count") == 0;
     if (argc > 3 || (argc == 3 && !constants && !counted)) return 2;
+    {
+        char value[4]{};
+        split = GetEnvironmentVariableA("X2W_SPLIT_INDIRECT_DISPATCH", value, sizeof(value)) && value[0] == '1';
+    }
     initial = counted ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x31415926, 0x5a5a5a5a} : constants ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 3, 5, 1, 1, 1, 0x31415926, 0x5a5a5a5a}
                         : Words{0xa5a5a5a5, 0, 0, 0, 0x31415926, 0x5a5a5a5a};
     argument_bytes = static_cast<UINT>((initial.size() - 2) * sizeof(std::uint32_t));
@@ -400,20 +461,28 @@ int main(int argc, char** argv) try
     const auto writer = pipeline(device.Get(), root.Get(), counted ? "write_count2" : constants ? "write_constant_args" : "write_args");
     const auto clamped_writer = pipeline(device.Get(), root.Get(), "write_count9");
     const auto zero_writer = pipeline(device.Get(), root.Get(), "write_count0");
+    const auto one_writer = pipeline(device.Get(), root.Get(), "write_count1");
+    const auto three_writer = pipeline(device.Get(), root.Get(), "write_count3");
     const auto other_writer = pipeline(device.Get(), root.Get(), constants ? "write_swapped_args" : "write_fewer_args");
     const auto consumer = guest_pipeline(guest.Get(), guest_root.Get());
     const auto verify = [&](ID3D12PipelineState* producer, const Words& record, Rejection rejection,
-                            ID3D12CommandSignature* command_signature) {
+                            ID3D12CommandSignature* command_signature, bool follow_up = false, bool retire = false) {
         return run(device.Get(), guest.Get(), root.Get(), guest_root.Get(), other_guest_root.Get(), producer,
-                   consumer.Get(), command_signature, record, rejection);
+                   consumer.Get(), command_signature, record, rejection, follow_up, retire);
     };
     const auto run_counted = [&] {
         const Words records{0, 2, 1, 1, 1, 2, 1, 1, 1, 3};
         const auto with_count = [&](std::uint32_t count) { Words r = records; r[0] = count; return r; };
         const auto& sig = signature;
+        // GPU-written counts 2, above the maximum (9), 0, 1 and 3; a zero count must leave the result untouched.
+        // With the split on, the last case also resets the guest allocator before its submission retires.
         return verify(writer.Get(), with_count(2), Rejection::none, sig.Get()) &&
                verify(clamped_writer.Get(), with_count(9), Rejection::none, sig.Get()) &&
                verify(zero_writer.Get(), with_count(0), Rejection::none, sig.Get()) &&
+               verify(one_writer.Get(), with_count(1), Rejection::none, sig.Get()) &&
+               verify(three_writer.Get(), with_count(3), Rejection::none, sig.Get()) &&
+               verify(writer.Get(), with_count(2), Rejection::none, sig.Get(), true) &&
+               (!split || verify(writer.Get(), with_count(2), Rejection::none, sig.Get(), false, true)) &&
                verify(nullptr, {}, Rejection::none, sig.Get()) &&
                verify(zero_writer.Get(), with_count(0), Rejection::no_count_buffer, sig.Get()) &&
                verify(writer.Get(), with_count(2), Rejection::unmapped, sig.Get()) &&
