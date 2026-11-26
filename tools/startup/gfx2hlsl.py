@@ -2746,6 +2746,7 @@ class Stage:
         descriptor_inputs, buffer_descriptors = set(), set()
         reads_before_write = set()
         defined = {key}
+        keyed = {key}  # scalars whose value depends on the key (so on the iteration) after the instructions so far
         for j in range(head + 2, close - 1):
             base, ops, mods = parse(ins[j][3])
             base = re.sub(r'_e(32|64)$', '', base)
@@ -2771,6 +2772,10 @@ class Stage:
             reads_before_write.update(reads - defined)
             defined.update(writes)
             body_writes.update(may_write)
+            if (reads & keyed) or base == 'buffer_load_dword':
+                keyed.update(may_write)
+            else:
+                keyed -= writes
         if reads_before_write & body_writes:
             return 'body reads loop-carried scalar state'
         # The data byte offset can use the key. Loading or modifying the resource descriptor
@@ -2779,7 +2784,10 @@ class Stage:
             return 'per-lane descriptor selection requires a proven bound heap range'
         # The close leaves EXEC and SCC zero. The last physical pass's other scalar
         # values can differ per lane in this model and must be dead on every successor.
-        if close + 1 < len(ins) and (body_writes - {'scc'}) & live_in[close + 1]:
+        # A scalar written from loop-invariant inputs only (no read of the key or of a key-dependent scalar, no
+        # load through a body address) holds the same value in every iteration, so the last pass's value is each
+        # lane's own: it may be live. The key and anything computed from it may not.
+        if close + 1 < len(ins) and (body_writes - {'scc'}) & live_in[close + 1] & (keyed | {key}):
             return 'body scalar is live at the loop exit'
         if any(name.startswith('s_movrel') for _, _, name, _ in ins):
             return 'relative scalar indexing can observe a loop register'
