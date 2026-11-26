@@ -3756,6 +3756,23 @@ class Stage:
     def pc_index(self):
         return next((i for i, ins in enumerate(self.ins) if ins[0] == self.pc), None)
 
+    def exec_write_exact(self, srcs, syms):
+        """Whether a scalar EXEC write takes every source from a lane mask (vcc, exec, a saved EXEC or a tagged mask) or
+        from the all-zero / all-ones constants: then each lane's bit is the guest's. Any other source (a mask built
+        from a number such as 1) selects guest lanes the one-lane model cannot tell apart."""
+        for tok, sym in zip(srcs, syms):
+            r = reg_range(tok)
+            if tok in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or sym == ('execcopy',) or (
+                    r and r[0] == 's' and r[1] in getattr(self, 'masks', ())):
+                continue
+            try:
+                if int(tok, 0) in (0, -1, 0xffffffff, 0xffffffffffffffff):
+                    continue
+            except ValueError:
+                pass
+            return False
+        return True
+
     def skipped_block_vector_only(self, branch, target):
         """Whether the instructions a forward EXEC branch can skip are per-lane vector work only.
 
@@ -3766,12 +3783,33 @@ class Stage:
         reads nothing later)."""
         if target <= branch:
             return False
-        for off, _n, name, _asm in self.ins:
-            if branch < off < target and not (
-                    (name.startswith('v_') and not name.startswith(('v_cmp', 'v_readlane', 'v_readfirstlane',
-                                                                    'v_writelane')))
+        for off, _n, name, asm in self.ins:
+            if not branch < off < target:
+                continue
+            if name == 's_endpgm':
+                # A quad that ends reads nothing later, unless later code can turn it back on: an EXEC write after the
+                # branch (a restore of a saved mask) would reactivate every quad of the guest wave.
+                if any(o > branch and writes_exec(n, parse(a)[1]) for o, _s, n, a in self.ins):
+                    return False
+                continue
+            if not (self.vector_only_instruction(name, asm)
                     or name.startswith(('image_', 'buffer_', 'tbuffer_', 'global_', 'flat_', 'exp'))
-                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt', 's_endpgm')):
+                    or name in ('s_waitcnt', 's_nop', 's_waitcnt_vscnt')):
+                return False
+        return True
+
+    @staticmethod
+    def vector_only_instruction(name, asm):
+        """A vector ALU instruction whose only destination is a VGPR: no SGPR, VCC or EXEC write (a carry-out, a compare,
+        a readlane), which the guest performs once for the whole wave."""
+        if not name.startswith('v_') or name.startswith(('v_cmp', 'v_readlane', 'v_readfirstlane', 'v_writelane',
+                                                         'v_div_scale', 'v_mad_u64', 'v_mad_i64')):
+            return False
+        if re.match(r'v_(add|sub|subrev)_co|v_addc|v_subb', name):
+            return False
+        for tok in destinations(name, parse(asm)[1]):
+            r = reg_range(tok)
+            if tok in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0') or (r and r[0] == 's'):
                 return False
         return True
 
@@ -4975,6 +5013,10 @@ class Stage:
                         self.align4_v.clear()
                     return None
                 self.exec_known = False
+                if hasattr(self, 'lane_exec_breaks') and not self.exec_write_exact(srcs, syms):
+                    # exec = (expr) & 1 writes every pixel and helper lane alike; the guest enables only the lanes the
+                    # source selects, so the lane's EXEC bit may stop following the guest's from here.
+                    self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
             self.emit('%s = (%s) & 1;' % (var, expr))
             if scc:
                 self.set_scc(scc.replace('$', var))
