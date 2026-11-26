@@ -13,6 +13,12 @@ if (-not $ReportPath) { $ReportPath = Join-Path $PSScriptRoot "gpu-report-$Backe
 $binary = (Get-Item -LiteralPath (Join-Path $PSScriptRoot 'offscreen_check.exe')).FullName
 $revision = (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'SOURCE_COMMIT.txt')).Trim()
 if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'The package is missing a valid source revision.' }
+$manifest = Join-Path $PSScriptRoot 'cases/manifest.tsv'
+if (-not $NoShaders) {
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'The package is missing cases/manifest.tsv.' }
+    $rows = @(Get-Content -LiteralPath $manifest | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not $rows.Count) { throw 'The shader case manifest is empty.' }
+}
 $windows = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $threadUrl = 'https://github.com/R0Y00/Xbox2Windows/issues/1'
 
@@ -118,9 +124,7 @@ function Invoke-ShaderCase {
 
 # Compiled gfx2hlsl compute cases recorded by tools/record_gpu_cases.py: each one is dispatched on this adapter and
 # its output words are compared inside offscreen_check. They need no compiler here. One report section sums them up.
-$manifest = Join-Path $PSScriptRoot 'cases/manifest.tsv'
-if (-not $NoShaders -and (Test-Path -LiteralPath $manifest)) {
-    $rows = @(Get-Content -LiteralPath $manifest | Where-Object { $_ })
+if (-not $NoShaders) {
     $shaderLines = [System.Collections.Generic.List[string]]::new()
     $counts = @{ PASS = 0; FAIL = 0; SKIP = 0 }
     $shaderLines.Add('translated compute shaders replayed from the package (compiler, case, result)')

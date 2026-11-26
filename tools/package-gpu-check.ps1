@@ -24,7 +24,7 @@ try {
     if (-not $dxcLine) { throw 'DXC_EXECUTABLE is not in the CMake cache.' }
     $dxc = $dxcLine.Matches[0].Groups[1].Value
     $python = Join-Path $root 'out/pe-env/Scripts/python.exe'
-    if (-not (Test-Path -LiteralPath $python)) { throw "Missing $python; run tools/dev.ps1 first." }
+    if (-not (Test-Path -LiteralPath $python)) { throw "Missing $python. Create out/pe-env and install requirements-dev.txt before packaging." }
     $cases = Join-Path $stage 'cases'
     if (Test-Path -LiteralPath $cases) { Remove-Item -LiteralPath $cases -Recurse -Force }
     & $python -B tools/record_gpu_cases.py $dxc $cases
