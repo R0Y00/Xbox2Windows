@@ -15515,7 +15515,7 @@ of exec, or 0 / -1), not data such as a group id or `s_mov_b32 M, 16`, whose lan
   `s_and` of exec and a lane mask. A skipped lane keeps its bit, so M needs no zeroing, but M's last write before the
   branch must itself hold lane bits (no branch or branch target after it);
 - compare: a `v_cmp` (not `v_cmpx`) into M, only when `s_mov_b32 M, 0` (or `s_movk_i32 M, 0`) is the last write before the branch;
-- all ones: `s_orn2_b32 M, X, exec_lo`, X a lane mask, only when `s_mov_b32 M, -1` (or `s_movk_i32 M, -1`) is the last write before the branch.
+- all ones: `s_orn2_b32 M, X, exec_lo`, X a lane mask, only when `s_mov_b32 M, -1` is the last write before the branch.
 Zeroing and all-ones writes do not mix, and any other write of M that no later zeroing or all-ones write overwrites
 keeps the refusal.
 
