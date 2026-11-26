@@ -464,6 +464,16 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('image_load_mip tfe')
         if word1 & (1 << 30):
             raise Unsupported('image_load_mip a16')
+    if name == 'global_load_dword':
+        if n != 8 or off + 8 > len(code):
+            raise Unsupported('global_load_dword encoding length %d at +0x%x' % (n, off))
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & (1 << 25):
+            raise Unsupported('global_load_dword reserved bit 25 set at +0x%x' % off)
+        if word1 & (1 << 23):
+            raise Unsupported('global_load_dword nv')
+        if word1 & 0x0000ff00:
+            raise Unsupported('global_load_dword unused data field set at +0x%x' % off)
     if name in LDS_UNUSED_W1_MASK:
         if n != 8 or off + 8 > len(code):
             raise Unsupported('%s encoding length %d at +0x%x' % (name, n, off))
@@ -1215,7 +1225,7 @@ def calculated_pc_proof(ins, kind):
                     scc = None
                 elif not name.startswith(('v_', 's_branch', 's_cbranch_', 's_mov_', 's_movk_', 's_load_',
                                           's_buffer_load_', 's_nop', 's_waitcnt', 's_inst_prefetch', 's_clause',
-                                          'buffer_', 'tbuffer_', 'image_', 'exp', 'ds_')):
+                                          'buffer_', 'tbuffer_', 'global_', 'image_', 'exp', 'ds_')):
                     scc = -1
 
             if name in ('s_swappc_b64', 's_call_b64', 's_rfe_b64'):
@@ -2087,6 +2097,8 @@ class Stage:
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
+    align4_v = ()             # VGPRs proven to hold a multiple of 4 in every lane
+    align4_s = ()             # SGPRs proven to hold a multiple of 4
     used_atomic = ()          # atomic result types ('uint', 'int') needing declarations in main()
     # pixel: VGPR -> (attr, channel, high) of the v_interp_p1ll_f16 that wrote it. Created on first use, because
     # unit probes build a Stage without __init__.
@@ -2366,6 +2378,58 @@ class Stage:
         except ValueError:
             return None
 
+    def operand_align4(self, tok):
+        """True when 32-bit operand tok is proven to be a multiple of 4 in every lane."""
+        if self.is_lane_mask(tok):
+            return False
+        c = self.const_u32(tok)
+        if c is not None:
+            return (c & 3) == 0
+        r = reg_range(tok)
+        if not r or r[1] != r[2]:
+            return False
+        if r[0] == 'v':
+            return r[1] in self.align4_v and r[1] not in self.low16_only_v
+        if r[0] == 's':
+            return r[1] in self.align4_s and self.sym.get(r[1]) is None
+        return False
+
+    def valu_align4(self, base, srcs):
+        """True when a modifier-free VEC_U operation produces a multiple of 4 from srcs."""
+        if base in ('v_add_nc_u32', 'v_sub_nc_u32', 'v_subrev_nc_u32', 'v_or_b32', 'v_xor_b32',
+                    'v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32',
+                    'v_add3_u32', 'v_or3_b32', 'v_xor3_b32', 'v_xad_u32',
+                    'v_min3_u32', 'v_max3_u32', 'v_med3_u32', 'v_min3_i32', 'v_max3_i32', 'v_med3_i32'):
+            return all(self.operand_align4(s) for s in srcs)
+        if base in ('v_and_b32', 'v_mul_lo_u32', 'v_mul_u32_u24', 'v_mul_i32_i24'):
+            return any(self.operand_align4(s) for s in srcs)
+        if base == 'v_lshlrev_b32':
+            return self.operand_align4(srcs[1]) or ((self.const_u32(srcs[0]) or 0) & 31) >= 2
+        if base in ('v_lshl_add_u32', 'v_lshl_or_b32'):
+            return (self.operand_align4(srcs[0]) or ((self.const_u32(srcs[1]) or 0) & 31) >= 2) and self.operand_align4(srcs[2])
+        if base == 'v_add_lshl_u32':
+            return ((self.const_u32(srcs[2]) or 0) & 31) >= 2 or (self.operand_align4(srcs[0]) and self.operand_align4(srcs[1]))
+        if base in ('v_and_or_b32', 'v_mad_u32_u24', 'v_mad_i32_i24', 'v_mad_u32_u16'):
+            return (self.operand_align4(srcs[0]) or self.operand_align4(srcs[1])) and self.operand_align4(srcs[2])
+        return False
+
+    def salu_align4(self, base, srcs):
+        """True when a 32-bit non-mask Stage.scalar operation produces a multiple of 4 from srcs."""
+        if base == 's_mov_b32':
+            return self.operand_align4(srcs[0])
+        if base == 's_lshl_b32':
+            return self.operand_align4(srcs[0]) or ((self.const_u32(srcs[1]) or 0) & 31) >= 2
+        if base in ('s_and_b32', 's_mul_i32'):
+            return any(self.operand_align4(s) for s in srcs)
+        if base == 's_andn2_b32':
+            return self.operand_align4(srcs[0]) or ((self.const_u32(srcs[1]) or 0) & 3) == 3
+        if base in ('s_add_u32', 's_sub_u32', 's_add_i32', 's_sub_i32', 's_or_b32', 's_xor_b32',
+                    's_cselect_b32', 's_min_u32', 's_max_u32', 's_min_i32', 's_max_i32', 's_lshl1_add_u32'):
+            return all(self.operand_align4(s) for s in srcs)
+        if base in ('s_lshl2_add_u32', 's_lshl3_add_u32', 's_lshl4_add_u32'):
+            return self.operand_align4(srcs[1])
+        return False
+
     def read_vcc(self):
         if getattr(self, 'has_branches', False):
             self.vcc_events.setdefault(self.pc, []).append(('read_vcc', None))
@@ -2466,11 +2530,16 @@ class Stage:
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
             self.low16_only_v.discard(n)
 
-    def set_v(self, n, expr, *, low16_only=False):
+    def set_v(self, n, expr, *, low16_only=False, align4=False):
         if getattr(self, 'interp_p1', None):
             self.interp_p1.pop(n, None)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
+        if isinstance(self.align4_v, set):
+            if align4 and not low16_only and (self.exec_known or n in self.align4_v):
+                self.align4_v.add(n)
+            else:
+                self.align4_v.discard(n)
         self.last_v = (n, expr)
         if low16_only:
             if not isinstance(self.low16_only_v, set):
@@ -2553,7 +2622,7 @@ class Stage:
         if getattr(self, 'since_join', None) is not None:
             (self.since_join.add if uniform else self.since_join.discard)(n)
 
-    def set_s(self, n, expr, sym=None, scc=None, uniform=None):
+    def set_s(self, n, expr, sym=None, scc=None, uniform=None, align4=False):
         """Assign scalar register n at run time and/or symbolically.
 
         Any write ends n's life as a lane mask; a caller that writes a mask marks n again after this call.
@@ -2564,6 +2633,13 @@ class Stage:
             self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         getattr(self, 'float_const_s', {}).pop(n, None)
+        if isinstance(self.align4_s, set):
+            if sym is not None and sym[0] == 'const':
+                (self.align4_s.add if (sym[1] & 3) == 0 else self.align4_s.discard)(n)
+            elif sym is None and align4:
+                self.align4_s.add(n)
+            else:
+                self.align4_s.discard(n)
         if sym is not None:
             self.sym[n] = sym
             if sym[0] != 'const':
@@ -3197,6 +3273,8 @@ class Stage:
             self.fetched = False
             self.uniform_v = set()
             self.varying_s = set()
+            self.align4_v = set()
+            self.align4_s = set()
             self.scc_uniform = True
             self.scc_verified = False
             # Offset of the emitted, uniform SCC write that reaches here (None: none, or not proven), and the one
@@ -3241,6 +3319,8 @@ class Stage:
             for instruction_index, (off, n, name, asm) in enumerate(self.ins):
                 if off in splits and off != start:
                     self.pinned_low16_v.update(self.low16_only_v)
+                    self.align4_v.clear()
+                    self.align4_s.clear()
                     self.blocks.append((start, self.lines, None))
                     self.lines, start = [], off
                     self.descriptor_block_first = instruction_index
@@ -3258,12 +3338,16 @@ class Stage:
                     self.scc_def = None
                 if not falls:
                     self.scc_verified = False
+                    self.align4_v.clear()
+                    self.align4_s.clear()
                 # Before the first branch target or terminator every path has run exactly the instructions above, so
                 # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
                     self.heap_index.clear()  # another path into the join may hold a different word
+                    self.align4_v.clear()
+                    self.align4_s.clear()
                     pre_uniform = {
                         r for r in (self.defined_uniform_s if self.since_join is None else self.since_join)
                         if r not in self.varying_s and r not in self.masks
@@ -3961,6 +4045,8 @@ class Stage:
         self.needs_sm6 = True
         self.used_v.add(DPP_SCRATCH)
         self.uniform_v.discard(DPP_SCRATCH)
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(DPP_SCRATCH)
         self.emit('{ uint x2w_q0 = QuadReadLaneAt(%s, 0), x2w_q1 = QuadReadLaneAt(%s, 1),'
                   ' x2w_q2 = QuadReadLaneAt(%s, 2), x2w_q3 = QuadReadLaneAt(%s, 3);'
                   ' uint x2w_lane = ((uint(i.pos.y) & 1u) << 1u) | (uint(i.pos.x) & 1u);'
@@ -4002,6 +4088,8 @@ class Stage:
             for reg in scalar_registers(ops[0]):
                 self.sym.pop(reg, None)
                 self.masks.discard(reg)
+                if isinstance(self.align4_s, set):
+                    self.align4_s.discard(reg)
                 self.varying_s.add(reg)
             if base in ('s_add_u32', 's_addc_u32'):
                 self.scc_uniform = False
@@ -4028,6 +4116,8 @@ class Stage:
                 self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
+            if isinstance(self.align4_v, set):
+                self.align4_v.clear()
             if hasattr(self, 'scc_uniform'):
                 self.scc_uniform = False  # the hardware SCC result is not modelled
             self.scc_verified = False
@@ -4216,7 +4306,8 @@ class Stage:
                 pipe = getattr(self, 'pipe', None)
                 if pipe is not None and isinstance(getattr(pipe, 'uses_sad', None), set):
                     pipe.uses_sad.add(base)
-            return self.set_v(reg_range(ops[0])[1], text.format(*args))
+            align4 = self.valu_align4(base, ops[1:1 + arity])
+            return self.set_v(reg_range(ops[0])[1], text.format(*args), align4=align4)
         if base in SCA:
             return self.scalar(base, ops, mods) if mods else self.scalar(base, ops)
         if base == 's_addc_u32':
@@ -4836,6 +4927,8 @@ class Stage:
                     self.wqm_exec = False  # and the copy can be older than the WQM
                     if hasattr(self, 'uniform_v'):
                         self.uniform_v.clear()
+                    if isinstance(self.align4_v, set):
+                        self.align4_v.clear()
                     return None
                 self.exec_known = False
                 if hasattr(self, 'lane_exec_breaks') and not self.exec_write_exact(srcs, syms):
@@ -4910,7 +5003,8 @@ class Stage:
             high_source = 's%d' % high if high is not None else srcs[0]
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
-        self.set_s(d, expr, scc=None if lane_complement else scc)
+        salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
+        self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
             # Keep the runtime SGPR assignment intact while letting const_words() read inline float patterns
             # such as 0x40000000 (OPAQUE_BLACK, encoded as inline 244 / '2.0').
@@ -5056,7 +5150,9 @@ class Stage:
             value = (sym[1] + imm if add else sym[1] * imm) & 0xffffffff
             self.set_s(d, '0x%08xu' % value, ('const', value))
         else:
-            self.set_s(d, result)
+            was_align4 = d in self.align4_s and sym is None
+            acc_align4 = (was_align4 and (imm & 3) == 0) if add else (was_align4 or (imm & 3) == 0)
+            self.set_s(d, result, align4=acc_align4)
         offset = self.heap_word_offset(ops[0], sym) if hasattr(self, 'heap_index') else None
         if offset:
             p, w, scale, plus = offset
@@ -5507,6 +5603,8 @@ class Stage:
             self.emit('{ uint t = %s(%s, %s%s); s%d = t; scc = t != 0u; }' % (helper, low, amount, sg, d))
         for r in range(d, d + width):
             self.sym.pop(r, None)
+            if isinstance(self.align4_s, set):
+                self.align4_s.discard(r)
             self.used_s.add(r)
             if self.tracks_uniformity():
                 (self.varying_s.discard if uniform else self.varying_s.add)(r)
@@ -5679,6 +5777,74 @@ class Stage:
 
     def op_buffer_load_dwordx4(self, ops, mods):
         self.op_buffer_load_dword(ops, mods, 4)
+
+    def op_global_load_dword(self, ops, mods):
+        # Compute-stage one-dword GLOBAL load in the saddr form (RDNA 2 ISA §9.2, LLVM 15 SelectGlobalSAddr):
+        # ADDR = SADDR[63:0] + zext(VADDR[31:0]) + sext(OFFSET[11:0]), where SADDR is a proven 64-bit root
+        # buffer pointer pair s[base:base+1] (optionally copied or advanced by completed literal s_add_u32 /
+        # s_addc_u32). Modifiers are checked before the operand count so the two-operand `lds` form refuses on
+        # its modifier rather than arity.
+        if getattr(self, 'kind', None) != 'cs':
+            raise Unsupported('global_load_dword')
+        offset = 0
+        for m in mods:
+            if m.startswith('offset:') and re.fullmatch(r'-?(?:0x[0-9a-f]+|\d+)', m[7:]):
+                imm = int(m[7:], 0)
+                if not -2048 <= imm <= 2047:
+                    raise Unsupported('global load offset %s' % m[7:])
+                offset += imm
+            elif m not in ('glc', 'slc', 'dlc'):
+                raise Unsupported('global load modifier %s' % m)
+        if len(ops) != 3:
+            raise Unsupported('global load with %d operands, expected 3' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('global load destination %s' % ops[0])
+        if ops[2] == 'off':
+            raise Unsupported('global load without a scalar address pair')
+        base = reg_range(ops[2])
+        if not base or base[0] != 's' or base[2] - base[1] != 1 or base[1] % 2 or base[2] > 105:
+            raise Unsupported('global load base %s' % ops[2])
+        vaddr = reg_range(ops[1])
+        if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
+            raise Unsupported('global load vaddr %s' % ops[1])
+        p = self.sym.get(base[1])
+        if not p or p[0] != 'ptr':
+            raise Unsupported('global load through s%d holding %s' % (base[1], p))
+        if len(p) > 2 and not isinstance(p[2], int):
+            raise Unsupported('global load through s%d: the pointer was advanced by an untracked offset' % base[1])
+        if p[1][0] != 'root':
+            raise Unsupported('global load through %s' % (p[1],))
+        base_off = p[2] if len(p) > 2 else 0
+        if not isinstance(base_off, int) or isinstance(base_off, bool) or base_off < 0:
+            raise Unsupported('global load through s%d: invalid pointer byte offset %r' % (base[1], base_off))
+        if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[2]) != ptr_high_symbol(p[1], base_off):
+            raise Unsupported('global load through s%d: its high word is not the matching pair' % base[1])
+        # RDNA 2 low-bit GLOBAL alignment depends on SH_MEM_CONFIG.ALIGNMENT_MODE (DWORD rounds down, STRICT /
+        # DWORD_STRICT faults, UNALIGNED gathers across neighbouring DWORDs; Scarlett's setting is unmeasured),
+        # and HLSL ByteAddressBuffer.Load requires a multiple of four. Require proven 4-byte-aligned components.
+        if offset % 4:
+            raise Unsupported('global load at unaligned immediate offset %d' % offset)
+        if base_off % 4:
+            raise Unsupported('global load through s%d at unaligned pointer offset %d' % (base[1], base_off))
+        if not self.operand_align4(ops[1]):
+            raise Unsupported('global load vaddr %s is not proven 4-byte aligned' % ops[1])
+        total_off = base_off + offset
+        if total_off > 0xffffffff or total_off < -0xffffffff:
+            raise Unsupported('global load byte offset %#x' % total_off)
+        buf = self.pipe.resource((p[1], None), 'buf')
+        # Guard the signed 64-bit view-relative byte offset (zext(vaddr) + base_off + sext(offset)) against
+        # [0, 0xffffffff] before converting to a 32-bit ByteAddressBuffer offset so overflow above 4 GiB or
+        # underflow below base cannot wrap into an in-bounds word of a bounded root view.
+        self.emit('a = %s;' % self.u(ops[1]))
+        if total_off > 0:
+            load_expr = '(a <= 0x%08xu ? %s.Load(a + %du) : 0u)' % (0xffffffff - total_off, buf, total_off)
+        elif total_off < 0:
+            mag = -total_off
+            load_expr = '(a >= %du ? %s.Load(a - %du) : 0u)' % (mag, buf, mag)
+        else:
+            load_expr = '%s.Load(a)' % buf
+        self.set_v(dst[1], load_expr)
 
     def op_buffer_store_vs(self, ops, mods, count):
         # Vertex-stage store in the `off` form: scalar byte offset plus the 12-bit immediate, through a
@@ -7546,7 +7712,8 @@ class Stage:
         if len(ops) != 2:
             raise Unsupported('v_mov_b32 with %d operands, expected 2' % len(ops))
         self.reject_lane_mask_data('v_mov_b32', ops[1])
-        self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
+        align4 = not mods and self.operand_align4(ops[1])
+        self.set_v(reg_range(ops[0])[1], self.u(ops[1]), align4=align4)
 
     def op_v_swap_b32(self, ops, mods):
         # VOP1 only (llvm-mc rejects the e64, DPP and SDWA spellings for gfx1013). Both registers exchange
@@ -7567,6 +7734,10 @@ class Stage:
         uniform = (dst in self.uniform_v and self.exec_known, src in self.uniform_v and self.exec_known)
         for reg, flag in zip((src, dst), uniform):
             (self.uniform_v.add if flag else self.uniform_v.discard)(reg)
+        if isinstance(self.align4_v, set):
+            aligned = (dst in self.align4_v and self.exec_known, src in self.align4_v and self.exec_known)
+            for reg, flag in zip((src, dst), aligned):
+                (self.align4_v.add if flag else self.align4_v.discard)(reg)
         exprs = getattr(self, 'uniform_expr', {})
         moved = {src: exprs.pop(dst, None), dst: exprs.pop(src, None)}
         exprs.update({reg: e for reg, e in moved.items() if e is not None and reg in self.uniform_v})
@@ -7583,14 +7754,17 @@ class Stage:
         for source in ops[1:3]:
             self.reject_lane_mask_data('v_cndmask_b32', source)
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
+        align4 = self.operand_align4(ops[1]) and self.operand_align4(ops[2])
         self.set_v(reg_range(ops[0])[1],
-                   '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
+                   '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])), align4=align4)
 
     def op_v_interp_p1_f32(self, ops, mods):
         if ops[1].startswith(('-', '|')):
             raise Unsupported('interpolation source modifier %s' % ops[1])
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(reg_range(ops[0])[1])
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
@@ -8000,6 +8174,9 @@ class Stage:
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(dst[1])
             self.uniform_v.discard(dst[2])
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(dst[1])
+            self.align4_v.discard(dst[2])
         self.clear_low16(dst[1])
         self.clear_low16(dst[2])
         self.used_v.update((dst[1], dst[2]))
@@ -8044,7 +8221,8 @@ class Stage:
         else:
             self.emit('a = %s - %s;' % (a, b))
             self.emit('w = %s > %s ? 1u : 0u;' % (b, a))
-        self.set_v(d[1], 'a')
+        align4 = self.operand_align4(ops[2]) and self.operand_align4(ops[3])
+        self.set_v(d[1], 'a', align4=align4)
         predicate = 'w' if self.exec_known else '(exec & w)'
         if ops[1] in ('vcc', 'vcc_lo'):
             self.emit('vcc = %s;' % predicate)
