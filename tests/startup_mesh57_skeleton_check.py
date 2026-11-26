@@ -188,18 +188,68 @@ WAVE_LOAD_MESH = wave_load_mesh()
 WAVE_LOAD_REFUSAL = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
 WAVE_LOAD_REFUSALS = (
     ('different EXEC compare', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7d28002a'))),
-    ('missing full EXEC reset', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'bf800000'))),
+    ('missing full EXEC reset', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'befe0404'))),
     ('different compare index', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7da80e2a'))),
     ('EXEC write between compare and branch', wave_load_mesh(WAVE_LOAD_PREFIX.replace('beaa0380', 'befe04c1'))),
     ('branch into load block', wave_load_mesh('bf840009 ' + WAVE_LOAD_PREFIX)),
     ('branch to the EXEC-zero instruction', wave_load_mesh('bf840008 ' + WAVE_LOAD_PREFIX)),
-    ('second live scalar write',
+    # The block writes s43, which the join reads, but s43 has no value before the block for an empty wave to keep.
+    ('second live scalar write without an old value',
      wave_load_mesh(body=WAVE_LOAD_BODY + ' beab0386', exports='7e280228 7e2a022b')),
-    ('ordinary SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4000a05'))),
-    ('wider SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4240a08'))),
     ('buffer store', wave_load_mesh(body=WAVE_LOAD_BODY + ' f4600a08 520001e0')),
     ('buffer atomic', wave_load_mesh(body=WAVE_LOAD_BODY + ' e0c81000 80040700')),
+)
+# Blocks that #2660 refused and that the wave block accepts: every scalar instruction of the block runs once for a
+# wave with an active lane, so further scalar loads and writes, live or dead after the join, follow the guest.
+WAVE_LOAD_ACCEPTED = (
+    ('wider SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4240a08'))),
     ('dead scalar result', wave_load_mesh(exports='7e2a0307')),
+    # With the adjacent reset replaced by s_nop, the reset that closes the group-index exchange still reaches the
+    # compare: nothing between them reads or writes EXEC or VCC, and no branch enters that range.
+    ('full EXEC reset earlier in the region', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'bf800000'))),
+)
+# A table load is accepted by the wave block; this one then stops at the register-offset rule of s_load.
+WAVE_LOAD_OTHER_REFUSALS = (
+    ('ordinary SMEM load with a register offset', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4000a05')),
+     "s_load with a register offset through ('table', 1)"),
+)
+
+# Two scalar buffer loads (the second at an offset computed in the block), a dead table load, a dead per-lane VCC compare and a scalar
+# write between the EXEC reset and the compare. The second load reads the same word as WAVE_LOAD_ASM
+# (s45 + 0x1dc = s41 + 0x1e0); the first reads the next word and is dead after the join.
+WAVE_BLOCK_ASM = """s_mov_b32 s40, 0x3e808081
+s_lshl_b32 s41, s6, 8
+s_mov_b32 s42, 6
+v_mov_b32 v7, 0
+s_mov_b64 exec, -1
+s_mov_b32 s43, 0
+v_cmpx_gt_u32_e32 s42, v0
+s_mov_b32 s42, 0
+s_cbranch_execz 11
+s_buffer_load_dword s44, s[16:19], s41 offset:0x1e4
+s_load_dwordx4 s[48:51], s[10:11], 0x0
+s_add_u32 s45, s41, 4
+s_waitcnt lgkmcnt(0)
+s_buffer_load_dword s40, s[16:19], s45 offset:0x1dc
+v_cmp_class_f32_e32 vcc, -1, v7
+v_mov_b32 v7, 1.0
+s_waitcnt lgkmcnt(0)
+s_mov_b64 exec, -1"""
+WAVE_BLOCK_PREFIX = WAVE_LOAD_PREFIX.replace('befe04c1 7da8002a', 'befe04c1 beab0380 7da8002a')
+WAVE_BLOCK_BODY = 'f4200b08 520001e4 f4080c05 fa000000 802d8429 bf8cc07f f4200a08 5a0001dc 7d100ec1 7e0e02f2 bf8cc07f'
+WAVE_BLOCK_MESH = wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY)
+WAVE_BLOCK_REFUSALS = (
+    ('VCC live at the join', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY, exports='7e280228 022a0e80')),
+    ('src_scc in the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beaf03fd')),
+    ('EXEC copied in the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY + ' beb0047e')),
+    ('branch inside the block', wave_load_mesh(WAVE_BLOCK_PREFIX, WAVE_BLOCK_BODY.replace('bf8cc07f', 'bf840000', 1))),
+    ('branch from outside between the reset and the compare', wave_load_mesh('bf840006 ' + WAVE_BLOCK_PREFIX,
+                                                                              WAVE_BLOCK_BODY)),
+    # s_cmp_eq_u32 s43, 0; s_cbranch_scc1 to the execz branch: that path never runs the compare.
+    ('branch from between the reset and the compare past the compare',
+     wave_load_mesh(WAVE_BLOCK_PREFIX.replace('beab0380', 'beab0380 bf06802b bf850002'), WAVE_BLOCK_BODY)),
+    ('EXEC write between the reset and the compare',
+     wave_load_mesh(WAVE_BLOCK_PREFIX.replace('beab0380', 'befe0404'), WAVE_BLOCK_BODY)),
 )
 
 
@@ -522,8 +572,21 @@ def controls():
                    ('wave_any = (tid & ~63u) < ' in text, 'pc = (!wave_any) ?' in text), (True, True))
             expect('the scalar buffer read is inside a branched fall-through',
                    bool(re.search(r'\[branch\] if \(pc == \d+\) \{[^}]*s40 = [^\n]*\.Load\(', text)), True)
-        for what, mesh in WAVE_LOAD_REFUSALS:
+        for what, mesh in WAVE_LOAD_REFUSALS + WAVE_BLOCK_REFUSALS:
             expect(what, request(tmp, mesh)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+        for what, mesh in WAVE_LOAD_ACCEPTED:
+            expect(what + ' translates', request(tmp, mesh)[1], 'ok')
+        for what, mesh, reason in WAVE_LOAD_OTHER_REFUSALS:
+            expect(what, request(tmp, mesh)[1], 'unsupported: ' + reason)
+        key, result = request(tmp, WAVE_BLOCK_MESH)
+        expect('pre-exchange wave block translates', result, 'ok')
+        if result == 'ok':
+            text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            block = re.search(r'\[branch\] if \(pc == \d+\) \{(.*?)\n    \}', text, re.S)
+            expect('the wave block is one branched fall-through', bool(block) and 'pc = (!wave_any) ?' in text, True)
+            if block:
+                expect('both scalar loads and the offset sum run inside it',
+                       (block[1].count('.Load('), bool(re.search(r'\bs45 = ', block[1]))), (2, True))
         # The accepted mesh opcodes cannot produce a lane-varying numeric SGPR here.
         # Inject that analysis fact at the Stage boundary to exercise the uniformity refusal.
         from unittest.mock import patch
@@ -614,6 +677,9 @@ def binary(mc):
     wave_load = mesh.replace('s_mov_b32 s13, s8', WAVE_LOAD_ASM + '\ns_mov_b32 s13, s8')
     wave_load = wave_load.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
     expect('pre-exchange wave load words match llvm-mc', assemble(mc, wave_load), WAVE_LOAD_MESH)
+    wave_block = mesh.replace('s_mov_b32 s13, s8', WAVE_BLOCK_ASM + '\ns_mov_b32 s13, s8')
+    wave_block = wave_block.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
+    expect('pre-exchange wave block words match llvm-mc', assemble(mc, wave_block), WAVE_BLOCK_MESH)
 
 
 # ---- draw: four triangles in a 32x32 target, vertices stored out of order ----------------------
@@ -675,9 +741,11 @@ def rasterise(points, colours, indices, verts, prims):
     return image
 
 
-def draw_wave_load(directory, renderer, adapter):
-    key, result = request(directory, WAVE_LOAD_MESH)
-    expect('pre-exchange wave load compiles', result, 'ok')
+def draw_wave_load(directory, renderer, adapter, mesh=WAVE_LOAD_MESH, label='wave load', dxc=None):
+    """Draw the mesh and compare. With dxc, also draw a mutant whose block branch skips per lane instead of per
+    wave: it must match the per-lane image and differ from the correct one."""
+    key, result = request(directory, mesh)
+    expect('pre-exchange %s compiles' % label, result, 'ok')
     if result != 'ok':
         return 0
     base = Path(directory) / ('%016x' % key)
@@ -689,7 +757,7 @@ def draw_wave_load(directory, renderer, adapter):
     data = bytearray(buffer(points, colours, words))
     struct.pack_into('<f', data, 480, 1.0)
     constants = bytearray(1024)
-    uds = G.MeshPipeline(code(WAVE_LOAD_MESH), code(PIXEL), root()).uds
+    uds = G.MeshPipeline(code(mesh), code(PIXEL), root()).uds
     for slot, count in enumerate((len(triangles), 128)):
         struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
 
@@ -720,16 +788,42 @@ def draw_wave_load(directory, renderer, adapter):
            sum(pixel != (0, 0, 0, 255) for pixel in correct))
     expect('the wave load covers pixels', different > 0, True)
     path = Path(directory) / 'wave-load.bin'
-    for label, image, status, mismatches in (
-            ('wave load', correct, 0, 0), ('swapped wave load selection', swapped, 1, different)):
+    shader = base.with_suffix('.ms57.cso')
+    cases = [(label, shader, correct, 0, 0), ('swapped %s selection' % label, shader, swapped, 1, different)]
+    if dxc:
+        # Lanes outside EXEC in the mixed wave keep the old red when the block is skipped per lane.
+        per_lane = reference_per_lane(points, colours, triangles, bound, old, wave_red)
+        lanes = sum(a != b for a, b in zip(correct, per_lane))
+        expect('the per-lane %s mutant changes pixels' % label, lanes > 0, True)
+        source = base.with_suffix('.ms57.hlsl').read_text()
+        expect('one wave predicate on the block branch', source.count('pc = (!wave_any) ?'), 1)
+        mutated = Path(directory) / 'per-lane.hlsl'
+        mutated.write_text(source.replace('pc = (!wave_any) ?', 'pc = ((exec & 1) == 0) ?'))
+        mutant = Path(directory) / 'per-lane.cso'
+        subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True, capture_output=True)
+        cases += [('per-lane %s against the wave image' % label, mutant, correct, 1, lanes),
+                  ('per-lane %s against its own image' % label, mutant, per_lane, 0, 0)]
+    for what, shader, image, status, mismatches in cases:
         path.write_bytes(bytes(constants) + bytes(data) + b'\xcd' * 80 + b''.join(map(bytes, image)))
-        run = subprocess.run([renderer, adapter, '--mesh-indexed', base.with_suffix('.ms57.cso'),
+        run = subprocess.run([renderer, adapter, '--mesh-indexed', shader,
                               base.with_suffix('.ps57.cso'), path], capture_output=True, text=True)
         if run.returncode == 77:
             print(run.stdout + run.stderr)
             return 77
-        expect(label, (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout), (status, True))
+        expect(what, (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout), (status, True))
+        print('%s: %d pixels differ from the reference' % (what, mismatches))
     return 0
+
+
+def reference_per_lane(points, colours, triangles, bound, old, wave_red):
+    """The image when each lane skips the block by its own EXEC bit: only threads below the bound load."""
+    rendered = list(colours)
+    for tri in triangles:
+        for tid in tri:
+            slot = tid & 15
+            red = wave_red[tid & ~63] if tid < bound else old
+            rendered[slot] = (red, 255 if tid < bound else 0, *colours[slot][2:])
+    return rasterise(points, rendered, triangles, 128, len(triangles))
 
 
 def publish_request(directory, publisher, adapter):
@@ -845,7 +939,10 @@ def draw(dxc, renderer, adapter, publisher=None):
                 return 77
             expect('draw of ' + what, (r.returncode, 'pixels=1024 mismatches=0' in r.stdout), (0, True))
         if publisher is None:
-            return draw_wave_load(tmp, renderer, adapter)
+            status = draw_wave_load(tmp, renderer, adapter)
+            if status:
+                return status
+            return draw_wave_load(tmp, renderer, adapter, WAVE_BLOCK_MESH, 'wave block', dxc)
     return 0
 
 
