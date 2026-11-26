@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -43,6 +44,31 @@ def cpu_checks():
                     wrong.append((a, b, out[key]))
             C.check('%s into %s matches the reference on every bit pair' % (name, dest), not wrong, str(wrong))
     C.check('NOR and NAND references differ', REFERENCES['s_nor_b32'](0, 1) != REFERENCES['s_nand_b32'](0, 1))
+
+
+def accepts(name, dest, kind, group):
+    stage = C.Probe()
+    stage.kind, stage.pipe = kind, SimpleNamespace(group=group)
+    stage.masks.update((1, 2))
+    try:
+        stage.one(name, '%s %s, s1, s2' % (name, dest))
+    except C.G.Unsupported:
+        return False
+    return True
+
+
+def stage_checks():
+    """exec_lo leaves lanes 32..63 alone, so a wave64 stage must keep refusing it (a wave64 wave would keep stale
+    upper lanes active while the low lanes are rewritten). Only a pixel stage or compute with at most 32 threads
+    per group is proven wave32. An SGPR destination is exact per lane in every stage."""
+    for name in REFERENCES:
+        for kind, group, want in (('ps', None, True), ('cs', (32, 1, 1), True), ('cs', (8, 4, 1), True),
+                                  ('cs', (64, 1, 1), False), ('cs', (8, 8, 1), False),
+                                  ('ms', None, False), ('vs', None, False)):
+            C.check('%s into exec_lo in a %s stage%s is %s' % (name, kind, ' of %s threads' % (group,) if group else '',
+                                                              'accepted' if want else 'refused'),
+                    accepts(name, 'exec_lo', kind, group) == want)
+        C.check('%s into s3 stays accepted in a wave64 mesh stage' % name, accepts(name, 's3', 'ms', None))
 
 
 def dispatch(dxc, runner, adapter, name, dest, directory):
@@ -96,6 +122,7 @@ def check_dispatch(dxc, runner, adapter):
 
 def main():
     cpu_checks()
+    stage_checks()
     if C.failures:
         print('FAILED: %s' % ', '.join(C.failures))
         sys.exit(1)

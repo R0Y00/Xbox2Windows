@@ -119,7 +119,9 @@ def code(name, form):
 
 
 class Probe(G.Stage):
-    """A Stage with no pipeline: enough state for decoded instructions to be translated."""
+    """A Stage with no pipeline: enough state for decoded instructions to be translated. It is a pixel stage (wave32)
+    unless a test sets `kind` and `pipe.group`."""
+    kind = 'ps'
 
     def __init__(self):
         self.lines, self.sym = [], {}
