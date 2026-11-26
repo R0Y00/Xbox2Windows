@@ -15668,6 +15668,23 @@ and array views and for unreadable arguments. `startup_address_srv_hardware` and
 `startup_address_srv_warp` also match the five lines of their refused calls (zero address, other
 width, interior address, a buffer view, a destination off the heap) and show the descriptor unchanged.
 
+### Copied raw vertex-buffer SRVs
+
+`startup_copied_vertex_srv` publishes 512-byte and 256-byte raw views of the
+same source-built buffer into separate slots. It copies each view in turn to
+the bound table slot, compares the guest-visible descriptor bytes with the
+source slot, and draws a band with that binding. The vertex shader reads
+distinct words at byte offsets 224 and 288. All 32 pixels must show both words
+with the full view, only the first word with the stale short view, and both
+words again after copying the full view back. This covers the copy and lookup
+sequence through slot 24 for #2695. The descriptor producer in the executable's
+diagnostic run remains unidentified.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer
+ctest --preset release --no-tests=error -R '^startup_(copied_vertex_srv|address_buffer_srv|frame_copy)_(warp|hardware)$' -V
+```
+
 ```powershell
 cmake --build --preset release --target startup_memory_srv_report_check startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^(startup_memory_srv_report|startup_address_srv_)' -V
