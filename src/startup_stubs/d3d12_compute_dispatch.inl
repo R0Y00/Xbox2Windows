@@ -2,7 +2,7 @@
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
 // inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
-// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d float table <param> <byte> channels 4` outputs) named
+// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -23,6 +23,7 @@ struct ComputeTranslation {
         int word_param = -1, word_byte = 0;
         std::uint32_t at = 0, times = 0;
         Source source = root_constant;
+        bool array = false;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -125,6 +126,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.uavs.size())
             tr.uavs.push_back({a, b, true});
+        else if (std::sscanf(line.c_str(), "uav %u tex2da float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().array = true;
+        }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
         // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
@@ -136,7 +142,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
-                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D float texture"
+                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D/2D-array float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
     }
@@ -165,14 +171,13 @@ const char* load_compute_translation(ComputeTranslation& tr)
     return nullptr;
 }
 
-// True when the bound pipeline is a slot 67 placeholder with a request key: the call is then settled here
-// (dispatched, or refused and logged). False leaves it to the desktop-pipeline decision of list_dispatch.
-bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
+// Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
+const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const u64 key = list && pass.pipeline ? pass.pipeline->own().compute_request_key : 0;
-    if (!key) return false;
+    const u64 key = pass.pipeline->own().compute_request_key;
+    const auto [x, y, z] = dispatch.groups;
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
     struct View {
@@ -216,6 +221,10 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
+        if (dispatch.signature && (slot.heap || slot.texture)) {
+            reason = "translated indirect Dispatch requires fixed-table raw buffers";
+            break;
+        }
         std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
         if (slot.word_param >= 0) {
@@ -296,11 +305,20 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             if (!known || record.slot != 19) reason = "an output texture entry is not the token of an unordered access view";
             else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
                 reason = "an output texture view was not created on the desktop";
-            else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
+            else if (slot.array) {
+                // The layer in HLSL is relative to FirstArraySlice: retain the caller's complete view.
+                const auto& a = desc.Texture2DArray;
+                if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+                    reason = "an output texture view is not a 2D array";
+                else if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.SampleDesc.Count != 1 ||
+                         a.PlaneSlice || a.MipSlice >= resource.MipLevels || a.FirstArraySlice >= resource.DepthOrArraySize ||
+                         !a.ArraySize || a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
+                    reason = "an output texture array view is outside the resource";
+            } else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
                                : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                 reason = "an output texture view is not 2D";
-            else if (x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
-            else if (!float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+            if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
+            if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
             // One state per resource here: a texture read and written by the same call is refused. Two outputs
             // of one texture (two mips) share the unordered access state.
             for (std::size_t input = 0; input < inputs && !reason; ++input)
@@ -339,6 +357,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         views[i] = {placed.alias, offset, bytes, true};
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
+    if (dispatch.argument)
+        for (std::size_t i = 0; i < count && !reason; ++i)
+            if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
     // An entry value from a descriptor comes from the words its view was bound from in the loop above.
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
@@ -377,8 +398,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;
-        if (first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16)) log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
-        return true;
+        if (!dispatch.signature && first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16))
+            log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
+        return reason;
     }
     const UINT n = static_cast<UINT>(count);
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
@@ -425,7 +447,12 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     list->SetComputeRootSignature(tr->root.Get());
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
-    list->Dispatch(x, y, z);
+    if (dispatch.signature) {
+        require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);
+    } else {
+        list->Dispatch(x, y, z);
+    }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -441,13 +468,13 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     ++tr->translated;
     ReleaseSRWLockExclusive(&draw_lock);
     static LONG checks;  // as translated draws do: the queue's execute drains the rest
-    if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", 14);
+    if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", dispatch.signature ? 61 : 14);
     InterlockedIncrement(&compute_dispatches_translated);
     static LONG logged;
-    if (first_calls(logged, 8))
+    if (!dispatch.signature && first_calls(logged, 8))
         log("x2w-draw compute %016llx Dispatch(%u, %u, %u) translated: entry [%x %x %x %x], %zu inputs, %zu outputs", key, x, y, z,
             values[0], values[1], values[2], values[3], inputs, count - inputs);
-    return true;
+    return nullptr;
 }
 
 // With the periodic totals: refused dispatches by the first refusal reason of their key, then every key by

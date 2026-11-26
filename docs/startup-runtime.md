@@ -208,9 +208,16 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-19`. Revision 19 folds `s_mov_b32` from a scalar register that
-holds a plain constant, so later reads of the copy use the constant word. The matching compute
-(`x2w-startup-shader-19cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
+Graphics and compute use cache revisions `x2w-startup-shader-25` and `x2w-startup-shader-25cs`.
+Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
+Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
+treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
+making a later VOP3 lane-mask read of vcc_hi refuse instead of lowering to bit 0. The two cache keys advance together.
+Revision 22 invalidates compute shaders that assumed the entry EXEC mask at a load reached on a later
+loop iteration after an EXEC write. The two cache keys advance together.
+Revision 21 refuses a compute lane-mask form that revision 20 translated (`s_and_b32 M, X, exec_lo` with X data).
+Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch.
+Revision 19 folds `s_mov_b32` from a scalar register that holds a plain constant, so later reads of the copy use the constant word. The fixed slot 57 mesh
 (`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
 Revisions before 19 read a register copied from a constant as a run-time value.
 Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
@@ -1456,7 +1463,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
-| `X2W_XMEM_LAZY_STARTUP=1` | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks placed by `X2W_XMEM_STARTUP_BELOW_40` stay committed up front. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
+| `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
@@ -1594,8 +1601,9 @@ explicit overwrite and normal completion, with the legacy setting on and off.
 resource whose final guest Release happened and whose desktop object is still
 alive, once, by the first cause that applies. Format: `reason=count/bytes(oldest Nf)`,
 bytes from the budget ticket, `oldest` in frames since the final Release:
-- `view-refs`: a tracked slot 18 descriptor still names it;
-  `view-refs-in-visible-heap` is the part with a descriptor in a shader-visible heap.
+- `view-refs`: a tracked descriptor slot still names it (a slot 18 SRV, and since
+  Slice 3a a slot 19 UAV, 20 RTV or 21 DSV); `view-refs-in-visible-heap` is the
+  slot-18 part with a descriptor in a shader-visible heap.
 - `list-hold`, `flight`: a closed or recording list, or a submission, holds a
   desktop reference.
 - `queued-waiting-fence`: queued, the release-time fence of a queue has not passed;
@@ -1613,24 +1621,46 @@ recorded and no line is built.
 
 Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
 targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
-described above. A resource leaves the class for good when a UAV/RTV/DSV view is
-created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
-an untracked descriptor slot or is copied out of tracked heaps, when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
-SRV keeps the resource only when the desktop created the view: desktop view
-creation returns `void`, so a removed device is the only failure it reports, and
-a slot whose creation failed is recorded without a reference. Tracked
-slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+described above. A descriptor slot the shim shadows (`HeapInfo::shadow`) holds one
+reference for each materialized view it names: a slot 18 SRV, and since Slice 3a
+also a slot 19 UAV (one for the view resource and one for its counter resource),
+a slot 20 RTV and a slot 21 DSV. `note_view` adds the references when a view is
+written into a tracked slot (writing the same view again adds nothing), and the
+same functions release exactly the references they added: `note_view` on an
+overwrite, `note_copy` when a copy moves another view over the slot or into
+another tracked slot, and the heap's `Release` through `retire_drop_heap_views`
+when the slot's heap is destroyed. A view the desktop did not create (a removed
+device) is recorded unmaterialized: it releases the slot's previous references
+and adds none. A resource leaves the class for good when a view call targets a
+descriptor slot no heap shadow tracks, or a copy moves a tracked view into an
+untracked heap (`retire_leave_class`, slots 18-21, a slot 19 counter too), when
+it is passed to MakeResident or Evict (slots 34 and 35), or when it is presented.
+Tracked views (including slot 70 `device_memory_srv`) keep the resource retained
 while any descriptor slot in `HeapInfo::shadow` names it (updated across
 `note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
 bound textures via `retire_hold`. Only wrappers can be in the class; a raw
 desktop pointer never is. Sampler feedback is not checked: no device slot of the
 stand-in reaches it.
 
+The 19-21 references free nothing on their own yet: the class still excludes a
+texture created with the render-target, depth-stencil or unordered-access flag
+(`retire_classify`), and desktop creates a UAV/RTV/DSV only on a resource that
+carries the matching flag. A class texture's 19-21 view call is therefore the
+console-only case the shim refuses (a UAV of a depth texture, an RTV of a texture
+without render-target); it records no view, adds no reference, and the texture
+still retires once it is released and its fences have passed. The accounting is
+the prerequisite for a later slice that admits those textures. The slots 19-21
+fallback is unchanged: in a heap the shim does not shadow the call keeps
+`retire_leave_class`, so nothing is freed under a descriptor the shim cannot
+follow. `X2W_D3D12_RELEASE_RETIRED_VIEWS` no longer clears live descriptors; it is a legacy
+diagnostic that logs that clearing is disabled and enables the retirement
+breakdown. A tracked descriptor reference in any of slots 18-21 keeps its resource
+until the slot is overwritten, copied over, or its heap is destroyed (#2679).
+
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
-passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
-recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+passed, all tracked descriptor references (slots 18-21) have dropped to zero, and
+no recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
 resolve destination (19), or translated draw SRV bind that the stand-in forwards
 makes the list hold a desktop reference to each resource of the class it names,
 source and destination, until the list is Reset, fails to Close or is destroyed. A list
@@ -1672,8 +1702,18 @@ and a translated draw that samples such a texture through a descriptor table (th
 token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
 a clear sentinel corner, and the texture leaves the budget only after the closed draw
 recording is dropped); the `_off_` case checks that an ordinary committed texture (no
-title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
-`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+title memory) still records its upload. Since Slice 3a the title fixture also drives the
+19-21 descriptor references: case 8 creates an RTV, a DSV and a UAV (and a buffer UAV with
+a counter resource) in tracked heap slots and checks through the retire probe that each
+materialized view adds one reference per slot - slot 19 one for its resource and one for
+its counter - that the same view written again adds nothing, and that overwrite, a
+`CopyDescriptorsSimple` copy and heap destruction each release exactly what was added
+(including a view in an untracked desktop heap, which adds none); case 9 checks the
+`view_slot` fallback in both switch modes: a refused RTV on a class texture in a tracked
+slot stays in the class and retires, while the same call into a descriptor slot the shim
+does not shadow keeps `retire_leave_class` and the texture stays retained. The fixture-only
+exports `x2w_d3d12_retire_probe` (which reports the resource's tracked slot references as
+`view_refs`), `x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
 `x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
@@ -2876,7 +2916,8 @@ experimental `x2w_xmem_page_stats` export.
 
 The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
 its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
-committed, is zeroed on reuse, and is chosen before a fresh slot. The experimental `x2w_xmem_slab_stats`
+committed, is zeroed on reuse, and is chosen before a fresh slot; once all slots of a slab are freed and
+unpinned, the empty slab is closed and its commit is returned to the OS. The experimental `x2w_xmem_slab_stats`
 export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
 calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
 injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages

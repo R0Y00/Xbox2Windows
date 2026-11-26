@@ -6,7 +6,7 @@ The translator keeps the SGPRs that hold a lane mask (a v_cmp destination, a sav
 scalar logic op with a mask source is lowered as a mask op: its result is reduced to the lane's bit. The generic
 scalar path cleared the mark when it overwrote a register with ordinary data, but the other writers did not:
 after `v_cmp_eq_u32_e64 s6, v0, v1` and `s_buffer_load_dword s6, s[16:19], 0x0`, s6 holds a buffer word, yet
-`s_or_b32 s8, s6, s7` was still lowered as a mask OR and cut to bit 0. Every scalar write through `set_s` now clears
+`s_or_b32 s8, s6, s20` was still lowered as a mask OR and cut to bit 0. Every scalar write through `set_s` now clears
 the mark (the writers of a mask mark the register again after it), and `s_load` clears it on its destination
 registers, also in the forms that only record a descriptor symbol.
 
@@ -66,11 +66,11 @@ def run(s, *texts):
 
 
 def or_value(s, s6, s7):
-    """Value of s8 after s_or_b32 s8, s6, s7, from the emitted line."""
+    """Value of s8 after s_or_b32 s8, s6, s20, from the emitted line."""
     s.lines = []
-    run(s, 's_or_b32 s8, s6, s7')
+    run(s, 's_or_b32 s8, s6, s20')
     line = next(l for l in s.lines if l.startswith('s8 = '))
-    return Expr(line[5:-1]).run({'s6': s6, 's7': s7})[0], line
+    return Expr(line[5:-1]).run({'s6': s6, 's20': s7})[0], line
 
 
 COMPARE = 'v_cmp_eq_u32_e64 s6, v0, v1'
@@ -121,6 +121,25 @@ def main():
             check('control: %s after the load translates' % writer, False, error)
             continue
         check('control: %s after the load marks s6 again' % writer, 6 in s.masks, (s.masks, s.lines))
+
+    # A lane mask read as a number is refused in the pixel and vertex stages too (the wave's ballot word is every lane's
+    # bit, the model holds one): the compare into vcc_lo then v_cvt_f32_u32, and the compare into s0 then s_add_i32.
+    for kind in ('ps', 'vs'):
+        for compare, use in (('v_cmp_lt_u32_e32 vcc_lo, 5, v0', 'v_cvt_f32_u32_e32 v1, vcc_lo'),
+                             ('v_cmp_lt_u32_e64 s0, 5, v0', 's_add_i32 s1, s0, 0')):
+            s = stage()
+            s.kind = kind
+            run(s, compare)
+            try:
+                run(s, use)
+                check('%s: %s after %s is refused' % (kind, use, compare), False, s.lines)
+            except G.Unsupported as why:
+                check('%s: %s after %s is refused' % (kind, use, compare), 'as numeric data' in str(why), str(why))
+        s = stage()
+        s.kind = kind
+        run(s, 'v_cmp_lt_u32_e64 s0, 5, v0', 's_mov_b32 s0, 7')   # overwritten: a number again
+        run(s, 's_add_i32 s1, s0, 0')
+        check('%s: a mask register overwritten by a constant is a number again' % kind, 0 not in s.masks, s.masks)
 
     if failures:
         print('FAILED: %d check(s)' % failures)
