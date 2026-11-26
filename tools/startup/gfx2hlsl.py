@@ -4695,9 +4695,9 @@ class Stage:
             # A write to exec_lo leaves lanes 32..63 alone, so it is exact only where the wave is proven wave32:
             # a pixel stage, or compute with at most 32 threads per group (as the b32 waterfall close requires).
             # Other stages (the slot 57 mesh stage is wave64) keep refusing it.
+            kind = getattr(self, 'kind', 'ps')  # a bare test probe has no pipeline and stands for a pixel stage
             group = getattr(getattr(self, 'pipe', None), 'group', None)
-            wave32_stage = self.kind == 'ps' or (
-                self.kind == 'cs' and group is not None and group[0] * group[1] * group[2] <= 32)
+            wave32_stage = kind == 'ps' or (kind == 'cs' and group is not None and group[0] * group[1] * group[2] <= 32)
             exec_dest = (dname == 'exec_lo' and base in ('s_nand_b32', 's_nor_b32') and wave32_stage)
             lane_complement = (word_complement and (sgpr_dest or exec_dest)
                                and all(mask_source(t) for t in (ops[1:] if exec_dest else srcs)))
