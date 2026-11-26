@@ -43,6 +43,7 @@ def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare(directory)
+        env.pop('X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT', None)  # prepare() copies os.environ: every baseline run starts with the flag off
         env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
             env['X2W_TEST_DISPATCH_HARDWARE'] = '1'

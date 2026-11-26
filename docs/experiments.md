@@ -199,8 +199,8 @@ which needs `X2W_TRANSLATED_INDIRECT_COPY_RANGES=1`), else a snapshot of the ran
 into the upload ring when the Dispatch is recorded, else the refusal `an input is in a placed buffer that does not alias title
 memory`. A guest write after the recording is not seen, and data a GPU pass wrote into such a buffer is not either. The first
 use per pipeline key logs `x2w-draw compute <key> input <n> (...) comes from a GPU copy this list made|a snapshot of title
-memory`, and the render totals line counts both paths. Off by default; `tools/startup/tester_run.ps1` turns it on
-(`-NoTitleInputSnapshot` turns it off). `startup_compute_dispatch_input` covers it with the `dispatch-input-snapshot` case.
+memory`, and the render totals line counts both paths. Off by default. To turn it on for a run, set `$env:X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT = "1"` in the PowerShell session before
+starting `tools/startup/run.ps1`, which passes the session's environment on to the run. `startup_compute_dispatch_input` covers it with the `dispatch-input-snapshot` case.
 
 The source-built fixture reproduces a 68-byte request shape with source offset `0xbfffa0`.
 Its compute writer fills the source with contrasting colours. The consumer reads red
