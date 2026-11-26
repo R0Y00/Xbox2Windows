@@ -109,9 +109,9 @@ refused('lane 63 leaves the 64 KiB allocation',
 # Non-affine and unproven addresses.
 refused('entry v0 as the address', run(ALLOC, 'ds_write_b32 v0, v2', BARRIER, 'ds_read_b32 v3, v0', PRIM), 'is proven')
 refused('plain copy of the entry v0',
-        run(ALLOC, 'v_mov_b32_e32 v1, v0', 'ds_write_b32 v1, v2 offset:16', POS), 'is proven')
+        run(ALLOC, 'v_mov_b32_e32 v1, v0', 'ds_write_b32 v1, v8 offset:16', POS), 'is proven')
 refused('low half of the lane count alone (lanes 32..63 share a value)',
-        run(ALLOC, LANE[0], 'ds_write_b32 v1, v2', POS), 'is proven')
+        run(ALLOC, LANE[0], 'ds_write_b32 v1, v8', POS), 'is proven')
 refused('sum of two lane-varying registers (non-affine)',
         run(ALLOC, *LANE, 'v_add_nc_u32 v10, v1, v2', 'ds_write_b32 v10, v8', POS), 'only valid as an LDS address')
 refused('product of the lane id with itself (non-affine)',
@@ -146,9 +146,9 @@ REFUSED = [
     ('primitive export after a branch', (PRIM,), 'non-identity primitive export', True),
     ('unknown message', ('s_sendmsg 0x2',), 's_sendmsg'),
     ('allocation message with stream bits', ('s_sendmsg 0x109',), 's_sendmsg'),
-    ('LDS write in a pixel shader', ('ds_write_b32 v1, v2 offset:16',), 'ds_write_b32',
+    ('LDS write in a pixel shader', ('ds_write_b32 v1, v8 offset:16',), 'ds_write_b32',
      False, 'ps'),
-    ('LDS after a branch', (*LANE, 'ds_write_b32 v1, v2 offset:16'), 'requires a straight-line vertex shader', True),
+    ('LDS after a branch', (*LANE, 'ds_write_b32 v1, v8 offset:16'), 'requires a straight-line vertex shader', True),
 ]
 for label, instructions, reason, *extra in REFUSED:
     branch = bool(extra and extra[0])
