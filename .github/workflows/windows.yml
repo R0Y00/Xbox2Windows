@@ -314,7 +314,8 @@ jobs:
             tests/startup_build_rev_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_gfx2hlsl_int_alu_check.py \
-            tests/startup_gfx2hlsl_interp_f16_check.py             tests/startup_gfx2hlsl_interp_p2_hi_check.py \
+            tests/startup_gfx2hlsl_interp_f16_check.py \
+            tests/startup_gfx2hlsl_interp_p2_hi_check.py \
             tests/startup_gfx2hlsl_sgpr_spill_check.py \
             tests/startup_gfx2hlsl_spill_branches_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
@@ -331,6 +332,7 @@ jobs:
             tests/startup_gfx2hlsl_s_quadmask_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
+            tests/startup_gfx2hlsl_cmp_class_f16_sdwa_check.py \
             tests/startup_gfx2hlsl_mul_hi_i32_check.py \
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
