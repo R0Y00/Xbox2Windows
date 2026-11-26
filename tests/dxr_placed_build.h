@@ -150,7 +150,8 @@ public:
         sizes.UpdateScratchDataSizeInBytes = top_size.ScratchDataSizeInBytes;
         const auto request = [&](UINT64 source, bool update) {
             auto build = top;
-            build.Inputs.Flags = update ? (build.Inputs.Flags | update_flag) : (build.Inputs.Flags & ~update_flag);
+            // A valid update repeats the source's flags, ALLOW_UPDATE included (the structure it writes stays updatable).
+            build.Inputs.Flags = update ? (build.Inputs.Flags | update_flag | allow_flag) : (build.Inputs.Flags & ~update_flag);
             build.SourceAccelerationStructureData = source;
             build.DestAccelerationStructureData = build.ScratchAccelerationStructureData = 0;
             return build;
