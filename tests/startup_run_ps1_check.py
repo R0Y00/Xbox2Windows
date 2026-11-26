@@ -137,7 +137,7 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
     (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit), encoding="utf-8")
     (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(early_exit=early_exit), encoding="utf-8")
-    build = root / ("build with spaces" if absolute_build else "bld")
+    build = root / ("build [with spaces]" if absolute_build else "bld")
     build.mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
         (build / f"{dll}.dll").write_bytes(b"")
@@ -181,6 +181,9 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
         printed = [line.strip() for line in stdout if line.strip()]
         error_text = stderr.read().strip()
     found = []
+    for dll in DLLS:
+        if not (exe.parent / f"{dll}.dll").is_file():
+            found.append(f"stand-in {dll}.dll was not copied")
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
     want_output = STUB_LINES[:HEAD_LINES]
