@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -39,8 +40,11 @@ def routing_failures(rows):
 
 
 def inside(root, name):
-    path = (root / name).resolve()
-    if not path.is_relative_to(root) or path == root or Path(name).is_absolute():
+    """Resolve a package-relative path, normalizing root so unnormalized '..' in root does not reject valid names."""
+    base = root.resolve()
+    path = (base / name).resolve()
+    if (not path.is_relative_to(base) or path == base or
+            Path(name).is_absolute() or str(name).startswith(("/", "\\"))):
         raise ValueError(f"Invalid package path: {name}")
     return path
 
@@ -210,7 +214,7 @@ def collect(root, candidate, baseline, integrity, report):
     return 0
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("candidate", type=Path, nargs="?", help="Separate file, or omit to use the manifest path")
     parser.add_argument("--build", type=Path)
@@ -225,11 +229,46 @@ def main(argv=None):
         if len(builds) != 1:
             parser.error("Use --build to select a package")
         args.build = builds[0].parent
-    root = args.build.resolve()
-    reports = args.reports.resolve()
+    try:
+        if not args.build.exists():
+            raise FileNotFoundError(f"--build directory not found: {args.build}")
+        if not args.build.is_dir():
+            raise NotADirectoryError(f"--build path is not a directory: {args.build}")
+        if args.reports.is_symlink():
+            raise ValueError(f"failed to write report in {args.reports}: report directory must not be a symlink")
+        if args.reports.is_file():
+            raise ValueError(f"failed to write report in {args.reports}: path is a regular file")
+        for parent in args.reports.parents:
+            if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+                raise NotADirectoryError(
+                    f"failed to write report in {args.reports}: parent is not a directory: {parent}"
+                )
+        root = args.build.resolve()
+        reports = args.reports.resolve()
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if reports.is_relative_to(root) or reports.is_relative_to(PROJECT / "game-files"):
         parser.error("Choose a report directory outside game files")
     integrity = args.integrity or PROJECT / "out/integrity" / (root.name + ".json")
+    try:
+        if (
+            args.candidate is not None
+            and (args.candidate.exists() or args.candidate.is_symlink())
+            and not args.candidate.is_file()
+        ):
+            raise ValueError(f"candidate path is not a regular file: {args.candidate}")
+        if args.baseline.is_dir():
+            raise IsADirectoryError(f"--baseline path is a directory: {args.baseline}")
+        if not args.baseline.is_file():
+            raise FileNotFoundError(f"--baseline file not found: {args.baseline}")
+        if integrity.is_dir():
+            raise IsADirectoryError(f"--integrity path is a directory: {integrity}")
+        if not integrity.is_file():
+            raise FileNotFoundError(f"--integrity file not found: {integrity}")
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     report = {"schema": 1, "status": "error"}
     try:
         code = collect(root, args.candidate.resolve() if args.candidate else None,
@@ -244,12 +283,22 @@ def main(argv=None):
             print(f"unsupported: {row['image']} -> {row['dll']}!{row['symbol']}", file=sys.stderr)
         if failures:
             code = 1
-    reports.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(mode="w", suffix=".tmp", dir=reports, encoding="utf-8", delete=False) as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    dest = Path(f.name).with_suffix("." + report["status"] + ".json")
-    Path(f.name).rename(dest)
+    tmp_path = None
+    try:
+        reports.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(mode="w", suffix=".tmp", dir=reports, encoding="utf-8", delete=False) as f:
+            tmp_path = Path(f.name)
+            json.dump(report, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        dest = tmp_path.with_suffix("." + report["status"] + ".json")
+        os.replace(tmp_path, dest)
+        tmp_path = None
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"error: failed to write report in {reports}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
     print(f"{report['status']} | {dest}")
     if "error" in report:
         print(report["error"])

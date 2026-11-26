@@ -129,6 +129,6 @@ pactl list short sink-inputs
 On Windows, these checks cover the Wine differences above (`startup_debug` fails its debug-heap control under Wine):
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_debug$' --output-on-failure
+ctest --preset dev --no-tests=error -R '^startup_debug' --output-on-failure
 ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V
 ```

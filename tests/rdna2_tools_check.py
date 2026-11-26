@@ -4309,6 +4309,54 @@ class TestRdna2Scanner(unittest.TestCase):
         )
         self.assertEqual(missing, [])
 
+    def test_permlane_cross_lane_census_preserves_lowering_refusal(self):
+        # gfx1013 VOP3 bytes use the same valid VGPR/SGPR operands in all three forms.
+        encodings = (
+            ("000077d701050c00", "v_permlane16_b32", "VALU (Cross-lane)"),
+            ("000078d701050c00", "v_permlanex16_b32", "VALU (Cross-lane)"),
+            ("000044d701050c00", "v_perm_b32", "VALU (Vector ALU)"),
+        )
+        results = []
+        for wave_size in (32, 64):
+            for encoding, opcode, category in encodings:
+                with self.subTest(wave_size=wave_size, opcode=opcode):
+                    instruction = disasm_rdna2(bytes.fromhex(encoding))[0]["assembly"]
+                    self.assertEqual(instruction, f"{opcode} v0, v1, s2, s3")
+                    shader = [
+                        "v_mov_b32_e32 v1, 1",
+                        "s_mov_b32 s2, 0",
+                        "s_mov_b32 s3, 0",
+                        instruction,
+                        "v_cvt_pkrtz_f16_f32_e32 v16, v0, v0",
+                        "exp mrt0 v16, v16, v16, v16 done compr vm",
+                        "s_endpgm",
+                    ]
+                    record = analyze_shader_instructions(
+                        f"ps_{opcode}_wave{wave_size}", shader, wave_size=wave_size
+                    )
+                    self.assertTrue(record["opcodes_recognized"])
+                    self.assertFalse(record["translator_accepted"])
+                    self.assertEqual(record["compatibility_category"], "opcode_recognized_translator_rejected")
+                    self.assertEqual(record["lower_error_kind"], "translator_rejection")
+                    self.assertEqual(record["lower_error"], f"Unsupported instruction 3: {instruction}")
+                    self.assertEqual(record["unsupported_details"], [
+                        {"line_number": 4, "raw": instruction, "opcode": opcode, "category": category},
+                    ])
+                    results.append(record)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_file, _ = generate_progress_dashboard(results, Path(tmp))
+            report = json.loads(json_file.read_text(encoding="utf-8"))
+        cross_lane = report["subsystems"]["VALU (Cross-lane)"]
+        self.assertEqual(cross_lane["total_instructions"], 4)
+        self.assertEqual(cross_lane["distinct_opcodes"], 2)
+        self.assertCountEqual(cross_lane["top_opcodes"], ["v_permlane16_b32", "v_permlanex16_b32"])
+        missing = {row["opcode"]: row for row in report["missing_opcodes_ranked"]}
+        for _, opcode, category in encodings:
+            self.assertEqual(missing[opcode]["category"], category)
+            self.assertEqual(missing[opcode]["occurrences"], 2)
+
+
     def test_accepted_full_shader(self):
         """Canonical straight-line pixel shader accepted by pixel_aot translator."""
         canonical_shader = [
@@ -6110,10 +6158,10 @@ class TestRdna2Scanner(unittest.TestCase):
         """Issue #928: the 64-bit VOP3 shifts are supported with at most one SGPR or literal source."""
         for line in ("v_lshlrev_b64 v[12:13], v20, v[18:19]", "v_lshrrev_b64 v[2:3], s46, v[4:5]",
                      "v_ashrrev_i64 v[2:3], 0x41, v[4:5]", "v_lshlrev_b64 v[2:3], v1, s[4:5]",
-                     "v_ashrrev_i64 v[2:3], 3, -1", "v_lshlrev_b64_e64 v[2:3], v1, v[4:5]"):
+                     "v_ashrrev_i64 v[2:3], 3, -1", "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64_e64 v[2:3], v1, v[4:5]"):
             self.assertTrue(is_instruction_supported(line), line)
         for line in ("v_lshlrev_b64 v[2:3], s4, s[4:5]", "v_lshlrev_b64 v[2:3], 0x41, s[4:5]",
-                     "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
+                     "v_lshlrev_b64 v[2:3], s4, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
                      "v_lshlrev_b64_e32 v[2:3], v1, v[4:5]", "v_lshlrev_b64 v[2:3], -v1, v[4:5]"):
             self.assertFalse(is_instruction_supported(line), line)
 
@@ -6200,7 +6248,7 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_add_f16_e64 v24, 3, v19", "v_add_f16_e64 v24, v18, 3", "v_add_f16_e64 v24, 3.0, v19",
             "v_add_f16_e64 v24, 0x10000, v19", "v_add_f16_e64 v24, v256, v19", "v_add_f16_e64 v256, v18, v19",
             "v_add_f16_e64 v24, s106, v19", "v_add_f16_e64 v24, v18", "v_add_f16_e64 v24, v18, v19, v19",
-            "v_fma_f16_e64 v24, v18, v19, v19", "v_fract_f16_e64 v24, v18", "v_mul_f16_e64 v24, v18, v19 clamp",
+            "v_fma_f16_e64 v24, v18, v19, v19", "v_rcp_f16_e64 v24, v18", "v_mul_f16_e64 v24, v18, v19 clamp",
             "v_floor_f16_e64 v24, -v18", "v_floor_f16_e64 v24, |v18|", "v_floor_f16_e64 v24, v18 clamp",
             "v_floor_f16_e64 v24, v18 mul:2", "v_floor_f16_e64 v24, 3", "v_floor_f16_e64 v24, 0x10000",
             "v_floor_f16_e64 v24, v256", "v_floor_f16_e64 v24, v18, v19", "v_rndne_f16_e64 v24",

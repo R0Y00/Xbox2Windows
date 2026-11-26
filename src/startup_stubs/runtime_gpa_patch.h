@@ -16,7 +16,8 @@
 
 namespace x2w_runtime_patch {
 
-enum class Kind : unsigned char { get_proc_address = 1, query_api_impl = 2 };
+// registry: one of the registry imports named by console_mode.h (classified by its own caller).
+enum class Kind : unsigned char { get_proc_address = 1, query_api_impl = 2, registry = 3 };
 
 struct Hit {
     Kind kind;
@@ -113,9 +114,9 @@ inline bool c_string_in_image(const unsigned char* base, std::size_t image_size,
     return false;
 }
 
-template <class Fn>
+template <class Classify, class Fn>
 int visit_named_thunks(const unsigned char* base, std::size_t image_size, const char* dll, std::uint32_t name_table_rva,
-                       std::uint32_t iat_rva, bool delay_import, Fn on_hit)
+                       std::uint32_t iat_rva, bool delay_import, Classify classify, Fn on_hit)
 {
     int hits = 0;
     for (std::uint32_t ti = 0;; ++ti) {
@@ -139,10 +140,11 @@ int visit_named_thunks(const unsigned char* base, std::size_t image_size, const 
     return hits;
 }
 
-// Walk a PE image's import and delay-import tables. Invokes `on_hit(Hit)` for each classified import.
-// Returns the number of hits. Malformed images stop the walk and return what was found.
-template <class Fn>
-int visit_imports(const unsigned char* base, std::size_t image_size, Fn on_hit)
+// Walk a PE image's import and delay-import tables. Invokes `on_hit(Hit)` for each import that
+// `classify(dll, name, &kind)` accepts. Returns the number of hits. Malformed images stop the walk
+// and return what was found.
+template <class Classify, class Fn>
+int visit_imports_with(const unsigned char* base, std::size_t image_size, Classify classify, Fn on_hit)
 {
     if (!readable_range(base, image_size, 0, sizeof(DosStub))) return 0;
     const auto* dos = reinterpret_cast<const DosStub*>(base);
@@ -167,7 +169,7 @@ int visit_imports(const unsigned char* base, std::size_t image_size, Fn on_hit)
             if (!imp->name || !imp->original_first_thunk || !imp->first_thunk) continue;
             if (!c_string_in_image(base, image_size, imp->name)) continue;
             const char* dll = reinterpret_cast<const char*>(base + imp->name);
-            hits += visit_named_thunks(base, image_size, dll, imp->original_first_thunk, imp->first_thunk, false, on_hit);
+            hits += visit_named_thunks(base, image_size, dll, imp->original_first_thunk, imp->first_thunk, false, classify, on_hit);
         }
     }
 
@@ -181,10 +183,18 @@ int visit_imports(const unsigned char* base, std::size_t image_size, Fn on_hit)
             if (!delay->dll_name || !delay->original_first_thunk || !delay->first_thunk) continue;
             if (!c_string_in_image(base, image_size, delay->dll_name)) continue;
             const char* dll = reinterpret_cast<const char*>(base + delay->dll_name);
-            hits += visit_named_thunks(base, image_size, dll, delay->original_first_thunk, delay->first_thunk, true, on_hit);
+            hits += visit_named_thunks(base, image_size, dll, delay->original_first_thunk, delay->first_thunk, true, classify, on_hit);
         }
     }
     return hits;
+}
+
+// The runtime proxy's own imports: GetProcAddress from any module, QueryApiImpl from xgameruntime.dll.
+template <class Fn>
+int visit_imports(const unsigned char* base, std::size_t image_size, Fn on_hit)
+{
+    return visit_imports_with(base, image_size, [](const char* dll, const char* name, Kind* kind) { return classify(dll, name, kind); },
+                              on_hit);
 }
 
 }  // namespace x2w_runtime_patch

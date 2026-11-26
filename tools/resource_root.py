@@ -1,5 +1,6 @@
 """Check the root instance of a relocated PRD0 v0x7a resource in one zlib member."""
 import argparse
+from collections.abc import Sequence
 import json
 from pathlib import Path
 import struct
@@ -56,20 +57,29 @@ def integer(text: str) -> int:
     return int(text, 0)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--offset", type=integer, required=True, help="Byte offset of the zlib member")
     parser.add_argument("--stored", type=integer, required=True, help="Exact compressed size in bytes")
     parser.add_argument("--decoded", type=integer, required=True, help="Exact uncompressed size in bytes")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if args.offset < 0:
+            raise ValueError(f"Expected non-negative --offset, got {args.offset}")
+        if args.stored <= 0:
+            raise ValueError(f"Expected positive --stored, got {args.stored}")
+        if args.decoded <= 0:
+            raise ValueError(f"Expected positive --decoded, got {args.decoded}")
+        if args.archive.is_dir():
+            raise ValueError(f"Archive path is a directory: {args.archive}")
         with args.archive.open("rb") as stream:
             kind, size = read_member(stream, args.offset, args.stored, args.decoded)
-    except (OSError, ValueError, zlib.error) as error:
+    except (OSError, ValueError, struct.error, zlib.error) as error:
         parser.exit(1, f"{args.archive}: {error}\n")
     print(json.dumps({"root_type_hash": f"0x{kind:08x}", "root_bytes": size}))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

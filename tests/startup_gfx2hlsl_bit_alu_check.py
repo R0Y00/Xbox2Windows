@@ -54,6 +54,7 @@ OPS = {
     'v_ffbh_u32': (1, True, lambda x: next((k for k in range(32) if x >> (31 - k) & 1), MASK)),
     'v_ffbh_i32': (1, True, ref_ffbh_i32),
     'v_bfrev_b32': (1, True, lambda x: int('{:032b}'.format(x)[::-1], 2)),
+    'v_bfm_b32': (2, False, lambda w, o: (((1 << (w & 31)) - 1) << (o & 31)) & MASK),  # D.u = ((1 << S0[4:0]) - 1) << S1[4:0]
     'v_xor3_b32': (3, False, lambda x, y, z: x ^ y ^ z),  # LLVM 15 VOP3 v_xor3_b32: D.u = S0.u ^ S1.u ^ S2.u
 }
 # mnemonic -> (pattern in the translated text, replacement): a wrong lowering of the same operation
@@ -64,6 +65,8 @@ MUTATIONS = {
     'v_ffbh_u32': (r'31u - firstbithigh', 'firstbithigh'),                    # counts from the low end
     'v_ffbh_i32': (r'asint\((v\d+)\) < 0 \? ~v\d+ : v\d+', r'\1'),            # negative values scanned as is
     'v_bfrev_b32': (r'reversebits\((v\d+)\)', r'\1'),                         # not reversed
+    'v_bfm_b32': (r'\(\(\(1u << \((v\d+) & 31\)\) - 1\) << \((v\d+) & 31\)\)',
+                  r'(((1u << (\2 & 31)) - 1) << (\1 & 31))'),                # width and offset swapped
     'v_xor3_b32': (r'(v\d+) \^ (v\d+) \^ v\d+', r'\1 ^ \2'),                    # the third operand is dropped
 }
 # mnemonic -> the word the mutated lowering must produce, defined from the mutation and the inputs with plain integer
@@ -75,6 +78,7 @@ MUTATION_REF = {
     'v_ffbh_u32': lambda x: MASK if x == 0 else x.bit_length() - 1,
     'v_ffbh_i32': lambda x: MASK if x in (0, MASK) else 32 - x.bit_length(),
     'v_bfrev_b32': lambda x: x,
+    'v_bfm_b32': lambda w, o: (((1 << (o & 31)) - 1) << (w & 31)) & MASK,
     'v_xor3_b32': lambda x, y, z: x ^ y,
 }
 SPECIAL = [0, 1, 2, 3, 0x7f, 0x80, 0xff, 0x7fffffff, 0x80000000, 0x80000001, 0xfffffffe, MASK, 0x55555555,
@@ -85,6 +89,7 @@ GRID = {
     'v_bfe_i32': [(x, off, w) for x in SPECIAL for off in range(32) for w in range(32)]
                  + [(x, off, w) for x in SPECIAL for off, w in ((32, 33), (63, 0xffffffe5), (0x25, 0x1f))],
     'v_bcnt_u32_b32': [(x, y, 0) for x in BITS for y in (0, 1, 32, MASK)],
+    'v_bfm_b32': [(w, o, 0) for w in list(range(34)) + [0x3f, 0x40, 0xffffffe0, MASK] for o in list(range(34)) + [0x3f, MASK]],
     'v_xor3_b32': [(x, y, z) for x in XOR3_WORDS for y in XOR3_WORDS for z in XOR3_WORDS],
 }
 for _name, (_arity, _vop1, _ref) in OPS.items():
@@ -98,6 +103,7 @@ DRAW = {
                        (0x55555555, 0, 0), (0, MASK, 0), (0xf0f0f0f0, 7, 0), (0x00010000, 0x80000000, 0)],
     # Three different sources in every byte (13/24/fe, 57/68/dc, 9b/ac/ba, df/e0/98), so dropping any one source,
     # or OR, AND or an add for the XOR, reads a different word; the other sets check zero, all ones and a repeat.
+    'v_bfm_b32': [(8, 4, 0), (31, 1, 0), (32, 5, 0), (33, 31, 0), (0, 0, 0), (1, 31, 0), (0x25, 0x3f, 0), (MASK, MASK, 0)],
     'v_xor3_b32': [(0x13579bdf, 0x2468ace0, 0xfedcba98), (0x2468ace0, 0xfedcba98, 0x13579bdf),
                    (0xfedcba98, 0x13579bdf, 0x2468ace0), (0x0f0f0f0f, 0xa5c30f96, 0x80000001),
                    (0, 0, 0), (MASK, MASK, MASK), (0x13579bdf, 0x13579bdf, 0x2468ace0), (0, 0xdeadbeef, MASK)],
@@ -123,6 +129,8 @@ BODY_WORDS = {
         '0077187e0d00bbd50101000002771c7e0f00bbd503010000'),
     'v_bfrev_b32': bytes.fromhex(
         '0071187e0d00b8d50101000002711c7e0f00b8d503010000'),
+    'v_bfm_b32': bytes.fromhex(
+        '0c0063d7000902000d0063d7010b02000e0063d7020d02000f0063d7030f0200'),
     'v_xor3_b32': bytes.fromhex(
         '0c0078d5000922040d0078d5010b26040e0078d5020d2a040f0078d5030f2e04'),
 }
@@ -267,6 +275,9 @@ class Expr:
             return v, True
         if name in ('asuint', 'uint'):
             return v, False
+        if name == 'abs':
+            assert s, 'abs of an unsigned value'  # HLSL abs of a uint is the identity
+            return (-v if v & 0x80000000 else v) & MASK, True
         if name == 'min':
             assert not s and not rest[0][1]
             return min(v, rest[0][0]), False
@@ -357,6 +368,9 @@ def controls():
     check('the same forms without a modifier or operand error translate', not any(refused(a) for a in (
         'v_ffbh_i32_e64 v1, v2', 'v_bfe_i32 v1, v2, v3, v4', 'v_bcnt_u32_b32 v1, v2, v3', 'v_bfrev_b32 v1, v2',
         'v_xor3_b32 v1, v2, v3, v4')))
+    check('v_bfm_b32 has no VOP2 spelling: _e32 refused, _e64 and the bare name translate',
+          refused('v_bfm_b32_e32 v1, v2, v3') and not refused('v_bfm_b32_e64 v1, v2, v3')
+          and not refused('v_bfm_b32 v1, v2, v3'))
     check('modifiers refused', all(refused(a) for a in (
         'v_ffbh_u32_e64 v1, v2 clamp', 'v_bfe_i32 v1, v2, v3, v4 clamp', 'v_bcnt_u32_b32 v1, v2, v3 clamp',
         'v_ffbl_b32_e64 v1, v2 mul:2', 'v_bfrev_b32_e64 v1, -v2', 'v_ffbh_i32_e64 v1, |v2|',
