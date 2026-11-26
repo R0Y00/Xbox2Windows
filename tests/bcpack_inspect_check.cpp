@@ -3,6 +3,7 @@
 // Each stream decodes with decode_bcpack as it is; the cases change only the destination size, the input
 // length or one input byte. --mutate collapse is the negative control: every failure is reported as one
 // class, which this test must reject.
+#include "bcpack_encoder.h"
 #include "startup_stubs/bcpack_inspect.h"
 
 #include <cstdint>
@@ -200,6 +201,54 @@ void test_bc7()
           "bc7 one block decodes to the vector's block");
 }
 
+// BC3, BC4 and BC5 have lane layouts too (the alphabets bcpack_encoder_check round-trips through decode_bcpack).
+// Streams come from the test-only encoder, which is not a stream a title wrote: the cases check that the class is
+// the lane state's reading and never unsupported_format, and that every answer agrees with decode_bcpack.
+void test_bc345()
+{
+    using C = InspectClass;
+    struct Layout {
+        unsigned format;
+        std::size_t lanes, block_bytes, symbols_per_block;
+        uint8_t ab[12];
+    };
+    const Layout layouts[3] = {
+        { 3, 12, 16, 2, { 3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7 } },
+        { 4, 12, 8, 1, { 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 } },
+        { 5, 12, 16, 2, { 3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 } },
+    };
+    bcpack_test::Rng rng{ 77 };
+    for (const Layout& l : layouts) {
+        const std::string name = "bc" + std::to_string(l.format);
+        const std::size_t blocks = 40, size = blocks * l.block_bytes;
+        bcpack_test::Options options;
+        options.unflushed = true;
+        Bytes stream;
+        std::vector<uint16_t> symbols;
+        check(bcpack_test::make_stream(l.ab, l.lanes, blocks * l.symbols_per_block, rng, options, stream, symbols),
+              name + " encoder");
+        const InspectResult exact = inspect(stream, l.format, size);
+        check(exact.cls == C::ok && exact.bytes_read == stream.size() &&
+                  exact.min_symbols_per_lane == blocks * l.symbols_per_block &&
+                  exact.max_symbols_per_lane == blocks * l.symbols_per_block,
+              name + " exact: " + x2w_bcpack::inspect_class_name(exact.cls));
+        expect_class(name + " exact agrees", stream, l.format, size, C::ok);
+        expect_class(name + " half the blocks", stream, l.format, size / 2, C::request_shorter_than_stream);
+        expect_class(name + " one byte after the end", padded(stream, 0x5a, 1), l.format, size, C::trailing_input);
+        expect_class(name + " misaligned", stream, l.format, size - 1, C::destination_misaligned);
+        const InspectResult longer = inspect(stream, l.format, size * 2);
+        check((longer.cls == C::request_longer_than_stream || longer.cls == C::truncated_in_fragment) &&
+                  !decodes(stream, l.format, size * 2),
+              name + " twice the blocks: " + x2w_bcpack::inspect_class_name(longer.cls));
+        const InspectResult cut = inspect(truncated(stream, stream.size() / 2), l.format, size);
+        check((cut.cls == C::truncated_in_fragment || cut.cls == C::request_longer_than_stream) &&
+                  !decodes(truncated(stream, stream.size() / 2), l.format, size),
+              name + " half the stream: " + x2w_bcpack::inspect_class_name(cut.cls));
+        // The BC1 layout is not this one: a stream of another format is named by the lanes, not refused as a format.
+        check(inspect(stream, l.format == 4 ? 5 : 4, size).cls != C::unsupported_format, name + " read as another format");
+    }
+}
+
 // A fragment header whose first byte names an alphabet wider than 8 bits cannot come from the BC1 or BC7
 // layouts, whose alphabets never go below 3 bits. A one-lane decode with a 2-bit alphabet reaches it.
 void test_lane_report()
@@ -238,6 +287,7 @@ int main(int argc, char** argv)
     }
     test_bc1();
     test_bc7();
+    test_bc345();
     test_lane_report();
     std::printf("bcpack_inspect_check: %d cases, %d failed%s\n", cases, failures, collapse ? " (collapsed control)" : "");
     return failures ? 1 : 0;

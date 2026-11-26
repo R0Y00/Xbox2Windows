@@ -4,8 +4,10 @@
 //
 // The class is a reading of lane state, not a proof about the source data. A stream cut exactly at a
 // fragment boundary in every lane reads as request_longer_than_stream, because it is a shorter stream.
-// Only the formats decode_bcpack decodes through decode_lanes here (BC1 and BC7) have a lane layout;
-// add a layout entry when decode_bcpack gains a format.
+// Every format decode_bcpack decodes (BC1, BC3, BC4, BC5 and BC7) has a lane layout here, the same alphabets and
+// symbols per block; add a layout entry when decode_bcpack gains a format. The BC1, BC3, BC4 and BC5 block
+// stages fail only on a destination that is too small, which this header never passes, so only BC7 has a
+// control_code_unmapped class.
 #pragma once
 
 #include <cstddef>
@@ -56,6 +58,9 @@ struct InspectLayout {
 inline constexpr InspectLayout INSPECT_LAYOUTS[] = {
     { 1, 12, { 7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7 }, 8, 1 },
     { 7, 16, { 3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4 }, 16, 2 },
+    { 3, 12, { 3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7 }, 16, 2 },
+    { 4, 12, { 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 }, 8, 1 },
+    { 5, 12, { 3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 }, 16, 2 },
 };
 
 inline const InspectLayout* inspect_layout(unsigned format) {
