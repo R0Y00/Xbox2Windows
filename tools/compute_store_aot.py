@@ -94,6 +94,8 @@ SALU = {
     # RDNA2 SOP2: temp.i64 = (int64)S0.i32 - (int64)S1.i32; D.i32 = temp.i32[31:0]; SCC = (temp.i64 != (int64)D.i32) ? 1 : 0 (unread).
     "s_sub_i32": "({0} - {1})",
     "s_and_b32": "({0} & {1})",
+    "s_bitset0_b32": "({0} & ~(1u << ({1} & 31u)))",
+    "s_bitset1_b32": "({0} | (1u << ({1} & 31u)))",
     "s_or_b32": "({0} | {1})",
     "s_xor_b32": "({0} ^ {1})",
     "s_lshr_b32": "({0} >> ({1} & 31u))",
@@ -1289,6 +1291,17 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         ):
             op, dst = m[1], int(m[2])
             words = [alu_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
+            if dst > 105 or dst in pending or None in words:
+                raise ValueError("Unverified scalar ALU operand")
+            expression = SALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            scalar[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"(s_bitset[01]_b32) s(\d+), {SALU_SOURCE}", line):
+            # SOP1 s_bitset0_b32 and s_bitset1_b32 clear or set bit src0[4:0] of sD and keep its other bits, so sD
+            # is read as well as written: it must already hold a known word. SCC is not written.
+            op, dst = m[1], int(m[2])
+            words = [alu_word(f"s{dst}", scalar, vector, pending, sizes), alu_word(m[3], scalar, vector, pending, sizes)]
             if dst > 105 or dst in pending or None in words:
                 raise ValueError("Unverified scalar ALU operand")
             expression = SALU[op].format(*map(hlsl_word, words))
