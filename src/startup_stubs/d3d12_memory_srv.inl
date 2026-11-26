@@ -523,24 +523,21 @@ const char* console_address_hold(Wrapper* device, u64 address, const D3D12_RESOU
     return x2w_startup::gfx10::Layout(desc).bytes() > reported ? "console_layout_beyond_xg_size" : nullptr;
 }
 
-// Why publish_tiled_texture (or the lookup of a live resource) gave no texture: the three causes the census
-// keeps apart. `published` is true when a publication was attempted (BC, console layout, single element), false when
-// only a live resource with this base and description could have served the view.
-constexpr u64 max_published_texture_bytes = 64ull << 20;  // the transient upload ring's single-copy limit
+// Why publish_tiled_texture (or the lookup of a live resource) gave no texture: the causes the census keeps apart
+// (x2w_startup::texture_unavailable_cause).
 const char* texture_unavailable_reason(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc, bool published)
 {
-    if (!published) return "texture_no_resource";
-    const auto bytes = address_texture_bytes(device, desc);
-    if (bytes > max_published_texture_bytes) return "texture_over_64mib";
-    if (!x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return "texture_unreadable";
-    return "texture_unavailable";  // publication failed for another reason (no wrapper)
+    const u64 bytes = published ? address_texture_bytes(device, desc) : 0;
+    return x2w_startup::texture_unavailable_cause(published, bytes, [&] {
+        return x2w_local::readable(reinterpret_cast<const void*>(address), bytes);
+    });
 }
 
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     const auto bytes = address_texture_bytes(device, desc);
     // The transient upload ring accepts individual copies up to 64 MiB.
-    if (bytes > max_published_texture_bytes || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
+    if (bytes > x2w_startup::max_published_texture_bytes || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
     const auto [first, last] = tiled_srv_addresses.equal_range(address);
     for (auto it = first; it != last; ++it) {
