@@ -350,6 +350,52 @@ dimensions, formats, resources and counters that are left alone. A rewrite must 
 field of the description. `startup_null_texture_view_unchecked_fallback_control` rewrites without
 asking about R8G8B8A8 and must fail.
 
+## Unknown and mismatched view dimensions
+
+A view description with `ViewDimension` 0 (UNKNOWN) makes desktop D3D12 remove the device instead of
+failing the call, and so does a dimension that does not suit the resource (debug layer: "The
+ViewDimension in the View Desc is incompatible with the type of the Resource"). Measured: a console
+package module made such SRVs on 2D RGBA8 textures. Views of device slots 18 to 21 (shader resource,
+unordered access, render target, depth stencil) are now checked before they are forwarded:
+
+- an SRV (slot 18) with dimension 0 gets the resource's default view (a null description) where
+  desktop allows one: a texture with a typed format that is not a depth format. The default view
+  replaces the whole description, including its format and component mapping. Only this SRV case is
+  measured. With dimension 0 every other view is skipped;
+- a dimension whose resource dimension differs from the resource's is skipped.
+
+The default view for UAV, RTV and DSV descriptions with dimension 0 is an explicit experiment,
+`X2W_D3D12_VIEW_DEFAULTS=all`: it is unmeasured, and it drops the requested format the same way.
+`X2W_D3D12_VIEW_DEFAULTS=off` skips the SRV case too. Any other value, or none, keeps the SRV
+default.
+
+A refused SRV, for any reason, writes a null SRV (R8G8B8A8_UNORM, the requested dimension where it
+is a texture dimension, else 2D) into its destination descriptor. Otherwise the slot would keep the
+view it held before. That view would still be bindable and would be copied by `CopyDescriptors`,
+although the slot's record no longer keeps its resource alive. Translated draws already resolve the
+slot to nothing.
+
+A refused UAV, RTV or DSV leaves the previous descriptor and its tracking record in place.
+
+The first of each are logged (`x2w-d3d12 Device::slot<n> view dimension ...`), and when a view still
+removes the device, its forwarded description and the resource's shape are logged
+(`removing view desc`). Run
+`ctest --preset dev --no-tests=error -R '^startup_view_dimension(_control)?$'`
+(`src/startup_stubs/view_dimension.h`); the control swaps the resource dimension of the mismatched
+cases for the matching one and must print `FAIL:`.
+
+`startup_view_dimension_warp` goes through `d3d12_xs.dll` on WARP. A compute shader samples each
+descriptor of a shader-visible heap through the wrapper's desktop heap. The fixture checks three
+cases. An unknown-dimension SRV of a texture filled with one distinct colour must read back that
+colour. An explicit TEXTURE3D SRV of a 2D texture must be refused with the device not removed.
+A descriptor slot that held a valid view of a second colour, then receives a refused TEXTURE2D
+SRV of a buffer, must read zero, and so must a `CopyDescriptorsSimple` copy of it. The slot gate
+for UAV, RTV and DSV is checked without a device by `startup_view_dimension`.
+`startup_view_dimension_off_control_warp` runs the same fixture with
+`X2W_D3D12_VIEW_DEFAULTS=off`. It must print `FAIL: (a) default view` with `device not removed`,
+so it fails on the missing default view and not on setup or a removed device. Both return 77
+without WARP.
+
 ## 16-bit packed targets
 
 A description that asks for a B5G5R5A1_UNORM, B4G4R4A4_UNORM or B5G6R5_UNORM render target is created as
@@ -1414,6 +1460,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
+| `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
@@ -1423,6 +1470,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
+| `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
