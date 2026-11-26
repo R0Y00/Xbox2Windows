@@ -74,8 +74,25 @@ def check_compare_sampler_constant():
     except AttributeError:
         pass
 
+# llc builds a constant sampler by copying one zeroed SGPR into the other words (s_mov_b32 s25, s24).
+COPY_WORDS = IMAGE_WORDS.replace(
+    bytes.fromhex('800398be' '800399be' '80039abe' '80039bbe'),
+    bytes.fromhex('800398be' '180399be' '18039abe' '18039bbe'),
+)
+
+
+def check_copied_constant_sampler():
+    """A sampler word copied from a constant SGPR is that constant, not an unknown value."""
+    assert COPY_WORDS != IMAGE_WORDS
+    expected = [l for l in translate(IMAGE_WORDS).manifest().splitlines() if l.startswith('smp ')]
+    got = [l for l in translate(COPY_WORDS).manifest().splitlines() if l.startswith('smp ')]
+    assert got == expected and got, (got, expected)
+    print('copied constant sampler folds to %s' % got[0])
+
+
 def controls():
     check_compare_sampler_constant()
+    check_copied_constant_sampler()
     fixtures = []
     for name, code, words in (
         ('clamp', CLAMP_WORDS, (0x2, 0, 0x00100000, 0)),
