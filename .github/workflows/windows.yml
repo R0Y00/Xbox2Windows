@@ -110,6 +110,7 @@ jobs:
               (["tests/startup_compute_image_store_d16_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_readfirstlane_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_heap_record_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_heap_word_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_gather_l_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_buffer_atomics_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_compute_store_d16_x_check.py", "binary", "llvm-mc-15"], {}),
@@ -144,6 +145,7 @@ jobs:
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_dpp_quad_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_mad64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mul_hi_i32_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mul_mad_i24_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cube_check.py", "binary", "llvm-mc-15"], {}),
@@ -165,8 +167,10 @@ jobs:
               (["tests/compute_dpp_row_shr_check.py", *COMMON_LLVM], {}),
               (["tests/startup_compute_lds_dual_atomics_check.py", "binary", "llvm-mc-15"], {}),
           ]
-          sys.exit(runpy.run_path("tools/run_checks_parallel.py",
-                                  run_name="run_checks_parallel")["run_checks"](CHECKS))
+          runner = runpy.run_path("tools/run_checks_parallel.py", run_name="run_checks_parallel")
+          # Checks listed in tests/checks/pixel-binary/*.txt run after the inline list.
+          CHECKS = runner["merge_checks"](CHECKS, "tests/checks/pixel-binary")
+          sys.exit(runner["run_checks"](CHECKS))
           PY
   python-linux:
     name: Run platform-independent Python checks on Linux
@@ -186,6 +190,7 @@ jobs:
       - name: Run Python checks
         run: |
           python -B tools/run_checks_parallel.py \
+            --from-dir tests/checks/python-linux \
             tests/script_state_check.py \
             tests/resource_root_check.py \
             tests/pe_authentihash_check.py \
@@ -305,6 +310,7 @@ jobs:
             tests/startup_gfx2hlsl_readfirstlane_recompute_check.py \
             tests/startup_compute_readfirstlane_check.py \
             tests/startup_gfx2hlsl_heap_record_check.py \
+            tests/startup_gfx2hlsl_heap_word_check.py \
             tests/startup_gfx2hlsl_calculated_target_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
@@ -338,6 +344,8 @@ jobs:
             tests/startup_gfx2hlsl_s_quadmask_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
+            tests/startup_gfx2hlsl_shift64_literal_check.py \
+            tests/startup_gfx2hlsl_mad64_check.py \
             tests/startup_gfx2hlsl_cmp_class_f16_sdwa_check.py \
             tests/startup_gfx2hlsl_mul_hi_i32_check.py \
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \
@@ -359,6 +367,7 @@ jobs:
             tests/startup_gfx2hlsl_sad_check.py \
             tests/startup_gfx2hlsl_sad_hi_msad_check.py \
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
+            tests/startup_gfx2hlsl_const_copy_join_check.py \
             tests/startup_gfx2hlsl_s_bit_scan_check.py \
             tests/startup_gfx2hlsl_pack_b32_f16_check.py \
             tests/startup_inline_sampler_check.py \
