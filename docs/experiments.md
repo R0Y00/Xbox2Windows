@@ -17300,22 +17300,20 @@ needs support for consuming the resulting `srv ... buf root` manifest record.
 ctest --test-dir out/build/release --no-tests=error -R "^startup_compute_global_load_(controls|warp|hardware)$" -V
 ```
 
-## Design B retention pressure and the 16 GiB host-commit reduction (#2379)
+## Design B descriptor retention and host commit on a 16 GiB system (#2379)
 
 R0Y00's standing decision on #2379 keeps **design B** (#2679): a materialized descriptor and its copies own the
 resource until the slot is overwritten, copied over, or the heap wrapper is destroyed. A final guest `Release()`
 plus completed release fences retire prior references and submissions, but a live descriptor slot must still
 support rebinding, so `drain_retired_resources()` frees a class member only when `retire_view_refs == 0` and no
 recording hold or in-flight submission names it. Slice 3 ended with #2719 (slots 19-21 tracked like slot 18);
-`X2W_D3D12_RELEASE_RETIRED_VIEWS` stays a legacy diagnostic that logs clearing is disabled. The retained bytes
-below are therefore **intended pressure**, not a reclamation bug, and are recorded here as the measurement that
-decision rests on. No game names, paths, dumps or captures are included; adapters and aggregate counters only.
+`X2W_D3D12_RELEASE_RETIRED_VIEWS` stays a legacy diagnostic that logs clearing is disabled. This rule intentionally retains live descriptor-owned bytes. The measurements below report total pressure and, where available, its ownership breakdown.
 
 ### Matched retention pair (AMD Radeon RX 9070 XT, 16 GB, driver 32.0.32029.2010, Windows 11 26300)
 
 One release build, `main` `6b9fb9d9` (#2468 merged), only `X2W_D3D12_RELEASE_RETIRED` differs; same executable,
 saved profile, warm shader cache, 32 GiB job cap, `X2W_D3D12_BUDGET=1`, `run.ps1 -Render`, 600 s window, scripted
-input that clears the legal/acceptance page (MasterDomino, #2379):
+input that clears the legal/acceptance page. [Matched RX 9070 XT runs](https://github.com/R0Y00/Xbox2Windows/issues/2379#issuecomment-7173347195)
 
 | | switch off | switch on |
 |---|---|---|
@@ -17331,12 +17329,11 @@ input that clears the legal/acceptance page (MasterDomino, #2379):
 Retention climbs in steps and does not come back down (switch-on: ~0.08 GB at 290 s, 3.80 GB at 375 s, 6.28 GB at
 460 s, 9.39 GB at 520 s). Slice 2 removed the out-of-memory failure inside the window but left local usage about
 5.4 GB over the DXGI budget; a second switch-on run at `e29b1a7b` reached the timeout with 9.14 GB retained. The
-~9 GB is the design-B remainder: slot 133 textures whose SRV lives in a heap slot the workload never overwrites.
+~9 GB is the retained texture budget measured in these runs. The attribution below comes from a separate run.
 
 ### Attribution: live slots vs recording holds vs in-flight work
 
-A local opt-in reason counter (JB2WIN, #2379, `1cce2a32`, ~6 min start-up run) attributed every final-released,
-still-live resource:
+A separate roughly six-minute startup run at `1cce2a32` used a local opt-in counter to attribute each final-released resource that was still live. [Attribution report](https://github.com/R0Y00/Xbox2Windows/issues/2379#issuecomment-7174634554)
 
 ```
 x2w-retire held: view-refs=2297/4445110272(oldest 4374f) never-class:buffer=8178/551813120
@@ -17368,42 +17365,28 @@ On a GTX 1660 SUPER diagnostic run with the current tree the line reads
 unattributed=0/0`; the descriptor-owned bytes stay in the budget `retained` column because design B keeps them
 resolvable, exactly as the matched pair above measures.
 
-### 16 GiB host-commit reduction (system RAM, distinct from local-VRAM retention)
+### Host-commit measurements on a 16 GiB system
 
-The retention above is local video memory. A separate pressure on 16 GiB hosts is **system commit**: eager
-`CreateCommittedResource` / `OpenExistingHeapFromAddress` / `MEM_COMMIT` allocations charge the page file even
-when the GPU never touches them. Four opt-in/default changes were measured together on a 16 GiB host (GTX 1660
-SUPER, 5,966 MiB VRAM, Windows 11, `SysCommitLimit` 22,931.8 MiB), release build, `-Render -Translate -FakeUser
--GpuMirror -LazyMemory`, `X2W_D3D12_LAZY_TEXTURES=1`, 300 s window, 3,260 storage requests, 6,434 frames:
+The reporter used a GTX 1660 SUPER with 5,966 MiB of VRAM on Windows 11 and a 22,931.8 MiB system commit limit. A release build of main at `d1b2be6a`, including #2767 and #2770, ran for 180 seconds with `-Render -Translate -FakeUser -GpuMirror -LazyMemory`. It recorded 3,260 storage requests, 3,994 frames, and a host-commit peak of **11,053 MiB**. The reporter observed zero device-removal, out-of-memory or mapping-failure lines during the window. [Main-only result](https://github.com/R0Y00/Xbox2Windows/pull/2780#issuecomment-7187587300)
 
-| change | effect |
-|---|---|
-| #2767 `audio: commit the stand-in APU heap on demand` | ~457 MiB eager `MEM_COMMIT` -> reserve + page commit/decommit |
-| #2770 `xmem: lazily reserve below-40 startup blocks and reclaim empty slabs` | below-`2^40` lazy startup + empty 256 MiB slab `CloseHandle` reclaim |
-| #2773 `gpu: defer CreateCommittedResource for read-only slot 133 textures` | read-only slot 133 textures commit on first use |
-| #2775 `gpu: cap slot 133 existing heaps at 256 MiB and grow upload ring on demand` | no multi-GiB `OpenExistingHeapFromAddress` pin; 16 MiB upload-ring start |
+A separate experimental build included #2767/#2770 and local versions of #2773/#2775. It enabled lazy textures and the large existing-heap cap and ran for 300 seconds, recording 3,260 storage requests and 6,434 frames. The existing-heap cap used in that build now requires `X2W_D3D12_CAP_EXISTING_HEAP=1`. These figures compare the reported historical baseline with the experimental combination. The runs do not isolate the contribution of individual patches. [Combined experimental result](https://github.com/R0Y00/Xbox2Windows/pull/2775#issuecomment-7186316341)
 
-| metric | baseline `main` | combined four | delta |
-|---|---|---|---|
-| host commit peak (`x2w-dstorage` heartbeat) | 12,144 MiB | **8,787 MiB** | **-3,357 MiB (-3.28 GiB)** |
-| DXGI non-local peak (`x2w-budget`) | 2,897 MiB | **695 MiB** | -2,202 MiB |
-| existing-heap bytes (`heap` column) | 2,199 MiB | **0 MiB** | -2,199 MiB |
+| Metric | Reported historical baseline | 300 s experimental combination |
+|---|---:|---:|
+| Host commit peak | 12,144 MiB | 8,787 MiB |
+| DXGI non-local peak | 2,897 MiB | 695 MiB |
+| Existing-heap bytes | 2,199 MiB | 0 MiB |
 
-The largest remaining commit targets are slot 133 textures that carry `ALLOW_RENDER_TARGET` /
-`ALLOW_DEPTH_STENCIL` / `ALLOW_UNORDERED_ACCESS` (deferred only for read-only textures by #2773), ~3,155 tiny
-`< 64 KiB` slot 133 buffers paying the WDDM 64 KiB commit floor, and `MEM_MAPPED` duplicate committed buffers.
-These are commit (page-file) reductions and do not change the design-B local-VRAM retention contract.
+The experiment identifies remaining commit from slot 133 render-target, depth and UAV textures, small buffers subject to WDDM allocation granularity, and duplicate committed buffers for mapped memory. The descriptor retention rule described above still applies.
 
 ### Verification
 
 ```powershell
 ctest --preset dev --no-tests=error -R "^startup_resource_(retire|budget)" -V
-ctest --preset dev --no-tests=error -R "^startup_slot133_(lazy_textures|heap_cap)" -V
+ctest --preset dev --no-tests=error -R "^startup_slot133_heap_cap_" -V
 ctest --preset dev --no-tests=error -R "^(xmem_|startup_run_ps1)" -V
 python -B tests/docs_links_check.py
 ```
 
 `startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
-design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences); the matched
-title pairs above are local executable runs, not source-built fixtures, and are recorded as pressure measurements
-only. Refs #2379, #2679, #2719, #1199.
+design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.
