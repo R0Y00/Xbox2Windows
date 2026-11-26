@@ -785,6 +785,8 @@ are not copied. Keep using the package root as `-DataDir`, then run the staged e
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+Use `-BuildDir` to select their build directory; relative paths are relative to the repository root,
+and absolute paths are used as supplied. The default is `out/build/release`.
 It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
