@@ -49,6 +49,7 @@
 #include "startup_stubs/buffer_format_word3.h"
 #include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/single_element_srv.h"
+#include "startup_stubs/view_dimension.h"
 #include "startup_stubs/list_copy.h"
 #include "startup_stubs/d3d12_teardown.h"
 #include "startup_stubs/rect_indirect_args.h"
@@ -56,6 +57,8 @@
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/present_planes.h"
+#include "startup_stubs/plane_compositor.h"
 
 #include <d3d12.h>
 #include "command_list_slot_names.h"
@@ -185,6 +188,8 @@ struct alignas(16) WrapperOwn {
     LONG compute_trace_dispatches;
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
+    u64 compute_request_key;           // PipelineState: key of the slot 67 request it published, or 0
+    const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
@@ -1843,8 +1848,22 @@ SRWLOCK shown_lock = SRWLOCK_INIT;
 char shown_note[160] = "no frame read back yet";
 
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
-void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
+// raw_plane < 0: the baseline capture of the presented surface (plane 0), reduced for the window and
+// logged as `x2w-render presented`. raw_plane >= 0 (X2W_PRESENT_COMPOSITE=1 only): a sample of that
+// plane's own surface, before compositing, logged as `x2w-render raw plane <n>`; it leaves the window
+// copy, the note and the dump alone. Neither is the composited window picture.
+void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int raw_plane = -1)
 {
+    const bool raw = raw_plane >= 0;
+    char failure[160] = "";
+    const auto report_failure = [&] {
+        if (!raw) {
+            std::snprintf(shown_note, sizeof(shown_note), "%s", failure);
+            return;
+        }
+        static LONG raw_failures;
+        if (first_calls(raw_failures, 4)) log("x2w-render raw plane %d (not composited): %s", raw_plane, failure);
+    };
     static ID3D12CommandAllocator* allocator;
     static ID3D12GraphicsCommandList* list;
     static ID3D12Fence* fence;
@@ -1860,7 +1879,8 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     const bool bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
     if ((!rgba && !bgra) || total == 0 || total == ~0ull) {
-        std::snprintf(shown_note, sizeof(shown_note), "presented surface format %d not shown yet", desc.Format);
+        std::snprintf(failure, sizeof(failure), "presented surface format %d not shown yet", desc.Format);
+        report_failure();
         return;
     }
     HRESULT hr = S_OK;
@@ -1890,7 +1910,8 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     if (SUCCEEDED(hr)) hr = allocator->Reset();
     if (SUCCEEDED(hr)) hr = list->Reset(allocator, nullptr);
     if (FAILED(hr)) {
-        std::snprintf(shown_note, sizeof(shown_note), "readback setup failed 0x%08lx", static_cast<unsigned long>(hr));
+        std::snprintf(failure, sizeof(failure), "readback setup failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
         return;
     }
     transition(list, surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1908,32 +1929,36 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     queue->Signal(fence, ++fence_value);
     fence->SetEventOnCompletion(fence_value, event);
     if (WaitForSingleObject(event, 3000) != WAIT_OBJECT_0) {
-        std::snprintf(shown_note, sizeof(shown_note), "readback timed out");
+        std::snprintf(failure, sizeof(failure), "readback timed out");
+        report_failure();
         return;
     }
     void* mapped = nullptr;
     const D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
     if (FAILED(readback->Map(0, &range, &mapped))) return;
-    AcquireSRWLockExclusive(&shown_lock);
-    shown_pixels.resize(shown_width * shown_height);
-    std::uint64_t sum = 0;
+    if (!raw) {
+        AcquireSRWLockExclusive(&shown_lock);
+        shown_pixels.resize(shown_width * shown_height);
+    }
+    std::uint64_t sum = 0, alpha_sum = 0;
     for (int y = 0; y < shown_height; ++y) {
         const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                           static_cast<UINT64>(y) * desc.Height / shown_height * footprint.Footprint.RowPitch;
         for (int x = 0; x < shown_width; ++x) {
             const unsigned char* texel = row + static_cast<UINT64>(x) * desc.Width / shown_width * 4;
             const unsigned r = rgba ? texel[0] : texel[2], g = texel[1], b = rgba ? texel[2] : texel[0];
-            shown_pixels[y * shown_width + x] = (r << 16) | (g << 8) | b;
+            if (!raw) shown_pixels[y * shown_width + x] = (r << 16) | (g << 8) | b;
             sum += r + g + b;
+            alpha_sum += texel[3];
         }
     }
-    ReleaseSRWLockExclusive(&shown_lock);
+    if (!raw) ReleaseSRWLockExclusive(&shown_lock);
     // X2W_D3D12_DUMP_SURFACE=<file>: every 40th read-back is also written at full resolution as a
     // 32-bit BMP (overwritten each time), for looking at detail the reduced overlay copy loses.
     {
         static wchar_t dump_path[MAX_PATH];
         static const bool dump = GetEnvironmentVariableW(L"X2W_D3D12_DUMP_SURFACE", dump_path, MAX_PATH) != 0;
-        if (dump && (shown_frames % 4) == 3 && desc.Width <= 8192 && desc.Height <= 8192) {
+        if (!raw && dump && (shown_frames % 4) == 3 && desc.Width <= 8192 && desc.Height <= 8192) {
             const UINT width = static_cast<UINT>(desc.Width), height = desc.Height;
             std::vector<unsigned char> file(54 + std::size_t{width} * height * 4);
             const std::uint32_t header[] = {static_cast<std::uint32_t>(file.size()), 0, 54, 40, width, static_cast<std::uint32_t>(-static_cast<int>(height)),
@@ -1956,6 +1981,15 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     }
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
+    if (raw) {
+        static LONG raw_frames;
+        const LONG count = InterlockedIncrement(&raw_frames);
+        if ((count > 0 && count <= 3) || count % 40 == 0)
+            log("x2w-render raw plane %d (not composited): surface %llux%u format %d, sample %ld, mean level %.2f/255, mean alpha %.2f/255",
+                raw_plane, desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height),
+                alpha_sum / (1.0 * shown_width * shown_height));
+        return;
+    }
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
@@ -2451,6 +2485,7 @@ struct Pass {
     x2w_startup::ViewTable view_tables[16]{};
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
+    x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
@@ -2661,6 +2696,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     pass.compute_tables.set_signature(w ? root_info(w) : nullptr);  // a different signature leaves no table bound
     pass.compute_params = real ? root_info(w) : nullptr;
+    pass.compute_srv_bound = 0;
+    // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
+    pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (compute_binding_trace_enabled() && (!pass.compute_trace || pass.compute_trace->root != w)) {
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
@@ -3648,8 +3686,10 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
 // List slot 14, Dispatch. Forwarded only with a desktop compute pipeline and root bound and group counts within the limit.
+bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z);
 void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 {
+    if (dispatch_translated(self, x, y, z)) return;  // a slot 67 placeholder never reaches the desktop decision
     auto* list = recording(self);
     x2w_startup::ListDispatch request;
     request.list_open = list != nullptr;
@@ -3724,6 +3764,7 @@ std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_draw.inl"
+#include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
 #include "startup_stubs/list_copy_texture.inl"
@@ -4183,6 +4224,39 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     return S_OK;
 }
 
+// A null R8G8B8A8_UNORM SRV of a texture dimension (2 to 10; any other value gives texture 2D). A null resource
+// reads no more of the description than its format and dimension.
+D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(x2w_view_dimension::refused_srv_null_dimension(dimension));
+    switch (desc.ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
+    default: desc.Texture2D.MipLevels = 1; break;
+    }
+    return desc;
+}
+
+// X2W_D3D12_VIEW_DEFAULTS (view_dimension.h): which slots give an unknown-dimension view the resource's default view.
+x2w_view_dimension::DefaultViews view_defaults_mode()
+{
+    static const x2w_view_dimension::DefaultViews mode = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_D3D12_VIEW_DEFAULTS", value, sizeof(value));
+        return x2w_view_dimension::default_views_mode(n && n < sizeof(value) ? value : nullptr);
+    }();
+    return mode;
+}
+
 // Device view slots: forwarded with the destination CPU handle (argument D, 0-based after the
 // object) translated from title to desktop.
 // Desktop removes the device (DXGI_ERROR_INVALID_CALL) on view calls it rejects, so they are checked
@@ -4212,6 +4286,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                   described_bytes, title_dest, args[D], materialized);
     };
     const char* skip = nullptr;
+    bool default_view = false;
     if (N == 17) skip = "constant buffer view (title GPU address)";
     if (N >= 18 && N <= 21 && args[0]) {
         const UINT flags = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc().Flags;
@@ -4219,9 +4294,56 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) skip = "resource lacks unordered access";
         if (N == 20 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) skip = "resource lacks render target";
         if (N == 21 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) skip = "resource lacks depth stencil";
+        // Every view description of slots 18-21 starts with Format, then ViewDimension.
+        const u64 described = N == 19 ? args[2] : args[1];
+        UINT view_dimension = 0;
+        if (!skip && described && x2w_local::readable(reinterpret_cast<const void*>(described), 8)) {
+            std::memcpy(&view_dimension, reinterpret_cast<const unsigned char*>(described) + 4, sizeof(view_dimension));
+            const D3D12_RESOURCE_DESC resource_desc = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
+            const auto dimension = static_cast<unsigned>(resource_desc.Dimension);
+            if (view_dimension == 0) {
+                // UNKNOWN: desktop refuses it; make the resource's default view where that is allowed. By default only
+                // SRVs (slot 18) get one; UAV, RTV and DSV need X2W_D3D12_VIEW_DEFAULTS=all (view_dimension.h).
+                const auto mode = view_defaults_mode();
+                if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format), mode))
+                    default_view = true;
+                else if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format),
+                                                                  x2w_view_dimension::DefaultViews::all))
+                    skip = mode == x2w_view_dimension::DefaultViews::off
+                        ? "unknown view dimension, and default views are off (X2W_D3D12_VIEW_DEFAULTS=off)"
+                        : "unknown view dimension; a default view of this type needs X2W_D3D12_VIEW_DEFAULTS=all";
+                else
+                    skip = "unknown view dimension, and the resource has no default view";
+                static LONG unknown_dimension;
+                if (first_calls(unknown_dimension, 6))
+                    log("x2w-d3d12 Device::slot%d view dimension 0 (unknown), view format %u, resource dim=%u fmt=%d -> %s", N,
+                        *reinterpret_cast<const UINT*>(described), dimension, resource_desc.Format,
+                        default_view ? "default view" : "skipped");
+            } else if (!x2w_view_dimension::fits(N, view_dimension, dimension)) {
+                skip = "view dimension does not suit the resource";
+                static LONG mismatched;
+                if (first_calls(mismatched, 6))
+                    log("x2w-d3d12 Device::slot%d view dimension %u needs resource dimension %u, resource has %u", N, view_dimension,
+                        x2w_view_dimension::needed(N, view_dimension), dimension);
+            }
+        }
     }
+    // Replace a refused SRV in both the desktop heap and the descriptor record. A skipped UAV, RTV or DSV
+    // does not write a replacement to the desktop heap, so its previous descriptor record must stay live.
+    const auto refuse_view = [&] {
+        if constexpr (N == 18) {
+            UINT requested = D3D12_SRV_DIMENSION_TEXTURE2D;
+            if (args[1] && x2w_local::readable(reinterpret_cast<const void*>(args[1]), 8))
+                std::memcpy(&requested, reinterpret_cast<const unsigned char*>(args[1]) + 4, sizeof(requested));
+            const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = null_srv_desc(requested);
+            device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+            record_view(false);
+        } else if constexpr (N == 17) {
+            record_view(false);  // Translated constant-buffer views use only the descriptor record.
+        }
+    };
     if (skip) {
-        record_view(false);
+        refuse_view();
         static LONG skipped;
         if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
         return 0;
@@ -4243,7 +4365,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             const auto actual = resource->GetDesc().Format;
             const auto verdict = x2w_startup::packed_view(mapped, actual, x2w_startup::packed_stand_in_of(resource));
             if (verdict == x2w_startup::PackedView::refused) {
-                record_view(false);
+                refuse_view();
                 static LONG refused;
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 Device::slot%d view skipped: packed format %d on a texture of format %d that does not stand in for it",
@@ -4271,6 +4393,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                 *reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(b), null_rtv))
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
+    if (default_view) args[desc_index] = 0;
+    const LONG removed_before = removal_reported;
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
     // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
     // may keep the resource: on failure the slot is recorded unmaterialized, which releases the slot's previous view
@@ -4287,6 +4411,19 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     if ((N == 20 || N == 21) && args[0] && created)
         note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]), N);
     check_device("Device view", N);
+    if (!removed_before && removal_reported && N >= 18 && N <= 21) {
+        // The view that removed the device: its forwarded description and the resource's shape.
+        char bytes[3 * 40 + 1] = {};
+        const u64 described = args[desc_index];
+        if (described) hex_text(reinterpret_cast<const void*>(described), 40, bytes, sizeof(bytes));
+        log("x2w-d3d12 Device::slot%d removing view desc %s", N, described ? bytes : "(null)");
+        if (args[0]) {
+            const D3D12_RESOURCE_DESC rd = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
+            log("x2w-d3d12 Device::slot%d removing view resource: dim=%d %llux%u depth/array=%u mips=%u fmt=%d samples=%u flags=0x%x", N,
+                rd.Dimension, static_cast<unsigned long long>(rd.Width), rd.Height, rd.DepthOrArraySize, rd.MipLevels, rd.Format,
+                rd.SampleDesc.Count, static_cast<UINT>(rd.Flags));
+        }
+    }
     static LONG calls;
     if (first_calls(calls))
         log("x2w-d3d12 Device::slot%d view(0x%llx, 0x%llx, 0x%llx, 0x%llx) dest 0x%llx -> 0x%llx", N, a, b, c, d,
@@ -4452,6 +4589,70 @@ struct ExistingHeap {
 };
 std::vector<std::pair<void*, ExistingHeap>> existing_heaps;
 
+// Lifetime boundary: one cross-adapter page alias per (heap, page) at a title address, kept for as long as
+// this module is loaded, because the GPU may still read a page the title keeps live for the device's
+// lifetime. It is the function-local static of placed_page_aliases() below, so it is destroyed during
+// this module's CRT teardown -- see startup_stubs/d3d12_teardown.h for the two detaches. On process exit
+// the display driver may already be stopped, so the placed buffers are detached and nothing reaches it;
+// FreeLibrary leaves the process and the driver alive and the pages release their objects normally. The
+// heap and page words are plain addresses, not owned. Each owned buffer is accounted for on the path it
+// took and, with X2W_TEARDOWN_REPORT, reported as one x2w-teardown pages line.
+struct PlacedPageAliases {
+    struct Page {
+        ID3D12Heap* heap;
+        u64 page;
+        x2w_startup::ComPtr<ID3D12Resource> resource;
+    };
+    using iterator = std::array<Page, 64>::iterator;
+    iterator begin() { return entries.begin(); }
+    iterator end() { return entries.end(); }
+
+    // Test hook (startup_teardown_unload, #2572; the review of the ownership change asked for one):
+    // enters one alias for a heap and page the caller owns, where the translated indirect address route
+    // would keep it after its first call. False when that pair is already there or the cache is full. No
+    // real path calls it, and the entry keeps the heap as a key only, as the route does.
+    bool insert_for_test(ID3D12Heap* heap, u64 page, ID3D12Resource* resource)
+    {
+        if (!heap || !resource) return false;
+        for (const Page& entry : entries)
+            if (entry.heap == heap && entry.page == page) return false;
+        for (Page& entry : entries) {
+            if (entry.heap) continue;
+            entry.resource = resource;  // AddRef: the cache owns this reference
+            entry.page = page;
+            entry.heap = heap;
+            return true;
+        }
+        return false;
+    }
+
+    ~PlacedPageAliases()
+    {
+        const bool detach = x2w_startup::d3d12_process_terminating && !x2w_startup::teardown_guard_disabled("pages");
+        unsigned detached = 0, released = 0;
+        for (auto& entry : entries) {
+            if (!entry.resource) continue;
+            if (detach) {
+                entry.resource.Detach();
+                ++detached;
+            } else {
+                ++released;
+            }
+        }
+        x2w_startup::teardown_report("pages", detached, released);
+    }
+    std::array<Page, 64> entries{};
+};
+
+// The cache lives in its own accessor so the fixture probe can reach it, the way
+// indexed_validation_pipeline(device) exposes the validation pipeline. One function-local static, built
+// on the first translated indirect address.
+PlacedPageAliases& placed_page_aliases()
+{
+    static PlacedPageAliases pages{};
+    return pages;
+}
+
 IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 bytes)
 {
     static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_INDIRECT_ADDRESS_ALIAS");
@@ -4475,8 +4676,8 @@ IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 by
         [&](const auto& entry) { return entry.first == memory.base; });
     if (known == existing_heaps.end()) return {};
     auto* heap = known->second.real;
-    struct Page { ID3D12Heap* heap; u64 page; x2w_startup::ComPtr<ID3D12Resource> resource; };
-    static std::array<Page, 64> pages{};
+    using Page = PlacedPageAliases::Page;
+    auto& pages = placed_page_aliases();
     auto it = std::find_if(pages.begin(), pages.end(), [&](const Page& entry) { return entry.heap == heap && entry.page == page; });
     if (it != pages.end()) return {it->resource.Get(), offset};
     it = std::find_if(pages.begin(), pages.end(), [](const Page& entry) { return !entry.heap; });
@@ -4964,28 +5165,9 @@ void retire_resource(Wrapper* w)
 // resolves to nothing). A null resource reads no more of the description than its format and dimension.
 D3D12_SHADER_RESOURCE_VIEW_DESC retire_null_srv_desc(const ViewRecord& record)
 {
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    if (record.desc_bytes >= 40) {
-        D3D12_SRV_DIMENSION dimension;
-        std::memcpy(&dimension, record.desc + 4, sizeof(dimension));
-        if (dimension >= D3D12_SRV_DIMENSION_TEXTURE1D && dimension <= D3D12_SRV_DIMENSION_TEXTURECUBEARRAY)
-            desc.ViewDimension = dimension;
-    }
-    switch (desc.ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
-    default: desc.Texture2D.MipLevels = 1; break;
-    }
-    return desc;
+    unsigned dimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    if (record.desc_bytes >= 40) std::memcpy(&dimension, record.desc + 4, sizeof(dimension));
+    return null_srv_desc(dimension);
 }
 
 // True when the release-time fence of every queue has passed (retire_lock held).
@@ -5448,16 +5630,28 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
     return TRUE;
 }
 
-// Fixture probe (startup_teardown_unload, #2572) for the two caches that keep desktop objects for a
-// device: the indexed-validation pipeline (d3d12_draw.inl, bit 0) and the rectangle-list argument
-// converter (rect_indirect_args.h, bit 1). Warms the selected caches the way their first real call
-// would -- the validation pipeline directly, the converter through one record-only conversion, nothing
-// executed -- and answers how many objects they now hold for `device`: the validation entry's device,
-// root signature and pipeline (3), plus the converter entry's root signature and pipeline (2). The
-// caller can warm one cache at a time to see each one release what it owns when the module is unloaded.
-extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches)
+// Fixture probe (startup_teardown_unload, #2572) for the four caches that keep desktop objects for a
+// device, one bit each: the indexed-validation pipeline (d3d12_draw.inl, bit 1) and the rectangle-list
+// argument converter (rect_indirect_args.h, bit 2), the placed page aliases of the translated indirect
+// address route (bit 4) and the draw-dump readbacks (bit 8). Warms the selected caches the way their
+// first real call would -- the validation pipeline directly, the converter through one record-only
+// conversion, an alias entry on a placed buffer of this device, a recorded readback -- and answers how
+// many objects they now hold for `device`: the validation entry's device, root signature and pipeline
+// (3), the converter entry's root signature and pipeline (2), the alias entry's placed buffer (1), the
+// readback entry's buffer and fence (2). The caller can warm one cache at a time to see each one release
+// what it owns when the module is unloaded.
+//
+// `placed_heap` is how bit 4 hands the heap it creates over to the caller. The alias entry keeps that heap
+// as a key only -- it owns no reference, as the route's heap belongs to the device's allocation -- so the
+// one reference this probe holds is the caller's from the moment the entry is entered, and the caller must
+// release it after the cache released the placed buffer (a heap must outlive the resources placed in it).
+// Bit 4 is not warmed when `placed_heap` is null: an entry whose backing heap nobody owns is the leak this
+// handover exists to rule out. Every other bit leaves `*placed_heap` null.
+extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Device* device, UINT caches,
+                                                                    ID3D12Heap** placed_heap)
 {
-    if (!device || !caches || (caches & ~3u)) return 0;
+    if (placed_heap) *placed_heap = nullptr;
+    if (!device || !caches || (caches & ~15u)) return 0;
     UINT owned = 0;
     if (caches & 1u) {
         const auto& validation = indexed_validation_pipeline(device);
@@ -5465,29 +5659,145 @@ extern "C" __declspec(dllexport) UINT x2w_d3d12_cached_objects_probe(ID3D12Devic
         if (validation.root) ++owned;
         if (validation.pipeline) ++owned;
     }
-    if (!(caches & 2u)) return owned;
+    if (caches & 2u) {
+        x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
+        x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                            IID_PPV_ARGS(&list))))
+            return owned;
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 256;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // convert() copies its 16 source words; an uninitialised buffer in the state it requires is enough.
+        x2w_startup::ComPtr<ID3D12Resource> source;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                   nullptr, IID_PPV_ARGS(&source))))
+            return owned;
+        const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
+        if (scratch && x2w_startup::rect_indirect_arguments().convert(list.Get(), source.Get(), 0, scratch.Get()))
+            owned += 2;  // the converter's root signature and pipeline for this device
+    }
+    if (!(caches & 12u)) return owned;
 
-    x2w_startup::ComPtr<ID3D12CommandAllocator> allocator;
-    x2w_startup::ComPtr<ID3D12GraphicsCommandList> list;
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                        IID_PPV_ARGS(&list))))
-        return owned;
-    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC buffer{};
-    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = 256;
-    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
-    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    // convert() copies its 16 source words; an uninitialised buffer in the state it requires is enough.
-    x2w_startup::ComPtr<ID3D12Resource> source;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                               nullptr, IID_PPV_ARGS(&source))))
-        return owned;
-    const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
-    if (scratch && x2w_startup::rect_indirect_arguments().convert(list.Get(), source.Get(), 0, scratch.Get()))
-        owned += 2;  // the converter's root signature and pipeline for this device
+    // The two caches below hold desktop objects, as their real entries do: draw_dump_after() creates the
+    // readback buffer on the desktop device, and execute() creates the fence on the desktop device it
+    // reads from the desktop queue. Two shapes of device reach this probe. A title gets a wrapper from
+    // D3D12XboxCreateDevice (attach_device wraps the created device), and the desktop device is then the
+    // one behind it. A fixture creates its device without a parameter block, so that entry returns a
+    // plain D3D12CreateDevice() result: an unwrapped desktop device. The handle itself is the desktop
+    // device then. removal_device is not a fallback: attach_device is where it is written, so on the
+    // unwrapped path it is null or names another device.
+    Wrapper* wrapper = as_wrapper(device);
+    ID3D12Device* desktop = wrapper ? device_of(wrapper) : device;
+
+    // Diagnostics for the fixture, off unless X2W_CACHE_PROBE_DEBUG is set: one line per step, so a probe
+    // that answers fewer objects than expected names the call that refused. Temporary, together with the
+    // two caches they measure.
+    char probe_debug[2]{};
+    const bool trace = GetEnvironmentVariableA("X2W_CACHE_PROBE_DEBUG", probe_debug, sizeof(probe_debug)) != 0;
+    if (trace)
+        std::fprintf(stderr, "x2w-cache-probe device=%p wrapper=%p desktop=%p caches=0x%x\n",
+                     static_cast<void*>(device), static_cast<void*>(wrapper), static_cast<void*>(desktop), caches);
+
+    // Bit 4 needs an owner for the heap it creates, and that owner is the caller: with no out pointer
+    // there is nowhere to put the reference, so the alias is not warmed at all rather than entered on a
+    // heap nobody owns for the rest of the process.
+    if ((caches & 4u) && !placed_heap && trace)
+        std::fputs("x2w-cache-probe placed: no heap out pointer, bit 4 not warmed\n", stderr);
+    if ((caches & 4u) && placed_heap) {
+        // One placed buffer on a heap of this device, entered where the translated indirect address route
+        // keeps its aliases. The page word is only the cache key: no title address is involved here, and
+        // the entry never dereferences the heap. The route's buffers carry ALLOW_CROSS_ADAPTER; sharing
+        // them across adapters needs a heap opened for it and plays no part in the lifetime measured
+        // here, so this buffer is an ordinary placed buffer.
+        D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_HEAP_DESC heap_desc{};
+        heap_desc.SizeInBytes = 65536;
+        heap_desc.Properties = properties;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        x2w_startup::ComPtr<ID3D12Heap> heap;
+        const HRESULT heap_hr = desktop->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe heap hr=0x%08lx\n", static_cast<unsigned long>(heap_hr));
+        if (FAILED(heap_hr)) return owned;
+        const D3D12_RESOURCE_DESC placed{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                                         {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        x2w_startup::ComPtr<ID3D12Resource> alias;
+        const HRESULT placed_hr = desktop->CreatePlacedResource(heap.Get(), 0, &placed, D3D12_RESOURCE_STATE_COMMON,
+                                                               nullptr, IID_PPV_ARGS(&alias));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe placed hr=0x%08lx\n", static_cast<unsigned long>(placed_hr));
+        if (FAILED(placed_hr)) return owned;
+        {
+            std::lock_guard lock(placed_mutex);
+            auto& pages = placed_page_aliases();
+            const bool entered = pages.insert_for_test(heap.Get(), 0x10000, alias.Get());
+            unsigned used = 0;
+            for (const auto& entry : pages)
+                if (entry.heap) ++used;
+            if (trace) std::fprintf(stderr, "x2w-cache-probe insert=%d used=%u/64\n", entered ? 1 : 0, used);
+            if (entered) {
+                // The route's heap belongs to the device's allocation, not to an alias entry: the shim
+                // keeps it for the device's lifetime, and the entry only stores the pointer. This probe
+                // created its own heap, so the one reference it holds is not abandoned here but handed to
+                // the caller, who owns it from now on and releases it after the placed buffer this entry
+                // keeps -- a heap must outlive the resources placed in it.
+                *placed_heap = heap.Detach();
+                ++owned;
+            }
+        }
+    }
+    if (caches & 8u) {
+        // One recorded draw readback: the READBACK buffer draw_dump_after() keeps and the queue fence
+        // execute() attaches once the copy is submitted. execute() builds both on the desktop device it
+        // reads from the desktop queue, so both are desktop objects here too.
+        D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 256;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        x2w_startup::ComPtr<ID3D12Resource> staging;
+        x2w_startup::ComPtr<ID3D12Fence> fence;
+        const HRESULT staging_hr = desktop->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                    IID_PPV_ARGS(&staging));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe readback hr=0x%08lx\n", static_cast<unsigned long>(staging_hr));
+        if (FAILED(staging_hr)) return owned;
+        const HRESULT fence_hr = desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe fence hr=0x%08lx\n", static_cast<unsigned long>(fence_hr));
+        if (FAILED(fence_hr)) return owned;
+        const bool recorded = draw_dumps().record_for_test(std::move(staging), std::move(fence));
+        if (trace) std::fprintf(stderr, "x2w-cache-probe record=%d\n", recorded ? 1 : 0);
+        if (recorded) owned += 2;
+    }
     return owned;
+}
+
+// Fixture probe (startup_teardown_unload, #2572) for the ownership of the two caches above: hands the
+// caller one reference to an object a warmed entry owns, so the fixture can watch that reference go away
+// when the module is unloaded. `cache` and `slot`: 4/0 the placed buffer, 8/0 the readback buffer, 8/1 its
+// fence; null for anything else. The caller's reference keeps the object alive after the module is gone,
+// which is what makes its count readable then.
+extern "C" __declspec(dllexport) IUnknown* x2w_d3d12_cached_object_probe(UINT cache, UINT slot)
+{
+    IUnknown* object = nullptr;
+    if (cache == 4u) {
+        std::lock_guard lock(placed_mutex);
+        auto& pages = placed_page_aliases();
+        for (auto& entry : pages) {
+            if (!entry.resource) continue;
+            object = entry.resource.Get();
+            break;
+        }
+    } else if (cache == 8u) {
+        object = draw_dumps().owned_for_test(slot);
+    }
+    if (!object) return nullptr;
+    object->AddRef();
+    return object;
 }
 
 // Fixture probes (startup_resource_retire_title) for state the retire bookkeeping maintains for one resource. They read
@@ -5792,9 +6102,15 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
         hex_text(desc, 96, bytes, sizeof(bytes));
         log("x2w-d3d12 Device::slot%d(pipeline?) desc=[%s] riid=%s -> placeholder", N, bytes, text);
     }
-    if constexpr (N == 67) publish_compute_request(desc);
     *out = wrap(nullptr, pipeline_kind);
     if (!*out) return E_OUTOFMEMORY;
+    if constexpr (N == 67) {
+        // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
+        if (const u64 key = publish_compute_request(desc)) {
+            static_cast<Wrapper*>(*out)->own().compute_request_key = key;
+            static_cast<Wrapper*>(*out)->own().compute_request_root = as_wrapper(*static_cast<void* const*>(desc));
+        }
+    }
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
     return S_OK;
 }
@@ -6093,6 +6409,74 @@ void report_budget(ID3D12CommandQueue* queue)
     log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu", local, nonlocal, text, counts.unmeasured);
 }
 
+// X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
+// window composites every presented plane. Unset, the window shows plane 0 alone, as before.
+bool present_composite_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_PRESENT_COMPOSITE");
+    return on;
+}
+
+// The planes the output window draws for a present, resolved to real resources it can draw.
+// X2W_PRESENT_PLANE=<n> (diagnostic) keeps plane n alone (plane 0 when n is past the count). Otherwise
+// plane 0 alone is kept, unless X2W_PRESENT_COMPOSITE=1 keeps every plane for the composite
+// (present_planes.h). The baseline capture and readback do not use this: they read plane 0 as before.
+struct PresentedPlanes {
+    ID3D12Resource* drawable[window_planes] = {};  // per plane, null when left out
+    x2w_startup::PlaneStep steps[window_planes];
+    unsigned count = 0;          // composite steps
+    unsigned top_plane = 0;      // the highest kept plane with a known resource
+    ID3D12Resource* top = nullptr;  // its surface
+};
+PresentedPlanes presented_planes(UINT planes, const void* plane_parameters)
+{
+    static const long wanted = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_PRESENT_PLANE", value, sizeof(value)) ? std::atol(value) : -1L;
+    }();
+    const auto readable = [](const void* address, std::size_t bytes) { return x2w_local::readable(address, bytes); };
+    PresentedPlanes out;
+    std::uint64_t shown[window_planes] = {};
+    const unsigned total = planes < window_planes ? planes : window_planes;
+    const unsigned only = wanted >= 0 ? (static_cast<unsigned long>(wanted) < planes ? static_cast<unsigned>(wanted) : 0u)
+                          : present_composite_enabled() ? ~0u
+                                                        : 0u;
+    for (unsigned i = 0; i < total; ++i) {
+        if (only != ~0u && i != only) continue;
+        const std::uint64_t resource = x2w_startup::present_plane_resource(plane_parameters, planes, i, readable);
+        Wrapper* const surface = resource ? as_wrapper(reinterpret_cast<void*>(resource)) : nullptr;
+        if (!surface || surface->own().kind != resource_kind || !surface->own().real) continue;
+        auto* const real = static_cast<ID3D12Resource*>(surface->own().real);
+        out.top_plane = i;
+        out.top = real;
+        if (!presentable_surface(real)) continue;
+        out.drawable[i] = real;
+        shown[i] = resource;
+    }
+    out.count = x2w_startup::composite_steps(shown, total, out.steps, window_planes);
+    return out;
+}
+
+// The first presents and every 300th: each plane's first resource and its shape.
+void log_present_planes(LONG frame, UINT planes, const void* plane_parameters)
+{
+    if (frame > 2 && frame % 300 != 0) return;
+    static LONG lines;
+    if (!first_calls(lines, 24)) return;
+    const auto readable = [](const void* address, std::size_t bytes) { return x2w_local::readable(address, bytes); };
+    for (unsigned i = 0; i < planes && i < 4; ++i) {
+        const std::uint64_t resource = x2w_startup::present_plane_resource(plane_parameters, planes, i, readable);
+        Wrapper* const surface = resource ? as_wrapper(reinterpret_cast<void*>(resource)) : nullptr;
+        if (!surface || surface->own().kind != resource_kind || !surface->own().real) {
+            log("x2w-present frame %ld plane %u/%u: resource %p is not a known resource", frame, i, planes, reinterpret_cast<void*>(resource));
+            continue;
+        }
+        const D3D12_RESOURCE_DESC desc = static_cast<ID3D12Resource*>(surface->own().real)->GetDesc();
+        log("x2w-present frame %ld plane %u/%u: %llux%u format %d flags=0x%x", frame, i, planes,
+            static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, static_cast<UINT>(desc.Flags));
+    }
+}
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -6128,7 +6512,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
     }
     bool shown_in_window = false;
+    log_present_planes(frame, planes, plane_parameters);
+    // X2W_PRESENT_COMPOSITE=1: the highest plane above plane 0, sampled raw below.
+    ID3D12Resource* raw_surface = nullptr;
+    unsigned raw_plane = 0;
     {
+        // The baseline: plane 0's first resource, captured, sampled and read back as before the planes
+        // were decoded, with or without X2W_PRESENT_COMPOSITE.
         Wrapper* surface = nullptr;
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
@@ -6136,9 +6526,18 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         capture::present(frame, surface);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
-        // Render mode: the presented surface goes to the title's window through a swap chain.
-        if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
-            shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
+        // by default, every plane with X2W_PRESENT_COMPOSITE=1. The compositor draws the steps in order.
+        if (render_mode()) {
+            const PresentedPlanes presented = presented_planes(planes, plane_parameters);
+            if (presented.count)
+                shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), presented.steps, presented.count,
+                                                    presented.drawable, present_composite_enabled() ? window_planes : 1);
+            if (present_composite_enabled() && presented.top && presented.top_plane > 0) {
+                raw_surface = presented.top;
+                raw_plane = presented.top_plane;
+            }
+        }
         InterlockedExchange(&last_frame_shown, shown_in_window ? 1 : 0);
         if (render_mode()) present_signature(self, surface, frame);
     }
@@ -6161,6 +6560,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
                 std::snprintf(shown_note, sizeof(shown_note), "presented object %p is not a known resource",
                               *reinterpret_cast<void* const*>(words[2]));
         }
+        // The raw plane sample is that plane's own surface, not the composited window picture.
+        if (raw_surface) read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real), raw_surface, static_cast<int>(raw_plane));
     }
     if (shown_in_window) {
         if (frame % 30 == 0) {
@@ -6195,6 +6596,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    if (render_mode() && frame % 300 == 0) {
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
+            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
+        log_compute_census();
+    }
     if (render_mode() && frame % 300 == 0) {
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
         static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",

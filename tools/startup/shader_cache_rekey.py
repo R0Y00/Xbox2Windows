@@ -12,7 +12,9 @@ key of every such request with the gfx2hlsl.py next to it and copies the request
 
 The old cache is only read. Only request files (req_*) are written; results and .fail files are not, and a file
 that already exists in <new request dir> is left as it is. Each file is written to a temporary name and renamed;
-the ready marker (.a, .c67, .m57) goes last, as the runtime writes it. Slot 86 mesh requests are only counted.
+the ready marker (.a, .c67, .m57) goes last, as the runtime writes it. A stream description (.psin) is written
+again under the new key with the same masks, since its line names the key and its masks are part of the key.
+Slot 86 mesh requests are only counted.
 
 All requests are read before anything is written. When a request part is missing or unreadable, or an RTV
 variant is malformed, does not match its own name or names a base request that is not in the cache, the tool
@@ -29,9 +31,9 @@ import gfx2hlsl as g  # noqa: E402
 
 REQUEST = re.compile(r'req_([0-9a-f]{16})\.(a|rtv|c67|m57|m86)')
 # Request files of each kind; the ready marker is last.
-PARTS = {'g': ('.b', '.root', '.ia', '.a'), 'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67'),
+PARTS = {'g': ('.b', '.root', '.ia', '.psin', '.a'), 'c': ('.desc', '.sa', '.sb', '.data', '.root', '.c67'),
          'm57': ('.ps57', '.root', '.m57')}
-OPTIONAL = {'.ia'}  # a graphics request without an input layout has no .ia
+OPTIONAL = {'.ia', '.psin'}  # a graphics request may have no input layout (.ia) and no stream description (.psin)
 
 
 class Incomplete(Exception):
@@ -61,7 +63,12 @@ def current_key(job):
     except OSError as error:
         return kind, key, None, 'unreadable %s: %s' % (os.path.basename(error.filename or ''), error.strerror)
     if kind == 'g':
-        return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b'')), None
+        # The pixel input masks of a stream description are part of the key; the description names its key.
+        try:
+            masks = g.read_ps_inputs(request_name(src, key, '.psin'), key)
+        except g.Unsupported as reason:
+            return kind, key, None, str(reason)
+        return kind, key, g.pipeline_key(p['.a'], p['.b'], p['.root'], p.get('.ia', b''), masks), None
     if kind == 'm57':
         return kind, key, g.mesh57_key(p['.m57'], p['.ps57'], p['.root']), None
     return kind, key, g.compute_key(p['.c67'], p['.data'], p['.root'], p['.desc'], p['.sa'], p['.sb']), None
@@ -177,6 +184,9 @@ def rekey(src, dst, jobs=None, out=None):
                 done.add(key)
                 # Read again, not checked against the hashing pass: nothing may write the old cache meanwhile.
                 for ext, data in read_parts(src, kind, old).items():
+                    if ext == '.psin':  # the line names the new key
+                        data = ('psin1 %016x ena=0x%04x addr=0x%04x\n' % (
+                            key, *g.read_ps_inputs(request_name(src, old, '.psin'), old))).encode('ascii')
                     publish(request_name(dst, key, ext), data, stats)
             current = sum(old == key for old, key in new[kind].items())
             print('%s: %d requests, %d already current -> %d keys' % (label, len(new[kind]), current, len(done)), file=out)

@@ -14,6 +14,7 @@
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
 // and, while the proxy is on, XStoreCreateContext for that user (see area_call).
 #include "startup_stubs/api_trace.h"
+#include "startup_stubs/console_mode.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/runtime_gpa_patch.h"
 #include "startup_stubs/save_blob_pack.h"
@@ -484,12 +485,16 @@ bool module_is_exe_or_package_helper(HMODULE module) noexcept
     return true;
 }
 
+#include "startup_stubs/registry_console_mode.inl"
+
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
 {
     const FARPROC real = GetProcAddress(module, name);
     if (real && reinterpret_cast<u64>(name) > 0xffff) {
         static LONG logged;
         if (x2w_local::first_calls(logged, 40)) x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name, static_cast<void*>(real));
+        // Registry exports only when the module is a Windows registry provider (registry_console_mode.inl).
+        if (const FARPROC hook = registry_hook_for(module, name, real)) return hook;
         // Wrap gaming-runtime exports only when the provider module is xgameruntime.dll.
         if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0 &&
             remember_real_query(reinterpret_cast<QueryApi>(real)))
@@ -555,6 +560,13 @@ int patch_module(HMODULE module)
         }
         VirtualProtect(slot, 8, old, &old);
     });
+    // Registry imports for the console mode (registry_console_mode.inl), counted on their own line.
+    if (!self) {
+        const int registry = patch_registry_imports(base, image_size);
+        if (registry > 0)
+            x2w_local::logf("x2w-runtime console mode: %d registry import(s) patched in the %s", registry,
+                            module == GetModuleHandleW(nullptr) ? "main module" : "package module");
+    }
     return patched;
 }
 
