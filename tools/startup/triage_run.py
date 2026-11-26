@@ -44,6 +44,10 @@ SLOT70_REASONS = {
     "unsupported_description",
     "destination_outside_view_heaps",
     "gpu_written_resource",
+    # the acceleration-structure holds of publish_as_srv (memory_srv_as.h, as_srv_refusal_name)
+    "as_unaligned",
+    "as_not_placed",
+    "as_wrong_state",
     "buffer_unavailable",
     "texture_unavailable",
     # the partial-tile holds of device_memory_srv

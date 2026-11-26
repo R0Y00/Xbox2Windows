@@ -556,8 +556,9 @@ Three census lines follow the five-second report whenever their counts changed
 - `x2w-d3d12 memory SRV refusals (slot 70): total N; <reason> n, ...; distinct shapes K` counts every
   refused slot 70 call by reason. It then prints one `x2w-d3d12 memory SRV refused shape i:` line per
   distinct `reason`, dimension, format, size, mips, layout and flags, for the reasons that depend on the
-  description (all but `null_destination`, `unreadable_resource`, `unreadable_view`, `null_address` and
-  `destination_outside_view_heaps`). The reasons include the partial-tile holds (`partial_tile_*`) and the
+  description (all but `null_destination`, `unreadable_resource`, `unreadable_view`, `null_address`,
+  `destination_outside_view_heaps` and the acceleration-structure holds `as_unaligned`, `as_not_placed` and
+  `as_wrong_state`). The reasons include the partial-tile holds (`partial_tile_*`) and the
   console-layout holds (`unsupported_desktop_format`, `console_layout_*`, `overlapping_resource`).
   Up to 128 shapes are kept; later shapes are only counted. The periodic report lists the shapes counted
   since it last ran.
