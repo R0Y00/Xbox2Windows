@@ -825,6 +825,20 @@ that its fixture's module and export are in that list, that a source-built DLL l
 movie-player module name is not hooked by default, that each of its 7 export calls is counted with
 `--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
 
+**Window pictures.** At the end of a run that is still going, `debug_launch.py` saves the client area of the
+title's window as `window.png`. `--capture-every <seconds>` (`run.ps1 -CaptureEvery`, `run.sh --capture-every`)
+also saves it every N seconds (N is at least 1; 0, the default, is off) as `window_<sss>s.png`, with the seconds
+since the process started, so a run that passes several screens leaves one picture per screen. A frame whose
+pixels equal the previous frame is not saved, at most 120 files are written (later changes are counted, not
+saved), and the summary prints one line such as `window captures: 12 saved, 7 unchanged skipped, first change
+at 74 s`. A thread of its own takes the pictures, so a capture never delays the debug events, and the
+conversion to PNG uses whole-buffer slices instead of a per-byte loop. The end-of-run `window.png` is
+unchanged. `tests/startup_window_capture_check.py` checks the file names, the skip, the cap, the summary line
+and the pixels of the PNG against a per-pixel reference. `tests/startup_debug_window_check.py` runs the
+source-built `tests/startup_window_probe.cpp` (a window that is red, then blue after 3.5 s) with
+`--capture-every 1`: one red and one blue frame are saved, the others are skipped, the reported first change
+falls in the second the probe changes it, and without the option no `window_<sss>s.png` exists.
+
 `run.ps1 -TraceApi` sets `X2W_TRACE_API=1` for the child process and enables
 `x2w-api` lines for individual runtime provider methods. Use `-TraceCalls` for
 the debugger breakpoints described above. The switches work independently and
