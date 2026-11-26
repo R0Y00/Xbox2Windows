@@ -1,6 +1,7 @@
 """The `src_scc` scalar source in tools/startup/gfx2hlsl.py (issue #1820).
 
 usage: startup_gfx2hlsl_src_scc_check.py
+       startup_gfx2hlsl_src_scc_check.py dispatch <dxc> <offscreen_check> <warp|hardware>
 
 The census contained `s_mul_i32 s28, 1.0, src_scc`, refused as `operand 'src_scc'` (#870, issue #1820).
 Source code 253 reads the SCC bit as the integer value 0 or 1; the generated shader carries SCC as a
@@ -18,7 +19,10 @@ The instruction bytes are **constructed here** from the field layout the checked
 """
 import os
 import struct
+import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
@@ -104,6 +108,110 @@ def refused_reason(code):
     except G.Unsupported as error:
         return str(error)
     return None
+
+
+MASK = 0xFFFFFFFF
+SOP1_MOV_B32 = 0x03
+# (a, b) pairs: s_cmp_eq_u32 sets SCC = (a == b), then s_mov_b32 s3, src_scc stores it.
+DISPATCH_CASES = ((0, 0), (1, 1), (0xFFFFFFFF, 0xFFFFFFFF), (0x12345678, 0x12345678),
+                  (0, 1), (1, 0), (0x80000000, 0x00000001), (0xFFFFFFFF, 0xFFFFFFFE))
+
+
+def encode_sop1(op, sdst, ssrc):
+    return struct.pack('<I', (0b101111101 << 23) | ((sdst & 0x7F) << 16) | ((op & 0xFF) << 8) | (ssrc & 0xFF))
+
+
+class Probe(G.Stage):
+    """Minimal Stage for one-instruction-at-a-time lowering (same shape as the s_ff1 check)."""
+
+    def __init__(self):
+        self.lines, self.sym = [], {}
+        self.used_s, self.used_v, self.uniform_v = set(), set(), set()
+        self.masks = set()
+        self.exec_known = True
+        self.kind = 'vs'
+        self.past_entry = False
+
+
+def lower_cmp_then_read_scc():
+    """Lower `s_cmp_eq_u32 s1, s2` then `s_mov_b32 s3, src_scc` with the real handlers."""
+    code = encode_sopc(SOPC_CMP_EQ_U32, S1, 2) + encode_sop1(SOP1_MOV_B32, 3, S_SCC)
+    stage = Probe()
+    for _o, _n, ins, _asm in G.decode(code):
+        stage.one(ins, _asm)
+    return stage.lines
+
+
+def dispatch(dxc, runner, adapter, lines, directory, name):
+    n = len(DISPATCH_CASES)
+    fill = tuple(((i + 1) * 0x9e3779b1 & MASK) | 1 for i in range(2 * n))
+    hlsl = ['RWByteAddressBuffer data : register(u0);', '[numthreads(1, 1, 1)]', 'void main() {']
+    for i, (a, b) in enumerate(DISPATCH_CASES):
+        hlsl.extend((
+            '    {',
+            '        uint s1 = data.Load(%d) ^ %#010xu;' % (8 * i, fill[2 * i] ^ a),
+            '        uint s2 = data.Load(%d) ^ %#010xu;' % (8 * i + 4, fill[2 * i + 1] ^ b),
+            '        uint s3;',
+            '        bool scc;',
+        ))
+        hlsl.extend('        ' + line for line in lines)
+        hlsl.append('        data.Store(%d, s3);' % (4 * (2 * n + i)))
+        hlsl.append('    }')
+    hlsl.append('}')
+    src, cso, output = (directory / (name + suffix) for suffix in ('.hlsl', '.cso', '.bin'))
+    src.write_text('\n'.join(hlsl) + '\n', encoding='ascii')
+    compiled = subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)],
+                              stderr=subprocess.PIPE, text=True)
+    if compiled.returncode or compiled.stderr:
+        raise AssertionError(compiled.stderr or 'DXC exited with %d' % compiled.returncode)
+    words = 3 * n
+    dump_words = (words + 3) // 4 * 4
+    ran = subprocess.run([runner, adapter, '--raw-uav-dump', str(cso), '1', str(4 * dump_words), str(output)],
+                         capture_output=True, text=True)
+    print(ran.stdout, end='')
+    if ran.returncode == 77:
+        sys.exit(77)
+    if ran.returncode or ran.stderr:
+        raise AssertionError(ran.stderr or 'raw UAV dump exited with %d' % ran.returncode)
+    actual = struct.unpack('<%dI' % dump_words, output.read_bytes())
+    assert actual[:2 * n] == fill, 'operand region changed: %s' % (actual[:2 * n],)
+    return actual[2 * n:words]
+
+
+def check_dispatch(dxc, runner, adapter):
+    lines = lower_cmp_then_read_scc()
+    check('dispatch lowering is the compare then the SCC read',
+          lines == ['scc = s1 == s2;', 's3 = (scc ? 1u : 0u);'], repr(lines))
+    runner = str(Path(runner).resolve())
+    out = Path(here).parent / 'out'
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        directory = Path(tmp)
+        got = dispatch(dxc, runner, adapter, lines, directory, 'src_scc')
+        for i, (a, b) in enumerate(DISPATCH_CASES):
+            want = 1 if a == b else 0  # CPU reference: src_scc reads the SCC bit as 0 or 1
+            check('dispatch src_scc after s_cmp_eq_u32 %#x, %#x' % (a, b), got[i] == want,
+                  'got %#x want %#x' % (got[i], want))
+        check('dispatch covers both SCC=0 and SCC=1', {0, 1} <= set(got), repr(got))
+        # Negative control: the same harness with the lowering mutated to (scc ? 0u : 1u) must read back
+        # the wrong value on every case, so a wrong src_scc lowering cannot pass the checks above.
+        mutated = [line.replace('(scc ? 1u : 0u)', '(scc ? 0u : 1u)') for line in lines]
+        check('negative control mutates the lowering', mutated != lines, repr(mutated))
+        bad = dispatch(dxc, runner, adapter, mutated, directory, 'src_scc_mutated')
+        for i, (a, b) in enumerate(DISPATCH_CASES):
+            check('negative control reads the wrong value for %#x, %#x' % (a, b),
+                  bad[i] == (0 if a == b else 1), 'got %#x' % bad[i])
+    if failures:
+        print('FAILED: %s' % ', '.join(failures))
+        sys.exit(1)
+    print('dispatch ok')
+
+
+if len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
+    check_dispatch(*sys.argv[2:])
+    sys.exit(0)
+elif len(sys.argv) != 1:
+    sys.exit(__doc__)
 
 
 # 1. At shader entry, SCC is unverified: reading src_scc before any modeled writer must be refused.

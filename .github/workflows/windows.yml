@@ -332,6 +332,7 @@ jobs:
             tests/startup_gfx2hlsl_s_bitset_check.py \
             tests/startup_gfx2hlsl_s_flbit_check.py \
             tests/startup_gfx2hlsl_s_ff1_check.py \
+            tests/startup_gfx2hlsl_src_scc_check.py \
             tests/startup_gfx2hlsl_s_quadmask_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
