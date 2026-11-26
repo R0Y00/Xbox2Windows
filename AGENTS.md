@@ -173,9 +173,11 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_heap_record_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_store_format_xyzw_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_heap_word_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_abs_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_quadmask_b64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_ff0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_bitset_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_flbit_check.py
@@ -207,6 +209,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_load_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_pack_absdiff_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
@@ -215,6 +218,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_bfm_b64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_data_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_get_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
@@ -265,14 +269,17 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_signext_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_brev_fold_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_const_copy_join_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_pack_b32_f16_check.py
 ./out/pe-env/bin/python -B tests/run_checks_parallel_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_handler_arity_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_getpc_refusal_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_arity_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_hi_msad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_pk_int16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_null_check.py
+./out/pe-env/bin/python -B tests/startup_compute_global_load_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support
@@ -286,7 +293,9 @@ newer versions may print a different `exp` spelling.
 | `src/` | Windows runtime shims and shared shader helpers. |
 | `tools/` | Offline translators, PE/image probes and inventory tools. |
 | `tests/` | C++, HLSL, MASM and Python fixtures. `tests/cpu/` holds the PE fixtures. |
-| `docs/experiments.md` | Measured results, assumptions and reproduction commands. |
+| `docs/experiments.md` | Older measured results, assumptions and reproduction commands. New notes go in `docs/experiments/<topic>.md`. |
+| `tests/cmake/` | One `<family>.cmake` file per test family or pull request, included by `CMakeLists.txt` (see its README). |
+| `tests/checks/` | Text files that add Python checks to the Linux CI jobs; see its README. |
 | `game-files/` | Local inputs; gitignored. Never commit or upload. |
 | `out/` | Build, generated sources and reports; gitignored. |
 
