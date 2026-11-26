@@ -8,6 +8,12 @@ struct PixelWqm {
     std::set<unsigned> filters, quad_guards;
     unsigned exact_restore = UINT_MAX;
     string survivor;
+    // Cross-quad EXECZ (#2907): each write of the branch mask, taken from the
+    // filtered coverage or the whole-quad EXEC, or narrowing the mask again.
+    enum class MaskSource { survivors, whole_quad, narrowed };
+    std::map<unsigned, MaskSource> vote_masks;
+    unsigned vote_wqm = UINT_MAX, vote_skip = UINT_MAX;
+    string vote_lane;
 
     static bool local(const Inst &i) {
         return GraphicsMaskRegions::local_alu(i) || i.name == "s_waitcnt" || i.name == "s_nop" ||
@@ -138,6 +144,123 @@ struct PixelWqm {
         p.at.erase(code[null].pc);
         p.at.erase(code.back().pc);
         code.resize(null);
+    }
+    // A scalar instruction that neither reads nor writes EXEC or VCC.
+    static bool plain_scalar(const Inst &i) {
+        if (i.enc != Encoding::Sop1 && i.enc != Encoding::Sop2 && i.enc != Encoding::Sopc &&
+            i.enc != Encoding::Sopk)
+            return false;
+        return (i.enc == Encoding::Sopc || i.dst < 106) && i.name.find("exec") == Name::npos &&
+               std::none_of(i.src.begin(), i.src.end(), [](unsigned r) { return r >= 106 && r <= 127; });
+    }
+    // Cross-quad EXECZ under WQM (#2907):
+    //   s_mov sE, exec; s_wqm exec, exec
+    //   one or more coverage filters  v_cmp_* vcc; s_andn2 sE, sE, vcc
+    //   v_cmp_* vcc; s_andn2 sM, sX, vcc     sX = sE (survivors) or exec (whole quads)
+    //   s_wqm exec, sM; s_cbranch_execz J    the region writes only scalars
+    //   J: s_mov exec, sE                    then a terminal colour export
+    // Lanes are skipped only when EXEC is zero in the whole guest wave, so the
+    // branch is a vote over the wave. It is lowered over the desktop wave,
+    // under the #2835 packing contract: a correct program cannot depend on
+    // which quads share a guest wave. The vote reads EXEC as modelled at the
+    // branch, OR-ed across the quad, so helper lanes count as on the guest.
+    void raster_vote(Program &p, bool narrow) {
+        auto &code = p.code;
+        const auto mov = narrow ? "s_mov_b32" : "s_mov_b64", andn2 = narrow ? "s_andn2_b32" : "s_andn2_b64";
+        const unsigned last_reg = narrow ? 105u : 104u;
+        auto aligned = [&](unsigned r) { return r <= last_reg && (narrow || !(r & 1)); };
+        auto overlaps = [&](const Inst &i, unsigned r) {
+            const unsigned width = i.name.find("_b64") != Name::npos ? 2 : 1;
+            return i.enc != Encoding::Sopc && i.dst < r + (narrow ? 1u : 2u) && r < i.dst + width;
+        };
+        auto compare = [](const Inst &i) {
+            return i.enc == Encoding::Vopc && i.dst == 106 && i.name.substr(0, 6) == "v_cmp_" &&
+                   i.name.find("class") == Name::npos;
+        };
+        if (!filters.empty() || code.size() < 10 || code[0].name != mov || code[0].src[0] != 126 ||
+            !aligned(code[0].dst) || !is_wqm(code[1], narrow) || code[1].dst != 126 || code[1].src[0] != 126)
+            return;
+        const unsigned entry = code[0].dst;
+        size_t n = 2;
+        while (n + 1 < code.size() && !code[n].branch() && !(is_wqm(code[n], narrow) && code[n].dst == 126))
+            ++n;
+        if (n + 1 >= code.size() || code[n].branch() || !code[n + 1].branch() || code[n + 1].op != 8 ||
+            code[n + 1].target() <= code[n + 1].pc)
+            return;
+        const auto &wqm = code[n];
+        auto &skip = code[n + 1];
+        if (!aligned(wqm.src[0]) || wqm.src[0] == entry)
+            return;
+        const unsigned mask = wqm.src[0];
+        // Before the vote: filters on sE, the mask write and lane-local work.
+        std::vector<unsigned> filter_pcs;
+        std::map<unsigned, MaskSource> mask_writes;
+        bool vcc_from_compare = false;
+        for (size_t k = 2; k < n; ++k) {
+            const auto &i = code[k];
+            if (compare(i)) {
+                vcc_from_compare = true;
+                continue;
+            }
+            if (i.name == andn2 && i.src[1] == 106) {
+                if (!vcc_from_compare)
+                    return;
+                if (i.dst == entry && i.src[0] == entry && mask_writes.empty())
+                    filter_pcs.push_back(i.pc);
+                else if (i.dst == mask && mask_writes.empty() && (i.src[0] == entry || i.src[0] == 126))
+                    mask_writes.emplace(i.pc, i.src[0] == 126 ? MaskSource::whole_quad : MaskSource::survivors);
+                else if (i.dst == mask && i.src[0] == mask && !mask_writes.empty())
+                    mask_writes.emplace(i.pc, MaskSource::narrowed);
+                else
+                    return;
+                vcc_from_compare = false;
+                continue;
+            }
+            if (local(i) && !(i.dst < 256 && (i.dst == 106 || i.dst == 107)))
+                continue;
+            if (plain_scalar(i) && !overlaps(i, entry) && !overlaps(i, mask))
+                continue;
+            return;
+        }
+        if (filter_pcs.empty() || mask_writes.empty())
+            return;
+        // The region: from here on the shape is claimed, so refuse by name.
+        size_t r = n + 2;
+        for (; r < code.size() && !(code[r].name == mov && code[r].dst == 126); ++r) {
+            const auto &i = code[r];
+            if (i.name == "s_nop" || i.name == "s_waitcnt")
+                continue;
+            if (i.branch())
+                refuse(i.pc, "cross-quad EXECZ region contains a branch");
+            if (i.name.find("s_setreg") == 0 || i.name.find("s_getreg") == 0)
+                refuse(i.pc, "cross-quad EXECZ region accesses a hardware register with " + string(i.name));
+            if (!plain_scalar(i))
+                refuse(i.pc, "cross-quad EXECZ region may only write scalars; " + string(i.name) +
+                                 " depends on the lanes the vote leaves out");
+            if (overlaps(i, entry))
+                refuse(i.pc, "cross-quad EXECZ region overwrites the saved coverage");
+        }
+        if (r == code.size() || code[r].src[0] != entry || skip.target() != code[r].pc)
+            refuse(skip.pc, "cross-quad EXECZ must branch to the exact coverage restore");
+        for (size_t j = r + 1; j < code.size(); ++j) {
+            const auto &i = code[j];
+            if (i.name == "s_endpgm" && j + 1 == code.size())
+                break;
+            if (!(GraphicsMaskRegions::local_alu(i) || i.name == "s_waitcnt" ||
+                  (i.enc == Encoding::Export && ((i.a >> 4) & 63) < 8)))
+                refuse(i.pc, "cross-quad EXECZ needs a terminal colour export after the restore");
+        }
+        for (const auto &i : code)
+            if (i.branch() && i.pc != skip.pc)
+                refuse(i.pc, "cross-quad EXECZ program has another branch");
+        filters.insert(filter_pcs.begin(), filter_pcs.end());
+        vote_masks.insert(mask_writes.begin(), mask_writes.end());
+        vote_wqm = wqm.pc;
+        vote_skip = skip.pc;
+        exact_restore = code[r].pc;
+        // SCC carries the vote; it is uniform over the desktop wave.
+        skip.op = 4;
+        skip.name = "s_cbranch_scc0";
     }
     string expand(DxilModule &ir, const string &mask) const {
         auto pair = ir.binary("or", mask, ir.binary("lshr", mask, "1"));

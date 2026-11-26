@@ -1405,6 +1405,7 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
     PixelWqm wqm;
     if (pixel) {
         wqm.raster_guard(program,stage.wave32);
+        wqm.raster_vote(program,stage.wave32);
         wqm.numeric_guards(program,stage.wave32);
     }
     GraphicsMaskRegions regions(program, stage.wave32, !pixel);
@@ -1485,6 +1486,35 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
             wqm.survivor=alu.ir.value("and i1 "+previous+", "+keep);
             alu.write(i.dst,{}); if (!stage.wave32) alu.write(i.dst+1,{});
             alu.write(128,{});
+            return;
+        }
+        if (auto vote=wqm.vote_masks.find(pc); vote!=wqm.vote_masks.end()) {
+            if (!whole_quad || exact_after_wqm || !alu.graphics_predicate.empty() || wqm.survivor.empty())
+                refuse(pc,"cross-quad EXECZ mask requires whole-quad EXEC after a coverage filter");
+            // Every lane of a covered quad, helpers included, is in the
+            // whole-quad EXEC; the filtered coverage holds only survivors.
+            const auto keep=alu.cmp("eq",alu.read(106),"0");
+            using Source=PixelWqm::MaskSource;
+            if (vote->second==Source::narrowed && wqm.vote_lane.empty())
+                refuse(pc,"cross-quad EXECZ mask narrowed before it is written");
+            wqm.vote_lane=vote->second==Source::whole_quad ? keep :
+                alu.ir.value("and i1 "+(vote->second==Source::survivors ? wqm.survivor : wqm.vote_lane)+", "+keep);
+            alu.write(i.dst,{}); if (!stage.wave32) alu.write(i.dst+1,{});
+            alu.write(128,{});
+            return;
+        }
+        if (pc==wqm.vote_wqm) {
+            if (wqm.vote_lane.empty()) refuse(pc,"cross-quad EXECZ vote has no modelled EXEC");
+            // EXEC at the branch is the WQM expansion of the mask: OR it over
+            // the quad (quad reads see helper lanes), then vote over the wave.
+            alu.ir.uses_wave=true;
+            auto bit=alu.ir.value("zext i1 "+wqm.vote_lane+" to i32");
+            auto quad=bit;
+            for (unsigned op=0;op<3;++op)
+                quad=alu.ir.binary("or",quad,
+                    alu.ir.invoke("i32","quadOp.i32",123,{{"i32",bit},{"i8",to_string(op)}},"nounwind"));
+            auto vote=alu.ir.invoke("i1","waveAnyTrue",113,{{"i1",alu.cmp("ne",quad,"0")}},"nounwind");
+            alu.write(128,alu.ir.value("zext i1 "+vote+" to i32"));
             return;
         }
         if (wqm.quad_guards.count(pc)) {
@@ -1999,7 +2029,13 @@ NativeComputeShader lower_graphics(GuestShaderStage &stage, unsigned first_srv =
                 auto condition = branch != regions.lane_branches.end() ?
                     alu.cmp(branch->second.second ? "ne" : "eq", alu.read(branch->second.first), "0") :
                     alu.cmp((last.op & 1) ? "ne" : "eq", alu.read(last.op >= 6 ? 106 : 128), "0");
-                if (branch == regions.lane_branches.end() && alu.ir.dependencies[condition].any())
+                // The cross-quad EXECZ vote is uniform over the desktop wave;
+                // its input dependencies still reach the values merged after it.
+                // Wave intrinsics are undefined on helper lanes, so a helper may
+                // take the other edge: safe only while nothing after the branch
+                // reads another lane (raster_vote keeps the tail lane-local).
+                if (branch == regions.lane_branches.end() && alu.ir.dependencies[condition].any() &&
+                    last.pc != wqm.vote_skip)
                     refuse(last.pc, "graphics scalar condition depends on a varying input");
                 alu.ir.body << "  br i1 " << condition << ", label %g" << last.target() << ", label %g" << last.next
                             << "\n";
