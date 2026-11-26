@@ -16675,6 +16675,43 @@ ctest --preset dev --no-tests=error -R '^(pixel_aot_sdwa_int_extra_warp|pixel_ao
 
 Linux controls, `form_coverage_check.check_sdwa_int_extra_forms`, and Python reference/mutation checks ran locally; LLVM 15 `pixel_aot_binary` round-trips and Windows WARP/hardware D3D12 draws run in CI.
 
+## `src_scc` as a scalar source
+
+`s_mul_i32 s28, 1.0, src_scc` was refused as `operand 'src_scc'` (issue #1820), one of the refused shaders
+in the loading-screen cache (#870). Scalar source code 253 reads the SCC bit as the integer value 0 or 1
+(fitting in 16 bits, so `low16_only=True` returns the same expression), and the generated shader carries SCC
+as a `bool scc`, so `Stage.u()` lowers `src_scc` to `(scc ? 1u : 0u)` when a modeled writer has set SCC
+on every reaching path in the current block (`s_cmp_*` / `s_and_b32` etc. via `set_scc()`, `set_exec_scc()`,
+or `scalar_wide_op()`). Reads where incoming SCC is unverified are refused: at shader entry, across
+control-flow joins/branch targets, after descriptor-elided SCC writes, and after unmodeled SCC writers in
+`SCC_UNMODELLED` such as `s_add_u32` (after `s_add_u32` finishes reading its own sources). Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc$' -V`.
+
+A branch target no longer drops a proven SCC in every case. In the local request cache, 238 of 239 requests
+refused this way stop first at `s_mov_b32 sN, src_scc`, and 1 at `s_mul_i32 sN, sN, src_scc`. Walking the
+control-flow graph back from each read finds the SCC writes that reach it: `s_bitcmp1_b32 sN, imm` (169
+reads), `s_bitcmp0_b32 sN, imm` (17), `s_cmp_eq_i32 sN, imm` (17), `s_cmp_lg_i32 sN, imm` (16),
+`s_cmp_lt_i32` (7), `s_cmp_lt_u32 sN, sN` (6), `s_cmp_eq_u64 sN, sN` (3), `s_and_b64 sN, vcc, exec` (2), or
+both `s_cmp_eq_i32` and `s_cmp_lg_i32` (2). One write reaches 230 reads, and two or three different writes
+reach 9. In the samples inspected, this is the compiler copying SCC into an SGPR on both arms of an if/else
+after `s_cbranch_scc0/1`, with the read in the arm that only the taken edge enters. Program-order tracking
+marked that arm unverified because of the other arm's `s_branch`, or a descriptor-elided SCC write there
+(`s_bfe_u32` of a descriptor word).
+
+Each forward branch now carries the offset of the emitted SCC write that reaches it, but only when that write
+was uniform (`scc_uniform`). A target keeps SCC proven when the fall-through and every edge into it carry the
+same write and no back edge enters it. Every path then ran that one write last, both for the modelled lane
+and for the wave. This holds whichever path each took, including a block that `s_cbranch_execz` skips for
+one lane only, so the model's SCC is the hardware value. Lane-mask SCC (`set_exec_scc`, a mask op on `vcc` or
+`exec`), unmodelled and elided writers, different writes on different paths, and loop heads stay refused.
+
+The translator was origin/main plus #1821, run over the 239 requests with 4 workers. Before the change, 85
+refuse first on `src_scc`; the other 154 stop earlier, 137 of them on `NEG on an integer or literal source`.
+After it, 75 of the 85 move on and 1 translates and compiles. The 10 left are compute requests. Each has a
+reaching `s_cmp_*` whose source the model does not prove uniform. In 7 a different write reaches on another
+path, and in 3 the path crosses a loop head.
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc(_join)?$' -V`.
+
 ## Startup shader request identity
 
 `startup_shader_cache_key` uses the explicit `X2W_FXC=''` manifest-only mode: no GPU
