@@ -29,7 +29,15 @@ The fixtures are source-built gfx1013 pixel stages behind a fixed vertex stage:
 - CALC: s23 = 1, a proven s_setpc_b64 skips s23 = 2 and lands on the read (a calculated jump is a branch; 1).
 - LOOP_RFL, JOIN_RFL: v_readfirstlane_b32 of a loop counter, and of a register written on one path of a join (both
   refused as unproven, never recomputed with a folded constant).
+- exec_join(): a lane mask written on the fall-through of a forward s_cbranch_execz and ANDed with exec by the
+  instruction at the branch target, while the skipping edge still brings a descriptor word. On the skipping edge
+  the lane's exec bit is 0, so bit 0 of `S & exec` is 0 (and of `S | ~exec` is 1) whatever S holds: these two
+  forms read the joined register. That a lane whose exec bit is 0 behaves as if it took the branch is the
+  translator's one-lane model, not something this check proves. The words are built here from the SOP2, SOPP and
+  VOP3 field layouts and checked against the decoder's text; they are not in SOURCES, so `binary` does not
+  assemble them.
 """
+import re
 import struct
 import subprocess
 import sys
@@ -85,6 +93,62 @@ SOURCES = {
                   'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
                   '04040cf4000000fa80039ebe8002007e8002027e1e8006bf020085bf04040cf4000000fa7fc08cbf080f00f000040400'
                   '703f8cbf0f1800f804050607000081bf'),
+    # Rule R1 (wave64): s_and_saveexec + s_cbranch_execz skips an s_load of a descriptor. The image_load at the branch
+    # target runs before the exec restore, so the lanes that skipped the arm (exec == 0) do nothing and it keeps the arm's
+    # descriptor. EXEC_DESC_AFTER reads it after the restore, where a lane that skipped is active again: refused.
+    'EXEC_DESC_MASKED': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                         's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                         's_waitcnt lgkmcnt(0)\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                         's_waitcnt vmcnt(0)\ns_or_b64 exec, exec, s[6:7]\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                         '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf080f00f000040400'
+                         '703f8cbf7e06fe880f1800f804050607000081bf'),
+    # A scalar read of the kept descriptor at the join instruction itself ends the window (refused); a reload of it
+    # between the join and the restore is a fresh all-path definition (translated).
+    'EXEC_DESC_SCALAR_JOIN': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                              's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                              's_waitcnt lgkmcnt(0)\ns_mov_b32 s30, s17\ns_waitcnt lgkmcnt(0)\n'
+                              'image_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\ns_waitcnt vmcnt(0)\n'
+                              's_or_b64 exec, exec, s[6:7]\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                              '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf11039ebe7fc08cbf08'
+                              '0f00f000040400703f8cbf7e06fe880f1800f804050607000081bf'),
+    'EXEC_DESC_RELOAD': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                         's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                         's_waitcnt lgkmcnt(0)\ns_load_dwordx8 s[16:23], s[8:9], 0x0\ns_waitcnt lgkmcnt(0)\n'
+                         's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                         's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                         '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf04040cf4000000fa7f'
+                         'c08cbf7e06fe88080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    # The join instruction is itself a branch: its incoming edge must not carry the kept arm descriptor to the next
+    # target, where the read after the restore would translate (refused). EXEC_DESC_BRANCH_IN has the branch inside
+    # the window, after a plain join instruction: the branch ends the window too (refused).
+    'EXEC_DESC_JOIN_BRANCH': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                              's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                              's_waitcnt lgkmcnt(0)\ns_branch 0\n'
+                              's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                              's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                              '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf000082bf7e06fe88'
+                              '080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    'EXEC_DESC_JOIN_SCC': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                           's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                           's_waitcnt lgkmcnt(0)\ns_cbranch_scc1 1\ns_endpgm\n'
+                           's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                           's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                           '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf010085bf000081bf'
+                           '7e06fe88080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    'EXEC_DESC_BRANCH_IN': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                            's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                            's_waitcnt lgkmcnt(0)\ns_nop 0\ns_branch 1\ns_endpgm\n'
+                            's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                            's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                            '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf000080bf010082bf'
+                            '000081bf7e06fe88080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    'EXEC_DESC_AFTER': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                        's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                        's_waitcnt lgkmcnt(0)\ns_or_b64 exec, exec, s[6:7]\n'
+                        'image_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\ns_waitcnt vmcnt(0)\n'
+                        'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                        '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf7e06fe88080f00f000040400'
+                        '703f8cbf0f1800f804050607000081bf'),
     # Compute, with the root of startup_gfx2hlsl_compute_check.py: the table descriptor is loaded before the loop, the
     # loop stores through it at its header and reloads it from the same place before the back edge. Each of 8 lanes
     # stores the counter (1, then 2) to two consecutive words.
@@ -154,7 +218,9 @@ def root(*params):
 
 
 ROOTS = {'DESC_CALC': ('t', 1), 'PAIR_READ': ('t', 1), 'PAIR_ROOT': ('t', 1), 'PAIR_WRITE': ('t', 1), 'DESC_LOAD': ('t', 1),
-         'DESC_WORD': ('t', 1), 'DESC_SAME': ('t', 1), 'DESC_ONE_PATH': ('t', 1),
+         'DESC_WORD': ('t', 1), 'DESC_SAME': ('t', 1), 'DESC_ONE_PATH': ('t', 1), 'EXEC_DESC_MASKED': ('t', 1),
+         'EXEC_DESC_AFTER': ('t', 1), 'EXEC_DESC_SCALAR_JOIN': ('t', 1), 'EXEC_DESC_RELOAD': ('t', 1),
+         'EXEC_DESC_JOIN_BRANCH': ('t', 1), 'EXEC_DESC_JOIN_SCC': ('t', 1), 'EXEC_DESC_BRANCH_IN': ('t', 1),
          'PTR_OFFSETS': ('t', 1)}
 
 
@@ -219,6 +285,16 @@ def check_controls():
     assert '        v0 = s23;' in lines('JOIN_SAME')  # #2279 drops the constant at any join another path writes
     same = translate('DESC_SAME')
     assert '        t = r0.Load(int3(v0, v1, 0));' in same.hlsl_ps().splitlines(), same.hlsl_ps()
+    # Rule R1: a descriptor loaded in an s_cbranch_execz arm is kept for a read before the exec restore ...
+    masked = translate('EXEC_DESC_MASKED').hlsl_ps().splitlines()
+    assert '        t = r0.Load(int3(v0, v1, 0));' in masked, masked
+    # ... and still refused for a read after the restore (a lane that skipped the arm is active again).
+    refused('EXEC_DESC_AFTER', "holds ('joined at a branch target',)")
+    for branchy in ('EXEC_DESC_JOIN_BRANCH', 'EXEC_DESC_JOIN_SCC', 'EXEC_DESC_BRANCH_IN'):
+        refused(branchy, "holds ('joined at a branch target',)")
+    refused('EXEC_DESC_SCALAR_JOIN','numeric use of s17 holding joined at a branch target')
+    reloaded = translate('EXEC_DESC_RELOAD').hlsl_ps().splitlines()
+    assert '        t = r0.Load(int3(v0, v1, 0));' in reloaded, reloaded
     reload = translate_cs('CS_RELOAD')
     cs = reload.hlsl_cs().splitlines()
     assert '        u0.Store(a, v5);' in cs and '        s22 = s22 + 0x00000001u;' in cs, cs
@@ -249,9 +325,147 @@ def check_controls():
           'on every path are kept; straight-line code still folds')
 
 
+def sop2(op, dst, src0, src1):
+    return struct.pack('<I', 0x80000000 | op << 23 | dst << 16 | src1 << 8 | src0)
+
+
+S_AND_B32, S_AND_B64, S_OR_B64, S_ANDN2_B64, S_ORN2_B64 = 14, 15, 17, 21, 23
+SCC1, VCCZ, EXECZ = 5, 6, 8
+EXEC = 126
+JOINED_S16 = 'numeric use of s16 holding joined at a branch target'
+
+
+def sopp(op, simm):
+    return struct.pack('<I', 0xbf800000 | op << 16 | simm & 0xffff)
+
+
+def cmp_ne(sdst, v):  # v_cmp_ne_i32_e64 sdst, 0, v
+    return struct.pack('<II', 0xd4000000 | 0x85 << 16 | sdst, 128 | (256 + v) << 9)
+
+
+def select_mask(mask):
+    # v_cndmask_b32_e64 v0, 0, 1, mask
+    return struct.pack('<II', 0xd5010000, 128 | (129 << 9) | (mask << 18))
+
+
+def exec_join(at_target, branch=EXECZ, fall=None, before=b'', read=select_mask(16)):
+    """s[16:23] = a descriptor; exec &= (v1 != 0); branch over `fall` (default: s16 = lane mask v0 != 0) to
+    `at_target`; then `read` (default: select on s16 into v0) and the export. `before` goes in front of the branch."""
+    fall = cmp_ne(16, 0) if fall is None else fall
+    return (bytes.fromhex('04040cf4000000fa' '8002007e' '8002027e') + cmp_ne(30, 1) + sop2(S_AND_B64, EXEC, EXEC, 30)
+            + before + struct.pack('<I', 0xbf800000 | branch << 16 | len(fall) // 4) + fall + at_target
+            + read + bytes.fromhex(EXPORT_WORDS))
+
+
+def exec_join_hlsl(*args, **kwargs):
+    return G.Pipeline(VS_WORDS, exec_join(*args, **kwargs), root('t', 1)).hlsl_ps().splitlines()
+
+
+REFUSALS = [0]
+
+
+def exec_join_refused(fragment, *args, **kwargs):
+    REFUSALS[0] += 1
+    try:
+        exec_join_hlsl(*args, **kwargs)
+    except G.Unsupported as reason:
+        assert fragment in str(reason), str(reason)
+        return
+    raise AssertionError('accepted, expected a refusal naming %r' % fragment)
+
+
+def check_exec_join():
+    and_s16 = sop2(S_AND_B64, 16, 16, EXEC)
+    # The built words decode to the program described above.
+    assert [asm for *_, asm in G.decode(exec_join(and_s16))] == [
+        's_load_dwordx8 s[16:23], s[8:9], 0x0', 'v_mov_b32_e32 v0, 0', 'v_mov_b32_e32 v1, 0',
+        'v_cmp_ne_i32_e64 s30, 0, v1', 's_and_b64 exec, exec, s[30:31]', 's_cbranch_execz label_0x28',
+        'v_cmp_ne_i32_e64 s16, 0, v0', 's_and_b64 s[16:17], s[16:17], exec', 'v_cndmask_b32_e64 v0, 0, 1, s16',
+        'exp mrt0 v0, v0, v0, v0 done vm', 's_endpgm'], G.decode(exec_join(and_s16))
+    # Accepted: the mask ANDed with exec at the target (either operand order), and ORed with its complement.
+    hlsl = exec_join_hlsl(and_s16)
+    assert "        pc = ((exec & 1) == 0) ? 2 : 1;" in hlsl and '        s16 = (s16 & exec) & 1;' in hlsl, hlsl
+    exec_join_refused('v_mov_b32 data operand s16 is a lane mask', and_s16, read=bytes.fromhex('1002007e'))
+    swapped, orn2 = exec_join_hlsl(sop2(S_AND_B64, 16, EXEC, 16)), exec_join_hlsl(sop2(S_ORN2_B64, 16, 16, EXEC))
+    assert '        s16 = (exec & s16) & 1;' in swapped and '        s16 = (s16 | ~exec) & 1;' in orn2
+    # exec as the destination: the same statement, and the lane stays off on the skipping edge.
+    assert '        exec = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, EXEC, 16, EXEC), read=bytes.fromhex('8002007e'))
+    # The emitted right-hand sides with exec bit 0, the only case in which the variable s16 may not hold the
+    # register: every word of s16 gives 0 for the AND and 1 for the OR with the complement.
+    def rhs(text):
+        line, = (l for l in text if l.startswith('        s16 = ') and l.endswith(') & 1;'))
+        return line[len('        s16 = '):-1]
+    for word in (0, 1, 3, 0x7ffffffe, 0xffffffff, 0x80000001):
+        for text, want in ((hlsl, 0), (swapped, 0), (orn2, 1)):
+            assert eval(rhs(text), {'s16': word, 'exec': 0}) == want, (rhs(text), word)
+    # Another destination: the result is read, and the source stays joined for the read after it.
+    assert '        s32 = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, 32, 16, EXEC), read=select_mask(32))
+    exec_join_refused(JOINED_S16, sop2(S_AND_B64, 32, 16, EXEC))
+    # Refused, each for one missing piece of the argument:
+    # the skipping branch is not s_cbranch_execz, so exec says nothing about the edge;
+    exec_join_refused(JOINED_S16, and_s16, branch=SCC1)
+    exec_join_refused(JOINED_S16, and_s16, branch=VCCZ)
+    # a second edge of another kind enters the same target (s_cbranch_scc1 over the execz branch and the write);
+    exec_join_refused(JOINED_S16, and_s16, before=struct.pack('<I', 0xbf800000 | SCC1 << 16 | 3))
+    # the AND is one instruction after the target (s_nop in between), where exec is no longer the edge's;
+    exec_join_refused(JOINED_S16, struct.pack('<I', 0xbf800000) + and_s16)
+    # an operation exec does not absorb: OR, AND with the complement, the complement of the mask, a 32-bit AND;
+    for op, src0, src1 in ((S_OR_B64, 16, EXEC), (S_ANDN2_B64, 16, EXEC), (S_ORN2_B64, EXEC, 16),
+                           (S_AND_B32, 16, EXEC), (S_AND_B64, 16, 30)):
+        exec_join_refused(JOINED_S16, sop2(op, 16, src0, src1))
+    # the fall-through leaves a constant, not a plain run-time number (s_mov_b32 s16, 3);
+    exec_join_refused(JOINED_S16, and_s16, fall=bytes.fromhex('830390be'))
+    # a read at the target without an absorbing operation;
+    exec_join_refused(JOINED_S16, b'')
+    # the branch into the target is backward (L: and; s_cbranch_execz L), only forward edges are absorbed;
+    backward = and_s16 + sopp(EXECZ, -2)
+    decoded = G.decode(exec_join(backward))
+    at = next(off for off, _n, name, asm in decoded if name == 's_and_b64' and 'exec, exec' not in asm)
+    assert [asm for *_, name, asm in decoded if name == 's_cbranch_execz'][-1] == 's_cbranch_execz label_0x%x' % at, decoded
+    exec_join_refused(JOINED_S16, backward)
+    # no fall-through enters: s16 is plain at the first skipping edge, a descriptor at the second, and the
+    # instruction before the target is s_endpgm;
+    only_skips = dict(before=cmp_ne(16, 0), fall=bytes.fromhex('04040cf4000000fa') + sopp(EXECZ, 1) + bytes.fromhex('000081bf'))
+    names = [name for _off, _n, name, _asm in G.decode(exec_join(and_s16, **only_skips))]
+    assert names[names.index('s_and_b64', names.index('s_and_b64') + 1) - 1] == 's_endpgm', names
+    exec_join_refused(JOINED_S16, and_s16, **only_skips)
+    # a plain run-time number on every path is no joined register: the read is the ordinary one;
+    assert '        s16 = (s16 & exec) & 1;' in exec_join_hlsl(and_s16, before=cmp_ne(16, 0))
+    # The compute pre-pass can now prove the lane absorption, but the scalar value is still a
+    # joined descriptor/number, so lowering must still refuse its numeric use.
+    cs = (bytes.fromhex('06038abe80038bbe05030cf4000000fa7fc08cbf') + cmp_ne(30, 0) + sop2(S_AND_B64, EXEC, EXEC, 30)
+          + sopp(EXECZ, 2) + cmp_ne(12, 0) + sop2(S_AND_B64, 12, 12, EXEC) + bytes.fromhex('0c02027e000081bf'))
+    import startup_gfx2hlsl_compute_check as C
+
+    def refusal_of_cs():
+        try:
+            G.ComputePipeline(cs, C.root_blob(), CS_RSRC2, CS_GROUP).hlsl_cs()
+        except G.Unsupported as reason:
+            return str(reason)
+        raise AssertionError('compute accepted')
+    reason = refusal_of_cs()
+    assert reason == 'numeric use of s12 holding joined at a branch target', reason
+    # Without the lowering every accepted form is refused where it reads s16.
+    absorbed = G.Stage.exec_absorbed_source
+    G.Stage.exec_absorbed_source = lambda self, base, srcs: None
+    try:
+        for word in (and_s16, sop2(S_AND_B64, 16, EXEC, 16), sop2(S_ORN2_B64, 16, 16, EXEC)):
+            exec_join_refused(JOINED_S16, word)
+    finally:
+        G.Stage.exec_absorbed_source = absorbed
+    print('exec join: a mask ANDed with exec (or ORed with its complement) at a target that only s_cbranch_execz '
+          'skips to is read; %d refusal controls and the old behaviour hold' % REFUSALS[0])
+
+
 def check_binary(llvm_mc):
     for name, (source, words) in SOURCES.items():
-        built = assemble(llvm_mc, source).hex()
+        if name.startswith('EXEC_DESC'):  # 64-bit exec mask forms: wave64
+            run = subprocess.run([llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64', '-show-encoding'],
+                                 input=source, capture_output=True, text=True, check=True)
+            built = ''.join(bytes(int(b, 16) for b in m.group(1).split(',')).hex() for m in
+                            (re.search(r'encoding: \[([^\]]*)\]', l) for l in run.stdout.splitlines()) if m)
+        else:
+            built = assemble(llvm_mc, source).hex()
         assert built == words, '%s: assembled %s, recorded %s' % (name, built, words)
     print('fixture words match llvm-mc')
 
@@ -321,6 +535,7 @@ def run_reload(dxc, runner, adapter, directory):
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         check_controls()
+        check_exec_join()
     elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
         check_binary(sys.argv[2])
     elif len(sys.argv) == 5 and sys.argv[1] in ('dispatch', 'control'):

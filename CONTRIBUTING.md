@@ -27,7 +27,9 @@ Start with the [first build](README.md#first-build). Create the Python environme
 | `src/` | Windows runtime implementations and their observable behavior. |
 | `tests/` | C++, HLSL and generated-input fixtures. Tests ending in `_warp` use the software adapter. Those ending in `_hardware` use a physical GPU. |
 | `tools/` | Build setup and offline metadata tools. The PE fixtures live in `tests/intake/`. |
-| `docs/experiments.md` | Measured results, assumptions and reproduction commands. |
+| `docs/experiments.md` | Older measured results, assumptions and reproduction commands. New notes go in `docs/experiments/<topic>.md`. |
+| `tests/cmake/` | One `<family>.cmake` file per test family or pull request; [CMakeLists.txt](CMakeLists.txt) includes each. See [its README](tests/cmake/README.md). |
+| `tests/checks/` | Text files that add Python checks to the Linux CI jobs without editing the workflow. See [its README](tests/checks/README.md). |
 
 On pull requests, `Build and test on Windows` builds the smoke-test targets with `cmake --build --preset pr` and runs `ctest --preset pr --no-tests=error`. The preset selects tests for CPU translation, PE startup, memory, archive decoding and WARP rendering, including the SPIR-V bridge checks. The bridge checks can skip locally if their tools are missing; hosted CI installs the pinned tools and requires the WARP bridge checks to pass. For a strict local run, run [the pinned tool setup](tools/setup-spirv-tools.ps1) (`.\tools\setup-spirv-tools.ps1` in PowerShell) before configuring or reconfiguring, then set `$env:X2W_REQUIRE_SPIRV_TOOLS = '1'` before running CTest. Run the tests for your specific change locally and include their results in the PR.
 
