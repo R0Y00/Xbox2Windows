@@ -188,7 +188,10 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
                                                             &stream_alternate_root))) return 7;
     }
 
-    LayoutStream with_layout{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, {layout_elements, 2}},
+    wchar_t layout_mode[8] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_INPUT_LAYOUT", layout_mode, 8);
+    const bool empty_layout = std::wcscmp(layout_mode, L"empty") == 0;  // declared layout with zero elements
+    LayoutStream with_layout{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, {layout_elements, empty_layout ? 0u : 2u}},
                              {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}}};
