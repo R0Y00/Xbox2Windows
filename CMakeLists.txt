@@ -1455,7 +1455,7 @@ foreach(backend IN ITEMS warp hardware)
 endforeach()
 
 # #2653: a failed wrapper allocation returns E_OUTOFMEMORY with a null output from device creation and slots 8, 9, 14,
-# 16, 55, 73 and 127. `control` never arms the failure, so the fixture must report it.
+# 16, 55, 73, 127 and both paths through slot 133. `control` never arms the failure.
 add_executable(startup_wrap_allocation tests/startup_wrap_allocation.cpp)
 target_compile_features(startup_wrap_allocation PRIVATE cxx_std_17)
 target_link_libraries(startup_wrap_allocation PRIVATE d3d12_xs_shim d3d12 dxgi)
