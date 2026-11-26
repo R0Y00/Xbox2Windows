@@ -986,6 +986,17 @@ def check_lane_mask_copy_of_data_clears_tag():
     refused('s_load through s14', lambda: translate('A', code=splice_words(mask_copy)).hlsl_cs())
 
 
+def check_lane_mask_pair_copy_of_data_stays_refused():
+    """A 64-bit copy of plain data (root constants s[4:5]) is lowered as a mask copy (the lane bit only), so its low word
+    must not be read as a number in a multi-thread group: the store would write 1, not the root constant."""
+    copy = bytes.fromhex('040494be')    # s_mov_b64 s[20:21], s[4:5]
+    use = bytes.fromhex('14020a7e')     # v_mov_b32 v5, s20
+    refused('is a lane mask', lambda: translate('A', code=splice_words(copy, use), group=(2, 1, 1)).hlsl_cs())
+    # a 32-bit copy of the same plain word is a full-word copy and stays readable
+    word = bytes.fromhex('040394be')    # s_mov_b32 s20, s4
+    assert 'v5 = s20' in translate('A', code=splice_words(word, use), group=(2, 1, 1)).hlsl_cs()
+
+
 def check_lane_mask_high_word_copy_and_overwrite():
     """A copy of a mask's high word is itself only a high word (no low-word tag, so no '& 1' on a numeric use in a one-thread
     group), and a wide write over a tagged pair ends the tag (no false refusal of the new value)."""
@@ -1311,6 +1322,7 @@ def check_controls():
     check_lane_mask_high_word()
     check_lane_mask_compare_pair()
     check_lane_mask_copy_of_data_clears_tag()
+    check_lane_mask_pair_copy_of_data_stays_refused()
     check_lane_mask_single_thread_group()
     check_lane_mask_high_word_copy_and_overwrite()
     check_lane_mask_derived_word()
