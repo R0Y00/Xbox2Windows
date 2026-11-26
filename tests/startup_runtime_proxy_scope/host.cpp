@@ -6,7 +6,9 @@
 // QueryApiImpl on xgameruntime must return the proxy; the same name on the decoy must still be the
 // decoy's export. A QueryApiImpl pointer cached before the proxy attaches stays the real export
 // (pre-attach gap). A delay-imported QueryApiImpl that has already bound is rewritten to the proxy;
-// an unbound delay thunk must not be. No game files.
+// an unbound delay thunk must not be. RegQueryValueExW is hooked on advapi32.dll only: the decoy's
+// same-named export stays its own, with X2W_DEVICE_TYPE unset and set, and never becomes the registry
+// the hook calls. No game files.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -29,6 +31,8 @@ void check(const char* label, bool ok)
 
 using ResolveFn = FARPROC(WINAPI*)(HMODULE);
 using QueryFn = HRESULT(WINAPI*)(const GUID*, const GUID*, void**);
+using RegQueryFn = LONG(WINAPI*)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+using SeenFn = LONG(WINAPI*)();
 
 std::wstring dir_of_self()
 {
@@ -102,6 +106,11 @@ int main()
     const FARPROC xgr_query = xgr ? GetProcAddress(xgr, "QueryApiImpl") : nullptr;
     check("xgameruntime exports QueryApiImpl", xgr_query != nullptr);
     check("decoy and xgameruntime exports differ", decoy_query && xgr_query && decoy_query != xgr_query);
+    const FARPROC decoy_reg = decoy ? GetProcAddress(decoy, "RegQueryValueExW") : nullptr;
+    check("decoy exports RegQueryValueExW", decoy_reg != nullptr);
+    const HMODULE advapi = LoadLibraryW(L"advapi32.dll");
+    const FARPROC advapi_reg = advapi ? GetProcAddress(advapi, "RegQueryValueExW") : nullptr;
+    check("advapi32.dll exports RegQueryValueExW", advapi_reg != nullptr && advapi_reg != decoy_reg);
 
     // Pre-attach cache: resolve before the proxy carrier loads. This pointer must stay the real
     // export after attach (IAT/GPA hooks do not rewrite already-held function pointers).
@@ -159,7 +168,6 @@ int main()
     }
 
     // Intended call: invoke the proxied entry; the fake xgameruntime must run.
-    using SeenFn = LONG(WINAPI*)();
     const auto xgr_seen = xgr ? reinterpret_cast<SeenFn>(GetProcAddress(xgr, "query_calls")) : nullptr;
     const auto decoy_seen = decoy ? reinterpret_cast<SeenFn>(GetProcAddress(decoy, "query_calls")) : nullptr;
     const LONG xgr_before = xgr_seen ? xgr_seen() : -1;
@@ -172,6 +180,32 @@ int main()
     // Pre-attach cache still reaches the real export (not the proxy entry).
     if (cached_before_proxy) reinterpret_cast<QueryFn>(cached_before_proxy)(nullptr, nullptr, nullptr);
     check("pre-attach cache still calls real export", xgr_seen && xgr_seen() == xgr_before + 2);
+
+    // Registry names, with the switch unset and set. The decoy is looked up first each time, so a
+    // match by name alone would keep the decoy as the registry the hook calls.
+    const auto decoy_reg_seen = decoy ? reinterpret_cast<SeenFn>(GetProcAddress(decoy, "registry_query_calls")) : nullptr;
+    DWORD type = 0, bytes = 0;
+    const LONG expect_real = advapi_reg ? reinterpret_cast<RegQueryFn>(advapi_reg)(nullptr, L"ConsoleMode", nullptr, &type, nullptr, &bytes) : -1;
+    check("advapi32.dll's own answer differs from the decoy's", expect_real != 0x5EC1);
+    for (const wchar_t* device : {static_cast<const wchar_t*>(nullptr), L"7"}) {
+        SetEnvironmentVariableW(L"X2W_DEVICE_TYPE", device);
+        const std::string pass = device ? "X2W_DEVICE_TYPE=7: " : "switch unset: ";
+        const FARPROC host_decoy_reg = decoy ? GetProcAddress(decoy, "RegQueryValueExW") : nullptr;
+        check((pass + "host GetProcAddress(decoy, RegQueryValueExW) stays original").c_str(), host_decoy_reg == decoy_reg);
+        const LONG decoy_reg_before = decoy_reg_seen ? decoy_reg_seen() : -1;
+        const LONG decoy_answer =
+            host_decoy_reg ? reinterpret_cast<RegQueryFn>(host_decoy_reg)(nullptr, L"ConsoleMode", nullptr, &type, nullptr, &bytes) : -1;
+        check((pass + "decoy RegQueryValueExW answers its own result").c_str(),
+              decoy_answer == 0x5EC1 && decoy_reg_seen && decoy_reg_seen() == decoy_reg_before + 1);
+        const FARPROC host_advapi_reg = advapi ? GetProcAddress(advapi, "RegQueryValueExW") : nullptr;
+        check((pass + "host GetProcAddress(advapi32, RegQueryValueExW) is hooked").c_str(),
+              host_advapi_reg && host_advapi_reg != advapi_reg && host_advapi_reg != decoy_reg);
+        const LONG hooked_answer =
+            host_advapi_reg ? reinterpret_cast<RegQueryFn>(host_advapi_reg)(nullptr, L"ConsoleMode", nullptr, &type, nullptr, &bytes) : -1;
+        check((pass + "hooked RegQueryValueExW reaches advapi32.dll, not the decoy").c_str(),
+              hooked_answer == expect_real && decoy_reg_seen && decoy_reg_seen() == decoy_reg_before + 1);
+    }
+    SetEnvironmentVariableW(L"X2W_DEVICE_TYPE", nullptr);
 
     if (failures) {
         std::printf("startup_runtime_proxy_scope: FAIL (%d)\n", failures);

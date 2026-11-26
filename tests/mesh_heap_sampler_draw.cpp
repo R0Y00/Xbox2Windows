@@ -46,14 +46,11 @@ struct Stream {
     Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
 };
 
-// The stand-in's decoder plus the LOD clamp: SQ_IMG_SAMP_WORD1 holds MIN_LOD in bits 11:0 and
-// MAX_LOD in bits 23:12, both unsigned 4.8 fixed point (RDNA2 ISA, image sampler descriptor).
-// dynamic_sampler() now applies them as well; the fixture keeps its own decode.
+// The stand-in's decoder, LOD clamp included: dynamic_sampler() applies MIN_LOD (SQ_IMG_SAMP_WORD1 bits 11:0)
+// and MAX_LOD (bits 23:12), both unsigned 4.8 fixed point (RDNA2 ISA, image sampler descriptor).
 bool fixture_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& out)
 {
     out = x2w_startup::dynamic_sampler(words);
-    out.MinLOD = static_cast<float>(words[1] & 0xfff) / 256.0f;
-    out.MaxLOD = static_cast<float>((words[1] >> 12) & 0xfff) / 256.0f;
     return true;
 }
 }  // namespace

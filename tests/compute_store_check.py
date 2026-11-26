@@ -16,6 +16,10 @@ import compute_store_aot as aot
 import shader_profile_audit
 from pixel_aot import _read_named_container, disassemble
 from resource_inventory import parts
+import dxc_cache
+
+# Route DXC compiles through the opt-in X2W_DXC_CACHE cache; other subprocess calls are untouched.
+subprocess = dxc_cache.with_dxc_cache(subprocess)
 
 SENTINEL = 0xc5c5c5c5
 INDEXED = [
@@ -5103,17 +5107,19 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
-def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix, group=32):
+def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix, group=32, *, cpu="gfx1030",
+                   features=DS_FEATURES):
     dims = aot.checked_group(group)
+    attributes = [f"-mattr={features}"] if features else []
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
-        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", f"-mcpu={cpu}", *attributes,
                         "-filetype=obj", src, "-o", obj], check=True)
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
         code = raw.read_bytes()
-        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
-                                          features=DS_FEATURES.encode()))
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=cpu.encode(),
+                                          features=(features or "").encode()))
         assert [line for line in decoded if line.startswith(prefix)] == [
             line for line in lines if line.startswith(prefix)]
         expected = aot.lower(lines, dims, **binding)
@@ -5404,6 +5410,231 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
             bad = subprocess.run(run, capture_output=True, text=True)
             if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
                 raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
+        accepted.update(line.split()[0] for line in lines)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
+    return 0
+
+
+# Group-shared LDS on gfx1013 (issue #1541): one 64-thread group per program, LDS words written by one lane and
+# read by another. Lane l of group g has tid = 64 * g + l; v5 = l * 4 is its word address, v8 its index.
+SHARED_PREFIX = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0", "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+                 "v_lshl_add_u32 v8, s11, 6, v0", "s_waitcnt lgkmcnt(0)", "v_lshlrev_b32_e32 v5, 2, v0"]
+SHARED_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=8, cpu="gfx1013", lds_bytes=1024,
+                      wave_size=64)
+# Without an allocation the wave64 statement is refused, so the no-LDS controls drop it.
+SHARED_NO_LDS = {key: value for key, value in SHARED_BINDING.items() if key != "wave_size"} | {"lds_bytes": 0}
+SHARED_WIDE_BINDING = SHARED_BINDING | {"stride": 16}
+SHARED_MIRROR = "v_sub_nc_u32_e32 v9, 0xfc, v5"  # (63 - l) * 4
+SHARED_DATA = ["v_add_nc_u32_e32 v6, 0x10000000, v8", "v_add_nc_u32_e32 v7, 0x20000000, v8"]
+# The atomic operand: an odd multiplier spreads the lanes' bits over the word.
+SHARED_MIX = 0x9e3779b1
+SHARED_PROGRAMS = {
+    # Own word, then the next lane's word and the mirrored lane's word.
+    "shared_exchange": (SHARED_BINDING, [
+        "v_add_nc_u32_e32 v6, 0x12340000, v8", "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        "v_add_nc_u32_e32 v7, 4, v5", "v_and_b32_e32 v7, 0xfc, v7", "ds_read_b32 v10, v7", "s_waitcnt lgkmcnt(0)",
+        SHARED_MIRROR, "ds_read_b32 v11, v9", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # Two words per lane, 64 words apart, written and read as pairs of the mirrored lane.
+    "shared_pair_b32": (SHARED_BINDING, [
+        *SHARED_DATA, "ds_write2_b32 v5, v6, v7 offset1:64", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        SHARED_MIRROR, "ds_read2_b32 v[10:11], v9 offset1:64", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # The same layout through st64: offset 1 is 64 elements.
+    "shared_pair_st64_b32": (SHARED_BINDING, [
+        *SHARED_DATA, "ds_write2st64_b32 v5, v6, v7 offset1:1", "s_waitcnt lgkmcnt(0)",
+        SHARED_MIRROR, "ds_read2st64_b32 v[10:11], v9 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # A qword per lane at l * 8, read back from the mirrored lane.
+    "shared_b64": (SHARED_BINDING, [
+        *SHARED_DATA, "v_lshlrev_b32_e32 v4, 3, v0", "ds_write_b64 v4, v[6:7]", "s_waitcnt lgkmcnt(0)",
+        "v_sub_nc_u32_e32 v9, 0x1f8, v4", "ds_read_b64 v[10:11], v9", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+    # Two qwords per lane 64 qwords apart, written with write2 and read with read2st64, and the other way round.
+    "shared_pair_b64": (SHARED_WIDE_BINDING, [
+        *SHARED_DATA, "v_add_nc_u32_e32 v12, 0x30000000, v8", "v_add_nc_u32_e32 v13, 0x50000000, v8",
+        "v_lshlrev_b32_e32 v4, 3, v0", "ds_write2_b64 v4, v[6:7], v[12:13] offset1:64", "s_waitcnt lgkmcnt(0)",
+        "v_sub_nc_u32_e32 v9, 0x1f8, v4", "ds_read2st64_b64 v[14:17], v9 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[14:17], v8, s[20:23], 0 idxen"]),
+    "shared_pair_st64_b64": (SHARED_WIDE_BINDING, [
+        *SHARED_DATA, "v_add_nc_u32_e32 v12, 0x30000000, v8", "v_add_nc_u32_e32 v13, 0x50000000, v8",
+        "v_lshlrev_b32_e32 v4, 3, v0", "ds_write2st64_b64 v4, v[6:7], v[12:13] offset1:1", "s_waitcnt lgkmcnt(0)",
+        "v_sub_nc_u32_e32 v9, 0x1f8, v4", "ds_read2_b64 v[14:17], v9 offset1:64", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[14:17], v8, s[20:23], 0 idxen"]),
+    # Four words per lane at l * 16, read back from the next lane.
+    "shared_b128": (SHARED_WIDE_BINDING, [
+        "v_add_nc_u32_e32 v10, 0x10000000, v8", "v_add_nc_u32_e32 v11, 0x20000000, v8",
+        "v_add_nc_u32_e32 v12, 0x30000000, v8", "v_add_nc_u32_e32 v13, 0x50000000, v8",
+        "v_lshlrev_b32_e32 v4, 4, v0", "ds_write_b128 v4, v[10:13]",
+        "s_waitcnt lgkmcnt(0)", "v_add_nc_u32_e32 v9, 16, v4", "v_and_b32_e32 v9, 0x3f0, v9",
+        "ds_read_b128 v[14:17], v9", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[14:17], v8, s[20:23], 0 idxen"]),
+    # Every lane sets the seven counters (same values, so the overlapping writes agree), then updates them; lane l
+    # reports counters l & 7 and (l + 1) & 7, where counter 7 holds a constant.
+    "shared_atomics": (SHARED_BINDING, [
+        "v_mov_b32_e32 v4, 0", "v_mov_b32_e32 v20, 0", "v_mov_b32_e32 v21, -1", "v_mov_b32_e32 v23, 0x5a5a5a5a",
+        "ds_write2_b32 v4, v20, v20 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "ds_write2_b32 v4, v21, v20 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "ds_write2_b32 v4, v20, v21 offset0:4 offset1:5", "s_waitcnt lgkmcnt(0)",
+        "ds_write2_b32 v4, v20, v23 offset0:6 offset1:7", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        f"v_mul_lo_u32 v22, 0x{SHARED_MIX:08x}, v8",
+        "ds_add_u32 v4, v8", "s_waitcnt lgkmcnt(0)", "ds_sub_u32 v4, v8 offset:4", "s_waitcnt lgkmcnt(0)",
+        "ds_and_b32 v4, v22 offset:8", "s_waitcnt lgkmcnt(0)", "ds_or_b32 v4, v22 offset:12", "s_waitcnt lgkmcnt(0)",
+        "ds_xor_b32 v4, v22 offset:16", "s_waitcnt lgkmcnt(0)", "ds_min_u32 v4, v22 offset:20", "s_waitcnt lgkmcnt(0)",
+        "ds_max_u32 v4, v22 offset:24", "s_waitcnt lgkmcnt(0)", "s_barrier",
+        "v_and_b32_e32 v24, 28, v5", "ds_read_b32 v10, v24", "s_waitcnt lgkmcnt(0)",
+        "v_add_nc_u32_e32 v25, 4, v5", "v_and_b32_e32 v25, 28, v25", "ds_read_b32 v11, v25", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]),
+}
+SHARED_CASES = [(name, SHARED_PREFIX + lines + ["s_endpgm"], binding)
+                for name, (binding, lines) in SHARED_PROGRAMS.items()]
+SHARED_FORMS = {"ds_write_b32", "ds_read_b32", "ds_write_b64", "ds_read_b64", "ds_write_b128", "ds_read_b128",
+                "ds_write2_b32", "ds_read2_b32", "ds_write2st64_b32", "ds_read2st64_b32", "ds_write2_b64",
+                "ds_read2_b64", "ds_write2st64_b64", "ds_read2st64_b64", "ds_add_u32", "ds_sub_u32", "ds_and_b32",
+                "ds_or_b32", "ds_xor_b32", "ds_min_u32", "ds_max_u32", "s_barrier"}
+
+
+def shared_counters(group):
+    tids = [64 * group + lane for lane in range(64)]
+    mixed = [tid * SHARED_MIX & 0xffffffff for tid in tids]
+    total = sum(tids) & 0xffffffff
+    a = mixed[0]
+    for value in mixed[1:]:
+        a &= value
+    o = x = 0
+    for value in mixed:
+        o |= value
+        x ^= value
+    return [total, -total & 0xffffffff, a, o, x, min(mixed), max(mixed), 0x5a5a5a5a]
+
+
+def shared_reference(name, groups):
+    words = []
+    for group in range(groups):
+        def tid(lane):
+            return 64 * group + lane
+        counters = shared_counters(group)
+        for lane in range(64):
+            mirror = 63 - lane
+            if name == "shared_exchange":
+                words += [0x12340000 + tid((lane + 1) % 64), 0x12340000 + tid(mirror)]
+            elif name in ("shared_pair_b32", "shared_pair_st64_b32", "shared_b64"):
+                words += [0x10000000 + tid(mirror), 0x20000000 + tid(mirror)]
+            elif name in ("shared_pair_b64", "shared_pair_st64_b64"):
+                words += [base + tid(mirror) for base in (0x10000000, 0x20000000, 0x30000000, 0x50000000)]
+            elif name == "shared_b128":
+                words += [base + tid((lane + 1) % 64) for base in (0x10000000, 0x20000000, 0x30000000, 0x50000000)]
+            else:
+                words += [counters[lane & 7], counters[(lane + 1) & 7]]
+    return words
+
+
+def shared_mutants(name, lines, binding):
+    """Assembly changes the reference must catch, with the first word they change."""
+    if name == "shared_exchange":
+        # The next-but-one lane instead of the next one.
+        yield variant(lines, ("v_add_nc_u32_e32 v7, 4, v5", "v_add_nc_u32_e32 v7, 8, v5")), 0
+    elif name == "shared_pair_st64_b32":
+        # offset1:1 as 4 bytes instead of 64 elements reads the next word, the mirrored lane's neighbour.
+        yield variant(lines, ("ds_read2st64_b32 v[10:11], v9 offset1:1", "ds_read2_b32 v[10:11], v9 offset1:1")), 1
+    elif name == "shared_atomics":
+        # min in place of max: lane 5 reports counter 6 as its second word.
+        yield variant(lines, ("ds_max_u32 v4, v22 offset:24", "ds_min_u32 v4, v22 offset:24")), 11
+
+
+def shared_controls():
+    for name, lines, binding in SHARED_CASES:
+        source = aot.lower(lines, 64, **binding)
+        assert f"groupshared uint lds[{binding['lds_bytes'] // 4}];" in source, name
+        # Every DS instruction is followed by one group barrier; s_barrier adds none after it.
+        steps = sum(line.startswith("ds_") for line in lines)
+        assert source.count("GroupMemoryBarrierWithGroupSync();") == steps, name
+        assert "uint3 local : SV_GroupThreadID" in source, name
+        # Out-of-range words are outside the input contract; every access stays guarded by the allocation size.
+        guard = f" < {binding['lds_bytes'] // 4}u"
+        assert all(guard in line for line in source.splitlines() if "lds[" in line and "groupshared" not in line), name
+    programs = {name: lines for name, lines, _ in SHARED_CASES}
+    atomics = aot.lower(programs["shared_atomics"], 64, **SHARED_BINDING)
+    for method in ("Add", "And", "Or", "Xor", "Min", "Max"):
+        assert f"Interlocked{method}(lds[" in atomics, method
+    assert "(0u - tid.x)" in atomics
+    lines = programs["shared_exchange"]
+    # A barrier with no DS instruction before it is kept.
+    assert aot.lower(SHARED_PREFIX + ["s_barrier"] + lines[len(SHARED_PREFIX):], 64,
+                     **SHARED_BINDING).count("GroupMemoryBarrierWithGroupSync();") == 4
+    write = "ds_write_b32 v5, v6"
+    for wrong, message in (
+            ("ds_add_rtn_u32 v10, v5, v6", "Unsupported shared LDS instruction"),
+            ("ds_write_b96 v5, v[6:8]", "Unsupported shared LDS instruction"),
+            ("ds_write_b8 v5, v6", "Unsupported shared LDS instruction"),
+            ("ds_min_i32 v5, v6", "Unsupported shared LDS instruction"),
+            ("ds_write_b32 v5, v6 offset:65536", "Unverified shared LDS offset"),
+            ("ds_write_b32 v0, v6", "Unverified shared LDS address"),
+            ("ds_write_b32 v5, v0", "Shared LDS data is not a known word"),
+            ("ds_write_b64 v5, v[6:8]", "Unverified shared LDS register range"),
+            ("ds_write2_b32 v5, v6, v6 offset0:3 offset1:3", "Unverified shared LDS pair offsets"),
+            ("ds_write2_b32 v5, v6, v6 offset1:256", "Unverified shared LDS pair offsets")):
+        rejects(message, aot.lower, variant(lines, (write, wrong)), 64, **SHARED_BINDING)
+    # Barriers need uniform control flow: no DS instruction after a lane guard.
+    i = lines.index(write)
+    guarded = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Shared LDS access under a lane guard", aot.lower, guarded, 64, **SHARED_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 64, **SHARED_BINDING)
+    for size in (0x10004 // 2, 2, 6, 32772):
+        rejects("Invalid shared LDS allocation", aot.lower, lines, 64, **SHARED_BINDING | {"lds_bytes": size})
+    # The profile is one guest wave. 32 threads are one wave at either width and need no statement; 64 threads
+    # need the wave64 statement, and are two waves under wave32; 128 threads are two wave64 waves.
+    unstated = {key: value for key, value in SHARED_BINDING.items() if key != "wave_size"}
+    half = variant(lines, ("v_lshl_add_u32 v8, s11, 6, v0", "v_lshl_add_u32 v8, s11, 5, v0"))
+    assert "groupshared uint lds[256];" in aot.lower(half, 32, **unstated)
+    for group, binding in ((64, unstated), (64, SHARED_BINDING | {"wave_size": 32}), (128, SHARED_BINDING),
+                           ((32, 2, 1), SHARED_BINDING | {"wave_size": 32})):
+        rejects("Shared LDS requires a group of one guest wave", aot.lower, lines, group, **binding)
+    # wave64 is not a lane layout outside the shared LDS profile.
+    rejects("Unsupported wave size statement", aot.lower, lines, 64, **SHARED_NO_LDS | {"wave_size": 64})
+    rejects("Unsupported wave size statement", aot.lower, lines, 64, **SHARED_BINDING | {"cpu": "gfx1030"})
+    # Without an allocation gfx1013 keeps refusing the local-ID address, DS and s_barrier.
+    rejects("Unverified dispatch byte offset", aot.lower, lines, 64, **SHARED_NO_LDS)
+    rejects("Unverified private LDS write", aot.lower, SHARED_PREFIX[:5] + lines[len(SHARED_PREFIX):], 64,
+            **SHARED_NO_LDS)
+    rejects("Unsupported compute instruction: s_barrier", aot.lower,
+            SHARED_PREFIX[:5] + ["s_barrier", "buffer_store_dword v8, v8, s[20:23], 0 idxen", "s_endpgm"], 64,
+            **SHARED_NO_LDS | {"stride": 4})
+    # The CPU references differ from the mutants'.
+    for name, lines, binding in SHARED_CASES:
+        for _, first in shared_mutants(name, lines, binding):
+            assert first < len(shared_reference(name, 1)), name
+    assert {line.split()[0] for _, lines, _ in SHARED_CASES for line in lines} >= SHARED_FORMS
+
+
+def shared_draw(directory, compiler, renderer, backend):
+    shared_controls()
+    accepted = set()
+    for name, lines, binding in SHARED_CASES:
+        source = aot.lower(lines, 64, **binding)
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        src.write_text(source, encoding="ascii")
+        compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile, check=True)
+        run = [renderer, backend, "--compute-store-case", cso, case]
+        # Two groups show that each group has its own LDS; four words per lane leave room for one.
+        for groups in (1,) if binding["stride"] == 16 else (1, 2):
+            words = shared_reference(name, groups)
+            case.write_bytes(struct.pack("<321I", groups, *(words + [SENTINEL] * (320 - len(words)))))
+            execution = subprocess.run(run)
+            if execution.returncode:
+                return execution.returncode
+        for mutated, mismatched_word in shared_mutants(name, lines, binding):
+            src.write_text(aot.lower(mutated, 64, **binding), encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
+                raise AssertionError(f"{name}: shared LDS mutation escaped detection\n{bad.stderr}")
             print(bad.stderr, end="")
         accepted.update(line.split()[0] for line in lines)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
@@ -5883,6 +6114,376 @@ def mubuf_counter_draw(directory, compiler, renderer, backend, wide=False, csub=
         path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
     return 0
 
+# Raw fixed-address buffer_atomic_fmin/fmax on gfx1030, under the caller's buffer_float_domain
+# "finite-normal" contract. Like the integer reductions, the address is fixed (off, no idxen/offen)
+# and the atomic is the sole UAV operation; the offset selects the word (1 = byte offset 4).
+MUBUF_FLOAT_DOMAIN = "finite-normal"
+MUBUF_FLOAT_LITERAL = {"fmin": 0xbf800011, "fmax": 0x3f800011}  # -1.000002 and +1.000002
+# Every lane's contended word is MUBUF_REDUCTION_INPUT ^ gid ^ ((gid % 4) << 30), the integer
+# reduction fixture's per-lane value: it stays finite-normal binary32 for all gids and spans
+# positive and negative magnitudes across six orders of magnitude, so lanes genuinely compete.
+MUBUF_FLOAT_INITIAL = {"fmin": 0x7f7fffff, "fmax": 0xff7fffff}  # the largest and smallest finite float
+MUBUF_FLOAT_INITIAL_FLAG = 1 << 31  # store-case header bit declaring initial output words
+
+
+def mubuf_float_cases():
+    for op in ("fmin", "fmax"):
+        for contended in (False, True):
+            name = f"buffer_atomic_{op}{'_contended' if contended else ''}"
+            lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                     "s_load_dwordx4 s[20:23], s[12:13], 0x30"]
+            if contended:
+                # gid = group.x * 32 + local.x; the word is the reduction fixture's per-lane value.
+                lines += ["v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)",
+                          f"v_xor_b32_e32 v10, {MUBUF_REDUCTION_INPUT:#x}, v8",
+                          "v_and_b32_e32 v12, 3, v8", "v_lshlrev_b32_e32 v12, 30, v12",
+                          "v_xor_b32_e32 v10, v12, v10"]
+            else:
+                lines += ["s_waitcnt lgkmcnt(0)",
+                          f"v_mov_b32_e32 v10, {MUBUF_FLOAT_LITERAL[op]:#x}"]
+            lines += [f"buffer_atomic_{op} v10, off, s[20:23], 0 offset:4", "s_endpgm"]
+            yield name, op, contended, lines, {k: v for k, v in DS_BINDING.items() if k != "stride"} | {
+                "buffer_float_domain": MUBUF_FLOAT_DOMAIN}
+
+
+def mubuf_float_word(gid):
+    """The contended per-lane word, the integer reduction fixture's input pattern."""
+    return (MUBUF_REDUCTION_INPUT ^ gid ^ ((gid % 4) * 0x40000000)) & 0xffffffff
+
+
+def mubuf_float_reference(op, contended, groups, *, initial=SENTINEL, reversed_values=False):
+    """Independent CPU float reference: fold min/max over the stored word and the lanes' words.
+
+    The values are finite-normal binary32, so Python's float comparison is the ISA's ordering;
+    the winner keeps its exact bit pattern because distinct finite-normal floats are distinct words.
+    reversed_values models a translation that compares with the wrong operator.
+    """
+    words = [initial]
+    if contended:
+        # tid.x is the dispatch X index, so two 32-lane groups offer two distinct 32-word
+        # spans and every lane's word competes.
+        words += [mubuf_float_word(gid) for gid in range(32 * groups)]
+    else:
+        words += [MUBUF_FLOAT_LITERAL[op]] * 32 * groups
+    choose = min if (op == "fmin") != reversed_values else max
+    result = choose(words, key=lambda word: struct.unpack("<f", struct.pack("<I", word))[0])
+    for word in words:
+        assert 0 < ((word >> 23) & 0xff) < 0xff, hex(word)
+    return result
+
+
+def mubuf_float_controls():
+    for name, op, contended, lines, binding in mubuf_float_cases():
+        atomic = lines[-2]
+        # The domain contract: missing, unneeded and misspelled.
+        rejects("buffer_atomic fmin/fmax require a finite-normal domain, a single 32-bit operand and no glc",
+                aot.lower, lines, 32, **(binding | {"buffer_float_domain": None}))
+        rejects("Invalid buffer float domain", aot.lower, lines, 32,
+                **(binding | {"buffer_float_domain": "all-floats"}))
+        rejects("Unused buffer float domain", aot.lower, variant(lines, (atomic, atomic.replace(
+            f"buffer_atomic_{op}", "buffer_atomic_umin"))), 32, **binding)
+        # A plain store replacing the atomic is a mixed target, not a float atomic.
+        rejects("Unsupported store address", aot.lower, variant(
+            lines, (atomic, "buffer_store_dword v10, off, s[20:23], 0 offset:4")), 32, **binding)
+        # Mixed operations: an integer atomic or a plain store next to the float atomic.
+        rejects("An atomic reduction must be the only UAV operation", aot.lower,
+                variant(lines, (atomic, atomic + "\nbuffer_atomic_umin v11, off, s[20:23], 0 offset:8")),
+                32, **binding)
+        # The single 32-bit no-glc operand form.
+        rejects("buffer_atomic fmin/fmax require a finite-normal domain, a single 32-bit operand and no glc",
+                aot.lower, variant(lines, (atomic, atomic + " glc")), 32, **binding)
+        rejects("Unverified atomic reduction data range", aot.lower,
+                variant(lines, (atomic, atomic.replace("v10,", "v[10:11],"))), 32, **binding)
+        # The other profile guards: target, descriptor, address and sole-UAV-operation.
+        rejects("Unsupported atomic reduction target or binding", aot.lower, lines, 32,
+                **(binding | {"cpu": "gfx1013"}))
+        rejects("Unsupported atomic reduction target or binding", aot.lower, lines, 32,
+                **(binding | {"stride": 4}))
+        rejects("Unverified atomic reduction descriptor", aot.lower,
+                variant(lines, (atomic, atomic.replace("s[20:23]", "s[21:24]"))), 32, **binding)
+        rejects("Unverified atomic reduction address", aot.lower,
+                variant(lines, (atomic, atomic.replace("offset:4", "offset:2"))), 32, **binding)
+        rejects("Unverified atomic reduction address", aot.lower,
+                variant(lines, (atomic, atomic.replace("offset:4", "offset:4096"))), 32, **binding)
+        rejects("Unverified atomic reduction descriptor", aot.lower,
+                variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+
+
+def mubuf_float_case_bytes(groups, expected, initial_words, *, constants_words=None, source_words=None):
+    """Pack a store-case file: header flag, 320 expected words, then the flagged initial
+    segment, then the historic optional constants and t0 source segments in order."""
+    data = struct.pack("<321I", groups | MUBUF_FLOAT_INITIAL_FLAG, *expected)
+    data += struct.pack("<320I", *initial_words)
+    if constants_words is not None or source_words is not None:
+        data += struct.pack("<16I", *(constants_words or [0] * 16))
+    if source_words is not None:
+        data += struct.pack("<320I", *source_words)
+    return data
+
+
+def mubuf_float_case_controls(cmd, case):
+    """Malformed flagged case files through the actual runner's parser, before any dispatch:
+    a truncated initial segment, an unknown header bit, and a trailing partial constants
+    payload. Each must fail with the parser's exact diagnostic on an admitted backend; an
+    unavailable one propagates the runner's 77 skip."""
+    expected, initial_words = [SENTINEL] * 320, [SENTINEL] * 320
+    expected[1], initial_words[1] = 0x3f800011, 0x7f7fffff
+    good = mubuf_float_case_bytes(2, expected, initial_words)
+    for malformed, diagnostic in (
+        (good[:4 + 1280 + 640], "Invalid compute store initial words"),
+        (struct.pack("<321I", 2 | (1 << 30), *expected) + struct.pack("<320I", *initial_words),
+         "Invalid compute store reference"),
+        (good + struct.pack("<4s", b"junk"), "Invalid compute store constants"),
+    ):
+        case.write_bytes(malformed)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode == 77:
+            print(bad.stdout, end="")
+            return 77
+        if bad.returncode != 1 or diagnostic not in bad.stderr:
+            raise AssertionError(f"Malformed case escaped the parser\n{bad.stdout}\n{bad.stderr}")
+        print(bad.stderr.strip(), flush=True)
+    return 0
+
+
+def mubuf_float_mutation(op, contended):
+    """Source-text mutations of the emitted CAS that a wrong lowering would produce."""
+    if contended:
+        return ("while (observed != expected)", "while (false)")
+    comparison, opposite = ("<", ">") if op == "fmin" else (">", "<")
+    return (f"valueKey {comparison} oldKey", f"valueKey {opposite} oldKey")
+
+
+def mubuf_float_draw(directory, compiler, renderer, backend):
+    mubuf_float_controls()
+    src, cso, case = (directory / f"mubuf-float.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    accepted = set()
+    for name, op, contended, lines, binding in mubuf_float_cases():
+        print(name, flush=True)
+        kernel = aot.lower(lines, 32, **binding)
+        src.write_text(kernel, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        if not accepted:
+            # The malformed-case controls run through the actual CLI parser before any
+            # dispatch; a hardware capability skip propagates out of the draw entry.
+            skipped = mubuf_float_case_controls(run, case)
+            if skipped:
+                return skipped
+        for groups in (1, 2):
+            # One and two 32-lane groups: tid.x spans the whole dispatch X, so the second
+            # group's contended words are distinct from the first group's.
+            for initial in (MUBUF_FLOAT_INITIAL[op], SENTINEL):
+                # The op-specific extreme is the value the winning lane must beat; the sentinel
+                # run keeps the untouched-seed profile the integer reductions use. The stored
+                # word starts at the declared seed, so the CPU oracle matches the buffer.
+                expected = [SENTINEL] * 320
+                initial_words = [SENTINEL] * 320
+                initial_words[1] = initial
+                expected[1] = mubuf_float_reference(op, contended, groups, initial=initial)
+                case.write_bytes(mubuf_float_case_bytes(groups, expected, initial_words))
+                result = subprocess.run(run)
+                if result.returncode:
+                    return result.returncode
+        correct, wrong = mubuf_float_mutation(op, contended)
+        assert kernel.count(correct) == 1
+        mutant = mubuf_float_reference(op, contended, 2, initial=MUBUF_FLOAT_INITIAL[op],
+                                       reversed_values=True)
+        src.write_text(kernel.replace(correct, wrong), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        # The mutated kernel keeps the extreme initial word: the contended while (false) form stops
+        # after one failed compare against the never-zero stored word, and the uncontended flipped
+        # comparison prefers the initial extreme over the single lane value, so the observed word
+        # is the mutated reference either way.
+        expected = [SENTINEL] * 320
+        expected[1] = mubuf_float_reference(op, contended, 2, initial=MUBUF_FLOAT_INITIAL[op])
+        initial_words = [SENTINEL] * 320
+        initial_words[1] = MUBUF_FLOAT_INITIAL[op]
+        case.write_bytes(mubuf_float_case_bytes(2, expected, initial_words))
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if (bad.returncode != 1 or f"word=1 expected={expected[1]:08x} actual={mutant:08x}"
+                not in bad.stderr):
+            raise AssertionError(f"{name}: incorrect float min/max escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+        accepted.add(name)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(sorted(accepted)) + "\n", encoding="utf-8")
+    return 0
+
+
+# Only the four forms not already covered by mubuf_float_cases(). Low words differ
+# even when the high words agree, so a truncated comparison or an exchanged pair fails.
+MUBUF_FLOAT_EXTRA = (
+    ("fcmpswap", False, 0xbf812345, 0x3f865432),
+    ("fcmpswap", True, 0xbff2345676543210, 0x3ff6543212345678),
+    ("fmin", True, 0xc000000012345678, 0xc000000087654321),
+    ("fmax", True, 0xc000000076543210, 0x4000000087654321),
+)
+
+
+def mubuf_float_extra_cases():
+    for op, wide, initial, value in MUBUF_FLOAT_EXTRA:
+        name = f"buffer_atomic_{op}{'_x2' if wide else ''}"
+        width = 2 if wide else 1
+        operands = (value, initial) if op == "fcmpswap" else (value,)
+        words = [operand >> (32 * i) & 0xffffffff for operand in operands for i in range(width)]
+        lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                 "s_load_dwordx4 s[20:23], s[12:13], 0x30", "s_waitcnt lgkmcnt(0)"]
+        lines += [f"v_mov_b32_e32 v{10 + i}, {word:#x}" for i, word in enumerate(words)]
+        lines += [f"{name} v[10:{9 + len(words)}], off, s[20:23], 0 offset:8", "s_endpgm"]
+        yield name, op, wide, initial, value, lines, {
+            k: v for k, v in DS_BINDING.items() if k != "stride"
+        } | {"buffer_float_domain": MUBUF_FLOAT_DOMAIN}
+
+
+def mubuf_float_extra_reference(op, wide, initial, value, compare):
+    def number(bits):
+        integer, real = ("<Q", "<d") if wide else ("<I", "<f")
+        return struct.unpack(real, struct.pack(integer, bits))[0]
+
+    old, candidate = number(initial), number(value)
+    if op == "fcmpswap":
+        return value if old == number(compare) else initial
+    return value if (candidate < old if op == "fmin" else candidate > old) else initial
+
+
+def mubuf_float_extra_controls():
+    for _, op, wide, initial, value, lines, binding in mubuf_float_extra_cases():
+        atomic = lines[-2]
+        domain = "require a finite-normal domain and no glc"
+        rejects(domain, aot.lower, lines, 32, **(binding | {"buffer_float_domain": None}))
+        rejects(domain, aot.lower, variant(lines, (atomic, atomic + " glc")), 32, **binding)
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(lines, (atomic, atomic.replace("off,", "v0,") + " offen")), 32, **binding)
+        rejects("Unverified atomic reduction address", aot.lower,
+                variant(lines, ("offset:8", "offset:4" if wide else "offset:2")), 32, **binding)
+        rejects("Unverified atomic reduction data range", aot.lower,
+                variant(lines, (atomic, atomic.replace(atomic.split()[1], "v10,"))), 32, **binding)
+        high_moves = [lines[5 if wide else 4]]
+        if op == "fcmpswap":
+            high_moves.append(lines[7 if wide else 5])
+        for move in high_moves:
+            inf = 0x7ff00000 if wide else 0x7f800000
+            sign = 0x80000000
+            for word in ("0", "1", hex(sign), hex(inf), hex(inf | 0x80000)):
+                rejects("operands must be finite-normal constants", aot.lower,
+                        variant(lines, (move, f"{move.split(',')[0]}, {word}")), 32, **binding)
+            dynamic = f"v_lshl_add_u32 v18, s11, 5, v0\n{move.split(',')[0]}, v18"
+            rejects("operands must be finite-normal constants", aot.lower,
+                    variant(lines, (move, dynamic)), 32, **binding)
+        assert mubuf_float_extra_reference(op, wide, initial, value, initial) == value
+        if op == "fcmpswap":
+            miss = initial ^ 1
+            assert mubuf_float_extra_reference(op, wide, miss, value, initial) == miss
+        wrong = (mubuf_float_extra_reference(op, wide, initial, initial, value) if op == "fcmpswap" else
+                 mubuf_float_extra_reference("fmax" if op == "fmin" else "fmin", wide, initial, value, initial))
+        assert wrong == initial
+
+
+def mubuf_float_extra_binary_rejections(directory, assembler, objcopy, library):
+    cases = {name: (lines, binding) for name, _, _, _, _, lines, binding in mubuf_float_extra_cases()}
+    lines, binding = cases["buffer_atomic_fcmpswap"]
+    wide, wide_binding = cases["buffer_atomic_fcmpswap_x2"]
+    missing_domain = {key: value for key, value in binding.items() if key != "buffer_float_domain"}
+    domain = "Float buffer compare-swap and _x2 require a finite-normal domain and no glc"
+    for name, program, options, diagnostic in (
+        ("missing-domain", lines, missing_domain, domain),
+        ("glc", variant(lines, (lines[-2], lines[-2] + " glc")), binding, domain),
+        ("fp64-compare-inf", variant(wide, (wide[7], "v_mov_b32_e32 v13, 0x7ff00000")), wide_binding,
+         "Float buffer atomic operands must be finite-normal constants"),
+        ("fp64-misaligned", variant(wide, ("offset:8", "offset:4")), wide_binding,
+         "Unverified atomic reduction address"),
+    ):
+        code = assemble(directory, assembler, objcopy, program, cpu="gfx1030", features=DS_FEATURES)
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
+                                          features=DS_FEATURES.encode()))
+        assert [line for line in decoded if line.startswith("buffer_atomic_")] == [program[-2]]
+        rejects(diagnostic, aot.lower, decoded, 32, **options)
+        archive, output = (directory / f"float-reject-{name}.{ext}" for ext in ("dxbc", "hlsl"))
+        archive.write_bytes(store_container(code, aot.checked_group(32)))
+        args = [part for key, value in options.items() for part in ("--" + key.replace("_", "-"), str(value))]
+        result = subprocess.run([sys.executable, "-B", aot.__file__, archive, "--output", output,
+                                 "--llvm", library, *args], capture_output=True, text=True)
+        assert result.returncode == 1 and result.stderr.splitlines()[-1] == f"ValueError: {diagnostic}", result
+        assert not output.exists(), output
+        print(f"assembled rejection {name}: {diagnostic}")
+
+
+def mubuf_float_extra_binary(directory, assembler, objcopy, library):
+    mubuf_float_extra_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(name, lines, binding) for name, _, _, _, _, lines, binding in mubuf_float_extra_cases()],
+                   "buffer_atomic_")
+    mubuf_float_extra_binary_rejections(directory, assembler, objcopy, library)
+
+
+def mubuf_float_extra_draw(directory, compiler, renderer=None, backend=None, *, wide):
+    record = os.environ.get("FORM_COVERAGE_RECORD") if renderer else None
+    if record:
+        Path(record).unlink(missing_ok=True)
+    mubuf_float_extra_controls()
+    src, cso, case = (directory / f"mubuf-float-extra.{ext}" for ext in ("hlsl", "cso", "case"))
+    profile = "cs_6_6" if wide else "cs_6_0"
+    runner = "--compute-store-case-atomic64" if wide else "--compute-store-case"
+    run = [renderer, backend, runner, cso, case]
+    accepted = []
+    for name, op, is_wide, initial, value, lines, binding in mubuf_float_extra_cases():
+        if wide != is_wide:
+            continue
+
+        def compile_source(program):
+            src.write_text(aot.lower(program, 32, **binding), encoding="ascii")
+            subprocess.run([compiler, "-T", profile, "-E", "main", "-Fo", cso, src], check=True)
+
+        def output_words(bits):
+            words = [SENTINEL] * 320
+            words[2] = bits & 0xffffffff
+            if wide:
+                words[3] = bits >> 32
+            return words
+
+        compile_source(lines)
+        # Flipping one low bit produces a distinct finite-normal seed and a compare miss.
+        if renderer:
+            for seed in (initial, initial ^ 1):
+                expected = mubuf_float_extra_reference(op, wide, seed, value, initial)
+                for groups in (1, 2):
+                    case.write_bytes(mubuf_float_case_bytes(groups, output_words(expected), output_words(seed)))
+                    result = subprocess.run(run)
+                    if result.returncode:
+                        return result.returncode
+        if op == "fcmpswap":
+            width = 2 if wide else 1
+            moves = lines[4:4 + 2 * width]
+            mutant = [*lines[:4], *(f"v_mov_b32_e32 v{10 + i}, {move.split(', ')[1]}"
+                                   for i, move in enumerate(moves[width:] + moves[:width])), *lines[-2:]]
+        else:
+            opposite = "fmax" if op == "fmin" else "fmin"
+            mutant = variant(lines, (name, name.replace(op, opposite)))
+        compile_source(mutant)
+        before, after = output_words(initial), output_words(value)
+        first = next(i for i, (wanted, actual) in enumerate(zip(after, before)) if wanted != actual)
+        diagnostic = f"word={first} expected={after[first]:08x} actual={before[first]:08x}"
+        if renderer:
+            case.write_bytes(mubuf_float_case_bytes(2, before, before))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+            case.write_bytes(mubuf_float_case_bytes(2, after, before))
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or diagnostic not in bad.stderr:
+                raise AssertionError(f"{name}: atomic mutation escaped detection\n{bad.stderr}")
+            accepted.append(name)
+        print(f"{name}: {'readback' if renderer else 'CPU predicted'} negative control {diagnostic}")
+    if record:
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(sorted(accepted)) + "\n", encoding="utf-8")
+    return 0
+
 
 def scalar_alu_binary(directory, assembler, objcopy, library):
     """The assembled scalar chain decodes to the same program as its text."""
@@ -5961,6 +6562,11 @@ def binary(directory, assembler, objcopy, library):
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_counter_cases(wide), "buffer_atomic_")
     mubuf_csub_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_csub_cases(), "buffer_atomic_")
+    mubuf_float_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(name, lines, binding) for name, _, _, lines, binding in mubuf_float_cases()],
+                   "buffer_atomic_")
+    mubuf_float_extra_binary(directory, assembler, objcopy, library)
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mubuf_vector_controls()
@@ -5990,6 +6596,8 @@ def binary(directory, assembler, objcopy, library):
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
+    shared_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, SHARED_CASES, "ds_", 64, cpu="gfx1013", features=None)
     mtbuf_load_controls()
     mimg_load_binary(directory, assembler, objcopy, library)
     mimg_resinfo_controls()
@@ -7598,16 +8206,16 @@ def mimg_atomic_controls(*, suite="integer"):
     msaa = "image_msaa_load v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm"
     rejects("requires an unguarded R32_UINT MSAA binding", aot.lower,
             variant(lines, (instruction, msaa)), MIMG_STORE_GROUP, **binding)
-    # gfx1013 shares this lowering for add, umax and cmpswap on R32_UINT only
+    # gfx1013 shares this lowering for add, umin, umax and cmpswap on R32_UINT only
     # (tests/compute_image_atomics_gfx1013_check.py); every other op and format stays refused there.
     for op, (case, case_binding) in cases.items():
         gfx1013 = case_binding | {"cpu": "gfx1013"}
         if case_binding["image_format"] != "R32_UINT":
             rejects("Invalid image UAV binding", aot.lower, case, MIMG_STORE_GROUP, **gfx1013)
-        elif op.removesuffix("_contended") in ("add", "umax", "cmpswap"):
+        elif op.removesuffix("_contended") in ("add", "umin", "umax", "cmpswap"):
             assert aot.lower(case, MIMG_STORE_GROUP, **gfx1013) == aot.lower(case, MIMG_STORE_GROUP, **case_binding)
         else:
-            rejects("gfx1013 image atomics require add, umax or cmpswap", aot.lower, case, MIMG_STORE_GROUP, **gfx1013)
+            rejects("gfx1013 image atomics require add, umin, umax or cmpswap", aot.lower, case, MIMG_STORE_GROUP, **gfx1013)
     for case, case_binding in cases.values():
         wrong_format = "R32_UINT" if case_binding["image_format"] == "R32_SINT" else "R32_SINT"
         rejects("Unsupported image atomic target or binding", aot.lower, case, MIMG_STORE_GROUP,
@@ -9305,6 +9913,12 @@ if __name__ == "__main__":
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
                  "draw-mubuf-csub": lambda d, *a: mubuf_counter_draw(d, *a, csub=True),
+                 "draw-mubuf-float": mubuf_float_draw,
+                 "binary-mubuf-float-extra": mubuf_float_extra_binary,
+                 "compile-mubuf-float-cmpswap": lambda d, c: mubuf_float_extra_draw(d, c, wide=False),
+                 "compile-mubuf-float-x2": lambda d, c: mubuf_float_extra_draw(d, c, wide=True),
+                 "draw-mubuf-float-cmpswap": lambda d, *a: mubuf_float_extra_draw(d, *a, wide=False),
+                 "draw-mubuf-float-x2": lambda d, *a: mubuf_float_extra_draw(d, *a, wide=True),
                  "draw-mubuf-counter": mubuf_counter_draw,
                  "draw-mubuf-counter-x2": lambda d, *a: mubuf_counter_draw(d, *a, wide=True),
                  "draw-mubuf-exchange": mubuf_exchange_draw,
@@ -9341,6 +9955,7 @@ if __name__ == "__main__":
                  "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),
                  "draw-lds-f32": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_FLOAT_CASES),
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
+                 "draw-lds-shared": shared_draw,
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),

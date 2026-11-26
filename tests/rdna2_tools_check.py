@@ -2608,6 +2608,92 @@ class TestRdna2Disasm(unittest.TestCase):
         with self.assertRaises(ValueError):
             lower(bad_shader_asm, 20, 24, None, constant_descriptor=0)
 
+    def test_vop3p_fma_mix_half_select_per_source_position(self):
+        """Each v_fma_mix* source position reads op_sel_hi as binary16 and op_sel as the high half on its own."""
+        refusal = "High-half selection requires an f16 operand"
+        prologue = [
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx4 s[28:31], s[20:21], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_buffer_load_dwordx4 s[28:31], s[28:31], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v8, s29",
+            "v_mov_b32_e32 v9, s30",
+            "v_mov_b32_e32 v10, s31",
+        ]
+        epilogue = [
+            "v_cvt_pkrtz_f16_f32_e32 v16, v8, v8",
+            "exp mrt0 v16, v16, v16, v16 done compr vm",
+            "s_endpgm",
+        ]
+        # v8, v9 and v10 lower to alu5, alu6 and alu7, so a source read at the wrong position is visible.
+        sources = ("alu5", "alu6", "alu7")
+
+        def widened(position, high):
+            """Sources with only `position` widened as binary16; `high` picks its upper half."""
+            shift = " >> 16" if high else ""
+            return [f"widen16(asuint({name}){shift})" if k == position else name for k, name in enumerate(sources)]
+
+        def lowered_mad(op, selectors):
+            # v_fma_mixlo_f16 keeps the other half of its destination, so it writes the initialized v8.
+            dst = "v12" if op == "v_fma_mix_f32" else "v8"
+            asm = prologue + [f"{op} {dst}, v8, v9, v10{selectors}"] + epilogue
+            found = [line for line in lower(asm, 20, 24, None, constant_descriptor=0).splitlines() if " = mad(" in line]
+            self.assertEqual(len(found), 1, found)
+            return found[0].split(" = ", 1)[1]
+
+        def mad(args):
+            return f"mad({', '.join(args)});"
+
+        def bits(position):
+            return ",".join("1" if k == position else "0" for k in range(3))
+
+        for op in ("v_fma_mix_f32", "v_fma_mixlo_f16"):
+            self.assertEqual(lowered_mad(op, ""), mad(sources), op)
+            lowered = {}
+            for pos in range(3):
+                one = bits(pos)
+                low_sel = f" op_sel_hi:[{one}]"
+                high_sel = f" op_sel:[{one}] op_sel_hi:[{one}]"
+                # The parsed fields must name the same position the lowering reads.
+                zero = [0, 0, 0]
+                marked = [int(k == pos) for k in range(3)]
+                self.assertEqual(parse_fma_mix(f"v8, v9, v10{low_sel}")[1:3], (zero, marked))
+                self.assertEqual(parse_fma_mix(f"v8, v9, v10{high_sel}")[1:3], (marked, marked))
+
+                with self.subTest(op=op, position=pos, case="low half"):
+                    # (a) op_sel_hi alone widens the low half of this source and leaves the others binary32.
+                    lowered[pos, "low"] = lowered_mad(op, low_sel)
+                    self.assertEqual(lowered[pos, "low"], mad(widened(pos, False)))
+                with self.subTest(op=op, position=pos, case="high half"):
+                    # (b) op_sel with op_sel_hi on this source picks the high half of that source only.
+                    lowered[pos, "high"] = lowered_mad(op, high_sel)
+                    self.assertEqual(lowered[pos, "high"], mad(widened(pos, True)))
+                with self.subTest(op=op, position=pos, case="high half among binary16 sources"):
+                    # All three sources are binary16 and op_sel marks one: it must not move to a neighbour.
+                    expected = [f"widen16(asuint({name}){' >> 16' if k == pos else ''})" for k, name in enumerate(sources)]
+                    self.assertEqual(lowered_mad(op, f" op_sel:[{one}] op_sel_hi:[1,1,1]"), mad(expected))
+                with self.subTest(op=op, position=pos, case="op_sel alone"):
+                    # (c) op_sel on a binary32 source is refused, at the parser and through lower().
+                    with self.assertRaisesRegex(ValueError, refusal):
+                        parse_fma_mix(f"v8, v9, v10 op_sel:[{one}]")
+                    with self.assertRaisesRegex(ValueError, refusal):
+                        lowered_mad(op, f" op_sel:[{one}]")
+                    # The refusal tracks the position: op_sel_hi on a different source does not excuse it.
+                    other_hi = bits((pos + 1) % 3)
+                    with self.assertRaisesRegex(ValueError, refusal):
+                        parse_fma_mix(f"v8, v9, v10 op_sel:[{one}] op_sel_hi:[{other_hi}]")
+                    with self.assertRaisesRegex(ValueError, refusal):
+                        lowered_mad(op, f" op_sel:[{one}] op_sel_hi:[{other_hi}]")
+
+            # (d) Swapped-source control: the same modifier on another position gives different text.
+            for pos in range(3):
+                self.assertNotEqual(lowered[pos, "low"], lowered[pos, "high"], (op, pos))
+                for other in range(3):
+                    if other != pos:
+                        for half in ("low", "high"):
+                            self.assertNotEqual(lowered[pos, half], lowered[other, half], (op, pos, other, half))
+
     def test_mubuf_opcode_table_synthetic_forms(self):
         """Every GFX1013 MUBUF opcode must decode with exact width, scanner recognition, and 8-byte alignment."""
         from disasm_rdna2 import MUBUF_OPS
@@ -4308,6 +4394,54 @@ class TestRdna2Scanner(unittest.TestCase):
             if not is_opcode_recognized(name)
         )
         self.assertEqual(missing, [])
+
+    def test_permlane_cross_lane_census_preserves_lowering_refusal(self):
+        # gfx1013 VOP3 bytes use the same valid VGPR/SGPR operands in all three forms.
+        encodings = (
+            ("000077d701050c00", "v_permlane16_b32", "VALU (Cross-lane)"),
+            ("000078d701050c00", "v_permlanex16_b32", "VALU (Cross-lane)"),
+            ("000044d701050c00", "v_perm_b32", "VALU (Vector ALU)"),
+        )
+        results = []
+        for wave_size in (32, 64):
+            for encoding, opcode, category in encodings:
+                with self.subTest(wave_size=wave_size, opcode=opcode):
+                    instruction = disasm_rdna2(bytes.fromhex(encoding))[0]["assembly"]
+                    self.assertEqual(instruction, f"{opcode} v0, v1, s2, s3")
+                    shader = [
+                        "v_mov_b32_e32 v1, 1",
+                        "s_mov_b32 s2, 0",
+                        "s_mov_b32 s3, 0",
+                        instruction,
+                        "v_cvt_pkrtz_f16_f32_e32 v16, v0, v0",
+                        "exp mrt0 v16, v16, v16, v16 done compr vm",
+                        "s_endpgm",
+                    ]
+                    record = analyze_shader_instructions(
+                        f"ps_{opcode}_wave{wave_size}", shader, wave_size=wave_size
+                    )
+                    self.assertTrue(record["opcodes_recognized"])
+                    self.assertFalse(record["translator_accepted"])
+                    self.assertEqual(record["compatibility_category"], "opcode_recognized_translator_rejected")
+                    self.assertEqual(record["lower_error_kind"], "translator_rejection")
+                    self.assertEqual(record["lower_error"], f"Unsupported instruction 3: {instruction}")
+                    self.assertEqual(record["unsupported_details"], [
+                        {"line_number": 4, "raw": instruction, "opcode": opcode, "category": category},
+                    ])
+                    results.append(record)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_file, _ = generate_progress_dashboard(results, Path(tmp))
+            report = json.loads(json_file.read_text(encoding="utf-8"))
+        cross_lane = report["subsystems"]["VALU (Cross-lane)"]
+        self.assertEqual(cross_lane["total_instructions"], 4)
+        self.assertEqual(cross_lane["distinct_opcodes"], 2)
+        self.assertCountEqual(cross_lane["top_opcodes"], ["v_permlane16_b32", "v_permlanex16_b32"])
+        missing = {row["opcode"]: row for row in report["missing_opcodes_ranked"]}
+        for _, opcode, category in encodings:
+            self.assertEqual(missing[opcode]["category"], category)
+            self.assertEqual(missing[opcode]["occurrences"], 2)
+
 
     def test_accepted_full_shader(self):
         """Canonical straight-line pixel shader accepted by pixel_aot translator."""
@@ -6110,10 +6244,10 @@ class TestRdna2Scanner(unittest.TestCase):
         """Issue #928: the 64-bit VOP3 shifts are supported with at most one SGPR or literal source."""
         for line in ("v_lshlrev_b64 v[12:13], v20, v[18:19]", "v_lshrrev_b64 v[2:3], s46, v[4:5]",
                      "v_ashrrev_i64 v[2:3], 0x41, v[4:5]", "v_lshlrev_b64 v[2:3], v1, s[4:5]",
-                     "v_ashrrev_i64 v[2:3], 3, -1", "v_lshlrev_b64_e64 v[2:3], v1, v[4:5]"):
+                     "v_ashrrev_i64 v[2:3], 3, -1", "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64_e64 v[2:3], v1, v[4:5]"):
             self.assertTrue(is_instruction_supported(line), line)
         for line in ("v_lshlrev_b64 v[2:3], s4, s[4:5]", "v_lshlrev_b64 v[2:3], 0x41, s[4:5]",
-                     "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
+                     "v_lshlrev_b64 v[2:3], s4, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
                      "v_lshlrev_b64_e32 v[2:3], v1, v[4:5]", "v_lshlrev_b64 v[2:3], -v1, v[4:5]"):
             self.assertFalse(is_instruction_supported(line), line)
 
@@ -6200,7 +6334,7 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_add_f16_e64 v24, 3, v19", "v_add_f16_e64 v24, v18, 3", "v_add_f16_e64 v24, 3.0, v19",
             "v_add_f16_e64 v24, 0x10000, v19", "v_add_f16_e64 v24, v256, v19", "v_add_f16_e64 v256, v18, v19",
             "v_add_f16_e64 v24, s106, v19", "v_add_f16_e64 v24, v18", "v_add_f16_e64 v24, v18, v19, v19",
-            "v_fma_f16_e64 v24, v18, v19, v19", "v_fract_f16_e64 v24, v18", "v_mul_f16_e64 v24, v18, v19 clamp",
+            "v_fma_f16_e64 v24, v18, v19, v19", "v_rcp_f16_e64 v24, v18", "v_mul_f16_e64 v24, v18, v19 clamp",
             "v_floor_f16_e64 v24, -v18", "v_floor_f16_e64 v24, |v18|", "v_floor_f16_e64 v24, v18 clamp",
             "v_floor_f16_e64 v24, v18 mul:2", "v_floor_f16_e64 v24, 3", "v_floor_f16_e64 v24, 0x10000",
             "v_floor_f16_e64 v24, v256", "v_floor_f16_e64 v24, v18, v19", "v_rndne_f16_e64 v24",
