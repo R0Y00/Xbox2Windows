@@ -16335,6 +16335,12 @@ instead. It requires a reservation refusal after exhaustion, payload 0
 preserved on the left, the null view on the right, and no retained-upload
 release line. The ring no longer reuses live storage. The revised Windows
 readback control remains unmeasured on macOS.
+`startup_address_console_gate_ring_reuse_{warp,hardware}` runs the same
+sequence, opens the gate, waits until every submit has completed and then
+draws payload 18 from the ring over the right half. That reservation must not
+be refused ([#2837](https://github.com/R0Y00/Xbox2Windows/issues/2837)). With
+chunk reuse disabled, as before the fix, it fails while `gate_ring` still
+passes.
 
 The equations are checked against addrlib and against the three existing layout headers, not against
 console memory. Which layouts a given console build writes for which textures is not established by
