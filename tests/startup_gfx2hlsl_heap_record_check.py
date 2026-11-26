@@ -13,8 +13,9 @@ after s9 is set to zero. gfx2hlsl.py names that input `srv 0 buf heap rootconst 
 dispatch reads the 32-byte heap record that root constant word 2 indexes. The HLSL and the manifest are
 compared whole. Every other form keeps a refusal: another shift, another index, an index register written
 again, a branch target between the shift and the load, a high word that is not a constant zero, an offset
-modifier, eight dwords, an index read from a buffer (named as such), a formatted load or a store through the
-record, and the graphics stages. --llvm-mc reassembles every instruction used here and compares the words.
+modifier, eight dwords, an index read from a buffer at an offset that differs between groups (named as such;
+startup_gfx2hlsl_heap_word_check.py covers the buffer forms that are accepted), a formatted load or a store through
+the record, and the graphics stages. --llvm-mc reassembles every instruction used here and compares the words.
 """
 import argparse
 import struct
@@ -52,7 +53,8 @@ ENCODED = {
     's_load_dwordx8 s[16:23], s[8:9], s6': '04040cf40000000c', 's_load_dwordx4 s[16:19], s[8:9], s5': '040408f40000000a',
     's_load_dwordx4 s[16:19], s[8:9], m0': '040408f4000000f8', 's_add_u32 s6, s6, 0': '06800680',
     's_load_dwordx4 s[28:31], s[12:13], 0x20': '060708f4200000fa',
-    's_buffer_load_dword s6, s[28:31], 0x0': '8e0120f4000000fa', 's_buffer_load_dword s26, s[28:31], 0x0': '8e0620f4000000fa',
+    's_buffer_load_dword s6, s[28:31], 0x0': '8e0120f4000000fa', 's_buffer_load_dword s6, s[28:31], s14': '8e0120f40000001c',
+    's_buffer_load_dword s26, s[28:31], s14': '8e0620f40000001c',
     's_lshl_b32 s6, s26, 5': '1a85068f', 's_cmp_eq_u32 s4, 0': '048006bf', 's_cbranch_scc0 1': '010084bf', 's_nop 0': '000080bf',
     'buffer_load_format_xyzw v[5:8], v4, s[16:19], 0 offen': '00100ce004050480',
     'buffer_store_dword v5, v4, s[16:19], 0 offen': '001070e004050480',
@@ -166,10 +168,10 @@ def check_refusals():
         ('index register loaded from a buffer after the shift',
          {SHIFT: (SHIFT, TABLE_LOAD, 's_buffer_load_dword s6, s[28:31], 0x0')}, not_shifted),
         ('branch target between the shift and the load', {SHIFT: (SHIFT,) + JUMP}, not_shifted),
-        ('index read from a buffer', {SHIFT: (TABLE_LOAD, 's_buffer_load_dword s26, s[28:31], 0x0', 's_lshl_b32 s6, s26, 5')},
-         from_buffer),
-        ('index read from a buffer into the shifted register',
-         {SHIFT: (TABLE_LOAD, 's_buffer_load_dword s6, s[28:31], 0x0', SHIFT)}, from_buffer),
+        ('index read from a buffer at a group-ID offset',
+         {SHIFT: (TABLE_LOAD, 's_buffer_load_dword s26, s[28:31], s14', 's_lshl_b32 s6, s26, 5')}, from_buffer),
+        ('index read from a buffer at a group-ID offset into the shifted register',
+         {SHIFT: (TABLE_LOAD, 's_buffer_load_dword s6, s[28:31], s14', SHIFT)}, from_buffer),
         ('high word 1', {CLEAR: ('s_mov_b32 s9, 1',)}, high),
         ('high word a root constant', {CLEAR: ('s_mov_b32 s9, s5',)}, high),
         ('high word left as the group ID', {CLEAR: ()}, high),
