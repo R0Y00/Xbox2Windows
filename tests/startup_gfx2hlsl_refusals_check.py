@@ -72,6 +72,158 @@ def check_stage():
                   found == preceding + [(label + ' in v_census_probe: TypeError', 'ps'), (SECOND, 'ps')])
 
 
+class Probe(G.Stage):
+    """A Stage with no pipeline: enough state for decoded instructions to be translated."""
+
+    def __init__(self):
+        self.lines, self.sym = [], {}
+        self.used_s, self.used_v, self.uniform_v = set(), set(), set()
+        self.masks = set()
+        self.exec_known = True
+
+
+def vop3(op, srcs, vdst=4, sdst=0, neg=0, absolute=0, literal=None):
+    """One VOP3 instruction: w0 = 0b110101 | op | abs | SDST (VOP3b) or VDST, w1 = three 9-bit sources | NEG."""
+    w0 = (0b110101 << 26) | (op << 16) | (absolute << 8) | (sdst << 8) | vdst
+    w1 = srcs[0] | (srcs[1] << 9) | (srcs[2] << 18) | (neg << 29)
+    return struct.pack('<2I', w0, w1) + (b'' if literal is None else struct.pack('<I', literal))
+
+
+def translate_one(code):
+    """(decoded text, generated lines) of a single instruction, or the refusal text."""
+    try:
+        decoded = G.decode(code)
+        assert len(decoded) == 1 and decoded[0][1] == len(code), decoded
+        probe = Probe()
+        probe.one(decoded[0][2], decoded[0][3])
+        return decoded[0][3], probe.lines
+    except G.Unsupported as reason:
+        return str(reason)
+    except (AttributeError, KeyError, IndexError, ValueError) as error:
+        # A handler that needs operands the synthetic probe does not provide: not an accepted form.
+        return 'probe error %s' % type(error).__name__
+
+
+def check_neg_integer_sources():
+    v = lambda n: 256 + n
+    sentinels = [v(10), v(12), v(14)]
+    inline = lambda n: 128 + n
+    names = {}
+    for op, entry in G.D.VOP3_NATIVE_OPS.items():
+        names[entry[0]] = op
+    cndmask = 0x101
+    accepted = [op for op in range(0x400) if not isinstance(translate_one(vop3(op, sentinels)), str)]
+    check('the sweep reaches the accepted VOP3 opcodes', len(accepted) > 100 and cndmask in accepted)
+    mismatches = []
+    for op in accepted:
+        for slot in range(3):
+            for source, literal, expected in ((inline(1), None, '0x80000001'), (255, 5, '0x80000005')):
+                srcs = list(sentinels)
+                srcs[slot] = source
+                code = vop3(op, srcs, literal=literal)
+                if literal is not None and G.D.decode_instruction(code, 0)[0] != len(code):
+                    # An unused source field does not consume a literal dword.
+                    continue
+                plain = translate_one(code)
+                if isinstance(plain, str) or (op == cndmask and slot < 2):
+                    continue
+                result = translate_one(vop3(op, srcs, neg=1 << slot, literal=literal))
+                name = plain[0].split()[0].removesuffix('_e64')
+                compare = name.startswith(('v_cmp_', 'v_cmpx_')) and name.endswith('_f32')
+                float_slot = (name in G.VEC_F and slot < G.VEC_F[name][0]
+                              or compare and slot < (1 if '_class_' in name else 2))
+                if float_slot:
+                    # Always/never compares consume no source in the emitted predicate.
+                    constant_compare = name.split('_')[-2] in ('t', 'f')
+                    ok = (not isinstance(result, str) and expected in result[0]
+                          and (constant_compare or expected + 'u' in ' '.join(result[1])))
+                else:
+                    # Dedicated encoding refusals run before the general NEG check.
+                    ok = (isinstance(result, str) and ('NEG on an integer or literal source %d' % slot in result
+                                                       or ' with neg/abs' in result))
+                if not ok:
+                    mismatches.append((hex(op), slot, expected, result))
+    check('VOP3 NEG on inline 1 and a literal follows the source type in every lowerable slot', not mismatches)
+    if mismatches:
+        print('  first misses: %s' % mismatches[:4])
+
+    def refused(code, slot):
+        text = translate_one(code)
+        return isinstance(text, str) and 'NEG on an integer or literal source %d' % slot in text
+
+    iadd, fadd, add_co, shl64 = names['v_mad_u32_u24'], 0x103, names['v_add_co_u32'], names['v_lshlrev_b64']
+    cmp_lt = next(op for op, entry in G.D.VOPC_OPS.items() if entry[0] == 'v_cmp_lt_f32_e32')
+    for slot in range(3):
+        srcs = list(sentinels)
+        srcs[slot] = inline(1)
+        check('v_mad_u32_u24 slot %d: inline 1 with NEG refused' % slot,
+              refused(vop3(iadd, srcs, neg=1 << slot), slot))
+        check('v_mad_u32_u24 slot %d: the same word without NEG still translates' % slot,
+              not isinstance(translate_one(vop3(iadd, srcs)), str))
+    check('inline 0 with NEG refused', refused(vop3(iadd, [inline(0), sentinels[1], sentinels[2]], neg=1), 0))
+    check('inline 64 with NEG refused', refused(vop3(iadd, [inline(64), sentinels[1], sentinels[2]], neg=1), 0))
+    check('literal with NEG refused', refused(vop3(iadd, [255, sentinels[1], sentinels[2]], neg=1, literal=5), 0))
+    check('literal without NEG translates', not isinstance(
+        translate_one(vop3(iadd, [255, sentinels[1], sentinels[2]], literal=5)), str))
+    def exact(code, word):
+        result = translate_one(code)
+        return not isinstance(result, str) and 'F(0x%08xu)' % word in ' '.join(result[1])
+
+    check('v_add_f32_e64 inline 0 with NEG is negative zero',
+          exact(vop3(fadd, [inline(0), v(12), 0], neg=1), 0x80000000))
+    check('v_add_f32_e64 inline 64 with NEG stays subnormal',
+          exact(vop3(fadd, [inline(64), v(12), 0], neg=1), 0x80000040))
+    check('v_add_f32_e64 NEG flips the sign of an encoded NaN payload',
+          exact(vop3(fadd, [255, v(12), 0], neg=1, literal=0xffc12345), 0x7fc12345))
+    check('v_add_f32_e64 immediate ABS with NEG is refused',
+          refused(vop3(fadd, [inline(1), v(12), 0], absolute=1, neg=1), 0))
+    word0, word1 = struct.unpack('<2I', vop3(fadd, [v(10), inline(1), 0], neg=2))
+    # The rewritten final operand must keep both supported and refused output modifiers.
+    clamp = translate_one(struct.pack('<2I', word0 | (1 << 15), word1))
+    check('rewriting the last source preserves clamp',
+          not isinstance(clamp, str) and 'saturate(F(v10) + F(0x80000001u))' in ' '.join(clamp[1]))
+    op_sel = translate_one(struct.pack('<2I', word0 | (1 << 11), word1))
+    check('rewriting the last source preserves the op_sel refusal',
+          isinstance(op_sel, str) and 'modifier op_sel' in op_sel)
+    check('float compare slot 0 with inline 1 and NEG reads its word',
+          exact(vop3(cmp_lt, [inline(1), v(12), 0], neg=1), 0x80000001))
+    check('float compare slot 1 with literal and NEG reads its word',
+          exact(vop3(cmp_lt, [v(10), 255, 0], neg=2, literal=7), 0x80000007))
+    check('class compare slot 0 with literal and NEG reads its word',
+          exact(vop3(0x88, [255, inline(1), 0], neg=1, literal=7), 0x80000007))
+    check('class compare slot 1 with literal and NEG is refused',
+          refused(vop3(0x88, [v(10), 255, 0], neg=2, literal=7), 1))
+    check('integer compare slot 0 with inline and NEG is refused',
+          refused(vop3(0x81, [inline(1), v(12), 0], neg=1), 0))
+    check('v_add_co_u32 (carry out) with inline 1 and NEG refused',
+          refused(vop3(add_co, [inline(1), v(12), 0], sdst=4, neg=1), 0))
+    check('v_lshlrev_b64 with NEG on the shift inline refused', refused(vop3(shl64, [inline(1), v(12), 0], neg=1), 0))
+
+    # Negative controls.
+    minus_one = translate_one(vop3(iadd, [193, sentinels[1], sentinels[2]]))
+    check('plain inline -1 still reads 0xffffffff',
+          not isinstance(minus_one, str) and '0xffffffffu' in ' '.join(minus_one[1]))
+    negative = translate_one(vop3(iadd, [193, sentinels[1], sentinels[2]], neg=1))
+    check('inline -1 with NEG is not refused by this rule',
+          not (isinstance(negative, str) and 'NEG on an integer' in negative))
+    for code in range(240, 249):
+        result = translate_one(vop3(fadd, [code, v(12), 0], neg=1))
+        check('inline float %d with NEG is not refused by this rule' % code,
+              not (isinstance(result, str) and 'NEG on an integer' in result))
+    check('v_add_co_u32 with sdst s4 and register sources translates',
+          not isinstance(translate_one(vop3(add_co, [v(10), v(12), 0], sdst=4)), str))
+    check('v_add_co_u32 with sdst s4 and an inline source translates',
+          not isinstance(translate_one(vop3(add_co, [inline(1), v(12), 0], sdst=4)), str))
+    for slot in range(2):
+        srcs = [v(10), v(12), 106]
+        srcs[slot] = inline(1)
+        result = translate_one(vop3(cndmask, srcs, neg=1 << slot))
+        check('v_cndmask_b32_e64 slot %d: inline 1 with NEG still translates' % slot,
+              not isinstance(result, str) and '0x80000001u' in ' '.join(result[1]))
+    check('v_cndmask_b32_e64 mask slot: inline 1 with NEG is refused',
+          refused(vop3(cndmask, [v(10), v(12), inline(1)], neg=4), 2))
+
+
 def check_decode():
     code = struct.pack('<2I', 0, END)
     with patch.object(G.D, 'decode_instruction', decode_instruction), patch.object(
@@ -314,6 +466,7 @@ if __name__ == '__main__':
     with patch.dict(os.environ, {'X2W_FXC': ''}):
         check_stage()
         check_decode()
+        check_neg_integer_sources()
         check_cli()
         check_request_failures()
         check_pairs()

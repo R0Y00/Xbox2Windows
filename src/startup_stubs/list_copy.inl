@@ -83,12 +83,18 @@ bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // A target or UAV holds what the GPU wrote; its title memory is never uploaded.
         if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return true;
-        const auto written = texture_uploads().find(source.resource);
         if (list_wrote(self, source.resource)) return true;
-        if (written != texture_uploads().end() && written->second.gpu_written) return true;
-        if (!upload_texture(self, source.wrapper, source.resource)) return false;
-        const auto found = texture_uploads().find(source.resource);
-        return found != texture_uploads().end() && found->second.staged;
+        AcquireSRWLockExclusive(&draw_lock);
+        const auto written = texture_uploads().find(source.resource);
+        bool ok = false;
+        if (written != texture_uploads().end() && written->second.gpu_written) {
+            ok = true;
+        } else if (upload_texture(self, source.wrapper, source.resource)) {
+            const auto found = texture_uploads().find(source.resource);
+            ok = found != texture_uploads().end() && found->second.staged;
+        }
+        ReleaseSRWLockExclusive(&draw_lock);
+        return ok;
     }
     const auto* info = resource_info(source.wrapper);
     return info && info->placement == Placement::aliased_buffer;
@@ -100,6 +106,14 @@ bool sync_title_source(Wrapper* self, const CopyEndpoint& source)
 // commit leaves the records in place and only Reset or a failed Close drops them.
 SRWLOCK pending_writes_lock = SRWLOCK_INIT;
 std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>>& pending_gpu_writes()
+{
+    static std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>> m;
+    return m;
+}
+// X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers a recording wrote (list slots 15 and 17), under the same
+// rule. A copied buffer stops being refreshed from its title memory only once a recording that writes it is
+// submitted; a recording that is discarded leaves it refreshed (linear_buffer_backing.h).
+std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>>& pending_linear_writes()
 {
     static std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>> m;
     return m;
@@ -119,11 +133,13 @@ void discard_list_gpu_writes(Wrapper* self)
 {
     AcquireSRWLockExclusive(&pending_writes_lock);
     pending_gpu_writes().erase(self);
+    pending_linear_writes().erase(self);
     ReleaseSRWLockExclusive(&pending_writes_lock);
 }
 
 void commit_list_gpu_writes(Wrapper* self)
 {
+    std::vector<ID3D12Resource*> linear;
     AcquireSRWLockShared(&pending_writes_lock);
     if (const auto it = pending_gpu_writes().find(self); it != pending_gpu_writes().end()) {
         for (ID3D12Resource* resource : it->second) {
@@ -132,7 +148,10 @@ void commit_list_gpu_writes(Wrapper* self)
             state.done = true;
         }
     }
+    if (const auto it = pending_linear_writes().find(self); it != pending_linear_writes().end()) linear = it->second;
     ReleaseSRWLockShared(&pending_writes_lock);
+    // After the recording's ExecuteCommandLists, outside the lock (the backing takes its own).
+    for (ID3D12Resource* resource : linear) linear_buffers().note_gpu_write(resource);
 }
 
 // A copy or resolve destination will hold what the GPU wrote once `self` is submitted. A title-backed texture
@@ -142,6 +161,25 @@ void mark_gpu_written(Wrapper* self, const CopyEndpoint& destination)
     if (!destination.wrapper || !destination.wrapper->own().title_memory) return;
     AcquireSRWLockExclusive(&pending_writes_lock);
     auto& writes = pending_gpu_writes()[self];
+    if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
+    ReleaseSRWLockExclusive(&pending_writes_lock);
+}
+
+// X2W_D3D12_LINEAR_BUFFERS: a copied linear buffer that a recorded copy writes keeps the GPU's bytes once
+// `self` is submitted, and is no longer refreshed from its title memory from then on (linear_buffer_backing.h).
+// Until then the write is pending on the recording: Reset or a failed Close drops it with the texture writes.
+void note_linear_gpu_write(Wrapper* self, const CopyEndpoint& destination)
+{
+    if (!destination.wrapper || !destination.wrapper->own().title_memory ||
+        x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off)
+        return;
+    if (x2w_startup::linear_detail::mutant("gpuw-at-record")) {
+        // Mutant: the backing changes at recording, so a discarded recording still stops its refreshes.
+        linear_buffers().note_gpu_write(destination.resource);
+        return;
+    }
+    AcquireSRWLockExclusive(&pending_writes_lock);
+    auto& writes = pending_linear_writes()[self];
     if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
     ReleaseSRWLockExclusive(&pending_writes_lock);
 }
@@ -207,9 +245,12 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
             (from_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
             SUCCEEDED(from.resource->GetHeapProperties(&source_properties, nullptr)) &&
             source_properties.Type == D3D12_HEAP_TYPE_DEFAULT;
-        note_mesh_xmem_write(self, to.wrapper, destination_offset, bytes,
+        const char* source_kind = upload ? "upload" : mesh_record ? "default-uav" :
+            (from_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? "uav-capable-buffer" : "buffer";
+        note_mesh_xmem_write(self, to.wrapper, destination_offset, bytes, 15, source_kind,
                              srv_word || mesh_record ? from.resource : nullptr, source_offset);
     }
+    note_linear_gpu_write(self, to);
     if (indirect_copy_ranges()) {
         const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;
         note_copy_gpu_range(self, to.resource, destination_offset, bytes, authoritative && info &&
@@ -234,9 +275,12 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
     require_copy_state(self, from.resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_COPY_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)->CopyResource(to.resource, from.resource);
+    retire_hold(self, to.wrapper);
+    retire_hold(self, from.wrapper);
     if (to_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        note_mesh_xmem_write(self, to.wrapper, 0, to_desc.Width);
+        note_mesh_xmem_write(self, to.wrapper, 0, to_desc.Width, 17, "buffer");
         note_copy_gpu_range(self, to.resource, 0, to_desc.Width, false);
+        note_linear_gpu_write(self, to);
     } else mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
 }
@@ -263,6 +307,7 @@ void __stdcall list_resolve_subresource(Wrapper* self, u64 destination, UINT des
     require_copy_state(self, to.resource, D3D12_RESOURCE_STATE_RESOLVE_DEST);
     static_cast<ID3D12GraphicsCommandList*>(self->own().real)
         ->ResolveSubresource(to.resource, destination_subresource, from.resource, source_subresource, plan.format);
+    retire_hold(self, to.wrapper);  // the source is multisampled, so never a member of the retire class
     mark_gpu_written(self, to);
     InterlockedIncrement(&list_resolves);
 }

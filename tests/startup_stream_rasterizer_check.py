@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 
+from hardware_adapter_filter_check import check as check_adapter_filter
 from startup_stream_check import gfx2hlsl
 from startup_stream_draw_check import pixel, vertex
 
@@ -24,6 +25,8 @@ def check(directory, consumer, backend, mode):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_D3D12_DEBUG="1", X2W_SHADER_CACHE=str(cache))
     base_args = [consumer, str(vs), str(ps), str(root), backend]
+    if mode == "filter":
+        return check_adapter_filter(base_args, env, allow_missing_factory=True)
     req = subprocess.run(base_args, env=env, capture_output=True, text=True)
     if backend == "hardware" and req.returncode == 77:
         print("No D3D12 feature-level 12 hardware adapter")

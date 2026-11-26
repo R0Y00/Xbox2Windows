@@ -8,8 +8,11 @@ loaded or executed.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import struct
 import sys
+import tempfile
 
 import pefile
 
@@ -251,9 +254,36 @@ def markdown_report(report):
     return "\n".join(lines) + "\n"
 
 
+def _same_path(left, right):
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_paths(image, json_path, markdown_path):
+    for flag, out_path in (("--json", json_path), ("--markdown", markdown_path)):
+        if out_path.exists() and out_path.is_dir():
+            raise ValueError(f"{flag} output path is an existing directory: {out_path}")
+    if _same_path(json_path, markdown_path):
+        raise ValueError(f"--json and --markdown output paths collide: {json_path}")
+    json_resolved = json_path.resolve()
+    markdown_resolved = markdown_path.resolve()
+    if json_resolved in markdown_resolved.parents or markdown_resolved in json_resolved.parents:
+        raise ValueError("--json and --markdown output paths cannot contain one another")
+    for flag, out_path in (("--json", json_path), ("--markdown", markdown_path)):
+        if _same_path(image, out_path):
+            raise ValueError(f"{flag} output path collides with image: {out_path}")
+    if image.is_dir():
+        raise ValueError(f"image path is a directory: {image}")
+
+
 def _write_text(path, text):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging_dir:
+        staged = Path(staging_dir) / path.name
+        staged.write_text(text, encoding="utf-8", newline="\n")
+        os.replace(staged, path)
 
 
 def main(argv=None):
@@ -263,26 +293,34 @@ def main(argv=None):
     parser.add_argument("--markdown", type=Path, required=True, help="deterministic Markdown output")
     args = parser.parse_args(argv)
 
-    image_name = args.image.name
+    image_name = args.image.name or str(args.image)
+    try:
+        _validate_paths(args.image, args.json, args.markdown)
+    except (OSError, ValueError) as exc:
+        print(f"compat_report: {exc}", file=sys.stderr)
+        return 2
+
     try:
         image_bytes = args.image.read_bytes()
     except OSError as exc:
-        detail = getattr(exc, "strerror", None) or type(exc).__name__
+        detail = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
         print(f"compat_report: cannot read {image_name}: {detail}", file=sys.stderr)
         return 2
 
     try:
         report = build_report(image_bytes, image_name)
-    except (pefile.PEFormatError, ValueError) as exc:
+    except (pefile.PEFormatError, ValueError, struct.error) as exc:
         print(f"compat_report: cannot read {image_name}: {exc}", file=sys.stderr)
         return 2
 
     try:
-        _write_text(args.json, json.dumps(
-            report, sort_keys=True, indent=2, ensure_ascii=True) + "\n")
-        _write_text(args.markdown, markdown_report(report))
+        json_text = json.dumps(
+            report, sort_keys=True, indent=2, ensure_ascii=True) + "\n"
+        markdown_text = markdown_report(report)
+        _write_text(args.json, json_text)
+        _write_text(args.markdown, markdown_text)
     except OSError as exc:
-        detail = getattr(exc, "strerror", None) or type(exc).__name__
+        detail = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
         print(f"compat_report: cannot write report: {detail}", file=sys.stderr)
         return 2
 

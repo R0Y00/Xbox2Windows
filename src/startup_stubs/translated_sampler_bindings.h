@@ -47,7 +47,12 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
         s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
         s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);
     }
-    s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    // SQ_IMG_SAMP_WORD3 bits 31:30 (BORDER_COLOR_TYPE, Mesa gfx10-rsrc.json): 0 = TRANS_BLACK, 1 = OPAQUE_BLACK,
+    // 2 = OPAQUE_WHITE. Value 3 (REGISTER, indexed by BORDER_COLOR_PTR) has no palette here and falls back to 0.
+    const UINT border_type = (words[3] >> 30) & 3u;
+    s.BorderColor = border_type == 2u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE
+                  : border_type == 1u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
+                                      : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
     if (lod_limits) {
         s.MinLOD = static_cast<float>(words[1] & 0xfffu) / 256.0f;
@@ -184,10 +189,13 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
 
 inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
 {
-    // A heap entry is the title's own descriptor, so its MIN_LOD and MAX_LOD apply (#2221).
+    // A heap entry is the title's own descriptor, so its MIN_LOD, MAX_LOD (#2221) and fixed border color apply.
     const auto s = decode_sampler(words, 0, false, true);
+    const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
+    const float alpha = (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
+                         s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK) ? 1.0f : 0.0f;
     return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
-            {}, s.MinLOD, s.MaxLOD};
+            {rgb, rgb, rgb, alpha}, s.MinLOD, s.MaxLOD};
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
