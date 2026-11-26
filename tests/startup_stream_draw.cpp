@@ -584,6 +584,45 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             invoke(list, 25, arg(pso));
             return true;
         };
+        // X2W_TEST_CONSOLE_KEEP (with the shared ring): a second list A records 32 payloads (32 x 16 MiB = 512 MiB),
+        // is submitted and waited for, and is never Reset. The fixture's own list then draws payload 32 over the right
+        // half. The target is read back; then A is submitted again, still closed and not Reset.
+        if (GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_KEEP", nullptr, 0)) {
+            constexpr unsigned kept = 32;
+            void *allocator_a = nullptr, *list_a = nullptr;
+            const unsigned list_a_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+            if (FAILED(static_cast<HRESULT>(invoke(guest, 9, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   arg(&__uuidof(ID3D12CommandAllocator)), arg(&allocator_a)))) ||
+                FAILED(static_cast<HRESULT>(invoke(guest, 73, arg(list_a_desc), arg(allocator_a), 0,
+                                                   arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list_a)))) ||
+                FAILED(static_cast<HRESULT>(invoke(allocator_a, 8))) ||
+                FAILED(static_cast<HRESULT>(invoke(list_a, 139, arg(allocator_a))))) return 23;  // created closed
+            const D3D12_VIEWPORT whole{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+            invoke(list_a, 50, 1, arg(&rtv));
+            invoke(list_a, 21, 1, arg(&whole));
+            invoke(list_a, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            invoke(list_a, 25, arg(pso));
+            for (unsigned payload = 0; payload < kept; ++payload)
+                if (const int result = draw_gated_console_payload(guest, list_a, payload, payload == 0)) return result;
+            const auto submit_and_wait = [&](void* recorded, UINT64 value) {
+                invoke(queue, 10, 1, arg(&recorded));
+                if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), value)))) return false;
+                const auto deadline = GetTickCount64() + 60000;
+                while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
+                return invoke(fence, 8) == value;
+            };
+            invoke(list, 9);  // the fixture's own recording so far (its clear) runs first
+            if (!submit_and_wait(list, 1)) return 25;
+            invoke(list_a, 9);
+            if (!submit_and_wait(list_a, 2)) return 25;
+            if (!next_recording()) return 35;
+            if (const int result = draw_gated_console_payload(guest, list, kept, false)) return result;
+            invoke(list, 9);
+            if (!submit_and_wait(list, 3)) return 25;
+            const int read = read_stream_target(desktop.Get(), frame, pixels);
+            if (!submit_and_wait(list_a, 4)) return 25;  // A again: closed, never Reset
+            return read;
+        }
         // Retrying the same bytes after abandoning a recording still needs an upload. The shared-ring
         // control skips it so every upload behind the gate comes from the ring, whose 256 MiB cap is
         // then exhausted: the later reservations are refused and those draws bind the null view.

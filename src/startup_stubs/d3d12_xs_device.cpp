@@ -1459,6 +1459,9 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 (allocator_lock): chunks each closed list released at a fenced submit, until its Reset.
+std::unordered_map<Wrapper*, ReleasedUploadChunks> released_upload_chunks;
+LONG upload_resubmits_after_reuse;  // closed lists submitted again after a released chunk was reused
 
 LONG allocator_swaps, allocator_creates;
 
@@ -1466,6 +1469,7 @@ void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    released_upload_chunks.erase(list);
     ReleaseSRWLockExclusive(&allocator_lock);
 }
 
@@ -1657,6 +1661,15 @@ bool submit_fence_fails()
     return on;
 }
 
+// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 (opt-in): a closed list stops holding its upload ring chunks once its submit is
+// fenced, so the queue fence alone guards them; the ring then grows in 16 MiB chunks up to 512 MiB. A later submit
+// of the same list before its Reset fences its intact chunks again; one whose chunk was reused meanwhile is logged.
+bool ring_release_at_submit()
+{
+    static const bool on = GetEnvironmentVariableW(L"X2W_D3D12_RING_RELEASE_AT_SUBMIT", nullptr, 0) != 0;
+    return on;
+}
+
 // draw_lock and allocator_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
 // the queue must pass before the allocator can be reset. If that fence cannot be created or
 // signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
@@ -1673,10 +1686,34 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         }
     }
     UploadChunkMask chunks = 0;
-    for (auto* list : lists) chunks |= list->own().upload_chunks;
+    for (auto* list : lists) {
+        chunks |= list->own().upload_chunks;
+        const auto released = released_upload_chunks.find(list);
+        if (released == released_upload_chunks.end()) continue;
+        UploadChunkMask reused = 0;
+        chunks |= resubmitted_upload_chunks(released->second, upload_chunks.data(), reused);
+        if (reused) {
+            InterlockedIncrement(&upload_resubmits_after_reuse);
+            static LONG logged;
+            if (first_calls(logged, 8))
+                log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%x were reused; "
+                    "it reads replaced upload bytes", static_cast<void*>(list), static_cast<unsigned>(reused));
+        }
+    }
     const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
     if (signaled) ++value;
     submit.submitted(chunks, signaled);
+    if (signaled && ring_release_at_submit()) {
+        for (Wrapper* list : lists) {
+            if (!list->own().upload_chunks) continue;
+            try {
+                release_upload_chunks_at_submit(list->own().upload_chunks, upload_chunks.data(),
+                                                released_upload_chunks[list]);
+            } catch (const std::bad_alloc&) {
+                // Keep the holds: the list then pins its chunks until its Reset, as without the switch.
+            }
+        }
+    }
     if (signaled) {
         for (Wrapper* list : lists) {
             const auto found = list_recordings.find(list);
@@ -1811,6 +1848,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             on = title.current;
             ++on->lists;
             discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+            released_upload_chunks.erase(self);
             state.list_uploads = nullptr;
             state.list_scratch = nullptr;
             state.list_ready = false;
@@ -2435,7 +2473,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 
 // Transient guest data is copied into mapped upload chunks. Chunks grow from
 // 16 MiB up to 256 MiB in total and stay alive for the process. A full chunk can be reused once
-// no recording can submit its bytes and every queue that used it has finished.
+// no recording can submit its bytes and every queue that used it has finished. With
+// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 every chunk is 16 MiB, up to 512 MiB, and a fenced submit releases its lists.
 
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
 {
@@ -2460,9 +2499,11 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
         if (reservation.mapped) return finish(active);
     }
 
-    const u64 remaining = total_bytes < max_upload_ring_bytes ? max_upload_ring_bytes - total_bytes : 0;
+    const bool release_at_submit = ring_release_at_submit();
+    const u64 ring_bytes = release_at_submit ? max_released_upload_ring_bytes : max_upload_ring_bytes;
+    const u64 remaining = total_bytes < ring_bytes ? ring_bytes - total_bytes : 0;
     if (rounded <= remaining) {
-        u64 chunk_bytes = chunks.empty() ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
+        u64 chunk_bytes = chunks.empty() || release_at_submit ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         auto* device = the_device ? device_of(the_device) : nullptr;
