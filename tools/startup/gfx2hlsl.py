@@ -1736,6 +1736,23 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
     return out
 
 
+def adjacent_address_carries(ins, targets):
+    """Map each candidate low add to its high-word carry read in the same basic block."""
+    pairs = {}
+    for index, (high_pc, _, name, asm) in enumerate(ins):
+        if name != 's_add_u32' or 'src_scc' not in asm or not index or high_pc in targets:
+            continue
+        low_pc, _, low_name, low_asm = ins[index - 1]
+        if low_name != 's_add_u32':
+            continue
+        low = parse(low_asm)[1]
+        if len(low) == 3 and re.fullmatch(r's\d+', low[0]):
+            reg = int(low[0][1:])
+            if reg < 105 and parse(asm)[1] == ['s%d' % (reg + 1), '0', 'src_scc']:
+                pairs[low_pc] = high_pc
+    return pairs
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -1757,6 +1774,8 @@ class Stage:
     bad_sgprs = None
     _uniform_written = None
     raw_code = b''
+    address_carry_pairs = ()
+    address_carry_reader = None
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -2534,6 +2553,8 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
+        if getattr(self, 'kind', None) == 'cs':
+            self.address_carry_pairs = adjacent_address_carries(self.ins, targets)
         # Forward edges reach each block in disassembly order. A back edge could
         # repeat a pointer advance before the next table load.
         self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
@@ -2578,6 +2599,7 @@ class Stage:
 
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
+            self.address_carry_reader = None
             uniform_vcc_compares = set()
             self.lines = []
             self.blocks = []          # (offset, [lines], terminator)
@@ -3553,6 +3575,11 @@ class Stage:
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
+        if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
+            # The immediately preceding numeric add emitted the carry; no branch can enter here.
+            self.set_s(reg_range(ops[0])[1], '(scc ? 1u : 0u)')
+            self.set_scc('false')  # 0 + a single bit never produces another carry.
+            return None
         if base in SCC_UNMODELLED and self.tracks_uniformity():
             self.scc_uniform = False
         dst = reg_range(ops[0])
@@ -3676,6 +3703,15 @@ class Stage:
             self.used_s.add(reg_range(srcs[absorbed])[1])
         values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
         expr = text.format(*values)
+        if base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs:
+            for tok in srcs:
+                self.reject_lane_mask_data(base, tok)
+                r = reg_range(tok)
+                if r and r[1] in getattr(self, 'join_masks', ()):
+                    raise Unsupported('address carry on a lane mask joined at a branch target')
+            # Compute carry before writing the low register, which can also be an addend.
+            self.set_scc('(%s) < %s' % (expr, values[0]))
+            self.address_carry_reader = self.address_carry_pairs[self.pc]
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]

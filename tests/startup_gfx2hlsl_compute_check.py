@@ -397,9 +397,33 @@ L_WORD3 = {
     'L-unorm': (1 << 12) | 1 | (4 << 3) | (7 << 6) | (5 << 9),  # one, X, W, Y
 }
 
+# Each group uses its ID as a low addend, overwrites that SGPR, and stores the
+# low word, high word and SCC left by the high add. The fourth word stays untouched.
+SOURCE_CARRY = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0
+s_waitcnt lgkmcnt(0)
+s_mul_i32 s20, s7, 1
+s_add_u32 s20, s20, -2
+s_add_u32 s21, 0, src_scc
+s_cselect_b32 s22, 1, 0
+s_lshl_b32 s23, s7, 4
+v_mov_b32_e32 v4, s23
+v_mov_b32_e32 v8, s20
+v_mov_b32_e32 v9, s21
+v_mov_b32_e32 v10, s22
+buffer_store_dwordx3 v[8:10], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_CARRY = bytes.fromhex(
+    '06038abe 80038bbe 05030cf4000000fa 7fc08cbf 07811493 14c21480 80fd1580 81801685'
+    ' 0784178f 1702087e 1402107e 1502127e 1602147e 00107ce004080480 000081bf')
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
+    'address-carry': (SOURCE_CARRY, WORDS_CARRY, USER7 | TGID_X, (1, 1, 1), (4, 1, 1)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | TGID_Z | tidig(2), (5, 2, 1), (4, 1, 3)),
     'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
@@ -598,6 +622,11 @@ def expected(name):
             out[4 * group:4 * group + 4] = [group, pair & MASK, pair >> 32, 0]
         return out
     _, _, _, local, groups = CASES[name]
+    if name == 'address-carry':
+        for group in range(groups[0]):
+            total = group + 0xfffffffe
+            out[4 * group:4 * group + 3] = [total & 0xffffffff, total >> 32, 0]
+        return out
     if name in L_WORD3:
         data = formatted_input()
         for lane in range(16):
@@ -979,6 +1008,18 @@ def check_off_stores():
 
 
 def check_controls():
+    carry = translate('address-carry').hlsl_cs()
+    assert 's21 = (scc ? 1u : 0u);' in carry
+    lo, hi, end = (bytes.fromhex(x) for x in ('04051480', '80fd1580', '000081bf'))
+    for near_miss in (
+            lo + bytes.fromhex('81809e80') + hi,             # intervening s_sub_u32 writes SCC
+            lo + bytes.fromhex('000080bf') + hi,             # non-adjacent
+            bytes.fromhex('010084bf') + lo + hi,             # branch into the high add
+            bytes.fromhex('06811480') + hi,                  # elided descriptor arithmetic
+            lo + bytes.fromhex('81fd1580'),                  # high addend is one
+            lo + bytes.fromhex('80fd1680')):                 # high register is not the next SGPR
+        refused('src_scc', lambda: translate('address-carry', code=near_miss + end))
+    refused('lane mask', lambda: translate('address-carry', code=bytes.fromhex('7e811480') + hi + end))
     ff1 = bytes.fromhex('7e1385be')
     end = bytes.fromhex('000081bf')
     # A write to EXEC can disable lane zero; a backward branch can re-enter

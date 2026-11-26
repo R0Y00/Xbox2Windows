@@ -14996,6 +14996,17 @@ python -B tests/startup_compute_store_format_xyzw_check.py binary llvm-mc-15
 
 Not covered here: hardware adapters, the `llvm-mc-15` `binary` step, formats with fewer than four channels (they write nothing), `OOB_SELECT` 1, a dispatch against a host view shorter than the guest range (the guard is checked only as emitted text), and runtime binding of the three entry constants.
 
+### Startup compute address carry
+
+The startup compute translator accepts a numeric `s_add_u32 sN, a, b` followed
+immediately by `s_add_u32 sN+1, 0, src_scc` when both execute in the same
+basic block. The first add produces the low word and unsigned carry. The second
+stores the carry as the high word and clears SCC. A branch directly to the high
+add, a lane-mask addend or symbolic descriptor arithmetic keeps the refusal.
+The `address-carry` fixture
+adds group IDs 0 through 3 to `0xfffffffe` and reads back both words and the
+final SCC. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|warp|hardware)$' -V`.
+
 ### First active lane at compute entry
 
 The startup compute translator accepts `s_ff1_i32_b32 sN, exec_lo` in the
