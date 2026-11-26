@@ -108,7 +108,7 @@ def controls():
 
     refused('cd', 'image_sample_c_d')
     refused('do', 'image_sample_d_o')
-    refused('d1', 'unverified 1D image sample address or modifiers')
+    refused('d1', 'unverified 1D image d address or modifiers')
     refused('dtfe', 'image_sample_d modifier tfe')
     print('refused: compare, offset, 1D, tfe')
 
