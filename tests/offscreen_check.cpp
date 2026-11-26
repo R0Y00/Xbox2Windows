@@ -1957,7 +1957,7 @@ int run_operation_spec(const OperationSpec& spec, const OperationContext& ctx, D
 OperationResult run_serve(const OperationContext& ctx)
 {
     std::setvbuf(stderr, nullptr, _IONBF, 0);
-    std::fprintf(stderr, "X2WEND -1\n");           // the banner printed so far is the text of the first case
+    std::fprintf(stderr, "X2WEND -1\n");           // the banner printed so far; the client repeats it in front of every case, as a one-shot call prints it
     std::printf("X2WCASE -1 0\n");
     std::fflush(stdout);
     std::vector<char> buffer(65536);

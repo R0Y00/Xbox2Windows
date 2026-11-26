@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -24,15 +25,19 @@ adapter, args = sys.argv[1], sys.argv[2:]
 def one(args):
     """The text and exit code of one case, as the real tool prints them."""
     op = args[0]
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cases.log"), "a") as log:
+        log.write(" ".join(args) + "\n")
     if op == "--pass":
-        return "ok %s\n" % args[1], "", 0
+        return "ok %s\ndebug_errors=0 debug_warnings=0\n" % args[1], "", 0
+    if op == "--warn":
+        return "ok %s\ndebug_errors=0 debug_warnings=1\n" % args[1], "", 0
     if op == "--mismatch":
         return "", "startup_flat_param mismatch %s\n" % args[1], 1
     if op == "--skip":
         return "skip: nothing\n", "", 77
     return "", "Unknown GPU operation or invalid arguments: %s\n" % op, 2
 
-banner = "backend=%s debug_layer=unavailable\nadapter=Fake\n" % adapter
+banner = "backend=%s debug_layer=enabled\nadapter=Fake\n" % adapter
 if args and args[0] == "--serve":
     if mode == "no-serve":
         sys.stderr.write("Unknown GPU operation or invalid arguments: --serve\n")
@@ -48,6 +53,13 @@ if args and args[0] == "--serve":
         out, err, code = one(line.rstrip("\n").split("\t"))
         if mode == "die-at-%d" % index:
             os._exit(3)
+        if mode == "hang-at-%d" % index:
+            import time
+            time.sleep(60)
+        if mode == "skew-at-%d" % index:
+            sys.stderr.write("X2WEND %d\n" % (index + 5))
+            print("X2WCASE %d 0" % index, flush=True)
+            continue
         sys.stdout.write(out)
         sys.stderr.write(err)
         sys.stderr.write("X2WEND %d\n" % index)
@@ -91,10 +103,11 @@ class RunnerChecks(unittest.TestCase):
         second = self.run_case(renderer, '--mismatch', 'b')
         third = self.run_case(renderer, '--pass', 'c')
         self.assertEqual((first.returncode, second.returncode, third.returncode), (0, 1, 0))
-        self.assertEqual(first.stdout, 'backend=warp debug_layer=unavailable\nadapter=Fake\nok a\n')   # banner once
+        self.assertEqual(first.stdout, 'backend=warp debug_layer=enabled\nadapter=Fake\nok a\ndebug_errors=0 debug_warnings=0\n')
         self.assertEqual(first.stderr, 'XBOX2WINDOWS_ADAPTER: skipping Other\n')
-        self.assertEqual((second.stdout, second.stderr), ('', 'startup_flat_param mismatch b\n'))
-        self.assertEqual((third.stdout, third.stderr), ('ok c\n', ''))
+        self.assertEqual(second.stderr, 'XBOX2WINDOWS_ADAPTER: skipping Other\nstartup_flat_param mismatch b\n')
+        self.assertEqual(third.stdout, 'backend=warp debug_layer=enabled\nadapter=Fake\nok c\ndebug_errors=0 debug_warnings=0\n')  # banner on every case
+        self.assertEqual(third.stderr, 'XBOX2WINDOWS_ADAPTER: skipping Other\n')
         self.assertEqual(self.run_case(renderer, '--bogus').returncode, 2)
 
     def test_skip_and_missing_adapter_keep_their_exit_code(self):
@@ -110,11 +123,42 @@ class RunnerChecks(unittest.TestCase):
         self.assertTrue(result.stdout.startswith('ONESHOT '))
         self.assertEqual(self.run_case(renderer, '--pass', 'q').returncode, 0)
 
-    def test_a_server_that_dies_is_restarted_and_the_case_still_answers(self):
+    def executed(self):
+        log = self.dir / 'cases.log'
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_a_crash_after_the_handshake_is_a_failed_verdict_and_the_case_is_not_run_again(self):
         renderer = launcher(self.dir, 'dies', 'die-at-1')
         self.assertEqual(self.run_case(renderer, '--pass', 'a').returncode, 0)
-        again = self.run_case(renderer, '--mismatch', 'b')            # case 1 kills the first server; the restart answers it
-        self.assertEqual((again.returncode, again.stderr.splitlines()[-1]), (1, 'startup_flat_param mismatch b'))
+        lost = self.run_case(renderer, '--pass', 'b')                 # the renderer dies on this case, which would pass if re-run
+        self.assertEqual(lost.returncode, 1)
+        self.assertIn('exited (code 3)', lost.stderr)
+        self.assertEqual(self.executed(), ['--pass a', '--pass b'])  # fake logs the case before dying; never a second time
+        self.assertEqual(self.run_case(renderer, '--pass', 'c').returncode, 0)     # the next case gets a new server
+
+    def test_a_silent_renderer_fails_the_case_after_one_deadline(self):
+        renderer = launcher(self.dir, 'hangs', 'hang-at-0')
+        self.addCleanup(setattr, R, 'CASE_TIMEOUT_S', R.CASE_TIMEOUT_S)
+        R.CASE_TIMEOUT_S = 2
+        started = time.monotonic()
+        lost = self.run_case(renderer, '--pass', 'a')
+        self.assertEqual(lost.returncode, 1)
+        self.assertIn('timed out after 2 s', lost.stderr)
+        self.assertLess(time.monotonic() - started, 4)               # one deadline for both streams, not one each
+
+    def test_a_reply_with_the_wrong_case_number_fails_the_case(self):
+        lost = self.run_case(launcher(self.dir, 'skew', 'skew-at-1'), '--pass', 'a')
+        self.assertEqual(lost.returncode, 0)
+        lost = self.run_case(launcher(self.dir, 'skew', 'skew-at-1'), '--pass', 'b')
+        self.assertEqual(lost.returncode, 1)
+        self.assertIn('answered case', lost.stderr)
+
+    def test_a_debug_warning_of_a_later_case_is_visible_to_the_check(self):
+        renderer = launcher(self.dir, 'fake', 'serve')
+        self.run_case(renderer, '--pass', 'a')
+        later = self.run_case(renderer, '--warn', 'b')
+        self.assertIn('debug_layer=enabled', later.stdout)           # the check looks for the status in every case
+        self.assertIn('debug_errors=0 debug_warnings=1', later.stdout)
 
     def test_every_exit_leaves_no_process_and_no_open_pipe(self):
         made = []
@@ -129,8 +173,9 @@ class RunnerChecks(unittest.TestCase):
             self.run_case(launcher(self.dir, 'none', 'no-adapter'), '--pass', 'a')   # skip 77 at the handshake
             dies = launcher(self.dir, 'dies', 'die-at-1')
             self.run_case(dies, '--pass', 'a')
-            self.run_case(dies, '--mismatch', 'b')                                   # dead server, restart
-            R._close_all()                                                           # the restarted server, at exit
+            self.run_case(dies, '--mismatch', 'b')                                   # dead server: failed verdict
+            self.run_case(dies, '--pass', 'c')                                       # next case, new server
+            R._close_all()                                                           # that server, at exit
         self.assertEqual(len(made), 4)
         for server in made:
             self.assertIsNotNone(server.proc.poll())
