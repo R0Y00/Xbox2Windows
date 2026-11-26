@@ -292,7 +292,10 @@ for label, instructions, group in (
         ('thread id base rewritten after', (GID, 'v_add_nc_u32_e32 v0, s3, v0', WAVE, READ1), (64, 1, 1)),
         ('thread id base scaled by 32', ('v_lshl_add_u32 v0, s2, 5, v0', WAVE, READ1), (64, 1, 1))):
     got = run(*instructions, kind='cs', group=group)
-    check(f'{label} refused', got == REFUSAL, repr(got))
+    # The compare's mask in s2 is refused where v_lshl_add_u32 reads it as a number, before the read.
+    expected = ('v_lshl_add_u32 reads lane mask s2 as numeric data'
+                if label == 'thread id base from a varying scalar' else REFUSAL)
+    check(f'{label} refused', got == expected, repr(got))
 
 # Older probes may provide either no tracker or only part of the tracking state.
 for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):
