@@ -16,9 +16,11 @@ Fixture (synthetic): the recorded c_lz stage of startup_image_sample_c_check wit
   exit_<op>   a divergent forward exit, loop closed by s_branch -> SampleLevel 0 (as before)
 
   (no arguments)   translation controls, pure Python
+  draw <dxc> <offscreen_check> <warp|hardware> [fxc]
 """
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -75,5 +77,52 @@ def main():
     print('plain image_sample: implicit LOD past a uniform branch/join, level 0 with divergent EXEC or control flow')
 
 
+def draw(dxc, renderer, adapter, fxc=None):
+    from startup_image_get_lod_view_check import FULLSCREEN_VS, UNPACK_XY, compile_hlsl, read_pixel
+
+    # Use screen coordinates so one pixel step is four texels at mip 0.
+    # The 4x4 fixture must select physical mip 2 through either SRV window.
+    code = stage(join=True)
+    constant_coords = bytes.fromhex('f002007eff02027e0000803ef202047ef402067e')
+    assert code.count(constant_coords) == 1
+    code = code.replace(constant_coords, UNPACK_XY)
+    lod_limits = bytes.fromhex('800399be')
+    assert code.count(lod_limits) == 1
+    code = code.replace(lod_limits, struct.pack('<II', 0xbe9903ff, 2 << 20))
+    pipe = G.Pipeline(VS_WORDS, code, root_blob(flags=0), ps_hw_inputs=(0x8000, 0x8000))
+    source = pipe.hlsl_ps()
+    sampler, = (line for line in pipe.manifest().splitlines() if line.startswith('smpl '))
+    implicit = '.Sample(q0, float2(F(v0), F(v1)))'
+    assert source.count(implicit) == 1
+    forced_level_zero = source.replace(implicit, '.SampleLevel(q0, float2(F(v0), F(v1)), 0)')
+
+    compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
+    if fxc:
+        compilers.append(('fxc', fxc, 'vs_5_1', 'ps_5_1'))
+    work_root = HERE.parent / 'out'
+    work_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=work_root) as tmp:
+        work = Path(tmp)
+        for kind, compiler, vs_profile, ps_profile in compilers:
+            vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'vs_' + kind, vs_profile, work)
+            guest = compile_hlsl(compiler, kind, source, 'implicit_' + kind, ps_profile, work)
+            forced = compile_hlsl(compiler, kind, forced_level_zero, 'forced_' + kind, ps_profile, work)
+            # Every channel exports the texel's red field. At (0,0), physical mip m stores (1+32m)/128.
+            wanted = struct.pack('>4f', *((65.0 / 128,) * 4))
+            for window, first_mip in (('0/3', 0), ('1/2', 1)):
+                actual = read_pixel(renderer, adapter, str(vs), str(guest), sampler, window)
+                control = read_pixel(renderer, adapter, str(vs), str(forced), sampler, window)
+                wrong = struct.pack('>4f', *(((1 + 32 * first_mip) / 128,) * 4))
+                assert actual == wanted, (kind, window, actual.hex(), wanted.hex())
+                assert control == wrong and control != actual, (kind, window, control.hex(), wrong.hex())
+                print(f'{kind} {adapter} {window}: implicit physical mip 2 {actual.hex()}, '
+                      f'forced physical mip {first_mip} {control.hex()}')
+
+
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) == 1:
+        main()
+    elif sys.argv[1] == 'draw' and len(sys.argv) in (5, 6):
+        draw(*sys.argv[2:])
+    else:
+        raise SystemExit(__doc__)
