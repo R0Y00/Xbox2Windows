@@ -1952,7 +1952,7 @@ int run_operation_spec(const OperationSpec& spec, const OperationContext& ctx, D
 // adapter name in a one-shot call. Each case runs through the same argument validation, capability gate, debug-layer check
 // and exit-code mapping as a one-shot call (0 pass, 1 failure, 77 skip, 2 bad arguments); its stdout and stderr text is
 // whatever the one-shot call prints. Both streams end the case with a marker line ("X2WEND <index>" on stderr, then
-// "X2WCASE <index> <exit code>" on stdout) so the client can split the text per case. Closing stdin ends the loop; a removed
+// "X2WCASE <index> <exit code>" on stdout) so the client can split the text per case. The line "--end" or closing stdin ends the loop; a removed
 // device ends it with exit code 1 after answering, and the client starts a new process.
 OperationResult run_serve(const OperationContext& ctx)
 {
@@ -1964,6 +1964,7 @@ OperationResult run_serve(const OperationContext& ctx)
     for (int index = 0; std::fgets(buffer.data(), int(buffer.size()), stdin); ++index) {
         std::string line(buffer.data());
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (line == "--end") break;                 // an explicit end: not every launcher (a Wine wrapper) passes the end of stdin on
         std::vector<std::string> field{ctx.argv[0], std::string(ctx.mode)};
         for (std::size_t start = 0;;) {
             const auto tab = line.find('\t', start);

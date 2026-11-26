@@ -140,9 +140,10 @@ class _Server:
 
     def close(self):
         try:
+            self.proc.stdin.write('--end\n')       # explicit: a launcher in between may not pass the end of stdin on
             self.proc.stdin.close()
             self.proc.wait(timeout=30)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, subprocess.TimeoutExpired):     # already closed, or it does not end
             self.proc.kill()
         self._release()
 

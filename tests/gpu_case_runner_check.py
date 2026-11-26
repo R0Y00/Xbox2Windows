@@ -49,6 +49,8 @@ if args and args[0] == "--serve":
     sys.stderr.write("X2WEND -1\n")
     print("X2WCASE -1 0", flush=True)
     for index, line in enumerate(sys.stdin):
+        if line == "--end\n":
+            sys.exit(0)
         out, err, code = one(line.rstrip("\n").split("\t"))
         if mode == "die-at-%d" % index:
             os._exit(3)
