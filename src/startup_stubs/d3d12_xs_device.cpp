@@ -174,8 +174,6 @@ struct alignas(16) WrapperOwn {
                             // accesses: a race needs the guest to use a resource across its own final Release.
     bool retire_hold_missed;  // Resource: retire_hold could not record a use (no desktop object or no room), so the
                               // drain must keep it for the process instead of dropping a list's desktop object.
-    bool retire_views_stuck;  // Resource: X2W_D3D12_RELEASE_RETIRED_VIEWS could not clear every descriptor slot that
-                              // names it, so it stays retained (and is not scanned again).
     std::uint8_t retire_never;  // RetireNever of this resource (set only with X2W_D3D12_RELEASE_RETIRED)
     std::uint8_t retire_left;   // RetireLeft: the first use that took it out of the class
     volatile LONG retire_view_refs;  // Live tracked slot-18 SRV descriptor slots referencing this resource.
@@ -827,17 +825,22 @@ const D3D12_CLEAR_VALUE* packed_clear_value(const D3D12_CLEAR_VALUE* clear, DXGI
     return &copy;
 }
 
-bool release_retired_enabled()
+bool legacy_retire_view_stats()
 {
-    static const bool on = x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED");
-    return on;
+    static const bool requested = [] {
+        if (!x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED_VIEWS")) return false;
+        log("x2w-d3d12: X2W_D3D12_RELEASE_RETIRED_VIEWS no longer clears live descriptors; budget statistics only");
+        return true;
+    }();
+    return requested;
 }
 
-// X2W_D3D12_RELEASE_RETIRED_VIEWS=1 (needs X2W_D3D12_RELEASE_RETIRED=1): a released class member that only tracked slot-18
-// descriptor slots keep alive is freed once every such slot has been replaced by a null descriptor.
-bool release_retired_views_enabled()
+bool release_retired_enabled()
 {
-    static const bool on = release_retired_enabled() && x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED_VIEWS");
+    static const bool on = [] {
+        (void)legacy_retire_view_stats();
+        return x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED");
+    }();
     return on;
 }
 
@@ -5178,15 +5181,6 @@ void retire_resource(Wrapper* w)
     if (!queued) InterlockedIncrement64(&retire_kept);  // stays retained, as without the switch
 }
 
-// A null SRV of the dimension the title's view had (the draw path binds the same R8G8B8A8_UNORM null for a view that
-// resolves to nothing). A null resource reads no more of the description than its format and dimension.
-D3D12_SHADER_RESOURCE_VIEW_DESC retire_null_srv_desc(const ViewRecord& record)
-{
-    unsigned dimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    if (record.desc_bytes >= 40) std::memcpy(&dimension, record.desc + 4, sizeof(dimension));
-    return null_srv_desc(dimension);
-}
-
 // True when the release-time fence of every queue has passed (retire_lock held).
 bool retire_fences_reached(const RetiredResource& item)
 {
@@ -5196,106 +5190,10 @@ bool retire_fences_reached(const RetiredResource& item)
     return reached;
 }
 
-// X2W_D3D12_RELEASE_RETIRED_VIEWS=1: a released class member whose release-time fences have passed and that only
-// tracked slot-18 descriptor slots still name gets those slots replaced by null descriptors, so the main drain loop can
-// free it. Every slot of every heap that has a shadow is handled, copies included (they are counted the same way). For
-// each slot, under note_lock: the shadow entry is cleared and its ref dropped, and the desktop descriptor is rewritten
-// as a null SRV of the same dimension. The view records that name the resource then lose it (so a token that a raw
-// title copy left behind resolves to nothing), and the token in title descriptor memory is cleared when it still
-// carries the id. A slot that cannot be rewritten keeps its ref, and the resource stays retained. Nothing waits.
-// Why this cannot reach GPU work: translated draws never bind a title heap. They build their own descriptors from the
-// title's tokens at draw time and retire_hold what they sample, so a descriptor of a title heap is read by no recorded
-// list or submission (ClearUnorderedAccessView binds a heap for UAV slots only, and those are not touched here).
-void retire_null_ready_views()
-{
-    std::vector<Wrapper*> ready;
-    try {
-        ready.reserve(64);
-    } catch (const std::bad_alloc&) {
-        return;
-    }
-    if (!TryAcquireSRWLockShared(&retire_lock)) return;
-    for (const RetiredResource& item : retired_resources) {
-        Wrapper* w = item.wrapper;
-        if (ready.size() == ready.capacity()) break;
-        if (w->own().retire_hold_missed || w->own().retire_views_stuck || !retire_fences_reached(item)) continue;
-        if (InterlockedCompareExchange(&w->own().retire_view_refs, 0, 0) <= 0) continue;
-        if (InterlockedCompareExchange(&w->own().refs, 0, 0) != 0) continue;  // referenced again: leave its views
-        ready.push_back(w);
-    }
-    ReleaseSRWLockShared(&retire_lock);
-    if (ready.empty()) return;
-
-    struct Cleared {
-        u64 title_cpu;
-        std::uint32_t index, increment, id;
-    };
-    std::vector<Cleared> cleared;
-    std::size_t stuck = 0;
-    // draw_lock first, in the order draw_translated takes them: a draw holds it from reading a view record until it
-    // retire_holds the texture, so clearing the records under it means a draw either recorded its hold already or
-    // resolves the token to nothing.
-    if (!TryAcquireSRWLockExclusive(&draw_lock)) return;
-    if (!TryAcquireSRWLockExclusive(&note_lock)) {
-        ReleaseSRWLockExclusive(&draw_lock);
-        return;
-    }
-    try {
-        std::unordered_set<std::uint32_t> ids;  // view ids that name a ready resource
-        for (std::uint32_t id = 0; id < view_records().size(); ++id) {
-            const ViewRecord& record = view_records()[id];
-            if (record.slot != 18 || !view_materialized()[id]) continue;
-            if (std::find(ready.begin(), ready.end(), reinterpret_cast<Wrapper*>(record.resource)) != ready.end())
-                ids.insert(id);
-        }
-        ID3D12Device* const device = the_device ? device_of(the_device) : nullptr;
-        for (const HeapInfo& h : heap_infos()) {
-            if (!h.shadow || ids.empty() || !device || !h.desktop_cpu) continue;
-            for (std::uint32_t i = 0; i < h.count; ++i) {
-                const std::uint32_t slot_id = h.shadow[i];
-                if (!slot_id || !ids.count(slot_id - 1)) continue;
-                const ViewRecord& record = view_records()[slot_id - 1];
-                const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = retire_null_srv_desc(record);
-                device->CreateShaderResourceView(nullptr, &null_view,
-                    D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(h.desktop_cpu + u64{i} * h.increment)});
-                h.shadow[i] = 0;
-                retire_release_view_ref(reinterpret_cast<const void*>(record.resource));
-                if (h.title_cpu && h.title_cpu != h.desktop_cpu) cleared.push_back({h.title_cpu, i, h.increment, slot_id - 1});
-            }
-        }
-        for (Wrapper* w : ready) {
-            if (InterlockedCompareExchange(&w->own().retire_view_refs, 0, 0) > 0) {
-                w->own().retire_views_stuck = true;
-                ++stuck;
-                continue;
-            }
-            for (std::uint32_t id : ids)
-                if (view_records()[id].resource == reinterpret_cast<u64>(w)) view_records()[id].resource = 0;
-        }
-    } catch (const std::bad_alloc&) {
-    }
-    ReleaseSRWLockExclusive(&note_lock);
-    ReleaseSRWLockExclusive(&draw_lock);
-    for (const Cleared& slot : cleared) {
-        const u64 token = slot.title_cpu + u64{slot.index} * title_descriptor_stride(slot.title_cpu, slot.increment);
-        if (!title_backed(token, 32) || !x2w_local::writable(reinterpret_cast<void*>(token), 32)) continue;
-        std::uint32_t words[2];
-        std::memcpy(words, reinterpret_cast<const void*>(token), sizeof(words));
-        if (words[0] == view_token_magic && words[1] == slot.id)
-            InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(token), 0, static_cast<LONG>(view_token_magic));
-    }
-    if (stuck) {
-        static LONG reported;
-        if (first_calls(reported, 4)) log("x2w-d3d12 retire: %zu released textures keep an untracked descriptor; they stay retained", stuck);
-    }
-}
-
-
 // Never blocks: a contended lock or an unfinished queue leaves the work for the next call.
 void drain_retired_resources()
 {
     if (!InterlockedCompareExchange(&retire_pending, 0, 0)) return;
-    if (release_retired_views_enabled()) retire_null_ready_views();
     constexpr std::size_t batch = 256;
     struct RetiredDrop {
         Wrapper* wrapper;
@@ -5326,10 +5224,7 @@ void drain_retired_resources()
             ++i;
             continue;
         }
-        bool reached = item.targets.size() <= retire_queues.size();
-        for (std::size_t q = 0; q < item.targets.size() && reached; ++q)
-            reached = retire_queues[q].fence->GetCompletedValue() >= item.targets[q];
-        if (!reached) {
+        if (!retire_fences_reached(item)) {
             ++i;
             continue;
         }
@@ -5394,7 +5289,8 @@ void drain_retired_resources()
 // is recorded and no line is built.
 bool retire_reasons_enabled()
 {
-    static const bool on = release_retired_enabled() && x2w_budget::enabled() && x2w_local::env_on("X2W_D3D12_RETIRE_REASONS");
+    static const bool on = release_retired_enabled() && x2w_budget::enabled() &&
+        (legacy_retire_view_stats() || x2w_local::env_on("X2W_D3D12_RETIRE_REASONS"));
     return on;
 }
 

@@ -7,6 +7,7 @@ With 'binary <llvm-mc>', validates assembled gfx1013 machine-code bytes. With 'd
 compiles with DXC (cs_6_0) and runs WARP / hardware GPU readback verification via offscreen_check.
 """
 
+import re
 import struct
 import subprocess
 import sys
@@ -20,7 +21,7 @@ sys.path.insert(0, str(ROOT / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 
 import gfx2hlsl as G
-from startup_gfx2hlsl_compute_check import TGID_X, USER7, patch, refused, root_blob
+from startup_gfx2hlsl_compute_check import TGID_X, USER7, patch, refused, renderer_diagnostics, root_blob
 
 
 def le32(w):
@@ -325,11 +326,13 @@ def check_dispatch(dxc, runner, adapter, control=None):
             print(run.stdout, end='')
             if run.returncode == 77:
                 return 77
+            diagnostics = renderer_diagnostics(run.stderr, adapter)
             if control:
-                if run.returncode != 1 or 'expected=' not in run.stderr:
+                if run.returncode != 1 or not diagnostics or not re.fullmatch(
+                        r'word=\d+ expected=[0-9a-f]{8} actual=[0-9a-f]{8}', diagnostics[0]):
                     raise AssertionError('control %s: not rejected (exit %d) %s' % (control, run.returncode, run.stderr))
-                print('control %s: rejected at %s' % (control, run.stderr.strip().splitlines()[0]))
-            elif run.returncode or run.stderr:
+                print('control %s: rejected at %s' % (control, diagnostics[0]))
+            elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:
                 print('case %s: all %d words match' % (name, WORDS))
