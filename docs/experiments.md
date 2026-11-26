@@ -15146,12 +15146,13 @@ ctest --preset release --no-tests=error -R '^startup_compute_gather_lz(_warp|_ha
 
 ### Startup compute D16 image store
 
-The startup compute translator accepts a 2D `image_store d16` with all four
-DMASK bits set, full-width X/Y and eight intact image descriptor words from a
-fixed table offset. The R/G half-floats occupy the low/high halves of the first
+The startup compute translator accepts 2D and 2D-array `image_store d16`
+with all four DMASK bits set, full-width X/Y (and layer for an array), and eight
+intact image descriptor words from a fixed table offset. The R/G half-floats occupy the low/high halves of the first
 data VGPR. B/A occupy the second. The translator widens the four halves for a
 typed UAV store under the lane's EXEC bit. The version 2 compute manifest
-records `uav N tex2d float table P O channels 4`. Raw buffer and texture UAVs
+records `uav N tex2d float table P O channels 4` or, for an array,
+`uav N tex2da float table P O channels 4`. Raw buffer and texture UAVs
 share a register index space. The consumer must validate the bound view against
 its dimension and float type. [AMD RDNA 2 ISA, §§8.2.1 and 8.2.5](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
 
@@ -15161,7 +15162,10 @@ write 16 texels to mip zero of an RGBA16_FLOAT UAV. Each run compares all 1,344
 half-words across three mips, including signed zeros, subnormals and untouched
 texels. A second program masks out the second row. Omitting the store, swapping
 R/G, swapping the packed registers and dropping the EXEC guard produce 64, 32,
-64 and 32 differences respectively. Slot-67 runtime binding is tracked in #2274.
+64 and 32 differences respectively. Slot-67 2D runtime binding is tracked in #2274.
+The [array UAV runtime fixture](experiments/startup-compute-array-uav.md) also
+checks packed D16 through the production slot-67/slot-14 path with a nonzero
+FirstArraySlice, all six physical slices and five negative controls.
 
 ```powershell
 cmake --build --preset release --target offscreen_check
@@ -15175,8 +15179,8 @@ dim:SQ_RSRC_IMG_2D_ARRAY with three full-width address VGPRs for x, y and layer.
 It emits an RWTexture2DArray<float4> store under the lane EXEC bit and records
 uav N tex2da float table P O channels 4 in the version 2 manifest.
 The [startup runtime array UAV binding](experiments/startup-compute-array-uav.md)
-consumes this manifest. Pixel arrays,
-packed D16 arrays and the 1D, 3D and cube store forms remain refused.
+consumes this manifest for full-mask FP32 and packed D16 compute stores.
+Pixel arrays and the 1D, 3D and cube store forms remain refused.
 
 The standalone GPU fixture writes the same four words into mip zero of layer 1
 and layer 3 of a four-layer allocation. It compares all 5,376 words and detects

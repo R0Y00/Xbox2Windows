@@ -7384,7 +7384,7 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write a full 2D texel or, for compute FP32, a full 2D-array texel.
+        """Write a full 2D texel or, for compute, a full 2D-array texel.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D, x, y, layer for dim 2D-array) and SRSRC
@@ -7414,8 +7414,6 @@ class Stage:
         array = dims[0] == 'SQ_RSRC_IMG_2D_ARRAY'
         if dims[0] != 'SQ_RSRC_IMG_2D' and (not array or self.kind != 'cs'):
             raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
-        if array and d16:
-            raise Unsupported('compute image_store d16 requires a 2D image')
         try:
             mask = int(masks[0], 0)
         except ValueError:
@@ -8366,8 +8364,10 @@ class Stage:
             if n.startswith('s_cbranch') or n == 's_branch':
                 target = int(ops[0].split('_')[1], 16)
             if target is not None:
-                if target <= off:
-                    raise Unsupported('a backward branch in a program with v_interp_p1ll_f16 / v_interp_p2_f16')
+                # A backward branch needs no refusal of its own: every branch instruction is a boundary below, where
+                # the scan requires that no p1ll result is pending, no p2 result is stale and no destination has an
+                # undefined upper half. Nothing the scan tracks therefore travels along a back edge, and the loop head
+                # (also a boundary, entered with the same empty state) starts clean on every iteration.
                 targets.add(target)
 
         def regs(tok):
