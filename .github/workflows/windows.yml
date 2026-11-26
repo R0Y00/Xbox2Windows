@@ -361,6 +361,7 @@ jobs:
             tests/startup_gfx2hlsl_sad_check.py \
             tests/startup_gfx2hlsl_sad_hi_msad_check.py \
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
+            tests/startup_gfx2hlsl_const_copy_join_check.py \
             tests/startup_gfx2hlsl_s_bit_scan_check.py \
             tests/startup_gfx2hlsl_pack_b32_f16_check.py \
             tests/startup_inline_sampler_check.py \

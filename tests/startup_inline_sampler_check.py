@@ -116,7 +116,7 @@ def check_copy_only_folds_plain_constants():
     # A register that holds a root constant or nothing known is not a constant.
     assert copy_symbol({15: ('ud', 1)}) != ('const', 1)
     assert copy_symbol({}) is None
-    # A copy after the source was overwritten takes the new value, never the old one.
+    # A copy of a plain constant takes that constant's value.
     assert copy_symbol({15: ('const', 7)}) == ('const', 7)
     print('copies fold only plain constants')
 
