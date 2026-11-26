@@ -877,6 +877,25 @@ def check_lane_mask_high_word():
     assert 'v5 = ud0;' in translate('A', code=splice_words(*chunks, bytes.fromhex('04020a7e'))).hlsl_cs()
 
 
+def check_lane_mask_compare_pair():
+    """A wave64 compare or carry-out into an even SGPR pair s[N:N+1] (the decoder names only sN) leaves the other 32 lanes in
+    s(N+1). Here s[4:5] are the two root constants, so s5 is a known register: a numeric read of it after the compare must
+    be refused, directly, through a copy of the pair, and through a copy of the high word."""
+    reads = ('05020a7e', '050c0a7e', '050a0a36', '050a0a4a',   # v_mov / v_cvt_f32_u32 / v_and / v_add with s5
+             '05810781', '058006bf', '050387be')                  # s_add_i32 s7, s5, 1 / s_cmp_eq_u32 s5, 0 / s_mov_b32 s7, s5
+    for write in ('040084d491000200',                            # v_cmp_gt_i32 s[4:5], 17, v0
+                  '06040fd700030200'):                           # v_add_co_u32 v6, s[4:5], v0, v1
+        for read in reads:
+            refused('as numeric data', lambda write=write, read=read: translate('A', code=splice_words(
+                bytes.fromhex(write), bytes.fromhex(read))))
+        for copy, use in (('040488be', '09810781'),             # s_mov_b64 s[8:9], s[4:5]; s_add_i32 s7, s9, 1
+                          ('050388be', '08810781')):            # s_mov_b32 s8, s5; s_add_i32 s7, s8, 1
+            refused('as numeric data', lambda write=write, copy=copy, use=use: translate('A', code=splice_words(
+                bytes.fromhex(write), bytes.fromhex(copy), bytes.fromhex(use))))
+    # before the compare s5 is the root constant: still a number the model has
+    translate('A', code=splice_words(bytes.fromhex('05810781'), bytes.fromhex('040084d491000200'))).hlsl_cs()
+
+
 def check_lane_mask_high_word_copy_and_overwrite():
     """A copy of a mask's high word is itself only a high word (no low-word tag, so no '& 1' on a numeric use in a one-thread
     group), and a wide write over a tagged pair ends the tag (no false refusal of the new value)."""
@@ -1200,6 +1219,7 @@ def check_controls():
     check_mbcnt()
     check_lane_mask_data()
     check_lane_mask_high_word()
+    check_lane_mask_compare_pair()
     check_lane_mask_single_thread_group()
     check_lane_mask_high_word_copy_and_overwrite()
     check_lane_mask_derived_word()

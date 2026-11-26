@@ -3566,6 +3566,7 @@ class Stage:
         already (set_s). self.masks holds the low word, self.mask_high the high word of a wave64 pair: no numeric read of
         either is lowered (lower())."""
         low, high = tags
+        self.tag_compare_pair(base, ops)
         saveexec = base.startswith('s_') and 'saveexec' in base
         scalar = bool(MASK_COPY_SALU_RE.match(base)) and (low or high)
         pair_select = base.startswith('s_cselect') and base.endswith('b64')
@@ -3582,6 +3583,21 @@ class Stage:
                 self.masks.add(r[1])
             if r[2] == r[1] and high and not (saveexec or pair_select):
                 self.mask_high = getattr(self, 'mask_high', set()) | {r[1]}
+
+    def tag_compare_pair(self, base, ops):
+        """A compare or carry-out into SGPR sN (the decoder prints a wave64 pair as s[N:N+1] by its low word only). In
+        wave64 the destination is an even-aligned pair and s(N+1) holds the other 32 lanes, which no one-lane value
+        has: tag s(N+1) as the high word. An odd sN is a wave32 destination (no high word); an even one that is a wave32
+        destination loses the numeric reads of s(N+1), a refusal and never a wrong value."""
+        if base.startswith('v_cmp') and not base.startswith('v_cmpx'):
+            tok = ops[0] if ops else ''
+        elif VOP3B_SDST.match(base) and len(ops) > 1:
+            tok = ops[1]
+        else:
+            return
+        r = reg_range(tok.strip())
+        if r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks and r[1] % 2 == 0:
+            self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
 
     def lane_mask_exact(self):
         """True where the one-lane model of a wave mask is exact: a compute group of one thread has one participating lane
