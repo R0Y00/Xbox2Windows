@@ -3,7 +3,9 @@
 usage: startup_mesh57_skeleton_check.py
        startup_mesh57_skeleton_check.py binary <llvm-mc>
        startup_mesh57_skeleton_check.py draw <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py depth <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py formatted <dxc> <offscreen_check> <warp|hardware>
+       startup_mesh57_skeleton_check.py shift <dxc> <offscreen_check> <warp|hardware>
        startup_mesh57_skeleton_check.py exchange <dxc> <offscreen_check> <warp|hardware> <publisher>
 
 The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted shape: lane 0 of wave 0 stores a
@@ -16,6 +18,10 @@ Without arguments: the fixture translates through the slot 57 request path, and 
 refused with its own message. `binary` compares the embedded words with llvm-mc. `draw` compiles the request
 path's output (ms_6_5, ps_6_0), draws it and compares the read-back target with a CPU rasteriser written here;
 a reference with one wrong pixel must fail.
+`depth` compiles the pair with a pixel stage that exports only to the null target (a depth-only pass), draws it
+twice into a depth buffer cleared to the sentinel 1.0 with depth test LESS, and compares colour (left cleared) and
+depth with the CPU rasteriser; a reference without the depth writes, and the same mesh with a null-export stage
+that does not discard, must each fail.
 The exchange mode uses the runtime-published request and the same pixel comparison.
 """
 import os
@@ -44,6 +50,21 @@ MESH = (
 PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\nv_interp_mov_f32 v2, p0, attr0.z\n'
              'v_interp_mov_f32 v3, p0, attr0.w\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n')
 PIXEL = 'c8020002 c8060102 c80a0202 c80e0302 f800180f 03020100 bf810000'.split()
+# A depth-only pixel stage: no colour output, only the null-target export (done, vm, no channel). Lanes whose flat
+# attribute 0 red is not above 0.5 leave EXEC, so the vm export kills them and they write no depth.
+DEPTH_PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_cmpx_lt_f32_e32 0.5, v0\n'
+                   'exp null off, off, off, off done vm\ns_endpgm\n')
+DEPTH_PIXEL = 'c8020002 7c2200f0 f8001890 00000000 bf810000'.split()
+NULL_EXPORT = DEPTH_PIXEL.index('f8001890')
+# The drawn stage with exp mrt0 v0, v0, v0, v0 inserted before its null export (after the v_cmpx), then the drawn
+# stage reading attribute 1, which the mesh does not export. The other mixed forms (mrtz, param0, pos0, both orders,
+# no EXEC narrowing) are covered by startup_mesh57_depth_only_check.py.
+DEPTH_PIXEL_MUTANTS = (
+    ('a colour write next to the drawn null export', DEPTH_PIXEL[:NULL_EXPORT] + ['f800000f', '00000000'] + DEPTH_PIXEL[NULL_EXPORT:],
+     'slot 57 pixel stage mixes the null export with another export'),
+    ('a depth-only pixel stage reading an attribute the mesh does not export', ['c8020402'] + DEPTH_PIXEL[1:],
+     'pixel stage reads attributes [1] the vertex stage does not export'),
+)
 
 # Overwrite red after the raw colour load; green, blue and alpha still come from its other three words.
 COLOUR_LOAD = 'buffer_load_dwordx4 v[20:23], v4, s[16:19], 0 offen offset:192'
@@ -90,6 +111,18 @@ def masked_vertex_red():
     return mesh[:at] + ['bf880004'] + mesh[at:]  # s_cbranch_execz skips both vertex exports
 
 
+# The first six threads select the shift for their entire guest wave. The second wave keeps 64/255.
+SHIFT_ASM = """s_mov_b32 s40, 0x3e808081
+v_cmp_gt_u32_e32 vcc, 6, v0
+s_and_saveexec_b64 s[20:21], vcc
+s_cbranch_execz 2
+s_lshl_b32 s40, 0x1fc00000, 1
+s_mov_b64 exec, -1
+v_mov_b32 v7, s40"""
+SHIFT_WORDS = 'bea803ff 3e808081 7d880086 be94246a bf880002 8f2881ff 1fc00000 befe04c1 7e0e0228'
+SHIFT_MESH = vertex_red(SHIFT_WORDS)
+
+
 # s_mov_b32 s40, 0.5; v_cmp_ge_f32_e64 vcc_lo, s40, 1.0
 VCC_COMPARE = 'bea803f0 d406006a 0001e428'
 
@@ -125,6 +158,82 @@ COUNT = [i for i, word in enumerate(MESH) if word == 'bf8a0000'][2]
 POST_COUNT = MESH.index('7d28000e')
 GROUP_END = MESH.index('05000006') + 1
 PRIMITIVE_EXPORT = MESH.index('f8000941')
+
+WAVE_LOAD_ASM = """s_mov_b32 s40, 0x3e808081
+s_lshl_b32 s41, s6, 8
+s_mov_b32 s42, 6
+v_mov_b32 v7, 0
+s_mov_b64 exec, -1
+v_cmpx_gt_u32_e32 s42, v0
+s_mov_b32 s42, 0
+s_cbranch_execz 4
+s_buffer_load_dword s40, s[16:19], s41 offset:0x1e0
+v_mov_b32 v7, 1.0
+s_waitcnt lgkmcnt(0)
+s_mov_b64 exec, -1"""
+WAVE_LOAD_PREFIX = 'bea803ff 3e808081 8f298806 beaa0386 7e0e0280 befe04c1 7da8002a beaa0380'
+WAVE_LOAD_BODY = 'f4200a08 520001e0 7e0e02f2 bf8cc07f'
+
+
+def wave_load_mesh(prefix=WAVE_LOAD_PREFIX, body=WAVE_LOAD_BODY, *, exports='7e280228 7e2a0307'):
+    """Insert the scalar load before the count exchange and export its value as vertex red."""
+    body = body.split()
+    before = MESH.index('be8d0308')
+    wait = MESH.index('bf8c3f70')
+    return (MESH[:before] + prefix.split() + [branch(0xbf88, 0, len(body) + 1)] + body + ['befe04c1']
+            + MESH[before:wait + 1] + exports.split() + MESH[wait + 1:])
+
+
+WAVE_LOAD_MESH = wave_load_mesh()
+WAVE_LOAD_REFUSAL = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
+WAVE_LOAD_REFUSALS = (
+    ('different EXEC compare', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7d28002a'))),
+    ('missing full EXEC reset', wave_load_mesh(WAVE_LOAD_PREFIX.replace('befe04c1', 'bf800000'))),
+    ('different compare index', wave_load_mesh(WAVE_LOAD_PREFIX.replace('7da8002a', '7da80e2a'))),
+    ('EXEC write between compare and branch', wave_load_mesh(WAVE_LOAD_PREFIX.replace('beaa0380', 'befe04c1'))),
+    ('branch into load block', wave_load_mesh('bf840009 ' + WAVE_LOAD_PREFIX)),
+    ('branch to the EXEC-zero instruction', wave_load_mesh('bf840008 ' + WAVE_LOAD_PREFIX)),
+    ('second live scalar write',
+     wave_load_mesh(body=WAVE_LOAD_BODY + ' beab0386', exports='7e280228 7e2a022b')),
+    ('ordinary SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4000a05'))),
+    ('wider SMEM load', wave_load_mesh(body=WAVE_LOAD_BODY.replace('f4200a08', 'f4240a08'))),
+    ('buffer store', wave_load_mesh(body=WAVE_LOAD_BODY + ' f4600a08 520001e0')),
+    ('buffer atomic', wave_load_mesh(body=WAVE_LOAD_BODY + ' e0c81000 80040700')),
+    ('dead scalar result', wave_load_mesh(exports='7e2a0307')),
+)
+
+
+def count_entry_red(*extra_words):
+    wait = MESH.index('bf8c3f70')
+    return MESH[:COUNT] + [
+        '7e0e0280',  # v_mov_b32_e32 v7, 0
+        'befe04c1',  # s_mov_b64 exec, -1
+        '7da8000d',  # v_cmpx_gt_u32_e32 s13, v0 (the proven thread index)
+        branch(0xbf88, COUNT + 3, COUNT + 5 + len(extra_words)),  # s_cbranch_execz to the first count barrier
+        '7e0e02f2',  # v_mov_b32_e32 v7, 1.0
+    ] + list(extra_words) + MESH[COUNT:wait + 1] + [
+        '7e280307',  # v_mov_b32_e32 v20, v7
+    ] + MESH[wait + 1:]
+
+
+COUNT_ENTRY = count_entry_red()
+COUNT_ENTRY_LT = mutate('7da8000d', '7da2000d', mesh=COUNT_ENTRY)
+# v_mov_b32_e32 v8, 4 before the reset, then v_cmpx_lt_u32_e32 v8, v0.
+COUNT_ENTRY_VGPRS = mutate('7da8000d', '7da20108', mesh=COUNT_ENTRY)
+COUNT_ENTRY_VGPRS = COUNT_ENTRY_VGPRS[:COUNT + 1] + ['7e100284'] + COUNT_ENTRY_VGPRS[COUNT + 1:]
+DEAD_SCALAR = '87288080'  # s_and_b32 s40, 0, 0
+COUNT_ENTRY_SCALAR = count_entry_red(DEAD_SCALAR)
+COUNT_ENTRY_CASES = (
+    ('EXEC-zero branch to the count exchange after GT', COUNT_ENTRY, lambda lane: 255 if lane < 4 else 0),
+    ('EXEC-zero branch to the count exchange after LT', COUNT_ENTRY_LT, lambda lane: 255 if lane > 4 else 0),
+    ('EXEC-zero branch to the count exchange after LT with two VGPRs', COUNT_ENTRY_VGPRS,
+     lambda lane: 255 if lane > 4 else 0),
+    ('EXEC compare with a defined VGPR other than the thread index',
+     mutate('7da8000d', '7da80e0d', mesh=COUNT_ENTRY), lambda lane: 255),  # s13 > v7 (4 > 0)
+    ('EXEC-zero branch to the count exchange over dead scalar ALU', COUNT_ENTRY_SCALAR,
+     lambda lane: 255 if lane < 4 else 0),
+)
+EXCHANGE_BRANCH_REFUSAL = 'slot 57 mesh: a branch enters or crosses a group-memory exchange'
 
 
 def joined_vertex_masks():
@@ -177,6 +286,36 @@ REFUSALS = (
     ('a branch into the count exchange',
      MESH[:COUNT] + [branch(0xbf82, COUNT, COUNT + 2)] + MESH[COUNT:],
      'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
+    ('an EXEC compare with an undefined first VGPR operand',
+     mutate('7da20108', '7da20101', mesh=COUNT_ENTRY_VGPRS), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC compare with an unmodelled entry VGPR',
+     mutate('7da8000d', '7da8020d', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('no EXEC reset before the compare',
+     mutate('befe04c1', 'bf800000', 1, mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC-nonzero branch to the count exchange',
+     mutate('bf880001', 'bf890001', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC write in the skipped block',
+     mutate('7e0e02f2', 'befe04c1', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    # Replace v_mov_b32 v20, v7 after the count exchange with v_mov_b32 v20, s40.
+    ('scalar ALU in the count-entry block with a live SGPR',
+     mutate('7e280307', '7e280228', mesh=COUNT_ENTRY_SCALAR), EXCHANGE_BRANCH_REFUSAL),
+    ('scalar ALU writing VCC in the count-entry block',
+     count_entry_red('876a8080'), EXCHANGE_BRANCH_REFUSAL),  # s_and_b32 vcc_lo, 0, 0
+    ('a scalar load in the count-entry block',
+     count_entry_red('f4000a05', 'fa000000'), EXCHANGE_BRANCH_REFUSAL),  # s_load_dword s40, s[10:11], 0
+    ('dead scalar ALU in a different EXEC-zero block',
+     vertex_red('7e0e02f2 bf880001 ' + DEAD_SCALAR),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('a v_cmpx in the skipped block',
+     mutate('7e0e02f2', '7da8000d', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC-zero branch over the count exchange',
+     mutate('bf880001', branch(0xbf88, COUNT + 3, POST_COUNT + 5), mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC-zero branch past the start of the count exchange',
+     mutate('bf880001', 'bf880002', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('a branch that bypasses the EXEC reset',
+     COUNT_ENTRY[:COUNT] + ['bf850002'] + COUNT_ENTRY[COUNT:], EXCHANGE_BRANCH_REFUSAL),
+    ('a branch into the skipped count-entry block',
+     COUNT_ENTRY[:COUNT] + ['bf850004'] + COUNT_ENTRY[COUNT:], EXCHANGE_BRANCH_REFUSAL),
     ('a branch over the group-index exchange', MESH[:1] + [branch(0xbf82, 1, GROUP_END + 1)] + MESH[1:],
      'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
     # s_branch .post_count replaces s_waitcnt lgkmcnt(0) between the exchanges.
@@ -246,6 +385,17 @@ REFUSALS = (
     # s_mov_b32 s40, 1 replaces the then-arm v_mov inside the s_cbranch_execz range.
     ('an EXEC-zero branch that skips a scalar write', mutate('7e0e02f2', 'bea80381', mesh=masked_vertex_red()),
      'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('EXEC-zero skips a scalar memory load', vertex_red(SHIFT_WORDS.replace('8f2881ff 1fc00000', 'f4000a00 fa000000')),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('a shift with a mask from an unproven thread register',
+     vertex_red(SHIFT_WORDS.replace('7d880086', '7e100300 7d881086')),  # v_mov v8,v0; compare against v8
+     'slot 57 mesh: scalar shift needs a proven wave EXEC predicate'),
+    ('a path enters the scalar shift without the compare or saveexec',
+     vertex_red(SHIFT_WORDS.replace('7d880086', 'bf008080 bf850003 7d880086')),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('a shift without an immediate full EXEC restore',
+     vertex_red(SHIFT_WORDS.replace('befe04c1', 'bf800000 befe04c1')),  # branch to s_nop before the restore
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
     # s_cmp_eq_i32 0, 0; s_cbranch_scc1 .end (over the two-dword primitive export).
     ('a uniform branch that skips the primitive export',
      MESH[:PRIMITIVE_EXPORT] + ['bf008080', 'bf850002'] + MESH[PRIMITIVE_EXPORT:],
@@ -277,6 +427,58 @@ REFUSALS = (
 )
 
 
+def depth_only_controls():
+    """A pixel stage that exports only to the null target is published as a depth-only pair."""
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, MESH, DEPTH_PIXEL)
+        expect('the depth-only pair translates', result, 'ok')
+        if result == 'ok':
+            names = sorted(p.name[16:] for p in Path(tmp).iterdir() if not p.name.startswith('req_'))
+            expect('depth-only pair source and manifest', names, ['.ms57.hlsl', '.ms57.txt', '.ps57.hlsl'])
+            manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+            # The pixel stage is bound but names no render target: an empty targets line, never 'ps none'.
+            expect('depth-only manifest stage information',
+                   [line for line in manifest if line.startswith(('params ', 'targets', 'wmask ', 'ps '))],
+                   ['params 1', 'targets '])
+            pixel = (Path(tmp) / ('%016x.ps57.hlsl' % key)).read_text()
+            expect('depth-only pixel stage has no output', ('void main(PSIn i)' in pixel, 'SV_Target' in pixel,
+                                                            'SV_Depth' in pixel), (True, False, False))
+            expect('depth-only pixel stage keeps the vm discard', pixel.count('discard;'), 1)
+            # The existing manifest reader (pending_keys): the pair is complete only with both bytecodes.
+            expect('depth-only manifest is enough in source-only mode', G.pending_keys(tmp, False), [])
+            part = struct.pack('<4sI4s', b'DXIL', 4, b'test')
+            bytecode = struct.pack('<4s16sHHIII', b'DXBC', bytes(16), 1, 0, 36 + len(part), 1, 36) + part
+            os.environ.pop('X2W_FXC')
+            (Path(tmp) / ('%016x.ms57.cso' % key)).write_bytes(bytecode)
+            expect('a depth-only pair without its pixel bytecode is pending (unlike ps none)', G.pending_keys(tmp, False), [key])
+            pixel_bytecode = Path(tmp) / ('%016x.ps57.cso' % key)
+            pixel_bytecode.write_bytes(bytecode)
+            expect('a depth-only pair with both bytecodes is done', G.pending_keys(tmp, False), [])
+            pixel_bytecode.write_bytes(bytecode[:-1])
+            expect('a depth-only pair with truncated pixel bytecode is pending', G.pending_keys(tmp, False), [key])
+            os.environ['X2W_FXC'] = ''
+    for what, pixel, reason in DEPTH_PIXEL_MUTANTS:
+        with tempfile.TemporaryDirectory() as tmp:
+            key, result = request(tmp, MESH, pixel)
+            expect(what, result, 'unsupported: ' + reason)
+            expect(what + ': only the refusal is published',
+                   sorted(p.name for p in Path(tmp).iterdir() if not p.name.startswith('req_')), ['%016x.fail' % key])
+    # A pair whose pixel stage is not the one the key was computed over, in both directions.
+    for what, keyed, stored in (('a colour stage stored under a depth-only key', DEPTH_PIXEL, PIXEL),
+                                ('a depth-only stage stored under a colour key', PIXEL, DEPTH_PIXEL)):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = G.mesh57_key(code(MESH), code(keyed), root())
+            for ext, data in (('.root', root()), ('.ps57', code(stored)), ('.m57', code(MESH))):
+                (Path(tmp) / ('req_%016x%s' % (key, ext))).write_bytes(data)
+            expect(what, G.translate_request(tmp, key), 'unsupported: slot 57 mesh request key mismatch')
+            expect(what + ': only the refusal is published',
+                   sorted(p.name for p in Path(tmp).iterdir() if not p.name.startswith('req_')), ['%016x.fail' % key])
+    # The mesh shapes the paired path refuses stay refused, with the same message, next to a depth-only pixel stage.
+    for what, mesh, reason in REFUSALS:
+        with tempfile.TemporaryDirectory() as tmp:
+            expect(what + ' (depth-only pair)', request(tmp, mesh, DEPTH_PIXEL)[1], 'unsupported: ' + reason)
+
+
 def controls():
     os.environ['X2W_FXC'] = ''   # sources and manifest only; the draw mode compiles
     with tempfile.TemporaryDirectory() as tmp:
@@ -302,7 +504,7 @@ def controls():
         expect('outputs follow the allocation',
                all(body.index(line) > body.index(want[-1]) for line in body if 'verts[tid]' in line or 'tris[tid]' in line), True)
     prefix = MESH[:1] + 'bf008080 bf850001 bf800000 bf800000'.split() + MESH[1:]
-    for what, mesh, _ in BRANCH_CASES + (('SCC branch before the group-index exchange', prefix, None),):
+    for what, mesh, _ in BRANCH_CASES + COUNT_ENTRY_CASES + (('SCC branch before the group-index exchange', prefix, None),):
         with tempfile.TemporaryDirectory() as tmp:
             key, result = request(tmp, mesh)
             expect(what + ' translates', result, 'ok')
@@ -311,6 +513,26 @@ def controls():
                 expect(what + ' uses forward block dispatch', ('if (pc ==' in text, '[loop]' in text), (True, False))
                 expect(what + ' guards the position export', bool(re.search(
                     r'if \(exec & 1\) \{[^\n]*o\.pos = [^\n]*mesh_vertex = true;', text)), True)
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, WAVE_LOAD_MESH)
+        expect('pre-exchange wave load translates', result, 'ok')
+        if result == 'ok':
+            text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
+            expect('the branch uses the wave predicate captured at the compare',
+                   ('wave_any = (tid & ~63u) < ' in text, 'pc = (!wave_any) ?' in text), (True, True))
+            expect('the scalar buffer read is inside a branched fall-through',
+                   bool(re.search(r'\[branch\] if \(pc == \d+\) \{[^}]*s40 = [^\n]*\.Load\(', text)), True)
+        for what, mesh in WAVE_LOAD_REFUSALS:
+            expect(what, request(tmp, mesh)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+        # The accepted mesh opcodes cannot produce a lane-varying numeric SGPR here.
+        # Inject that analysis fact at the Stage boundary to exercise the uniformity refusal.
+        from unittest.mock import patch
+
+        uniform_source = G.Stage.uniform_source
+        with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's42' and uniform_source(stage, token)):
+            expect('non-uniform wave load bound', request(tmp, WAVE_LOAD_MESH)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
+        with patch.object(G.Stage, 'uniform_source', lambda stage, token: token != 's41' and uniform_source(stage, token)):
+            expect('unproven wave load address', request(tmp, WAVE_LOAD_MESH)[1], 'unsupported: ' + WAVE_LOAD_REFUSAL)
     with tempfile.TemporaryDirectory() as tmp:
         key, result = request(tmp, FORMATTED_MESH)
         expect('formatted mesh translates', result, 'ok')
@@ -360,8 +582,8 @@ def controls():
             os.environ['X2W_FXC'] = ''
     # exp null off, off, off, off done vm; s_endpgm: a pixel stage without a colour output.
     with tempfile.TemporaryDirectory() as tmp:
-        expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1],
-               'unsupported: slot 57 mesh with a depth-only pixel stage is not covered')
+        expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1], 'ok')
+    depth_only_controls()
     # The request path refuses a missing s_endpgm earlier; the walk takes the last instruction as the terminator
     # unread, so the pipeline refuses it too (s_nop in its place).
     try:
@@ -386,6 +608,12 @@ def binary(mc):
     expect('rewritten descriptor words match llvm-mc',
            assemble(mc, mesh.replace(COLOUR_LOAD, COLOUR_LOAD + '\ns_mov_b32 s19, 0\n' + FORMAT_LOAD)), REWRITTEN_FORMAT)
     expect('pixel words match llvm-mc', assemble(mc, PIXEL_ASM), PIXEL)
+    shift = mesh.replace('v_cmpx_gt_i32 s14, v0', SHIFT_ASM + '\nv_cmpx_gt_i32 s14, v0')
+    shift = shift.replace('exp pos0', 'v_mov_b32 v20, v7\nexp pos0')
+    expect('scalar shift mesh words match llvm-mc', assemble(mc, shift), SHIFT_MESH)
+    wave_load = mesh.replace('s_mov_b32 s13, s8', WAVE_LOAD_ASM + '\ns_mov_b32 s13, s8')
+    wave_load = wave_load.replace('exp pos0', 'v_mov_b32 v20, s40\nv_mov_b32 v21, v7\nexp pos0')
+    expect('pre-exchange wave load words match llvm-mc', assemble(mc, wave_load), WAVE_LOAD_MESH)
 
 
 # ---- draw: four triangles in a 32x32 target, vertices stored out of order ----------------------
@@ -445,6 +673,63 @@ def rasterise(points, colours, indices, verts, prims):
                 if inside:
                     image[y * SIDE + x] = colour
     return image
+
+
+def draw_wave_load(directory, renderer, adapter):
+    key, result = request(directory, WAVE_LOAD_MESH)
+    expect('pre-exchange wave load compiles', result, 'ok')
+    if result != 'ok':
+        return 0
+    base = Path(directory) / ('%016x' % key)
+    points, colours, indices = geometry()
+    # Provoking threads 39 and 5 share the mixed wave; threads 67 and 70 are
+    # in the empty wave. Every vertex keeps its original low-four-bit slot.
+    triangles = [tuple(slot + wave for slot in tri) for tri, wave in zip(indices, (32, 0, 64, 64))]
+    words = [a | b << 10 | c << 20 for a, b, c in triangles]
+    data = bytearray(buffer(points, colours, words))
+    struct.pack_into('<f', data, 480, 1.0)
+    constants = bytearray(1024)
+    uds = G.MeshPipeline(code(WAVE_LOAD_MESH), code(PIXEL), root()).uds
+    for slot, count in enumerate((len(triangles), 128)):
+        struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, slot)), count)
+
+    bound, old = 6, 64
+    wave_red = {}
+    reads = []
+    for first in range(0, 128, 64):
+        wave_red[first] = old
+        if first < bound:
+            address = 480 + 4 * first
+            reads.append(address)
+            wave_red[first] = round(struct.unpack_from('<f', data, address)[0] * 255)
+    expect('only the mixed wave reads; the empty wave address is past the SRV',
+           (reads, len(data) + 80 < 480 + 4 * 64, wave_red), ([480], True, {0: 255, 64: 64}))
+
+    def reference(swap):
+        rendered = list(colours)
+        for tri in triangles:
+            for tid in tri:
+                first, slot = tid & ~63, tid & 15
+                red = wave_red[first ^ (64 if swap else 0)]
+                rendered[slot] = (red, 255 if tid < bound else 0, *colours[slot][2:])
+        return rasterise(points, rendered, triangles, 128, len(triangles))
+
+    correct, swapped = reference(False), reference(True)
+    different = sum(a != b for a, b in zip(correct, swapped))
+    expect('swapping old and loaded red changes every covered pixel', different,
+           sum(pixel != (0, 0, 0, 255) for pixel in correct))
+    expect('the wave load covers pixels', different > 0, True)
+    path = Path(directory) / 'wave-load.bin'
+    for label, image, status, mismatches in (
+            ('wave load', correct, 0, 0), ('swapped wave load selection', swapped, 1, different)):
+        path.write_bytes(bytes(constants) + bytes(data) + b'\xcd' * 80 + b''.join(map(bytes, image)))
+        run = subprocess.run([renderer, adapter, '--mesh-indexed', base.with_suffix('.ms57.cso'),
+                              base.with_suffix('.ps57.cso'), path], capture_output=True, text=True)
+        if run.returncode == 77:
+            print(run.stdout + run.stderr)
+            return 77
+        expect(label, (run.returncode, f'pixels=1024 mismatches={mismatches}' in run.stdout), (status, True))
+    return 0
 
 
 def publish_request(directory, publisher, adapter):
@@ -540,7 +825,7 @@ def draw(dxc, renderer, adapter, publisher=None):
                 expect('a reference with one wrong pixel fails',
                        (r.returncode, 'pixels=1024 mismatches=1' in r.stdout, 'Draw reference mismatch' in r.stderr),
                        (1, True, True))
-        for what, mesh, red in BRANCH_CASES:
+        for what, mesh, red in BRANCH_CASES + COUNT_ENTRY_CASES:
             key, result = request(tmp, mesh)
             expect(what + ' translates and compiles', result, 'ok')
             if result != 'ok':
@@ -559,6 +844,96 @@ def draw(dxc, renderer, adapter, publisher=None):
                 print(r.stdout + r.stderr)
                 return 77
             expect('draw of ' + what, (r.returncode, 'pixels=1024 mismatches=0' in r.stdout), (0, True))
+        if publisher is None:
+            return draw_wave_load(tmp, renderer, adapter)
+    return 0
+
+
+# ---- depth: the depth-only pair drawn twice into a D32 target cleared to 1.0, depth test LESS ------------------
+# Per triangle and draw: (depth, kept). A kept triangle has attribute 0 red 1.0 at its three vertices, a killed one
+# 0.25, so the depth-only pixel stage keeps or discards all of its pixels. The four triangles cover: the second draw
+# behind the first, the second in front, a first draw killed, both killed.
+DEPTH_DRAWS = (((0.25, True), (0.75, True), (0.125, False), (0.5, False)),
+               ((0.75, True), (0.375, True), (0.625, True), (0.875, False)))
+
+
+def depth_scene(points, indices, draws, honour_kill=True):
+    """The upload of each draw and the expected colour and depth images (cleared to black and 1.0)."""
+    uploads, depth = [], [1.0] * (SIDE * SIDE)
+    words = [a | b << 10 | c << 20 for a, b, c in indices]
+    for draw in draws:
+        data = bytearray(buffer(points, [(0, 0, 0, 0)] * 12, words))
+        for t, (z, kept) in enumerate(draw):
+            for slot in indices[t]:
+                struct.pack_into('<f', data, 16 * slot + 8, z)
+                struct.pack_into('<f', data, 192 + 16 * slot, 1.0 if kept else 0.25)
+            if not (kept or not honour_kill):
+                continue
+            covered = rasterise(points, [(1, 1, 1, 1)] * 12, [indices[t]], 12, 1)
+            for i, pixel in enumerate(covered):
+                if pixel == (1, 1, 1, 1) and z < depth[i]:
+                    depth[i] = z
+        uploads.append(bytes(data))
+    colour = b''.join(bytes((0, 0, 0, 255)) for _ in range(SIDE * SIDE))
+    return uploads, colour, b''.join(struct.pack('<f', z) for z in depth)
+
+
+def draw_depth(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, _, indices = geometry()
+    uploads, colour, depth = depth_scene(points, indices, DEPTH_DRAWS)
+    _, _, unkilled = depth_scene(points, indices, DEPTH_DRAWS, honour_kill=False)
+    cleared = struct.pack('<f', 1.0) * (SIDE * SIDE)
+    pixels = lambda a, b: sum(a[i:i + 4] != b[i:i + 4] for i in range(0, len(a), 4))
+    written, killed = pixels(depth, cleared), pixels(depth, unkilled)
+    assert written > 100 and killed > 50, (written, killed)
+    # Depth is cleared to the sentinel 1.0 and every drawn depth is below it, so a discarded pixel keeps the sentinel.
+    covered = pixels(unkilled, cleared)
+    print('covered %d pixels: %d keep a written depth, %d keep the sentinel only because of the discard, '
+          '%d differ from a draw without the discard' % (covered, written, covered - written, killed))
+    with tempfile.TemporaryDirectory() as tmp:
+        key, result = request(tmp, MESH, DEPTH_PIXEL)
+        expect('the depth-only pair translates and compiles', result, 'ok')
+        # The same mesh with a null export and no discard: what a pass without the pixel stage would draw.
+        bare, bare_result = request(tmp, MESH, 'f8001890 00000000 bf810000'.split())
+        expect('the pixel stage without discard translates and compiles', bare_result, 'ok')
+        if result != 'ok' or bare_result != 'ok':
+            return 0
+        names = sorted(p.name[16:] for p in Path(tmp).iterdir() if p.name.startswith('%016x' % key))
+        expect('depth-only compiled files', names, ['.ms57.cso', '.ms57.hlsl', '.ms57.txt', '.ps57.cso', '.ps57.hlsl'])
+        manifest = (Path(tmp) / ('%016x.ms57.txt' % key)).read_text().splitlines()
+        uds = {tuple(fields[2:]): int(fields[1]) for fields in map(str.split, manifest) if fields and fields[0] == 'udsrc'}
+        constants = bytearray(1024)
+        struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '0'], len(indices))
+        struct.pack_into('<I', constants, 4 * uds['rootconst', '0', '1'], len(points))
+        head = b''.join(bytes(constants) + upload for upload in uploads) + b'\xcd' * 160
+        path = Path(tmp) / 'depth.bin'
+        stems = {'depth-only pair': key, 'pixel stage without discard': bare}
+        # (label, pair, reference depth, depth mismatches). The colour target must stay cleared in every case.
+        cases = (('baseline', 'depth-only pair', depth, 0),
+                 ('a reference without the depth writes', 'depth-only pair', cleared, written),
+                 ('the discard dropped', 'pixel stage without discard', depth, killed))
+        for label, pair, ref_depth, depth_errors in cases:
+            name = str(Path(tmp) / ('%016x' % stems[pair]))
+            path.write_bytes(head + colour + ref_depth)
+            run = subprocess.run([renderer, adapter, '--mesh-depth-pair', name + '.ms57.cso', name + '.ps57.cso', str(path)],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            lines = set(run.stdout.splitlines())
+            message = 'Depth reference mismatch' if depth_errors else None
+            want = {'mesh_exports bytes=160 matched=1', 'pixels=1024 mismatches=0',
+                    'depth_pixels=1024 depth_mismatches=%d' % depth_errors}
+            clean = ('backend=%s debug_layer=unavailable' % adapter in lines or 'debug_errors=0 debug_warnings=0' in lines)
+            ok = (run.returncode == int(message is not None) and want <= lines and clean
+                  and (message is None or message in run.stderr))
+            print('%s (%s): depth mismatches want %d, exit=%d -> %s' % (label, pair, depth_errors, run.returncode,
+                                                                       'as expected' if ok else 'UNEXPECTED'))
+            if not ok or label == 'baseline':
+                print(run.stdout + run.stderr)
+            expect('depth draw: ' + label, ok, True)
     return 0
 
 
@@ -605,14 +980,72 @@ def draw_formatted(dxc, renderer, adapter):
     return 0
 
 
+def draw_shift(dxc, renderer, adapter):
+    os.environ['X2W_DXC'] = dxc
+    os.environ.pop('X2W_FXC', None)
+    points, colours, indices = geometry()
+    # The first provoking vertex (thread 39) shares a guest wave with active thread 5 across the
+    # host's possible 32-lane boundary. The last two triangles are in the all-empty guest wave.
+    triangles = [tuple(slot + offset for slot in tri) for tri, offset in zip(indices, (32, 0, 64, 64))]
+    words = [a | b << 10 | c << 20 for a, b, c in triangles]
+    with tempfile.TemporaryDirectory() as tmp:
+        key, status = request(tmp, SHIFT_MESH)
+        if status != 'ok':
+            raise AssertionError(status)
+        base = Path(tmp) / ('%016x' % key)
+        pipe = G.MeshPipeline(code(SHIFT_MESH), code(PIXEL), root())
+        constants = bytearray(1024)
+        for slot, count in enumerate((len(triangles), 128)):
+            struct.pack_into('<I', constants, 4 * pipe.uds.index(('rootconst', 0, slot)), count)
+        head = bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
+
+        def reference(per_lane):
+            red = list(colours)
+            for tri in triangles:
+                for tid in tri:
+                    active = tid < 6 if per_lane else tid // 64 == 0
+                    slot = tid % 16
+                    red[slot] = (255 if active else 64, *colours[slot][1:])
+            return rasterise(points, red, triangles, 128, len(triangles))
+
+        correct, per_lane = reference(False), reference(True)
+        different = sum(a != b for a, b in zip(correct, per_lane))
+        assert different > 0
+        source = base.with_suffix('.ms57.hlsl').read_text()
+        predicate = '(tid & ~63u) >= 6u'
+        assert source.count(predicate) == 1
+        mutated = Path(tmp) / 'per-lane.hlsl'
+        mutated.write_text(source.replace(predicate, '(exec & 1) == 0'))
+        mutant = Path(tmp) / 'per-lane.cso'
+        subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True)
+        case = Path(tmp) / 'shift.bin'
+        for shader, image, mismatch in ((base.with_suffix('.ms57.cso'), correct, 0),
+                                        (mutant, correct, different), (mutant, per_lane, 0)):
+            case.write_bytes(head + b''.join(map(bytes, image)))
+            run = subprocess.run([renderer, adapter, '--mesh-indexed', shader, base.with_suffix('.ps57.cso'), case],
+                                 capture_output=True, text=True)
+            if run.returncode == 77:
+                print(run.stdout + run.stderr)
+                return 77
+            if (run.returncode != int(bool(mismatch))
+                    or not re.search(rf'\bpixels={SIDE * SIDE} mismatches={mismatch}\b', run.stdout)):
+                raise AssertionError(run.stdout + run.stderr)
+            print(f'{shader.name}: {mismatch} pixels differ from the reference')
+    return 0
+
+
 def main(argv):
     status = 0
     if argv[1:2] == ['binary'] and len(argv) == 3:
         binary(argv[2])
     elif argv[1:2] == ['draw'] and len(argv) == 5:
         status = draw(*argv[2:])
+    elif argv[1:2] == ['depth'] and len(argv) == 5:
+        status = draw_depth(*argv[2:])
     elif argv[1:2] == ['formatted'] and len(argv) == 5:
         status = draw_formatted(*argv[2:])
+    elif argv[1:2] == ['shift'] and len(argv) == 5:
+        status = draw_shift(*argv[2:])
     elif argv[1:2] == ['exchange'] and len(argv) == 6:
         status = draw(*argv[2:])
     elif len(argv) == 1:
