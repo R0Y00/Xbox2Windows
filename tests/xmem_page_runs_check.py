@@ -153,9 +153,11 @@ def query_before_and_after_split(shim, base):
         assert view(i, 4, 7), f"upper piece, page {i}: {shim.query(base + i * PAGE)}"
     hole = shim.query(base + 3 * PAGE)
     assert hole[1] == base + 3 * PAGE and hole[2] == PAGE and hole[3] == MEM_RESERVE, hole
-    # Mapping the page again does not join the pieces: three views.
+    # Mapping the page again on its own call joins the lower piece, which ends at it on the slot before
+    # (merge_with_previous): two views. It never joins the upper piece. One view per call without the merge is
+    # asserted by xmem_cross_call_merge_control (tests/xmem_cross_call_merge_check.cpp).
     assert shim.contiguous(base + 3 * PAGE, 1, C.byref(shim.number(tokens[3]))) == base + 3 * PAGE
-    assert view(3, 3, 3) and view(2, 0, 2) and view(4, 4, 7)
+    assert view(3, 0, 3) and view(2, 0, 3) and view(4, 4, 7), (shim.query(base + 3 * PAGE), shim.query(base + 4 * PAGE))
     assert shim.contiguous(base, 8, None) == base and shim.release(8, tokens)
 
 

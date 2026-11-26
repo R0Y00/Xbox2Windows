@@ -262,6 +262,10 @@ const Backing* lease_backing(UINT version, ULONG_PTR page)
     return backing && backing->committed ? backing : nullptr;
 }
 
+// Set while this thread holds memory.mutex to change mappings or to copy into mapped pages (MappingThread). The
+// fault handlers pass such a thread's faults on: waiting for memory.mutex there would never return.
+thread_local bool mapping_thread = false;
+
 LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
@@ -296,6 +300,7 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
     // A thread that raced another one to the same slot finds it committed: retry once, then pass the fault on.
     thread_local ULONG_PTR retried = 0;
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
+    if (mapping_thread) return EXCEPTION_CONTINUE_SEARCH;
     const std::lock_guard guard(memory.mutex);
     Backing* backing = backing_at(address);
     if (!backing) return EXCEPTION_CONTINUE_SEARCH;
@@ -365,18 +370,50 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
+// MapViewOfFile3 and placeholder-split attempts made by map_split (x2w_xmem_map_counts).
+volatile LONG64 map_attempts, split_attempts;
+
+// True when [target, target + bytes) is a whole reserved region of its own: a placeholder that
+// MEM_REPLACE_PLACEHOLDER can take as it is, so no split is needed first.
+bool exact_placeholder(void* target, SIZE_T bytes)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(target, &info, sizeof(info)) == sizeof(info) && info.State == MEM_RESERVE &&
+           info.AllocationBase == target && info.BaseAddress == target && info.RegionSize == bytes;
+}
+
 // Only split a reservation owned by the shim. Caller-owned placeholders must already match the view.
+// Inside an owned reservation the split comes first when the target is not already an exact placeholder:
+// a map into the middle of a larger placeholder always fails, and under Wine every failed map is another
+// server round trip whose cost grows with the number of views (one 64 KiB page per call at startup).
+// The query and the split are not atomic, so if the split or the map after it fails, the map-first
+// path below runs as before. X2W_XMEM_TEST_MAP_FIRST=1 skips the split-first step (tests only).
 // Once a split succeeds, report the retry's result even if it fails for a different reason.
 template <class Map>
 bool map_split(void* target, SIZE_T bytes, Map map)
 {
-    if (map()) return true;
-    const DWORD error = GetLastError();
+    static const bool map_first = x2w_local::env_on("X2W_XMEM_TEST_MAP_FIRST");
     const auto address = reinterpret_cast<ULONG_PTR>(target);
     const auto reservation = owned_reservation(address);
-    if (reservation != memory.reservations.end() && bytes <= reservation->second - (address - reservation->first) &&
-        VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-        return map();
+    const bool owned = reservation != memory.reservations.end() &&
+                       bytes <= reservation->second - (address - reservation->first);
+    if (owned && !map_first && !exact_placeholder(target, bytes)) {
+        InterlockedIncrement64(&split_attempts);
+        if (VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            InterlockedIncrement64(&map_attempts);
+            if (map()) return true;
+        }
+    }
+    InterlockedIncrement64(&map_attempts);
+    if (map()) return true;
+    const DWORD error = GetLastError();
+    if (owned) {
+        InterlockedIncrement64(&split_attempts);
+        if (VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            InterlockedIncrement64(&map_attempts);
+            return map();
+        }
+    }
     SetLastError(error);
     return false;
 }
@@ -444,22 +481,51 @@ void coalesce_unused(const Pages& batch)
     }
 }
 
-// Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages).
-// A thread that touches one of those pages in between faults. The break records the address
-// ranges of the runs it takes apart and a generation that is odd while it is in progress.
+// Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages), and so does a
+// cross-call merge (merge_with_previous) for the run it joins. A thread that touches one of those pages in between
+// faults. Each break records the address ranges of the runs it takes apart, and a generation that is odd while it
+// is in progress; the break's id is that odd value. The last `kept` breaks stay recorded, so that a fault handler
+// that runs late, after later breaks on other runs have begun (a merge of the CPU view and then of its GPU mirror
+// in one call, or the next call's merge), still finds the break its fault came from.
 struct RemapWindow {
+    static constexpr std::size_t kept = 64;
+    struct Break {
+        ULONG64 id = 0;  // 0: no break recorded in this slot yet
+        std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges;
+    };
     SRWLOCK lock = SRWLOCK_INIT;
-    std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges;  // the runs of the break in progress, or of the last one
+    Break recent[kept];  // break id i in recent[(i / 2) % kept]
     ULONG64 generation = 0;
+
+    // The newest recorded break whose ranges hold address, or 0. Caller holds lock (shared).
+    ULONG64 newest_holding(ULONG_PTR address) const
+    {
+        ULONG64 found = 0;
+        for (const Break& b : recent) {
+            if (b.id <= found) continue;
+            for (const auto& [base, size] : b.ranges)
+                if (address - base < size) {
+                    found = b.id;
+                    break;
+                }
+        }
+        return found;
+    }
 };
 RemapWindow remap_window;
+// Set once shared views are on (FaultRetry::ready). Breaks also begin without them (every unmap counts in the
+// generation), but then a page has a view of its own and no break takes a neighbour away, so x2w_xmem_stable_call
+// does not wait for them.
+std::atomic<bool> shared_views_on{false};
 
 void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
 {
     std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges(broken.begin(), broken.end());
     AcquireSRWLockExclusive(&remap_window.lock);
-    remap_window.ranges.swap(ranges);
-    ++remap_window.generation;
+    const ULONG64 id = ++remap_window.generation;
+    auto& slot = remap_window.recent[(id / 2) % RemapWindow::kept];
+    slot.id = id;
+    slot.ranges.swap(ranges);  // the old slot's ranges are freed after the lock
     ReleaseSRWLockExclusive(&remap_window.lock);
 }
 void end_break()
@@ -471,12 +537,35 @@ void end_break()
 
 struct EndBreak { ~EndBreak() { end_break(); } };
 
-// Retries an access violation only when all of this holds: the address is inside a run that the
-// break in progress, or the last finished one, took apart; after that break has finished (the
-// mutex) the page is recorded and covered by a view; and this thread has not already retried this
-// page for this break. Everything else is passed on, so a fault that is not the transient one is
-// reported after at most one retry.
-thread_local bool mapping_thread = false;
+// Test build only: X2W_XMEM_TEST_HOLD_RETRY=<name> holds the fault handler before it reads the break: it sets
+// "<name>.faulted", then waits up to five seconds for "<name>.go", so that a test can end the break first.
+#ifdef X2W_XMEM_TEST_CONTROLS
+void hold_retry()
+{
+    char name[96];
+    const DWORD length = GetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", name, sizeof(name) - 16);
+    if (!length || length >= sizeof(name) - 16) return;
+    char event_name[128];
+    std::snprintf(event_name, sizeof(event_name), "%s.faulted", name);
+    HANDLE faulted = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.go", name);
+    HANDLE go = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    if (faulted && go) {
+        SetEvent(faulted);
+        WaitForSingleObject(go, 5000);
+    }
+    if (faulted) CloseHandle(faulted);
+    if (go) CloseHandle(go);
+}
+#else
+void hold_retry() {}
+#endif
+
+// Retries an access violation only when all of this holds: the address is inside a run that one of the recorded
+// breaks (the one in progress or the last RemapWindow::kept) took apart; after that break has finished (the mutex)
+// the page is recorded and covered by a view; and this thread has not already retried this page for the newest
+// such break. Everything else is passed on, so a fault that is not the transient one is reported after at most one
+// retry per break.
 LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
@@ -484,14 +573,13 @@ LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
         return EXCEPTION_CONTINUE_SEARCH;
     const ULONG_PTR address = record->ExceptionInformation[1];
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
-    bool inside = false;
+    hold_retry();
     AcquireSRWLockShared(&remap_window.lock);
-    const ULONG64 seen = remap_window.generation;
-    for (const auto& [base, size] : remap_window.ranges)
-        inside |= address - base < size;
+    // The newest break that took the page apart, in progress or finished; a later break on another run does not
+    // hide it. A fault in a later break of the same page names that break, so it is retried again.
+    const ULONG64 break_id = remap_window.newest_holding(address);
     ReleaseSRWLockShared(&remap_window.lock);
-    if (!inside || seen == 0) return EXCEPTION_CONTINUE_SEARCH;
-    const ULONG64 break_id = seen | 1;  // the break in progress, or the one that just finished
+    if (!break_id) return EXCEPTION_CONTINUE_SEARCH;
     thread_local ULONG_PTR retried_page = 0;
     thread_local ULONG64 retried_break = 0;
     if (retried_page == page && retried_break == break_id) return EXCEPTION_CONTINUE_SEARCH;
@@ -513,7 +601,9 @@ struct MappingThread {
 
 // Shared views are opt-in: X2W_XMEM_SHARED_VIEWS=1, read once by the first mapping call. Without
 // it every page has a view of its own, as before: unmapping a page never takes a neighbour away,
-// no handler is registered, and the module unloads like any DLL.
+// no handler is registered, and the module unloads like any DLL. The switch is also read once when
+// xmem.dll loads (virtual_query_ex_wrapped): with it set then, the main module's VirtualQueryEx imports
+// are wrapped, and the module is pinned at load when one is.
 //
 // With it, the first mapping call registers the handler and pins the module. The handler is
 // process-wide and Windows offers no way to remove one that also waits for every dispatch already
@@ -551,6 +641,7 @@ struct FaultRetry {
                 x2w_local::logf("x2w-xmem shared views are off: the fault handler could not be set up (error %lu)", GetLastError());
         }
         const bool result = guaranteed;
+        if (result) shared_views_on.store(true, std::memory_order_release);
         ReleaseSRWLockExclusive(&lock);
         return result;
     }
@@ -560,13 +651,15 @@ FaultRetry fault_retry;
 // Test build only (X2W_XMEM_TEST_CONTROLS; tests/xmem_page_runs_check.py): X2W_XMEM_TEST_FAULT=<stage>:<skip> makes one step of
 // the next unmap fail as if Windows had refused it, after skipping <skip> such steps. Stage 1 is
 // unmapping a run, stage 2 mapping surviving pages again, stage 3 both the unmap and the restore.
+// Stages 4 and 5 are steps of a cross-call merge (merge_with_previous): 4 the map of the joined view,
+// 5 joining the two placeholders.
 #ifdef X2W_XMEM_TEST_CONTROLS
 struct TestFault {
     unsigned stage = 0, skip = 0;
     TestFault()
     {
         char text[32];
-        if (GetEnvironmentVariableA("X2W_XMEM_TEST_FAULT", text, sizeof(text)) && text[0] >= '1' && text[0] <= '3' && text[1] == ':') {
+        if (GetEnvironmentVariableA("X2W_XMEM_TEST_FAULT", text, sizeof(text)) && text[0] >= '1' && text[0] <= '5' && text[1] == ':') {
             stage = static_cast<unsigned>(text[0] - '0');
             skip = static_cast<unsigned>(std::strtoul(text + 2, nullptr, 10));
         }
@@ -590,8 +683,8 @@ struct TestFault {
 };
 #endif
 
-// Test build only: X2W_XMEM_TEST_HOLD_WINDOW=<name> keeps an unmap in the window where the run is
-// unmapped and not yet mapped again. It sets the event "<name>.unmapped", then waits up to
+// Test build only: X2W_XMEM_TEST_HOLD_WINDOW=<name> keeps an unmap, or a cross-call merge (merge_with_previous), in the
+// window where the run is unmapped and not yet mapped again. It sets the event "<name>.unmapped", then waits up to
 // five seconds for "<name>.release", so that a reader thread can reach the window every time.
 #ifdef X2W_XMEM_TEST_CONTROLS
 void hold_window()
@@ -692,6 +785,82 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
     return lost;
 }
 
+// Shared views only. Startup maps nearly every page with a call of its own, and under Wine each map
+// costs more the more views the process has. A run mapped by a call of its own therefore joins the
+// recorded run R that ends at its address, when its first page is the next slot of the section behind
+// R's last page and R and the new pages lie in one reservation of the shim: the new pages' range is
+// split to a placeholder of its own, R is unmapped, the two placeholders are joined and one view is
+// mapped over both. R is taken apart as in an unmap (begin_break), so a thread that touches R in
+// between is retried and x2w_xmem_stable_call readers wait. On a refused step before R is unmapped
+// nothing changed; after it, R is mapped again as it was (map_recorded). Both return separate, and
+// the caller maps the new pages on their own. lost: R could not be mapped again; the pages that have
+// no view are forgotten, as in an unmap. X2W_XMEM_TEST_NO_MERGE=1 turns the merge off (tests only).
+// A joined run stops at max_merged_run_pages: a page that would make R longer starts a run of its own, which the
+// next pages join. The cap bounds the runs that joining builds: the work of each join, and of a later break of such a
+// run (an unmap inside a run takes the whole run apart and maps its other pages again). A run mapped by one call
+// (map_run in map_pages_locked) is not capped, and neither are the survivors map_recorded maps again after an unmap
+// inside such a run; both are as long as they were before the cap.
+enum class Merge { joined, separate, lost };
+
+constexpr SIZE_T max_merged_run_pages = 64;
+
+// Test build only: X2W_XMEM_TEST_MERGE_CAP=<pages> replaces the cap (xmem_cross_call_merge_check's timing mode).
+SIZE_T merged_run_cap()
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    char text[24];
+    if (GetEnvironmentVariableA("X2W_XMEM_TEST_MERGE_CAP", text, sizeof(text)))
+        if (const auto pages = std::strtoull(text, nullptr, 10)) return static_cast<SIZE_T>(pages);
+#endif
+    return max_merged_run_pages;
+}
+
+Merge merge_with_previous(ULONG_PTR address, const Backing& head, SIZE_T bytes, MapFailure* failure)
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    if (x2w_local::env_on("X2W_XMEM_TEST_NO_MERGE")) return Merge::separate;
+#endif
+    const auto next = memory.runs.lower_bound(address);
+    if (next == memory.runs.begin()) return Merge::separate;
+    const auto [base, size] = *std::prev(next);
+    if (base + size != address) return Merge::separate;
+    if ((size + bytes) / page_bytes > merged_run_cap()) return Merge::separate;
+    const auto tail = memory.views.find(address - page_bytes);
+    if (tail == memory.views.end()) return Merge::separate;
+    const Backing& previous = memory.backings.at(tail->second);
+    if (previous.section != head.section || previous.offset + page_bytes != head.offset) return Merge::separate;
+    const auto reservation = owned_reservation(base);
+    if (reservation == memory.reservations.end() || address + bytes > reservation->first + reservation->second)
+        return Merge::separate;
+    const Backing start = memory.backings.at(memory.views.at(base));
+    auto* const target = reinterpret_cast<void*>(address);
+    if (!exact_placeholder(target, bytes)) {
+        InterlockedIncrement64(&split_attempts);
+        if (!VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return Merge::separate;
+    }
+    TestFault test;
+    begin_break({{base, size}});
+    const EndBreak end;
+    if (!unmap_view(base)) return Merge::separate;
+    memory.runs.erase(base);
+    hold_window();
+    auto* const whole = reinterpret_cast<void*>(base);
+    if (!test.hit(5) && VirtualFree(whole, size + bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
+        InterlockedIncrement64(&map_attempts);
+        if (!test.hit(4) && MapViewOfFile3(start.section, GetCurrentProcess(), whole, start.offset, size + bytes,
+                                           MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
+            memory.runs[base] = size + bytes;
+            return Merge::joined;
+        }
+    }
+    // map_recorded splits the joined placeholder back to R's size (map_split: the reservation is the shim's).
+    const ULONG_PTR lost = map_recorded(base, size, false, failure);
+    if (!lost) return Merge::separate;
+    x2w_local::logf("x2w-xmem merge of a run with the next mapping call failed: %llu page(s) of the run could not be "
+                    "mapped again and were forgotten", static_cast<unsigned long long>(lost));
+    return Merge::lost;
+}
+
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
 template <typename AddressAt>
@@ -736,8 +905,18 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                     const Backing& b = memory.backings.at(last->second);
                     if (last->first != first->first + bytes || b.section != head.section || b.offset != head.offset + bytes) break;
                 }
+                // Only a run that is the whole batch joins an earlier one: a later run of the batch that
+                // fails unmaps everything in made, which a joined run is not.
+                const Merge merge = share_views && first == batch.begin() && last == batch.end()
+                                        ? merge_with_previous(first->first, head, bytes, failure)
+                                        : Merge::separate;
+                if (merge == Merge::lost) {
+                    coalesce_unused(batch);
+                    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                    return FALSE;
+                }
                 ULONG_PTR failed_address;
-                if (!map_run(first->first, head, bytes, made, failed_address)) {
+                if (merge == Merge::separate && !map_run(first->first, head, bytes, made, failed_address)) {
                     const DWORD error = GetLastError();
                     if (failure) failure->record("map-view", failed_address, batch.at(failed_address), error);
                     for (const auto& [base, size] : made) {
@@ -1131,19 +1310,61 @@ struct AliasEdit {
 using AliasPlan = std::map<ULONG_PTR, AliasEdit>;
 using ViewRuns = std::map<ULONG_PTR, SIZE_T>;
 
+// The region query exposes the placeholder reservation flag in Flags even though the SDK does not name that bit.
+constexpr ULONG placeholder_reservation = 0x100;
+
+// Measured once: whether the region query reports placeholder_reservation for a fresh placeholder, and, when it does
+// not, whether VirtualFree(MEM_PRESERVE_PLACEHOLDER) refuses a plain reservation and leaves it whole. Windows reports
+// the bit. Wine (Proton Experimental, 2026-11) leaves Flags 0 for placeholders but refuses the plain case with
+// ERROR_INVALID_ADDRESS. X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1 skips the second probe (tests only).
+bool placeholder_fallback()
+{
+    static const bool fallback = [] {
+        bool bit_reported = false, refuses_plain = false;
+        if (void* probe = VirtualAlloc2(GetCurrentProcess(), nullptr, 2 * page_bytes,
+                                        MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) {
+            WIN32_MEMORY_REGION_INFORMATION info{};
+            bit_reported = QueryVirtualMemoryInformation(GetCurrentProcess(), probe, MemoryRegionInfo, &info,
+                                                         sizeof(info), nullptr) &&
+                           (info.Flags & placeholder_reservation);
+            VirtualFree(probe, 0, MEM_RELEASE);
+        }
+        if (!bit_reported && !x2w_local::env_on("X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK")) {
+            if (auto* plain = static_cast<BYTE*>(VirtualAlloc(nullptr, 2 * page_bytes, MEM_RESERVE, PAGE_NOACCESS))) {
+                MEMORY_BASIC_INFORMATION after{};
+                refuses_plain = !VirtualFree(plain + page_bytes, page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+                                VirtualQuery(plain, &after, sizeof(after)) == sizeof(after) &&
+                                after.State == MEM_RESERVE && after.AllocationBase == plain &&
+                                after.RegionSize == 2 * page_bytes;
+                VirtualFree(plain, 0, MEM_RELEASE);
+            }
+        }
+        x2w_local::logf("x2w-xmem placeholder bit reported=%d, plain reservation kept by a placeholder release=%d",
+                        bit_reported, refuses_plain);
+        return !bit_reported && refuses_plain;
+    }();
+    return fallback;
+}
+
 bool alias_placeholders(ULONG_PTR address, SIZE_T bytes)
 {
-    // The region query exposes the placeholder reservation flag in Flags even though the
-    // SDK does not name that bit. VirtualQuery alone cannot distinguish a reserved private
-    // allocation from a placeholder. PRESERVE_PLACEHOLDER can silently release that allocation.
-    constexpr ULONG placeholder_reservation = 0x100;
+    // VirtualQuery alone cannot distinguish a reserved private allocation from a placeholder, and on Windows
+    // PRESERVE_PLACEHOLDER can silently release that allocation. Where the region query does not report the bit
+    // and the OS refuses that release (placeholder_fallback), any reserved region may be offered: a plain one
+    // fails the split instead of being released.
+    const bool fallback = placeholder_fallback();
     const auto end = address + bytes;
     while (address < end) {
         WIN32_MEMORY_REGION_INFORMATION info{};
         if (!QueryVirtualMemoryInformation(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                           MemoryRegionInfo, &info, sizeof(info), nullptr) ||
-            !(info.Flags & placeholder_reservation))
+                                           MemoryRegionInfo, &info, sizeof(info), nullptr))
             return false;
+        if (!(info.Flags & placeholder_reservation)) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!fallback || VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region)) != sizeof(region) ||
+                region.State != MEM_RESERVE)
+                return false;
+        }
         const auto base = reinterpret_cast<ULONG_PTR>(info.AllocationBase);
         if (address - base >= info.RegionSize) return false;
         address += info.RegionSize - (address - base);
@@ -1503,9 +1724,55 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
     return TRUE;
 }
 
+// Runs fn(context) so that its answer does not come from inside a run break: the moment, under memory.mutex,
+// when a run of shared views is unmapped and its surviving pages are mapped again (map_pages_locked,
+// remap_alias_pages). A thread that touches such a page faults and retry_remapped_page retries it, but a region
+// query (VirtualQuery) or a kernel copy (ReadProcessMemory) does not fault: inside the break it reports the pages
+// as reserved, or fails. fn must be a query, or a copy into the caller's memory, that can simply run again, and
+// must not take memory.mutex or call the mapping exports.
+// Without shared views (X2W_XMEM_SHARED_VIEWS unset, or no mapping call yet) fn runs once, directly: every page has
+// a view of its own, so no break takes a page away from a reader. With them fn runs once when no break begins or
+// ends around it (the break generation is even before and unchanged after), which is nearly every call; otherwise
+// it runs again under memory.mutex, so after the break. A thread that holds memory.mutex runs it directly.
+extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context)
+{
+    if (!fn) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (mapping_thread || !shared_views_on.load(std::memory_order_acquire)) {
+        fn(context);
+        return TRUE;
+    }
+    const auto generation = [] {
+        AcquireSRWLockShared(&remap_window.lock);
+        const ULONG64 value = remap_window.generation;
+        ReleaseSRWLockShared(&remap_window.lock);
+        return value;
+    };
+    const ULONG64 before = generation();
+    if (!(before & 1)) {
+        fn(context);
+        if (generation() == before) return TRUE;
+    }
+    const MappingThread marker;
+    const std::lock_guard guard(memory.mutex);
+    fn(context);
+    return TRUE;
+}
+
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
 // in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and empty slabs
 // are closed when all of their slots are freed and unpinned.
+// Test export: MapViewOfFile3 and placeholder-split attempts made by the physical-page map path so far.
+extern "C" BOOL WINAPI x2w_xmem_map_counts(ULONGLONG* maps, ULONGLONG* splits)
+{
+    if (!maps || !splits) return FALSE;
+    *maps = static_cast<ULONGLONG>(map_attempts);
+    *splits = static_cast<ULONGLONG>(split_attempts);
+    return TRUE;
+}
+
 extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in_use, ULONGLONG* slots_free)
 {
     if (!slabs || !slots_in_use || !slots_free) return FALSE;
@@ -1547,6 +1814,76 @@ extern "C" BOOL WINAPI x2w_xmem_commit_range(const void* address, SIZE_T bytes)
         if (page > ~ULONG_PTR{0} - page_bytes) break;
     }
     return TRUE;
+}
+
+namespace {
+// Keep the guarded copy out of functions that need unwinding (as read_alias_record).
+bool copy_guarded(void* destination, const void* data, SIZE_T bytes) noexcept
+{
+    __try {
+        std::memcpy(destination, data, bytes);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+// The longest hold of memory.mutex by a destination copy, and the largest copy, so far (under memory.mutex).
+double copy_hold_max_ms = 0;
+SIZE_T copy_bytes_max = 0;
+}  // namespace
+
+// The DirectStorage stand-in's copy into a plain-memory destination (XCRDAPI). The check that all of
+// [destination, destination + capacity) is committed and writable and the copy of bytes from data both run under
+// memory.mutex. Unmapping a page of a shared run takes the whole run away until its other pages are mapped again
+// (map_pages_locked, remap_alias_pages), all under that mutex, so neither the check nor the copy can fall into that
+// window, and no such window can open while the copy runs. Lazily mapped pages of both ranges are committed first,
+// before the mutex is taken: a fault under it is passed on (mapping_thread), not served.
+// TRUE when the bytes were copied. FALSE with ERROR_NOACCESS when the destination is not writable (nothing is
+// written), ERROR_INVALID_ADDRESS when the copy faulted (a source page not readable; part of the destination may be
+// written), or ERROR_INVALID_PARAMETER for more bytes than capacity or null data.
+extern "C" BOOL WINAPI x2w_xmem_copy_to_destination(void* destination, SIZE_T capacity, const void* data, SIZE_T bytes)
+{
+    if (bytes > capacity || (bytes && !data)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const auto start = reinterpret_cast<ULONG_PTR>(destination);
+    if (capacity && destination && capacity <= ~ULONG_PTR{0} - start) x2w_xmem_commit_range(destination, capacity);
+    if (bytes) x2w_xmem_commit_range(data, bytes);
+    DWORD error = ERROR_SUCCESS;
+    double held_ms = 0;
+    bool longest = false, largest = false;
+    {
+        const MappingThread marker;
+        const std::lock_guard guard(memory.mutex);
+        LARGE_INTEGER frequency{}, begin{}, end{};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&begin);
+        if (!x2w_local::committed_writable(destination, capacity))
+            error = ERROR_NOACCESS;
+        else if (bytes && !copy_guarded(destination, data, bytes))
+            error = ERROR_INVALID_ADDRESS;
+        QueryPerformanceCounter(&end);
+        held_ms = frequency.QuadPart ? 1000.0 * static_cast<double>(end.QuadPart - begin.QuadPart) / frequency.QuadPart : 0;
+        if (held_ms > copy_hold_max_ms) {
+            copy_hold_max_ms = held_ms;
+            longest = true;
+        }
+        if (!error && bytes > copy_bytes_max) {
+            copy_bytes_max = bytes;
+            largest = true;
+        }
+    }
+    // A line per new maximum (about the logarithm of the number of copies), logged after the mutex is released.
+    static volatile LONG lines;
+    if ((longest || largest) && x2w_local::first_calls(lines, 64))
+        x2w_local::logf("x2w-xmem destination copy: %s%s%.3f ms under the mapping mutex for 0x%llx bytes (capacity 0x%llx)",
+                        longest ? "longest hold so far, " : "", largest ? "largest copy so far, " : "", held_ms,
+                        static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(capacity));
+    SetLastError(error);
+    return error == ERROR_SUCCESS;
 }
 
 // Experimental export (X2W_XMEM_LAZY_STARTUP): commits the whole lazy startup block holding address and stops
@@ -1655,6 +1992,139 @@ const bool lazy_commit_installed = [] {
         x2w_local::logf("x2w-xmem lazy startup blocks (X2W_XMEM_LAZY_STARTUP): %d VirtualFree import(s) wrapped", frees);
     }
     return true;
+}();
+
+// With X2W_XMEM_SHARED_VIEWS=1 the main module's VirtualQueryEx imports answer outside run breaks
+// (x2w_xmem_stable_call): inside one, a page of the run being taken apart reads as reserved. A query of another
+// process runs the same way; it only costs the retry. The module is pinned once an import points into it (a main
+// module without the import leaves it unloadable, as before); if the pin is refused, the imports are restored.
+using VirtualQueryExFn = SIZE_T(WINAPI*)(HANDLE, LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T);
+VirtualQueryExFn real_virtual_query_ex;
+
+// The answer goes to a local buffer and is copied to the caller's after x2w_xmem_stable_call: on its mutex path the
+// lazy-commit handler passes faults on (MappingThread), so a write into an uncommitted mapped slot would not be
+// committed there.
+SIZE_T WINAPI virtual_query_ex_stable(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T bytes)
+{
+    if (!info || bytes < sizeof(MEMORY_BASIC_INFORMATION)) return real_virtual_query_ex(process, address, info, bytes);
+    struct Query {
+        HANDLE process;
+        LPCVOID address;
+        MEMORY_BASIC_INFORMATION info;
+        SIZE_T result;
+        DWORD error;
+    } query{process, address, {}, 0, ERROR_SUCCESS};
+    x2w_xmem_stable_call([](void* context) {
+        auto& q = *static_cast<Query*>(context);
+        q.result = real_virtual_query_ex(q.process, q.address, &q.info, sizeof(q.info));
+        q.error = GetLastError();
+    }, &query);
+    if (query.result) std::memcpy(info, &query.info, query.result);
+    SetLastError(query.error);
+    return query.result;
+}
+
+const int virtual_query_ex_wrapped = [] {
+    if (!x2w_local::env_on("X2W_XMEM_SHARED_VIEWS")) return 0;
+    real_virtual_query_ex = reinterpret_cast<VirtualQueryExFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualQueryEx"));
+    if (!real_virtual_query_ex) return 0;
+    int queries = patch_main_import("VirtualQueryEx", reinterpret_cast<const void*>(&virtual_query_ex_stable));
+    HMODULE self = nullptr;
+    if (queries && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                       reinterpret_cast<LPCWSTR>(&virtual_query_ex_stable), &self)) {
+        const DWORD error = GetLastError();
+        const int restored = patch_main_import("VirtualQueryEx", reinterpret_cast<const void*>(real_virtual_query_ex));
+        x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): xmem.dll could not be pinned (error %lu); "
+                        "%d of %d VirtualQueryEx import(s) restored", static_cast<unsigned long>(error), restored, queries);
+        queries = 0;
+    }
+    x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): %d VirtualQueryEx import(s) answer outside run breaks",
+                    queries);
+    return queries;
+}();
+
+// With X2W_XMEM_SHARED_VIEWS=1 the main module's ReadFile and WriteFile imports also go around run breaks. Inside one,
+// a kernel copy into or out of a page of the run being taken apart fails at once, with no fault to retry. Measured
+// under Wine (tests/xmem_run_break_readers_check.cpp, ReadFile_import and WriteFile_import): ReadFile fails with
+// ERROR_NOACCESS and leaves the file position where it was, WriteFile with ERROR_INVALID_USER_BUFFER. A synchronous
+// call (no OVERLAPPED) that fails with one of those while a break was in progress, or began or ended around it, and
+// whose buffer lies in a run, waits for memory.mutex (the end of the break) and runs again, at most io_attempts times
+// in all. A call that fails that way with no break around it, or outside the runs, fails at once as before.
+// Not covered: overlapped I/O (the copy happens at completion, after the call has returned), a call that a break
+// cuts short after part of the copy (a short count), and I/O from other modules or through GetProcAddress.
+using WriteFileFn = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+ReadFileFn next_read_file;  // read_file_committed with lazy commit, kernel32's ReadFile without
+WriteFileFn kernel_write_file;
+constexpr int io_attempts = 4;
+
+ULONG64 break_generation()
+{
+    AcquireSRWLockShared(&remap_window.lock);
+    const ULONG64 value = remap_window.generation;
+    ReleaseSRWLockShared(&remap_window.lock);
+    return value;
+}
+
+// Whether [buffer, buffer + bytes) holds a page of a run. Takes memory.mutex, so it returns after the break in progress.
+bool in_a_run(const void* buffer, DWORD bytes)
+{
+    const auto first = reinterpret_cast<ULONG_PTR>(buffer);
+    const std::lock_guard guard(memory.mutex);
+    const auto run = memory.runs.upper_bound(first);
+    if (run != memory.runs.begin() && first - std::prev(run)->first < std::prev(run)->second) return true;
+    return run != memory.runs.end() && run->first - first < bytes;
+}
+
+template <class Call>
+BOOL io_outside_breaks(const void* buffer, DWORD bytes, LPOVERLAPPED overlapped, const Call& call)
+{
+    if (overlapped || !buffer || !bytes || mapping_thread || !shared_views_on.load(std::memory_order_acquire)) return call();
+    for (int attempt = 1;; ++attempt) {
+        const ULONG64 before = break_generation();
+        if (call()) return TRUE;
+        const DWORD error = GetLastError();
+        const bool broken = (before & 1) || break_generation() != before;
+        if ((error != ERROR_NOACCESS && error != ERROR_INVALID_USER_BUFFER) || !broken || attempt == io_attempts ||
+            !in_a_run(buffer, bytes)) {
+            SetLastError(error);
+            return FALSE;
+        }
+    }
+}
+
+BOOL WINAPI read_file_stable(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped)
+{
+    return io_outside_breaks(buffer, bytes, overlapped, [&] { return next_read_file(file, buffer, bytes, read, overlapped); });
+}
+
+BOOL WINAPI write_file_stable(HANDLE file, LPCVOID buffer, DWORD bytes, LPDWORD written, LPOVERLAPPED overlapped)
+{
+    return io_outside_breaks(buffer, bytes, overlapped, [&] { return kernel_write_file(file, buffer, bytes, written, overlapped); });
+}
+
+const int file_io_wrapped = [] {
+    if (!x2w_local::env_on("X2W_XMEM_SHARED_VIEWS")) return 0;
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    const auto kernel_read_file = reinterpret_cast<ReadFileFn>(GetProcAddress(kernel32, "ReadFile"));
+    kernel_write_file = reinterpret_cast<WriteFileFn>(GetProcAddress(kernel32, "WriteFile"));
+    if (!kernel_read_file || !kernel_write_file) return 0;
+    // With lazy commit the ReadFile imports already point at read_file_committed, which stays the inner call.
+    next_read_file = lazy_commit_installed && real_read_file ? &read_file_committed : kernel_read_file;
+    int wrapped = patch_main_import("ReadFile", reinterpret_cast<const void*>(&read_file_stable));
+    wrapped += patch_main_import("WriteFile", reinterpret_cast<const void*>(&write_file_stable));
+    HMODULE self = nullptr;
+    if (wrapped && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                       reinterpret_cast<LPCWSTR>(&read_file_stable), &self)) {
+        const DWORD error = GetLastError();
+        const int restored = patch_main_import("ReadFile", reinterpret_cast<const void*>(next_read_file)) +
+                             patch_main_import("WriteFile", reinterpret_cast<const void*>(kernel_write_file));
+        x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): xmem.dll could not be pinned (error %lu); "
+                        "%d of %d ReadFile/WriteFile import(s) restored", static_cast<unsigned long>(error), restored, wrapped);
+        wrapped = 0;
+    }
+    x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): %d ReadFile/WriteFile import(s) run again after a run "
+                    "break that refused their buffer", wrapped);
+    return wrapped;
 }();
 }  // namespace
 

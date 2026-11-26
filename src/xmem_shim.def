@@ -22,3 +22,6 @@ EXPORTS
     x2w_xmem_release_section @20
     x2w_xmem_match_section @21
     X2WMapPageBatch @22
+    x2w_xmem_copy_to_destination @23
+    x2w_xmem_map_counts @25
+    x2w_xmem_stable_call @26

@@ -88,11 +88,14 @@ int main(int argc, char** argv)
     if (!whole) return 1;
     unsigned char* const first = whole + page;
 
-    // Two mapping calls next to each other: two views that meet at first + 8 pages.
+    // Two mapping calls next to each other: two views that meet at first + 8 pages. The upper one is mapped first: a
+    // call joins only a view that ends at its address (merge_with_previous), never one that starts after it.
     const auto a = pages(8), b = pages(8);
-    if (a.empty() || b.empty() || XMemMapPhysicalPages(first, 8, a.data()) != first ||
-        XMemMapPhysicalPages(first + 8 * page, 8, b.data()) != first + 8 * page)
+    if (a.empty() || b.empty() || XMemMapPhysicalPages(first + 8 * page, 8, b.data()) != first + 8 * page ||
+        XMemMapPhysicalPages(first, 8, a.data()) != first) {
+        std::printf("check_failed: allocate or map the two 8-page calls (error %lu)\n", GetLastError());
         return 1;
+    }
     place("inside one view", wrapper.Get(), first + 4 * page, 1);
     place("across two mapping calls", wrapper.Get(), first + 8 * page, 2);
 
@@ -107,12 +110,19 @@ int main(int argc, char** argv)
     }
     place("across two backing sections", wrapper.Get(), second + info.RegionSize, 2);
 
-    // Pages mapped one call at a time get a view each: the layout every page had before views were shared.
+    // Pages mapped one call at a time get a view each: the layout every page had before views were shared. The slots
+    // go in reverse order, so that no call continues the slot before it and joins its view (merge_with_previous).
     unsigned char* const third = second + 8192 * page;
     const auto single = pages(8);
-    if (single.empty()) return 1;
+    if (single.empty()) {
+        std::printf("check_failed: allocate 8 single pages (error %lu)\n", GetLastError());
+        return 1;
+    }
     for (int i = 0; i < 8; ++i)
-        if (XMemMapPhysicalPages(third + i * page, 1, &single[i]) != third + i * page) return 1;
+        if (XMemMapPhysicalPages(third + i * page, 1, &single[7 - i]) != third + i * page) {
+            std::printf("check_failed: single-page call %d (error %lu)\n", i, GetLastError());
+            return 1;
+        }
     place("across two single-page views", wrapper.Get(), third + 4 * page, 2);
 
     if (failures) {

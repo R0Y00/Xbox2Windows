@@ -3160,21 +3160,57 @@ view (`src/xmem_mapped_pages.cpp`). Before, every page had a section and a view 
 slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s for 100,000 pages,
 82 ms with shared sections and views).
 
+Start-up maps nearly every page with a call of its own, and under Wine each map costs more the
+more views the process has. So a mapping call whose pages all continue the view that ends at its
+address, on the next slots of the same section and inside the same reservation of the shim, joins
+that view: the view is unmapped, its placeholder is joined with the new pages' placeholder, and one
+view is mapped over both. It is taken apart the same way as in an unmap (below), and if a step is
+refused the view is mapped again as it was and the new pages get a view of their own. A joined
+view stops at 64 pages (`max_merged_run_pages`): a page that would make it longer starts a view of
+its own, which the next pages join. Every later unmap inside a joined view takes the whole view
+apart, so the cap bounds that work too. Only joined views are capped: a view mapped by one call
+covers as many of its pages as follow each other in address and in their section, and an unmap inside it maps the surviving pages again
+with one view per contiguous stretch, as long as before the cap. Measured under Wine with every byte of the view written
+(`xmem_cross_call_merge_check timing`): an unmap inside a view of 64 pages took 0.28 ms, of 512
+pages 2.1 ms and of 4096 pages 13 ms; joining a page to a view of 63 took 1.5 ms, about what a page
+mapped on its own costs (1.4 ms).
+
 Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
 that touches one of those pages in between takes an access violation. A vectored handler retries
-it only when the address is inside a view that the unmap in progress, or the last finished one,
-took apart, the page is recorded and covered by a view once that unmap is over, and the thread
-has not already retried that page for that unmap. Any other fault is passed on, after at most one
-retry.
+it only when the address is inside a view that one of the last 64 unmaps or joins (the one in
+progress included) took apart, the page is recorded and covered by a view once that one is over,
+and the thread has not already retried that page for the newest such unmap or join. A handler that
+runs late, after a later unmap or join of another view has begun (one call joins a CPU view and
+then its GPU mirror), still finds the one its fault came from. Any other fault is passed on, after
+at most one retry for each unmap or join.
 
 Shared views are opt-in. The caller chooses before the first mapping call by setting
-`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call.
+`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call. It also
+reads it once when `xmem.dll` loads: with it set then, the main module's `VirtualQueryEx`,
+`ReadFile` and `WriteFile` imports are wrapped (see below), and the module is pinned at load when
+one is.
+
+A region query or a kernel copy does not fault, so inside an unmap it would see the pages of the
+view being taken apart as reserved. With shared views such readers run through the export
+`x2w_xmem_stable_call`: the reader runs once, and runs again after the unmap if one began or ended
+around it. `XMemVirtualQuery`, the main module's `VirtualQueryEx` imports and the shim's own
+`VirtualQuery` and `ReadProcessMemory` readers (`src/startup_stubs/local_log.h`, slot 133,
+the sampler snapshot) use it. Without shared views every page has a view of its own and readers
+run once, as before.
+
+Inside an unmap a kernel copy into or out of a page of that view fails at once. Measured under
+Wine: `ReadFile` fails with `ERROR_NOACCESS` and leaves the file position as it was, `WriteFile`
+with `ERROR_INVALID_USER_BUFFER`. The main module's `ReadFile` and `WriteFile` imports therefore
+run again, up to 4 times in all, when a synchronous call fails with one of those errors while an
+unmap or join was in progress or began or ended around it, and its buffer lies in a view of a
+run; they wait for that one to end first. Overlapped I/O (the copy happens at completion), a call
+cut short after part of the copy, and I/O from other modules are not covered.
 
 | | Default | `X2W_XMEM_SHARED_VIEWS=1` |
 |---|---|---|
 | Views | one per page | one per run of adjacent pages |
 | Fault handler | none | registered by the first mapping call, never removed |
-| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends |
+| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends (at load when the main module imports `VirtualQueryEx`, `ReadFile` or `WriteFile`, else at the first mapping call) |
 
 The handler is process-wide, and Windows has no removal that also waits for a dispatch already
 under way, so the opt-in keeps the module, the handler and the shim's state in place for the life
