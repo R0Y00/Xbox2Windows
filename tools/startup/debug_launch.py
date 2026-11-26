@@ -495,7 +495,6 @@ def main():
     # A hook step-over restores the original byte for one instruction. Every other thread is held
     # for that step (--suspend-others 0 turns this off to measure what the window costs).
     window = StepWindow(hold_thread, release_thread, protect=opts.get("--suspend-others", "1") != "0")
-    file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace else None
 
     def arm(addr, *, skip_int3=False):
         if addr not in breakpoints:
