@@ -6673,7 +6673,8 @@ class Stage:
                                             (kind != 'ps' or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
-        self.require_spill_lanes_apart(vreg[1], name)
+        if kind in ('ps', 'vs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
+            self.require_spill_lanes_apart(vreg[1], name)
         return vreg[1], sreg, lane
 
     def require_spill_lanes_apart(self, n, name):
