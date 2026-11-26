@@ -1,6 +1,8 @@
 // Input for the startup debugger's diagnostics check (tests/startup_debug_check.py). It reaches two
-// breakpoints in its own image, the way a retail image keeps soft asserts, reserves one large
-// range, reports whether the loader gave it the debug heap, stays alive for a moment and exits 0.
+// breakpoints in its own image, the way a retail image keeps soft asserts, and with
+// STARTUP_DEBUG_PROBE_ASSERTS=<n> n more at a third site (the repeated-assert case). It also
+// reserves one large range, reports whether the loader gave it the debug heap, stays alive for a
+// moment and exits 0.
 // With STARTUP_DEBUG_PROBE_DLL=<file> and STARTUP_DEBUG_PROBE_EXPORT=<name> it also loads that DLL
 // and calls the export kCalls times (the call-hook case; tests/startup_debug_calls.cpp).
 // No GPU and no other input is involved.
@@ -27,6 +29,21 @@ __declspec(noinline) void second_assert()
 {
     reached = 2;
     __debugbreak();
+}
+
+// One trap site, called repeatedly: the shape a mapping loop has when it traps once per chunk.
+// Kept out of line so the compiler leaves a single INT3.
+__declspec(noinline) void third_assert()
+{
+    __debugbreak();
+}
+
+__declspec(noinline) void repeated_assert(int times)
+{
+    for (int i = 0; i < times; ++i) {
+        reached = 3 + i;
+        third_assert();
+    }
 }
 
 __declspec(noinline) void* reserve_large()
@@ -128,6 +145,10 @@ int main()
 {
     first_assert();
     second_assert();
+    const char* const repeated = std::getenv("STARTUP_DEBUG_PROBE_ASSERTS");
+    const int repeated_count = repeated ? std::atoi(repeated) : 0;
+    repeated_assert(repeated_count);
+    std::printf("debug-probe repeated %d\n", repeated_count);
     void* const range = reserve_large();
     std::printf("debug-probe reserved %s\n", range ? "ok" : "failed");
     std::printf("debug-probe heap flags 0x%lx\n", debug_heap_flags());

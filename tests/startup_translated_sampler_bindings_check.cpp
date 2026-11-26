@@ -202,8 +202,9 @@ int main(int argc, char** argv)
     decoded("anisotropic mag", {0, 0, 2u << 20, 0}, wrap, wrap, wrap, anisotropic, 1);
     decoded("anisotropic min", {0, 0, 2u << 22, 0}, wrap, wrap, wrap, anisotropic, 1);
     decoded("anisotropic mag 3, ratio 4", {word0(0, 0, 0, 4), 0, 3u << 20, 0}, wrap, wrap, wrap, anisotropic, 16);
-    // Bits the decoder does not read: PERF_MIP and PERF_Z in word 1, word 3, Z_FILTER and the high bits of
-    // words 0 and 2. MIN_LOD and MAX_LOD are both 0xfff, 4095 / 256, for a table entry.
+    // Bits the decoder does not read: PERF_MIP and PERF_Z in word 1, word 3 bits 29:0 (and BORDER_COLOR_TYPE 3
+    // falls back to transparent black), Z_FILTER and the high bits of words 0 and 2. MIN_LOD and MAX_LOD are
+    // both 0xfff, 4095 / 256, for a table entry.
     decoded("ignored bits", {word0(2, 1, 3, 0) | 0xfffff000u, ~0u, 1u << 22 | 3u << 24 | 0xf0000000u | 0xfffffu, ~0u},
             clamp, mirror, mirror_once, min_linear, 1, 7, 15.99609375f, 15.99609375f);
     // Word 1: MIN_LOD bits 11:0 and MAX_LOD bits 23:12, unsigned 4.8 fixed point. Each field is read on its
@@ -218,6 +219,33 @@ int main(int argc, char** argv)
             0.00390625f);
     decoded("lod with perf bits", {0, 0xff000000u | 0x080u | 0x300u << 12, 0, 0}, wrap, wrap, wrap, point, 1, 0,
             0.5f, 3.0f);
+
+    // Word 3 bits 31:30 (BORDER_COLOR_TYPE): 0 = TRANS_BLACK, 1 = OPAQUE_BLACK, 2 = OPAQUE_WHITE, and 3 = REGISTER
+    // (falls back to TRANS_BLACK). BORDER_COLOR_PTR in bits 11:0 does not alter the fixed border colors.
+    {
+        const struct {
+            const char* label;
+            std::uint32_t w3;
+            unsigned static_border;
+            float rgba[4];
+        } border_cases[] = {
+            {"border trans black", 0u << 30 | 0xfffu, 0, {0.0f, 0.0f, 0.0f, 0.0f}},
+            {"border opaque black", 1u << 30 | 0xfffu, 1, {0.0f, 0.0f, 0.0f, 1.0f}},
+            {"border opaque white", 2u << 30 | 0xfffu, 2, {1.0f, 1.0f, 1.0f, 1.0f}},
+            {"border register fallback", 3u << 30 | 0xfffu, 0, {0.0f, 0.0f, 0.0f, 0.0f}},
+        };
+        for (const auto& bc : border_cases) {
+            ++cases;
+            const SamplerWords words{word0(6, 6, 6, 0), 0, 0, bc.w3};
+            const D3D12_STATIC_SAMPLER_DESC s = decode_sampler(words, 2);
+            expect(bc.label, "static BorderColor", s.BorderColor, bc.static_border);
+            expect(bc.label, "static AddressU", s.AddressU, border);
+            expect(bc.label, "static AddressV", s.AddressV, border);
+            const D3D12_SAMPLER_DESC d = dynamic_sampler(words);
+            for (unsigned ch = 0; ch < 4; ++ch)
+                if (d.BorderColor[ch] != bc.rgba[ch]) fail(bc.label, "dynamic BorderColor", unsigned(d.BorderColor[ch]), unsigned(bc.rgba[ch]));
+        }
+    }
 
     // The border sampler a missing table entry uses: border on all three axes, point, transparent black.
     {
