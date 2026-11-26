@@ -1,4 +1,5 @@
 """Check v_bcnt_u32_b32 in the compute store profile: exact lowering, refusals and a WARP or GPU readback."""
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -110,8 +111,8 @@ def controls():
         (unsupported + "v_bcnt_u32_b32_e32", ((FIRST, "v_bcnt_u32_b32_e32 v2, v1, v3"),)),
         (unsupported + "v_bcnt_u32_b32_e64", ((FIRST, "v_bcnt_u32_b32_e64 v2, v1, s0"),)),
         (unsupported + "v_mbcnt_lo_u32_b32", ((FIRST, "v_mbcnt_lo_u32_b32 v2, v1, s0"),)),
-        # The scalar count stays limited to exec_lo.
-        ("Unsupported active lane count source: s0", ((FIRST, "s_bcnt1_i32_b32 s9, s0"),)),
+        # The scalar count takes exec_lo or a known scalar word, not the high half or an unknown register.
+        ("Unsupported active lane count source: exec_hi", ((FIRST, "s_bcnt1_i32_b32 s9, exec_hi"),)),
         # Source modifiers and an output modifier, which LLVM does not accept for this opcode.
         (unsupported + "v_bcnt_u32_b32", ((FIRST, "v_bcnt_u32_b32 v2, -v1, s0"),)),
         (unsupported + "v_bcnt_u32_b32", ((FIRST, "v_bcnt_u32_b32 v2, |v1|, s0"),)),
@@ -183,6 +184,11 @@ def draw(directory, compiler, renderer, backend):
             raise AssertionError(f"{NAME}: mutation '{label}' escaped detection\n{bad.stderr}")
     print(f"{NAME}: {len(base.READ_RUNS)} dispatches, {len(WRONG) + 2} wrong references and "
           f"{len(MUTATIONS)} mutated sources checked")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in LINES if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 

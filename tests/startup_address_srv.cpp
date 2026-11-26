@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
@@ -222,6 +223,86 @@ int draw_bc_address_srvs(void* guest, void* list)
     return 0;
 }
 
+// X2W_TEST_CONSOLE_VIEW names a file of texels and X2W_TEST_CONSOLE_DESC the texture they belong to
+// ("width,height,mips,format,layout,viewed mip"). No resource object exists at the address; one mip is
+// viewed and drawn over the whole target. With X2W_TEST_CONSOLE_XG_ROWS=1 the address is first announced
+// the way the XG stand-in announces a copy of desktop-footprint rows; with =after the announcement comes
+// between the publication and the draw.
+int draw_console_address_srv(void* guest, void* list)
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_VIEW", path, MAX_PATH);
+    char text[96]{};
+    unsigned width = 0, height = 0, mips = 0, format = 0, layout = 0, viewed = 0;
+    if (!length || length >= MAX_PATH || !GetEnvironmentVariableA("X2W_TEST_CONSOLE_DESC", text, sizeof(text)) ||
+        std::sscanf(text, "%u,%u,%u,%u,%u,%u", &width, &height, &mips, &format, &layout, &viewed) != 6) return 43;
+    alignas(4096) static std::array<char, 1 << 20> backing{};
+    std::ifstream input(path, std::ios::binary);
+    input.read(backing.data(), backing.size());
+    if (!input.gcount() || !input.eof()) return 43;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, static_cast<UINT16>(mips),
+        static_cast<DXGI_FORMAT>(format), {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(layout), D3D12_RESOURCE_FLAG_NONE};
+    ViewAt v{};
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture2D.MostDetailedMip = viewed;
+    v.view.Texture2D.MipLevels = 1;
+    v.address = ptr(backing.data());
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    wchar_t rows[8]{};
+    GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_XG_ROWS", rows, 8);
+    if (!std::wcscmp(rows, L"1")) x2w_d3d12_texture_written(backing.data(), backing.size());
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    // "after": the announcement follows the publication, before the draw samples the view.
+    if (!std::wcscmp(rows, L"after")) x2w_d3d12_texture_written(backing.data(), backing.size());
+    const D3D12_RECT whole{0, 0, 512, 128};
+    invoke(list, 22, 1, ptr(&whole));
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
+// X2W_TEST_CONSOLE_GATE: one 2048x2048 RGBA8 texture in the 64 KiB standard layout (16 MiB), republished
+// from the same address with a new payload before each draw. Every texel of a payload has one colour
+// (gate_colour in tests/startup_address_console_check.py), so the bytes do not depend on the layout. The
+// draw covers the left or the right half of the 512x128 target.
+int draw_gated_console_payload(void* guest, void* list, unsigned payload, bool left)
+{
+    constexpr unsigned side = 2048;
+    constexpr std::size_t bytes = std::size_t{side} * side * 4;
+    static auto* const backing = static_cast<unsigned char*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!backing) return 43;
+    const unsigned char colour[4] = {static_cast<unsigned char>(17 * payload + 3), static_cast<unsigned char>(255 - 9 * payload),
+                                     static_cast<unsigned char>(payload ^ 0x5a), 255};
+    for (std::size_t at = 0; at < bytes; at += 4) std::memcpy(backing + at, colour, 4);
+    static void* heap;
+    static Word cpu;
+    if (!heap) {
+        struct Extended {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word address, size;
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap))))) return 42;
+        cpu = invoke(heap, 9);
+    }
+    invoke(list, 32, 1, ptr(&heap));
+    invoke(list, 36, 0, invoke(heap, 10));
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x109), D3D12_RESOURCE_FLAG_NONE};
+    ViewAt v{};
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture2D.MipLevels = 1;
+    v.address = ptr(backing);
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    const D3D12_RECT half{left ? 0 : 256, 0, left ? 256 : 512, 128};
+    invoke(list, 22, 1, ptr(&half));
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
 // The backing is produced by XG CopyIntoSubresource from a source-built block texture.
 int draw_bc_chain(void* guest, void* list)
 {
@@ -334,12 +415,47 @@ void release_placed_vertices(bool done)
     }
 }
 
+// X2W_TEST_FORMATTED_VIEW=<DXGI format>:<component mapping>:<raw 0|1>:<64 hex bytes>: one typed (or raw) buffer view
+// the title creates over a placed buffer holding those bytes, at table entry 0, then one draw. The translated pixel
+// shader in tests/startup_formatted_view_draw_check.py reads element 1 through buffer_load_format_xyzw.
+int draw_formatted_view(void* guest, void* list)
+{
+    char spec[256]{};
+    if (!GetEnvironmentVariableA("X2W_TEST_FORMATTED_VIEW", spec, sizeof(spec))) return 48;
+    unsigned format = 0, mapping = 0, raw = 0;
+    char hex[129]{};
+    if (std::sscanf(spec, "%u:%x:%u:%128s", &format, &mapping, &raw, hex) != 4 || std::strlen(hex) != 128) return 48;
+    static std::array<std::uint8_t, 65536 + 256> backing{};
+    auto* const bytes = reinterpret_cast<std::uint8_t*>((ptr(backing.data()) + 0xffff) & ~Word{0xffff});
+    for (unsigned i = 0; i < 64; ++i) {
+        unsigned value = 0;
+        if (std::sscanf(hex + 2 * i, "%2x", &value) != 1) return 48;
+        bytes[i] = static_cast<std::uint8_t>(value);
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(bytes), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{static_cast<DXGI_FORMAT>(format), D3D12_SRV_DIMENSION_BUFFER, mapping};
+    view.Buffer.NumElements = 4;
+    view.Buffer.Flags = raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+    invoke(guest, 18, ptr(placed), ptr(&view), cpu);
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
 int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
     static std::array<std::uint8_t, 65536 + 256> raw_buf0{};
-    static std::array<std::uint8_t, 65536 + 256> raw_buf1{};
+    static auto* const buf1 = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     auto* const buf0 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf0.data()) + 0xffff) & ~Word{0xffff});
-    auto* const buf1 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf1.data()) + 0xffff) & ~Word{0xffff});
     std::memset(buf0, 0, 256);
     std::memset(buf1, 0, 256);
     buf0[0] = 17;
@@ -353,11 +469,10 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    void* placed[2]{};
+    void* placed = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf0), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[0]))))) return 47;
-    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf1), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
-                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[1]))))) return 47;
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    // buf1 is intentionally not placed in slot 133 to verify unplaced buffer backing in device slot 70.
 
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;
@@ -403,7 +518,8 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     structured.view.Buffer.StructureByteStride = 4;
     structured.address = ptr(buf0);
     invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
-    // An acceleration-structure view is refused; draw(4) proves the structured descriptor stayed in place.
+    // An acceleration-structure view of a placed buffer that is not in the acceleration-structure state is
+    // refused (as_wrong_state); draw(4) proves the structured descriptor stayed in place.
     ViewAt as_view{};
     as_view.view.Format = DXGI_FORMAT_UNKNOWN;
     as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
@@ -417,6 +533,16 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(5);
     draw(6);
+
+    // An unplaced buffer in an allocation above the 256 MiB limit is not wrapped as an existing heap; its
+    // upload copy must still publish the bytes at the address.
+    static auto* const large = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, (256ull << 20) + 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!large) return 53;
+    large[4] = 77;
+    raw.address = ptr(large);
+    raw.view.Buffer.FirstElement = 4;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(7);
     return 0;
 }
@@ -529,5 +655,247 @@ int draw_single_element_srvs(void* guest, void* list)
     auto aligned = rgba;
     aligned.Alignment = 0x10000;
     publish(aligned, view_of(aligned, ptr(memory[0]))); draw(7);
+    return 0;
+}
+
+// Exercise runtime bound-SRV format validation and d16unorm16 mode selection on a shader carrying
+// 'd16srv 0 exact' and 'udsrc 3 d16unorm16 0' (#2023):
+// - col 0: R16_UNORM (0xffef) + explicit R16_UNORM SRV -> d16unorm16=1 gives exact 0x3bff (yellow 255, 255, 0)
+// - col 1: R32_FLOAT (0x3f7ff000 = binary32(0xffef/65535)) + default SRV -> d16unorm16=0 gives 0x3c00 (red 255, 0, 0)
+// - col 2: R16_TYPELESS (0xaaaa) + explicit R16_UNORM SRV -> d16unorm16=1 gives 0x3955 (170, 0, 0)
+// - cols 3..6: R16_UINT, R16_SNORM, null-resource SRV and unwritten descriptor -> refused (clear blue 0, 0, 255)
+// - col 7: rebind R16_UNORM (0xffef) + default SRV -> d16unorm16=1 recovers cleanly (yellow 255, 255, 0)
+int draw_d16_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    D3D12_RESOURCE_DESC probe16{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1,
+        DXGI_FORMAT_R16_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    D3D12_RESOURCE_DESC probe32 = probe16;
+    probe32.Format = DXGI_FORMAT_R32_FLOAT;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp16{}, fp32{};
+    UINT64 total16 = 0, total32 = 0;
+    desktop->GetCopyableFootprints(&probe16, 0, 1, 0, &fp16, nullptr, nullptr, &total16);
+    desktop->GetCopyableFootprints(&probe32, 0, 1, 0, &fp32, nullptr, nullptr, &total32);
+    if (!total16 || total16 == ~UINT64{0} || !total32 || total32 == ~UINT64{0}) return 48;
+
+    static std::array<std::vector<unsigned char>, 5> planes;
+    const DXGI_FORMAT resource_formats[5] = {
+        DXGI_FORMAT_R16_UNORM,
+        DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R16_TYPELESS,
+        DXGI_FORMAT_R16_UINT,
+        DXGI_FORMAT_R16_SNORM,
+    };
+    const std::uint16_t u16_unorm = 0xffefu, u16_typeless = 0xaaaau, u16_uint = 200u, u16_snorm = 0x4000u;
+    const std::uint32_t f32_bits = 0x3f7ff000u;  // binary32(65519 / 65535.0): rounds to 0x3c00 under pack16_rne
+    void* textures[5]{};
+    for (int i = 0; i < 5; ++i) {
+        const bool is32 = i == 1;
+        const UINT64 total = is32 ? total32 : total16;
+        const UINT64 offset = is32 ? fp32.Offset : fp16.Offset;
+        planes[i].assign(static_cast<std::size_t>(total), 0);
+        if (i == 0) std::memcpy(planes[i].data() + offset, &u16_unorm, sizeof(std::uint16_t));
+        else if (i == 1) std::memcpy(planes[i].data() + offset, &f32_bits, sizeof(std::uint32_t));
+        else if (i == 2) std::memcpy(planes[i].data() + offset, &u16_typeless, sizeof(std::uint16_t));
+        else if (i == 3) std::memcpy(planes[i].data() + offset, &u16_uint, sizeof(std::uint16_t));
+        else std::memcpy(planes[i].data() + offset, &u16_snorm, sizeof(std::uint16_t));
+        auto desc = is32 ? probe32 : probe16;
+        desc.Format = resource_formats[i];
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(planes[i].data()), ptr(&desc),
+                                               D3D12_RESOURCE_STATE_COMMON, 0,
+                                               ptr(&__uuidof(ID3D12Resource)), ptr(&textures[i])))))
+            return 49;
+    }
+
+    struct Extended {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word address, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 9, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void* heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap)))))
+        return 42;
+    const Word cpu = invoke(heap, 9);
+    const Word gpu = invoke(heap, 10);
+    const UINT stride = static_cast<UINT>(invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+    if (!cpu || !gpu || stride < 32) return 42;
+    invoke(list, 32, 1, ptr(&heap));
+
+    const auto make_view = [](DXGI_FORMAT fmt) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = fmt;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        return v;
+    };
+    const auto v_unorm = make_view(DXGI_FORMAT_R16_UNORM);
+    const auto v_uint = make_view(DXGI_FORMAT_R16_UINT);
+    const auto v_snorm = make_view(DXGI_FORMAT_R16_SNORM);
+
+    invoke(guest, 18, ptr(textures[0]), ptr(&v_unorm), cpu + 0 * stride);  // 0: R16_UNORM (0xffef) + explicit R16_UNORM
+    invoke(guest, 18, ptr(textures[1]), 0,             cpu + 1 * stride);  // 1: R32_FLOAT (0x3f7ff000) + default SRV
+    invoke(guest, 18, ptr(textures[2]), ptr(&v_unorm), cpu + 2 * stride);  // 2: R16_TYPELESS (0xaaaa) + explicit R16_UNORM
+    invoke(guest, 18, ptr(textures[2]), ptr(&v_uint),  cpu + 3 * stride);  // 3: R16_TYPELESS + explicit R16_UINT (refused)
+    invoke(guest, 18, ptr(textures[3]), 0,             cpu + 4 * stride);  // 4: R16_UINT + default SRV (refused)
+    invoke(guest, 18, ptr(textures[4]), ptr(&v_snorm), cpu + 5 * stride);  // 5: R16_SNORM + explicit R16_SNORM (refused)
+    invoke(guest, 18, 0,                ptr(&v_unorm), cpu + 6 * stride);  // 6: null resource SRV (refused)
+    // Slot 7 is intentionally left unwritten (missing view token -> refused).
+    invoke(guest, 18, ptr(textures[0]), 0,             cpu + 8 * stride);  // 8: R16_UNORM (0xffef) + default SRV
+
+    const auto draw_at = [&](LONG x, UINT slot) {
+        invoke(list, 36, 0, gpu + Word{slot} * stride);
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    for (UINT col = 0; col < 7; ++col) draw_at(static_cast<LONG>(col), col);
+    draw_at(6, 7);  // Also test unwritten descriptor slot on column 6; must stay clear.
+    draw_at(7, 8);  // Rebind R16_UNORM default SRV on column 7; must draw yellow (0x3bff) cleanly.
+    return 0;
+}
+
+// One translated pixel shader uses the same table slot across five draws. The clear color is opaque blue.
+int draw_formatted_buffer(void* guest, void* list)
+{
+    alignas(16) static const std::uint32_t zeros[4] = {};
+    alignas(16) static const std::uint32_t red[4] = {0x3f800000u};
+    const auto draw_at = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    draw_at(0);  // No table binding.
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    const auto store = [&](const std::uint32_t* data, std::uint32_t format) {
+        const auto address = ptr(data);
+        const std::uint32_t descriptor[4] = {static_cast<std::uint32_t>(address),
+            static_cast<std::uint32_t>(address >> 32) | (4u << 16), 4u, (format << 12) | 4u};
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptor, sizeof(descriptor));
+    };
+    store(red, 2);
+    draw_at(1);  // Unknown FORMAT, readable descriptor and range.
+    store(zeros, 22);
+    draw_at(2);  // Real zero data with a supported R32_FLOAT descriptor.
+    store(nullptr, 22);
+    draw_at(3);  // Supported metadata with no resolved buffer.
+    store(red, 22);
+    // Expand the viewport from the fixture's initial four columns to all eight.
+    const D3D12_VIEWPORT viewport{0, 0, 8, 4, 0, 1};
+    invoke(list, 21, 1, ptr(&viewport));
+    draw_at(4);  // Nonzero data proves the accepted format is sampled.
+    return 0;
+}
+
+// 3D volume memory SRV (device slot 70) with 2 mips (4x4x2 and 2x2x1) in RGBA8_UNORM format.
+int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE3D, 0, 4, 4, 2, 2,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2]{};
+    UINT rows[2]{};
+    UINT64 row_bytes[2]{};
+    UINT64 total_bytes = 0;
+    desktop->GetCopyableFootprints(&desc, 0, 2, 0, footprints, rows, row_bytes, &total_bytes);
+    if (!total_bytes || total_bytes == ~UINT64{0}) return 50;
+    // Footprint row pitch (256 bytes) is larger than packed row bytes (4 texels * 4 bytes = 16 bytes).
+    if (footprints[0].Footprint.RowPitch <= row_bytes[0]) return 52;
+
+    static std::vector<unsigned char> backing;
+    backing.assign(static_cast<std::size_t>(total_bytes), 0);
+
+    const auto write_voxel = [&](UINT mip, UINT z, UINT y, UINT x, const unsigned char rgba[4]) {
+        const auto& fp = footprints[mip].Footprint;
+        const UINT64 slice_pitch = fp.RowPitch * rows[mip];
+        const UINT64 offset = footprints[mip].Offset + z * slice_pitch + y * fp.RowPitch + x * 4;
+        if (offset + 4 <= backing.size())
+            std::memcpy(backing.data() + offset, rgba, 4);
+    };
+
+    const unsigned char c0[4] = {200, 50, 10, 255};   // mip 0, slice 0
+    const unsigned char c1[4] = {50, 200, 10, 255};   // mip 0, slice 1
+    const unsigned char c2[4] = {10, 50, 200, 255};   // mip 1, slice 0
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) {
+            write_voxel(0, 0, y, x, c0);
+            write_voxel(0, 1, y, x, c1);
+        }
+    for (UINT y = 0; y < 2; ++y)
+        for (UINT x = 0; x < 2; ++x)
+            write_voxel(1, 0, y, x, c2);
+
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(backing.data()), ptr(&desc),
+                                           D3D12_RESOURCE_STATE_COMMON, 0,
+                                           ptr(&__uuidof(ID3D12Resource)), ptr(&placed)))))
+        return 51;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+
+    const auto draw = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+
+    ViewAt v{};
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture3D.MostDetailedMip = 0;
+    v.view.Texture3D.MipLevels = 2;
+    v.address = ptr(backing.data());
+
+    // Col 0: view of mip 0+1, shader samples (0, 0, slice 0, mip 0)
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    draw(0);
+
+    // Col 1: shader samples (0, 0, slice 1, mip 0)
+    draw(1);
+
+    // Col 2: view restricted to mip 1
+    v.view.Texture3D.MostDetailedMip = 1;
+    v.view.Texture3D.MipLevels = 1;
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    draw(2);
+
+    // Refusals before column 3:
+    // 1. Wrong view dimension (2D view on 3D resource)
+    ViewAt bad_dim = v;
+    bad_dim.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_dim), cpu);
+
+    // 2. Short backing / unregistered interior address
+    ViewAt bad_addr = v;
+    bad_addr.address = ptr(backing.data()) + 1;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_addr), cpu);
+
+    // 3. Mip range out of bounds
+    ViewAt bad_mip = v;
+    bad_mip.view.Texture3D.MostDetailedMip = 2;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_mip), cpu);
+
+    // 4. Explicit non-zero LOD clamp
+    ViewAt bad_clamp = v;
+    bad_clamp.view.Texture3D.ResourceMinLODClamp = 1.0f;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_clamp), cpu);
+
+    // 5. Wrong layout (console layout 0x105)
+    D3D12_RESOURCE_DESC bad_layout = desc;
+    bad_layout.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    invoke(guest, 70, ptr(&bad_layout), ptr(&v), cpu);
+
+    // Col 3: all refusals preserved the previous descriptor (mip 1 view)
+    draw(3);
+
+    // Col 4-7: rebind mip 0+1
+    v.view.Texture3D.MostDetailedMip = 0;
+    v.view.Texture3D.MipLevels = 2;
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    draw(4);
+    draw(5);
+    draw(6);
+    draw(7);
+
     return 0;
 }
