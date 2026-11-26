@@ -2913,7 +2913,8 @@ process's peak and current commit charge in MiB and the number of live 64 KiB ph
 (the heartbeat still calls them sections), so runs that stop at different points can be compared by
 memory spent rather than by elapsed time. A physical page holds a slot from its first use (a mapping
 or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
-experimental `x2w_xmem_page_stats` export.
+experimental `x2w_xmem_page_stats` export. A page-token write (`x2w_xmem_write_physical`) to a page
+that has no grant is refused with `ERROR_INVALID_PARAMETER`, like a mapping of it.
 
 The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
 its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains

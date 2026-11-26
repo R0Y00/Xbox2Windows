@@ -245,6 +245,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # and section count the DirectStorage heartbeat reports from it.
     add_test(NAME xmem_page_stats COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_page_stats_check.py" "$<TARGET_FILE:xmem_shim>")
+    # A page-token write names granted pages only: no section outside a grant, and a fresh grant reads zero.
+    add_test(NAME xmem_physical_write_owner COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_physical_write_owner_check.py" "$<TARGET_FILE:xmem_shim>")
+    set_tests_properties(xmem_physical_write_owner PROPERTIES TIMEOUT 120)
     # A few mapped pages commit about those pages, not the whole 256 MiB slab that holds them (#1199).
     add_test(NAME xmem_mapped_pages_commit COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_commit_check.py" "$<TARGET_FILE:xmem_shim>")
