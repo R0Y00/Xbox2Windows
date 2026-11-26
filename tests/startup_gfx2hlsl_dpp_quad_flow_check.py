@@ -210,6 +210,15 @@ def controls():
     own = [v for y in range(HEIGHT) for x in range(WIDTH)
            for v in (sum(word(x, y) + k * STEP for k in range(PASSES)) & MASK,) * 2 + (0, 0)]
     check('reference differs from a lane-local reading', reference[0::4] != own[0::4] and reference[1::4] != own[1::4])
+    # A dead quad read behind an early s_endpgm in a branch-free program has no branch to prove: no crash.
+    dead = bytes.fromhex('7e0afebeff0002165d9b00008002047e000081bffa04044a01b100fffa02087e01a000ff000081bf')
+    try:
+        G.Pipeline(VS_WORDS, dead, root_blob(), ps_hw_inputs=PACKED).hlsl_ps()
+        check('dead quad read after s_endpgm translates without a crash', True)
+    except G.Unsupported as reason:
+        check('dead quad read after s_endpgm translates without a crash', True, str(reason))
+    except Exception as error:  # noqa: BLE001 - the regression is an unexpected exception type
+        check('dead quad read after s_endpgm translates without a crash', False, repr(error))
     # A straight-line program with the same reads still translates as before.
     straight = bytes.fromhex('7e0afebeff0002165d9b0000fa02047e01b100ff0f1800f802010000000081bf')
     try:

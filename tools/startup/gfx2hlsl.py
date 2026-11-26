@@ -3516,7 +3516,8 @@ class Stage:
                         todo += succ[blk]
                 after[start] = seen
             return block_of[b] in after[start]
-        first = min([off for off, _ in branches] + list(targets))
+        # No branch or target (a dead read behind an early s_endpgm): nothing for the s_wqm to precede.
+        first = min([off for off, _ in branches] + list(targets), default=float('inf'))
         writers = [off for off, _n, name, asm in self.ins if writes_exec(name, parse(asm)[1])
                    and not (re.sub(r'_e(32|64)$', '', name) in ('s_wqm_b32', 's_wqm_b64')
                             and parse(asm)[1] in (['exec', 'exec'], ['exec_lo', 'exec_lo']))]
