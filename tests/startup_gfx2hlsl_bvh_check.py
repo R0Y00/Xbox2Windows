@@ -386,6 +386,9 @@ def main():
     pipe, hlsl, refusals = translate_program()
     assert not refusals, refusals
     compile_check(hlsl)
+    pipe, hlsl, refusals = translate_program(node=0x04)
+    assert not refusals, refusals
+    compile_check(hlsl)
     if failures:
         print("FAILED: %s" % ", ".join(failures))
         return 1
