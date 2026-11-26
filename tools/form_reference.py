@@ -11,6 +11,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 
@@ -116,7 +117,7 @@ def _validate_out_dir_and_targets(out_dir):
 
 
 def _write_atomic(path, content):
-    """Write content via a sibling temp file and os.replace, unlinking temp files on error."""
+    """Write via a sibling temp file, preserving POSIX output permissions."""
     _validate_output_file(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = None
@@ -132,11 +133,24 @@ def _write_atomic(path, content):
         ) as handle:
             tmp_path = Path(handle.name)
             handle.write(content)
+        if os.name == "posix":
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except FileNotFoundError:
+                mode = 0o666 & ~_umask()
+            os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
     except BaseException:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _umask():
+    # Temporarily restrict permissions rather than relaxing the existing mask.
+    current = os.umask(0o777)
+    os.umask(current)
+    return current
 
 
 def write(name, source, forms, out_dir=OUT):
