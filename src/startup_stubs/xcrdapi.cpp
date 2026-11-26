@@ -8,8 +8,10 @@
 #define X2W_TRAP_MODULE "XCRDAPI.dll"
 #define X2W_TRAP_MODULE_ID 4
 #include "startup_stubs/trap.h"
+#include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
+#include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
 #include "startup_stubs/bcpack_decoder.h"
 
@@ -24,6 +26,7 @@
 #include <vector>
 
 #include <cstdarg>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -31,7 +34,10 @@
 namespace {
 
 using u64 = std::uint64_t;
+using x2w_startup::StorageErrorRecord;
+using x2w_startup::StorageRequest;
 constexpr int slots = 32;
+constexpr u64 memory_source_option = 1ull << 22;
 
 enum Kind : unsigned { factory = 0x20, file = 0x40, status = 0x60, queue = 0x80 };
 const char* kind_name(unsigned kind)
@@ -58,6 +64,17 @@ struct Object {
     struct Unrecorded* unrecorded_tail = nullptr;
 };
 
+struct FileObject : Object {
+    wchar_t filename[MAX_PATH]{};
+};
+
+struct QueueObject : Object {
+    // Independent of QueueWork so a queue can report failures even when it has no worker.
+    std::mutex error_mutex;
+    StorageErrorRecord error_record = x2w_startup::empty_error_record();
+    HANDLE error_event = nullptr;
+};
+
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
 // tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
 // like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
@@ -70,7 +87,7 @@ struct Object {
 // are therefore a plain array, allocated once with new (std::nothrow) at EnqueueRequest.
 struct Entry {
     enum Type { request, status_entry, signal } type;
-    unsigned char bytes[0x48];
+    unsigned char bytes[sizeof(StorageRequest)];
     std::unique_ptr<ULONG_PTR[]> tokens;
     std::size_t token_count = 0;
     Object* array;
@@ -135,9 +152,35 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
+// True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
+// no-access page in between. Walks the regions one VirtualQuery at a time, so a destination that spans
+// regions of different protection is judged page by page. Nothing is written or touched.
+static bool destination_writable(const void* destination, std::size_t bytes)
+{
+    if (bytes == 0) return true;
+    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
+    const std::uintptr_t end = cursor + bytes;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = region_end;
+    }
+    return true;
+}
+
 // Return the exact queued requests that continue this stream in this submission, in queue order.
-// Status entries are skipped, and any unrelated request, submission boundary, or non-matching
-// source/offset ends the continuation chain.
+// Status entries and requests for unrelated files are skipped. In the same file, any non-matching
+// size, non-consecutive offset, or submission boundary ends the continuation chain (Refs #1136, #1144, #1198, #1214).
 static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission_id, u64 source, u64 offset,
                                             unsigned source_size, unsigned destination_size, std::size_t total_size)
 {
@@ -155,17 +198,22 @@ static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission
         }
         if (e.type != Entry::request) continue;
         const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
+        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
+        // Skip requests for other files (interleaving across unrelated files within one submission).
+        if (e_source != source) {
+            continue;
+        }
+        // For the same file, requests must strictly be compressed file requests continuing this sequence.
         if (!(e_options & 1) || (e_options & 0x400000)) {
             break;
         }
-        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
-        if (e_source != source || e_source_size != source_size || e_offset != expected) {
+        if (e_source_size != source_size || e_offset != expected) {
             break;
         }
         const u64 delta = expected - offset;
-        if (delta >= total_size) {
+        if (delta >= total_size || delta > UINT32_MAX) {
             break;
         }
         ids.push_back(e.id);
@@ -189,16 +237,7 @@ void log(const char* format, ...)
     line[n++] = '\r';
     line[n++] = '\n';
     x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n));
-    wchar_t log_path[MAX_PATH];
-    const DWORD length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path, MAX_PATH);
-    if (length && length < MAX_PATH) {
-        HANDLE out = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (out != INVALID_HANDLE_VALUE) {
-            x2w_trap::write_all(out, line, static_cast<DWORD>(n));
-            CloseHandle(out);
-        }
-    }
+    x2w_trap::append_log(line, static_cast<DWORD>(n), false);
 }
 
 void guid_text(const void* guid, char* out, std::size_t size)
@@ -240,13 +279,25 @@ long __stdcall query_interface(Object* self, const GUID* riid, void** out)
     return S_OK;
 }
 unsigned long __stdcall add_ref(Object* self) { return static_cast<unsigned long>(InterlockedIncrement(&self->refs)); }
-unsigned long __stdcall release(Object* self) { return static_cast<unsigned long>(InterlockedDecrement(&self->refs)); }
+unsigned long __stdcall release(Object* self)
+{
+    const auto refs = static_cast<unsigned long>(InterlockedDecrement(&self->refs));
+    if (refs == 0 && self->kind == queue) {
+        auto& object = *static_cast<QueueObject*>(self);
+        const std::lock_guard guard(object.error_mutex);
+        if (object.error_event) CloseHandle(std::exchange(object.error_event, nullptr));
+    }
+    return refs;
+}
 
 void** make_table(unsigned kind);
 
 Object* make(unsigned kind)
 {
-    auto* object = new Object{};
+    Object* object;
+    if (kind == queue) object = new QueueObject{};
+    else if (kind == file) object = new FileObject{};
+    else object = new Object{};
     object->vtable = make_table(kind);
     object->kind = kind;
     object->refs = 1;
@@ -259,16 +310,21 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
 {
     char id[48];
     guid_text(riid, id, sizeof(id));
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!path) {
+        log("x2w-dstorage Factory::OpenFile path=(null) riid=%s -> E_INVALIDARG", id);
+        return E_INVALIDARG;
+    }
     HANDLE handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
     const DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : 0;
     log("x2w-dstorage Factory::OpenFile path=\"%ls\" riid=%s -> %s (err %lu)", path ? path : L"(null)", id,
         handle == INVALID_HANDLE_VALUE ? "fail" : "ok", error);
-    if (!out) return E_POINTER;
-    *out = nullptr;
     if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(error);
-    Object* object = make(file);
+    auto* object = static_cast<FileObject*>(make(file));
     object->handle = handle;
+    wcsncpy_s(object->filename, path, _TRUNCATE);
     *out = object;
     return S_OK;
 }
@@ -283,7 +339,10 @@ long __stdcall factory_create_status_array(Object*, unsigned capacity, const cha
     Object* object = make(status);
     object->capacity = capacity;
     object->results = new LONG[capacity ? capacity : 1];
-    for (unsigned i = 0; i < capacity; ++i) object->results[i] = static_cast<LONG>(0x8000000A);  // E_PENDING
+    // A new slot is complete with S_OK until EnqueueStatus marks it pending (#1843), as in Microsoft's
+    // Win32 implementation of this API (Xbox-GDK-Samples, MIT: SimpleDirectStorageCombo/DirectStorageWin32/
+    // DirectStorageWin32WrapperStatusArray.cpp). A caller may poll IsComplete before a slot's first use.
+    for (unsigned i = 0; i < capacity; ++i) object->results[i] = S_OK;
     *out = object;
     return S_OK;
 }
@@ -307,8 +366,10 @@ long __stdcall factory_create_queue(Object*, const unsigned char* desc, const GU
     log("x2w-dstorage Factory::CreateQueue desc=[%s] name=\"%s\" riid=%s", bytes,
         name && x2w_local::readable(name, 1) ? name : "?", id);
     if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
     Object* object = make(queue);
-    object->capacity = desc ? *reinterpret_cast<const std::uint16_t*>(desc + 8) : 0;
+    object->capacity = *reinterpret_cast<const std::uint16_t*>(desc + 8);
     *out = object;
     return S_OK;
 }
@@ -325,9 +386,10 @@ void __stdcall file_close(Object* self)
 long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 {
     const BOOL ok = info && GetFileInformationByHandle(self->handle, info);
+    const DWORD error = ok ? 0 : GetLastError();  // before log(), whose Win32 calls overwrite it
     log("x2w-dstorage File::GetFileInformation -> %s size=0x%llx", ok ? "ok" : "fail",
         ok ? (static_cast<unsigned long long>(info->nFileSizeHigh) << 32) | info->nFileSizeLow : 0ull);
-    return ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    return ok ? S_OK : HRESULT_FROM_WIN32(error);
 }
 
 // Queue slot 3, EnqueueRequest(request*) by the PC numbering. Request layout from the title's builder
@@ -336,6 +398,155 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
+
+// Failed requests by cause, for the heartbeat (#1198). Each failure site names its cause and
+// count_failure adds it to requests_failed as well, so the causes add up to that total. "other" holds
+// the failures without a cause of their own: unknown option bits, page grants and page writes, a page
+// array unreadable at run, an entry that threw, an entry never started. Fixed counters, no allocation.
+enum class StorageFailure : unsigned {
+    read_at_or_past_eof, read_crossing_eof, read_other, destination_capacity, destination_not_writable,
+    zlib, bcpack, other, count
+};
+using StorageFailureCounts = LONG[static_cast<unsigned>(StorageFailure::count)];
+StorageFailureCounts storage_failures;
+
+void count_failure(StorageFailure cause, Object* self = nullptr, const unsigned char* bytes = nullptr,
+                   HRESULT result = E_FAIL) noexcept
+{
+    InterlockedIncrement(&storage_failures[static_cast<unsigned>(cause)]);
+    InterlockedIncrement(&requests_failed);
+    if (!self || !bytes) return;
+
+    auto& object = *static_cast<QueueObject*>(self);
+    const std::lock_guard guard(object.error_mutex);
+    auto& record = object.error_record;
+    const bool first = record.failure_count == 0;
+    if (record.failure_count != UINT32_MAX) ++record.failure_count;
+    if (!first) return;
+
+    StorageRequest request;
+    std::memcpy(&request, bytes, sizeof request);
+    auto& failure = record.first_failure;
+    failure.result = result;
+    failure.command_type = x2w_startup::command_type_request;
+    failure.options = request.options;
+    failure.destination = request.destination;
+    failure.destination_size = request.destination_size;
+    if (request.options & memory_source_option) {
+        failure.source = request.source;
+    } else {
+        const auto* source = static_cast<const FileObject*>(request.source);
+        if (x2w_local::readable(source, sizeof(*source)) && source->kind == file)
+            std::memcpy(failure.filename, source->filename, sizeof failure.filename);
+        failure.file_offset = request.file_offset;
+    }
+    failure.source_size = request.source_size;
+    failure.cancellation_tag = request.cancellation_tag;
+    const std::size_t name_bytes = x2w_local::probe_readable(reinterpret_cast<std::uintptr_t>(request.name),
+                                                           sizeof failure.name - 1);
+    for (std::size_t i = 0; i < name_bytes && request.name[i]; ++i) failure.name[i] = request.name[i];
+    if (object.error_event) SetEvent(object.error_event);
+}
+
+// The cause of a refused file read, from its range against the file size. No end offset is formed, so
+// neither an offset nor a count near 2^64 can wrap: at or past the end is offset >= size, crossing it
+// is count > size - offset (evaluated only when offset < size).
+StorageFailure read_failure_cause(bool size_known, u64 file_size, u64 offset, u64 count) noexcept
+{
+    if (!size_known) return StorageFailure::read_other;
+    if (offset >= file_size) return StorageFailure::read_at_or_past_eof;
+    if (count > file_size - offset) return StorageFailure::read_crossing_eof;
+    return StorageFailure::read_other;
+}
+
+StorageFailure read_failure_cause(const Object* file_object, u64 offset, u64 count) noexcept
+{
+    LARGE_INTEGER length{};
+    const bool known = file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
+                       GetFileSizeEx(file_object->handle, &length) && length.QuadPart >= 0;
+    return read_failure_cause(known, known ? static_cast<u64>(length.QuadPart) : 0, offset, count);
+}
+
+// The status HRESULT a failed request reports, by cause. A destination too small for the data and a
+// read at or past the end of the file are told apart; every other cause stays E_FAIL.
+HRESULT failure_result(StorageFailure cause) noexcept
+{
+    switch (cause) {
+    case StorageFailure::destination_capacity: return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    case StorageFailure::read_at_or_past_eof:
+    case StorageFailure::read_crossing_eof: return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+    default: return E_FAIL;
+    }
+}
+
+// The heartbeat's line of failure causes. It is a line of its own after the totals line, whose text
+// stays as it was; it carries no "inflated=", "options=" or "commit peak=" text, which
+// tools/startup/live_view.py, tools/startup/triage_run.py and tests/startup_heartbeat_check.py match.
+LONG sample_failure_counts(StorageFailureCounts& counts) noexcept
+{
+    ULONG total = 0;
+    for (unsigned i = 0; i < static_cast<unsigned>(StorageFailure::count); ++i) {
+        counts[i] = InterlockedCompareExchange(&storage_failures[i], 0, 0);
+        total += static_cast<ULONG>(counts[i]);
+    }
+    return static_cast<LONG>(total);
+}
+
+int format_failure_causes(char* out, std::size_t size, int second, const StorageFailureCounts& n) noexcept
+{
+    return std::snprintf(out, size,
+                         "x2w-dstorage heartbeat %d s: failed requests by cause read-at-or-past-eof=%ld "
+                         "read-crossing-eof=%ld read-other=%ld destination-capacity=%ld destination-not-writable=%ld "
+                         "zlib=%ld bcpack=%ld other=%ld",
+                         second, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
+}
+
+// Page-destination requests (option bit 21) by where their destination ends against the first 64 KiB
+// page, each split into completed and failed, for the heartbeat (#1198). The end is page_offset (+0x10,
+// low 16 bits) plus destination_size (+0x18, u32), formed in 64 bits so it cannot wrap. A request is
+// counted once, when it runs: by execute_request for every outcome but "empty" (which is neither
+// completed nor failed), and as failed when its page array is unreadable at run or its run threw. An
+// entry that never started is not counted (it failed in Submit, without running). Fixed counters, no
+// allocation; nothing here changes an outcome.
+enum class PageEnd : unsigned { inside, at_page_end, past, count };
+using PageEndCounts = LONG[static_cast<unsigned>(PageEnd::count)][2];  // [end][0 completed, 1 failed]
+PageEndCounts page_end_counts;
+
+PageEnd page_end(unsigned page_offset, unsigned destination_size) noexcept
+{
+    const u64 end = u64{page_offset} + destination_size;
+    if (end < 0x10000) return PageEnd::inside;
+    if (end == 0x10000) return PageEnd::at_page_end;
+    return PageEnd::past;
+}
+
+void count_page_request(const unsigned char* request, bool failed) noexcept
+{
+    const u64 options = *reinterpret_cast<const u64*>(request);
+    if (!(options & (1ull << 21))) return;
+    const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
+    const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
+    InterlockedIncrement(&page_end_counts[static_cast<unsigned>(page_end(page_offset, destination_size))][failed ? 1 : 0]);
+}
+
+void sample_page_end_counts(PageEndCounts& counts) noexcept
+{
+    for (unsigned end = 0; end < static_cast<unsigned>(PageEnd::count); ++end)
+        for (unsigned failed = 0; failed < 2; ++failed)
+            counts[end][failed] = InterlockedCompareExchange(&page_end_counts[end][failed], 0, 0);
+}
+
+// The heartbeat's line of page-destination requests by end, after the failure causes. Like that line it
+// carries no "inflated=", "options=" or "commit peak=" text.
+int format_page_ends(char* out, std::size_t size, int second, const PageEndCounts& n) noexcept
+{
+    return std::snprintf(out, size,
+                         "x2w-dstorage heartbeat %d s: page requests by end against the first 64 KiB page "
+                         "inside-completed=%ld inside-failed=%ld at-page-end-completed=%ld at-page-end-failed=%ld "
+                         "past-completed=%ld past-failed=%ld",
+                         second, n[0][0], n[0][1], n[1][0], n[1][1], n[2][0], n[2][1]);
+}
+
 LONG bcpack_requests[16], bcpack_blank[16];
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 
@@ -370,8 +581,56 @@ void log_bcpack_summary()
         format_counts(blank, sizeof(blank), bcpack_blank));
 }
 
+// Try to serve an identified continuation slice of an already-inflated chunked stream from the in-memory cache
+// (Refs #1136, #1144, #1198, #1214). Returns true if this request was matched as a continuation slice.
+static bool try_serve_cached_continuation(Object* self, u64 source, u64 offset, unsigned source_size,
+                                          unsigned destination_size, u64 entry_id,
+                                          std::vector<unsigned char>& output, std::size_t& decode_length,
+                                          const char*& outcome, StorageFailure& failure, const unsigned char*& data)
+{
+    if (!self || !self->work) return false;
+    QueueWork& work = *self->work;
+    const std::lock_guard guard(work.mutex);
+    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
+        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
+            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
+            if (pos != it->continuation_ids.end()) {
+                const u64 delta = offset - it->base_offset;
+                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
+                if ((delta % step) == 0 && delta < it->data.size() && delta <= UINT32_MAX) {
+                    const std::size_t available = it->data.size() - static_cast<std::size_t>(delta);
+                    if (destination_size > available) {
+                        outcome = "destination capacity exceeded";
+                        failure = StorageFailure::destination_capacity;
+                        data = nullptr;
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                    const std::size_t slice_size = destination_size < available ? destination_size : available;
+                    if (slice_size > 0) {
+                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
+                        decode_length = slice_size;
+                        data = output.data();
+                        outcome = "inflated (slice from stream cache)";
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
+    X2W_ZONE("DirectStorage request");
     if (!request) return;
     const u64 options = *reinterpret_cast<const u64*>(request);
     auto* const destination = *reinterpret_cast<unsigned char* const*>(request + 0x08);
@@ -379,10 +638,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const u64 source = *reinterpret_cast<const u64*>(request + 0x20);
     const u64 offset = *reinterpret_cast<const u64*>(request + 0x28);
     const unsigned source_size = *reinterpret_cast<const unsigned*>(request + 0x30);
-    const bool memory_source = (options & 0x400000) != 0;
+    const bool memory_source = (options & memory_source_option) != 0;
     const unsigned compression = static_cast<unsigned>(options & 0xFF);
     static LONG logged;
-    if (InterlockedIncrement(&logged) <= 12) {
+    if (x2w_local::first_calls(logged, 12)) {
         char bytes[3 * 0x40 + 1] = "";
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
@@ -397,8 +656,14 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
     const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
     const char* outcome = "done";
+    StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
+    const unsigned char* data = nullptr;
+    std::size_t decode_length = source_size;
+    const std::size_t destination_capacity = destination_size;
+    bool written = false;
+
     if (options & ~known) {
         outcome = "unknown option bits, not done";
     } else if (!destination || !source_size) {
@@ -410,13 +675,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         if (file_object && file_object->kind == file &&
             x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
             input = packed.data();
-        else
+        else {
             outcome = "read failed";
+            failure = read_failure_cause(file_object, offset, source_size);
+        }
     }
-    const unsigned char* data = nullptr;
-    std::size_t decode_length = source_size;
-    const std::size_t destination_capacity = destination_size;
-    bool written = false;
 
     if (input) {
         data = input;
@@ -424,19 +687,23 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
-                // With BCPack after it, the inflated size is not given; the destination size bounds it.
-                // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
-                // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
-                // so single-pass inflate succeeds and verifies Adler32, then check capacity before writing.
-                const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
-                std::size_t target_size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
-                if (bcpack) target_size = target_size * 2 + 0x10000;
+                // The public DSTORAGE_REQUEST layout has SourceSize at +0x30, IntermediateSize at +0x34 (the
+                // number of BCPack bytes when zlib and BCPack are both requested) and CancellationTag at
+                // +0x38. The tag is an arbitrary value, not a size, so no buffer is sized from it. A zlib-only
+                // request inflates to DestinationSize; with BCPack after it the inflated size is
+                // IntermediateSize, and the earlier destination-based bound is kept as the minimum.
+                const unsigned intermediate_size = *reinterpret_cast<const unsigned*>(request + 0x34);
+                std::size_t target_size = destination_size;
+                if (bcpack) {
+                    target_size = target_size * 2 + 0x10000;
+                    if (intermediate_size > target_size) target_size = intermediate_size;
+                }
                 output.resize(target_size);
                 std::size_t produced = 0;
                 bool ok = x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced);
                 if (!ok && output.size() < 0x80000) {
-                    // If destination_size was smaller than the uncompressed stream and uncompressed_size was unset,
-                    // expand up to 512 KiB to accommodate larger chunks.
+                    // If destination_size was smaller than the uncompressed stream, expand up to 512 KiB to
+                    // accommodate larger chunks.
                     std::size_t big_size = std::size_t{destination_size} * 8 + 0x40000;
                     if (big_size < 0x80000) big_size = 0x80000;
                     std::vector<unsigned char> big(big_size);
@@ -451,10 +718,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     output.resize(produced);
                     bool cached_chunked = false;
                     // If the stream expanded beyond this request's destination and continuation chunks are queued
-                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
+                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1144, #1198, #1214).
                     // BCPack streams are atomic multi-lane rANS payloads; they are not chunk-split continuation streams (Refs #1139).
                     if (!memory_source && !bcpack && produced > destination_size && self && self->work) {
-                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
+                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size,
+                                                                    destination_size, produced);
                         if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
                             const std::lock_guard guard(work.mutex);
@@ -480,45 +748,21 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             // slice of an already-inflated chunked stream on this queue (Refs #1136, #1144, #1214).
             // A request presenting a zlib header that failed decode (e.g. damaged checksum) is an actual
             // decode error and must stay distinct from a proven continuation. Memory requests stay strictly on direct decode.
-            if (!direct_decoded && !decode_error && !memory_source && self && self->work) {
+            if (!direct_decoded && !decode_error && !memory_source && !bcpack && destination && source_size && self && self->work) {
                 auto* file_object = reinterpret_cast<Object*>(source);
-                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE) {
-                    QueueWork& work = *self->work;
-                    const std::lock_guard guard(work.mutex);
-                    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
-                        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
-                            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
-                            if (pos != it->continuation_ids.end()) {
-                                const u64 delta = offset - it->base_offset;
-                                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
-                                if ((delta % step) == 0 && delta < it->data.size()) {
-                                    const std::size_t available = it->data.size() - delta;
-                                    // Handle short final destinations in multi-piece streams (Refs #1144)
-                                    const std::size_t slice_size = destination_size < available ? destination_size : available;
-                                    if (slice_size > 0 && destination_size <= available) {
-                                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
-                                        decode_length = slice_size;
-                                        data = output.data();
-                                        outcome = "inflated (slice from stream cache)";
-                                        direct_decoded = true;
-                                        it->continuation_ids.erase(pos);
-                                        if (it->continuation_ids.empty()) {
-                                            work.cached_streams.erase(it);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
+                    try_serve_cached_continuation(self, source, offset, source_size, destination_size, entry_id,
+                                                  output, decode_length, outcome, failure, data)) {
+                    direct_decoded = true;
                 }
             }
 
             if (!direct_decoded) {
                 outcome = "zlib failed";
+                failure = StorageFailure::zlib;
                 data = nullptr;
                 static LONG diagnosed;
-                if (InterlockedIncrement(&diagnosed) <= 12) {
+                if (x2w_local::first_calls(diagnosed, 12)) {
                     unsigned h[4] = {};
                     for (unsigned i = 0; i < 4 && i < source_size; ++i) h[i] = input[i];
                     log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
@@ -526,9 +770,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
+    }
+    if (input) {
         bool bcpack_decoded = false;
         if (data && bcpack) {
-            if (bcpack == 7 || bcpack == 1) {
+            if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
                 std::vector<unsigned char> decoded(destination_size);
                 std::size_t produced = 0;
                 if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
@@ -539,6 +785,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     bcpack_decoded = true;
                 } else {
                     outcome = "bcpack failed";
+                    failure = StorageFailure::bcpack;
                     data = nullptr;
                 }
             } else {
@@ -556,6 +803,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             // and leave the destination memory completely unchanged.
             if (decode_length > destination_capacity) {
                 outcome = "destination capacity exceeded";
+                failure = StorageFailure::destination_capacity;
                 data = nullptr;
             } else if (page_destination) {
                 const ULONG_PTR needed_pages = (page_offset + decode_length + 0xFFFF) / 0x10000;
@@ -592,7 +840,17 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     data = nullptr;
                 }
             } else if (data != destination) {
-                std::memcpy(destination, data, decode_length);
+                // The title's destination can be smaller in memory than its declared capacity (#870:
+                // a write fault inside this copy). Judge the whole declared capacity before the first
+                // byte is written, so a refusal leaves every page untouched.
+                if (destination_writable(destination, destination_capacity)) {
+                    std::memcpy(destination, data, decode_length);
+                } else {
+                    outcome = "destination not writable";
+                    failure = StorageFailure::destination_not_writable;
+                    data = nullptr;
+                    written = false;
+                }
             }
             if (written) {
                 if (bcpack && !bcpack_decoded) {
@@ -606,11 +864,14 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             }
         }
     }
-    const bool failed = (data == nullptr || !written) && std::strcmp(outcome, "empty") != 0;
-    if (failed) InterlockedIncrement(&requests_failed);
-    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+    const bool empty = std::strcmp(outcome, "empty") == 0;
+    const bool failed = (data == nullptr || !written) && !empty;
+    const HRESULT result = failure_result(failure);
+    if (failed) count_failure(failure, self, request, result);
+    if (!empty) count_page_request(request, failed);
+    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(result));
     static LONG summaries, failures;
-    if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
+    if (x2w_local::first_calls(summaries, 12) || (failed && x2w_local::first_calls(failures, 12)))
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
             static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
 }
@@ -630,10 +891,11 @@ void run_entry(Object* self, Entry& entry)
             // no token captured at enqueue is ever used.
             const std::size_t bytes = entry.token_count * sizeof(ULONG_PTR);
             if (!title || !x2w_local::readable(title, bytes)) {
-                InterlockedIncrement(&requests_failed);
+                count_failure(StorageFailure::other, self, entry.bytes);
+                count_page_request(entry.bytes, true);
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
-                if (InterlockedIncrement(&unreadable) <= 12)
+                if (x2w_local::first_calls(unreadable, 12))
                     log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
                         static_cast<const void*>(title), entry.token_count);
                 return;
@@ -673,10 +935,11 @@ void copy_reason(char (&reason)[96], const char* text) noexcept
 // Fails the entry that threw: the next status entry reports E_FAIL, the worker goes on with the queue.
 void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
 {
-    InterlockedIncrement(&requests_failed);
+    count_failure(StorageFailure::other, self, entry.type == Entry::request ? entry.bytes : nullptr);
+    if (entry.type == Entry::request) count_page_request(entry.bytes, true);
     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG reported;
-    if (InterlockedIncrement(&reported) <= 12)
+    if (x2w_local::first_calls(reported, 12))
         log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), reason,
             entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
 }
@@ -779,8 +1042,8 @@ bool start_worker(Object* self, QueueWork* work)
     return true;
 }
 
-// What an entry that could not be stored needs in order to fail at Submit: no request bytes, since a
-// request only counts as failed.
+// What an entry that could not be stored needs in order to fail at Submit, including the request
+// bytes for the error record. No page tokens or separately allocated request storage are needed.
 struct Unrecorded {
     Unrecorded* next;
     u64 submission_id;
@@ -790,6 +1053,7 @@ struct Unrecorded {
     unsigned index;
     void* fence;
     u64 value;
+    unsigned char bytes[sizeof(StorageRequest)];
 };
 
 // True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
@@ -804,10 +1068,11 @@ bool deferred_pending(const QueueWork& work)
 
 // Fails an entry that will not run: a request counts as failed, a status entry completes with the
 // pending failure (E_OUTOFMEMORY when nothing worse is pending), a fence is signaled.
-void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value)
+void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value,
+                    const unsigned char* request)
 {
     if (type == Entry::request) {
-        InterlockedIncrement(&requests_failed);
+        count_failure(StorageFailure::other, self, request, E_OUTOFMEMORY);
         InterlockedCompareExchange(&self->pending, static_cast<LONG>(E_OUTOFMEMORY), S_OK);
     } else if (type == Entry::status_entry) {
         const LONG pending = InterlockedExchange(&self->pending, S_OK);
@@ -843,11 +1108,12 @@ bool has_unrecorded(Object* self)
 
 void defer_unrecorded(Object* self, const Entry& entry)
 {
-    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value};
+    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value, {}};
     if (!node) {
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
         return;
     }
+    if (entry.type == Entry::request) std::memcpy(node->bytes, entry.bytes, sizeof node->bytes);
     const std::lock_guard guard(setup_mutex());
     (self->unrecorded_tail ? self->unrecorded_tail->next : self->unrecorded_head) = node;
     self->unrecorded_tail = node;
@@ -863,7 +1129,7 @@ void fail_unrecorded(Object* self)
     }
     while (node) {
         Unrecorded* const next = node->next;
-        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
         delete node;
         node = next;
     }
@@ -880,7 +1146,7 @@ void fail_waiting(Object* self, QueueWork* work)
             entry = std::move(work->waiting.front());
             work->waiting.pop_front();
         }
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
     }
 }
 
@@ -1008,10 +1274,10 @@ void complete_deferred(Object* self, QueueWork* work)
             }
         }
         if (node) {
-            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
             delete node;
         } else {
-            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
         }
     }
 }
@@ -1027,13 +1293,18 @@ void push(Object* self, Entry&& entry)
     start_worker(self, work);  // a failure shows at Submit
     bool recorded = false;
     bool full = false;
-    try {
+    {
         const std::lock_guard guard(work->mutex);
-        entry.id = ++work->next_entry_id;
-        work->waiting.push_back(std::move(entry));
-        recorded = true;
-        full = self->capacity && work->waiting.size() >= self->capacity;
-    } catch (const std::bad_alloc&) {
+        // The handler sits inside the lock's scope, like every other growth of these lists: a
+        // std::bad_alloc must not unwind through the guard (the MSVC build under test then leaves
+        // the mutex locked, and the next Submit throws std::system_error on its own lock).
+        try {
+            entry.id = ++work->next_entry_id;
+            work->waiting.push_back(std::move(entry));
+            recorded = true;
+            full = self->capacity && work->waiting.size() >= self->capacity;
+        } catch (const std::bad_alloc&) {
+        }
     }
     if (!recorded) {
         defer_unrecorded(self, entry);
@@ -1077,7 +1348,7 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
 {
     const bool valid = array && array->kind == status && index < array->capacity;
     static LONG calls;
-    if (!valid || InterlockedIncrement(&calls) <= 8)
+    if (!valid || x2w_local::first_calls(calls, 8))
         log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
             static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
     if (!valid) return;
@@ -1109,41 +1380,64 @@ void signal_fence(void* fence, u64 value)
         hr = reinterpret_cast<Signal>((*static_cast<void***>(fence))[10])(fence, value);
     }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4)
+    if (x2w_local::first_calls(calls, 4))
         log("x2w-dstorage Queue::EnqueueSignal fence=%p value=0x%llx -> 0x%08lx", fence, value, static_cast<unsigned long>(hr));
 }
 void __stdcall queue_submit(Object* self, u64 rdx, u64 r8)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
     submit(self);
 }
 void __stdcall queue_cancel(Object*, u64 mask, u64 value)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
 }
 void __stdcall queue_close(Object*) { log("x2w-dstorage Queue::Close"); }
-HANDLE __stdcall queue_error_event(Object*)
+// Slots 9 and 10 follow Microsoft's Xbox-GDK-Samples dstorage_win32.h. GetErrorEvent's
+// caller owns its handle (Microsoft Learn IDStorageQueueX::GetErrorEvent).
+HANDLE __stdcall queue_error_event(Object* self)
 {
-    static HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    auto& object = *static_cast<QueueObject*>(self);
+    HANDLE event = nullptr;
+    {
+        const std::lock_guard guard(object.error_mutex);
+        if (!object.error_event)
+            object.error_event = CreateEventW(nullptr, TRUE, object.error_record.failure_count != 0, nullptr);
+        if (object.error_event)
+            DuplicateHandle(GetCurrentProcess(), object.error_event, GetCurrentProcess(), &event,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+    }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::GetErrorEvent -> %p (never signaled)", event);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::GetErrorEvent -> %p", event);
     return event;
+}
+void __stdcall queue_retrieve_error_record(Object* self, StorageErrorRecord* out)
+{
+    if (!out) return;
+    auto& object = *static_cast<QueueObject*>(self);
+    const std::lock_guard guard(object.error_mutex);
+    std::memcpy(out, &object.error_record, sizeof *out);
+    object.error_record = x2w_startup::empty_error_record();
+    // The sample header and Microsoft Learn describe a new notification after each retrieve.
+    // Keep the manual-reset event signaled until retrieval consumes the record. Reset under
+    // the record's lock so a concurrent failure cannot lose its notification.
+    if (object.error_event) ResetEvent(object.error_event);
 }
 // Status array slot 3 IsComplete(index), slot 4 GetHResult(index).
 bool __stdcall status_is_complete(Object* self, unsigned index)
 {
     const bool complete = index < self->capacity && self->results[index] != static_cast<LONG>(0x8000000A);
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
     return complete;
 }
 long __stdcall status_hresult(Object* self, unsigned index)
 {
     const long hr = index < self->capacity ? self->results[index] : E_INVALIDARG;
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
     return hr;
 }
 
@@ -1171,6 +1465,7 @@ void** make_table(unsigned kind)
             table[7] = reinterpret_cast<void*>(&queue_cancel);
             table[8] = reinterpret_cast<void*>(&queue_close);
             table[9] = reinterpret_cast<void*>(&queue_error_event);
+            table[10] = reinterpret_cast<void*>(&queue_retrieve_error_record);
         } else if (kind == status) {
             table[3] = reinterpret_cast<void*>(&status_is_complete);
             table[4] = reinterpret_cast<void*>(&status_hresult);
@@ -1212,6 +1507,18 @@ MemorySample memory_sample() noexcept
     return sample;
 }
 
+// The heartbeat interval in ms: 10000 unless X2W_HEARTBEAT_INTERVAL_MS holds a whole number from 1000
+// to 10000. Only tests set it, to see a sample without waiting 10 s; anything else keeps the default.
+DWORD heartbeat_interval_ms() noexcept
+{
+    char text[16];
+    const DWORD length = GetEnvironmentVariableA("X2W_HEARTBEAT_INTERVAL_MS", text, sizeof(text));
+    if (length == 0 || length >= sizeof(text)) return 10000;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    return (*end == '\0' && value >= 1000 && value <= 10000) ? static_cast<DWORD>(value) : 10000;
+}
+
 }  // namespace
 
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
@@ -1227,13 +1534,22 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     (void)bcpack_summary;
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
     // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
-    // what the run spends (#1199), including while requests are stalled.
+    // what the run spends (#1199), including while requests are stalled. A second line splits the
+    // failed requests by cause, a third the page-destination requests by end (#1198).
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         MemorySample last_memory;
-        for (int second = 10;; second += 10) {
-            Sleep(10000);
-            const LONG total = requests_done + requests_compressed + requests_failed;
+        const DWORD interval_ms = heartbeat_interval_ms();
+        for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
+            const int second = static_cast<int>(elapsed_ms / 1000);
+            Sleep(interval_ms);
+            // Sample the counters once for every line of this report, even while the worker is reporting
+            // new failures.
+            StorageFailureCounts failure_counts;
+            const LONG failed = sample_failure_counts(failure_counts);
+            PageEndCounts page_ends;
+            sample_page_end_counts(page_ends);
+            const LONG total = requests_done + requests_compressed + failed;
             const LONG total2 = total + requests_bcpack_blank;
             const MemorySample sample = memory_sample();
             const ULONGLONG peak_mib = sample.peak_commit >> 20;
@@ -1258,8 +1574,12 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
+                    failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
+                char causes[384];
+                if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
+                char ends[384];
+                if (format_page_ends(ends, sizeof(ends), second, page_ends) > 0) log("%s", ends);
                 last = total2;
                 last_memory = sample;
             }
