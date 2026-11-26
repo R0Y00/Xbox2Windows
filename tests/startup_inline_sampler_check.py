@@ -90,9 +90,57 @@ def check_copied_constant_sampler():
     print('copied constant sampler folds to %s' % got[0])
 
 
+def copy_symbol(symbols, copy='s_mov_b32 s12, s15'):
+    """The symbol s12 holds after `copy` runs on a bare stage that starts with `symbols`."""
+    class Pipe:
+        sampler_heap = False
+
+    stage = G.Stage.__new__(G.Stage)
+    stage.pipe, stage.sym, stage.lines = Pipe(), dict(symbols), []
+    stage.used_s, stage.used_v, stage.uniform_v, stage.exec_known = set(), set(), set(), True
+    stage.has_branches, stage.masks = False, set()
+    stage.one(copy.split()[0], copy)
+    return stage.sym.get(12)
+
+
+def check_copy_only_folds_plain_constants():
+    """Only a plain ('const', value) copies as a constant; every other source must not fold."""
+    assert copy_symbol({15: ('const', 0)}) == ('const', 0)
+    # The default-sampler placeholder is tagged 'unassigned': a copy of it is no run-time constant.
+    assert copy_symbol({15: ('const', 0, 'unassigned')}) != ('const', 0)
+    # A register that holds a root constant or nothing known is not a constant.
+    assert copy_symbol({15: ('ud', 1)}) != ('const', 1)
+    assert copy_symbol({}) is None
+    # A copy after the source was overwritten takes the new value, never the old one.
+    assert copy_symbol({15: ('const', 7)}) == ('const', 7)
+    print('copies fold only plain constants')
+
+
+def check_copied_sampler_after_overwrite():
+    """A sampler word copied after its source was rewritten by a run-time value or another constant."""
+    prefix = bytes.fromhex('800398be')  # s_mov_b32 s24, 0
+    copies = bytes.fromhex('180399be' '18039abe' '18039bbe')
+    anchor = prefix + copies
+    assert anchor in COPY_WORDS
+    runtime = COPY_WORDS.replace(anchor, prefix + bytes.fromhex('090398be') + copies)  # s24 = s9 (root constant)
+    try:
+        translate(runtime)
+    except G.Unsupported as error:
+        assert 'holds' in str(error), error
+    else:
+        raise AssertionError('a sampler copied from a run-time register was accepted')
+    # s28 = 0, then s28 = 1, then s27 = s28; s24..s26 stay literal zeros
+    one = COPY_WORDS.replace(anchor, bytes.fromhex('800398be' '800399be' '80039abe' '80039cbe' '81039cbe' '1c039bbe'))
+    smp = [l for l in translate(one).manifest().splitlines() if l.startswith('smp ')]
+    assert smp == ['smp 0 0x0 0x0 0x0 0x1'], smp
+    print('copy after overwrite: run-time source refused, new constant wins (%s)' % smp[0])
+
+
 def controls():
     check_compare_sampler_constant()
     check_copied_constant_sampler()
+    check_copy_only_folds_plain_constants()
+    check_copied_sampler_after_overwrite()
     fixtures = []
     for name, code, words in (
         ('clamp', CLAMP_WORDS, (0x2, 0, 0x00100000, 0)),

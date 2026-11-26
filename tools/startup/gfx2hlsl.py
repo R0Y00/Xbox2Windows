@@ -4285,8 +4285,9 @@ class Stage:
             self.masks.discard(d)
             return None
         if base == 's_mov_b32' and not pair and len(srcs) == 1 and reg_range(srcs[0]) and reg_range(srcs[0])[0] == 's' \
-                and reg_range(srcs[0])[1] == reg_range(srcs[0])[2] and self.is_const(reg_range(srcs[0])[1]) is not None:
-            # A copy of an SGPR holding a known constant is that constant (llc copies a zero into an inline
+                and reg_range(srcs[0])[1] == reg_range(srcs[0])[2] and len(self.sym.get(reg_range(srcs[0])[1]) or ()) == 2 \
+                and self.is_const(reg_range(srcs[0])[1]) is not None:
+            # A copy of an SGPR holding a plain known constant (not the tagged unassigned placeholder) is that constant (llc copies a zero into an inline
             # sampler word: s_mov_b32 s12, s15 after s_mov_b32 s15, 0).
             value = self.is_const(reg_range(srcs[0])[1])
             self.set_s(d, '0x%08xu' % value, ('const', value))
