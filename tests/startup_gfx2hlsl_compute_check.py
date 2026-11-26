@@ -835,6 +835,15 @@ def check_lane_mask_scalar_data():
     translate('A', code=splice_words(compare, bytes.fromhex('6a7e0687'))).hlsl_cs()   # s_and_b32 s6, vcc_lo, exec_lo
 
 
+def check_lane_mask_derived_word():
+    """A bitwise result of a lane mask is still a mask word: a later numeric read of it is refused."""
+    compare = bytes.fromhex('8500027d')              # v_cmp_lt_i32 vcc_lo, 5, v0
+    mask_and = bytes.fromhex('6aff0687ff000000')     # s_and_b32 s6, vcc_lo, 0xff
+    for use in ('060a887d', '060a0a4a'):   # v_cmp_gt_u32 vcc_lo, s6, v5 ; v_add_nc_u32 v5, s6, v5
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, mask_and, bytes.fromhex(use))))
+    refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex('6a0c0a7e'))))  # v_cvt_f32_u32 v5, vcc_lo
+
+
 def check_lane_mask_high_word():
     """The high word of a wave64 mask (the ballot's upper 32 bits) is modelled as 0: a move of it is refused."""
     chunks = [bytes.fromhex(w) for w in ('0000 84d4 9100 0200'.replace(' ', ''),   # v_cmp_gt_i32 s[0:1], 17, v0
@@ -1110,6 +1119,7 @@ def check_controls():
     check_mbcnt()
     check_lane_mask_data()
     check_lane_mask_high_word()
+    check_lane_mask_derived_word()
     check_lane_mask_scalar_data()
     check_formatted_loads()
     a = translate('A')
