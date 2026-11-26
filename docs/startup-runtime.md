@@ -1548,6 +1548,14 @@ access, the last covered by the
 [shared-exponent stand-in](#shared-exponent-render-and-unordered-access-targets)). Choosing a profile
 is not evidence that the path it leads to runs.
 
+A title on the Series S profile may present its picture on a plane above plane 0 and leave plane 0
+black (see [Presented planes](#presented-planes) for a measured case). The output window shows plane 0 alone by
+default, so it then stays black. `X2W_PRESENT_COMPOSITE=1` composites the planes, and
+`X2W_PRESENT_PLANE=<n>` shows one plane alone. Whether other titles, or other profiles, present
+this way is not known. Under either switch, `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented`
+readback still read plane 0. With `X2W_PRESENT_COMPOSITE=1`, the `x2w-render raw plane <n>` line
+shows whether the higher plane holds a picture.
+
 ## D3D12 resource budget
 
 Set `X2W_D3D12_BUDGET=1` before startup to add one `x2w-budget` line to each
