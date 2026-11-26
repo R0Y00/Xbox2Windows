@@ -5,10 +5,6 @@ four distinct binary32 values, stores them with image_store ... dmask:0xf dim:SQ
 the same values to mrt0. The words were assembled by hand from the MIMG layout and are decoded back by
 tools/disasm_rdna2.py here; --llvm-mc reassembles the source and compares the words.
 
-A 2D-array variant (#2742) takes the layer as the third address register (v2 = 1) and must translate to
-a RWTexture2DArray indexed by uint3(v0, v1, v2); the runtime does not bind a 2D-array UAV, so it is a
-translation control only. The 2D form keeps its RWTexture2D and uint2(v0, v1) statement.
-
 Without arguments: translation controls and refusals. With draw: also compile the translation with DXC and
 draw it through offscreen_check --startup-image-store, which reads every texel of a 4x4 image back. Negative
 controls: the translator refuses the program when the lowering is removed, and the translated shader with
@@ -103,17 +99,6 @@ def controls():
     assert manifest.startswith('x2w-manifest 2\n'), manifest
     print('store: %s manifest uav 0 tex2d table 0 0' % STORE_LINE)
 
-    # A 2D-array store takes x, y and the layer in three address registers and binds a layered UAV (#2742).
-    # The runtime refuses a tex2da uav line, so this is checked by translation only.
-    array_store = bytes.fromhex('280f20f000040400')
-    slice_mov = bytes.fromhex('8102047e')  # v_mov_b32_e32 v2, 1: the layer address register
-    array = translate(PREFIX + slice_mov + array_store + SUFFIX)
-    array_ps, array_manifest = array.hlsl_ps(), array.manifest()
-    assert 'RWTexture2DArray<float4> w0 : register(u0);' in array_ps, array_ps
-    assert '    w0[uint3(v0, v1, v2)] = asfloat(uint4(v4, v5, v6, v7));' in array_ps, array_ps
-    assert 'uav 0 tex2da table 0 0' in array_manifest, array_manifest
-    print('array store: RWTexture2DArray w0[uint3(v0, v1, v2)], manifest uav 0 tex2da table 0 0')
-
     # Cache-policy bits and unorm (integer texel coordinates) do not change the written texel.
     for name, store in (('glc', patched(1, 0x20)), ('slc', patched(3, 0x02)),
                         ('dlc', patched(0, 0x80)), ('unorm', patched(1, 0x10))):
@@ -126,6 +111,7 @@ def controls():
     cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
+             ('SQ_RSRC_IMG_2D_ARRAY', bytes.fromhex('280f20f000040400')),
              ('SQ_RSRC_IMG_1D', bytes.fromhex('000f20f000040400')))
     for name, store in cases:
         decoded = D.decode_instruction(store, 0)[2]
