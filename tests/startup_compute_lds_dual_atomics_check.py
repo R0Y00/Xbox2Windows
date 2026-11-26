@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 
 import gfx2hlsl as G  # noqa: E402
-from startup_gfx2hlsl_compute_check import MASK, SENTINEL, TGID_X, USER7, WORDS, patch, refused, root_blob  # noqa: E402
+from startup_gfx2hlsl_compute_check import MASK, SENTINEL, TGID_X, USER7, WORDS, patch, refused, renderer_diagnostics, root_blob  # noqa: E402
 
 
 def le32(w):
@@ -770,11 +770,13 @@ def check_dispatch(dxc, runner, adapter, control=None):
                 return 77
             if check_debug_layer(name, run.stdout, run.stderr) == 'unavailable':
                 print('case %s: debug_layer=unavailable (word readback still verified)' % name)
+            diagnostics = renderer_diagnostics(run.stderr, adapter)
             if control:
-                if run.returncode != 1 or 'expected=' not in run.stderr:
+                if run.returncode != 1 or not diagnostics or not re.fullmatch(
+                        r'word=\d+ expected=[0-9a-f]{8} actual=[0-9a-f]{8}', diagnostics[0]):
                     raise AssertionError('control %s: not rejected (exit %d) %s' % (control, run.returncode, run.stderr))
-                print('control %s: rejected at %s' % (control, run.stderr.strip().splitlines()[0]))
-            elif run.returncode or run.stderr:
+                print('control %s: rejected at %s' % (control, diagnostics[0]))
+            elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:
                 print('case %s: all %d words match' % (name, WORDS))

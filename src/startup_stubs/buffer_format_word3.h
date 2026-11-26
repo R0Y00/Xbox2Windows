@@ -26,6 +26,7 @@ inline std::uint32_t buffer_format_code(DXGI_FORMAT format)
     case DXGI_FORMAT_R16G16_SNORM: return 24;
     case DXGI_FORMAT_R16G16_UINT: return 27;
     case DXGI_FORMAT_R16G16_FLOAT: return 29;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return 50;
     case DXGI_FORMAT_R8G8B8A8_UNORM: return 56;
     case DXGI_FORMAT_R8G8B8A8_UINT: return 60;
     case DXGI_FORMAT_R32G32_FLOAT: return 64;

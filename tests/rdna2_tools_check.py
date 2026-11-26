@@ -6158,10 +6158,10 @@ class TestRdna2Scanner(unittest.TestCase):
         """Issue #928: the 64-bit VOP3 shifts are supported with at most one SGPR or literal source."""
         for line in ("v_lshlrev_b64 v[12:13], v20, v[18:19]", "v_lshrrev_b64 v[2:3], s46, v[4:5]",
                      "v_ashrrev_i64 v[2:3], 0x41, v[4:5]", "v_lshlrev_b64 v[2:3], v1, s[4:5]",
-                     "v_ashrrev_i64 v[2:3], 3, -1", "v_lshlrev_b64_e64 v[2:3], v1, v[4:5]"):
+                     "v_ashrrev_i64 v[2:3], 3, -1", "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64_e64 v[2:3], v1, v[4:5]"):
             self.assertTrue(is_instruction_supported(line), line)
         for line in ("v_lshlrev_b64 v[2:3], s4, s[4:5]", "v_lshlrev_b64 v[2:3], 0x41, s[4:5]",
-                     "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
+                     "v_lshlrev_b64 v[2:3], s4, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
                      "v_lshlrev_b64_e32 v[2:3], v1, v[4:5]", "v_lshlrev_b64 v[2:3], -v1, v[4:5]"):
             self.assertFalse(is_instruction_supported(line), line)
 
