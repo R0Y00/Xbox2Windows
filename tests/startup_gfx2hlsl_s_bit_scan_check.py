@@ -140,8 +140,10 @@ check('b32 refuses a lane-mask source', refused('s_bcnt0_i32_b32', 3, 2, masks=(
 
 
 # ---- a real draw: the translated pixel shader runs on the adapter and its words are read back ----------------
-# Each pixel lane loads a 64-bit (or 32-bit) literal into s4/s5, runs the scalar op into s3 and copies s3 to
-# v12..v15, which the recorded export writes to the render target. The expected words come from ref() above.
+# Each channel loads a 64-bit (or 32-bit) literal into s4/s5 and runs the scalar op into s3.
+# Counts and bit indices are 0..64 or 0xffffffff. XOR moves each expected word into a distinct
+# finite normal float bit pattern before the RGBA32_FLOAT export. A raw small result can flush to zero.
+DRAW_TRANSPORT_XOR = 0x3f000000
 DRAW_VALUES = {
     32: [0, MASK, 0x80000000, 0x12345678, 1, 0xfffffffe, 0x0000ff00, 0xdeadbeef],
     64: [0, (1 << 64) - 1, 1 << 63, 1 << 32, 0x00000000ffffffff, 0xffffffff00000000, 0x0123456789abcdef,
@@ -155,11 +157,12 @@ def sop1(op, sdst, ssrc0):
 
 
 def lane_words(name, value):
-    """s_mov s4/s5 literals, the op, then v_mov_b32 v12..v15 from s3 (one lane's word is stored in all four)."""
+    """Load the literals, evaluate the scalar operation, then encode its result for the export."""
     out = sop1(0x03, 4, 255) + struct.pack('<I', value & MASK)
     if not name.endswith('b32'):
         out += sop1(0x03, 5, 255) + struct.pack('<I', value >> 32)
-    return out + sop1(OPCODES[name], 3, 4)
+    xor_s3_literal = (0b10 << 30) | (0x12 << 23) | (3 << 16) | (255 << 8) | 3
+    return out + sop1(OPCODES[name], 3, 4) + struct.pack('<2I', xor_s3_literal, DRAW_TRANSPORT_XOR)
 
 
 def ps_words_for(name, chunk):
@@ -186,17 +189,18 @@ def draw_check(dxc, renderer, adapter, fxc=None):
                     tag = '%s_%s_%d' % (name, kind, index)
                     ps = compile_hlsl(compiler, kind, pipe.hlsl_ps(), 'ps_' + tag, ps_profile, directory)
                     vs = compile_hlsl(compiler, kind, pipe.hlsl_vs(), 'vs_' + tag, vs_profile, directory)
-                    expected = words_text(ref(name, v)[0] for v in chunk)
+                    expected = words_text(ref(name, v)[0] ^ DRAW_TRANSPORT_XOR for v in chunk)
                     run = draw(renderer, adapter, vs, ps, expected)
                     if run.returncode:
                         raise AssertionError('%s %s %s\n%s\n%s' % (kind, name, [hex(v) for v in chunk], run.stdout,
                                                                    run.stderr))
                     print('%s %s %s: %s' % (kind, name, [hex(v) for v in chunk], expected), flush=True)
                     if index == 0 and name == 's_bcnt1_i32_b64':
-                        wrong = words_text((ref(name, v)[0] + 1) & MASK for v in chunk)
+                        wrong = words_text(((ref(name, v)[0] + 1) & MASK) ^ DRAW_TRANSPORT_XOR for v in chunk)
                         run = draw(renderer, adapter, vs, ps, wrong)
-                        if run.returncode == 0:
-                            raise AssertionError('%s a wrong expectation was accepted' % kind)
+                        if run.returncode != 1 or 'startup_flat_param mismatch' not in run.stderr:
+                            raise AssertionError('%s wrong count did not produce a readback mismatch: %s%s' %
+                                                 (kind, run.stdout, run.stderr))
                         print('%s wrong-expectation control: fails as expected' % kind, flush=True)
 
 
