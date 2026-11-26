@@ -80,6 +80,26 @@ with tempfile.TemporaryDirectory(prefix="x2w frag ") as tmp:
     assert twice.returncode == 1 and "b.txt:1" in twice.stdout and "duplicate" in twice.stdout, twice.stdout
     assert run().returncode == 2
 
+    # A listing saved with a UTF-8 byte-order mark (Notepad, Windows PowerShell 5.1 Set-Content
+    # -Encoding UTF8) behaves like the same listing without one, also when line 1 is a comment or
+    # blank. The mark is written as explicit bytes so the result does not depend on the platform.
+    bom = b"\xef\xbb\xbf"
+    for name, body in (
+        ("path", q(echo) + " bomarg\n"),
+        ("comment", "# note\n" + q(echo) + " bomarg\n"),
+        ("blank", "\n" + q(echo) + " bomarg\n"),
+    ):
+        results = []
+        for mark in (b"", bom):
+            listing = os.path.join(tmp, f"case_bom_{name}_{'bom' if mark else 'plain'}")
+            os.mkdir(listing)
+            with open(os.path.join(listing, "x.txt"), "wb") as handle:
+                handle.write(mark + body.encode("utf-8"))
+            results.append(run("--from-dir", listing))
+        for result in results:
+            assert result.returncode == 0 and "echo ran bomarg" in result.stdout \
+                and "all 1 checks passed" in result.stdout, (name, result.stdout)
+
 # On Windows a listed path keeps its backslashes and quoted words lose their quotes; POSIX
 # splitting would eat the backslashes (`C:\x2w\a.py` -> `C:x2wa.py`).
 split = runpy.run_path(RUNNER)["split_command"]

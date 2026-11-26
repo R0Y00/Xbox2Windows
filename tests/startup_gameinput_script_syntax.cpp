@@ -192,6 +192,9 @@ void check_rejections()
         {"ly=0.5", 0, 1, "missing @<seconds>"},
         {"4@1,base=start", 1, 2, "base= must be the first item"},
         {"base=later,4@1", 1, 1, "unknown base (use poll or start)"},
+        {"2@1e999", 0, 1, "bad time"},
+        {"1@+1e308,2@+1e308", 1, 2, "bad time"},
+        {"1@1e308,2@+1e308", 1, 2, "bad time"},
     };
     for (const Case& c : cases) {
         const x2w_input_script::Script s = x2w_input_script::parse(c.script);
@@ -381,6 +384,11 @@ void check_timeline()
                   close_to(s.entries[4].at, 3.0),
               "relative times follow the previous item's start");
     }
+    // A large but finite relative time is still the exact sum.
+    {
+        const tl::Script s = tl::parse("1@1e300,2@+1e300");
+        check(s.entries.size() == 2 && s.rejections.empty() && s.entries[1].at == 1e300 + 1e300, "large finite relative time is the exact sum");
+    }
     // Rejections of the new items.
     {
         struct Case {
@@ -398,6 +406,8 @@ void check_timeline()
             {"mark=a b", 1, "bad label"},
             {"4@+-1", 1, "bad time"},
             {"wait@5,mark@4", 2, "time before the preceding wait"},
+            {"1@1e308,wait@+1e308", 2, "bad time"},
+            {"1@1e308,mark@+1e308", 2, "bad time"},
         };
         for (const Case& c : cases) {
             const tl::Script s = tl::parse(c.script);

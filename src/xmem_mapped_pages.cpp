@@ -1660,7 +1660,10 @@ const bool lazy_commit_installed = [] {
 
 // Experimental export: writes bytes into physical pages named by the title's
 // page tokens (page number << 4, as XMemMapPhysicalPages takes them), starting offset bytes into the
-// first page. DirectStorage requests can name such pages as their destination.
+// first page. DirectStorage requests can name such pages as their destination. A token that names
+// no granted page is refused like a mapping of it (ERROR_INVALID_PARAMETER): a section for a page
+// nobody owns would stay until that page number is granted again, and that grant would map its
+// bytes instead of zeros.
 extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PTR count, SIZE_T offset, const void* data, SIZE_T bytes)
 {
     X2W_ZONE("x2w_xmem_write_physical");
@@ -1673,6 +1676,7 @@ extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PT
         ULONG64 section_offset = 0;
         {
             const std::lock_guard guard(memory.mutex);
+            if (!era_physical::owns(tokens[index] >> 4)) return physical_result(era_physical::Status::invalid);
             section = section_for(tokens[index] >> 4);
             if (section) section_offset = memory.backings.at(tokens[index] >> 4).offset;
         }

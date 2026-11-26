@@ -34,9 +34,18 @@ with tempfile.TemporaryDirectory() as tmp:
     with open(fail, "w") as f:
         # An uncaught assertion exits 1 and writes its traceback to stderr, the usual way a check fails.
         f.write("assert False, 'fail ran'\n")
-    ok = run(good, good)
+    also_good = os.path.join(tmp, "also_good.py")
+    with open(also_good, "w") as f:
+        f.write("print('good ran')\n")
+    ok = run(good, also_good)
     assert ok.returncode == 0 and ok.stdout.count("good ran") == 2, ok.stdout
     assert "all 2 checks passed" in ok.stdout, ok.stdout
+    # The same script twice on the command line fails like a command listed twice across the
+    # tests/checks files: one error line, status 1, and nothing runs.
+    twice = run(good, bad, good)
+    assert twice.returncode == 1, twice.stdout
+    assert twice.stdout.strip() == "duplicate command-line script: " + good, twice.stdout
+    assert "good ran" not in twice.stdout and "::group::" not in twice.stdout, twice.stdout
     mixed = run(bad, good)
     assert mixed.returncode == 1, mixed.stdout
     assert "bad ran" in mixed.stdout and "good ran" in mixed.stdout and "FAILED: " + bad in mixed.stdout, mixed.stdout

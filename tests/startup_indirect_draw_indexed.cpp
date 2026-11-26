@@ -107,6 +107,12 @@ void write_buffer_colour() {
 }
 
 [numthreads(1, 1, 1)]
+void write_large_buffer_colour() {
+    data.Store(0x100000c, 0xff00ff00u);
+    data.Store(0x100001c, 0xff0000ffu);
+}
+
+[numthreads(1, 1, 1)]
 void write_replay_colour() {
     data.Store(0, 0xff00ff00u);
     data.Store(4, 0xff00ff00u);
@@ -213,6 +219,11 @@ float4 translated_buffer_pixel() : SV_Target {
     return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
 }
 
+float4 translated_buffer_tail_pixel() : SV_Target {
+    uint value = translated_buffer.Load(0x100000c);
+    return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
+}
+
 struct RectVarying {
     float4 pos : SV_Position;
     float4 uv : PARAM0;
@@ -291,15 +302,18 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
     return root;
 }
 
+enum class TableSample { texture, buffer, buffer_tail };
+
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
-                                    bool needs_start, bool table_buffer = false, bool indexed = false, bool rect = false)
+                                    bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
-    constexpr char revision[] = "x2w-startup-shader-27";
+    constexpr char revision[] = "x2w-startup-shader-28";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
-    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000204};
+    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205};
+    static std::uint32_t indexed_pixel_id = 0xe0000204;
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
-    auto& pixel_id = pixel_ids[indexed ? 2 : table_buffer];
+    auto& pixel_id = indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)];
     std::uint64_t key = 1469598103934665603ull;
     const auto add = [&key](const void* data, std::size_t bytes) {
         const auto* p = static_cast<const unsigned char*>(data);
@@ -321,14 +335,15 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
         check(file.good() ? S_OK : E_FAIL, "write fixture cache");
     };
     const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
-    const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_buffer ? "translated_buffer_pixel" : "translated_pixel", "ps_5_1");
+    const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel"};
+    const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
     write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
     write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
     constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
     constexpr char buffer_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
     constexpr char indexed_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nparams 1\ntargets 0\n";
     if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
-    else if (table_buffer) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
+    else if (sample != TableSample::texture) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
     else write(".txt", manifest, sizeof(manifest) - 1);
     const std::array<UINT64, 0x300 / sizeof(UINT64)> desc{
         reinterpret_cast<UINT64>(root), 0, 0, 0, 0,
@@ -602,13 +617,14 @@ ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
 
 struct TranslatedDrawFixture {
     TranslatedDrawFixture(ID3D12Device* guest, std::uint32_t colour, ID3D12Device* desktop = nullptr,
-                          bool short_view = false, bool copied = false, bool replay = false, bool allow_rt = false)
+                          bool short_view = false, bool copied = false, bool replay = false, bool allow_rt = false,
+                          UINT committed_bytes = 64)
         : wrong_root(create_root(guest, {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE})),
           backing(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
     {
         if (!backing) throw std::bad_alloc();
         if (desktop && !copied) {
-            sampled = make_gpu_table_buffer(guest, 64);
+            sampled = make_gpu_table_buffer(guest, committed_bytes);
         } else {
             const D3D12_RESOURCE_DESC desc = copied ?
                 D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, replay ? replay_copy_bytes : 64u, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -641,6 +657,8 @@ struct TranslatedDrawFixture {
             srv.Buffer.FirstElement = replay ? 0 : 1;
             srv.Buffer.NumElements = replay ? static_cast<UINT>(replay_copy_bytes / 4) : short_view ? 1 : 2;
             srv.Buffer.StructureByteStride = replay ? 4 : 16;
+            if (committed_bytes > 64)
+                srv.Buffer.NumElements = (committed_bytes / 16) - 1 - (short_view ? 1 : 0);
         } else {
             srv.Format = format;
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2112,7 +2130,7 @@ int main(int argc, char** argv) try
         ComPtr<ID3DBlob> root_blob;
         const auto title_root = create_root(guest.Get(), title_desc, &root_blob);
         if (translated_indexed) {
-            const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true, false, true, rect);
+            const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true, TableSample::texture, true, rect);
             const auto left = writer_pipeline(device.Get(), writer.Get(), "write_left");
             const auto right = writer_pipeline(device.Get(), writer.Get(), "write_indexed_base");
             const auto invalid = writer_pipeline(device.Get(), writer.Get(), "write_indexed_overrun");
@@ -2176,7 +2194,7 @@ int main(int argc, char** argv) try
         }
         const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
         const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
-        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, true);
+        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
         const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");
         const auto buffer_writer = writer_pipeline(device.Get(), writer.Get(), "write_buffer_colour");
         D3D12_INDIRECT_ARGUMENT_DESC argument{};
@@ -2273,11 +2291,24 @@ int main(int argc, char** argv) try
         if (SUCCEEDED(D3D12SerializeRootSignature(&deferred_desc, D3D_ROOT_SIGNATURE_VERSION_1, &deferred_blob, nullptr)) &&
             SUCCEEDED(guest->CreateRootSignature(0, deferred_blob->GetBufferPointer(), deferred_blob->GetBufferSize(),
                                                  IID_PPV_ARGS(&deferred_root)))) {
-            const auto deferred_pso = translated_pipeline(guest.Get(), deferred_root.Get(), deferred_blob.Get(), false, true);
+            const auto deferred_pso = translated_pipeline(guest.Get(), deferred_root.Get(), deferred_blob.Get(), false, TableSample::buffer);
             if (ok) ok = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), deferred_root.Get(), deferred_pso.Get(), signature.Get(),
                 DrawKind::vertices, false, Refusal::none, "translated table with deferred guest root", &full_buffer);
         } else {
             std::puts("deferred guest root capability unavailable");
+        }
+        if (ok && !copy_on && !copy_off) {
+            const auto tail_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer_tail);
+            const auto tail_writer = writer_pipeline(device.Get(), writer.Get(), "write_large_buffer_colour");
+            // Both resources contain the sentinel. Only the full view includes the final DWORD.
+            for (bool short_view : {false, true}) {
+                TranslatedDrawFixture large(guest.Get(), 0, device.Get(), short_view, false, false, false, 0x1000020);
+                large.buffer_writer = tail_writer;
+                ok = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(), tail_pso.Get(), signature.Get(),
+                    DrawKind::vertices, false, short_view ? Refusal::insufficient_table_range : Refusal::none,
+                    short_view ? "large buffer tail outside view" : "large buffer tail inside view", &large);
+                if (!ok) break;
+            }
         }
         if (ok && (copy_on || copy_off)) {
             const TranslatedDrawFixture copied(guest.Get(), green, device.Get(), false, true, true);
