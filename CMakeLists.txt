@@ -614,6 +614,30 @@ target_compile_features(startup_null_texture_view_check PRIVATE cxx_std_17)
 add_test(NAME startup_null_texture_view COMMAND startup_null_texture_view_check)
 add_test(NAME startup_null_texture_view_unchecked_fallback_control COMMAND startup_null_texture_view_check --mutate unchecked-fallback)
 set_tests_properties(startup_null_texture_view_unchecked_fallback_control PROPERTIES WILL_FAIL TRUE)
+# Device views with ViewDimension 0 (UNKNOWN) or a dimension that does not fit the resource
+# (src/startup_stubs/view_dimension.h). The control must FAIL.
+add_executable(startup_view_dimension tests/startup_view_dimension_check.cpp)
+target_include_directories(startup_view_dimension PRIVATE src)
+target_compile_features(startup_view_dimension PRIVATE cxx_std_17)
+add_test(NAME startup_view_dimension COMMAND startup_view_dimension)
+add_test(NAME startup_view_dimension_control COMMAND startup_view_dimension --control)
+set_tests_properties(startup_view_dimension_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+# The same through d3d12_xs.dll: an unknown-dimension SRV samples its texture's colour, an incompatible explicit SRV is
+# refused without device removal, and a refused replacement leaves a null descriptor, not the slot's old view. The
+# off control (X2W_D3D12_VIEW_DEFAULTS=off) must fail on the missing default view alone, with the device not removed.
+add_executable(startup_view_dimension_device tests/startup_view_dimension_device.cpp)
+target_compile_features(startup_view_dimension_device PRIVATE cxx_std_17)
+target_link_libraries(startup_view_dimension_device PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_view_dimension_${backend} COMMAND startup_view_dimension_device ${backend})
+    set_tests_properties(startup_view_dimension_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0")
+endforeach()
+add_test(NAME startup_view_dimension_off_control_warp COMMAND startup_view_dimension_device warp off)
+set_tests_properties(startup_view_dimension_off_control_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=off"
+    PASS_REGULAR_EXPRESSION "FAIL: \\(a\\) default view reads 0\\.000 0\\.000 0\\.000 0\\.000, expected 0\\.200 0\\.600 0\\.800 1\\.000; device not removed.*cases complete"
+    FAIL_REGULAR_EXPRESSION "FAIL: setup|FAIL: \\(b\\)|FAIL: \\(c\\)|FAIL: \\(d\\)|DEVICE REMOVED|removed the device")
 # The slot and label of the x2w-render totals line each null-binding cause is counted under
 # (src/startup_stubs/null_binding_cause.h). The mutated run is the negative control.
 add_executable(startup_null_cause_labels_check tests/startup_null_cause_labels_check.cpp)
@@ -1570,11 +1594,12 @@ add_test(NAME startup_indirect_other_refusal_census_control_warp
 set_tests_properties(startup_indirect_other_refusal_census_control_warp PROPERTIES TIMEOUT 60
     PASS_REGULAR_EXPRESSION "got +'x2w-d3d12 indirect-other refusals: total 3. distinct keys 2, distinct pairs 2 \\(overflow calls 0\\)'")
 
-# Teardown of the two per-device caches that keep desktop D3D12 objects (#2572): the built d3d12_xs.dll is
+# Teardown of the four per-device caches that keep desktop D3D12 objects (#2572): the built d3d12_xs.dll is
 # loaded by explicit path, warmed through its own probe, then unloaded -- the caches must release what they
-# own and the module must go -- and a second load is left to process termination, where the caches must
-# release nothing because the display driver is already stopped. This check runs the built DLL itself, so
-# unlike the Python-driven startup_* tests it needs no INTAKE_PYTHON guard.
+# own and the module must go -- and a second load is run in a child process that leaves the module loaded to
+# process termination, where the caches must detach every owned reference (the shim reports it under
+# X2W_TEARDOWN_REPORT, and X2W_TEARDOWN_NO_GUARD has to make that check fail). This check runs the built DLL
+# itself, so unlike the Python-driven startup_* tests it needs no INTAKE_PYTHON guard.
 add_executable(startup_teardown_unload tests/startup_teardown_unload.cpp)
 target_compile_features(startup_teardown_unload PRIVATE cxx_std_17)
 target_link_libraries(startup_teardown_unload PRIVATE d3d12 dxgi)
@@ -2007,6 +2032,28 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME startup_sharedexp_target_${adapter} COMMAND offscreen_check ${adapter} --startup-sharedexp-target)
     set_tests_properties(startup_sharedexp_target_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 endforeach()
+# Presented planes (src/startup_stubs/present_planes.h): the plane record layout and the composite order
+# on synthetic records. The control reads 0x40-byte records and composites plane 0 alone, and must FAIL.
+add_executable(startup_present_planes tests/startup_present_planes_check.cpp)
+target_include_directories(startup_present_planes PRIVATE src)
+target_compile_features(startup_present_planes PRIVATE cxx_std_17)
+add_test(NAME startup_present_planes COMMAND startup_present_planes)
+add_test(NAME startup_present_planes_control COMMAND startup_present_planes --control)
+set_tests_properties(startup_present_planes_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+# The window's plane composite (src/startup_stubs/plane_compositor.h) read back on WARP: a single-plane
+# baseline, stacked planes with transparent, partly transparent and opaque overlays, and skipped repeats
+# and empty records. The control then removes the overlays and passes only on "control ok:", printed when
+# the baseline matched, every fence completed and the overlay-free picture differs from the stacked
+# expectation in exactly the overlay cells. Any FAIL line (setup, fence, device removal, pixels) fails it.
+add_executable(startup_present_composite_warp tests/startup_present_composite_warp.cpp)
+target_include_directories(startup_present_composite_warp PRIVATE src)
+target_compile_features(startup_present_composite_warp PRIVATE cxx_std_17)
+target_link_libraries(startup_present_composite_warp PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_present_composite_warp COMMAND startup_present_composite_warp)
+add_test(NAME startup_present_composite_overlay_removed_control_warp COMMAND startup_present_composite_warp --control)
+set_tests_properties(startup_present_composite_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+set_tests_properties(startup_present_composite_overlay_removed_control_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "control ok: baseline matched" FAIL_REGULAR_EXPRESSION "FAIL: ")
 # Static samplers built from smp and smpc manifest lines (src/startup_stubs/translated_sampler_bindings.h).
 add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison_check.cpp)
 target_include_directories(startup_sampler_comparison_check PRIVATE src)

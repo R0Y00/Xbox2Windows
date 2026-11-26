@@ -16203,7 +16203,9 @@ PSO-cache change. Canonical output bytes remain unchanged.
 
 Two caches keep desktop D3D12 objects for a device for as long as the module that holds them is loaded: the
 indexed-validation pipeline (`startup_stubs/d3d12_draw.inl`) and the rectangle-list argument converter
-(`startup_stubs/rect_indirect_args.h`). Both are function-local statics, so they are destroyed during the
+(`startup_stubs/rect_indirect_args.h`); the same boundary covers the placed page aliases of the translated
+indirect address route (`startup_stubs/d3d12_xs_device.cpp`) and the draw-dump readbacks
+(`startup_stubs/draw_dump_tracking.h`). All four are function-local statics, so they are destroyed during the
 module's CRT teardown, and that teardown happens at two different moments. At process exit Windows has already
 detached the display driver: releasing a pipeline state then faults inside the driver (`amdxc64`, at
 `0x35f2a19`, through `D3D12Core!CPipelineState::FinalRelease`) and the loader turns it into `0xC0000409`.
@@ -16221,18 +16223,44 @@ ctest --preset dev --no-tests=error -R "^startup_teardown_unload_(warp|hardware)
 ctest --preset dev --no-tests=error -R "^startup_indirect_(translated_indexed|rectlist)" -V
 ```
 
-The fixture (`tests/startup_teardown_unload.cpp`) loads the built `d3d12_xs.dll` by path, warms both caches
-through the module's own probe, and unloads it: the caches must release what they own, the device's reference
+The fixture (`tests/startup_teardown_unload.cpp`) loads the built `d3d12_xs.dll` by path, warms one cache at a
+time through the module's own probe, and unloads it: the cache must release what it owns, the device's reference
 count must come back, and the module must be gone. A second load is warmed and left loaded, so process
 termination exercises the other path. It is source-built and loads no title.
 
+The two caches added with the ownership change own desktop objects that hold no reference on the device handle
+the fixture holds, so the fixture measures them on the object: `x2w_d3d12_cached_object_probe` hands over one
+reference of the placed buffer, of the readback buffer and of its fence, and that reference has to stay alone
+once the module is unloaded. The placed-buffer case also owns the heap that buffer is placed on: the alias
+entry keeps the heap as a key only, as the real route does, so `x2w_d3d12_cached_objects_probe` creates the
+heap and hands its one reference to the fixture through an out parameter, and bit 4 is not warmed without that
+pointer rather than leaving an unowned heap behind. The fixture keeps that heap across the unload, drops the
+cache's and its own reference on the placed buffer first, and only then releases the heap -- a heap must
+outlive the resources placed in it -- and requires that release to be the last reference, so a heap the cache
+still owned would fail the case instead of leaking quietly. The termination load runs in a child of the fixture
+(the fixture itself, `--termination-only`), because the evidence only exists while that process tears the module
+down: with `X2W_TEARDOWN_REPORT=1` each cache writes `x2w-teardown <cache> detached=<n> released=<n>` straight
+to stderr (no stdio buffer survives a CRT teardown), and the child has to report every owned reference detached
+and none released. `X2W_TEARDOWN_NO_GUARD=<pages|readbacks|all>` is the negative control: it makes that cache
+release instead of detach, and the same check has to fail. Each passing run re-runs the child once per new cache
+with the hook set and requires that failure, so a check that passes with and without a guard cannot report
+success. Neither variable is read by an ordinary run.
+
+```powershell
+startup_teardown_unload.exe <path-to-d3d12_xs.dll> warp
+set X2W_TEARDOWN_REPORT=1
+set X2W_TEARDOWN_NO_GUARD=pages
+startup_teardown_unload.exe <path-to-d3d12_xs.dll> warp   # must fail: the pages guard is what detaches
+```
+
 Measured on Windows 11 25H2 (26200.9974, MSVC 19.44.35230), AMD Radeon RX 9070 XT (`1002:7550`, driver
-`32.0.32029.2010`), debug layer unavailable: `startup_teardown_unload` passes on WARP and on the card, and the
-five `startup_indirect_*_hardware` runs that died with `0xC0000409` now reach their last assertion and exit
-`0`. Removing either destructor brings its own failure back and only its own: without the validation-pipeline
-destructor the four `translated_indexed*` runs fail and `rectlist` passes; without the converter destructor
-`rectlist` fails and the four pass. Not covered: an explicit unload while a device is still referenced by a
-title, and any adapter other than the one above.
+`32.0.32029.2010`), debug layer unavailable: with the two original cases, `startup_teardown_unload` passes on
+WARP and on the card, and the five `startup_indirect_*_hardware` runs that died with `0xC0000409` now reach
+their last assertion and exit `0`. Removing either destructor brings its own failure back and only its own:
+without the validation-pipeline destructor the four `translated_indexed*` runs fail and `rectlist` passes;
+without the converter destructor `rectlist` fails and the four pass. The backing-heap handover is newer than
+that run and has not been exercised on either machine yet. Not covered: an explicit unload while a device is
+still referenced by a title, and any adapter other than the one above.
 
 ## Exact binary16 min, max, fract, and frexp forms (VOP1/VOP2/VOP3/DPP16/DPP8/SDWA) in pixel_aot
 
