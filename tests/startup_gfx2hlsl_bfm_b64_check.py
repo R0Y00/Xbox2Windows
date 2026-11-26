@@ -373,6 +373,9 @@ class TrackedStage(G.Stage):
     def run(self, *instructions):
         for asm in instructions:
             self.one(asm.split()[0], asm)
+            # The exec copy's high word is a wave64 mask word (a numeric read of it is refused, #2702); this check is about
+            # the uniformity of the sources, which s3 keeps as a varying number, so the mask-word tag is dropped here.
+            self.mask_high = set()
         return self
 
 

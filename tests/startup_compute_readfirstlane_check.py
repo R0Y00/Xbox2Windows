@@ -132,9 +132,10 @@ PATCHES = (
     ('integer chain from the thread id',
      [(pack_hex(*vop1('v_mov_b32_e32', 'v10', 's27')), pack_hex(*vop1('v_mov_b32_e32', 'v10', 'v0')))],
      'v_readfirstlane_b32 requires a proven uniform source'),
+    # the lane-mask read as a number is refused first (#2702); the chain is not reached
     ('integer chain with a lane-mask scalar',
      [(pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 's27', 'v10')), pack_hex(*vop2('v_add_nc_u32_e32', 'v10', 'vcc_lo', 'v10')))],
-     'v_readfirstlane_b32 requires a proven uniform source'),
+     'v_add_nc_u32 reads lane mask vcc_lo as numeric data'),
 )
 
 
