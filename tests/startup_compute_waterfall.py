@@ -38,6 +38,22 @@ def program(*, before_save=(), after_save=(), compare=COMPARE, body=(ADD, XOR), 
     return (*PREFIX, *before_save, SAVE, *after_save, *loop, branch, RESTORE, *after_restore, STORE, END)
 
 
+# First-lane readfirstlane (RFL3): the lanes above the root constant s4 stay enabled, s22 reads v5 of the lowest of them
+# (lane 0 when none is enabled) and every lane adds it to 13 after EXEC is restored.
+ABOVE = ('v_cmpx_lt_u32_e32 s4, v0', '0400a27d')
+FIRST_READ = ('v_readfirstlane_b32 s22, v5', '05052c7e')
+ADD_FIRST = ('v_add_nc_u32_e32 v7, s22, v7', '160e0e4a')
+
+
+def first_lane_program():
+    return (*PREFIX[:-1], ABOVE, FIRST_READ, RESTORE, ADD_FIRST, STORE, END)
+
+
+def first_lane_expected(lanes, active, source):
+    enabled = [lane for lane in range(lanes) if lane > active]
+    return [(13 + source[enabled[0] if enabled else 0]) & MASK] * lanes
+
+
 def translate(rows, group=(4, 1, 1)):
     code = bytes.fromhex(''.join(word for _, word in rows))
     return G.ComputePipeline(code, root_blob(), USER7, group).hlsl_cs()
@@ -83,9 +99,47 @@ def controls(llvm_mc=None):
         else:
             assert 's22 = v5;' in translate(rows)
     refused('at most 32 threads', lambda: translate(program(), (33, 1, 1)))
+    # A source that differs between lanes is read from the lowest enabled lane of a group of at most 32 threads.
+    if llvm_mc:
+        rows = first_lane_program()
+        source = '\n'.join(asm for asm, _ in rows) + '\n'
+        assert assemble(llvm_mc, source) == bytes.fromhex(''.join(word for _, word in rows)), source
+    for lanes in (4, 32):
+        text = translate(first_lane_program(), (lanes, 1, 1))
+        assert 'if (exec & 1) InterlockedMin(x2w_rfl_min,' in text and text.count('GroupMemoryBarrierWithGroupSync();') == 3, text
+    refused('requires a proven uniform source', lambda: translate(first_lane_program(), (33, 1, 1)))
+    refused('requires a proven uniform source', lambda: translate(first_lane_program(), (64, 1, 1)))
+
+
+def first_lane_dispatch(directory, dxc, runner, adapter):
+    """A group of 32 threads is many host waves on WARP (4 lanes) and some GPUs: the lowest enabled lane must not
+    depend on how the host splits it."""
+    lanes = 32
+    src, shader = directory / 'first_lane.hlsl', directory / 'first_lane.cso'
+    src.write_text(translate(first_lane_program(), (lanes, 1, 1)), encoding='ascii')
+    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', shader, src], check=True)
+    source = [(0x9e3779b1 * (i + 1) + 7) & MASK for i in range(WORDS)]
+    cases = []
+    for active in (0, 5, 16, 30, 31, 40):
+        output = first_lane_expected(lanes, active, source)
+        words = [1, *output, *([SENTINEL] * (WORDS - lanes)), active, *([0] * 15), *source]
+        case = directory / ('first-lane-%d.case' % len(cases))
+        case.write_bytes(struct.pack('<%dI' % len(words), *words))
+        cases.append((case, 'first enabled lane above %d' % active, None))
+        if active == 16:
+            wrong = list(output)
+            wrong[3] = (13 + source[0]) & MASK  # a lane choice fixed at lane 0
+            words = [1, *wrong, *([SENTINEL] * (WORDS - lanes)), active, *([0] * 15), *source]
+            case = directory / 'first-lane-wrong.case'
+            case.write_bytes(struct.pack('<%dI' % len(words), *words))
+            cases.append((case, 'lane 0 instead of the first enabled lane',
+                          'word=3 expected=%08x actual=%08x' % (wrong[3], output[3])))
+    return check_references('first-lane readfirstlane', runner, adapter, shader, cases)
 
 
 def dispatch(directory, dxc, runner, adapter):
+    if first_lane_dispatch(directory, dxc, runner, adapter):
+        return 77
     for label, body in (('arithmetic', (ADD, XOR)), ('fixed-buffer', FIXED_LOAD), ('invariant', (CONST, XOR))):
         src, shader = directory / 'waterfall.hlsl', directory / 'waterfall.cso'
         after = (USE_CONST,) if label == 'invariant' else ()

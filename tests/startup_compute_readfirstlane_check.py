@@ -119,7 +119,7 @@ PATCHES = (
      'v_readfirstlane_b32 requires a proven uniform source'),
     ('loop counter updated from lane mask',
      [(pack_hex(*sop2('s_add_u32', 's22', 's22', 1)), pack_hex(*sop1('s_mov_b32', 's22', 'vcc_lo')))],
-     'v_readfirstlane_b32 requires a proven uniform source'),
+     'is a lane mask'),
 )
 
 

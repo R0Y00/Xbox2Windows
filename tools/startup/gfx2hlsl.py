@@ -3097,6 +3097,7 @@ class Stage:
             self.wqm_exec = init_wqm_exec
             # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
             self.uniform_cf = True
+            self.first_lane_reads = False  # a v_readfirstlane_b32 lowered through the group (op_v_readfirstlane_b32)
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.masks = set(init_masks)
@@ -3352,6 +3353,13 @@ class Stage:
             break
         else:
             reason = 'v_readfirstlane_b32 uniformity proof exceeded pass limit'
+            if refusals is None:
+                raise Unsupported(reason)
+            refusals.append((reason, self.kind))
+        if getattr(self, 'first_lane_reads', False) and not self.uniform_cf:
+            # Every thread of the group has to reach the barriers of a first-lane read.
+            reason = ('v_readfirstlane_b32 requires a proven uniform source '
+                      '(the first-lane read needs control flow that is the same for every lane)')
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
@@ -6874,8 +6882,10 @@ class Stage:
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
+                not src or src[0] != 'v' or src[1] != src[2]):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        if not self.proven_uniform_v(src[1]):
+            return self.first_lane_read(ops, dst, src)
         if past_entry:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
             # of a scalar it read lies between them. A lane inactive at the definition kept an older VGPR value,
@@ -6883,6 +6893,30 @@ class Stage:
             self.set_s(dst[1], self.uniform_expr[src[1]])
         else:
             self.set_s(dst[1], self.u(ops[1]))
+
+    def first_lane_read(self, ops, dst, src):
+        """v_readfirstlane_b32 of a VGPR that is not proven wave-uniform, in a compute group of at most 32 threads.
+
+        The hardware reads the VGPR of the lowest lane whose EXEC bit is set (lane 0 when EXEC is zero). A group of at
+        most 32 threads is one guest wave of either size, thread t is lane t (SV_GroupThreadID flattened), and the
+        model keeps `exec & 1` per thread. The lowest enabled lane is found through groupshared memory
+        (InterlockedMin), so the result does not depend on how the host splits the group into waves. Every thread
+        must reach the barriers: the caller of the translation refuses the program when any branch is not proved
+        the same for every lane (first_lane_reads, checked after the pass)."""
+        group = getattr(getattr(self, 'pipe', None), 'group', None)
+        if (getattr(self, 'kind', None) != 'cs' or not group or group[0] * group[1] * group[2] > 32 or
+                not getattr(self, 'uniform_cf', False)):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        lane = '(tid.x + tid.y * %du + tid.z * %du)' % (group[0], group[0] * group[1])
+        self.first_lane_reads = self.uses_first_lane = True
+        word = self.u(ops[1])
+        self.emit('x2w_rfl_val[%s] = %s;' % (lane, word))
+        self.emit('if (%s == 0u) x2w_rfl_min = 0xffffffffu;' % lane)
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        self.emit('if (exec & 1) InterlockedMin(x2w_rfl_min, %s);' % lane)
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        self.set_s(dst[1], 'x2w_rfl_val[(x2w_rfl_min == 0xffffffffu) ? 0u : x2w_rfl_min]')
+        self.emit('GroupMemoryBarrierWithGroupSync();')
 
     # ---- SGPR spill to VGPR lanes (#2125 item E; mesh #2413 T7 / #2127) ----------------------
     # The compiler parks a scalar in one lane of a VGPR: `v_writelane_b32 vN, sM, k` writes sM into lane k
@@ -9003,6 +9037,8 @@ class ComputePipeline(Pipeline):
             raise Unsupported('export in a compute program')
         body = s.body()
         shared = ['groupshared uint lds[%d];' % self.lds_words] if getattr(s, 'uses_lds', False) else []
+        if getattr(s, 'uses_first_lane', False):
+            shared += ['groupshared uint x2w_rfl_val[32];', 'groupshared uint x2w_rfl_min;']
         return '\n'.join(self.common() + shared + ['[numthreads(%d, %d, %d)]' % self.group,
                                           'void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {']
                          + s.declarations() + ['    ' + line for line in s.entry] + body + ['}']) + '\n'

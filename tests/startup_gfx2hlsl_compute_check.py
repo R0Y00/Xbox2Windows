@@ -1651,7 +1651,12 @@ def check_controls():
                                       ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))
     # A readfirstlane of a buffer load at a uniform address translates; at a per-lane address it is refused.
     assert 's20 = v1;' in translate('N').hlsl_cs()
-    refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate('N', code=WORDS_N_VARYING).hlsl_cs())
+    varying = translate('N', code=WORDS_N_VARYING).hlsl_cs()  # per-lane address, group of 16: the lowest enabled lane
+    assert 'InterlockedMin(x2w_rfl_min,' in varying and 'x2w_rfl_val[(x2w_rfl_min == 0xffffffffu)' in varying, varying
+    assert varying.count('GroupMemoryBarrierWithGroupSync();') == 3 and 'groupshared uint x2w_rfl_val[32];' in varying
+    # A group of more than 32 threads can be two guest waves: the first lane is not one thread of the group.
+    refused('v_readfirstlane_b32 requires a proven uniform source',
+            lambda: translate('N', code=WORDS_N_VARYING, group=(64, 1, 1)).hlsl_cs())
     print('compute entry, numthreads, masked bit counts, manifest, offen store forms and the store, descriptor, execz and sample '
           'refusals pass')
 
