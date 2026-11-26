@@ -108,9 +108,12 @@ def load_comments(paths: list[Path]) -> list[dict]:
                 break
             value, index = decoder.raw_decode(text, index)
             for item in value if isinstance(value, list) else [value]:
-                if not isinstance(item, dict) or not isinstance(item.get("id"), int) or "body" not in item:
-                    raise ValueError(f"{path}: expected GitHub issue comment objects with id and body")
-                comments[item["id"]] = item
+                cid = item.get("id") if isinstance(item, dict) else None
+                if isinstance(cid, bool) or not isinstance(cid, int) or cid < 0 or "body" not in item:
+                    raise ValueError(
+                        f"{path}: expected GitHub issue comment objects with non-negative integer id and body"
+                    )
+                comments[cid] = item
     return [comments[key] for key in sorted(comments)]
 
 
@@ -446,6 +449,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
     args = parser.parse_args(argv)
     try:
+        if args.after is not None and args.after < 0:
+            raise ValueError(f"--after must be non-negative, got {args.after}")
+        for path in args.comments:
+            if path.is_dir():
+                raise IsADirectoryError(f"comments path is a directory: {path}")
+            if not path.is_file():
+                raise FileNotFoundError(f"comments file not found: {path}")
+        if args.readme.is_dir():
+            raise IsADirectoryError(f"--readme path is a directory: {args.readme}")
+        if not args.readme.is_file():
+            raise FileNotFoundError(f"--readme file not found: {args.readme}")
         comments = load_comments(args.comments)
         summary = summarize(comments, args.readme.read_text(encoding="utf-8"), args.after)
     except (OSError, ValueError) as error:
