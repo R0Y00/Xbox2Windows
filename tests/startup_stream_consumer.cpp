@@ -315,6 +315,24 @@ static int dispatch_slot67(void* device, const std::string& mode)
         view.Texture2D.MipLevels = 1;
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
     }
+    if (mode == "dispatch-input-memory-view") {
+        // The input is a buffer view (device slot 70) of memory no buffer is placed over, 16 bytes in; its token
+        // replaces the input descriptor and the words are written after the view exists.
+        auto* const unplaced = static_cast<UINT*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!unplaced) return 70;
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 0x10000, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        struct {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view;
+            UINT64 address;
+        } input{{DXGI_FORMAT_UNKNOWN, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING},
+                reinterpret_cast<UINT64>(unplaced)};
+        input.view.Buffer = {4, words, sizeof(UINT), D3D12_BUFFER_SRV_FLAG_NONE};
+        invoke(device, 70, word(&desc), word(&input), cpu);
+        // The token is wider than a table descriptor: the output descriptor after it is written again.
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
+        std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
+    }
     if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);
     invoke(list, 39, 0, 1, word(&constants[1]), 1);

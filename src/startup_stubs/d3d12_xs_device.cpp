@@ -4418,13 +4418,26 @@ template <int N, int D>
 __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
 {
     Timed timed(time_view);
-    // UAV, RTV and DSV views keep the resource's old lifetime; slot-18 SRVs stay in the retire class as long as
-    // their descriptor slots are tracked by shadow_slot and translated draws hold bound resources with retire_hold.
-    if constexpr (N >= 19 && N <= 21) retire_leave_class(reinterpret_cast<const void*>(a), RetireLeft::view);
-    if constexpr (N == 19) retire_leave_class(reinterpret_cast<const void*>(b), RetireLeft::view);
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     const u64 title_dest = args[D];
     args[D] = desktop_cpu_handle(args[D]);
+    // Slots 18-21 name a resource in a descriptor slot. While shadow_slot() tracks the destination, note_view() owns the
+    // slot's reference: the view (slot 19 for its resource and its counter resource) holds the resource in the retire
+    // class until the slot is overwritten, copied over, or its heap is destroyed. Without a tracked slot the shim cannot
+    // follow the descriptor, so the use takes the resource out of the class for good, as before.
+    if constexpr (N >= 19 && N <= 21) {
+        bool tracked = false;
+        if (args[D]) {
+            AcquireSRWLockShared(&note_lock);
+            tracked = shadow_slot(args[D]) != nullptr;
+            ReleaseSRWLockShared(&note_lock);
+        }
+        if (!tracked) {
+            retire_leave_class(reinterpret_cast<const void*>(a), RetireLeft::view);
+            if constexpr (N == 19) retire_leave_class(reinterpret_cast<const void*>(b), RetireLeft::view);
+        }
+    }
+    // No desktop destination handle: the view stays title-side, where no shadow slot can follow it.
     if (!args[D]) {
         if constexpr (N == 18) retire_leave_class(reinterpret_cast<const void*>(a), RetireLeft::view);
         return 0;
@@ -5145,8 +5158,10 @@ void retire_drop_heap_views(Wrapper* heap)
             const std::uint32_t id = h.shadow[i];
             if (!id) continue;
             h.shadow[i] = 0;
-            if (id - 1 < view_records().size() && view_records()[id - 1].slot == 18 && view_materialized()[id - 1])
-                retire_release_view_ref(reinterpret_cast<const void*>(view_records()[id - 1].resource));
+            // Every tracked view slot loses the ref it held: slots 18-21, slot 19 for the resource and its counter.
+            if (id - 1 < view_records().size() && view_materialized()[id - 1])
+                view_refs_release(view_records()[id - 1].slot, view_records()[id - 1].resource,
+                                  view_records()[id - 1].counter);
         }
     }
     ReleaseSRWLockExclusive(&note_lock);
@@ -5648,29 +5663,33 @@ extern "C" __declspec(dllexport) void x2w_d3d12_fail_wraps(LONG count)
 }
 
 // Fixture probe (startup_resource_retire): what still names a resource of the class by its raw desktop pointer, how many
-// resources the open recording of a list moved out of COMMON, and how many it holds. Counts entries only.
+// resources the open recording of a list moved out of COMMON, how many it holds, and how many tracked descriptor slots
+// hold the resource (retire_view_refs, slots 18-21). Counts entries only.
 struct RetireProbe {
     unsigned cache_entries;
     unsigned list_states;
     unsigned list_holds;
+    unsigned view_refs;
 };
 extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, void* list, RetireProbe* out)
 {
     if (!out) return FALSE;
     *out = {};
     if (!release_retired_enabled()) return FALSE;  // like x2w_d3d12_budget_snapshot: nothing to report without the switch
-    if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind && r->own().real) {
-        auto* real = static_cast<ID3D12Resource*>(r->own().real);
-        AcquireSRWLockExclusive(&draw_lock);
-        out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
-        ReleaseSRWLockExclusive(&draw_lock);
-        AcquireSRWLockShared(&target_lock);
-        for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
-        ReleaseSRWLockShared(&target_lock);
-        AcquireSRWLockShared(&pending_writes_lock);
-        for (const auto& writes : pending_gpu_writes())
-            out->cache_entries += static_cast<unsigned>(std::count(writes.second.begin(), writes.second.end(), real));
-        ReleaseSRWLockShared(&pending_writes_lock);
+    if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind) {
+        out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
+        if (auto* real = static_cast<ID3D12Resource*>(r->own().real)) {
+            AcquireSRWLockExclusive(&draw_lock);
+            out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
+            ReleaseSRWLockExclusive(&draw_lock);
+            AcquireSRWLockShared(&target_lock);
+            for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
+            ReleaseSRWLockShared(&target_lock);
+            AcquireSRWLockShared(&pending_writes_lock);
+            for (const auto& writes : pending_gpu_writes())
+                out->cache_entries += static_cast<unsigned>(std::count(writes.second.begin(), writes.second.end(), real));
+            ReleaseSRWLockShared(&pending_writes_lock);
+        }
     }
     if (Wrapper* l = as_wrapper(list); l && l->own().kind == list_kind) {
         if (l->own().pass) out->list_states = static_cast<unsigned>(pass_of(l).states.size());
