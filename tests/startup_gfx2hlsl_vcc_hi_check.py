@@ -74,7 +74,7 @@ v_add_nc_u32_e32 v5, s0, v0
 exp mrt0 v2, v5, v0, v0 done vm
 s_endpgm
 ''', 'ff03ebbe341200006b846b8f6b900080ff00887d05000500020001d58104a90100000a4a0f1800f802050000000081bf',
-        's_mov_b32 into vcc_hi'),
+        's_mov_b32 destination vcc_hi'),
     # A VALU mask read of vcc_lo and nothing proves wave32: in wave64 lanes 32..63 would read vcc_hi as their mask
     # bit, which the renamed scalar register does not model (found by an independent review).
     'MASK_READ': ('''s_mov_b32 vcc_lo, 0
@@ -83,7 +83,7 @@ v_mov_b32_e32 v2, 2.0
 v_cndmask_b32_e32 v1, 1.0, v2, vcc_lo
 exp mrt0 v1, v1, v1, v1 done vm
 s_endpgm
-''', '8003eabec103ebbef402047ef20402020f1800f801010101000081bf', 's_mov_b32 into vcc_hi'),
+''', '8003eabec103ebbef402047ef20402020f1800f801010101000081bf', 's_mov_b32 destination vcc_hi'),
     # The 64-bit pair `vcc` names vcc_hi as its high word.
     'PAIR': ('''v_cmp_gt_u32_e64 vcc_hi, v0, 0x50005
 s_and_b64 s[2:3], vcc, exec
@@ -96,7 +96,7 @@ s_endpgm
 v_mov_b32_e32 v2, 1
 exp mrt0 v2, v2, v2, v2 done vm
 s_endpgm
-''', '8003ffbe8102047e0f1800f802020202000081bf', 's_mov_b32 into exec_hi'),
+''', '8003ffbe8102047e0f1800f802020202000081bf', 's_mov_b32 destination exec_hi'),
 }
 
 
