@@ -1486,7 +1486,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_PRESENT_COMPOSITE=1` | experimental, in render mode: the output window composites every presented plane, bottom to top, instead of showing plane 0 alone, and the highest plane above plane 0 is sampled as `x2w-render raw plane <i> (not composited)`. Off by default; the baseline capture and `x2w-render presented` read plane 0 either way. See [Presented planes](#presented-planes) |
 | `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
-| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
+| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR`, `X2W_DRAW_DUMP_PIXEL=<x>,<y>` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). With `X2W_DRAW_DUMP_PIXEL`, each copy covers one texel instead and the present writes `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: one line per translated draw with `draw=`, `frame=`, `x=`, `y=`, `key=`, `count=`, `format=`, `raw=` and, for an 8-bit four-channel target, `rgba=`. The bounded history names the last draw that changed the texel (`src/startup_stubs/pixel_history.h`, `ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V`). |
 | `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
@@ -1547,6 +1547,14 @@ profiles do not, and that module met desktop refusals the other profiles did not
 access, the last covered by the
 [shared-exponent stand-in](#shared-exponent-render-and-unordered-access-targets)). Choosing a profile
 is not evidence that the path it leads to runs.
+
+A title on the Series S profile may present its picture on a plane above plane 0 and leave plane 0
+black (see [Presented planes](#presented-planes) for a measured case). The output window shows plane 0 alone by
+default, so it then stays black. `X2W_PRESENT_COMPOSITE=1` composites the planes, and
+`X2W_PRESENT_PLANE=<n>` shows one plane alone. Whether other titles, or other profiles, present
+this way is not known. Under either switch, `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented`
+readback still read plane 0. With `X2W_PRESENT_COMPOSITE=1`, the `x2w-render raw plane <n>` line
+shows whether the higher plane holds a picture.
 
 ## D3D12 resource budget
 
@@ -1721,6 +1729,41 @@ exports `x2w_d3d12_retire_probe` (which reports the resource's tracked slot refe
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
 physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
+
+## D3D12 view allocation failure
+
+A new view record goes into three containers: the record vector, the vector of
+materialization flags and the map from content to id. If one of them cannot
+allocate, the record goes into none of them, the process continues and the first
+eight failures are logged:
+
+`x2w-d3d12 note_view: out of memory in <view_records|view_materialized|view_ids> -> view of slot <n> not recorded, destination descriptor untracked`
+
+The device's view slots return nothing, so the log line is the only report. The
+destination descriptor is left untracked: its shadow entry and its token in
+title memory are cleared, and the view it named before loses its reference. A
+draw then sees a descriptor without a view, not the earlier one. If the desktop
+view was created, its resources leave the retire class of
+`X2W_D3D12_RELEASE_RETIRED` and are not released early. Earlier ids stay valid,
+and a later view is recorded if its allocations succeed. Records already copied
+elsewhere are not touched.
+
+This handles the failure; it does not reduce the memory the records use, and it
+does not cover other allocations, such as the map of render and depth targets.
+
+`startup_view_alloc_<records|materialized|ids>_<warp|hardware>` fails the
+allocation at one site three times through the fixture-only export
+`x2w_d3d12_fail_view_allocations`. The failure is injected, not produced by
+exhausting memory. For `view_ids` it is raised before the insertion, so the
+fixture relies on the standard guarantee that a failed single insertion leaves
+an `unordered_map` unchanged. The `control` variants never inject it and must
+fail. The failure is exercised on slot 18 and on a slot 19 view with a counter
+resource. For slot 19 only the reference counts are checked: resources that
+allow unordered access are never in the retire class.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failure
+```
 
 ## D3D12 view census
 
@@ -2172,6 +2215,24 @@ These are measured on one executable; treat them as hypotheses for others.
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
   pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
   compare bit, the carry or read `vcc_hi` as zero as failing controls.
+- **Wave reductions.** A whole wave32 reduction chain in a straight-line pixel stage (`s_or_saveexec_b32 sS, -1`,
+  the identity fill `v_cndmask_b32_e64 vT, <identity>, vX, sS`, four `_dpp` steps `quad_perm:[1,0,3,2]`,
+  `quad_perm:[2,3,0,1]`, `row_half_mirror`, `row_mirror`, `v_permlanex16_b32 vP, vT, 0, 0`, the combine,
+  `s_mov_b32 exec_lo, sS` and `v_readlane_b32 sD, vT, 31`) of `v_or_b32`, `v_min_u32` or `v_max_u32` is recognised
+  as one `WaveActiveBitOr`, `WaveActiveMin` or `WaveActiveMax` over the active lanes of the desktop wave (a correct
+  program cannot depend on how pixels are packed into waves). The min chain may read its lane later, as the #2125
+  censuses show: after its restore, one `v_cndmask_b32_sdwa` (lowered as usual), the saveexec of a max chain, then the
+  readlane, carried by that max chain before its fill. The entry EXEC must still hold, without `s_wqm`, so helper
+  lanes are left out on both sides. Other shapes that start like a chain are refused with their reason
+  ([the note](experiments/startup-gfx2hlsl-wave-reduce.md)). Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_wave_reduce"`.
+  [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
+- **First active lane.** In a straight-line pixel stage whose EXEC is still the entry mask, without `s_wqm`,
+  `s_ff1_i32_b32 sD, exec_lo` followed by `v_readlane_b32 sX, vY, sD` becomes `WaveReadLaneFirst(vY)` over the active
+  lanes of the desktop wave. This follows the packing contract of the wave reductions. `sD` has no run-time value,
+  and any other read of it is refused ([the note](experiments/startup-gfx2hlsl-pixel-first-lane.md)). Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_pixel_first_lane"`.
+  [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -2276,21 +2337,23 @@ These are measured on one executable; treat them as hypotheses for others.
 - **Pixel-stage image stores.** In a pixel stage, `image_store` with `dim:SQ_RSRC_IMG_2D` and
   `dmask:0xf` becomes a typed store to a `RWTexture2D<float4>` at its own `u` register, under the
   lane's exec bit, and the manifest becomes version 2 with a
-  `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
-  pixel-stage DMASK writes only the selected components (`w0[uint2(x, y)].xz = ...`) and does not
-  read the texel, so two invocations can update disjoint channels of one texel. Compute stores, D16
-  stores and array stores still require `dmask:0xf`. An empty or out-of-range mask, other dimensions,
-  `d16`, `a16`, `tfe`, `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and
-  a program that loads and stores the same image are refused by name. A hand-assembled program stores
-  four distinct values at texel (1, 2). Another draws two pixels in one pass; both address that texel,
-  one with `dmask:0x1` and one with `dmask:0x4`, and both updates must survive. Writing the second
-  value into y instead of z must fail. The desktop draw reads all 16 texels of a 4x4 image back;
-  deleting the store or exchanging x and y must fail. Run
+  `uav <index> tex2d table <table> <offset>` line. The same full mask on `dim:SQ_RSRC_IMG_2D_ARRAY`
+  uses three address registers, a `RWTexture2DArray<float4>` and a `tex2da` line. The cache-policy
+  bits are accepted. A partial pixel-stage 2D DMASK writes only the selected components
+  (`w0[uint2(x, y)].xz = ...`) and does not read the texel, so two invocations can update disjoint
+  channels of one texel. Compute stores, D16 stores and array stores still require `dmask:0xf`. An
+  empty or out-of-range mask, a dimension other than 2D or 2D-array, `d16`, `a16`, `tfe`, `lwe`,
+  `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads and
+  stores the same image are refused by name. A hand-assembled program stores four distinct values at
+  texel (1, 2). Another draws two pixels in one pass; both address that texel, one with `dmask:0x1`
+  and one with `dmask:0x4`, and both updates must survive. Writing the second value into y instead of
+  z must fail. The desktop draw reads all 16 texels of a 4x4 image back; deleting the store or
+  exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
-- **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d table P O` line
+- **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d|tex2da table P O` line
   as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
   view the title created at that table entry (`resolve_pixel_uavs` in `d3d12_draw.inl`), on
-  mip 0 of a 2D texture, and the texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
+  mip 0 of a 2D texture, or of a 2D array when the line says `tex2da`, and the texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
   with their reason and nothing is bound in place of the view. When the manifest is loaded, the
   translation is not used for another image kind, a buffer line (`uav N raw table P O`,
   the vertex-stage store of #2059), a view qualifier (`float`, `uint`, `sint`, as in the compute line), another source, extra fields such as
@@ -2298,8 +2361,9 @@ These are measured on one executable; treat them as hypotheses for others.
   word that is read: the binding must also support a typed UAV load. The translator does not emit it
   for a component store, which does not read the texel. At draw time,
   the draw is not translated for no table at the parameter, an entry outside the bound table, an
-  entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
-  array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
+  entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, a
+  `tex2d` line on an array resource, a `tex2da` line whose view is not a 2D array, a 3D, 1D or
+  multisampled resource, a view of another dimension, mip or plane, an integer,
   sRGB or non-colour format, a format without typed UAV store, a `typedload` binding whose format has
   no typed UAV load, and a texture that is also an SRV,
   a render target or the depth texture of the draw; these checks run before any view of the draw is
@@ -3305,8 +3369,15 @@ uncovered prefix, and right before
 committed default buffer that does not alias the title memory, holds zeros and is reported as
 success (`not aliased` in the log). `reserve_upload_ring` grows in demand
 chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
-bytes for the process; the allocator may use an older unused tail but
-refuses exhaustion or allocation failure rather than resetting live storage.
+bytes until its chunk is recycled. The allocator tries the active chunk, the
+remaining capacity and older unused tails first. Only then does it recycle a
+chunk, and only one that no command-list recording holds (a closed list keeps
+its hold until Reset, Release or a failed Close, because it can be submitted
+again) and whose last submit on every queue has completed. A failed fence
+signal or a removed device keeps the chunk busy. When no chunk qualifies, the
+reservation is refused; live storage is never reset. Recycling bumps the
+chunk's generation, and a cached frame copy from an older generation is not
+reused.
 `upload_reservation` exercises the shared cursor and returned-pointer contract
 without D3D12; on non-Windows hosts run
 `c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.

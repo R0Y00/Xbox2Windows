@@ -5,6 +5,9 @@ four distinct binary32 values, stores them with image_store ... dmask:0xf dim:SQ
 the same values to mrt0. The words were assembled by hand from the MIMG layout and are decoded back by
 tools/disasm_rdna2.py here; --llvm-mc reassembles the source and compares the words.
 
+A full-mask 2D-array program stores the same four values at layer 1. The address is x, y and the
+layer, and the manifest line is tex2da. A partial mask on that form is refused.
+
 A second program uses dmask:0x5 (x and z) so VDATA is two registers. The lowering writes only those
 components. It does not read the texel. The UAV starts at -1 in every channel, so y and w stay -1.
 
@@ -55,6 +58,7 @@ s_endpgm
 STORE = bytes.fromhex('080f20f000040400')
 # dmask:0x5 → VDATA v[4:5] written to channels x then z (same PREFIX: v4=1.0, v5=2.0).
 STORE_XZ = bytes.fromhex('080520f000040400')
+ARRAY_STORE = bytes.fromhex('280f20f000040400')
 PREFIX = bytes.fromhex('04040cf4000000fa' '8102007e' '8202027e' 'f202087e' 'f4020a7e' 'ff020c7e00004040'
                        'f6020e7e' '7fc08cbf')
 SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050607' '000081bf')
@@ -92,6 +96,25 @@ STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
 SPARSE_LINE = 'w0[uint2(v0, v1)].xz = float2(asfloat(v4), asfloat(v5));'
 GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
 SPARSE_BITS = ['3f800000', 'bf800000', '40000000', 'bf800000']  # 1.0, -1.0, 2.0, -1.0
+ARRAY_SOURCE = SOURCE.replace(
+    'image_store v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D',
+    'v_mov_b32 v2, 1\nimage_store v[4:7], v[0:2], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY',
+)
+ARRAY_STORE_LINE = 'w0[uint3(v0, v1, v2)] = asfloat(uint4(v4, v5, v6, v7));'
+ARRAY_GUARDED_LINE = 'if (exec & 1) ' + ARRAY_STORE_LINE
+
+
+def mov_v2_inline(constant):
+    """v_mov_b32_e32 v2, <constant>: VOP1 opcode 0x01, vdst=2, inline integer 0..64 (0x80 + n)."""
+    return struct.pack('<I', 0x7e040280 + constant)
+
+
+def array_program(layer):
+    return PREFIX + mov_v2_inline(layer) + ARRAY_STORE + SUFFIX
+
+
+ARRAY_WORDS = array_program(1)
+ARRAY_WORDS_LAST = array_program(3)
 
 
 def cmpx_eq(constant):
@@ -102,6 +125,8 @@ def cmpx_eq(constant):
 
 EXEC_ON = PREFIX + cmpx_eq(1) + STORE + SUFFIX   # v0 is 1: the lane stays active
 EXEC_OFF = PREFIX + cmpx_eq(2) + STORE + SUFFIX  # v0 is 1: every lane is turned off before the store
+ARRAY_EXEC_ON = PREFIX + mov_v2_inline(1) + cmpx_eq(1) + ARRAY_STORE + SUFFIX
+ARRAY_EXEC_OFF = PREFIX + mov_v2_inline(1) + cmpx_eq(2) + ARRAY_STORE + SUFFIX
 
 
 def translate(words):
@@ -152,20 +177,52 @@ def controls():
         assert STORE_LINE in translate(with_store(store)).hlsl_ps(), name
     print('glc, slc, dlc and unorm accepted')
 
+    # 2D-array pixel store (#2742): three address registers, RWTexture2DArray<float4>, manifest tex2da.
+    array_text = D.decode_instruction(ARRAY_STORE, 0)[2]
+    assert array_text == 'image_store v[4:7], v[0:2], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY', array_text
+    array_pipe = translate(ARRAY_WORDS)
+    array_ps, array_manifest = array_pipe.hlsl_ps(), array_pipe.manifest()
+    assert 'RWTexture2DArray<float4> w0 : register(u0);' in array_ps, array_ps
+    assert '    ' + ARRAY_STORE_LINE in array_ps, array_ps
+    assert 'register(t' not in array_ps, array_ps
+    assert 'uav 0 tex2da table 0 0' in array_manifest and 'srv ' not in array_manifest, array_manifest
+    assert array_manifest.startswith('x2w-manifest 2\n'), array_manifest
+    print('array store: %s manifest uav 0 tex2da table 0 0' % ARRAY_STORE_LINE)
+
     # Refusals, each by name: packed data or addresses, fault-status returns, a 128-bit descriptor,
     # and other image dimensions.
     cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
-             ('SQ_RSRC_IMG_2D_ARRAY', bytes.fromhex('280f20f000040400')),
+             ('SQ_RSRC_IMG_CUBE', bytes.fromhex('180f20f000040400')),
              ('SQ_RSRC_IMG_1D', bytes.fromhex('000f20f000040400')))
     for name, store in cases:
         decoded = D.decode_instruction(store, 0)[2]
         message = refused(with_store(store), 'image_store')
         print('refused %-20s %s' % (name + ':', message))
         assert decoded.startswith('image_store'), decoded
-    # Sparse DMASK: selected components only, in VDATA order. The UAV starts at -1; dmask:0x5 with
-    # v[4:5] = (1.0, 2.0) yields (1, -1, 2, -1) without reading the texel.
+    # 2D-array requires three address registers, a full mask, and still refuses pixel d16.
+    try:
+        array_pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY'])
+    except G.Unsupported as error:
+        assert 'x, y and layer expected' in str(error), error
+    else:
+        raise AssertionError('2D-array store with two address registers was accepted')
+    try:
+        array_pipe.ps.op_image_store(['v[4:5]', 'v[0:2]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY', 'd16'])
+    except G.Unsupported as error:
+        assert 'modifier d16' in str(error), error
+    else:
+        raise AssertionError('pixel 2D-array d16 store was accepted')
+    try:
+        array_pipe.ps.op_image_store(['v[4:5]', 'v[0:2]', 's[16:23]'], ['dmask:0x5', 'dim:SQ_RSRC_IMG_2D_ARRAY'])
+    except G.Unsupported as error:
+        assert 'writes all four channels' in str(error), error
+    else:
+        raise AssertionError('2D-array sparse dmask was accepted')
+    print('refused 2D-array with two address registers, pixel d16 and sparse dmask 0x5')
+    # Sparse DMASK on a pixel 2D store: selected components only, in VDATA order. The UAV starts at
+    # -1; dmask:0x5 with v[4:5] = (1.0, 2.0) yields (1, -1, 2, -1) without reading the texel.
     decoded_xz = D.decode_instruction(STORE_XZ, 0)[2]
     assert decoded_xz == 'image_store v[4:5], v[0:1], s[16:23] dmask:0x5 dim:SQ_RSRC_IMG_2D', decoded_xz
     sparse_ps = translate(WORDS_XZ).hlsl_ps()
@@ -257,6 +314,12 @@ def controls():
         assert ps.count(STORE_LINE) == 1, ps
     # With exec known (the entry mask) the store is not guarded.
     assert GUARDED_LINE not in translate(WORDS).hlsl_ps()
+    for constant, words in ((1, ARRAY_EXEC_ON), (2, ARRAY_EXEC_OFF)):
+        ps = translate(words).hlsl_ps()
+        assert '    exec = ((0x%08xu == v0) ? 1u : 0u);' % constant in ps, ps
+        assert '    ' + ARRAY_GUARDED_LINE in ps, ps
+        assert ps.count(ARRAY_STORE_LINE) == 1, ps
+    assert ARRAY_GUARDED_LINE not in array_ps
     print('exec after v_cmpx: %s' % GUARDED_LINE)
 
     # Same texel, disjoint masks: two invocations write x and z, and neither store reads the texel.
@@ -273,10 +336,10 @@ def controls():
     # The translator does not emit that request for a component store.
     draw_inl = (HERE.parent / 'src/startup_stubs/d3d12_draw.inl').read_text(encoding='utf-8')
     view = draw_inl.split('const char* pixel_uav_view', 1)[1].split('\nstruct Translation', 1)[0]
-    assert 'needs_typed_load' in view and 'typed_uav_load_refusal' in view, view
+    assert 'needs_typed_load' in view and 'typed_uav_load_refusal' in view and 'bool array' in view, view
     assert view.find('typed_uav_load_refusal') < view.find('out.Format = format'), view
     parser = draw_inl.split('const char* read_pixel_uav_line', 1)[1].split('\nbool float_uav_format', 1)[0]
-    assert 'typedload' in parser and 'needs_typed_load' in parser, parser
+    assert 'typedload' in parser and 'needs_typed_load' in parser and 'tex2da' in parser, parser
     store_cpp = (HERE / 'startup_image_store.cpp').read_text(encoding='utf-8')
     gate = store_cpp.split('check_startup_image_store_typed_load', 1)[1]
     assert 'DrawInstanced' not in gate and 'typed_uav_load_refusal' in gate, gate
@@ -293,7 +356,10 @@ def controls():
 
 
 def check_binary(llvm_mc):
-    for name, source, words in (('full mask', SOURCE, WORDS), ('same texel', SOURCE_LANES, WORDS_LANES)):
+    for name, source, words in (
+            ('full mask', SOURCE, WORDS),
+            ('2d array', ARRAY_SOURCE, ARRAY_WORDS),
+            ('same texel', SOURCE_LANES, WORDS_LANES)):
         built = assemble(llvm_mc, source)
         if built != words:
             raise AssertionError('%s fixture: assembled %s, recorded %s' % (name, built.hex(), words.hex()))
