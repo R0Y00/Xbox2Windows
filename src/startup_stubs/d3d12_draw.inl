@@ -314,10 +314,11 @@ LONG pointer_like_qwords(const std::vector<unsigned char>& blob)
 SRWLOCK compute_request_lock = SRWLOCK_INIT;
 std::unordered_set<u64>& compute_keys_seen() { static std::unordered_set<u64> s; return s; }
 
-void publish_compute_request(const void* desc)
+// Returns the request key, or 0 when publishing is disabled or the description is refused.
+u64 publish_compute_request(const void* desc)
 {
     wchar_t marker[MAX_PATH];
-    if (!render_mode() || !cache_path(marker, L"req_", 0, L".c67")) return;  // publishing disabled
+    if (!render_mode() || !cache_path(marker, L"req_", 0, L".c67")) return 0;  // publishing disabled
     static LONG logged;
     const char* refusal = nullptr;
     u64 words[12]{};
@@ -356,7 +357,7 @@ void publish_compute_request(const void* desc)
     if (refusal) {
         InterlockedIncrement(&compute_requests_failed);
         if (first_calls(logged, 12)) log("x2w-draw compute request not written: %s", refusal);
-        return;
+        return 0;
     }
     const auto& [code, data, state_a, state_b] = copies;
     // Pointer words never reach .desc or the key; 9 and 10 are not followed (shortcut: two descriptions that
@@ -392,6 +393,7 @@ void publish_compute_request(const void* desc)
         log("x2w-draw compute request %016llx %s (code %llu bytes, data %llu bytes, state blocks %llu + %llu bytes, "
             "pointer-like blob qwords %ld)", key, present ? "already present" : written ? "published" : "not written",
             words[6], words[8], words[2], words[4], pointers);
+    return key;
 }
 
 // Slot 57 fixed descriptors consumed by a decoded DispatchMesh signature.
