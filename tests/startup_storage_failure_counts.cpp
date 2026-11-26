@@ -366,6 +366,12 @@ int main(int argc, char** argv)
     std::snprintf(parsed_tail, sizeof parsed_tail, "inflated=1 failed=%ld", failed_now);
     ok = expect(std::strstr(counts, parsed_tail) != nullptr, "the inflated=N failed=N text live_view.py parses changed") && ok;
 
+    // Every term of completed is non-zero here, so a total that leaves out raw, inflated or bcpack-blank (or adds
+    // failed) is caught: the mixed run above has no BCPack-blank request.
+    format_request_counts(counts, sizeof counts, 1, 2, 3, 4);
+    ok = expect(std::strcmp(counts, "raw=1 inflated=2 failed=3 bcpack-blank=4 completed=7") == 0,
+                "completed is not raw + inflated + bcpack-blank (1, 2, 3, 4 must give completed=7)") && ok;
+
     // A run whose requests are all zlib: nothing is counted raw, yet completed equals the finished requests,
     // so the status line no longer reads as if storage were stuck.
     {
