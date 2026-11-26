@@ -187,6 +187,9 @@ check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 
 # These instructions refuse before v_readfirstlane_b32 is reached.
 EARLIER = {
     'op_sel overwrite': 'modifier op_sel:[0,0]',
+    # The high word of a copied wave64 mask carries the mask tag: its numeric read is refused where it is lowered.
+    'overlapping 64-bit move high word': 'v_mov_b32 reads lane mask s4 as numeric data',
+    'high word of saved exec': 'v_mov_b32 reads lane mask s3 as numeric data',
     'modified move overwrite': "v_mov_b32 with ['clamp']",
     'mask from uniform compare': 'v_mov_b32 data operand s2 is a lane mask',
     'vcc': 'v_mov_b32 data operand vcc_lo is a lane mask',
@@ -194,6 +197,14 @@ EARLIER = {
     'compare into SGPR': 'v_mov_b32 data operand s2 is a lane mask',
     'saved exec': 'v_mov_b32 data operand s2 is a lane mask',
     'mask in the entry block': 'v_mov_b32 data operand s2 is a lane mask',
+    'median of three of a lane mask': 'v_med3_f32 reads lane mask s2 as numeric data',
+    'unsigned to float conversion of a mask': 'v_cvt_f32_u32 reads lane mask s2 as numeric data',
+    # A scalar op that reads a lane mask as a number is refused where it is lowered (before the read).
+    'aliased load first word': 's_buffer_load_dwordx2 reads lane mask s2 as numeric data',
+    'aliased load second word': 's_buffer_load_dwordx2 reads lane mask s2 as numeric data',
+    'varying scalar buffer offset': 's_buffer_load_dword reads lane mask s2 as numeric data',
+    'mask through scalar arithmetic': 's_add_u32 reads lane mask s2 as numeric data',
+    'mask through scalar condition': 's_cmp_eq_u32 reads lane mask vcc_lo as numeric data',
 }
 for label, instructions in REFUSED:
     got = run(*instructions)
@@ -308,7 +319,45 @@ for label, instructions, group in (
         ('thread id base rewritten after', (GID, 'v_add_nc_u32_e32 v0, s3, v0', WAVE, READ1), (64, 1, 1)),
         ('thread id base scaled by 32', ('v_lshl_add_u32 v0, s2, 5, v0', WAVE, READ1), (64, 1, 1))):
     got = run(*instructions, kind='cs', group=group)
-    check(f'{label} refused', got == REFUSAL, repr(got))
+    # The compare's mask in s2 is refused where v_lshl_add_u32 reads it as a number, before the read.
+    expected = ('v_lshl_add_u32 reads lane mask s2 as numeric data'
+                if label == 'thread id base from a varying scalar' else REFUSAL)
+    check(f'{label} refused', got == expected, repr(got))
+
+# Only bits that survive both the field operation and the final shift may vary across threads.
+AND_OR = 'v_and_or_b32 v2, v0, 3, s2'
+EXTRACT = 'v_bfe_u32 v2, v0, 2, 3'
+SHIFT = 'v_lshrrev_b32_e32 v1, 2, v2'
+SHIFT1 = 'v_lshrrev_b32_e32 v1, 1, v2'
+for label, op, shift, size, expression in (
+        ('masked low bits of a large group', AND_OR, SHIFT, 128, '(s2 >> 2u)'),
+        ('mask above a non-power-of-two group', 'v_and_or_b32 v2, v0, 8, s2', SHIFT1, 7, '(s2 >> 1u)'),
+        ('extracted bit cleared by shift', EXTRACT, SHIFT1, 8, '0u'),
+        ('empty extracted field', 'v_bfe_u32 v2, v0, 0, 0', SHIFT1, 64, '0u'),
+        ('narrow field of a large group', 'v_bfe_u32 v2, v0, 1, 2', SHIFT, 128, '0u')):
+    got = run(op, shift, READ1, kind='cs', group=(size, 1, 1))
+    check(f'{label} accepted at entry', got[-1] == 's9 = v1;', repr(got))
+    got = run(op, shift, 's_cbranch_scc0 label_0014', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(size, 1, 1))
+    check(f'{label} recomputed past entry', got[-1] == f's9 = {expression};', repr(got))
+for label, instructions, size in (
+        ('surviving masked bit', (AND_OR, SHIFT1, READ1), 4),
+        ('surviving extracted bit', (EXTRACT, SHIFT1, READ1), 9),
+        ('variable mask', ('v_and_or_b32 v2, v0, s2, s2', SHIFT, READ1), 4),
+        ('vector OR source', ('v_and_or_b32 v2, v0, 3, v1', SHIFT, READ1), 4),
+        ('predicate as OR source', (COMPARE, AND_OR, SHIFT, READ1), 4),
+        ('scalar overwritten before shift', (AND_OR, 's_mov_b32 s2, 5', SHIFT, READ1), 4),
+        ('scalar overwritten before recompute', (AND_OR, SHIFT, 's_mov_b32 s2, 5', 's_cbranch_scc0 label_0018',
+                                                 READ1, 's_endpgm', 's_endpgm'), 4),
+        ('overwritten thread id', ('v_swap_b32 v1, v0', EXTRACT, SHIFT1, READ1), 8),
+        ('overwritten field', (EXTRACT, 'v_mov_b32_e32 v2, v0', SHIFT1, READ1), 8),
+        ('register field offset', ('v_bfe_u32 v2, v0, s2, 3', SHIFT1, READ1), 8),
+        ('register field width', ('v_bfe_u32 v2, v0, 2, s2', SHIFT1, READ1), 8),
+        ('signed field', ('v_bfe_i32 v2, v0, 2, 3', SHIFT1, READ1), 8),
+        ('unknown group for a masked field', (AND_OR, SHIFT, READ1), None)):
+    got = run(*instructions, kind='cs', group=(size, 1, 1) if size else None)
+    # a lane mask as the OR source meets the mask rule (#2702) before the uniformity rule: either refusal keeps it refused
+    mask_first = label == 'predicate as OR source' and got == 'v_and_or_b32 reads lane mask s2 as numeric data'
+    check(f'{label} refused', got == REFUSAL or mask_first, repr(got))
 
 # Older probes may provide either no tracker or only part of the tracking state.
 for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):

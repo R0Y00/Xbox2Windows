@@ -72,7 +72,7 @@ struct PhysicalMemory {
         for (const auto& run : runs)
             UnmapViewOfFile(reinterpret_cast<void*>(run.first));
         for (const HANDLE slab : slots.slabs())
-            CloseHandle(slab);
+            if (slab) CloseHandle(slab);
     }
 };
 
@@ -101,12 +101,26 @@ const Backing* mirrored_backing(ULONG_PTR page)
 }
 
 // Caller holds memory.mutex.
-void unpin_slot(const Slot& slot)
+void collect_empty_slabs(std::vector<HANDLE>& closed) noexcept
+{
+    memory.slots.reclaim_empty_slabs([&](HANDLE slab) noexcept {
+        try {
+            closed.push_back(slab);
+        } catch (...) {
+            CloseHandle(slab);
+        }
+    });
+}
+
+// Caller holds memory.mutex.
+void unpin_slot(const Slot& slot, std::vector<HANDLE>* closed = nullptr)
 {
     const auto found = memory.pins.find(slot);
     if (--found->second.references) return;
-    if (found->second.retired) memory.slots.release(slot.first, slot.second);
+    const bool retired = found->second.retired;
     memory.pins.erase(found);
+    if (retired && memory.slots.release(slot.first, slot.second) && closed)
+        collect_empty_slabs(*closed);
 }
 
 BOOL physical_result(era_physical::Status status) noexcept
@@ -1059,26 +1073,32 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
 {
     if (!pages || !count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
-    const std::lock_guard guard(memory.mutex);
-    for (ULONG_PTR i = 0; i < count; ++i) {
-        const auto backing = memory.backings.find(pages[i]);
-        if (backing != memory.backings.end() && backing->second.views)
-            return physical_result(era_physical::Status::invalid);
-    }
-    const auto status = era_physical::release(count, reinterpret_cast<const std::uint64_t*>(pages));
-    if (status == era_physical::Status::ok) {
+    std::vector<HANDLE> closed;
+    era_physical::Status status;
+    {
+        const std::lock_guard guard(memory.mutex);
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
-            if (backing != memory.backings.end()) {
-                const Slot slot{backing->second.slab, backing->second.offset};
-                if (const auto pin = memory.pins.find(slot); pin != memory.pins.end())
-                    pin->second.retired = true;
-                else
-                    memory.slots.release(slot.first, slot.second);
-                memory.backings.erase(backing);
+            if (backing != memory.backings.end() && backing->second.views)
+                return physical_result(era_physical::Status::invalid);
+        }
+        status = era_physical::release(count, reinterpret_cast<const std::uint64_t*>(pages));
+        if (status == era_physical::Status::ok) {
+            for (ULONG_PTR i = 0; i < count; ++i) {
+                const auto backing = memory.backings.find(pages[i]);
+                if (backing != memory.backings.end()) {
+                    const Slot slot{backing->second.slab, backing->second.offset};
+                    if (const auto pin = memory.pins.find(slot); pin != memory.pins.end())
+                        pin->second.retired = true;
+                    else
+                        memory.slots.release(slot.first, slot.second);
+                    memory.backings.erase(backing);
+                }
             }
+            collect_empty_slabs(closed);
         }
     }
+    for (const HANDLE slab : closed) CloseHandle(slab);
     return physical_result(status);
 }
 }  // namespace
@@ -1460,11 +1480,15 @@ extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_
 
 extern "C" BOOL WINAPI x2w_xmem_release_section(UINT version, ULONG64 lease)
 {
-    const std::lock_guard guard(memory.mutex);
-    const auto found = memory.leases.find(lease);
-    if (found == memory.leases.end() || found->second.version != version) return FALSE;
-    for (const auto& slot : found->second.slots) unpin_slot(slot);
-    memory.leases.erase(found);
+    std::vector<HANDLE> closed;
+    {
+        const std::lock_guard guard(memory.mutex);
+        const auto found = memory.leases.find(lease);
+        if (found == memory.leases.end() || found->second.version != version) return FALSE;
+        for (const auto& slot : found->second.slots) unpin_slot(slot, &closed);
+        memory.leases.erase(found);
+    }
+    for (const HANDLE slab : closed) CloseHandle(slab);
     return TRUE;
 }
 
@@ -1480,8 +1504,8 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
 }
 
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
-// in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and it is closed only at process end, so
-// a slot freed by a grant stays committed and these numbers do not show the commit held.
+// in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and empty slabs
+// are closed when all of their slots are freed and unpinned.
 extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in_use, ULONGLONG* slots_free)
 {
     if (!slabs || !slots_in_use || !slots_free) return FALSE;
@@ -1785,7 +1809,7 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
     }
     const bool below_40 = large_pages && attributes == 0x283 && x2w_local::env_on("X2W_XMEM_STARTUP_BELOW_40");
     // X2W_XMEM_LAZY_STARTUP: a large block is reserved and committed on first touch (lazy_startup).
-    const bool lazy = lazy_startup() && bytes >= lazy_block_min && !below_40;
+    const bool lazy = lazy_startup() && bytes >= lazy_block_min;
     const DWORD type = lazy ? MEM_RESERVE : MEM_RESERVE | MEM_COMMIT;
     void* block = nullptr;
     if (!large_pages) {
@@ -1800,7 +1824,7 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
         block = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, type, PAGE_READWRITE, &parameter, 1);
-        if (below_40) return keep_startup_block_below_40(block, bytes, attributes, protection);
+        if (below_40) block = keep_startup_block_below_40(block, bytes, attributes, protection);
     }
     if (block && lazy) {
         bool listed = false;

@@ -1,4 +1,4 @@
-"""Check 32-bit float compute image stores (with and without unorm) from the startup translator."""
+"""Check 32-bit float compute image stores (2D, unorm and 2D array) from the startup translator."""
 import argparse
 from pathlib import Path
 import struct
@@ -16,9 +16,76 @@ STORE_UNORM = bytes.fromhex('081f20f0080e0600')  # image_store v[14:17], v[8:9],
 MASK = bytes.fromhex('8002a47d')  # v_cmpx_eq_u32_e32 0, v1
 LINE = 'w0[uint2(v8, v9)] = asfloat(uint4(v14, v15, v16, v17));'
 
+# The 2D-array store (#2742) takes x, y and the layer in v8-v10 and needs no SRV read, so its four data
+# words are constants. The bound array has four layers and three mips: layer 1 is in the middle of the
+# range and layer 3 its last entry. tests/compute_check.cpp selects the layered RWTexture2DArray view.
+# The data words are not LLVM inline float constants: 0x40000000 (2.0) and 0x40800000 (4.0) would be
+# assembled as the four-byte inline form instead of the eight-byte literal below, so the values follow
+# the literal forms that tests/startup_image_2d_array_check.py and this fixture's own prologue already
+# pin against llvm-mc-15.
+ARRAY_STORE = bytes.fromhex('280f20f0080e0600')  # image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY
+ARRAY_FLAG = 1 << 31  # tests/compute_check.cpp texture_array_flag
+ARRAY_LAYERS = 4
+ARRAY_VALUES = (0x3f400000, 0x3e800000, 0x40810000, 0xbf810001)
+ARRAY_LINE = 'w0[uint3(v8, v9, v10)] = asfloat(uint4(v14, v15, v16, v17));'
+ARRAY_PROLOGUE = bytes.fromhex(
+    '07038cbe'                 # s_mov_b32 s12, s7
+    '80038dbe'                 # s_mov_b32 s13, 0
+    '06060cf4400000fa'         # s_load_dwordx8 s[24:31], s[12:13], 0x40
+    '080046d70a040104'         # v_lshl_add_u32 v8, s10, 2, v0
+    '090046d70b020504')        # v_lshl_add_u32 v9, s11, 1, v1
+ARRAY_SLICE = {1: bytes.fromhex('8102147e'), 3: bytes.fromhex('8302147e')}  # v_mov_b32_e32 v10, 1 or 3
+ARRAY_END = bytes.fromhex('000081bf')  # s_endpgm
+ARRAY_DATA = bytes.fromhex(
+    '7fc08cbf'                 # s_waitcnt lgkmcnt(0)
+    'ff021c7e0000403f'         # v_mov_b32_e32 v14, 0x3f400000
+    'ff021e7e0000803e'         # v_mov_b32_e32 v15, 0x3e800000
+    'ff02207e00008140'         # v_mov_b32_e32 v16, 0x40810000
+    'ff02227e010081bf')        # v_mov_b32_e32 v17, 0xbf810001
+ARRAY_SOURCE = """\
+s_mov_b32 s12, s7
+s_mov_b32 s13, 0
+s_load_dwordx8 s[24:31], s[12:13], 0x40
+v_lshl_add_u32 v8, s10, 2, v0
+v_lshl_add_u32 v9, s11, 1, v1
+v_mov_b32_e32 v10, {layer}
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v14, 0x3f400000
+v_mov_b32_e32 v15, 0x3e800000
+v_mov_b32_e32 v16, 0x40810000
+v_mov_b32_e32 v17, 0xbf810001
+image_store v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY
+s_endpgm
+"""
+
 
 def pipeline(body):
     return G.ComputePipeline(PREFIX + body + END, root_blob(3), RSRC2, fixture.GROUP)
+
+
+def array_program(layer):
+    return ARRAY_PROLOGUE + ARRAY_SLICE[layer] + ARRAY_DATA + ARRAY_STORE + ARRAY_END
+
+
+def array_pipeline(layer):
+    return G.ComputePipeline(array_program(layer), root_blob(3), RSRC2, fixture.GROUP)
+
+
+def array_reference(layer):
+    """Initial then expected words of the four-layer, three-mip array; only mip zero of `layer` is stored to."""
+    initial, expected = [], []
+    for z in range(ARRAY_LAYERS):
+        for mip in range(3):
+            for y in range(8 >> mip):
+                for x in range(32 >> mip):
+                    tag = mip << 16 | z << 12 | y << 7 | x << 2
+                    sentinels = [0xbf000000 | tag | c for c in range(4)]
+                    initial.extend(sentinels)
+                    if mip == 0 and z == layer and x < 4 * fixture.GROUPS and y < 2:
+                        expected.extend(ARRAY_VALUES)
+                    else:
+                        expected.extend(sentinels)
+    return initial, expected
 
 
 def controls(llvm_mc):
@@ -32,6 +99,8 @@ def controls(llvm_mc):
         assert assemble(llvm_mc, '\n'.join(fixture.LINES) + '\n') == fixture.WORDS
         assert assemble(llvm_mc, fixture.STORE + ' unorm\n') == STORE_UNORM
         assert assemble(llvm_mc, 'v_cmpx_eq_u32_e32 0, v1\n') == MASK
+        for layer in (1, 3):
+            assert assemble(llvm_mc, ARRAY_SOURCE.format(layer=layer)) == array_program(layer), layer
 
     pipe = pipeline(STORE)
     assert pipe.manifest().splitlines()[-2:] == [
@@ -44,6 +113,34 @@ def controls(llvm_mc):
     assert unorm_pipe.hlsl_cs() == pipe.hlsl_cs()
     assert unorm_pipe.manifest() == pipe.manifest()
     assert 'if (exec & 1) ' + LINE in pipeline(MASK + STORE_UNORM).hlsl_cs()
+
+    # 2D array (#2742): x, y and the layer are indexed as uint3 into a RWTexture2DArray bound as tex2da.
+    for layer in (1, 3):
+        array = array_pipeline(layer)
+        hlsl, manifest = array.hlsl_cs(), array.manifest()
+        first = layer * 1344
+        initial, expected = array_reference(layer)
+        assert 'RWTexture2DArray<float4> w0 : register(u0);' in hlsl, hlsl
+        assert ARRAY_LINE in hlsl and 'RWTexture2D<' not in hlsl, hlsl
+        assert f'v10 = 0x{layer:08x}u;' in hlsl, hlsl
+        assert 'uav 0 tex2da float table 1 64 channels 4' in manifest.splitlines(), manifest
+        # The four VDATA constants land at mip zero of that layer only; the other 5,312 words keep their
+        # sentinels. Layer 1 is in the middle of the four-layer range and layer 3 is its last entry.
+        assert len(initial) == len(expected) == ARRAY_LAYERS * 1344, (len(initial), len(expected))
+        assert expected[first:first + 4] == list(ARRAY_VALUES), expected[first:first + 4]
+        changed = [i for i, (before, after) in enumerate(zip(initial, expected)) if before != after]
+        assert len(changed) == 16 * 4 and changed[0] == first and changed[-1] == first + 128 + 31, changed[:1]
+    # An eight-byte literal is encoded only for a value LLVM does not take as an inline constant: a pattern
+    # such as 0x40000000 (2.0) or 0x40800000 (4.0) would assemble to the four-byte inline form instead, and
+    # only the --llvm-mc comparison would notice. Keep the hand-written data words clear of that table.
+    assert not set(ARRAY_VALUES) & set(G.D.INLINE_FLOAT_LITERALS), G.D.INLINE_FLOAT_LITERALS
+    # The array address is exactly x, y and layer: a two- or four-register address is refused.
+    array_mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY']
+    refused('compute image_store d16 requires a 2D image',
+            lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[24:31]'], array_mods + ['d16']))
+    for address in ('v[8:9]', 'v[8:11]'):
+        refused('x, y and layer expected',
+                lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], array_mods))
 
     mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D', 'unorm']
     for data in ('v14', 'v[14:15]', 'v[14:16]', 'v[253:256]'):
@@ -60,6 +157,12 @@ def controls(llvm_mc):
     ):
         instruction = encoded(asm, code)
         refused(reason, lambda: pipeline(instruction))
+
+    # 1D, 3D and cube keep the same refusal with the address count their form would take.
+    for dim, address in (('SQ_RSRC_IMG_1D', 'v8'), ('SQ_RSRC_IMG_3D', 'v[8:10]'),
+                         ('SQ_RSRC_IMG_CUBE', 'v[8:10]')):
+        refused('only 2D images',
+                lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], ['dmask:0xf', 'dim:' + dim]))
 
     wait = encoded('s_waitcnt lgkmcnt(0)', '7fc08cbf')
     changed = encoded('s_mov_b32 s26, 0', '80039abe')
@@ -85,12 +188,14 @@ def controls(llvm_mc):
         if offset == 64:
             for body in (read + STORE, STORE + read):
                 refused('used for a load and a store', lambda: pipeline(load + wait + body))
-    print('Compute 32-bit float image_store, unorm, EXEC, raw/texture binding order, alias and refusal checks passed')
+    print('Compute 32-bit float image_store, unorm, 2D array, EXEC, raw/texture binding order, alias and '
+          'refusal checks passed')
 
 
-def draw_cases(directory, compiler, renderer, adapter, payload, cases):
+def draw_cases(directory, compiler, renderer, adapter, payload, cases, selector=None, compared=1344):
+    selector = fixture.GROUPS | fixture.FLOAT_TEXTURE_FLAG if selector is None else selector
     hlsl, cso, case = (directory / f'image.{ext}' for ext in ('hlsl', 'cso', 'case'))
-    case.write_bytes(struct.pack(f'<2I{len(payload)}I', fixture.GROUPS | fixture.FLOAT_TEXTURE_FLAG, 0, *payload))
+    case.write_bytes(struct.pack(f'<2I{len(payload)}I', selector, 0, *payload))
     for name, source, expected_mismatches, needle in cases:
         hlsl.write_text(source, encoding='ascii')
         subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'main', '-Fo', cso, hlsl], check=True)
@@ -101,7 +206,7 @@ def draw_cases(directory, compiler, renderer, adapter, payload, cases):
             return 77
         if 'debug_layer=enabled' in result.stdout:
             assert 'debug_errors=0 debug_warnings=0' in result.stdout, name
-        assert f'compared_words=1344 mismatches={expected_mismatches}' in result.stdout, name
+        assert f'compared_words={compared} mismatches={expected_mismatches}' in result.stdout, name
         if expected_mismatches == 0:
             assert result.returncode == 0, name
         else:
@@ -136,7 +241,30 @@ def dispatch(directory, compiler, renderer, adapter):
         ('partial EXEC', masked, 0, None),
         ('drop EXEC guard', masked.replace(guard, LINE), 32, 'mip=0 word=128 expected=bf001000 actual=3f101000'),
     )
-    return draw_cases(directory, compiler, renderer, adapter, payload, cases)
+    if draw_cases(directory, compiler, renderer, adapter, payload, cases) == 77:
+        return 77
+    # 2D-array stores: layer 1 is in the middle of the four-layer range and layer 3 its last entry. The
+    # expected words carry the four VDATA constants at mip zero of that layer only. Storing one layer off
+    # must change both the wrong subresource and the untouched target, so each control differs by 128 words.
+    for layer, shift, needle in (
+        (1, '+ 1', 'mip=0 word=1344 expected=3f400000 actual=bf001000'),
+        (3, '- 1', 'mip=0 word=2688 expected=bf002000 actual=3f400000'),
+    ):
+        initial, expected = array_reference(layer)
+        source = array_pipeline(layer).hlsl_cs()
+        assert source.count(ARRAY_LINE) == 1
+        cases = (
+            ('layer %d, full EXEC' % layer, source, 0, None),
+            ('layer %d, omit store' % layer, source.replace(ARRAY_LINE, ''), 64,
+             'mip=0 word=%d expected=3f400000 actual=%08x'
+             % (layer * 1344, 0xbf000000 | layer << 12)),
+            ('layer %d, one layer off' % layer,
+             source.replace('uint3(v8, v9, v10)', 'uint3(v8, v9, v10 %s)' % shift), 128, needle),
+        )
+        if draw_cases(directory, compiler, renderer, adapter, initial + expected, cases,
+                      selector=fixture.GROUPS | ARRAY_FLAG, compared=len(initial)) == 77:
+            return 77
+    return 0
 
 
 if __name__ == '__main__':
