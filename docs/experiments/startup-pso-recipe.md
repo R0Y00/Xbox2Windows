@@ -32,10 +32,11 @@ available without a title run. It does not claim to eliminate driver compilation
 
 The device-free test `startup_pso_recipe` covers the serializer/parser round trip, two appended
 records, a corrupt state key, an unknown version, an oversized file, and target-format and DSV
-mismatches. The parser and state-key matching are verified. A two-process translated-draw replay
-with the same recipe directory is not yet part of the suite; the existing `startup_stream_*`
-fixtures can supply the translated draw when that case is added.
+mismatches. `startup_stream_draw_warp` runs the two-process replay: the first translated stream
+draw writes a recipe, a second process with the same directory loads and precreates it, and all
+32 RGBA bytes match. That test also covers the unused depth-stencil normalisation.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_pso_recipe$' -V
+ctest --preset dev --no-tests=error -R '^startup_stream_draw_warp$' -V
 ```
