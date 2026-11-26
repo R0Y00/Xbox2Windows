@@ -38,19 +38,17 @@ class ComputeStage(gfx.Stage):
             if not 0 < self.pipe.lds_words <= 8192:
                 raise gfx.Unsupported('native LDS requires a nonzero allocation of at most 32 KiB')
             self.uses_lds = True
-            reading = op.startswith('ds_read')
-            if reading:
-                self.u(args[1])
+            has_result = op.startswith('ds_read') or '_rtn_' in op
+            for operand in args[1:] if has_result else args:
+                reg = gfx.reg_range(operand)
+                if not reg or reg[0] != 'v':
+                    raise gfx.Unsupported('expected local DS VGPR operands')
+                self.u(operand)
+            if has_result:
+                # Check all inputs first: the destination can alias the address or data.
                 _, lo, hi = gfx.reg_range(args[0])
                 for index in range(lo, hi+1):
                     self.record_v_write(index)
-            else:
-                for operand in args:
-                    reg = gfx.reg_range(operand)
-                    if not reg or reg[0] != 'v':
-                        raise gfx.Unsupported('expected local DS VGPR operands')
-                    for index in range(reg[1], reg[2]+1):
-                        self.u(f'v{index}')
             first, second = struct.unpack_from('<II', self.code, self.pc)
             self.emit(f'#pragma x2w_lds {first:08x} {second:08x}')
             return
