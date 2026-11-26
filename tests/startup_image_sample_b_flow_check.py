@@ -123,6 +123,9 @@ REFUSED = {
     'scalar_in_block': (PROLOGUE + 's_mov_b32 s28, -1.0\nv_cmp_eq_u32_e32 vcc, 2, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n'
                         's_mov_b32 s28, 0\nBB1:\ns_or_b64 exec, exec, s[0:1]\nv_mov_b32_e32 v1, s28\n'
                         + SAMPLE + EXPORT, 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    'carry_in_block': (PROLOGUE + 's_mov_b64 s[28:29], exec\nv_cmp_eq_u32_e32 vcc, 2, v8\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\nv_add_co_u32_e64 v14, s[28:29], 0, 0\nBB1:\ns_or_b64 exec, exec, s[0:1]\ns_or_b64 exec, exec, s[28:29]\ns_waitcnt lgkmcnt(0)\nimage_sample_b v[10:13], v[1:4], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY\ns_waitcnt vmcnt(0)\nexp mrt0 v10, v11, v12, v13 done vm\ns_endpgm\n', 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    'exec_const_mask': (PROLOGUE + 's_mov_b64 s[12:13], exec\ns_mov_b64 exec, 1\nv_add_f32_e32 v2, 0.5, v2\ns_mov_b64 exec, s[12:13]\ns_waitcnt lgkmcnt(0)\nimage_sample_b v[10:13], v[1:4], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY\ns_waitcnt vmcnt(0)\nexp mrt0 v10, v11, v12, v13 done vm\ns_endpgm\n', 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
+    'kill_then_restore': (PROLOGUE + 's_mov_b64 s[12:13], exec\nv_cmpx_eq_u32_e32 0, v8\ns_cbranch_execnz BB1\ns_endpgm\nBB1:\ns_mov_b64 exec, s[12:13]\nv_add_f32_e32 v2, -0.5, v2\ns_waitcnt lgkmcnt(0)\nimage_sample_b v[10:13], v[1:4], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY\ns_waitcnt vmcnt(0)\nexp mrt0 v10, v11, v12, v13 done vm\ns_endpgm\n', 'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # A bias that differs per lane (a join of two values) past a divergent EXEC is not drawn: refused by name.
     'bias_per_lane': (PROLOGUE + 'v_mov_b32_e32 v14, 1.0\nv_cmp_eq_u32_e32 vcc, 0, v8\nv_cndmask_b32_e32 v1, v1, v14, vcc\n'
                       + branch_on_x(0, '-0.5') + SAMPLE + EXPORT,
@@ -190,6 +193,21 @@ WORDS_HEX = {
     ),
     'restore': (
         '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087e7e0cfe877fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'carry_in_block': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
+        'f0121210ff1204060000003ef302027eff02067e0000803e0902087e7e049cbe8210847d6a2480be020088bf0e1c0fd7'
+        '800001007e00fe887e1cfe887fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'exec_const_mask': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
+        'f0121210ff1204060000003ef302027eff02067e0000803e0902087e7e048cbe8104febef00404060c04febe7fc08cbf'
+        '280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'kill_then_restore': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127e'
+        'f0121210ff1204060000003ef302027eff02067e0000803e0902087e7e048cbe8010a47d010089bf000081bf0c04febe'
+        'f10404067fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
     'bias_per_lane': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087ef2021c7e8010847d011d02028010847d6a2480be010088bff10404067e00fe887fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
