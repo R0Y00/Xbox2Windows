@@ -2173,12 +2173,34 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
     // -vertex_first and each stream's view starts at vertex_first.
     const UINT index_bytes = pass.ib.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
-    const u64 index_address = pass.ib.BufferLocation + u64{start} * index_bytes;
+    const u64 index_start = u64{start} * index_bytes;
+    const u64 index_address = pass.ib.BufferLocation + index_start;
     const std::size_t index_total = std::size_t{count} * index_bytes;
     const bool indices_ok = indexed && !indirect && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
+    D3D12_INDEX_BUFFER_VIEW live_indices{};
+    ID3D12Resource* live_index_resource = nullptr;
+    // A vertex-stream SRV uses the recording-time index scan to size and rebase its view.
+    // For other draws, a live alias lets IA observe legal CPU writes made before submission.
+    if (indices_ok && index_total && index_address >= pass.ib.BufferLocation &&
+        (pass.ib.Format == DXGI_FORMAT_R16_UINT || pass.ib.Format == DXGI_FORMAT_R32_UINT) &&
+        index_address % index_bytes == 0 && index_start <= pass.ib.SizeInBytes &&
+        index_total <= pass.ib.SizeInBytes - index_start &&
+        std::none_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) { return srv.source == 1; })) {
+        const auto placed = placed_buffer_range(self->own().list_device, index_address, index_total);
+        if (!placed.reject && placed.alias && InterlockedCompareExchange(&placed.owner->own().refs, 0, 0)) {
+            const auto base = reinterpret_cast<u64>(placed.owner->own().title_memory);
+            const auto offset = index_address - base;
+            const auto gpu = placed.alias->GetGPUVirtualAddress();
+            if (gpu && offset <= ~u64{} - gpu && (gpu + offset) % index_bytes == 0 &&
+                retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(placed.alias))) {
+                live_indices = {gpu + offset, static_cast<UINT>(index_total), pass.ib.Format};
+                live_index_resource = placed.alias;
+            }
+        }
+    }
     INT vertex_first = indexed ? 0 : static_cast<INT>(start);
     UINT vertex_count = indexed ? 0 : count;
-    if (indices_ok) {
+    if (indices_ok && !live_index_resource) {
         std::uint32_t low = ~0u, high = 0;
         for (UINT k = 0; k < count; ++k) {
             const std::uint32_t value = index_bytes == 2 ? reinterpret_cast<const std::uint16_t*>(index_address)[k]
@@ -2546,11 +2568,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     } else if (indexed) {
         u64 offset = 0;
-        const u64 address = index_address;
-        const std::size_t bytes = index_total;
-        if (indices_ok && frame_copy(address, bytes, &offset)) {
-            const D3D12_INDEX_BUFFER_VIEW view{upload_ring->GetGPUVirtualAddress() + offset, static_cast<UINT>(bytes),
-                                               index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        auto view = live_indices;
+        if (live_index_resource) {
+            require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        } else if (indices_ok && frame_copy(index_address, index_total, &offset)) {
+            view = {upload_ring->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
+                    index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        }
+        if (view.BufferLocation) {
             list->IASetIndexBuffer(&view);
             const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);
