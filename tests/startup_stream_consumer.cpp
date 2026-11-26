@@ -164,7 +164,7 @@ static void* desktop_pipeline(void* device)
 //   stateb-unreadable, desc-unreadable
 //   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-heap,
 //   dispatch-heap-outside: one creation, then dispatch_slot67 below
-//   texture-store, texture-store-none, texture-store-denied: one creation, then texture_slot67 below
+//   texture-store, texture-store-none, texture-store-denied, texture-store-occupied, texture-store-copied: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
 static void* slot67_root;
@@ -306,7 +306,8 @@ static int dispatch_slot67(void* device, const std::string& mode)
 // three root constants, Dispatch of 2x1x1 groups, and the texture copied to a readback buffer whose 1024 halves go
 // to X2W_TEST_DISPATCH_OUT. texture-store-none records no Dispatch; texture-store-denied creates the texture
 // without unordered access, so the stand-in records its view as not created. texture-store-uint makes the texture
-// and its view RGBA16_UINT; texture-store-self also creates a shader resource view of the texture at table byte 0.
+// and its view RGBA16_UINT; texture-store-occupied then asks for a view of a texture without unordered access at the same
+// handle, which keeps the first view; texture-store-self also creates a shader resource view of the texture at table byte 0.
 static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32, height = 8, pitch = width * 8, bytes = pitch * height;
@@ -342,7 +343,25 @@ static int texture_slot67(void* device, const std::string& mode)
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
     const D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
-    invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
+    if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
+    if (mode == "texture-store-copied") {
+        // The view is created at another handle and its token copied into this slot by memcpy, as a title does; a
+        // refused creation at this slot then keeps that copied token.
+        invoke(device, 19, word(texture), 0, word(&view), cpu);
+        std::memcpy(reinterpret_cast<void*>(cpu + 64), reinterpret_cast<void*>(cpu), 32);
+        D3D12_RESOURCE_DESC plain = texture_desc;
+        plain.Flags = D3D12_RESOURCE_FLAG_NONE;
+        void* const other = make(D3D12_HEAP_TYPE_DEFAULT, plain, D3D12_RESOURCE_STATE_COMMON);
+        if (!other) return 79;
+        invoke(device, 19, word(other), 0, word(&view), cpu + 64);
+    } else if (mode == "texture-store-occupied") {
+        // A second creation at the same handle, over a texture without unordered access, is refused and leaves the first view.
+        D3D12_RESOURCE_DESC plain = texture_desc;
+        plain.Flags = D3D12_RESOURCE_FLAG_NONE;
+        void* const other = make(D3D12_HEAP_TYPE_DEFAULT, plain, D3D12_RESOURCE_STATE_COMMON);
+        if (!other) return 79;
+        invoke(device, 19, word(other), 0, word(&view), cpu + 64);
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     read.Texture2D.MipLevels = 1;
     if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
