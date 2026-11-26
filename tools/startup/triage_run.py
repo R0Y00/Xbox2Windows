@@ -833,6 +833,20 @@ def triage_run(
     )
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    if not args.logdir.exists():
+        raise FileNotFoundError(f"log path not found: {args.logdir}")
+    if not (args.logdir.is_file() or args.logdir.is_dir()):
+        raise ValueError(f"log path must be a regular file or directory: {args.logdir}")
+    if args.shader_cache is not None:
+        if not args.shader_cache.exists():
+            raise FileNotFoundError(f"shader cache directory not found: {args.shader_cache}")
+        if not args.shader_cache.is_dir():
+            raise NotADirectoryError(f"shader cache path is not a directory: {args.shader_cache}")
+    if args.max_items < 1:
+        raise ValueError(f"--max-items must be at least 1, got {args.max_items}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Summarize startup logs and optional shader cache into allowlisted Markdown."
@@ -851,9 +865,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum rows per summary table (default: 16)",
     )
     args = parser.parse_args(argv)
-    print(triage_run(args.logdir, shader_cache=args.shader_cache, max_items=args.max_items))
+    try:
+        _validate_args(args)
+        report = triage_run(args.logdir, shader_cache=args.shader_cache, max_items=args.max_items)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(report)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
