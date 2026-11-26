@@ -253,7 +253,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
         ComPtr<IUnknown> guest_queue;
         check(guest->CreateCommandQueue(&queue_desc, __uuidof(ID3D12CommandQueue),
                                         reinterpret_cast<void**>(guest_queue.GetAddressOf())), "create guest queue");
-        const auto queue = native_object<ID3D12CommandQueue>(device, guest, guest_queue.Get());
+        const auto queue = indirect_native_object<ID3D12CommandQueue>(device, guest, guest_queue.Get());
         ComPtr<ID3D12Fence> gate;
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "create gate fence");
         check(queue->Wait(gate.Get(), 1), "hold the guest queue on the gate");
