@@ -82,34 +82,6 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
     return done;
 }
 
-// Number of contiguous writable bytes at start, up to bytes, found like probe_readable but with one atomic
-// OR of zero per page: it faults where a write would and leaves every byte as it was, also against a
-// concurrent writer. A copy-on-write page gets its private copy, as the caller's write would give it.
-inline std::size_t probe_writable(std::uintptr_t start, std::size_t bytes) noexcept
-{
-    if (start < 0x10000 || start > 0x00007FFFFFFEFFFFull || bytes == 0 || bytes > UINTPTR_MAX - start) return 0;
-    std::size_t done = 0;
-    DWORD code = 0;
-    std::uintptr_t at = start;
-    const std::uintptr_t end = start + bytes;
-    __try {
-        while (at < end) {
-            _InterlockedOr8(reinterpret_cast<volatile char*>(at), 0);
-            const std::uintptr_t next = (at | 0xFFF) + 1;
-            done = static_cast<std::size_t>((next < end ? next : end) - start);
-            at = next;
-        }
-    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
-        if (code == 0x80000001u) {  // STATUS_GUARD_PAGE_VIOLATION: the system dropped the guard bit
-            MEMORY_BASIC_INFORMATION info{};
-            DWORD old = 0;
-            if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) && info.State == MEM_COMMIT)
-                VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
-        }
-    }
-    return done;
-}
-
 // With X2W_XMEM_LAZY_COMMIT, physical pages are committed on first touch (xmem_mapped_pages.cpp). A check of the
 // commit state, or a write that cannot fault (kernel I/O, GPU), commits the range first. A no-op without xmem.dll
 // or without the switch.

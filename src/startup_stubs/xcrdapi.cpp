@@ -152,17 +152,55 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
+// True when every page of [start, end) is resident and plain read-write: valid in the working set, PAGE_READWRITE
+// or PAGE_EXECUTE_READWRITE, no guard bit. One QueryWorkingSetEx per 512 pages, so the cost follows the
+// destination's size, not the region's. Reads attributes only; no page is touched.
+static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
+{
+    PSAPI_WORKING_SET_EX_INFORMATION pages[512];
+    std::uintptr_t page = start & ~std::uintptr_t{0xFFF};
+    while (page < end) {
+        DWORD count = 0;
+        for (; count < 512 && page < end; ++count, page += 0x1000) pages[count].VirtualAddress = reinterpret_cast<void*>(page);
+        if (!QueryWorkingSetEx(GetCurrentProcess(), pages, count * sizeof(pages[0]))) return false;
+        for (DWORD i = 0; i < count; ++i) {
+            const auto& page_info = pages[i].VirtualAttributes;
+            const DWORD protect = static_cast<DWORD>(page_info.Win32Protection);
+            if (!page_info.Valid || page_info.Bad || (protect & PAGE_GUARD) ||
+                ((protect & 0xFF) != PAGE_READWRITE && (protect & 0xFF) != PAGE_EXECUTE_READWRITE))
+                return false;
+        }
+    }
+    return true;
+}
+
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
-// no-access page in between. Probes one byte per page with a value-preserving write (probe_writable), so
-// a refusal changes no byte and a tripped guard page is re-armed. Not VirtualQuery: on the title's large
-// regions each query walks the whole region, which cost one storage thread ~20 s of kernel time per load.
+// no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
+// their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
+// destination to the VirtualQuery walk, which judges it region by region. That walk is slow on the title's
+// large regions: each query scans to the end of the region (#2684).
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
-    const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(destination);
-    if (!destination || bytes > UINTPTR_MAX - start) return false;
+    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
     x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
-    return x2w_local::probe_writable(start, bytes) == bytes;
+    const std::uintptr_t end = cursor + bytes;
+    if (resident_read_write(cursor, end)) return true;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = region_end;
+    }
+    return true;
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
