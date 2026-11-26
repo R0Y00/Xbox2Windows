@@ -2,9 +2,9 @@
 // Included inside d3d12_xs_device.cpp's anonymous namespace, before queue_present.
 //
 // A flip-model swap chain on the title window, created on the queue the title presents with; each
-// present draws the presented planes into the back buffer, bottom to top, with the plane compositor
+// present draws its planes into the back buffer, bottom to top, with the plane compositor
 // (plane_compositor.h: one full-window triangle a plane; a surface is usually larger than the
-// window), and flips. Diagnostics go to the window title, because GDI drawing does not mix with a
+// window), and flips. Plane 0 alone by default; every plane with X2W_PRESENT_COMPOSITE=1. Diagnostics go to the window title, because GDI drawing does not mix with a
 // flip-model swap chain.
 
 struct WindowPresenter {

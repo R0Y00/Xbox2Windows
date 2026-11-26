@@ -280,8 +280,11 @@ Series S profile a title presented two planes: plane 0 at 1920x1080 stayed black
 3840x2160 held the picture, with alpha 255 wherever it drew. Showing plane 0 alone gave a black
 window. Why plane 0 stays black is not known.
 
-The output window now composites the planes (`src/startup_stubs/plane_compositor.h`, shared by the
-window presenter and its fixture). The supported contract:
+By default the output window still shows plane 0 alone, as before the planes were decoded. The
+experimental `X2W_PRESENT_COMPOSITE=1` makes it composite the planes instead
+(`src/startup_stubs/plane_compositor.h`, shared by the window presenter and its fixture). It stays
+opt-in until a matched comparison on the same executable, with this change alone, shows what it does
+to a real present. The contract under the switch:
 
 - Order: plane 0 first, each later plane over it, in plane order (`composite_steps`). At most four
   planes are read.
@@ -296,8 +299,16 @@ window presenter and its fixture). The supported contract:
 - Each plane is scaled to the whole window with a linear, clamped sampler. The planes' source and
   destination rectangles in the record (after +0x10) are not decoded; a plane that covers only part
   of the screen on the console is stretched here.
-- What is reported and read back for diagnostics (`x2w-render presented`, now with the mean alpha)
-  is the topmost drawn plane.
+- The baseline capture is unchanged with or without the switch: the frame capture, the presented
+  signature, `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented` readback all read plane 0's
+  first resource, as before. Under the switch the highest plane above plane 0 with a known resource
+  is also sampled on the same frames, before compositing, and logged as a raw plane:
+
+  ```text
+  x2w-render raw plane <i> (not composited): surface <w>x<h> format <f>, sample <k>, mean level <l>/255, mean alpha <a>/255
+  ```
+
+  Neither line is the composited window picture.
 
 The first presents and every 300th log each plane:
 
@@ -308,14 +319,18 @@ x2w-present frame <n> plane <i>/<count>: <width>x<height> format <f> flags=0x<fl
 `ctest --preset dev --no-tests=error -R '^startup_present_planes(_control)?$'` checks the record layout
 and the composite order on synthetic records; the control reads 0x40-byte records and composites
 plane 0 alone, and must print `FAIL:`.
-`ctest --preset dev --no-tests=error -R '^startup_present_composite_warp(_control)?$'` draws source-built
-planes through the same records, `composite_steps` and compositor into a 64x32 RGBA8 target on WARP
-and reads every texel back: a single plane is shown as is (including a cell with alpha 0); a black
+`ctest --preset dev --no-tests=error -R '^startup_present_composite_(warp|overlay_removed_control_warp)$'`
+draws source-built planes through the same records, `composite_steps` and compositor (directly, without
+the switch) into a 64x32 RGBA8 target on WARP and reads every texel back: a single plane is shown as is (including a cell with alpha 0); a black
 plane 0 under a plane with alpha 0, 128, 5 and 255 cells and a third plane with opaque and
 half-transparent cells gives 0, 128, 5 and 255 levels and the plane-order result 128,0,127 for half
 red over blue (within 1 for blended cells, exact otherwise); a repeated surface and an empty record
-are left out. The control composites only the black first plane and must print `FAIL:`. The test
-exits 77 without a WARP adapter.
+are left out. The control runs the same cases, then removes the overlays and composites the black
+plane 0 alone. It passes only on `control ok: baseline matched, ...`, printed when the baseline and
+stacked cases matched, every fence completed without device removal, and the overlay-free picture is
+black and differs from the stacked expectation in exactly the six cells the overlays draw. Any `FAIL:`
+line fails it, including queue, compositor, target or plane setup, a fence that does not complete and
+device removal. Both exit 77 without a WARP adapter.
 
 ## Null Texture2D descriptors
 
@@ -1400,7 +1415,8 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
-| `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count) instead of compositing every plane. See [Presented planes](#presented-planes) |
+| `X2W_PRESENT_COMPOSITE=1` | experimental, in render mode: the output window composites every presented plane, bottom to top, instead of showing plane 0 alone, and the highest plane above plane 0 is sampled as `x2w-render raw plane <i> (not composited)`. Off by default; the baseline capture and `x2w-render presented` read plane 0 either way. See [Presented planes](#presented-planes) |
+| `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |

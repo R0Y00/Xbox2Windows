@@ -1961,15 +1961,18 @@ add_test(NAME startup_present_planes_control COMMAND startup_present_planes --co
 set_tests_properties(startup_present_planes_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 # The window's plane composite (src/startup_stubs/plane_compositor.h) read back on WARP: a single-plane
 # baseline, stacked planes with transparent, partly transparent and opaque overlays, and skipped repeats
-# and empty records. The control composites only the black first plane and must FAIL.
+# and empty records. The control then removes the overlays and passes only on "control ok:", printed when
+# the baseline matched, every fence completed and the overlay-free picture differs from the stacked
+# expectation in exactly the overlay cells. Any FAIL line (setup, fence, device removal, pixels) fails it.
 add_executable(startup_present_composite_warp tests/startup_present_composite_warp.cpp)
 target_include_directories(startup_present_composite_warp PRIVATE src)
 target_compile_features(startup_present_composite_warp PRIVATE cxx_std_17)
 target_link_libraries(startup_present_composite_warp PRIVATE d3d12 dxgi d3dcompiler)
 add_test(NAME startup_present_composite_warp COMMAND startup_present_composite_warp)
-add_test(NAME startup_present_composite_warp_control COMMAND startup_present_composite_warp --control)
+add_test(NAME startup_present_composite_overlay_removed_control_warp COMMAND startup_present_composite_warp --control)
 set_tests_properties(startup_present_composite_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-set_tests_properties(startup_present_composite_warp_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: " SKIP_RETURN_CODE 77 TIMEOUT 60)
+set_tests_properties(startup_present_composite_overlay_removed_control_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "control ok: baseline matched" FAIL_REGULAR_EXPRESSION "FAIL: ")
 # Static samplers built from smp and smpc manifest lines (src/startup_stubs/translated_sampler_bindings.h).
 add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison_check.cpp)
 target_include_directories(startup_sampler_comparison_check PRIVATE src)

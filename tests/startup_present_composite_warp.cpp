@@ -14,8 +14,11 @@
 //             cell blended over plane 1's opaque cell (order) and transparent elsewhere.
 //   skipped   plane 0 black, plane 1 as above, plane 2 the same surface as plane 1, plane 3 a record
 //             with no resource: the same picture as plane 0 and 1 alone.
-// --control composites only the black first plane for stacked and skipped: their overlay cells must
-// print FAIL.
+// --control runs the same cases and then removes the overlay: stacked composited from the black
+// plane 0 alone. It prints "control ok:" and exits 0 only when the baseline and stacked cases matched,
+// every fence completed without device removal, and the overlay-free result is black and differs from
+// the stacked expectation in exactly the six cells the overlays draw. A setup failure, a missing
+// fence, device removal or any other difference prints FAIL and exits 1.
 // usage: startup_present_composite_warp [--control]   (exit 77 when no WARP adapter is available)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -65,19 +68,34 @@ struct Gpu {
     UINT64 value = 0;
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    void run()
+    // Executes the list and waits for its fence. A list that does not close or execute, a fence that
+    // does not reach the value in time, or one that reports device removal (UINT64_MAX) is a failure.
+    bool run()
     {
-        list->Close();
+        const HRESULT closed = list->Close();
+        if (FAILED(closed)) {
+            ++failures;
+            std::printf("FAIL: command list close 0x%08lx\n", static_cast<unsigned long>(closed));
+            return false;
+        }
         ID3D12CommandList* lists[] = {list};
         queue->ExecuteCommandLists(1, lists);
-        queue->Signal(fence, ++value);
-        if (fence->GetCompletedValue() < value) {
-            fence->SetEventOnCompletion(value, event);
+        const HRESULT signalled = queue->Signal(fence, ++value);
+        if (SUCCEEDED(signalled) && fence->GetCompletedValue() < value && SUCCEEDED(fence->SetEventOnCompletion(value, event)))
             WaitForSingleObject(event, 10000);
+        const UINT64 completed = fence->GetCompletedValue();
+        if (FAILED(signalled) || completed == UINT64_MAX || completed < value) {
+            ++failures;
+            std::printf("FAIL: fence %llu not completed (completed %llu, signal 0x%08lx)\n", static_cast<unsigned long long>(value),
+                        static_cast<unsigned long long>(completed), static_cast<unsigned long>(signalled));
+            return false;
         }
+        ++fences;
         allocator->Reset();
         list->Reset(allocator, nullptr);
+        return true;
     }
+    unsigned fences = 0;  // fences that completed
 };
 
 void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
@@ -154,8 +172,12 @@ ID3D12Resource* plane(Gpu& gpu, const Cells& cells)
     from.PlacedFootprint = footprint;
     gpu.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
     barrier(gpu.list, texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    gpu.run();
+    const bool ran = gpu.run();
     upload->Release();
+    if (!ran) {
+        texture->Release();
+        return nullptr;
+    }
     return texture;
 }
 
@@ -219,9 +241,8 @@ std::vector<unsigned char> composite(Gpu& gpu, x2w_startup::PlaneCompositor& com
     from.pResource = target.texture;
     from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     gpu.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-    gpu.run();
     std::vector<unsigned char> pixels;
-    if (!drawn) return pixels;
+    if (!gpu.run() || !drawn) return pixels;
     pixels.resize(std::size_t{width} * height * 4);
     void* mapped = nullptr;
     const D3D12_RANGE range{0, static_cast<SIZE_T>(target.footprint.Footprint.RowPitch) * height};
@@ -233,6 +254,23 @@ std::vector<unsigned char> composite(Gpu& gpu, x2w_startup::PlaneCompositor& com
     const D3D12_RANGE none{0, 0};
     target.readback->Unmap(0, &none);
     return pixels;
+}
+
+// Whether every texel of a cell is within `tolerance` of `want` (alpha 255); the first texel off it
+// goes to `got`.
+bool cell_matches(const std::vector<unsigned char>& pixels, UINT row, UINT column, const Rgba& want, int tolerance, unsigned char* got)
+{
+    const unsigned char w[4] = {want.r, want.g, want.b, 255};
+    for (UINT y = row * cell_h; y < (row + 1) * cell_h; ++y)
+        for (UINT x = column * cell_w; x < (column + 1) * cell_w; ++x) {
+            const unsigned char* g = &pixels[(std::size_t{y} * width + x) * 4];
+            for (int k = 0; k < 4; ++k)
+                if (std::abs(int{g[k]} - int{w[k]}) > tolerance) {
+                    std::memcpy(got, g, 4);
+                    return false;
+                }
+        }
+    return true;
 }
 
 // Every texel of every cell must be within `tolerance` of the expected colour (alpha 255).
@@ -348,7 +386,7 @@ int main(int argc, char** argv)
         expect("baseline", pixels, want, exact);
     }
 
-    // Stacked: black, overlay, top. The control composites the black plane alone.
+    // Stacked: black, overlay, top.
     // Expected (UNORM8, src * a/255 + dst * (1 - a/255)): 128/255 of 255 is 128; 5/255 of 255 is 5;
     // half red over blue is 128,0,127.
     const Rgba stacked_want[rows][columns] = {{{0, 0, 0, 255}, {0, 128, 0, 255}, {5, 5, 5, 255}, {0, 0, 255, 255}},
@@ -356,7 +394,7 @@ int main(int argc, char** argv)
     const int blended[rows][columns] = {{0, 1, 1, 0}, {1, 0, 0, 0}};
     {
         ID3D12Resource* const planes[] = {p_black, p_overlay, p_top};
-        const auto pixels = composite(gpu, compositor, target, planes, control ? 1 : 3, &steps);
+        const auto pixels = composite(gpu, compositor, target, planes, 3, &steps);
         if (steps != 3) {
             ++failures;
             std::printf("FAIL: stacked: %u steps, want 3\n", steps);
@@ -368,7 +406,7 @@ int main(int argc, char** argv)
     // would blend the half-green cell twice (0,191,0) and the nearly transparent one twice (10).
     {
         ID3D12Resource* const planes[] = {p_black, p_overlay, p_overlay, nullptr};
-        const auto pixels = composite(gpu, compositor, target, planes, control ? 1 : 4, &steps);
+        const auto pixels = composite(gpu, compositor, target, planes, 4, &steps);
         if (steps != 2) {
             ++failures;
             std::printf("FAIL: skipped: %u steps, want 2 (plane 0 and plane 1)\n", steps);
@@ -379,6 +417,45 @@ int main(int argc, char** argv)
         expect("skipped", pixels, want, tolerance);
     }
 
+    // Control: the overlays removed, stacked is composited from the black plane 0 alone. That must be
+    // black everywhere, and must differ from the stacked expectation in exactly the cells the overlays
+    // draw: every cell except row 0 column 0 (plane 1 transparent) and row 1 column 3 (both transparent).
+    unsigned control_differences = 0;
+    if (control && !failures) {
+        const bool overlay_drawn[rows][columns] = {{false, true, true, true}, {true, true, true, false}};
+        const Rgba black_want = {0, 0, 0, 255};
+        ID3D12Resource* const planes[] = {p_black};
+        const auto pixels = composite(gpu, compositor, target, planes, 1, &steps);
+        if (steps != 1) {
+            ++failures;
+            std::printf("FAIL: control: overlay removed: %u steps, want 1\n", steps);
+        }
+        if (pixels.empty()) {
+            ++failures;
+            std::printf("FAIL: control: overlay removed: nothing composited\n");
+        }
+        for (UINT row = 0; row < rows && !pixels.empty(); ++row)
+            for (UINT column = 0; column < columns; ++column) {
+                unsigned char got[4] = {};
+                const unsigned char black[4] = {0, 0, 0, 255};
+                if (!cell_matches(pixels, row, column, black_want, 0, got)) {
+                    fail("FAIL: %s cell row %u column %u: got %u,%u,%u,%u want %u,%u,%u,%u\n", "control: overlay removed", row, column, got,
+                         black);
+                    continue;
+                }
+                const bool differs = !cell_matches(pixels, row, column, stacked_want[row][column], blended[row][column], got);
+                if (differs) ++control_differences;
+                if (differs != overlay_drawn[row][column]) {
+                    ++failures;
+                    std::printf("FAIL: control: overlay removed: cell row %u column %u %s the stacked expectation, want it to %s\n", row,
+                                column, differs ? "differs from" : "matches", overlay_drawn[row][column] ? "differ" : "match");
+                } else {
+                    std::printf("control: overlay removed: cell row %u column %u %s the stacked expectation\n", row, column,
+                                differs ? "differs from" : "matches");
+                }
+            }
+    }
+
     const HRESULT removed = gpu.device->GetDeviceRemovedReason();
     if (FAILED(removed)) {
         ++failures;
@@ -387,6 +464,11 @@ int main(int argc, char** argv)
     if (failures) {
         std::printf("startup_present_composite: FAIL (%d)\n", failures);
         return 1;
+    }
+    if (control) {
+        std::printf("control ok: baseline matched, %u fences completed, removing the overlay changed %u of %u cells as expected\n",
+                    gpu.fences, control_differences, rows * columns);
+        return 0;
     }
     std::puts("startup_present_composite: ok (baseline, stacked and skipped planes on WARP)");
     return 0;
