@@ -3291,8 +3291,14 @@ recording and before submit, while the cap skips multi-GiB existing heaps to avo
 uncovered prefix, and right before
 `OpenExistingHeapFromAddress` opens the heap). Anything else gets a
 committed default buffer that does not alias the title memory, holds zeros and is reported as
-success (`not aliased` in the log). `reserve_upload_ring` similarly grows in demand chunks starting at 16 MiB up to the
-256 MiB total cap instead of committing 256 MiB upfront. `X2W_D3D12_LINEAR_BUFFERS` changes this for one buffer kind: a
+success (`not aliased` in the log). `reserve_upload_ring` grows in demand
+chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
+bytes for the process; the allocator may use an older unused tail but
+refuses exhaustion or allocation failure rather than resetting live storage.
+`upload_reservation` exercises the shared cursor and returned-pointer contract
+without D3D12; on non-Windows hosts run
+`c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.
+`X2W_D3D12_LINEAR_BUFFERS` changes placement for one buffer kind: a
 buffer description with row-major or unknown layout and initial state `COMMON`
 (`src/startup_stubs/linear_buffer_backing.h`, [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914)).
 Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, keep the default backing.
