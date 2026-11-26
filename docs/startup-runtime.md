@@ -1462,7 +1462,6 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
-| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Slots 19-21 are never rewritten: their reference keeps the resource until the slot is overwritten or its heap is destroyed. Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
@@ -1642,9 +1641,10 @@ still retires once it is released and its fences have passed. The accounting is
 the prerequisite for a later slice that admits those textures. The slots 19-21
 fallback is unchanged: in a heap the shim does not shadow the call keeps
 `retire_leave_class`, so nothing is freed under a descriptor the shim cannot
-follow. `X2W_D3D12_RELEASE_RETIRED_VIEWS` still replaces only slot 18 SRVs by null
-descriptors: a 19-21 reference is never rewritten, so it keeps its resource until
-the slot is overwritten or its heap is destroyed.
+follow. `X2W_D3D12_RELEASE_RETIRED_VIEWS` no longer clears live descriptors; it is a legacy
+diagnostic that logs that clearing is disabled and enables the retirement
+breakdown. A tracked descriptor reference in any of slots 18-21 keeps its resource
+until the slot is overwritten, copied over, or its heap is destroyed (#2679).
 
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
