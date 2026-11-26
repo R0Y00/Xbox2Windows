@@ -3335,7 +3335,8 @@ texture with that description exists at the address, its view is created as befo
 70 already read from an address keep their own paths unchanged: the single texel, the `0x105`
 BC3/BC7 surface (partial last tiles included) and the `0x109` BC chains. For any other description
 with no live texture whose `Layout` is `0x101`, `0x102`, `0x105`, `0x106`, `0x109` or `0x10a` (256 B,
-4 KiB and 64 KiB blocks in the standard and display orders, no XOR), the texels are read from the
+4 KiB and 64 KiB blocks in the standard and display orders, no XOR) or the linear mode `0x100` (rows
+whose pitch is rounded up to 256 bytes, the mips stored from the smallest up), the texels are read from the
 address in that console layout (`src/startup_stubs/address_texture.h`, device-free). A translated
 draw that samples the view copies each mip of each array slice from that layout into desktop
 footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
@@ -3344,8 +3345,8 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
-Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
+Anything else is refused as before and leaves the destination descriptor unchanged: layout `0`
+without a live texture, three-dimensional and cube views, multisampled
 textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
 at most 64 MiB.
 

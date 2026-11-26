@@ -5,9 +5,10 @@
 // device, which of those descriptions the startup renderer reads from the address: a sampled-only,
 // two-dimensional, single-sample texture whose Layout field holds a console swizzle mode that
 // gfx10_layout.h addresses. Its texels are in that console layout.
-// Everything else is refused here: the desktop's unknown layout and the console's linear mode (the
-// extent of such rows is not established), other dimensions, multisampled textures, textures that
-// are also targets, formats without a known element size and swizzle modes without an equation.
+// The console's linear mode (0x100) is one of those layouts: rows with addrlib's 256-byte pitch.
+// Everything else is refused here: the desktop's unknown layout, other dimensions, multisampled
+// textures, textures that are also targets, formats without a known element size and swizzle modes
+// without an equation.
 
 #include "startup_stubs/gfx10_layout.h"
 
