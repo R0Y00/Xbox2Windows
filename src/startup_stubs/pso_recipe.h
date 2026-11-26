@@ -119,6 +119,24 @@ inline D3D12_RASTERIZER_DESC default_pso_rasterizer()
     return rasterizer;
 }
 
+// A valid depth-stencil state for a recipe that does not use one. The serializer writes every
+// field, and the parser rejects an invalid stencil op; the zero-filled D3D12 struct is not a
+// valid serialized state even when the PSO ignores it.
+inline D3D12_DEPTH_STENCIL_DESC default_pso_depth()
+{
+    D3D12_DEPTH_STENCIL_DESC depth{};
+    depth.DepthEnable = FALSE;
+    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    depth.StencilEnable = FALSE;
+    depth.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    depth.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    depth.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                       D3D12_COMPARISON_FUNC_ALWAYS};
+    depth.BackFace = depth.FrontFace;
+    return depth;
+}
+
 inline bool same_float_bits(float a, float b)
 {
     std::uint32_t left = 0, right = 0;
@@ -188,8 +206,8 @@ inline PsoRecipe make_pso_recipe(std::uint64_t translation_key, std::uint64_t st
     recipe.use_depth_stencil = use_depth_stencil;
     recipe.has_rasterizer = has_rasterizer;
     recipe.blend = desc.BlendState;
-    recipe.depth_stencil = desc.DepthStencilState;
-    recipe.rasterizer = desc.RasterizerState;
+    recipe.depth_stencil = use_depth_stencil ? desc.DepthStencilState : default_pso_depth();
+    recipe.rasterizer = has_rasterizer ? desc.RasterizerState : default_pso_rasterizer();
     recipe.sample_mask = desc.SampleMask;
     recipe.sample_count = desc.SampleDesc.Count;
     recipe.topology = desc.PrimitiveTopologyType;
@@ -552,17 +570,11 @@ inline bool parse_pso_recipe_lines(const std::vector<std::string_view>& lines, s
         return false;
     }
 
-    if (!recipe.use_depth_stencil) {
-        D3D12_DEPTH_STENCIL_DESC disabled{};
-        if (!same_pso_depth(recipe.depth_stencil, disabled)) {
-            why = "depth state is present but marked unused";
-            return false;
-        }
-    }
-    if (!recipe.has_rasterizer && !same_pso_rasterizer(recipe.rasterizer, default_pso_rasterizer())) {
-        why = "rasterizer state is present but marked unused";
-        return false;
-    }
+    // The serializer records a valid default for an unused state so that every field it writes is
+    // a legal enum. The state key ignores both blocks when their flags are clear; normalize them
+    // here so a replay compares the same zero/default values the creation path uses.
+    if (!recipe.use_depth_stencil) recipe.depth_stencil = {};
+    if (!recipe.has_rasterizer) recipe.rasterizer = default_pso_rasterizer();
     if (pso_recipe_state_key(recipe) != recipe.state_key) {
         why = "state key does not match the recorded state";
         return false;
