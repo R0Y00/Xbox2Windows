@@ -11,7 +11,7 @@ carry-out destination, a v_cndmask mask, a scalar operand. The decoder prints wa
 give the wave size; the translator renames vcc_hi to an SGPR the program never names only when that is exact in both
 wave sizes: no instruction names the 64-bit pair `vcc`, and either a VALU compare/carry writes vcc_hi (or an odd
 SGPR) or a VOP3 mask source reads one (a misaligned pair in wave64, so the program is wave32), or no VALU instruction
-writes vcc_lo (in wave64 that write would also set vcc_hi). Otherwise vcc_hi is refused by name, as before, and a
+and no vcc branch uses vcc_lo as a lane mask (in wave64 those also write or read vcc_hi for lanes 32..63). Otherwise vcc_hi is refused by name, as before, and a
 scalar write into vcc_hi or exec_hi is now a refusal instead of a TypeError.
 
 The draw fixture PS (packed screen position v0 = x | y << 16):
@@ -74,6 +74,15 @@ exp mrt0 v2, v5, v0, v0 done vm
 s_endpgm
 ''', 'ff03ebbe341200006b846b8f6b900080ff00887d05000500020001d58104a90100000a4a0f1800f802050000000081bf',
         's_mov_b32 into vcc_hi'),
+    # A VALU mask read of vcc_lo and nothing proves wave32: in wave64 lanes 32..63 would read vcc_hi as their mask
+    # bit, which the renamed scalar register does not model (found by an independent review).
+    'MASK_READ': ('''s_mov_b32 vcc_lo, 0
+s_mov_b32 vcc_hi, -1
+v_mov_b32_e32 v2, 2.0
+v_cndmask_b32_e32 v1, 1.0, v2, vcc_lo
+exp mrt0 v1, v1, v1, v1 done vm
+s_endpgm
+''', '8003eabec103ebbef402047ef20402020f1800f801010101000081bf', 's_mov_b32 into vcc_hi'),
     # The 64-bit pair `vcc` names vcc_hi as its high word.
     'PAIR': ('''v_cmp_gt_u32_e64 vcc_hi, v0, 0x50005
 s_and_b64 s[2:3], vcc, exec

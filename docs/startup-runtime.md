@@ -2102,7 +2102,7 @@ These are measured on one executable; treat them as hypotheses for others.
   scalar register. The decoder prints wave32 syntax, so the translator renames `vcc_hi` to an SGPR the program never
   names only when that is exact in both wave sizes: no instruction names the 64-bit pair `vcc`, and either a VALU
   compare or carry-out writes `vcc_hi` (or an odd SGPR), a VOP3 mask source reads one (a misaligned pair in wave64),
-  or no VALU instruction writes `vcc_lo`. Otherwise `vcc_hi` stays refused; scalar writes into `vcc_hi` or
+  or no VALU instruction and no `vccz`/`vccnz` branch uses `vcc_lo` as a lane mask (in wave64 those see `vcc_hi` for lanes 32..63). Otherwise `vcc_hi` stays refused; scalar writes into `vcc_hi` or
   `exec_hi` are now refusals instead of a Python TypeError. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
   pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the

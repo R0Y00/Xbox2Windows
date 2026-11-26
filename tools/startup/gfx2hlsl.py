@@ -955,10 +955,12 @@ def wave32_vcc_hi(ins):
 
     The decoder prints wave32 syntax, so the program text alone does not give the wave size. vcc_hi holds its own
     word in both wave sizes as long as only scalar instructions write it; in wave64 a VALU write of VCC (a compare,
-    a carry-out, v_div_scale, printed as vcc_lo) also writes vcc_hi with the high lanes. So the rename is exact when
+    a carry-out, v_div_scale, printed as vcc_lo) also writes vcc_hi with the high lanes, and a VALU mask read of VCC
+    (v_cndmask_b32_e32, a carry-in, v_div_fmas) or s_cbranch_vccz/vccnz reads vcc_hi for them. So the rename is
+    exact when
     - no instruction names the 64-bit pair `vcc` (whose high word would then be vcc_hi), and
-    - a VALU instruction writes vcc_hi or an odd SGPR as its compare or carry destination (a misaligned pair in
-      wave64, so the program is wave32), or no VALU instruction writes vcc_lo.
+    - a VALU compare or carry writes vcc_hi or an odd SGPR, or a VOP3 mask source reads one (a misaligned pair in
+      wave64, so the program is wave32), or no VALU instruction and no vcc branch uses vcc_lo as a lane mask.
     Otherwise, or when M0-relative s_movrel* could reach the chosen register, vcc_hi is left alone and refused."""
     if not any(re.search(r'\bvcc_hi\b', asm) for *_, asm in ins):
         return ins
@@ -976,7 +978,12 @@ def wave32_vcc_hi(ins):
             masks.append(ops[-1])  # a lane-mask source is a pair in wave64 too: vcc_hi or an odd SGPR proves wave32
     odd = any((reg_range(tok) or ('', 0, 1))[0] == 's' and reg_range(tok)[1] == reg_range(tok)[2]
               and reg_range(tok)[1] % 2 for tok in masks)
-    if 'vcc_hi' not in masks and not odd and 'vcc_lo' in masks:
+    # Without that proof the program may be wave64, where every VALU use of VCC as a lane mask (a write, an
+    # implicit or explicit mask source such as v_cndmask_b32_e32, a carry-in, v_div_fmas) and s_cbranch_vccz/vccnz
+    # see vcc_hi for lanes 32..63: none may be present.
+    vcc_mask_use = any((name.startswith('v_') and re.search(r'\bvcc_lo\b', asm)) or name.startswith('v_div_fmas')
+                       or name in ('s_cbranch_vccz', 's_cbranch_vccnz') for _o, _n, name, asm in ins)
+    if 'vcc_hi' not in masks and not odd and vcc_mask_use:
         return ins
     named = set()
     for *_, asm in ins:
