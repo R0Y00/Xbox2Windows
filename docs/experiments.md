@@ -15578,6 +15578,26 @@ python3 -B tests/startup_gfx2hlsl_calculated_target_check.py
 python3 -B tests/startup_gfx2hlsl_calculated_target_check.py binary llvm-mc-15
 ```
 
+### Statically resolved far early-outs through the two-exit profile
+
+The gfx1013 pixel two-exit extractor accepts a single proven forward calculated transfer onto an
+instruction-aligned terminating continuation containing only `s_nop`/`v_nop` and a plain `s_endpgm`.
+The contiguous `s_getpc_b64`/`s_add_u32`/`s_addc_u32`/`s_setpc_b64` chain uses a fresh aligned scalar
+pair and a constant displacement with matching sign extension. The repository and LLVM instruction
+inventories must agree, and no branch may enter the chain interior. Observable continuation effects
+remain refused. The standalone `pixel_aot.lower()` retains its single-export, single-exit scope.
+
+The source-built fixture compares short direct, short calculated and far calculated transfers using
+both selector outcomes and an independent arithmetic reference. The far displacement exceeds the
+131068-byte positive SOPP range. The bounded FSSM extraction check requires LLVM 15; its absence is
+reported separately from translation. Refusal controls cover malformed chains, escaping scratch
+words or SCC, effectful continuations and unaligned or out-of-range destinations.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_far_early_out_check.py
+python3 -B tests/startup_gfx2hlsl_far_early_out_check.py binary llvm-mc-15
+```
+
 ## Compute stage in the startup translator
 
 `gfx2hlsl.ComputePipeline` translates one gfx1013 compute program with the root and resource model of

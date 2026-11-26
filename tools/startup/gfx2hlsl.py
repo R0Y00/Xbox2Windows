@@ -1363,6 +1363,81 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+TERMINAL_NOP_NAMES = ('s_nop', 'v_nop')
+
+
+def terminal_continuation_proof(ins, calculated):
+    """Prove a single calculated forward transfer onto a pure terminating continuation in a two-exit program."""
+    transfers = [(off, target) for off, target in calculated.items() if target is not None]
+    ends = [off for off, _, name, _ in ins if name == 's_endpgm']
+    if len(transfers) != 1 or len(ends) != 2:
+        return None
+    setpc, target = transfers[0]
+    if target <= setpc:
+        raise Unsupported('far early-out: the calculated continuation target %#x is not forward' % target)
+    by_off = {off: (n, name, asm) for off, n, name, asm in ins}
+    if setpc not in by_off:
+        raise Unsupported('far early-out: the calculated transfer is not a decoded instruction')
+    # GETPC, ADD, ADDC and SETPC must be contiguous; a literal ADD occupies eight bytes.
+    elided = sorted(off for off in calculated if off < setpc)
+    chain = list(elided[-3:]) + [setpc]
+    if (len(elided) != 3 or any(off not in by_off for off in chain)
+            or chain[0] + by_off[chain[0]][0] != chain[1] or chain[1] + by_off[chain[1]][0] != chain[2]
+            or chain[2] + by_off[chain[2]][0] != chain[3]):
+        raise Unsupported('far early-out: the documented GETPC/ADD/ADDC/SETPC chain is not contiguous')
+    get_n, _, get_asm = by_off[chain[0]]
+    _, add_name, add_asm = by_off[chain[1]]
+    _, addc_name, addc_asm = by_off[chain[2]]
+    set_n, _, set_asm = by_off[chain[3]]
+    get_ops, get_mods = parse(get_asm)[1:]
+    add_ops, add_mods = parse(add_asm)[1:]
+    addc_ops, addc_mods = parse(addc_asm)[1:]
+    set_ops, set_mods = parse(set_asm)[1:]
+    pair = pc_pair(get_ops[0]) if len(get_ops) == 1 and not get_mods and get_n == 4 else None
+    if (pair is None or set_ops != ['s[%d:%d]' % (pair, pair + 1)] or set_mods or set_n != 4
+            or add_name != 's_add_u32' or addc_name != 's_addc_u32'):
+        raise Unsupported('far early-out: the calculated transfer does not use the documented chain form')
+    displacement = pc_word(add_ops[2]) if len(add_ops) == 3 and add_ops[0] == add_ops[1] == 's%d' % pair and not add_mods else None
+    extension = pc_word(addc_ops[2]) if len(addc_ops) == 3 and addc_ops[0] == addc_ops[1] == 's%d' % (pair + 1) and not addc_mods else None
+    if displacement is None or extension is None or extension != (-1 if displacement < 0 else 0):
+        raise Unsupported('far early-out: the displacement is not a complete constant with its matching sign extension')
+    if target != chain[0] + get_n + displacement:
+        raise Unsupported('far early-out: the proven target disagrees with the chain displacement')
+    # An ordinary definition of either scratch register would outlive the elided chain.
+    for off, _n, name, asm in ins:
+        if off in calculated:
+            continue
+        if {pair, pair + 1} & scalar_registers(asm):
+            raise Unsupported('far early-out: the scratch pair s[%d:%d] is not fresh' % (pair, pair + 1))
+    branch_targets = set()
+    for off, _n, name, asm in ins:
+        if name == 's_setpc_b64':
+            to = calculated.get(off)
+        elif name.startswith('s_cbranch') or name == 's_branch':
+            to = int(parse(asm)[1][0].split('_')[1], 16)
+        else:
+            continue
+        if to is not None:
+            branch_targets.add(to)
+    for off in chain[1:]:
+        if off in branch_targets:
+            raise Unsupported('far early-out: a branch enters the chain interior at +0x%x' % off)
+    # Even exp null with vm may change pixel validity; only observable no-op instructions are admitted.
+    at = target
+    while at in by_off:
+        _n, name, asm = by_off[at]
+        if name in TERMINAL_NOP_NAMES:
+            at += 4
+            continue
+        if name == 's_endpgm':
+            if asm != 's_endpgm' or at != ends[-1]:
+                raise Unsupported('far early-out: the continuation ends at +0x%x, not the program\'s final exit'
+                                  % at)
+            return setpc, target, tuple(chain)
+        raise Unsupported('far early-out: the continuation instruction %s is not a pure terminating no-op' % asm.split()[0])
+    raise Unsupported('far early-out: the continuation leaves the decoded program before ending')
+
+
 def _lds_single(tok):
     """Single hardware VGPR vN (v0..v255) for bounded LDS exchange validation."""
     m = re.fullmatch(r'v(\d+)', tok)
@@ -3438,6 +3513,12 @@ class Stage:
                 raise
             refusals.append((str(reason), self.kind))
             self.calculated_pc = {}
+        try:
+            terminal_continuation_proof(self.ins, self.calculated_pc)
+        except Unsupported as reason:
+            if refusals is None:
+                raise
+            refusals.append((str(reason), self.kind))
         targets = set()
         targets.update(target for target in self.calculated_pc.values() if target is not None)
         # (branch, target) of every branch, the proven s_setpc_b64 jumps included
