@@ -347,8 +347,8 @@ static int texture_slot67(void* device, const std::string& mode)
     if (mode == "texture-store-copied") {
         // The view is created at another handle and its token copied into this slot by memcpy, as a title does; a
         // refused creation at this slot then keeps that copied token.
-        invoke(device, 19, word(texture), 0, word(&view), cpu + 96);
-        std::memcpy(reinterpret_cast<void*>(cpu + 64), reinterpret_cast<void*>(cpu + 96), 32);
+        invoke(device, 19, word(texture), 0, word(&view), cpu);
+        std::memcpy(reinterpret_cast<void*>(cpu + 64), reinterpret_cast<void*>(cpu), 32);
         D3D12_RESOURCE_DESC plain = texture_desc;
         plain.Flags = D3D12_RESOURCE_FLAG_NONE;
         void* const other = make(D3D12_HEAP_TYPE_DEFAULT, plain, D3D12_RESOURCE_STATE_COMMON);
