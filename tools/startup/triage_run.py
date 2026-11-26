@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import sys
-from typing import Iterable
+from typing import Any, Iterable
 
 
 LOG_EXTENSIONS = {".txt", ".log", ".out"}
@@ -42,8 +43,18 @@ SLOT70_REASONS = {
     "null_address",
     "unsupported_description",
     "destination_outside_view_heaps",
+    "gpu_written_resource",
     "buffer_unavailable",
     "texture_unavailable",
+    # the partial-tile holds of device_memory_srv
+    "partial_tile_xg_rows",
+    "partial_tile_beyond_xg_size",
+    # the console-layout holds of device_memory_srv (#2015)
+    "unsupported_desktop_format",
+    "console_layout_xg_rows",
+    "console_layout_without_footprints",
+    "console_layout_beyond_xg_size",
+    "overlapping_resource",
 }
 DSTORAGE_FAIL_OUTCOMES = {
     "bcpack failed",
@@ -56,6 +67,25 @@ DSTORAGE_FAIL_OUTCOMES = {
     "zlib failed",
 }
 TRAP_TAGS = {"x2w-trap", "x2w-noop", "x2w-continue", "x2w-fail"}
+INDIRECT_PREFIX = "x2w-render indirect: "
+# Ordered fields emitted by the slot-61 census in d3d12_xs_device.cpp.
+INDIRECT_OUTCOMES = (
+    "forwarded", "refused graphics-pipeline", "compute-pipeline", "placeholder-signature", "other",
+)
+INDIRECT_KINDS = ("other", "dispatch", "draw", "drawindexed", "dispatchmesh")
+RE_INDIRECT_COUNT = re.compile(r"[0-9]{1,19}\Z")
+# The budget heartbeat is produced by report_budget() in d3d12_xs_device.cpp.
+BUDGET_DECIMAL = r"[0-9]{1,20}"
+BUDGET_SEGMENT = rf"(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a)"
+BUDGET_CATEGORY = rf"{BUDGET_DECIMAL}/{BUDGET_DECIMAL}\+{BUDGET_DECIMAL}/{BUDGET_DECIMAL}"
+RE_GPU_BUDGET = re.compile(
+    rf"x2w-budget local=(?:(?P<usage>{BUDGET_DECIMAL})/(?P<budget>{BUDGET_DECIMAL})|n/a)"
+    rf" nonlocal={BUDGET_SEGMENT} placed={BUDGET_CATEGORY}"
+    rf" texture=(?P<live>{BUDGET_DECIMAL})/{BUDGET_DECIMAL}"
+    rf"\+(?P<retained>{BUDGET_DECIMAL})/(?P<objects>{BUDGET_DECIMAL})"
+    + "".join(rf" {name}={BUDGET_CATEGORY}" for name in ("buffer", "upload", "readback", "heap"))
+    + rf" unmeasured={BUDGET_DECIMAL}"
+)
 OTHER = "other (text omitted)"
 RE_DEC = re.compile(r"[0-9]{1,10}\Z")
 RE_HEX = re.compile(r"0x[0-9a-fA-F]{1,8}\Z")
@@ -65,6 +95,8 @@ RE_OPENFILE_FAIL = re.compile(r"fail(?: \(err (\d{1,10})\))?\Z")
 MNEMONIC_FAMILY = r"(v|s|ds|buffer|tbuffer|image|flat|global|scratch|exp|lds)_[a-z0-9_]{1,40}"
 SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(image_load_mip) (tfe|a16)\Z"), r"\1 \2"),
+    (re.compile(r"buffer_load_format_(?:x|xy|xyz|xyzw) requires descriptor FORMAT and DST_SEL\Z"),
+     "buffer_* instruction"),
     (re.compile(r"SDWA UNUSED_SEXT\Z"), "SDWA UNUSED_SEXT"),
     (re.compile(r"SDWA dst_unused\b"), "SDWA dst_unused"),
     (re.compile(r"undecodable word\b"), "undecodable word"),
@@ -80,6 +112,83 @@ SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(MNEMONIC_FAMILY + r" with\b"), r"\1_* with modifier"),
     (re.compile(MNEMONIC_FAMILY + r"\Z"), r"\1_* instruction"),
 ]
+
+
+# Run end-point: how far a run got and how it ended. Only decimal counts, the fixed failure-cause names of the
+# DirectStorage heartbeat and the 32-bit exception code with its chance are copied; the rest of those lines (module
+# names, paths, addresses, exception parameters) is dropped.
+FAILURE_CAUSES = (
+    "read-at-or-past-eof",
+    "read-crossing-eof",
+    "read-other",
+    "destination-capacity",
+    "destination-not-writable",
+    "zlib",
+    "bcpack",
+    "other",
+)
+# Omit common debugger events from the observed exception list unless they are second-chance.
+FILTERED_FIRST_CHANCE = {"0x80000003", "0x80000004", "0x406d1388", "0x40010006"}
+RE_HEARTBEAT_SECOND = re.compile(r"x2w-dstorage heartbeat (\d{1,10}) s:")
+RE_COMMIT_PEAK = re.compile(r"x2w-dstorage heartbeat \d{1,10} s: .*?\bcommit peak=(\d{1,10}) MiB\b")
+RE_FAILURE_CAUSES = re.compile(r"x2w-dstorage heartbeat (\d{1,10}) s: failed requests by cause ((?:[a-z-]+=\d{1,10}(?:\s+|$))+)")
+RE_CAUSE_COUNT = re.compile(r"([a-z-]+)=(\d{1,10})")
+# debug_launch.py events.txt: "<seconds> exception <code> <name> at <where> first|second-chance params=[...]".
+RE_EXCEPTION = re.compile(r"^\s*\d+\.\d+\s+exception\s+(0x[0-9a-fA-F]{8})\b.*?\b(first|second)-chance\b")
+RE_DEBUGGER_STOP = re.compile(r"^debugger stop (0x[0-9a-fA-F]{8}) (first|second)-chance$")
+RE_STOP_SUMMARY = re.compile(
+    r"^stopped at [^(]+\((0x[0-9a-fA-F]{8})\) at .+ after \d+\.\d+ s \((first|second) chance\) params=\["
+)
+
+
+def _keep_peak(old: int | None, new: int) -> int:
+    return new if old is None else max(old, new)
+
+
+def _is_later_sample(old_second: int | None, new_second: int) -> bool:
+    return old_second is None or new_second >= old_second
+
+
+@dataclass
+class RunEndpoint:
+    """Where a run got to, built only from allowlisted values."""
+
+    peak_commit_mib: int | None = None
+    last_heartbeat_s: int | None = None
+    failure_second: int | None = None
+    failure_counts: dict[str, int] = field(default_factory=dict)
+    first_exception: tuple[str, str] | None = None
+    last_exception: tuple[str, str] | None = None
+    exception_events: int = 0
+    confirmed_stop: tuple[str, str] | None = None
+
+    def observe(self, line: str) -> None:
+        m = RE_HEARTBEAT_SECOND.search(line)
+        if m:
+            second = int(m.group(1))
+            if self.last_heartbeat_s is None or second > self.last_heartbeat_s:
+                self.last_heartbeat_s = second
+            peak = RE_COMMIT_PEAK.search(line)
+            if peak:
+                self.peak_commit_mib = _keep_peak(self.peak_commit_mib, int(peak.group(1)))
+            causes = RE_FAILURE_CAUSES.search(line)
+            if causes and _is_later_sample(self.failure_second, int(causes.group(1))):
+                self.failure_second = int(causes.group(1))
+                self.failure_counts = {
+                    name: int(count) for name, count in RE_CAUSE_COUNT.findall(causes.group(2)) if name in FAILURE_CAUSES
+                }
+            return
+        m = RE_DEBUGGER_STOP.match(line) or RE_STOP_SUMMARY.match(line)
+        if m:
+            self.confirmed_stop = (m.group(1).lower(), m.group(2))
+            return
+        m = RE_EXCEPTION.match(line)
+        if m and (m.group(2) == "second" or m.group(1).lower() not in FILTERED_FIRST_CHANCE):
+            exception = (m.group(1).lower(), m.group(2))
+            self.exception_events += 1
+            if self.first_exception is None:
+                self.first_exception = exception
+            self.last_exception = exception
 
 
 def _dec(text: str | None) -> str:
@@ -193,19 +302,91 @@ def iter_log_files(log_target: Path) -> list[Path]:
     return files
 
 
-def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
+def parse_indirect_snapshot(payload: str) -> dict[tuple[str, str], int] | None:
+    groups = payload.split("; ")
+    if len(groups) != len(INDIRECT_OUTCOMES):
+        return None
+    snapshot: dict[tuple[str, str], int] = {}
+    for expected, group in zip(INDIRECT_OUTCOMES, groups):
+        outcome, _, counts = group.partition(": ")
+        if outcome != expected:
+            return None
+        if counts == "0":
+            continue
+        fields = counts.split()
+        if not fields or len(fields) % 2:
+            return None
+        for kind, count in zip(fields[::2], fields[1::2]):
+            key = (outcome, kind)
+            if kind not in INDIRECT_KINDS or key in snapshot or not RE_INDIRECT_COUNT.fullmatch(count):
+                return None
+            snapshot[key] = int(count)
+    return snapshot
+
+
+@dataclass(frozen=True)
+class GpuBudgetSample:
+    local: tuple[int, int] | None
+    live_texture_bytes: int
+    retained_texture_bytes: int
+    retained_textures: int
+
+
+@dataclass
+class GpuBudgetSummary:
+    samples: int = 0
+    known_local_budget: int = 0
+    above_local_budget: int = 0
+    local_peak: GpuBudgetSample | None = None
+    texture_peak: GpuBudgetSample | None = None
+
+    def observe(self, match: re.Match[str]) -> None:
+        local = (int(match["usage"]), int(match["budget"])) if match["usage"] is not None else None
+        sample = GpuBudgetSample(local, int(match["live"]), int(match["retained"]), int(match["objects"]))
+        self.samples += 1
+        if self.texture_peak is None or sample.retained_texture_bytes > self.texture_peak.retained_texture_bytes:
+            self.texture_peak = sample
+        if local is None or local[1] == 0:
+            return
+        usage, budget = local
+        self.known_local_budget += 1
+        self.above_local_budget += usage > budget
+        peak = self.local_peak.local if self.local_peak else None
+        if peak is None or usage * peak[1] > peak[0] * budget:
+            self.local_peak = sample
+
+
+def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
     """Aggregate startup telemetry counters from an iterable of log lines."""
     slot70_refusals: Counter[tuple[str, str, str, str, str, str, str]] = Counter()
     d3d12_unhandled: Counter[str] = Counter()
     slot133_outcomes: Counter[str] = Counter()
+    indirect_peaks: Counter[tuple[str, str]] | None = None
+    gpu_budget = GpuBudgetSummary()
     d3d12_debug: Counter[tuple[str, str]] = Counter()
     dstorage_failures: Counter[str] = Counter()
     dstorage_hresults: Counter[str] = Counter()
     runtime_failures: Counter[tuple[str, str]] = Counter()
+    endpoint = RunEndpoint()
 
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
+            continue
+        endpoint.observe(line)  # reads only; the line is still classified below
+
+        budget_match = RE_GPU_BUDGET.fullmatch(line)
+        if budget_match:
+            gpu_budget.observe(budget_match)
+            continue
+
+        if line.startswith(INDIRECT_PREFIX):
+            snapshot = parse_indirect_snapshot(line.removeprefix(INDIRECT_PREFIX))
+            if snapshot is not None:
+                if indirect_peaks is None:
+                    indirect_peaks = Counter()
+                # The runtime emits cumulative snapshots. Counter union takes each bucket's maximum.
+                indirect_peaks |= Counter(snapshot)
             continue
 
         # 1. slot70 memory SRV refusals
@@ -337,10 +518,13 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
         "slot70_refusals": slot70_refusals,
         "d3d12_unhandled": d3d12_unhandled,
         "slot133_outcomes": slot133_outcomes,
+        "indirect_peaks": indirect_peaks,
+        "gpu_budget": gpu_budget,
         "d3d12_debug": d3d12_debug,
         "dstorage_failures": dstorage_failures,
         "dstorage_hresults": dstorage_hresults,
         "runtime_failures": runtime_failures,
+        "endpoint": endpoint,
     }
 
 
@@ -362,7 +546,11 @@ def summarize_shader_cache(cache_dir: Path | None) -> Counter[str]:
                 break
         if not first_line:
             first_line = "(empty .fail)"
-        reasons["(empty .fail)" if first_line == "(empty .fail)" else classify_shader_reason(first_line)] += 1
+        reason = "(empty .fail)" if first_line == "(empty .fail)" else classify_shader_reason(first_line)
+        # A device slot 67 compute request (req_<key>.c67) gets its own class, so graphics counts do not move.
+        if (cache_dir / ("req_" + fail_path.stem + ".c67")).is_file():
+            reason = "compute: " + reason
+        reasons[reason] += 1
     return reasons
 
 
@@ -389,8 +577,41 @@ def _format_table(
     return lines
 
 
+def _stop_text(stop: tuple[str, str] | None) -> str:
+    return "not reported" if stop is None else f"`{stop[0]}` ({stop[1]}-chance)"
+
+
+def format_endpoint(endpoint: RunEndpoint) -> list[str]:
+    """Render the run end-point section."""
+    peak = "not reported" if endpoint.peak_commit_mib is None else f"`{endpoint.peak_commit_mib}` MiB"
+    beat = "not reported" if endpoint.last_heartbeat_s is None else f"`{endpoint.last_heartbeat_s}` s"
+    out = [
+        "### Run End-Point",
+        "",
+        "| Item | Value |",
+        "| --- | --- |",
+        f"| Peak commit (maximum of the `commit peak=` values) | {peak} |",
+        f"| Last heartbeat | {beat} |",
+        f"| Confirmed debugger stop | {_stop_text(endpoint.confirmed_stop)} |",
+        f"| First observed exception | {_stop_text(endpoint.first_exception)} |",
+        f"| Last observed exception | {_stop_text(endpoint.last_exception)} |",
+        f"| Observed exceptions | `{endpoint.exception_events}` |",
+        "",
+    ]
+    if endpoint.failure_second is None:
+        out.extend(["_No failed-requests-by-cause heartbeat line._", ""])
+        return out
+    out.extend([f"Failed requests by cause at heartbeat second `{endpoint.failure_second}`:", ""])
+    out.extend(["| Cause | Count |", "| --- | --- |"])
+    for cause in FAILURE_CAUSES:
+        count = endpoint.failure_counts.get(cause)
+        out.append(f"| {cause} | {'?' if count is None else count} |")
+    out.append("")
+    return out
+
+
 def format_markdown(
-    summary: dict[str, Counter],
+    summary: dict[str, Any],
     shader_failures: Counter[str],
     files_scanned: int,
     shader_cache_provided: bool,
@@ -457,6 +678,41 @@ def format_markdown(
         s133_rows = [[s133[name], name] for name in SLOT133_OUTCOMES if s133[name]]
         out.extend(_format_table(["Count", "Outcome"], s133_rows, len(s133_rows), sum(s133.values()), max_items))
 
+    indirect = summary["indirect_peaks"]
+    if indirect is not None:
+        out.extend([
+            "### `ExecuteIndirect` Outcomes",
+            "",
+            "Peak sampled cumulative count per cell. Rows and columns can peak in different samples.",
+            "",
+        ])
+        rows = [[outcome, *(indirect[outcome, kind] for kind in INDIRECT_KINDS)] for outcome in INDIRECT_OUTCOMES]
+        out.extend(_format_table(["Outcome", *INDIRECT_KINDS], rows, len(rows), 0, len(rows)))
+
+    gpu_budget = summary["gpu_budget"]
+    if gpu_budget.samples:
+        out.extend([
+            "### GPU Memory Budget",
+            "",
+            f"- Complete samples: `{gpu_budget.samples}`",
+            f"- Samples above local budget: `{gpu_budget.above_local_budget}` of `{gpu_budget.known_local_budget}` "
+            "with a positive reported local budget",
+            "",
+        ])
+        rows = []
+        for label, sample in (
+            ("Highest local usage-to-budget ratio", gpu_budget.local_peak),
+            ("Most retained texture bytes", gpu_budget.texture_peak),
+        ):
+            if sample is not None:
+                rows.append([
+                    label, *(sample.local if sample.local is not None else ("n/a", "n/a")),
+                    sample.live_texture_bytes, sample.retained_texture_bytes, sample.retained_textures,
+                ])
+        headers = ["Sample", "Local usage bytes", "Local budget bytes", "Live texture bytes",
+                   "Retained texture bytes", "Retained textures"]
+        out.extend(_format_table(headers, rows, len(rows), 0, len(rows)))
+
     # 3. x2w-d3d12-debug
     dbg = summary["d3d12_debug"]
     if dbg:
@@ -512,7 +768,10 @@ def format_markdown(
         )
     )
 
-    # 6. X2W_SHADER_CACHE .fail reasons
+    # 6. Run end-point
+    out.extend(format_endpoint(summary["endpoint"]))
+
+    # 7. X2W_SHADER_CACHE .fail reasons
     if shader_cache_provided:
         out.extend(["### `X2W_SHADER_CACHE` `.fail` Reasons", ""])
         sh_rows = [[count, f"`{reason}`"] for reason, count in shader_failures.most_common()]
@@ -574,6 +833,20 @@ def triage_run(
     )
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    if not args.logdir.exists():
+        raise FileNotFoundError(f"log path not found: {args.logdir}")
+    if not (args.logdir.is_file() or args.logdir.is_dir()):
+        raise ValueError(f"log path must be a regular file or directory: {args.logdir}")
+    if args.shader_cache is not None:
+        if not args.shader_cache.exists():
+            raise FileNotFoundError(f"shader cache directory not found: {args.shader_cache}")
+        if not args.shader_cache.is_dir():
+            raise NotADirectoryError(f"shader cache path is not a directory: {args.shader_cache}")
+    if args.max_items < 1:
+        raise ValueError(f"--max-items must be at least 1, got {args.max_items}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Summarize startup logs and optional shader cache into allowlisted Markdown."
@@ -592,9 +865,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum rows per summary table (default: 16)",
     )
     args = parser.parse_args(argv)
-    print(triage_run(args.logdir, shader_cache=args.shader_cache, max_items=args.max_items))
+    try:
+        _validate_args(args)
+        report = triage_run(args.logdir, shader_cache=args.shader_cache, max_items=args.max_items)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(report)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

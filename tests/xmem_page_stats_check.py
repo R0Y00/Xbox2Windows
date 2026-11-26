@@ -50,8 +50,8 @@ def main(path):
     def snapshot(stage, expected, slab_counts):
         actual = sections()
         assert actual == expected, f"{stage}: {actual} live sections, expected {expected}"
-        # (slabs open, slots in use, slots free). A slab holds 4096 slots and stays open after its slots are
-        # freed, so the pages in use are the slots in use.
+        # (slabs open, slots in use, slots free). A slab holds 4096 slots, stays open while any slot is live,
+        # and is closed once all of its slots are released.
         counts = slabs()
         assert counts == slab_counts, f"{stage}: slabs, in use, free = {counts}, expected {slab_counts}"
         assert counts[1] == actual, f"{stage}: {counts[1]} slots in use but {actual} pages hold a slot"
@@ -69,7 +69,7 @@ def main(path):
         assert allocate(PHYSICAL_64K, C.byref(count), pages) and count.value == 3
         snapshot("after the grant", 0, (0, 0, 0))
 
-        # Mapping two pages backs them with two 64 KiB sections.
+        # Mapping two pages backs them with two 64 KiB slots of one slab.
         one, other = number(pages[0]), number(pages[1])
         assert contiguous(first, 1, C.byref(one)) == first
         assert contiguous(second, 1, C.byref(other)) == second
@@ -80,24 +80,24 @@ def main(path):
         assert contiguous(second, 1, None) == second
         snapshot("after unmapping", 2, (1, 2, 4094))
 
+        # A second grant backed by a page-token write shares the same slab.
+        extra_count, extra_pages = number(1), (number * 1)()
+        assert allocate(PHYSICAL_64K, C.byref(extra_count), extra_pages) and extra_count.value == 1
+        token = number(extra_pages[0] << 4)
+        assert write_physical(C.byref(token), 1, 0, b"section", len(b"section"))
+        snapshot("write through page tokens", 3, (1, 3, 4093))
+
+        # Releasing the first grant leaves the slab open while the second grant still holds a slot.
         assert release(3, pages)
-        # The slab stays open: its commit is not given back.
-        snapshot("after releasing the grant", 0, (1, 0, 4096))
+        snapshot("after releasing first grant", 1, (1, 1, 4095))
+
+        # Releasing the last slot in the slab closes and reclaims it.
+        assert release(1, extra_pages)
+        snapshot("after releasing the written grant", 0, (0, 0, 0))
     finally:
         free(first, 0, WIN_RELEASE)
         free(second, 0, WIN_RELEASE)
-
-    # A decoded DirectStorage request backs its destination pages without mapping them.
-    count, pages = number(1), (number * 1)()
-    assert allocate(PHYSICAL_64K, C.byref(count), pages) and count.value == 1
-    snapshot("second grant", 0, (1, 0, 4096))
-    token = number(pages[0] << 4)
-    assert write_physical(C.byref(token), 1, 0, b"section", len(b"section"))
-    snapshot("write through page tokens", 1, (1, 1, 4095))
-    assert release(1, pages)
-    snapshot("after releasing the written grant", 0, (1, 0, 4096))
-    print("physical pages: grant=0 mapped=2 unmapped=2 released=0; page-token write created and released 1; "
-          "one slab stayed open with 4096 slots free")
+    print("physical pages: grant=0 mapped=2 unmapped=2 extra=1 first_released=1 all_released=0")
 
 
 if __name__ == "__main__":

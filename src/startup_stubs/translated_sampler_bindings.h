@@ -21,7 +21,13 @@ constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
-inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false)
+// lod_limits (manifest line smpl, image_sample_b and a constant sampler of image_sample, _l, _lz): the descriptor's LOD clamp is carried over. MIN_LOD (word 1 bits
+// 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json,
+// SQ_IMG_SAMP_WORD1; radeonsi si_state.c:5169-5170 encodes them as S_FIXED(x, 8)), so MinLOD and MaxLOD are the fields
+// divided by 256. dynamic_sampler() sets it for every heap entry. Without it MinLOD stays 0 and MaxLOD unbounded, as
+// for the other sample forms.
+inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
+                                                bool lod_limits = false)
 {
     static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -36,13 +42,22 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
     s.AddressW = modes[(words[0] >> 6) & 7];
     s.MaxAnisotropy = 1u << ((words[0] >> 9) & 7);
     if (s.MaxAnisotropy > 16) s.MaxAnisotropy = 16;
-    s.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     if (comparison) {
         s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
         s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);
     }
-    s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    // SQ_IMG_SAMP_WORD3 bits 31:30 (BORDER_COLOR_TYPE, Mesa gfx10-rsrc.json): 0 = TRANS_BLACK, 1 = OPAQUE_BLACK,
+    // 2 = OPAQUE_WHITE. Value 3 (REGISTER, indexed by BORDER_COLOR_PTR) has no palette here and falls back to 0.
+    const UINT border_type = (words[3] >> 30) & 3u;
+    s.BorderColor = border_type == 2u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE
+                  : border_type == 1u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
+                                      : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
+    if (lod_limits) {
+        s.MinLOD = static_cast<float>(words[1] & 0xfffu) / 256.0f;
+        s.MaxLOD = static_cast<float>((words[1] >> 12) & 0xfffu) / 256.0f;
+    }
     s.ShaderRegister = shader_register;
     s.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     return s;
@@ -51,6 +66,7 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
 struct TranslatedSamplers {
     std::vector<SamplerWords> statics;
     std::vector<bool> comparison;  // parallel to statics: bound as SamplerComparisonState
+    std::vector<bool> lod_limits;  // parallel to statics: MIN_LOD and MAX_LOD carried over (line smpl)
     bool heap = false;
     bool reserved_fallback = false;
 
@@ -72,10 +88,12 @@ struct TranslatedSamplers {
             int index = 0;
             unsigned words[4] = {};
             const bool compare = std::strncmp(line, "smpc", 4) == 0;
-            if (std::sscanf(line, compare ? "smpc %d %x %x %x %x" : "smp %d %x %x %x %x", &index, &words[0], &words[1],
-                            &words[2], &words[3]) == 5) {
+            const bool limits = std::strncmp(line, "smpl", 4) == 0;
+            if (std::sscanf(line, compare ? "smpc %d %x %x %x %x" : limits ? "smpl %d %x %x %x %x" : "smp %d %x %x %x %x",
+                            &index, &words[0], &words[1], &words[2], &words[3]) == 5) {
                 statics.push_back({words[0], words[1], words[2], words[3]});
                 comparison.push_back(compare);
+                lod_limits.push_back(limits);
             }
         }
         return true;
@@ -87,24 +105,30 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
 {
     std::vector<D3D12_STATIC_SAMPLER_DESC> statics;
     for (UINT i = 0; i < samplers.statics.size(); ++i)
-        statics.push_back(decode_sampler(samplers.statics[i], i, i < samplers.comparison.size() && samplers.comparison[i]));
+        statics.push_back(decode_sampler(samplers.statics[i], i, i < samplers.comparison.size() && samplers.comparison[i],
+                                         i < samplers.lod_limits.size() && samplers.lod_limits[i]));
     return statics;
 }
 
-inline UINT sampler_root_parameter(UINT srvs) { return srvs ? 2u : 1u; }
+// views: the SRVs and UAVs of the view table together.
+inline UINT sampler_root_parameter(UINT views) { return views ? 2u : 1u; }
 
+// Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.. right after them.
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
-                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out)
+                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0)
 {
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = constants;
-    const D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0};
+    // A compute program's outputs (u0..) follow its resources in the same table.
+    const D3D12_DESCRIPTOR_RANGE view_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0},
+                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, uavs, 0, 0, srvs}};
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[1].DescriptorTable = {1, &srv_range};
+    // A range of no descriptors does not serialize: a program without resources starts the table at its outputs.
+    parameters[1].DescriptorTable = {(srvs ? 1u : 0u) + (uavs ? 1u : 0u), srvs ? view_ranges : view_ranges + 1};
     const D3D12_DESCRIPTOR_RANGE sampler_range{
         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, translated_sampler_count, 0, translated_sampler_space, 0};
-    UINT count = sampler_root_parameter(srvs);
+    UINT count = sampler_root_parameter(srvs + uavs);
     if (samplers.heap) {
         parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[count].DescriptorTable = {1, &sampler_range};
@@ -170,14 +194,21 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
 
 inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
 {
-    const auto s = decode_sampler(words, 0);
+    // A heap entry is the title's own descriptor, so its MIN_LOD, MAX_LOD (#2221) and fixed border color apply.
+    const auto s = decode_sampler(words, 0, false, true);
+    const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
+    const float alpha = (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
+                         s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK) ? 1.0f : 0.0f;
     return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
-            {}, s.MinLOD, s.MaxLOD};
+            {rgb, rgb, rgb, alpha}, s.MinLOD, s.MaxLOD};
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
 {
-    return dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    // Not a title descriptor: its zero word 1 is not a LOD clamp, so the full mip range stays available.
+    auto s = dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    s.MaxLOD = D3D12_FLOAT32_MAX;
+    return s;
 }
 
 struct NullSamplerCounts {

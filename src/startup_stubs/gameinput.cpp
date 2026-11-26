@@ -15,12 +15,17 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/qpc_microseconds.h"
+#include "startup_stubs/input_script.h"
+#include "startup_stubs/present_signature.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 using u64 = std::uint64_t;
@@ -30,6 +35,7 @@ constexpr HRESULT reading_too_old = static_cast<HRESULT>(0x838A0004);
 constexpr std::uint32_t kind_keyboard = 0x00000010;
 constexpr std::uint32_t kind_gamepad = 0x00040000, kind_controller_bits = 0x0000000E;
 constexpr std::uint32_t status_connected = 0x47;  // connected, input enabled, output enabled, synchronized
+constexpr std::uint32_t family_xbox_one = 1;      // GameInputFamilyXboxOne (GameInputDeviceFamily)
 constexpr std::size_t max_keys = 32;
 constexpr std::size_t history_capacity = 64;
 
@@ -99,6 +105,176 @@ PadShared* pad_shared()
     return shared;
 }
 
+// Milliseconds since this process started. X2W_INPUT_CLOCK_MS replaces this clock for the input script
+// (test seam: tests/startup_gameinput_script_syntax.cpp sets it before each poll).
+u64 process_milliseconds()
+{
+    const DWORD saved = GetLastError();
+    char text[24]{};
+    const DWORD length = GetEnvironmentVariableA("X2W_INPUT_CLOCK_MS", text, sizeof(text));
+    SetLastError(saved);
+    if (length && length < sizeof(text)) return std::strtoull(text, nullptr, 10);
+    static const ULONGLONG started = [] {
+        FILETIME created{}, exited{}, kernel{}, user{}, now{};
+        GetSystemTimeAsFileTime(&now);
+        const ULONGLONG tick = GetTickCount64();
+        if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return tick;
+        const auto value = [](const FILETIME& f) { return (static_cast<ULONGLONG>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+        const ULONGLONG age = value(now) > value(created) ? (value(now) - value(created)) / 10000 : 0;
+        return age < tick ? tick - age : 0;
+    }();
+    return GetTickCount64() - started;
+}
+
+// X2W_INPUT_SCRIPT (src/startup_stubs/input_script.h), parsed once on GameInputCreate or the first poll.
+// At most 4,095 characters (a longer value is ignored) and 256 entries, as before; every rejected item is
+// also logged with its index and reason.
+const x2w_input_script::Script& input_script()
+{
+    static const x2w_input_script::Script script = [] {
+        x2w_input_script::Script parsed;
+        constexpr DWORD max_characters = 4095;
+        const DWORD saved = GetLastError();
+        const DWORD size = GetEnvironmentVariableA("X2W_INPUT_SCRIPT", nullptr, 0);  // characters + 1, 0 if unset
+        std::string text(size ? size : 1, '\0');
+        const DWORD length = size && size - 1 <= max_characters ? GetEnvironmentVariableA("X2W_INPUT_SCRIPT", text.data(), size) : 0;
+        SetLastError(saved);
+        if (size && size - 1 > max_characters) {
+            x2w_local::logf("x2w-input X2W_INPUT_SCRIPT ignored: %lu characters, at most %u", static_cast<unsigned long>(size - 1),
+                            static_cast<unsigned>(max_characters));
+            return parsed;
+        }
+        if (!length || length >= size) return parsed;
+        text.resize(length);
+        parsed = x2w_input_script::parse(text.c_str());
+        const std::size_t rejected = parsed.rejections.size();
+        std::size_t malformed = 0;
+        for (const x2w_input_script::Rejection& r : parsed.rejections) malformed += r.reason != "over 256 entries";
+        if (rejected)
+            x2w_local::logf("x2w-input X2W_INPUT_SCRIPT: %d of %d entries used (%d malformed, at most %d)",
+                            static_cast<int>(parsed.items - rejected), static_cast<int>(parsed.items), static_cast<int>(malformed),
+                            static_cast<int>(x2w_input_script::max_entries));
+        x2w_local::logf("x2w-input script: %zu entries accepted, %zu rejected, time base %s", parsed.entries.size(), rejected,
+                        parsed.from_process_start ? "process-start" : "first-poll");
+        constexpr std::size_t listed = 32;
+        for (std::size_t i = 0; i < rejected && i < listed; ++i) {
+            const x2w_input_script::Rejection& r = parsed.rejections[i];
+            x2w_local::logf("x2w-input script item %zu rejected (%s): \"%.48s\"", r.index, r.reason.c_str(), r.text.c_str());
+        }
+        if (rejected > listed) x2w_local::logf("x2w-input script: %zu more rejected items not listed", rejected - listed);
+        if (!parsed.waits.empty() || !parsed.marks.empty())
+            x2w_local::logf("x2w-input script: %zu waits, %zu marks; picture signal from Local\\x2w_present_signature_%lu",
+                            parsed.waits.size(), parsed.marks.size(), static_cast<unsigned long>(GetCurrentProcessId()));
+        if (!parsed.groups.empty()) x2w_local::logf("x2w-input script: %zu groups", parsed.groups.size());
+        // The presenter samples the picture only for scripts that wait on it.
+        if (!parsed.waits.empty())
+            x2w_local::logf("x2w-input script: picture signature %s",
+                            x2w_present_signature::request_sampling(GetCurrentProcessId()) ? "requested" : "could not be requested");
+        // A wait with ;fine reads the 64 x 72 grid; the presenter copies it only while asked.
+        if (parsed.wants_fine())
+            x2w_local::logf("x2w-input script: fine picture signature (64 x 72) %s",
+                            x2w_present_signature::request_fine(GetCurrentProcessId()) ? "requested" : "could not be requested");
+        return parsed;
+    }();
+    return script;
+}
+
+// Seconds on the script's time base; the first call fixes the first-poll zero and logs the resolved base.
+double script_seconds(const x2w_input_script::Script& script)
+{
+    static const u64 zero = [&] {
+        const u64 first_poll = process_milliseconds();
+        const u64 base = script.from_process_start ? 0 : first_poll;
+        x2w_local::logf("x2w-input script time base %s: first poll at %.3f s, first entry at %.3f s since process start",
+                        script.from_process_start ? "process-start" : "first-poll", first_poll / 1000.0,
+                        base / 1000.0 + x2w_input_script::first_start(script));
+        return base;
+    }();
+    return static_cast<double>(static_cast<long long>(process_milliseconds() - zero)) / 1000.0;
+}
+
+// The presenter's picture signature (src/startup_stubs/present_signature.h), opened by process id. While
+// no presenter has created it, opening is retried at most every 0.5 s.
+static_assert(x2w_input_script::signal_cells == x2w_present_signature::cells &&
+                  x2w_input_script::fine_cells == x2w_present_signature::fine_cells, "signature grid size");
+bool read_signal(x2w_input_script::Signal& out)
+{
+    static const x2w_present_signature::Block* block;
+    static ULONGLONG next_try;
+    if (!block) {
+        const ULONGLONG tick = GetTickCount64();
+        if (tick < next_try) return false;
+        next_try = tick + 500;
+        const DWORD saved = GetLastError();
+        block = x2w_present_signature::open_block(GetCurrentProcessId());
+        SetLastError(saved);
+        if (!block) return false;
+    }
+    x2w_present_signature::Snapshot snapshot;
+    if (!x2w_present_signature::read(block, snapshot)) return false;
+    out.available = true;
+    out.sequence = snapshot.sequence;
+    out.present = snapshot.presents;
+    std::memcpy(out.cells, snapshot.luma, sizeof(out.cells));
+    out.fine_available = snapshot.fine_valid;
+    if (snapshot.fine_valid) std::memcpy(out.fine, snapshot.fine, sizeof(out.fine));
+    return true;
+}
+
+void log_event(const x2w_input_script::Event& e)
+{
+    using x2w_input_script::Event;
+    switch (e.type) {
+    case Event::wait_begun:
+        x2w_local::logf("x2w-input script wait item %zu begun at %.3f s%s", e.item, e.at, e.signal ? "" : " (no presenter signal yet)");
+        break;
+    case Event::wait_changed:
+        x2w_local::logf("x2w-input script wait item %zu: picture changed at %.3f s, %.3f s after the wait began", e.item, e.at, e.elapsed);
+        break;
+    case Event::wait_done:
+        x2w_local::logf("x2w-input script wait item %zu done at %.3f s after %.3f s", e.item, e.at, e.elapsed);
+        break;
+    case Event::wait_timeout:
+        if (!e.label.empty())
+            x2w_local::logf("x2w-input script wait item %zu timed out at %.3f s after %.3f s%s; group %s is skipped from here", e.item, e.at,
+                            e.elapsed, e.signal ? "" : " (no presenter signal)", e.label.c_str());
+        else
+            x2w_local::logf("x2w-input script wait item %zu timed out at %.3f s after %.3f s%s; the script %s", e.item, e.at, e.elapsed,
+                            e.signal ? "" : " (no presenter signal)", e.stopped ? "stops" : "goes on");
+        break;
+    case Event::group_skipped:
+        x2w_local::logf("x2w-input script group %s (items %zu-%zu) failed at step item %zu: rest of the group skipped, "
+                        "the script goes on after item %zu from %.3f s",
+                        e.label.c_str(), e.group_item, e.end_item, e.item, e.end_item, e.at);
+        break;
+    case Event::mark:
+        if (e.signal)
+            x2w_local::logf("x2w-input script mark %s at %.3f s (item %zu, present %llu)", e.label.c_str(), e.at, e.item,
+                            static_cast<unsigned long long>(e.present));
+        else
+            x2w_local::logf("x2w-input script mark %s at %.3f s (item %zu, no presenter signal)", e.label.c_str(), e.at, e.item);
+        break;
+    }
+}
+
+// Scripts with waits or marks: one timeline for every polling thread.
+SRWLOCK timeline_lock = SRWLOCK_INIT;
+x2w_input_script::Output play_timeline(const x2w_input_script::Script& script, double t, double& end)
+{
+    static x2w_input_script::Timeline timeline(script);
+    static x2w_input_script::Signal signal;
+    std::vector<x2w_input_script::Event> events;
+    AcquireSRWLockExclusive(&timeline_lock);
+    x2w_input_script::Signal latest;
+    if (read_signal(latest)) signal = latest;
+    timeline.advance(t, signal, events);
+    const x2w_input_script::Output out = timeline.play(t);
+    end = timeline.end();
+    ReleaseSRWLockExclusive(&timeline_lock);
+    for (const x2w_input_script::Event& e : events) log_event(e);
+    return out;
+}
+
 GamepadState sample()
 {
     GamepadState s{};
@@ -158,40 +334,25 @@ GamepadState sample()
         const double t = (GetTickCount64() - automatic.zero) / 1000.0 - automatic.start;
         if (t >= 0 && std::fmod(t, automatic.period) < 0.2) s.buttons |= automatic.mask;
     }
-    // X2W_INPUT_SCRIPT=<mask hex>@<second>[,...]: one press of 0.3 s per entry (e.g. 4@60,1@70,20@80
-    // presses A, then Menu, then Y), so one run can try several buttons at known times.
-    // A script longer than the buffer, extra entries and malformed entries are reported, not dropped silently.
-    static constexpr int max_entries = 256;
-    static const struct Script { std::uint32_t mask[max_entries]; double at[max_entries]; int count; ULONGLONG zero; } script = [] {
-        Script sc{{}, {}, 0, GetTickCount64()};
-        static char text[4096];
-        const DWORD length = GetEnvironmentVariableA("X2W_INPUT_SCRIPT", text, sizeof(text));
-        if (length >= sizeof(text)) {
-            x2w_local::logf("x2w-input X2W_INPUT_SCRIPT ignored: %lu characters, at most %u", static_cast<unsigned long>(length - 1),
-                            static_cast<unsigned>(sizeof(text) - 1));
-        } else if (length) {
-            int entries = 0, malformed = 0;
-            for (char* item = std::strtok(text, ","); item; item = std::strtok(nullptr, ",")) {
-                ++entries;
-                unsigned mask = 0;
-                double at = 0;
-                if (std::sscanf(item, "%x@%lf", &mask, &at) != 2) {
-                    ++malformed;
-                } else if (sc.count < max_entries) {
-                    sc.mask[sc.count] = mask;
-                    sc.at[sc.count++] = at;
-                }
-            }
-            if (sc.count + malformed < entries || malformed)
-                x2w_local::logf("x2w-input X2W_INPUT_SCRIPT: %d of %d entries used (%d malformed, at most %d)", sc.count, entries,
-                                malformed, max_entries);
-        }
-        return sc;
-    }();
-    if (script.count) {
-        const double t = (GetTickCount64() - script.zero) / 1000.0;
-        for (int i = 0; i < script.count; ++i)
-            if (t >= script.at[i] && t < script.at[i] + 0.3) s.buttons |= script.mask[i];
+    // X2W_INPUT_SCRIPT (src/startup_stubs/input_script.h): timed presses, holds and axis values, e.g.
+    // 4@60,1@70,20@80 presses A, then Menu, then Y for 0.3 s each; 4@60+2 holds A; lx=-1@60+1.5 holds left.
+    // Waits and marks (wait=..., mark=..., @+<s>) go through the timeline; other scripts as before.
+    const x2w_input_script::Script& script = input_script();
+    const bool timeline = !script.waits.empty() || !script.marks.empty();
+    if (!script.entries.empty() || timeline) {
+        const double t = script_seconds(script);
+        double end = -1;
+        const x2w_input_script::Output out = timeline ? play_timeline(script, t, end) : x2w_input_script::play(script, t);
+        s.buttons |= out.buttons;
+        float* const axes[x2w_input_script::axis_count] = {&s.left_trigger, &s.right_trigger, &s.left_x, &s.left_y, &s.right_x, &s.right_y};
+        for (int i = 0; i < x2w_input_script::axis_count; ++i)
+            if (out.active[i] && std::fabs(out.axes[i]) > std::fabs(*axes[i])) *axes[i] = out.axes[i];
+        static volatile LONG finished;
+        static const double last_end = x2w_input_script::last_end(script);
+        if (!timeline) end = last_end;
+        if (end >= 0 && t >= end && InterlockedExchange(&finished, 1) == 0)
+            x2w_local::logf("x2w-input script time passed its last entry (%zu entries, ended at %.3f s on the script time base)",
+                            script.entries.size(), end);
     }
     return s;
 }
@@ -560,6 +721,16 @@ HRESULT __stdcall input_previous_reading(Object*, Reading* reference, std::uint3
     *out = make_reading(entry, kind, device);
     return S_OK;
 }
+
+// Microsoft's v0 GetTemporalReading was never implemented and was removed in v1.
+HRESULT __stdcall input_temporal_reading(Object*, u64 timestamp, Object* device, Reading** out)
+{
+    static LONG calls;
+    note("GameInput::GetTemporalReading", calls, timestamp, reinterpret_cast<u64>(device));
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
+    *out = nullptr;
+    return E_NOTIMPL;
+}
 using DeviceCallback = void(__stdcall*)(u64 token, void* context, Object* device, u64 timestamp, std::uint32_t current, std::uint32_t previous);
 HRESULT __stdcall input_register_device_callback(Object*, Object* device, std::uint32_t kind, std::uint32_t status_filter, std::uint32_t enumeration,
                                                  void* context, DeviceCallback callback, u64* token)
@@ -657,6 +828,7 @@ void build()
     input_table.slots[4] = reinterpret_cast<void*>(&input_current_reading);
     input_table.slots[5] = reinterpret_cast<void*>(&input_next_reading);
     input_table.slots[6] = reinterpret_cast<void*>(&input_previous_reading);
+    input_table.slots[7] = reinterpret_cast<void*>(&input_temporal_reading);
     input_table.slots[8] = reinterpret_cast<void*>(&input_register_callback);          // RegisterReadingCallback
     input_table.slots[9] = reinterpret_cast<void*>(&input_register_device_callback);
     input_table.slots[10] = reinterpret_cast<void*>(&input_register_short_callback);   // RegisterGuideButtonCallback
@@ -688,7 +860,9 @@ void build()
     std::memcpy(device_info + 4, ids, 4);
     for (int i = 0; i < 32; ++i) device_info[0x20 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceId
     for (int i = 0; i < 32; ++i) device_info[0x40 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceRootId
-    const std::uint32_t tail[4] = {2 /* family: Xbox One */, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
+    // GameInputDeviceFamily: Virtual -1, XboxOne 1 (XboxGIP / XInputHID), Xbox360 2 (XUSB22), Hid 3, I8042 4. The
+    // vendor/product above name an Xbox Series pad, a GIP device, so the family is XboxOne.
+    const std::uint32_t tail[4] = {family_xbox_one, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
     std::memcpy(device_info + 0x60, tail, sizeof(tail));
     // Virtual keyboard device info.
     std::memcpy(keyboard_device_info, &size, 4);
@@ -709,6 +883,7 @@ extern "C" __declspec(noinline) HRESULT GameInputCreate(void** out)
 {
     build();
     x2w_local::logf("x2w-input GameInputCreate(%p): virtual gamepad stand-in (keyboard + XInput pad 0)", static_cast<void*>(out));
+    input_script();
     if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
     InterlockedIncrement(&the_input.refs);
     *out = &the_input;
