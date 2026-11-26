@@ -174,6 +174,12 @@ def controls():
     unmasked.masks, unmasked.varying_s = {60}, set()
     unmasked.one('v_mad_u64_u32', 'v_mad_u64_u32 v[14:15], vcc_lo, s58, 1, s[56:57]')
     check('a scalar that is not a lane mask is still accepted', bool(unmasked.lines))
+    tracked = Probe()
+    tracked.masks, tracked.varying_s = set(), set()
+    tracked.uniform_v, tracked.scc_uniform = set(), True
+    tracked.one('v_mad_u64_u32', 'v_mad_u64_u32 v[12:13], s60, v18, v19, v[20:21]')
+    check('an SGPR carry mask is marked varying, not uniform',
+          60 in tracked.masks and 60 in tracked.varying_s and not tracked.uniform_source('s60'))
     for asm in ('v_mad_i64_i32 v[12:13], vcc_lo, v18, v19, v[20:21]',
                 'v_mad_u64_u32 v[12:13], null, v18, v19, v[20:21]',
                 'v_mad_u64_u32 v[12:13], vcc_lo, v18, v19, v[20:21] clamp',

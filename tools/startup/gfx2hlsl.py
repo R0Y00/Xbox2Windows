@@ -6298,7 +6298,8 @@ class Stage:
             if mask in ('vcc', 'vcc_lo'):
                 self.emit('vcc = %s;' % expr)
             else:
-                self.set_s(mask_reg[1], expr)
+                # The carry is a per-lane bit: never a uniform scalar, whatever the scratch name hides.
+                self.set_s(mask_reg[1], expr, uniform=False)
                 self.masks.add(mask_reg[1])
         self.emit('}')
 
