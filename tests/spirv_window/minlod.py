@@ -9,6 +9,8 @@ SAMPLES = (
     ("implicit", "OpImageSampleImplicitLod %v4 %sampled %uv MinLod %one"),
     ("bias", "OpImageSampleImplicitLod %v4 %sampled %uv Bias|ConstOffset|MinLod %bias %offset %one"),
     ("grad", "OpImageSampleExplicitLod %v4 %sampled %uv Grad|MinLod %dx %dy %one"),
+    # On the 8x8 texture these gradients cover two texels, so they select mip 1 with a floor of 0.
+    ("grad-above-clamp", "OpImageSampleExplicitLod %v4 %sampled %uv Grad|MinLod %twoTexelsDx %twoTexelsDy %zero"),
     ("no-clamp", "OpImageSampleImplicitLod %v4 %sampled %uv"),
 )
 
