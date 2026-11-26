@@ -219,10 +219,14 @@ got = run('s_and_b32 m0, s2, 0xff', 's_cselect_b32 s3, 1, 0', 'v_mov_b32_e32 v7,
 check('uniform m0 write into SCC accepted',
       got == ['m0 = s2 & 0x000000ffu;', 'scc = m0 != 0;', 's3 = scc ? 0x00000001u : 0x00000000u;',
               'v7 = s3;', 's9 = v7;'], repr(got))
-# Every other SCC write either updates the proof or invalidates it: ops whose SCC result is not
-# modelled (carry, selected source), s_wqm, and the symbolic descriptor path, which emits nothing.
-for label, first in (('unmodelled carry', 's_add_u32 s3, s2, 1'),
-                     ('whole quad mode', 's_wqm_b64 exec, exec'),
+# s_add_u32 and its siblings emit their SCC (carry, borrow, overflow, selected source) from the sources, so the select that
+# reads it is uniform when the sources are.
+got = run('s_add_u32 s3, s2, 1', 's_cselect_b32 s3, 1, 0', 'v_mov_b32_e32 v7, s3', READ)
+check('select after a modelled carry from a uniform source accepted',
+      got == ['scc = (s2 + 0x00000001u) < (s2);', 's3 = s2 + 0x00000001u;', 's3 = scc ? 0x00000001u : 0x00000000u;',
+              'v7 = s3;', 's9 = v7;'], repr(got))
+# Every other SCC write either updates the proof or invalidates it: s_wqm and the symbolic descriptor path, which emits nothing.
+for label, first in (('whole quad mode', 's_wqm_b64 exec, exec'),
                      ('symbolic descriptor word', 's_and_b32 s10, s4, 0xff')):
     got = run(first, 's_cselect_b32 s3, 1, 0', 'v_mov_b32_e32 v7, s3', READ)
     check(f'select after {label} refused', got == REFUSAL, repr(got))

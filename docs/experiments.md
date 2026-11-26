@@ -101,7 +101,7 @@ whose reflected constants depend on the draw's start vertex or instance. It also
 shader bytecode. A deferred guest root can still supply the recorded tables to the translated root.
 A missing cached translation retains the request publishing path.
 
-Table buffer views bind their complete byte range, up to 16 MiB, from the recording's upload allocation,
+Table buffer views bind their complete byte range up to the D3D12 raw-view limit from the recording's upload allocation,
 one unique aliased placed buffer, or a wrapped resource with desktop backing and no title shadow.
 The runtime refuses non-DWORD ranges, misaligned offsets, cross-device views, any view of the
 same resource that contains the indirect arguments, and copied placements with unproven desktop contents. It binds
@@ -120,6 +120,12 @@ non-aliased placement is refused. A raw descriptor over a recording-owned upload
 same colour and refuses a view that crosses its allocation. `startup_indirect_translated_targets_{warp,hardware}`
 additionally checks two-target MRT, colour plus depth-stencil, depth-only (zero colour targets with a
 depth view), refusal of zero attachments, and refusal of a sampled texture aliasing render target 1.
+
+The same test reads the last DWORD of a GPU-backed raw view extending 16 bytes beyond
+16 MiB. The compute writer puts red there and green one element earlier. Shortening the
+view by one element makes the pixel read zero although the resource still contains red.
+The shim binds the existing GPU range directly and checks the complete range against its
+backing and the D3D12 raw-view element limit.
 
 ### Index views backed by a recording upload
 
@@ -15146,12 +15152,13 @@ ctest --preset release --no-tests=error -R '^startup_compute_gather_lz(_warp|_ha
 
 ### Startup compute D16 image store
 
-The startup compute translator accepts a 2D `image_store d16` with all four
-DMASK bits set, full-width X/Y and eight intact image descriptor words from a
-fixed table offset. The R/G half-floats occupy the low/high halves of the first
+The startup compute translator accepts 2D and 2D-array `image_store d16`
+with all four DMASK bits set, full-width X/Y (and layer for an array), and eight
+intact image descriptor words from a fixed table offset. The R/G half-floats occupy the low/high halves of the first
 data VGPR. B/A occupy the second. The translator widens the four halves for a
 typed UAV store under the lane's EXEC bit. The version 2 compute manifest
-records `uav N tex2d float table P O channels 4`. Raw buffer and texture UAVs
+records `uav N tex2d float table P O channels 4` or, for an array,
+`uav N tex2da float table P O channels 4`. Raw buffer and texture UAVs
 share a register index space. The consumer must validate the bound view against
 its dimension and float type. [AMD RDNA 2 ISA, §§8.2.1 and 8.2.5](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
 
@@ -15161,7 +15168,10 @@ write 16 texels to mip zero of an RGBA16_FLOAT UAV. Each run compares all 1,344
 half-words across three mips, including signed zeros, subnormals and untouched
 texels. A second program masks out the second row. Omitting the store, swapping
 R/G, swapping the packed registers and dropping the EXEC guard produce 64, 32,
-64 and 32 differences respectively. Slot-67 runtime binding is tracked in #2274.
+64 and 32 differences respectively. Slot-67 2D runtime binding is tracked in #2274.
+The [array UAV runtime fixture](experiments/startup-compute-array-uav.md) also
+checks packed D16 through the production slot-67/slot-14 path with a nonzero
+FirstArraySlice, all six physical slices and five negative controls.
 
 ```powershell
 cmake --build --preset release --target offscreen_check
@@ -15175,8 +15185,8 @@ dim:SQ_RSRC_IMG_2D_ARRAY with three full-width address VGPRs for x, y and layer.
 It emits an RWTexture2DArray<float4> store under the lane EXEC bit and records
 uav N tex2da float table P O channels 4 in the version 2 manifest.
 The [startup runtime array UAV binding](experiments/startup-compute-array-uav.md)
-consumes this manifest. Pixel arrays,
-packed D16 arrays and the 1D, 3D and cube store forms remain refused.
+consumes this manifest for full-mask FP32 and packed D16 compute stores.
+Pixel arrays and the 1D, 3D and cube store forms remain refused.
 
 The standalone GPU fixture writes the same four words into mip zero of layer 1
 and layer 3 of a four-layer allocation. It compares all 5,376 words and detects
@@ -15393,6 +15403,15 @@ On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), 
 `tools/startup/gfx2hlsl.py` now lowers `v_swap_b32` (VOP1, opcode 101), which it used to refuse. Both VGPRs exchange their old values, so the lowering reads the destination into a temporary before either register is written: `{ uint t = v1; v1 = v2; v2 = t; }`. The RDNA 2 ISA allows no input or output modifier on it, and LLVM 15 assembles only the 32-bit VOP1 spelling for gfx1013 (the `_e64`, `_dpp` and `_sdwa` forms and a scalar, constant, negated or 64-bit operand are rejected), so the translator refuses all of those and a modifier. A register-to-itself swap assembles and keeps its value. A proven-uniform register keeps that proof across the swap only while the exec mask is known.
 
 `tests/startup_gfx2hlsl_swap_check.py` (`startup_gfx2hlsl_swap`) decodes the documented VOP1 words, evaluates the translated text of seven programs on the CPU against a plain exchange of two list entries, and checks the refusals. Two mutations (write before read, only one destination written) are loaded from the translator source and must fail the fixtures. `python -B tests/startup_gfx2hlsl_swap_check.py binary llvm-mc-15` also reassembles the source lines. This is translation only; no draw was run.
+
+## Signed zero in startup binary16 multiplication
+
+The `startup_gfx2hlsl_f16_alu_draw` fixture draws plain, packed and SDWA binary16 products
+with independently computed raw-word expectations. In the SDWA high-word preserve case,
+the lower 16 bits start at `abcd`. Multiplying negative zero by positive zero and applying
+the fixture's export tag must read back `e000abcd`. Losing the sign gives `6000abcd`.
+The HLSL multiply uses a `precise` binary32 product before the binary16 rounding step.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f16_alu_draw_(warp|hardware)$' -V`.
 
 ## Startup translator: v_fma_mix_f32
 
@@ -17270,6 +17289,22 @@ or `scalar_wide_op()`). Reads where incoming SCC is unverified are refused: at s
 control-flow joins/branch targets, after descriptor-elided SCC writes, and after unmodeled SCC writers in
 `SCC_UNMODELLED` such as `s_add_u32` (after `s_add_u32` finishes reading its own sources). Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc$' -V`.
+
+
+## Startup translator: derivative image ops under a divergent EXEC
+
+`image_sample_b` and `image_get_lod` take implicit derivatives of the four lanes of a pixel quad. A pixel program
+with such an op and no backward branch now decides its `s_cbranch_execz` / `s_cbranch_execnz` per quad
+(`x2w_quad_any(exec)`: some lane of the 2x2 quad has its EXEC bit, from fine derivatives of the 0/1 bit), as the guest's
+wave skips a block only when no lane is active and runs it with the other lanes masked. A voted branch parts no quad,
+so it keeps `uniform_cf` (#2659); the vote reads the quad, so it is taken only while the control flow is quad-uniform
+and no lane-exec break (`s_wqm` of a narrowed EXEC, a discard under an unknown EXEC) came first. With that, a derivative
+op may sit under `v_cmpx`, inside an `execz` block, past an `execnz` kill branch, or after an EXEC restore. Still
+refused: any branch that can differ between lanes and is not an EXEC branch (VCC, SCC not proven uniform), loops with
+such a branch, and an `s_wqm` of a narrowed EXEC before the op.
+`tests/startup_image_sample_b_flow_check.py` and `tests/startup_image_get_lod_flow_check.py` draw each shape against a
+CPU reference (DXC ps_6_0 and FXC ps_5_1) with wrong-value controls.
+
 The `_dispatch_warp` and `_dispatch_hardware` tests run `s_cmp_eq_u32` then `s_mov_b32 sX, src_scc` on a D3D12
 UAV dispatch and compare each lane with the CPU reference (SCC 0 and SCC 1, distinct per-case data). A copy of the
 lowering mutated to `(scc ? 0u : 1u)` must read back wrong. Run
@@ -17290,3 +17325,94 @@ needs support for consuming the resulting `srv ... buf root` manifest record.
 ```powershell
 ctest --test-dir out/build/release --no-tests=error -R "^startup_compute_global_load_(controls|warp|hardware)$" -V
 ```
+
+## Design B descriptor retention and host commit on a 16 GiB system (#2379)
+
+R0Y00's standing decision on #2379 keeps **design B** (#2679): a materialized descriptor and its copies own the
+resource until the slot is overwritten, copied over, or the heap wrapper is destroyed. A final guest `Release()`
+plus completed release fences retire prior references and submissions, but a live descriptor slot must still
+support rebinding, so `drain_retired_resources()` frees a class member only when `retire_view_refs == 0` and no
+recording hold or in-flight submission names it. Slice 3 ended with #2719 (slots 19-21 tracked like slot 18);
+`X2W_D3D12_RELEASE_RETIRED_VIEWS` stays a legacy diagnostic that logs clearing is disabled. This rule intentionally retains live descriptor-owned bytes. The measurements below report total pressure and, where available, its ownership breakdown.
+
+### Matched retention pair (AMD Radeon RX 9070 XT, 16 GB, driver 32.0.32029.2010, Windows 11 26300)
+
+One release build, `main` `6b9fb9d9` (#2468 merged), only `X2W_D3D12_RELEASE_RETIRED` differs; same executable,
+saved profile, warm shader cache, 32 GiB job cap, `X2W_D3D12_BUDGET=1`, `run.ps1 -Render`, 600 s window, scripted
+input that clears the legal/acceptance page. [Matched RX 9070 XT runs](https://github.com/R0Y00/Xbox2Windows/issues/2379#issuecomment-7173347195)
+
+| | switch off | switch on |
+|---|---|---|
+| first failure / timeout | access violation at **490.7 s** after 8x `0x8007000e` | none; still running at the 600 s timeout |
+| `0x8007000e` / device removed | 8 / 0 | 0 / 0 |
+| desktop references dropped by the drain | 0 | 53,000 |
+| texture retained, peak | **10.67 GB / 4,874** | **9.41 GB / 4,364** |
+| texture retained, end | 10.67 GB / 4,874 | 9.10 GB / 4,267 |
+| DXGI local usage / budget, peak | 20.32 / 14.51 GB | 19.91 / 14.46 GB |
+| DXGI non-local usage, peak | 6.01 GB | 6.43 GB |
+| system commit 10 s after exit | 24.9 GiB | 25.0 GiB |
+
+Retention climbs in steps and does not come back down (switch-on: ~0.08 GB at 290 s, 3.80 GB at 375 s, 6.28 GB at
+460 s, 9.39 GB at 520 s). Slice 2 removed the out-of-memory failure inside the window but left local usage about
+5.4 GB over the DXGI budget; a second switch-on run at `e29b1a7b` reached the timeout with 9.14 GB retained. The
+~9 GB is the retained texture budget measured in these runs. The attribution below comes from a separate run.
+
+### Attribution: live slots vs recording holds vs in-flight work
+
+A separate roughly six-minute startup run at `1cce2a32` used a local opt-in counter to attribute each final-released resource that was still live. [Attribution report](https://github.com/R0Y00/Xbox2Windows/issues/2379#issuecomment-7174634554)
+
+```
+x2w-retire held: view-refs=2297/4445110272(oldest 4374f) never-class:buffer=8178/551813120
+  never-class:dimension=4/262144 never-class:rt-ds-uav=14/200212480
+  view-refs-in-visible-heap=2297/4445110272 total=10493/5197398016 unattributed=0/0
+```
+
+About **4.4 GB** (4,445,110,272 bytes / 2,297 objects, oldest 4,374 frames) are slot 133 class members kept alive
+only by a descriptor in a shader-visible heap that is never overwritten (`view-refs`, all in visible heaps);
+~0.55 GB are never-class buffers and ~0.2 GB never-class RT/DS/UAV textures. `unattributed=0/0`: the counter
+accounts for every retained byte.
+
+Upstream `X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`) emits one
+`x2w-retire held:` heartbeat line from `retire_reasons_line` (`src/startup_stubs/d3d12_xs_device.cpp`). The `Held`
+taxonomy distinguishes the three ownership kinds R0Y00 asked to separate:
+
+- **live descriptor slots** - `view-refs` (a tracked `HeapInfo::shadow` cell still names the resource), plus
+  `view-refs-in-visible-heap` for the shader-visible subset;
+- **recording holds** - `list-hold` (`retire_list_holds`, a closed recording that names the resource) and
+  `unqueued` / `drain-pending`;
+- **in-flight work** - `flight` (`retire_flights`, a submission behind an unsignalled fence) and
+  `queued-waiting-fence`;
+- resources that left the class are reported as `left-class:{view,view-copy,residency,present,hold-missed}` and
+  `never-class:{slot,buffer,dimension,msaa,rt-ds-uav,heap-type,heap-flags,title-memory,aliased,reserved}`, with
+  `total` and `unattributed` (budget `retained` minus the attributed sum) closing the line.
+
+On a GTX 1660 SUPER diagnostic run with the current tree the line reads
+`never-class:buffer=2/131072 never-class:dimension=4/262144 never-class:rt-ds-uav=3/103481344 total=9/103874560
+unattributed=0/0`; the descriptor-owned bytes stay in the budget `retained` column because design B keeps them
+resolvable, exactly as the matched pair above measures.
+
+### Host-commit measurements on a 16 GiB system
+
+The reporter used a GTX 1660 SUPER with 5,966 MiB of VRAM on Windows 11 and a 22,931.8 MiB system commit limit. A release build of main at `d1b2be6a`, including #2767 and #2770, ran for 180 seconds with `-Render -Translate -FakeUser -GpuMirror -LazyMemory`. It recorded 3,260 storage requests, 3,994 frames, and a host-commit peak of **11,053 MiB**. The reporter observed zero device-removal, out-of-memory or mapping-failure lines during the window. [Main-only result](https://github.com/R0Y00/Xbox2Windows/pull/2780#issuecomment-7187587300)
+
+A separate experimental build included #2767/#2770 and local versions of #2773/#2775. It enabled lazy textures and the large existing-heap cap and ran for 300 seconds, recording 3,260 storage requests and 6,434 frames. The existing-heap cap used in that build now requires `X2W_D3D12_CAP_EXISTING_HEAP=1`. These figures compare the reported historical baseline with the experimental combination. The runs do not isolate the contribution of individual patches. [Combined experimental result](https://github.com/R0Y00/Xbox2Windows/pull/2775#issuecomment-7186316341)
+
+| Metric | Reported historical baseline | 300 s experimental combination |
+|---|---:|---:|
+| Host commit peak | 12,144 MiB | 8,787 MiB |
+| DXGI non-local peak | 2,897 MiB | 695 MiB |
+| Existing-heap bytes | 2,199 MiB | 0 MiB |
+
+The experiment identifies remaining commit from slot 133 render-target, depth and UAV textures, small buffers subject to WDDM allocation granularity, and duplicate committed buffers for mapped memory. The descriptor retention rule described above still applies.
+
+### Verification
+
+```powershell
+ctest --preset dev --no-tests=error -R "^startup_resource_(retire|budget)" -V
+ctest --preset dev --no-tests=error -R "^startup_slot133_heap_cap_" -V
+ctest --preset dev --no-tests=error -R "^(xmem_|startup_run_ps1)" -V
+python -B tests/docs_links_check.py
+```
+
+`startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
+design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.

@@ -136,8 +136,6 @@ def controls(llvm_mc):
     assert not set(ARRAY_VALUES) & set(G.D.INLINE_FLOAT_LITERALS), G.D.INLINE_FLOAT_LITERALS
     # The array address is exactly x, y and layer: a two- or four-register address is refused.
     array_mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY']
-    refused('compute image_store d16 requires a 2D image',
-            lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[24:31]'], array_mods + ['d16']))
     for address in ('v[8:9]', 'v[8:11]'):
         refused('x, y and layer expected',
                 lambda: pipe.cs.op_image_store(['v[14:17]', address, 's[24:31]'], array_mods))

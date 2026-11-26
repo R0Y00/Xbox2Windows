@@ -330,7 +330,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason);
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20);
             if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
             if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
                 log("x2w-draw compute %016llx first refused input %zu (%s %d %d), descriptor at 0x%llx", key, i,
