@@ -69,6 +69,15 @@ ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipe
           "Create compute command list");
 }
 
+ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12CommandQueue* existing, ID3D12PipelineState* pipeline)
+    : queue(existing)
+{
+    const auto type = queue->GetDesc().Type;
+    check(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator)), "Create compute allocator");
+    check(device->CreateCommandList(0, type, allocator.Get(), pipeline, IID_PPV_ARGS(&list)),
+          "Create compute command list");
+}
+
 void ComputeCommands::submit_and_wait(ID3D12Device* device)
 {
     check(list->Close(), "Close compute command list");

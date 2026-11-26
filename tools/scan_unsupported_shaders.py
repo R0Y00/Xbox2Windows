@@ -310,14 +310,14 @@ if PIXEL_VOP3_INT16_TERNARY:
         rf"\s+{INT16_SOURCE},\s+{INT16_SOURCE},\s+{INT16_SOURCE}"
     )
 # 64-bit VOP3 shifts (issue #928): a VGPR-pair destination, a 32-bit amount (VGPR, SGPR, inline integer or
-# literal) and a 64-bit value (VGPR pair, SGPR pair or inline integer), with at most one SGPR or literal source.
+# literal) and a 64-bit value (VGPR pair, SGPR pair, inline integer or 32-bit hex literal), with at most one SGPR or literal source.
 # This matches syntax only; pixel_aot also checks the pair ranges and that the sources are tracked.
 SHIFT64_AMOUNT = r"(?:v\d+|-?\d+)"
 SHIFT64_VALUE = r"(?:v\[\d+:\d+\]|-?\d+)"
 SUPPORTED_INSTRUCTIONS_REGEX.append(
     r"v_(?:lshlrev_b64|lshrrev_b64|ashrrev_i64)(?:_e64)?\s+v\[\d+:\d+\],\s+"
     rf"(?:{SHIFT64_AMOUNT},\s+{SHIFT64_VALUE}|(?:s\d+|0x[0-9a-f]{{1,8}}),\s+{SHIFT64_VALUE}"
-    rf"|{SHIFT64_AMOUNT},\s+s\[\d+:\d+\])"
+    rf"|{SHIFT64_AMOUNT},\s+s\[\d+:\d+\]|{SHIFT64_AMOUNT},\s+0x[0-9a-f]{{1,8}})"
 )
 
 for name, (arity, _) in PIXEL_INTEGER.items():
@@ -482,11 +482,15 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     }
 )
 
+OPCODE_ENCODING_SUFFIX = re.compile(r"_(?:e32|e64|sdwa|dpp.*)$")
+CROSS_LANE_VALU_OPCODES = {"v_permlane16_b32", "v_permlanex16_b32"}
+CROSS_LANE_VALU_CATEGORY = "VALU (Cross-lane)"
+
 
 def is_opcode_recognized(opcode: str) -> bool:
     """Check if opcode belongs to recognized AMD RDNA 2 ISA instructions."""
     clean = opcode.strip().lower()
-    base = re.sub(r"_(?:e32|e64|sdwa|dpp.*)$", "", clean)
+    base = OPCODE_ENCODING_SUFFIX.sub("", clean)
     if base in KNOWN_RDNA2_BASE_OPCODES or clean in KNOWN_RDNA2_BASE_OPCODES:
         return True
     if base.startswith(("v_cmp_", "v_cmpx_")) or clean.startswith(("v_cmp_", "v_cmpx_")):
@@ -501,6 +505,8 @@ def is_opcode_recognized(opcode: str) -> bool:
 def classify_isa_category(opcode: str) -> str:
     """Classify instruction into RDNA 2 ISA category according to the AMD manual."""
     op = opcode.lower()
+    if OPCODE_ENCODING_SUFFIX.sub("", op.strip()) in CROSS_LANE_VALU_OPCODES:
+        return CROSS_LANE_VALU_CATEGORY
     if op.startswith("v_interp"):
         return "VINTRP (Parameter Interpolation)"
     if op.startswith("v_"):
@@ -899,6 +905,8 @@ def make_progress_bar(percentage: float, width: int = 24, unicode_blocks: bool =
 def get_implementation_target(opcode: str, category: str) -> str:
     """Identify target file and subsystem in Xbox2Windows for an opcode."""
     op = opcode.lower()
+    if category == CROSS_LANE_VALU_CATEGORY:
+        return "`tools/pixel_aot.py` (Wave lane layout, active lanes and bound control)"
     if "VALU" in category or "Vector ALU" in category:
         if any(x in op for x in ["_f32", "_f16", "_i32", "_u32"]):
             return "`tools/pixel_aot.py` (ALU dictionary / table)"

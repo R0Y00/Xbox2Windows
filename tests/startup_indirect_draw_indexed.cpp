@@ -107,6 +107,12 @@ void write_buffer_colour() {
 }
 
 [numthreads(1, 1, 1)]
+void write_large_buffer_colour() {
+    data.Store(0x100000c, 0xff00ff00u);
+    data.Store(0x100001c, 0xff0000ffu);
+}
+
+[numthreads(1, 1, 1)]
 void write_replay_colour() {
     data.Store(0, 0xff00ff00u);
     data.Store(4, 0xff00ff00u);
@@ -213,6 +219,11 @@ float4 translated_buffer_pixel() : SV_Target {
     return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
 }
 
+float4 translated_buffer_tail_pixel() : SV_Target {
+    uint value = translated_buffer.Load(0x100000c);
+    return float4(value & 255, (value >> 8) & 255, (value >> 16) & 255, 255) / 255.0;
+}
+
 struct RectVarying {
     float4 pos : SV_Position;
     float4 uv : PARAM0;
@@ -291,15 +302,18 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const D3D12_ROOT_S
     return root;
 }
 
+enum class TableSample { texture, buffer, buffer_tail };
+
 ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* root, ID3DBlob* root_blob,
-                                    bool needs_start, bool table_buffer = false, bool indexed = false, bool rect = false)
+                                    bool needs_start, TableSample sample = TableSample::texture, bool indexed = false, bool rect = false)
 {
     // The opaque guest programs identify synthetic cache entries. The actual bound shaders are source-built DXBC.
-    constexpr char revision[] = "x2w-startup-shader-14";
+    constexpr char revision[] = "x2w-startup-shader-27";
     static std::uint32_t vertex_ids[]{0xe0000101, 0xe0000102, 0xe0000103};
-    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000204};
+    static std::uint32_t pixel_ids[]{0xe0000202, 0xe0000203, 0xe0000205};
+    static std::uint32_t indexed_pixel_id = 0xe0000204;
     auto& vertex_id = vertex_ids[indexed ? 2 : needs_start];
-    auto& pixel_id = pixel_ids[indexed ? 2 : table_buffer];
+    auto& pixel_id = indexed ? indexed_pixel_id : pixel_ids[static_cast<unsigned>(sample)];
     std::uint64_t key = 1469598103934665603ull;
     const auto add = [&key](const void* data, std::size_t bytes) {
         const auto* p = static_cast<const unsigned char*>(data);
@@ -321,14 +335,15 @@ ComPtr<IUnknown> translated_pipeline(ID3D12Device* guest, ID3D12RootSignature* r
         check(file.good() ? S_OK : E_FAIL, "write fixture cache");
     };
     const auto vs = compile(rect ? "translated_rect_vertex" : indexed ? "translated_indexed_vertex" : needs_start ? "translated_vertex_with_start" : "translated_vertex", "vs_5_1");
-    const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_buffer ? "translated_buffer_pixel" : "translated_pixel", "ps_5_1");
+    const char* table_pixels[]{"translated_pixel", "translated_buffer_pixel", "translated_buffer_tail_pixel"};
+    const auto ps = compile(rect ? "translated_rect_pixel" : indexed ? "translated_indexed_pixel" : table_pixels[static_cast<unsigned>(sample)], "ps_5_1");
     write(".vs.cso", vs->GetBufferPointer(), vs->GetBufferSize());
     write(".ps.cso", ps->GetBufferPointer(), ps->GetBufferSize());
     constexpr char manifest[] = "x2w-manifest 1\nud 2\nudsrc 0 rect\nudsrc 1 basevertex\nsrv 0 tex2d table 0 0\nparams 0\ntargets 0\n";
     constexpr char buffer_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf table 0 0\nparams 0\ntargets 0\n";
     constexpr char indexed_manifest[] = "x2w-manifest 1\nud 3\nudsrc 0 rect\nudsrc 1 basevertex\nudsrc 2 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nparams 1\ntargets 0\n";
     if (indexed) write(".txt", indexed_manifest, sizeof(indexed_manifest) - 1);
-    else if (table_buffer) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
+    else if (sample != TableSample::texture) write(".txt", buffer_manifest, sizeof(buffer_manifest) - 1);
     else write(".txt", manifest, sizeof(manifest) - 1);
     const std::array<UINT64, 0x300 / sizeof(UINT64)> desc{
         reinterpret_cast<UINT64>(root), 0, 0, 0, 0,
@@ -497,6 +512,24 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
+// The lease fixtures hold a writer queue behind a CPU-signalled gate while run() clears and reads back
+// its targets. With NVIDIA driver 32.0.16.2124, releasing a queue during that hold blocks until the test
+// times out when another process releases a queue during its own hold. Those clears and copies therefore
+// share one DIRECT queue per device that lives until the process exits.
+ID3D12CommandQueue* kept_direct_queue(ID3D12Device* device)
+{
+    static std::mutex lock;
+    static std::vector<std::pair<ID3D12Device*, ComPtr<ID3D12CommandQueue>>> queues;
+    const std::lock_guard guard(lock);
+    for (const auto& [owner, queue] : queues)
+        if (owner == device) return queue.Get();
+    const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    ComPtr<ID3D12CommandQueue> queue;
+    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "create kept readback queue");
+    queues.emplace_back(device, queue);
+    return queue.Get();
+}
+
 struct MeshLeaseDraw {
     UINT64 address;
     IUnknown* queue;
@@ -584,19 +617,20 @@ ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
 
 struct TranslatedDrawFixture {
     TranslatedDrawFixture(ID3D12Device* guest, std::uint32_t colour, ID3D12Device* desktop = nullptr,
-                          bool short_view = false, bool copied = false, bool replay = false)
+                          bool short_view = false, bool copied = false, bool replay = false, bool allow_rt = false,
+                          UINT committed_bytes = 64)
         : wrong_root(create_root(guest, {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE})),
           backing(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
     {
         if (!backing) throw std::bad_alloc();
         if (desktop && !copied) {
-            sampled = make_gpu_table_buffer(guest, 64);
+            sampled = make_gpu_table_buffer(guest, committed_bytes);
         } else {
             const D3D12_RESOURCE_DESC desc = copied ?
                 D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, replay ? replay_copy_bytes : 64u, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
                                     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS} :
-                D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, format, {1, 0},
-                                    D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+                D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, allow_rt ? width : 1u, allow_rt ? height : 1u, 1, 1, format, {1, 0},
+                                    D3D12_TEXTURE_LAYOUT_UNKNOWN, allow_rt ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE};
             auto* address = static_cast<unsigned char*>(backing.get()) + (copied ? 16 : 0);
             std::memcpy(address + (replay ? 4 : copied ? 32 : 0), &colour, sizeof(colour));
             using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
@@ -623,6 +657,8 @@ struct TranslatedDrawFixture {
             srv.Buffer.FirstElement = replay ? 0 : 1;
             srv.Buffer.NumElements = replay ? static_cast<UINT>(replay_copy_bytes / 4) : short_view ? 1 : 2;
             srv.Buffer.StructureByteStride = replay ? 4 : 16;
+            if (committed_bytes > 64)
+                srv.Buffer.NumElements = (committed_bytes / 16) - 1 - (short_view ? 1 : 0);
         } else {
             srv.Format = format;
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -900,7 +936,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         if (leased && leased->before_submit) {
             // A submission-level refusal skips the entire wrapped list,
             // including its clear. Initialize the readback target separately.
-            ComputeCommands clear_targets(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            ComputeCommands clear_targets(device, kept_direct_queue(device), nullptr);
             for (std::size_t i = 0; i < targets.size(); ++i) {
                 auto* target = targets[i].Get();
                 transition(clear_targets.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1147,7 +1183,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
     for (const auto& target : targets) {
         const auto pixel_readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        ComputeCommands copy(device, kept_direct_queue(device), nullptr);
         transition(copy.list.Get(), target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION source{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         D3D12_TEXTURE_COPY_LOCATION destination{pixel_readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
@@ -1319,6 +1355,207 @@ bool check_translated_refusal_census(const std::wstring& log_path)
     return true;
 }
 
+bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root,
+                              ID3D12PipelineState* writer, ID3D12RootSignature* title_root, IUnknown* pso,
+                              ID3D12CommandSignature* signature, const TranslatedDrawFixture& red_binding)
+{
+    const TranslatedDrawFixture alias_binding(guest, red, nullptr, false, false, false, true);
+    enum class Mode { mrt_two, color_and_dsv, depth_only, no_attachments, alias_rtv1 };
+    const auto run_mode = [&](Mode mode, const char* label) -> bool {
+        const auto& binding = mode == Mode::alias_rtv1 ? alias_binding : red_binding;
+        PlacedBuffer arguments(device, guest, static_cast<UINT>(sizeof(initial)), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        Words initial_words = initial;
+        initial_words[1 + command_stride(DrawKind::vertices) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
+        const auto upload = make_buffer(device, sizeof(initial_words), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* memory = nullptr;
+        const D3D12_RANGE untouched{0, 0};
+        check(upload->Map(0, &untouched, &memory), "map targets upload");
+        std::memcpy(memory, initial_words.data(), sizeof(initial_words));
+        upload->Unmap(0, nullptr);
+
+        const D3D12_RESOURCE_DESC color_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, format, {1, 0},
+            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+        const D3D12_RESOURCE_DESC depth_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, DXGI_FORMAT_D16_UNORM, {1, 0},
+            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+        constexpr float clear[]{0, 0, 0, 1};
+        D3D12_CLEAR_VALUE color_clear{format, {0, 0, 0, 1}};
+        D3D12_CLEAR_VALUE depth_clear{DXGI_FORMAT_D16_UNORM, {0, 0, 0, 1}};
+        depth_clear.DepthStencil = {1.0f, 0};
+
+        const auto color0 = resource(device, color_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &color_clear);
+        const auto color1 = resource(device, color_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &color_clear);
+        const auto depth = resource(device, depth_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, &depth_clear);
+
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        ComPtr<ID3D12DescriptorHeap> rtv_heap;
+        check(device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtv_heap)), "create targets rtv heap");
+        const UINT rtv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2]{
+            rtv_heap->GetCPUDescriptorHandleForHeapStart(),
+            {rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr + rtv_inc}};
+        guest->CreateRenderTargetView(color0.Get(), nullptr, rtvs[0]);
+        ID3D12Resource* rtv1_res = mode == Mode::alias_rtv1 ? binding.sampled.Get() : color1.Get();
+        guest->CreateRenderTargetView(rtv1_res, nullptr, rtvs[1]);
+
+        const D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        ComPtr<ID3D12DescriptorHeap> dsv_heap;
+        check(guest->CreateDescriptorHeap(&dsv_heap_desc, IID_PPV_ARGS(&dsv_heap)), "create targets dsv heap");
+        using GetCpu = UINT64(WINAPI*)(IUnknown*, void*);
+        D3D12_CPU_DESCRIPTOR_HANDLE guest_dsv{slot<GetCpu>(dsv_heap.Get(), 9)(dsv_heap.Get(), nullptr)};
+        const D3D12_CPU_DESCRIPTOR_HANDLE native_dsv =
+            native_object<ID3D12DescriptorHeap>(device, guest, dsv_heap.Get())->GetCPUDescriptorHandleForHeapStart();
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
+        dsv_desc.Format = DXGI_FORMAT_D16_UNORM;
+        dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        guest->CreateDepthStencilView(depth.Get(), &dsv_desc, guest_dsv);
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create targets allocator");
+        auto wrapped_list = begin_guest_list(guest, allocator.Get());
+        auto* wrapped = wrapped_list.Get();
+        const auto native_list = native_object<ID3D12GraphicsCommandList>(device, guest, wrapped);
+        auto* list = native_list.Get();
+
+        transition(list, arguments.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(arguments.native.Get(), 0, upload.Get(), 0, sizeof(initial_words));
+        transition(list, arguments.native.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list->SetPipelineState(writer);
+        list->SetComputeRootSignature(writer_root);
+        list->SetComputeRootUnorderedAccessView(0, arguments.native->GetGPUVirtualAddress());
+        list->Dispatch(1, 1, 1);
+        transition(list, arguments.native.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        using Bind = void (WINAPI*)(IUnknown*, IUnknown*);
+        using Clear = void (WINAPI*)(IUnknown*, SIZE_T, const float*, UINT, const D3D12_RECT*);
+        using Targets = void (WINAPI*)(IUnknown*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+        using Topology = void (WINAPI*)(IUnknown*, D3D12_PRIMITIVE_TOPOLOGY);
+        using Viewport = void (WINAPI*)(IUnknown*, UINT, const D3D12_VIEWPORT*);
+        using Scissor = void (WINAPI*)(IUnknown*, UINT, const D3D12_RECT*);
+        using Heaps = void (WINAPI*)(IUnknown*, UINT, ID3D12DescriptorHeap* const*);
+        using Table = void (WINAPI*)(IUnknown*, UINT, UINT64);
+        using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
+
+        slot<Clear>(wrapped, 52)(wrapped, rtvs[0].ptr, clear, 0, nullptr);
+        if (mode == Mode::mrt_two) slot<Clear>(wrapped, 52)(wrapped, rtvs[1].ptr, clear, 0, nullptr);
+        if (mode == Mode::mrt_two || mode == Mode::alias_rtv1)
+            slot<Targets>(wrapped, 50)(wrapped, 2, rtvs, FALSE, nullptr);
+        else if (mode == Mode::color_and_dsv) {
+            slot<Targets>(wrapped, 50)(wrapped, 1, rtvs, FALSE, &guest_dsv);
+            list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        } else if (mode == Mode::depth_only) {
+            slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, &guest_dsv);
+            list->ClearDepthStencilView(native_dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        } else {
+            slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, nullptr);
+        }
+
+        ComPtr<ID3D12QueryHeap> query_heap;
+        ComPtr<ID3D12Resource> query_readback;
+        if (mode == Mode::depth_only) {
+            const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+            check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap)), "create depth-only occlusion query heap");
+            query_readback = make_buffer(device, sizeof(std::uint64_t), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+
+        const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
+        const D3D12_RECT scissor{0, 0, width, height};
+        slot<Bind>(wrapped, 25)(wrapped, pso);
+        slot<Bind>(wrapped, 34)(wrapped, title_root);
+        ID3D12DescriptorHeap* heaps[]{binding.heap.Get()};
+        slot<Heaps>(wrapped, 32)(wrapped, 1, heaps);
+        slot<Table>(wrapped, 36)(wrapped, 0, binding.gpu);
+        slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
+        slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
+        if (mode == Mode::depth_only) list->BeginQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+        slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+        if (mode == Mode::depth_only) {
+            list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list->ResolveQueryData(query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, query_readback.Get(), 0);
+        }
+        check(slot<HRESULT(WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped), "close targets list");
+
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        ComPtr<IUnknown> guest_queue;
+        check(guest->CreateCommandQueue(&queue_desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(guest_queue.GetAddressOf())),
+              "create targets queue");
+        IUnknown* lists[]{wrapped};
+        slot<void (WINAPI*)(IUnknown*, UINT, IUnknown* const*)>(guest_queue.Get(), 10)(guest_queue.Get(), 1, lists);
+        const auto native_queue = native_object<ID3D12CommandQueue>(device, guest, guest_queue.Get());
+        ComPtr<ID3D12Fence> fence;
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "create targets fence");
+        check(native_queue->Signal(fence.Get(), 1), "signal targets fence");
+        HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        check(fence->SetEventOnCompletion(1, done), "set targets fence event");
+        WaitForSingleObject(done, INFINITE);
+        CloseHandle(done);
+
+        if (mode == Mode::depth_only) {
+            std::uint64_t samples = 0;
+            const D3D12_RANGE query_range{0, sizeof(samples)};
+            check(query_readback->Map(0, &query_range, &memory), "map depth-only occlusion query");
+            std::memcpy(&samples, memory, sizeof(samples));
+            query_readback->Unmap(0, &untouched);
+            const auto expected_samples = static_cast<std::uint64_t>(width) * height;
+            if (samples != expected_samples) {
+                std::fprintf(stderr, "%s: expected %llu rasterized samples, got %llu\n",
+                             label, static_cast<unsigned long long>(expected_samples),
+                             static_cast<unsigned long long>(samples));
+                return false;
+            }
+        }
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT64 bytes = 0;
+        device->GetCopyableFootprints(&color_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+        const auto read_pixels = [&](ID3D12Resource* target, std::uint32_t expected_colour, const char* which) -> bool {
+            const auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            ComputeCommands copy(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            transition(copy.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION src{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION dst{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            dst.PlacedFootprint = footprint;
+            copy.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            copy.submit_and_wait(device);
+            const D3D12_RANGE range{0, static_cast<SIZE_T>(bytes)};
+            check(readback->Map(0, &range, &memory), "map targets readback");
+            bool ok = true;
+            for (UINT y = 0; y < height; ++y)
+                for (UINT x = 0; x < width; ++x) {
+                    std::uint32_t actual = 0;
+                    std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * sizeof(actual), sizeof(actual));
+                    if (actual != expected_colour) {
+                        std::fprintf(stderr, "%s (%s) pixel (%u,%u): got 0x%08x, expected 0x%08x\n",
+                                     label, which, x, y, actual, expected_colour);
+                        ok = false;
+                    }
+                }
+            readback->Unmap(0, &untouched);
+            return ok;
+        };
+        const bool expect_draw = mode == Mode::mrt_two || mode == Mode::color_and_dsv;
+        if (!read_pixels(color0.Get(), expect_draw ? red : black, "rtv0")) return false;
+        if (mode == Mode::mrt_two && !read_pixels(color1.Get(), black, "rtv1")) return false;
+        std::printf("%s: OK\n", label);
+        return true;
+    };
+    const bool ok =
+        run_mode(Mode::mrt_two, "translated indirect MRT (2 color targets)") &&
+        run_mode(Mode::color_and_dsv, "translated indirect color + DSV") &&
+        run_mode(Mode::depth_only, "translated indirect depth-only (0 RTV + DSV)") &&
+        run_mode(Mode::no_attachments, "translated indirect refuses 0 RTV + no DSV") &&
+        run_mode(Mode::alias_rtv1, "translated indirect refuses sampled texture aliasing RTV 1");
+    if (!ok) return false;
+    const std::size_t needed = x2w_d3d12_census_report(nullptr, 0);
+    std::string report(needed + 1, '\0');
+    x2w_d3d12_census_report(report.data(), report.size());
+    if (report.find("reason=sampled_texture_mismatch calls=1") == std::string::npos) {
+        std::fprintf(stderr, "expected sampled_texture_mismatch refusal for RTV 1 alias in census report:\n%s\n", report.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool check_indirect_other_refusal_census(const std::wstring& log_path)
 {
     const std::size_t needed = x2w_d3d12_census_report(nullptr, 0);
@@ -1390,7 +1627,7 @@ bool check_indirect_other_refusal_census(const std::wstring& log_path)
     std::string log_line;
     bool saw_vp_log = false, saw_arg_log = false, saw_multi_log = false;
     const std::string want_vp = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
-        " [missing_viewport_or_scissor]: indirect graphics requires one matching target, viewport and scissor";
+        " [missing_viewport_or_scissor]: translated indirect draw requires bound target or depth view, viewport and scissor";
     const std::string want_arg = "x2w-render ExecuteIndirect refused, key " + parsed[0].key +
         " [argument_outside_placed_buffer]: argument record is outside a unique placed buffer";
     const std::string want_multi = "x2w-render ExecuteIndirect refused, key " + zero_key +
@@ -1496,7 +1733,11 @@ int main(int argc, char** argv) try
     const bool lease_fixture = GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_XMEM", lease_xmem, MAX_PATH) != 0;
     const bool dual_lease = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DUAL", nullptr, 0) != 0;
     if (dual_lease) check(lease_fixture && !lease_arguments ? S_OK : E_FAIL, "configure combined mesh XMem fixture");
-    if (lease_fixture && !lease_arguments)
+    const bool loose_root = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_LOOSE_ROOT", nullptr, 0) != 0;
+    if (loose_root)
+        check(lease_fixture && SetEnvironmentVariableA("X2W_MESH86_LOOSE_XMEM_SRV", "1") &&
+            SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", nullptr) ? S_OK : E_FAIL, "enable loose XMem root SRV");
+    else if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
@@ -1504,6 +1745,7 @@ int main(int argc, char** argv) try
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
     const bool refusal_census_control = argc == 3 && std::strcmp(argv[2], "translated-refusal-census-control") == 0;
     const bool refusal_census = refusal_census_control || (argc == 3 && std::strcmp(argv[2], "translated-refusal-census") == 0);
+    const bool translated_targets = argc == 3 && std::strcmp(argv[2], "translated-targets") == 0;
     const bool other_refusal_census_control = argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census-control") == 0;
     const bool other_refusal_census = other_refusal_census_control || (argc == 3 && std::strcmp(argv[2], "indirect-other-refusal-census") == 0);
     const bool upload_index = argc == 3 && std::strcmp(argv[2], "translated-indexed-upload") == 0;
@@ -1511,7 +1753,7 @@ int main(int argc, char** argv) try
     const bool alias_disabled = argc == 3 && std::strcmp(argv[2], "translated-indexed-alias-off") == 0;
     const bool alias_index = alias_disabled || (argc == 3 && std::strcmp(argv[2], "translated-indexed-alias") == 0);
     const bool translated_indexed = alias_index || upload_index || rect || (argc == 3 && std::strcmp(argv[2], "translated-indexed") == 0);
-    const bool translated = copy_on || copy_off || refusal_census || other_refusal_census || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
+    const bool translated = copy_on || copy_off || refusal_census || other_refusal_census || translated_targets || translated_indexed || (argc == 3 && std::strcmp(argv[2], "translated") == 0);
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
@@ -1554,7 +1796,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || refusal_census || other_refusal_census) {
+    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1642,6 +1884,72 @@ int main(int argc, char** argv) try
                                         writer.Get(), initialize.Get(), append.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
         }
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
+        if (loose_root) {
+            const bool ready = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0) != 0;
+            MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem, nullptr, nullptr, nullptr, nullptr, true);
+            const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            const auto verify = [&](const MeshLeaseDraw& draw, const char* label) {
+                return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
+                    DrawKind::mesh, false, Refusal::none, label, nullptr, false, nullptr, false, false, 1, false, false,
+                    &draw);
+            };
+            if (!ready) {
+                const bool ok = verify({source.address(), queue.Get(), black}, "loose mesh requires shader proof");
+                source.free_original();
+                return ok ? 0 : 1;
+            }
+            if (!verify({source.address(), queue.Get(), green}, "loose mesh reads ordinary XMem root SRV") ||
+                !verify({source.address() + 4, queue.Get(), black}, "loose mesh refuses misaligned root") ||
+                !verify({source.address() + 2 * MeshLeaseWriter::page, queue.Get(), black}, "loose mesh refuses unmapped page"))
+                return 1;
+            const std::unique_ptr<void, FreeMemory> unrelated(
+                VirtualAlloc(nullptr, MeshLeaseWriter::page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!unrelated || !verify({reinterpret_cast<UINT64>(unrelated.get()), queue.Get(), black},
+                "loose mesh refuses readable untracked memory")) return 1;
+            const auto registered_desc = D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER, 0, MeshLeaseWriter::page,
+                1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+            using Place = HRESULT (WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
+            ComPtr<IUnknown> placed;
+            check(slot<Place>(guest.Get(), 133)(guest.Get(), source.cpu, &registered_desc, D3D12_RESOURCE_STATE_COMMON,
+                nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(placed.GetAddressOf())), "register overlapping buffer");
+            if (!verify({source.address(), queue.Get(), black}, "loose mesh refuses registered resource without a publisher")) return 1;
+            placed.Reset();
+
+            MeshLeaseDraw late{source.address(), queue.Get(), red};
+            late.before_submit = [&] { std::memcpy(source.cpu + source.record_offset, &red, sizeof(red)); };
+            if (!verify(late, "loose mesh sees a CPU write after Close")) return 1;
+            // The queue rejects the entire stale recording, so use already
+            // initialized external DispatchMesh arguments for this control.
+            PlacedBuffer args(device.Get(), guest.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_RESOURCE_FLAG_NONE);
+            const auto upload = make_buffer(device.Get(), sizeof(MeshLeaseWriter::old_groups), D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ);
+            const D3D12_RANGE empty{};
+            void* memory{};
+            check(upload->Map(0, &empty, &memory), "map loose-root dispatch arguments");
+            std::memcpy(memory, MeshLeaseWriter::old_groups.data(), sizeof(MeshLeaseWriter::old_groups));
+            upload->Unmap(0, nullptr);
+            ComputeCommands seed(device.Get(), nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            seed.list->CopyBufferRegion(args.native.Get(), 0, upload.Get(), 0, sizeof(MeshLeaseWriter::old_groups));
+            seed.submit_and_wait(device.Get());
+            MeshLeaseDraw remap{source.address(), queue.Get(), black};
+            remap.argument = args.wrapped.Get();
+            remap.before_submit = [&] { source.replace_loose_page(); };
+            if (!verify(remap, "loose mesh refuses a remapped page on submit") ||
+                !verify({source.address(), queue.Get(), green}, "new loose mesh recording reads replacement page")) return 1;
+            source.free_original();
+            check_lease_debug(info.Get());
+
+            std::ifstream log{std::filesystem::path(log_path)};
+            const std::string lines{std::istreambuf_iterator<char>(log), {}};
+            log.close();
+            DeleteFileW(log_path.c_str());
+            check(lines.find("mesh XMem loose root bind") != std::string::npos &&
+                  lines.find("mesh XMem submit refused: writer or live page identity changed") != std::string::npos &&
+                  lines.find("mesh XMem loose root SRV has no usable single-page lease") != std::string::npos &&
+                  lines.find("mesh XMem read address is missing or misaligned") != std::string::npos ? S_OK : E_FAIL,
+                  "observe loose binding, stale submission and invalid range refusals");
+            return 0;
+        }
         if (lease_fixture) {
             MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);
             const auto queue = source.create_queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -1715,24 +2023,47 @@ int main(int argc, char** argv) try
         return ok ? 0 : 1;
     }
     if (mesh && GetEnvironmentVariableA("X2W_MESH_REQUEST_FIXTURE", nullptr, 0)) {
-        const auto cache = std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
+        wchar_t exchange[MAX_PATH]{};
+        const DWORD exchange_size = GetEnvironmentVariableW(L"X2W_TEST_MESH57_EXCHANGE", exchange, MAX_PATH);
+        if (exchange_size >= MAX_PATH) return 1;
+        const auto cache = exchange_size ? std::filesystem::path(exchange) / "requests" :
+            std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set mesh fixture cache");
+        const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants = {0, 0, 2};
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {1, &srv};
+        const D3D12_ROOT_SIGNATURE_DESC source_root{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const auto& desc = exchange_size ? source_root : graphics_desc;
         ComPtr<ID3DBlob> root_blob;
-        const auto root = create_root(guest.Get(), graphics_desc, &root_blob);
-        const auto different_root = create_root(guest.Get(), graphics_desc);
+        const auto root = create_root(guest.Get(), desc, &root_blob);
+        const auto different_root = create_root(guest.Get(), desc);
         // Distinct, source-owned bounded spans. The request publisher must preserve their stage roles and lengths.
-        const std::array<UINT, 4> ms{0xbfa00003, 0xbf900009, 0xbf810000, 0};
-        const std::array<UINT, 2> ps{0xbfa00003, 0xbf810000};
+        const std::array<UINT, 4> default_ms{0xbfa00003, 0xbf900009, 0xbf810000, 0};
+        const std::array<UINT, 2> default_ps{0xbfa00003, 0xbf810000};
+        const auto read_stage = [&](const wchar_t* name) {
+            std::ifstream file(std::filesystem::path(exchange) / name, std::ios::binary);
+            return std::vector<char>(std::istreambuf_iterator<char>(file), {});
+        };
+        const auto source_ms = exchange_size ? read_stage(L"ms.bin") : std::vector<char>{};
+        const auto source_ps = exchange_size ? read_stage(L"ps.bin") : std::vector<char>{};
+        if (exchange_size && (source_ms.empty() || source_ps.empty())) return 1;
+        const void* ms = exchange_size ? static_cast<const void*>(source_ms.data()) : default_ms.data();
+        const void* ps = exchange_size ? static_cast<const void*>(source_ps.data()) : default_ps.data();
+        const auto ms_size = exchange_size ? source_ms.size() : sizeof(default_ms);
+        const auto ps_size = exchange_size ? source_ps.size() : sizeof(default_ps);
         const auto make_pso = [&](bool with_pixel, bool with_vertex, bool incomplete_pixel) {
             std::array<UINT64, 0x300 / sizeof(UINT64)> fields{};
             fields[0] = reinterpret_cast<UINT64>(root.Get());
-            fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps.data()) : 0;
-            fields[6] = with_pixel && !incomplete_pixel ? sizeof(ps) : 0;
-            fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps.data()) : 0;
-            fields[10] = with_vertex ? sizeof(ps) : 0;
-            fields[13] = reinterpret_cast<UINT64>(ms.data());
-            fields[14] = sizeof(ms);
+            fields[5] = with_pixel ? reinterpret_cast<UINT64>(ps) : 0;
+            fields[6] = with_pixel && !incomplete_pixel ? ps_size : 0;
+            fields[9] = with_vertex ? reinterpret_cast<UINT64>(ps) : 0;
+            fields[10] = with_vertex ? ps_size : 0;
+            fields[13] = reinterpret_cast<UINT64>(ms);
+            fields[14] = ms_size;
             using Create = HRESULT (WINAPI*)(IUnknown*, const void*, REFIID, void**);
             ComPtr<IUnknown> pso;
             check(slot<Create>(guest.Get(), 57)(guest.Get(), fields.data(), __uuidof(ID3D12PipelineState),
@@ -1771,13 +2102,13 @@ int main(int argc, char** argv) try
             auto path = file.path();
             if (path.extension() != ".m57") continue;
             ++requests;
-            if (!matches(path, ms.data(), sizeof(ms)) ||
+            if (!matches(path, ms, ms_size) ||
                 !matches(path.replace_extension(".root"), root_blob->GetBufferPointer(), root_blob->GetBufferSize())) return 1;
-            if (matches(path.replace_extension(".ps57"), ps.data(), sizeof(ps))) ++with_ps;
+            if (matches(path.replace_extension(".ps57"), ps, ps_size)) ++with_ps;
             else if (!matches(path, nullptr, 0)) return 1;
         }
         if (requests != 2 || with_ps != 1 || files != 6) return 1;
-        std::filesystem::remove_all(cache);
+        if (!exchange_size) std::filesystem::remove_all(cache);
         std::puts("slot 57 MS+PS and MS-only requests preserved stages and the matching root");
         return 0;
     }
@@ -1799,7 +2130,7 @@ int main(int argc, char** argv) try
         ComPtr<ID3DBlob> root_blob;
         const auto title_root = create_root(guest.Get(), title_desc, &root_blob);
         if (translated_indexed) {
-            const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true, false, true, rect);
+            const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true, TableSample::texture, true, rect);
             const auto left = writer_pipeline(device.Get(), writer.Get(), "write_left");
             const auto right = writer_pipeline(device.Get(), writer.Get(), "write_indexed_base");
             const auto invalid = writer_pipeline(device.Get(), writer.Get(), "write_indexed_overrun");
@@ -1863,7 +2194,7 @@ int main(int argc, char** argv) try
         }
         const auto pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false);
         const auto start_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), true);
-        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, true);
+        const auto buffer_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer);
         const auto producer = writer_pipeline(device.Get(), writer.Get(), "write_one_triangle");
         const auto buffer_writer = writer_pipeline(device.Get(), writer.Get(), "write_buffer_colour");
         D3D12_INDIRECT_ARGUMENT_DESC argument{};
@@ -1896,6 +2227,30 @@ int main(int argc, char** argv) try
             std::filesystem::remove_all(cache);
             DeleteFileW(log_path.c_str());
             return ok && (!info || !info->GetNumStoredMessages()) ? 0 : 1;
+        }
+        if (translated_targets) {
+            const bool ok = check_translated_targets(device.Get(), guest.Get(), writer.Get(), producer.Get(),
+                                                     title_root.Get(), pso.Get(), signature.Get(), red_binding);
+            std::filesystem::remove_all(cache);
+            bool debug_ok = true;
+            if (info) {
+                for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
+                    SIZE_T bytes = 0;
+                    info->GetMessage(i, nullptr, &bytes);
+                    std::vector<char> storage(bytes);
+                    auto* msg = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                    info->GetMessage(i, msg, &bytes);
+                    // Message 679 (PS expects RTV0 with NumRenderTargets=0) is an expected benign warning when
+                    // reusing the colour-writing pixel shader for the depth-only pass.
+                    if (msg->Severity <= D3D12_MESSAGE_SEVERITY_ERROR ||
+                        (msg->Severity == D3D12_MESSAGE_SEVERITY_WARNING && msg->ID != 679)) {
+                        std::fprintf(stderr, "D3D12 debug message %u (sev %d): %s\n",
+                                     static_cast<unsigned>(msg->ID), static_cast<int>(msg->Severity), msg->pDescription);
+                        debug_ok = false;
+                    }
+                }
+            }
+            return ok && debug_ok ? 0 : 1;
         }
         if (other_refusal_census) {
             bool ok = verify(producer.Get(), false, Refusal::none, "other census warm up translated pipeline key") &&
@@ -1936,11 +2291,24 @@ int main(int argc, char** argv) try
         if (SUCCEEDED(D3D12SerializeRootSignature(&deferred_desc, D3D_ROOT_SIGNATURE_VERSION_1, &deferred_blob, nullptr)) &&
             SUCCEEDED(guest->CreateRootSignature(0, deferred_blob->GetBufferPointer(), deferred_blob->GetBufferSize(),
                                                  IID_PPV_ARGS(&deferred_root)))) {
-            const auto deferred_pso = translated_pipeline(guest.Get(), deferred_root.Get(), deferred_blob.Get(), false, true);
+            const auto deferred_pso = translated_pipeline(guest.Get(), deferred_root.Get(), deferred_blob.Get(), false, TableSample::buffer);
             if (ok) ok = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), deferred_root.Get(), deferred_pso.Get(), signature.Get(),
                 DrawKind::vertices, false, Refusal::none, "translated table with deferred guest root", &full_buffer);
         } else {
             std::puts("deferred guest root capability unavailable");
+        }
+        if (ok && !copy_on && !copy_off) {
+            const auto tail_pso = translated_pipeline(guest.Get(), title_root.Get(), root_blob.Get(), false, TableSample::buffer_tail);
+            const auto tail_writer = writer_pipeline(device.Get(), writer.Get(), "write_large_buffer_colour");
+            // Both resources contain the sentinel. Only the full view includes the final DWORD.
+            for (bool short_view : {false, true}) {
+                TranslatedDrawFixture large(guest.Get(), 0, device.Get(), short_view, false, false, false, 0x1000020);
+                large.buffer_writer = tail_writer;
+                ok = run(device.Get(), guest.Get(), writer.Get(), producer.Get(), title_root.Get(), tail_pso.Get(), signature.Get(),
+                    DrawKind::vertices, false, short_view ? Refusal::insufficient_table_range : Refusal::none,
+                    short_view ? "large buffer tail outside view" : "large buffer tail inside view", &large);
+                if (!ok) break;
+            }
         }
         if (ok && (copy_on || copy_off)) {
             const TranslatedDrawFixture copied(guest.Get(), green, device.Get(), false, true, true);

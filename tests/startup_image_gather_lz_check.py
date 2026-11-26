@@ -81,7 +81,7 @@ def controls(llvm_mc):
     refused(shader(dst=0xff), 'four destination registers')
     # The explicit-LOD and fixed-mip comparison gathers are lowered by their own tests; the implicit,
     # biased and offset gathers stay refused here.
-    refused(shader(opcode=0x40), 'image_gather4')
+    refused(shader(opcode=0x40), 'image_gather4 requires the guest implicit mip level')
     refused(shader(opcode=0x45), 'image_gather4_b')
     refused(shader(opcode=0x54), 'image_gather4_l_o')
     refused(shader(opcode=0x48), 'image_gather4_c')

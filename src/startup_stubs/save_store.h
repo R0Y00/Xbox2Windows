@@ -13,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -56,12 +57,21 @@ inline bool valid_name(std::string_view name) noexcept
             same = std::tolower(static_cast<unsigned char>(tail[i])) == suffix[i];
         if (same) return false;
     }
-    std::string stem(name.substr(0, name.find('.')));
-    for (char& c : stem) c = static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c);
-    while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+    std::string_view stem = name.substr(0, name.find('.'));
+    while (!stem.empty() && stem.back() == ' ') stem.remove_suffix(1);
+    const auto upper = [](char c) { return static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c); };
+    const auto matches = [&](std::string_view device) {
+        if (stem.size() != device.size()) return false;
+        for (std::size_t i = 0; i < stem.size(); ++i)
+            if (upper(stem[i]) != device[i]) return false;
+        return true;
+    };
     for (const char* device : {"CON", "PRN", "AUX", "NUL"})
-        if (stem == device) return false;
-    if (stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) && stem[3] >= '0' && stem[3] <= '9') return false;
+        if (matches(device)) return false;
+    if (stem.size() == 4 && stem[3] >= '0' && stem[3] <= '9') {
+        stem.remove_suffix(1);
+        if (matches("COM") || matches("LPT")) return false;
+    }
     return true;
 }
 
@@ -145,8 +155,13 @@ public:
     {
         if (update >= capacity || !updates_[update]) return false;
         if (action.data.size() > max_staged_bytes - staged_bytes_[update]) return false;
-        staged_bytes_[update] += action.data.size();
-        staged_[update].push_back(std::move(action));
+        const std::size_t size = action.data.size();
+        try {
+            staged_[update].push_back(std::move(action));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        staged_bytes_[update] += size;
         return true;
     }
     // The staged actions in order; the update starts empty again.

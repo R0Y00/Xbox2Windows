@@ -41,6 +41,7 @@ def run(*instructions):
 
 
 REFUSAL = 'v_readfirstlane_b32 requires a proven uniform source'
+EARLIER = {'lane mask source': 'v_mul_f32 reads lane mask s3 as numeric data'}
 READ = 'v_readfirstlane_b32 s9, v7'
 # Offset 0x8 is a join: the branch at 0x0 skips the instruction at 0x4.
 JOIN = ('s_cbranch_scc0 label_0008', 's_nop 0')
@@ -81,7 +82,7 @@ ACCEPTED = [
       's_cbranch_scc1 label_0018', DEFINE, READ, 's_endpgm')),
 ]
 EXPECTED = {'chain through a second VGPR': 's9 = U(F((s3)) * 2.0);',
-            'median of three after a join': 's9 = U(med3(F(s3), F(0x00000000u), 0.5));'}
+            'median of three after a join': 's9 = U(med3_32(F(s3), F(0x00000000u), 0.5));'}
 for label, instructions in ACCEPTED:
     got = run(*instructions)
     want = EXPECTED.get(label, RECOMPUTED)
@@ -127,7 +128,7 @@ REFUSED = [
 ]
 for label, instructions in REFUSED:
     got = run(*instructions)
-    check(f'{label} refused', got == REFUSAL, repr(got))
+    check(f'{label} refused', got == EARLIER.get(label, REFUSAL), repr(got))
 
 # Writes the translator does not route through the first operand.
 probe = G.Stage.__new__(G.Stage)

@@ -16,12 +16,17 @@ is the host's fallback, which a proven offset never reaches.
 """
 
 import argparse
+import os
 import re
+import struct
+import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
 from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
 from mesh_entry_aot import U32, UNDEF, Wave, decode_mesh, float4, live_barriers_agree, run_group
+from mesh_param_link import hlsl_param_fields, hlsl_param_writes, merge_wave_params, validate_linkage
 
 
 MAX_VARIANTS = 32
@@ -148,6 +153,11 @@ class RuntimeWave(Wave):
     def descriptor_scalar_op(self, op, args):
         """Handle sampler heap and texture descriptor words; False for any other scalar op."""
         if self.geometry.sampler_heap_sgpr is None:
+            return False
+        if op.startswith(("s_cmp_", "s_bitcmp")):
+            found = self.descriptor_operand(args)
+            if found:
+                self.refuse_descriptor_use(op, found)
             return False
         dest, *sources = args
         if op == "s_load_dwordx8":
@@ -278,11 +288,11 @@ class RuntimeWave(Wave):
             raise ValueError(f"Unproven runtime geometry word {value.index} in {token}")
         return value
 
-    def scalar_op(self, op, args):
+    def scalar_op(self, op, args, *, dynamic_bitcmp=False):
         if op == "s_cmp_eq_u32":
             left, right = (super(RuntimeWave, self).scalar(t, True) for t in args)
             if left is UNDEF or right is UNDEF:
-                return super().scalar_op(op, args)
+                return super().scalar_op(op, args, dynamic_bitcmp=dynamic_bitcmp)
             if isinstance(right, RuntimeWord):
                 left, right = right, left
             if isinstance(left, RuntimeWord) and type(right) is int:
@@ -293,7 +303,7 @@ class RuntimeWave(Wave):
                 return
         if self.descriptor_scalar_op(op, args):
             return
-        super().scalar_op(op, args)
+        super().scalar_op(op, args, dynamic_bitcmp=dynamic_bitcmp)
 
     def vector_op(self, op, args, expressions):
         found = self.descriptor_operand(args if op.startswith("v_cmpx_") else args[1:])
@@ -330,6 +340,7 @@ class Variant:
     indices: dict
     # {vertex: {(kind, vector): values}} for the enabled clip and cull distances.
     distances: dict = None
+    params: dict = None
 
 
 def run_variant(decoded, geometry, limits, conditions):
@@ -340,16 +351,15 @@ def run_variant(decoded, geometry, limits, conditions):
         raise ValueError("Inconsistent mesh synchronization or allocation")
     nv, np = first.counts[0]
     pos = first.positions | second.positions
-    attrs = first.attributes | second.attributes
+    params = merge_wave_params([first, second], pos)
+    attrs = params.get(0, {})
     indices = first.indices | second.indices
     if (not 0 <= nv <= limits[0] or not 0 <= np <= limits[1]
             or set(pos) != set(range(nv)) or set(indices) != set(range(np))
             or any(max(triangle) >= nv for triangle in indices.values())):
         raise ValueError("Conflicting mesh counts, vertices or primitive indices")
-    if attrs and attrs.keys() != pos.keys():
-        raise ValueError("Incomplete vertex attribute")
     distances = vertex_distances(first.position_exports | second.position_exports, geometry.distance_layout)
-    return Variant(conditions, (nv, np), expressions, pos, attrs, indices, distances)
+    return Variant(conditions, (nv, np), expressions, pos, attrs, indices, distances, params)
 
 
 def enumerate_variants(decoded, geometry_word_count, limits, sampler_heap_sgpr=None, vs_out_cntl=None):
@@ -380,13 +390,21 @@ def enumerate_variants(decoded, geometry_word_count, limits, sampler_heap_sgpr=N
             pending.append((*conditions, (split.index, split.value, True)))
     if not any(variant.conditions for variant in variants):
         raise ValueError("No runtime geometry comparisons")
-    if len({bool(variant.attributes) for variant in variants if variant.positions}) > 1:
+    if len({frozenset(variant.params) for variant in variants if variant.positions}) > 1:
         raise ValueError("Runtime mesh branches disagree on the vertex signature")
     return variants
 
 
-def emit_hlsl(variants, limits, distance_layout=None):
-    has_attributes = any(variant.attributes for variant in variants)
+def emit_hlsl(variants, limits, distance_layout=None, param_linkage=None):
+    exported_params = tuple(sorted(next((v.params for v in variants if v.positions), {})))
+    validate_linkage(
+        exported_params,
+        pixel_attrs=param_linkage.pixel_attrs if param_linkage is not None else None,
+        flat=param_linkage.flat if param_linkage is not None else (),
+        f16_plain=param_linkage.f16_plain if param_linkage is not None else (),
+        distance_vectors=len(distance_layout.fields()) if distance_layout else 0,
+        semantic=param_linkage.semantic if param_linkage is not None else ("param" if any(s > 0 for s in exported_params) else "texcoord"),
+    )
     input_words = sorted({index for variant in variants for index, _, _ in variant.conditions})
     samples = any(expr.startswith(TEXTURE_NAME + ".SampleLevel(")
                   for variant in variants for expr in variant.expressions)
@@ -398,7 +416,7 @@ def emit_hlsl(variants, limits, distance_layout=None):
            f"SamplerState qh[{SAMPLER_HEAP_SIZE}] : register(s0, space{SAMPLER_HEAP_SPACE});"]
           if samples else []),
         "struct Vertex { float4 position : SV_Position; "
-        + ("float4 attr : TEXCOORD0; " if has_attributes else "") + hlsl_fields(distance_layout) + "};",
+        + hlsl_param_fields(exported_params, param_linkage) + hlsl_fields(distance_layout) + "};",
         '[outputtopology("triangle")]',
         "[numthreads(128,1,1)]",
         "void main(uint id : SV_GroupIndex, "
@@ -428,8 +446,14 @@ def emit_hlsl(variants, limits, distance_layout=None):
         for index, position in sorted(variant.positions.items()):
             lines.append(f"    if (id == {index}) {{")
             lines.append(f"      vertices[{index}].position = {float4(position)};")
-            if has_attributes:
-                lines.append(f"      vertices[{index}].attr = {float4(variant.attributes[index])};")
+            for write_line in hlsl_param_writes(
+                f"vertices[{index}]",
+                {s: d[index] for s, d in variant.params.items()},
+                exported_params,
+                float4,
+                param_linkage,
+            ):
+                lines.append(f"      {write_line}")
             if variant.distances:
                 lines.append(f"      {hlsl_writes(f'vertices[{index}]', variant.distances[index])}")
             lines.append("    }")
@@ -441,18 +465,25 @@ def emit_hlsl(variants, limits, distance_layout=None):
     return "\n".join(lines) + "\n"
 
 
-def lower(decoded, geometry_word_count, limits, sampler_heap_sgpr=None, vs_out_cntl=None):
+def lower(decoded, geometry_word_count, limits, sampler_heap_sgpr=None, vs_out_cntl=None, param_linkage=None):
     variants = enumerate_variants(decoded, geometry_word_count, limits, sampler_heap_sgpr, vs_out_cntl)
     layout = None if vs_out_cntl is None else decode_vs_out_cntl(vs_out_cntl)
-    return emit_hlsl(variants, limits, layout)
+    return emit_hlsl(variants, limits, layout, param_linkage)
 
 
-def translate(blob, geometry_word_count, library, sampler_heap_sgpr=None, vs_out_cntl=None):
+def translate(blob, geometry_word_count, library, sampler_heap_sgpr=None, vs_out_cntl=None, param_linkage=None):
     decoded, limits = decode_mesh(blob, library)
-    return lower(decoded, geometry_word_count, limits, sampler_heap_sgpr, vs_out_cntl)
+    return lower(decoded, geometry_word_count, limits, sampler_heap_sgpr, vs_out_cntl, param_linkage)
 
 
-if __name__ == "__main__":
+def _same_path(left: Path, right: Path) -> bool:
+    # resolve() handles a not-yet-existing output path; samefile() handles case/link aliases on Windows.
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("container", type=Path)
     parser.add_argument("--geometry-word-count", type=int, required=True)
@@ -462,16 +493,28 @@ if __name__ == "__main__":
     parser.add_argument("--pa-cl-vs-out-cntl", type=lambda s: int(s, 0),
                         help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2")
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
-        parser.error("Expected a separate HLSL output")
+    args = parser.parse_args(argv)
     if args.sampler_heap_sgpr is not None and (
             not 0 <= args.sampler_heap_sgpr <= 105 or args.sampler_heap_sgpr in ENTRY_SGPRS):
         parser.error("--sampler-heap-sgpr must name a free SGPR (s0-s105, not s3, s17, s20 or s21)")
     try:
+        if args.output.exists() and args.output.is_dir():
+            raise ValueError(f"Output path is an existing directory: {args.output}")
+        if args.output.suffix.lower() != ".hlsl":
+            raise ValueError("Expected a separate HLSL output")
+        if _same_path(args.output, args.container):
+            raise ValueError("Expected a separate HLSL output")
         hlsl = translate(args.container.read_bytes(), args.geometry_word_count, args.llvm,
                          args.sampler_heap_sgpr, args.pa_cl_vs_out_cntl)
-    except (ValueError, KeyError) as error:
-        parser.exit(1, f"mesh_dynamic_aot: {error}\n")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(hlsl, encoding="ascii")
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=args.output.parent) as staging_dir:
+            staged = Path(staging_dir) / args.output.name
+            staged.write_text(hlsl, encoding="ascii")
+            os.replace(staged, args.output)
+    except (OSError, ValueError, KeyError, struct.error, zlib.error) as error:
+        parser.exit(1, f"{type(error).__name__}: {error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

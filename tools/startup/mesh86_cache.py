@@ -144,7 +144,7 @@ def publish(cache, key, ms_path, ps_path, *, srv_dxc=None):
             # Dump the very bytes that will be published, including when the
             # original shader paths change concurrently.
             dumps = [subprocess.run([srv_dxc, '-dumpbin', work / stage], check=True,
-                                    capture_output=True, text=True, encoding='utf-8').stdout
+                                    capture_output=True, text=True, encoding='utf-8', timeout=30).stdout
                      for stage in ('ms', 'ps')]
             extent = prove_mesh_root_srv(*dumps)
             manifest = f'x2w-mesh86 2 {hashes} srv 0 0 {extent}\n'
@@ -156,7 +156,14 @@ def publish(cache, key, ms_path, ps_path, *, srv_dxc=None):
         (work / 'marker').replace(ready)
 
 
-def main():
+def _require_file(path: Path, option: str) -> None:
+    if path.is_dir():
+        raise IsADirectoryError(f'{option} must be a regular file, not a directory: {path}')
+    if not path.is_file():
+        raise FileNotFoundError(f'{option} file not found: {path}')
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('cache', type=Path)
     parser.add_argument('key', type=lambda text: int(text, 16))
@@ -164,19 +171,29 @@ def main():
     parser.add_argument('--pixel', type=Path, help='desktop PS DXIL when the captured input has a pixel stage')
     parser.add_argument('--prove-root-srv', type=Path, metavar='DXC',
                         help='use DXC to verify the bounded single-DWORD mesh root SRV profile')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
-        if args.mesh:
+        if not 0 <= args.key < (1 << 64):
+            raise ValueError(f'request key out of 64-bit range: {args.key:#x}')
+        if not args.cache.is_dir():
+            raise NotADirectoryError(f'cache directory not found: {args.cache}')
+        if args.mesh is not None:
+            _require_file(args.mesh, '--mesh')
+            if args.pixel is not None:
+                _require_file(args.pixel, '--pixel')
+            if args.prove_root_srv is not None:
+                _require_file(args.prove_root_srv, '--prove-root-srv')
             publish(args.cache, args.key, args.mesh, args.pixel, srv_dxc=args.prove_root_srv)
             print(f'{args.key:016x}: published desktop stages')
         else:
-            if args.pixel or args.prove_root_srv:
+            if args.pixel is not None or args.prove_root_srv is not None:
                 raise ValueError('--pixel and --prove-root-srv require --mesh')
             ms, ps, root, stream = load_request(args.cache, args.key)
             print(f'{args.key:016x}: MS {len(ms)}, PS {len(ps)}, root {len(root)}, stream {len(stream)} bytes')
-    except (ValueError, OSError, struct.error, subprocess.CalledProcessError) as error:
+    except (ValueError, OSError, struct.error, subprocess.SubprocessError) as error:
         parser.exit(1, f'{error}\n')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

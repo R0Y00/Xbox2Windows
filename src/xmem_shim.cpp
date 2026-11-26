@@ -15,6 +15,7 @@
 #include "era_title_gpu.h"
 #include "xmem_gpu_usage.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/profile_zone.h"
 
 #include <unordered_set>
 
@@ -83,17 +84,19 @@ bool local_free(void* block)
 extern "C" void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes)
 {
     void* allocation = era_heap::allocate(bytes, attributes);
-    if (!allocation && bytes && x2w_local::env_on("X2W_XMEM_PERMISSIVE")) return local_alloc(bytes, attributes);
     // Desktop policy: graphics memory types count as GPU-intended for XMemVirtualQuery.
-    if (allocation && is_graphics(attributes) && !era_title_gpu::track(allocation, bytes)) {
+    if (!allocation && bytes && x2w_local::env_on("X2W_XMEM_PERMISSIVE")) allocation = local_alloc(bytes, attributes);
+    else if (allocation && is_graphics(attributes) && !era_title_gpu::track(allocation, bytes)) {
         era_heap::release_with_attributes(allocation, attributes);
         return nullptr;
     }
+    if (allocation) X2W_ALLOC(allocation, bytes, "XMemAlloc");
     return allocation;
 }
 
 extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
 {
+    if (allocation) X2W_FREE(allocation, "XMemAlloc");
     if (allocation && local_free(allocation)) return;
     if (allocation && is_graphics(attributes)) {
         era_title_gpu::untrack(allocation);

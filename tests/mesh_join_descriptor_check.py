@@ -20,19 +20,19 @@ GEOMETRY = [0x1003]
 POINT, MATRIX = "0x60", "0x80"
 
 
-def program(arm_true, arm_false, selector="s_cmp_eq_u32 s14, 0"):
+def program(fallthrough, taken, selector="s_cmp_eq_u32 s14, 0", *, branch="s_cbranch_scc0"):
     """Splice a uniform if/else that defines the descriptor s[36:39]."""
-    first = arm_true + ["s_branch %d" % len(arm_false)]
+    first = fallthrough + ["s_branch %d" % len(taken)]
     return (
         PROGRAM[:7]  # descriptor tables, wait, geometry word s15
         + [
             "s_buffer_load_dword s14, s[16:19], null",
             "s_waitcnt lgkmcnt(0)",
             selector,
-            "s_cbranch_scc0 %d" % len(first),
+            f"{branch} {len(first)}",
         ]
         + first
-        + arm_false
+        + taken
         + [
             "s_buffer_load_dword s30, s[36:39], 0x4",
             "s_buffer_load_dword s31, s[20:23], 0xc",
@@ -49,6 +49,7 @@ def table(offset):
 NULL = [f"s_mov_b32 s{i}, 0" for i in range(36, 40)]
 PER_MATERIAL = program(table(POINT), table(MATRIX))
 NULL_ARM = program(table(POINT), NULL)
+PER_MATERIAL_SCC1 = program(table(MATRIX), table(POINT), branch="s_cbranch_scc1")
 
 
 def build(lines, **kw):
@@ -69,11 +70,15 @@ def checks():
     source = build(PER_MATERIAL)
     expect = "(asuint(pointData[0].x) == 0u) ? pointData[0].y : matrixData[0].y"
     assert expect in source, source
+    assert build(PER_MATERIAL_SCC1) == source
+    assert build(program(NULL, table(POINT), branch="s_cbranch_scc1")) == build(NULL_ARM)
     assert "(asuint(pointData[0].x) == 0u) ? pointData[0].y : 0.0f" in build(NULL_ARM)
     # LLVM 15 prints a branch to itself (SIMM16 = -1) as 65535.
     split = PER_MATERIAL.copy()
     split[split.index("s_cbranch_scc0 3")] = "s_cbranch_scc0 65535"
     refused(split, "Expected a forward mesh branch")
+    refused(program(table(POINT) + ["s_mov_b64 exec, 1"], table(MATRIX), branch="s_cbranch_scc1"),
+            "changed EXEC, VCC or M0")
 
     arm = PER_MATERIAL.copy()
     latch = arm.index("s_branch 2")
@@ -139,16 +144,17 @@ def cases(null_arm):
     def triangle(z):
         return [(x, y, z, w) for x, y, _, w in TRIANGLE]
 
-    # selector 0.0 takes the fall-through arm (point table); 1.0 the other arm.
+    # Selector 0.0 chooses the point table in either branch encoding.
     other = 0.0 if null_arm else 0.25
     return [
         (constants(0.0, 0.125, 0.25, 0.375), triangle(0.5), True),
         (constants(1.0, 0.125, 0.25, 0.375), triangle(other + 0.375), True),
+        (constants(1.0, 0.125, 1.25, 0.375), triangle(0.375 if null_arm else 1.625), null_arm),
     ]
 
 
 def check(dxc, renderer, adapter):
-    for lines, null_arm in ((PER_MATERIAL, False), (NULL_ARM, True)):
+    for lines, null_arm in ((PER_MATERIAL, False), (NULL_ARM, True), (PER_MATERIAL_SCC1, False)):
         with tempfile.TemporaryDirectory() as directory:
             result = draw(dxc, renderer, adapter, Path(directory), build(lines), cases(null_arm))
             if result == 77:
