@@ -15763,6 +15763,20 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+### Counted loop exit inside a compute EXEC-zero block (#2645 T2)
+
+The 112-byte gfx1013 fixture in `tests/startup_gfx2hlsl_compute_check.py` starts with eight
+lanes and keeps lanes 0–2 in two saved masks. At counter values 1, 2 and 3 it removes each
+remaining lane whose ID is below the counter. The wave exits when the second mask becomes
+empty. The wave and singleton traces both store `[9, 1, 2, 9, 9, 9, 9, 9]`.
+
+Reading the counter after restoring EXEC exposes the difference. The wave exits with 3 for
+every lane. In the singleton model lanes 0 and 1 exit early with 1 and 2. Lanes 3–7 skip the
+guarded block and take the latch until the counter reaches 4. The translator reports
+`loop exit crosses a backward s_cbranch_scc0` for the early exit in both variants.
+Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture.
+
 ### Startup compute formatted buffer reads
 
 The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using

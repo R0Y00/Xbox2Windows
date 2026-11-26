@@ -2967,8 +2967,13 @@ class Stage:
                 if inner.startswith(EXECZ_REFUSED):
                     reason = 'effect outside scalar registers'
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
-                        b < index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1) <= t):
+                        b < (exit_index := index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1)) <= t):
                     reason = 'branch out of the block'
+                    # A lane can leave while the wave takes the latch, or take the latch after the wave exits.
+                    if inner == 's_cbranch_scc0' and any(
+                            t <= latch < exit_index and self.ins[latch][2] == 's_cbranch_scc0'
+                            and target in index and index[target] <= b for latch, target in jumps):
+                        reason = 'loop exit crosses a backward s_cbranch_scc0'
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
