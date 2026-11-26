@@ -6269,6 +6269,9 @@ class Stage:
         tex = self.pipe.resource(key, 'tex2d')
         return dst, addr, words, channels[masks[0]], tex
 
+    def op_image_gather4(self, ops, mods):
+        raise Unsupported('image_gather4 requires the guest implicit mip level')
+
     def op_image_gather4_lz(self, ops, mods):
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
             'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True)

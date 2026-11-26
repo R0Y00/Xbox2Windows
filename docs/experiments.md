@@ -14885,6 +14885,10 @@ with normalized clamp addressing, bilinear XY, point mip filtering, and
 zero minimum LOD and bias. Implicit, explicit-LOD, comparison, offset,
 and non-2D forms remain outside this slice.
 
+Plain `image_gather4` reports `requires the guest implicit mip level`.
+Translating it through the fixed-mip path could read a different level
+because Direct3D gather uses the first visible mip of the bound view.
+
 The sampler's Z address mode (`CLAMP_Z`, SQ_IMG_SAMP_WORD0 bits 8:6) is not
 checked: a 2D view has no third coordinate, and the Direct3D 11.3
 functional spec (22.4.2, gather4) says only the sampler's addressing modes
