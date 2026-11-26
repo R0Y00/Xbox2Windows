@@ -32,6 +32,8 @@ OpDecorate %color Location 0
 %uv = OpConstantComposite %v2 %quarter %quarter
 %dx = OpConstantComposite %v2 %step %zero
 %dy = OpConstantComposite %v2 %zero %step
+%twoTexelsDx = OpConstantComposite %v2 %quarter %zero
+%twoTexelsDy = OpConstantComposite %v2 %zero %quarter
 %ix = OpConstant %int 1
 %iy = OpConstant %int 0
 %offset = OpConstantComposite %iv2 %ix %iy

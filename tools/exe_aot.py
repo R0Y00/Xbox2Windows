@@ -10,7 +10,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -143,6 +143,7 @@ def build(cxx, source, exe, *, timeout=BUILD_TIMEOUT_S):
     compiler = shutil.which(str(cxx)) if cxx else shutil.which("cl")
     if compiler is None:
         raise Refusal("build", f"C++ compiler {cxx or 'cl'} not found; run tools/dev.ps1 or pass --cxx")
+    compiler_name = PureWindowsPath(compiler).name
     # The provenance export would otherwise make the linker write an import library and .exp file.
     command = [compiler, *CXX_FLAGS, source.name, f"/Fe{exe.name}", f"/Fo{source.stem}.obj",
                "/link", "/NOIMPLIB", "/NOEXP"]
@@ -163,15 +164,15 @@ def build(cxx, source, exe, *, timeout=BUILD_TIMEOUT_S):
         )
         raise Refusal(
             "build",
-            f"{Path(compiler).name} timed out after {exc.timeout}s",
+            f"{compiler_name} timed out after {exc.timeout}s",
             output=_tail_lines(combined),
         ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        raise Refusal("build", f"failed to run {Path(compiler).name}: {exc}") from exc
+        raise Refusal("build", f"failed to run {compiler_name}: {exc}") from exc
     if result.returncode or not exe.is_file():
         tail = _tail_lines((result.stdout or "") + (result.stderr or ""))
-        raise Refusal("build", f"{Path(compiler).name} exited {result.returncode}", output=tail)
-    return Path(compiler).name
+        raise Refusal("build", f"{compiler_name} exited {result.returncode}", output=tail)
+    return compiler_name
 
 
 def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True):

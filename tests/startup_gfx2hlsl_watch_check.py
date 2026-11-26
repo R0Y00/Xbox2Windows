@@ -107,9 +107,10 @@ mesh57_fixture(mesh, pixel, 'slot 57 mesh group-index exchange: instruction 1 of
 # A pair without a pixel stage is translated when the mesh has the accepted shape; this synthetic mesh does not.
 mesh57_fixture(mesh, b'', 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
 mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
-# A pixel stage whose only export is the null target (done, vm, no channels) is a depth-only stage and passes the role check.
+# A pixel stage whose only export is the null target (done, vm, no channels) is a depth-only stage and passes the role check;
+# the pair is translated when the mesh has the accepted shape, which this synthetic mesh does not.
 null_export = struct.pack('<3I', 0xf8001890, 0, endpgm)
-mesh57_fixture(mesh, null_export, 'slot 57 mesh with a depth-only pixel stage is not covered')
+mesh57_fixture(mesh, null_export, 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
 # Controls: a position export, or a null export mixed with one, stays refused.
 mesh57_fixture(mesh, struct.pack('<3I', *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, struct.pack('<5I', 0xf8001890, 0, *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
