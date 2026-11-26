@@ -3448,9 +3448,6 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: v_add/sub/subrev_co_u32 against ISA references.
     add_test(NAME startup_gfx2hlsl_add_sub_co_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_check.py")
-    # Startup shader translator: v_bfm_b32 bit-field mask.
-    add_test(NAME startup_gfx2hlsl_v_bfm_controls COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_v_bfm_check.py")
     # Startup shader translator: v_{add,sub,subrev}_co_ci_u32 carry/borrow-in and out.
     add_test(NAME startup_gfx2hlsl_add_sub_co_ci_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_ci_check.py")

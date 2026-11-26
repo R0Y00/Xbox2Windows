@@ -15737,11 +15737,11 @@ Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and 
 
 ### Startup shader translator: `v_bfm_b32`
 
-`tools/startup/gfx2hlsl.py` now lowers the gfx1013 bit-field mask `v_bfm_b32` (`_e32` and `_e64`) that it used to refuse. The result is a mask of S0[4:0] ones shifted left by S1[4:0], emitted as `(((1u << (a & 31)) - 1) << (b & 31))`, so a width of 0 gives 0 and a shift past the top drops the bits. Scope is translation only: the control is pure Python, it compares the emitted expression with a CPU reference and does not run a GPU. Source modifiers, `clamp` and output modifiers are refused with `Unsupported`, as for the sibling integer operations. The WARP draw of the same formula is the existing `pixel_aot_bfm_<adapter>` test.
+`tools/startup/gfx2hlsl.py` now lowers the gfx1013 bit-field mask `v_bfm_b32` (`_e32` and `_e64`) that it used to refuse. The result is a mask of S0[4:0] ones shifted left by S1[4:0], emitted as `(((1u << (a & 31)) - 1) << (b & 31))`, so a width of 0 gives 0 and a shift past the top drops the bits. `v_bfm_b32` is a row of `tests/startup_gfx2hlsl_bit_alu_check.py`: the emitted text runs on its integer evaluator over 1368 width/offset pairs against a plain-integer reference, a swapped width/offset mutation must read other words, and the `draw` mode renders the translated pixel stage on the adapter (FXC 5_1 and DXC 6_0) and reads the words back. Source modifiers, `clamp` and output modifiers are refused with `Unsupported`, as for the sibling integer operations. The WARP draw of the same formula is the existing `pixel_aot_bfm_<adapter>` test.
 
 ```bash
-python3 -B tests/startup_gfx2hlsl_v_bfm_check.py
-ctest -R startup_gfx2hlsl_v_bfm_controls
+python3 -B tests/startup_gfx2hlsl_bit_alu_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_bit_alu_(controls|warp)$' -V
 ```
 
 ## Startup list Dispatch
