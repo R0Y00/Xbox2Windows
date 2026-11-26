@@ -123,7 +123,7 @@ STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_m
 
 def inline(value):
     """A fill constant as an inline constant: (LLVM spelling, encoded field)."""
-    return {0: ('0', 128), 1: ('1', 129), MASK: ('-1', INLINE_M1)}[value]
+    return {0: ('0', 128), 1: ('1', 129), 5: ('5', 133), MASK: ('-1', INLINE_M1)}[value]
 
 
 def cndmask_fill(vt, src, ss, value, mask=None):
@@ -415,6 +415,9 @@ def refusals():
     yield ('no identity fill', full(fill=None), 'identity fill', False)
     yield ('the input copied without the identity', full(fill='copy'), 'identity fill', False)
     yield ('a fill with another constant (1 for v_max_u32)', full(identity=1), 'identity fill', None)
+    for other in OPS:   # a constant that is no operation's identity, for each operation
+        yield ('a fill with another constant (5 for %s)' % other,
+               program(start(other), chain(other, identity=5), RESULT, END), 'identity fill', None)
     yield ('a fill under another saved mask (s5)', full(fill_mask=5), 'identity fill', None)
     yield ('wrong identity (-1 for v_max_u32)', full(identity=MASK), 'identity', False)
     yield ('wrong identity (0 for v_min_u32)', program(START_MUL, chain('v_min_u32', identity=0), RESULT, END),
@@ -726,6 +729,26 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                         adapter, label, how, errors[0] if errors else '', len(errors)), bool(errors))
 
 
+def assemble_object(llvm_mc, source):
+    """The .text bytes of an object assembled by llvm-mc. -show-encoding prints a branch to a label with its offset
+    still a fixup ([A,A,0x88,0xbf]); the object has it resolved."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, obj = Path(tmp) / 'a.s', Path(tmp) / 'a.o'
+        src.write_text(source)
+        subprocess.run([llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-filetype=obj', str(src), '-o', str(obj)],
+                       check=True)
+        elf = obj.read_bytes()
+    # ELF64 little endian: section headers at e_shoff, e_shentsize bytes each; e_shstrndx names them.
+    shoff, = struct.unpack_from('<Q', elf, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', elf, 0x3a)
+    sections = [struct.unpack_from('<IIQQQQ', elf, shoff + k * shentsize) for k in range(shnum)]
+    names = sections[shstrndx][4]
+    for name, _type, _flags, _addr, offset, size in sections:
+        if elf[names + name:elf.index(b'\0', names + name)] == b'.text':
+            return elf[offset:offset + size]
+    raise AssertionError('no .text section in the object llvm-mc wrote')
+
+
 def check_binary(llvm_mc):
     programs = [('%s fixture' % op, fixture(op)) for op in OPS]
     programs += [('min then max, interleaved, vT shared', PAIR), ('min then max, interleaved, vT apart', PAIR_SPLIT),
@@ -747,7 +770,7 @@ def check_binary(llvm_mc):
                     out.append('L%04X:' % target)
                 out.append(text.replace('label_', 'L'))
                 offset += size
-            built = assemble(llvm_mc, '\n'.join(out) + '\n')
+            built = assemble_object(llvm_mc, '\n'.join(out) + '\n')
         check('llvm-mc assembles the program "%s" to the same words' % label, built == words,
               built.hex() + ' / ' + words.hex())
 

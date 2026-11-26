@@ -84,6 +84,8 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_wave_reduce' -V
 python -B tests/startup_gfx2hlsl_wave_reduce_check.py binary <llvm-mc>
 ```
 
-The `binary` mode assembles every fixture and compares the words. WARP runs 4-lane waves (one quad per wave), so only
+The `binary` mode assembles every fixture and compares the words; the programs with a branch are assembled to an
+object (`-filetype=obj`) and compared with its `.text`, because `-show-encoding` prints a branch to a label with its
+offset still unresolved. WARP runs 4-lane waves (one quad per wave), so only
 a hardware adapter reduces across quads. This does not measure console behavior or a title, and wave64 chains are
 the next slice.
