@@ -208,7 +208,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-Graphics and compute use cache revisions `x2w-startup-shader-27` and `x2w-startup-shader-27cs`.
+Graphics and compute use cache revisions `x2w-startup-shader-28` and `x2w-startup-shader-28cs`.
+Revision 28 lowers `v_fma_mix*` through a `precise` `mad`, so a zero product keeps its sign.
 Revision 25 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
 Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
 treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
@@ -3290,8 +3291,14 @@ recording and before submit, while the cap skips multi-GiB existing heaps to avo
 uncovered prefix, and right before
 `OpenExistingHeapFromAddress` opens the heap). Anything else gets a
 committed default buffer that does not alias the title memory, holds zeros and is reported as
-success (`not aliased` in the log). `reserve_upload_ring` similarly grows in demand chunks starting at 16 MiB up to the
-256 MiB total cap instead of committing 256 MiB upfront. `X2W_D3D12_LINEAR_BUFFERS` changes this for one buffer kind: a
+success (`not aliased` in the log). `reserve_upload_ring` grows in demand
+chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
+bytes for the process; the allocator may use an older unused tail but
+refuses exhaustion or allocation failure rather than resetting live storage.
+`upload_reservation` exercises the shared cursor and returned-pointer contract
+without D3D12; on non-Windows hosts run
+`c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.
+`X2W_D3D12_LINEAR_BUFFERS` changes placement for one buffer kind: a
 buffer description with row-major or unknown layout and initial state `COMMON`
 (`src/startup_stubs/linear_buffer_backing.h`, [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914)).
 Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, keep the default backing.

@@ -2055,6 +2055,10 @@ foreach(mutation IN ITEMS no-limit no-state no-root-args no-pairing no-bound)
     add_test(NAME startup_list_dispatch_${mutation}_control COMMAND startup_list_dispatch_check --mutate ${mutation})
     set_tests_properties(startup_list_dispatch_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+add_executable(upload_reservation_check tests/upload_reservation_check.cpp)
+target_include_directories(upload_reservation_check PRIVATE src)
+target_compile_features(upload_reservation_check PRIVATE cxx_std_17)
+add_test(NAME upload_reservation COMMAND upload_reservation_check)
 # The same slot driven through the stand-in on a desktop device: one refusal line per refused case, and the
 # forwarded calls counted by a pipeline-statistics query on the desktop list.
 add_executable(startup_list_dispatch_native tests/startup_list_dispatch_native.cpp)
