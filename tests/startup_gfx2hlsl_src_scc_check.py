@@ -266,8 +266,17 @@ add_reads_scc = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
                  + encode_sop2(SOP2_ADD_U32, S1, S_SCC, S_ONE)
                  + encode_sopp(SOPP_ENDPGM))
 asm, emitted, _stage = translate_program(add_reads_scc)
+read_line = 's1 = (scc ? 1u : 0u) + 0x00000001u;'
 check('s_add_u32 reading incoming verified src_scc is accepted',
-      's1 = (scc ? 1u : 0u) + 0x00000001u;' in emitted, emitted)
+      read_line in emitted, emitted)
+# The destination reads the incoming SCC before this add's own carry replaces it (the carry is emitted after the write).
+check('s_add_u32 src_scc operand is read before the add writes SCC',
+      emitted.index(read_line) < emitted.index('scc = ((scc ? 1u : 0u) + 0x00000001u) < ((scc ? 1u : 0u));'), emitted)
+check('s_add_u32 whose destination is also a source and reads src_scc is refused',
+      refused_reason(encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
+                     + encode_sop2(SOP2_ADD_U32, S1, S1, S_SCC)
+                     + encode_sopp(SOPP_ENDPGM)) == 's_add_u32 reads src_scc with a destination that is also a source '
+                                                    'or a special register')
 _asm, emitted, _stage = translate_program(
     encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
     + encode_sop2(SOP2_ADD_U32, S1, S_SCC, S_ONE)

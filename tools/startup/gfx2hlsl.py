@@ -5158,6 +5158,7 @@ class Stage:
                 raise Unsupported('%s into null on a lane mask' % base)
             if pair:
                 raise Unsupported('%s into null' % base)
+        deferred_scc = None
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
@@ -5173,8 +5174,19 @@ class Stage:
             self.set_scc('(%s) < %s' % (expr, values[0]))
             self.address_carry_reader = self.address_carry_pairs[self.pc]
         elif base in SCC_UNMODELLED:
-            # From the sources, before the destination is written (it can be a source).
-            self.set_scc(add_sub_min_max_scc(base, values[0], values[1], expr))
+            scc_text = add_sub_min_max_scc(base, values[0], values[1], expr)
+            if re.search(r'\bscc\b', scc_text):
+                # An operand is the incoming SCC (src_scc): the destination must read it before this instruction's own
+                # SCC replaces it, so the destination is written first and the SCC after, from sources it did not change.
+                if dname in ('m0', 'exec', 'exec_lo', 'vcc', 'vcc_lo', 'null') or any(
+                        reg_range(t) and dst and reg_range(t)[0] == 's' and dst[1] <= reg_range(t)[1] <= dst[2]
+                        for t in srcs):
+                    raise Unsupported('%s reads src_scc with a destination that is also a source or a special register'
+                                      % base)
+                deferred_scc = scc_text
+            else:
+                # From the sources, before the destination is written (it can be a source).
+                self.set_scc(scc_text)
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
@@ -5270,6 +5282,8 @@ class Stage:
                             self.uniform_source(high_source))
         salu_align4 = not pair and not is_mask and self.salu_align4(base, srcs)
         self.set_s(d, expr, scc=None if lane_complement else scc, align4=salu_align4)
+        if deferred_scc is not None:
+            self.set_scc(deferred_scc)
         if base == 's_mov_b32' and srcs[0] in FLOATS and not is_mask:
             # Keep the runtime SGPR assignment intact while letting const_words() read inline float patterns
             # such as 0x40000000 (OPAQUE_BLACK, encoded as inline 244 / '2.0').

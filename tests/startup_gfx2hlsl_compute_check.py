@@ -1266,7 +1266,9 @@ def check_scc_modelled():
     SPLICE.update(words)
     for line, word in words.items():  # the decoder prints each hand-assembled word as its line (literals in hex)
         (_, _, name, text), = G.decode(bytes.fromhex(word))
-        assert text == line or text == line.replace('-1', '0xffffffff'), (line, text)
+        # the decoder prints a branch with its target label and a -1 literal in hex
+        assert text == line or text == line.replace('-1', '0xffffffff') or (
+            name.startswith('s_cbranch') and text.startswith(name + ' ')), (line, text)
     for op, scc in (('s_add_u32 s23, s7, -1', 'scc = (s7 + 0xffffffffu) < (s7);'),
                     ('s_sub_u32 s23, s7, 1', 'scc = (s7) < (0x00000001u);'),
                     ('s_add_i32 s23, s7, 0x7fffffff',
@@ -1592,6 +1594,7 @@ def check_controls():
     assert expected('A-ff1') != expected('A')
     check_lds()
     check_descriptor_scc()
+    check_scc_modelled()
     check_mbcnt()
     check_lane_mask_data()
     check_lane_mask_high_word()
