@@ -2098,7 +2098,6 @@ foreach(adapter IN ITEMS warp hardware)
 endforeach()
 set_tests_properties(startup_committed_slot76_hardware PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME startup_committed_slot76_control COMMAND startup_committed_slot76_check warp --control)
-set_tests_properties(startup_committed_slot76_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 # Opt-in BC7 4 KiB standard surfaces (src/startup_stubs/bc7_4k_s.h): accepted descriptions, padded
 # sizes, block order and detile; the mutated run (x-first bit order) is the negative control.
 add_executable(startup_bc7_4k_s_check tests/startup_bc7_4k_s_check.cpp)

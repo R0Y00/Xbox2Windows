@@ -5,7 +5,7 @@
 // the default, upload and readback heaps, passed as a title passes them (initial state 0xffffffff),
 // must all be created and the device must stay alive.
 // usage: startup_committed_slot76_check warp|hardware [--control]
-// --control asks for a 2D texture on an upload heap, which no runtime creates: that row must print FAIL.
+// --control also requires a 2D upload-heap texture to return E_INVALIDARG with no output resource.
 #include "xmem_test_device.h"
 
 #include <cstdio>
@@ -61,8 +61,9 @@ const char* heap_name(D3D12_HEAP_TYPE type)
     return type == D3D12_HEAP_TYPE_DEFAULT ? "default" : type == D3D12_HEAP_TYPE_UPLOAD ? "upload" : "readback";
 }
 
-// Returns 0 when slot 76 creates the resource and the device stays alive.
-int check(ID3D12Device* wrapper, D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, const D3D12_CLEAR_VALUE* clear = nullptr)
+// Returns 0 only when the requested creation or rejection is observed and the device stays alive.
+int check(ID3D12Device* wrapper, D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc,
+          const D3D12_CLEAR_VALUE* clear = nullptr, bool reject = false)
 {
     const D3D12_HEAP_PROPERTIES props{type};
     const GUID iid = __uuidof(ID3D12Resource);
@@ -72,7 +73,9 @@ int check(ID3D12Device* wrapper, D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC
     const char* what = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "2D texture";
     std::printf("%s heap, %s of 0x%llx%s: slot 76 -> 0x%08lx\n", heap_name(type), what,
                 static_cast<unsigned long long>(desc.Width), clear ? " with clear value" : "", static_cast<unsigned long>(hr));
-    const int result = FAILED(hr) || !created || FAILED(removed) ? 1 : 0;
+    const bool expected = reject ? hr == E_INVALIDARG && !created : SUCCEEDED(hr) && created;
+    const int result = expected && SUCCEEDED(removed) ? 0 : 1;
+    if (reject && !result) std::puts("slot 76 rejected the upload-heap texture with E_INVALIDARG and no resource");
     if (result)
         std::printf("FAIL: %s heap %s: hr 0x%08lx object %p device 0x%08lx\n", heap_name(type), what, static_cast<unsigned long>(hr),
                     created, static_cast<unsigned long>(removed));
@@ -101,8 +104,9 @@ int main(int argc, char** argv)
     clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     failures += check(wrapper.Get(), D3D12_HEAP_TYPE_DEFAULT, texture(128, 64, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), &clear);
     failures += check(wrapper.Get(), D3D12_HEAP_TYPE_DEFAULT, buffer(0x10000));
-    failures += check(wrapper.Get(), D3D12_HEAP_TYPE_UPLOAD, control ? texture(64, 64) : buffer(0x10000));
+    failures += check(wrapper.Get(), D3D12_HEAP_TYPE_UPLOAD, buffer(0x10000));
     failures += check(wrapper.Get(), D3D12_HEAP_TYPE_READBACK, buffer(768));
+    if (control) failures += check(wrapper.Get(), D3D12_HEAP_TYPE_UPLOAD, texture(64, 64), nullptr, true);
     if (failures) {
         std::printf("startup_committed_slot76: FAIL (%d)\n", failures);
         return 1;

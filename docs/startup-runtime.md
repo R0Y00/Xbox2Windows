@@ -2878,7 +2878,7 @@ clear-value retry and title memory, and a log line naming the slot. Run
 (`tests/startup_committed_slot76_check.cpp`): a render target with a clear value and buffers on the
 default, upload and readback heaps, passed with initial state 0xffffffff as a title passes them, must
 be created and leave the device alive. The control asks for a 2D texture on an upload heap and must
-print `FAIL:`. `startup_committed_slot76_hardware` runs the same on a physical GPU.
+return `E_INVALIDARG` with no resource and leave the device alive. The control also requires all four valid creations to pass. `startup_committed_slot76_hardware` runs the creation checks on a physical GPU.
 
 - `ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V` runs the
   earlier contract check and `tests/xmem_page_runs_check.py`: a batch across two sections with
