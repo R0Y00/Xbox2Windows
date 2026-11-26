@@ -846,6 +846,9 @@ NO_SCALAR_DESTINATION = ('s_cbranch', 's_branch', 's_waitcnt', 's_nop', 's_endpg
 TWO_SCALAR_DESTINATIONS = ('v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale', 'v_mad_u64_u32', 'v_mad_i64_i32')
 # Symbols whose register also holds the value at run time: constants are assigned when set, entry root constants are
 # assigned at entry when a join needs it, and the others are assigned when tracked.
+# Longest uniform HLSL expression a VGPR keeps for a first-lane read: a chain past it is no longer recomputable.
+UNIFORM_EXPR_LIMIT = 4096
+
 RUN_TIME_SYMBOLS = ('const', 'ud', 'execcopy', 'fixed_buffer_word')
 
 
@@ -968,6 +971,11 @@ UNIFORM_VALU = frozenset((
     'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_u32', 'v_cvt_f32_ubyte0', 'v_cvt_off_f32_i4',
     'v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32',
     'v_mul_f32', 'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_med3_f32', 'v_mov_b32',
+    # Pure 32-bit integer ALU: each lane computes the result from its own sources only, so equal sources give
+    # equal results in every lane (no carry-out, no lane ID, no cross-lane read).
+    'v_add_nc_u32', 'v_sub_nc_u32', 'v_subrev_nc_u32', 'v_and_b32', 'v_or_b32', 'v_xor_b32', 'v_not_b32',
+    'v_lshlrev_b32', 'v_lshrrev_b32', 'v_ashrrev_i32', 'v_mul_lo_u32', 'v_mul_u32_u24',
+    'v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32',
 ))
 
 UNIFORM_LOAD_WORDS = {'buffer_load_dword': 1, 'buffer_load_dwordx2': 2, 'buffer_load_dwordx3': 3, 'buffer_load_dwordx4': 4,
@@ -3147,6 +3155,9 @@ class Stage:
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
+            self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
+            self.divergent_branches = {}  # s_cbranch offset -> mnemonic, for branches not proven wave-uniform
+            self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
             self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform) for constant-lane SGPR spills
             self.vcc_events = {}
             self.vcc_lost = self.vcc_descriptor_overwritten = False
@@ -3325,6 +3336,7 @@ class Stage:
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
+                            self.divergent_branches[off] = base
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
                             regs = {r for r in regs if isinstance(r, int)}
@@ -3392,6 +3404,12 @@ class Stage:
             refusals.append((reason, self.kind))
         if self.lines:
             self.blocks.append((start, self.lines, None))
+        for at, reason in self.quad_flow_refusals(branches, targets):
+            if refusals is None:
+                error = Unsupported(reason)
+                error.instruction = names[at]
+                raise error
+            refusals.append((reason, self.kind))
         self.materialized = materialize  # declarations() assigns these before the body (and before any loop)
         if set(scc_effects.values()) - {'emitted'}:
             for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
@@ -3640,10 +3658,86 @@ class Stage:
                     self.uniform_expr[dst] = shifted
                 elif expr is None or loaded or any(n not in self.uniform_expr for n in vs):
                     self.uniform_expr.pop(dst, None)
+                elif sum(len(self.uniform_expr[n]) for n in vs) > UNIFORM_EXPR_LIMIT:
+                    # A VGPR used as both operands (v10 = v10 + v10) doubles the text each time: past the limit the
+                    # chain has no recomputable expression, so a first-lane read of it is refused.
+                    self.uniform_expr.pop(dst, None)
                 else:
                     self.uniform_expr[dst] = re.sub(r'\bv(\d+)\b', lambda m: '(%s)' % self.uniform_expr[int(m[1])],
                                                     expr)
         return term
+
+    def quad_flow_straight(self):
+        """Whether a DPP quad read sits in straight-line code (the quad intrinsics then run in uniform flow)."""
+        return not getattr(self, 'has_branches', True) and not getattr(self, 'blocks', [])
+
+    def quad_flow_allowed(self):
+        """Whether a DPP quad read in a pixel program with branches or loops may be lowered now and proven over the
+        whole program after translation (Stage.quad_flow_refusals). Unit probes without translate() cannot."""
+        return getattr(self, 'kind', None) == 'ps' and getattr(self, 'quad_flow_reads', None) is not None
+
+    def note_quad_flow(self, base):
+        if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
+            self.quad_flow_reads.append((self.pc, base))
+
+    def quad_flow_refusals(self, branches, targets):
+        """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
+
+        The one-lane model runs each lane as its own HLSL thread through the pc dispatch, so the QuadReadLaneAt /
+        QuadReadAcross* of a lane reads its neighbours only when all four threads of the quad reach that statement
+        together (same block, same pass of the dispatch loop) with the word the guest lanes hold. The guest runs
+        the wave as one: its scalar branches are wave-wide, and the quad is whole when EXEC is the s_wqm mask. A
+        read is kept when, on every path to it:
+        - the s_wqm exec, exec that proved whole-quad EXEC ran first: it sits before every branch and target;
+        - no other instruction that can write EXEC reaches it (so EXEC is still that mask and every VGPR write ran
+          on all four lanes, helper lanes included);
+        - every conditional branch that reaches it is wave-uniform (SCC proven uniform by the translator), or an
+          execz/execnz branch, whose EXEC is the whole-quad mask by the rule above and so never taken. A vccz/vccnz
+          branch, or SCC from lane data, can split a quad, and the read is refused.
+        Then the four threads ran the same branch outcomes, so they are in the same block on the same dispatch
+        pass. No wave size is assumed: the SM 6.0 quad operations need only the 2x2 quad of four lanes."""
+        reads = getattr(self, 'quad_flow_reads', [])
+        if not reads:
+            return []
+        index, block_of, succ, _dom, _writes, _reached = self.flow
+        after = {}
+
+        def reaches(src, dst):
+            a, b = index[src], index[dst]
+            if block_of[a] == block_of[b] and a < b:
+                return True
+            start = block_of[a]
+            if start not in after:
+                seen, todo = set(), list(succ[start])
+                while todo:
+                    blk = todo.pop()
+                    if blk not in seen:
+                        seen.add(blk)
+                        todo += succ[blk]
+                after[start] = seen
+            return block_of[b] in after[start]
+        # No branch or target (a dead read behind an early s_endpgm): nothing for the s_wqm to precede.
+        first = min([off for off, _ in branches] + list(targets), default=float('inf'))
+        writers = [off for off, _n, name, asm in self.ins if writes_exec(name, parse(asm)[1])
+                   and not (re.sub(r'_e(32|64)$', '', name) in ('s_wqm_b32', 's_wqm_b64')
+                            and parse(asm)[1] in (['exec', 'exec'], ['exec_lo', 'exec_lo']))]
+        out = []
+        for at, base in reads:
+            if self.wqm_set_at is None or self.wqm_set_at >= first:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the s_wqm exec, exec does not '
+                                'run before every branch' % (base, at)))
+                continue
+            writer = next((w for w in writers if reaches(w, at)), None)
+            if writer is not None:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the EXEC write at +0x%x reaches '
+                                'it' % (base, at, writer)))
+                continue
+            split = next((b for b, name in sorted(self.divergent_branches.items())
+                          if name not in ('s_cbranch_execz', 's_cbranch_execnz') and reaches(b, at)), None)
+            if split is not None:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: %s at +0x%x is not proven '
+                                'wave-uniform' % (base, at, self.divergent_branches[split], split)))
+        return out
 
     def dpp_pair(self, base, asm, ops, mods):
         """A DPP16 spelling whose SRC0 is a quad pair broadcast (#2125 item C).
@@ -3668,7 +3762,7 @@ class Stage:
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
         if perm not in DPP_PAIR:
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
-        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
+        if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False) or
                 not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
             raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
                               % (base, perms[0]))
@@ -3680,6 +3774,7 @@ class Stage:
         if not src:
             raise Unsupported('%s_dpp source %s' % (base, ops[1]))
         word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         self.used_v.add(DPP_SCRATCH)
         self.uniform_v.discard(DPP_SCRATCH)
@@ -3857,6 +3952,8 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
+                if getattr(self, 'wqm_set_at', False) is None:
+                    self.wqm_set_at = getattr(self, 'pc', None)  # where the quad-read flow proof starts
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -4096,8 +4193,9 @@ class Stage:
         if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
         # A branch to offset zero also makes the nominal entry block re-entrant.
-        if (getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))) or
-                not getattr(self, 'exec_known', False)):
+        # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
+        if (not getattr(self, 'exec_known', False) or
+                (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
             raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
@@ -4119,6 +4217,7 @@ class Stage:
         rewritten = 'v%d' % self.DPP_TEMP
         rewritten = '|%s|' % rewritten if absolute else rewritten
         rewritten = '-' + rewritten if neg else rewritten
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
         operands = [ops[0], rewritten] + ops[2:]
@@ -4181,12 +4280,12 @@ class Stage:
                 src_neg_abs.append((neg, absolute, base_tok))
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
-        if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
-                or not getattr(self, 'exec_known', False)):
+        if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
             raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
         if not getattr(self, 'wqm_exec', False):
             raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                               'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         if kind == 'f':
@@ -7062,7 +7161,10 @@ class Stage:
     # AMDGPU spill lowering). Both ignore EXEC. With a constant k and a VGPR that no other instruction
     # touches, vN is only a table of scalar slots, so one scalar variable per (vN, k) is an exact model
     # and no other lane is ever read. Anything else keeps the one-lane model out of reach and is refused.
-    # Pixel stages are wave32 (lanes 0..31). Slot 57 mesh is wave64 (lanes 0..63), matching #2127.
+    # Lanes 0..63 cover a wave64 program. A wave32 program uses only bits 4:0 of the lane select (RDNA 2 ISA,
+    # v_readlane/v_writelane: the lane is taken modulo the wave size), so k and k + 32 name one slot there and two in
+    # wave64; the translator does not know the wave size, so a VGPR whose lanes include such a pair is refused.
+    # Slot 57 mesh is wave64 (#2127). Vertex stages use the same model: the two instructions touch no other lane and no stage input.
     #
     # With branches the slot variable is assigned on the pixel's own path, while the hardware slot holds the last
     # write on the wave's path. The two paths differ only inside the region of a branch not proven uniform (an
@@ -7072,7 +7174,8 @@ class Stage:
     # the write lies in such a region that the read is outside (a loop or arm the wave can run after this pixel
     # left it). Several writes: the value is chosen by the path, so every write must lie outside every such region;
     # the reload then keeps a constant only if all of them stored it, and is not claimed uniform.
-    SPILL_LANES = 32
+    SPILL_LANES = 64
+    SPILL_STAGES = ('ps', 'vs', 'ms')
 
     def spill_reaching(self, cfg):
         """Instruction index of each v_readlane_b32 -> the v_writelane_b32 indices that can supply its (VGPR, lane), or
@@ -7152,16 +7255,34 @@ class Stage:
         except ValueError:
             raise Unsupported('%s requires a constant lane, got %s' % (name, ops[2])) from None
         kind = getattr(self, 'kind', None)
-        lanes = 64 if kind == 'ms' else self.SPILL_LANES
-        if not 0 <= lane < lanes:
-            raise Unsupported('%s lane %d outside 0..%d' % (name, lane, lanes - 1))
-        if kind not in ('ps', 'ms'):
-            raise Unsupported('%s is lowered in pixel and mesh stages only' % name)
+        if not 0 <= lane < self.SPILL_LANES:
+            raise Unsupported('%s lane %d outside 0..%d' % (name, lane, self.SPILL_LANES - 1))
+        if kind not in self.SPILL_STAGES:
+            raise Unsupported('%s is lowered in pixel, vertex and mesh stages only' % name)
         if not self.tracks_uniformity() or (getattr(self, 'has_branches', True) and
                                             (kind != 'ps' or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
+        if kind in ('ps', 'vs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
+            self.require_spill_lanes_apart(vreg[1], name)
         return vreg[1], sreg, lane
+
+    def require_spill_lanes_apart(self, n, name):
+        """Refuse when two lanes of spill VGPR v<n> differ by 32: one slot in wave32, two in wave64."""
+        lanes = set()
+        for _, _, op, asm in getattr(self, 'ins', ()):
+            if re.sub(r'_e(32|64)$', '', op) not in ('v_writelane_b32', 'v_readlane_b32'):
+                continue
+            ops = parse(asm)[1]
+            if len(ops) == 3 and n in [r[1] for r in map(reg_range, ops[:2]) if r and r[0] == 'v']:
+                try:
+                    lanes.add(int(ops[2], 0))
+                except ValueError:
+                    continue  # a register lane is refused where it is read
+        for lane in lanes:
+            if lane + 32 in lanes:
+                raise Unsupported('%s: v%d lanes %d and %d are one slot in wave32 and two in wave64'
+                                  % (name, n, lane, lane + 32))
 
     def require_spill_only(self, n, name):
         """Refuse unless every instruction naming v<n> is a lane write or read of it."""
@@ -7549,6 +7670,48 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, 'hi')
 
+    def packed_half(self, base, arity, text, ops, mods):
+        """v_pk_{mul,add,fma}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
+
+        Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
+        modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
+        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR
+        (an inline constant or a literal reaches the high lane in a way that is not proven; hold it in a VGPR first).
+        """
+        if len(ops) != arity + 1:
+            raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
+        sel = {'op_sel': [0] * arity, 'op_sel_hi': [1] * arity}
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key not in sel or not (value.startswith('[') and value.endswith(']')):
+                raise Unsupported('%s with %s' % (base, m))
+            bits = value[1:-1].split(',')
+            if len(bits) != arity or any(b not in ('0', '1') for b in bits):
+                raise Unsupported('%s with %s' % (base, m))
+            sel[key] = [int(b) for b in bits]
+        for tok in ops:
+            r = reg_range(tok)
+            if not r or r[0] != 'v' or r[1] != r[2] or tok != 'v%d' % r[1]:
+                raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
+        lanes = []
+        for picks in (sel['op_sel'], sel['op_sel_hi']):
+            args = []
+            for tok, hi, both in zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi'])):
+                word = self.u(tok, low16_only=not any(both))
+                args.append('f16tof32(%s)' % ('(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word))
+            lanes.append('f16rn(%s)' % text.format(*args))
+        d = reg_range(ops[0])[1]
+        self.set_v(d, '%s | (%s << 16)' % tuple(lanes))
+
+    def op_v_pk_mul_f16(self, ops, mods):
+        self.packed_half('v_pk_mul_f16', 2, '{0} * {1}', ops, mods)
+
+    def op_v_pk_add_f16(self, ops, mods):
+        self.packed_half('v_pk_add_f16', 2, '{0} + {1}', ops, mods)
+
+    def op_v_pk_fma_f16(self, ops, mods):
+        self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
+
     def cube(self, kind, ops, mods):
         """v_cube{id,sc,tc,ma}_f32: LLVM's ConstantFoldAMDGCNCubeIntrinsic.
 
@@ -7756,6 +7919,60 @@ class Stage:
 
     def op_v_ashrrev_i64(self, ops, mods):
         self.shift64(ops, mods, 'shr64i')
+
+    def mad64(self, ops, mods, signed):
+        """v_mad_u64_u32 / v_mad_i64_i32: D = S0 * S1 + S2 modulo 2^64, two 32-bit factors, 64-bit S2.
+
+        The unsigned form also writes the carry-out of the 64-bit add to a lane mask. The signed carry-out
+        is not established, so the signed form is accepted only with the discarding null destination."""
+        name = 'v_mad_i64_i32' if signed else 'v_mad_u64_u32'
+        if mods:
+            raise Unsupported('%s with %s' % (name, mods))
+        if len(ops) != 5:
+            raise Unsupported('%s with %d operands, expected 5' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1 or dst[2] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        mask = ops[1]
+        mask_reg = reg_range(mask)
+        if signed:
+            if mask != 'null':
+                raise Unsupported('%s carry-out %s: only null is lowered' % (name, mask))
+        elif mask not in ('vcc', 'vcc_lo') and not (
+                mask_reg and mask_reg[0] == 's' and mask_reg[1] == mask_reg[2] and mask_reg[1] <= 105):
+            raise Unsupported('%s carry-out %s' % (name, mask))
+        for tok in ops[2:4]:
+            r = reg_range(tok)
+            if tok in FLOATS or tok in ('exec', 'exec_lo') or (
+                    r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255) or (r[0] == 's' and r[1] > 105))):
+                raise Unsupported('%s factor %s' % (name, tok))
+        for tok in ops[2:5]:
+            r = reg_range(tok)
+            if tok in ('vcc', 'vcc_lo', 'vcc_hi') or (r and r[0] == 's' and any(
+                    w in self.masks for w in range(r[1], r[2] + 1))):
+                # u() would supply the per-lane 0/1 projection, not the architectural 32-bit mask.
+                raise Unsupported('%s reads the lane mask %s as an integer' % (name, tok))
+        low, high = self.i64_words(ops[4])
+        self.emit('{ uint3 r = %s(%s, %s, %s, %s);' % ('mad64i' if signed else 'mad64u',
+                                                         self.u(ops[2]), self.u(ops[3]), low, high))
+        self.set_v(dst[1], 'r.x')
+        self.set_v(dst[2], 'r.y')
+        if not signed:
+            expr = 'r.z' if self.exec_known else '(exec & r.z)'
+            if mask in ('vcc', 'vcc_lo'):
+                self.emit('vcc = %s;' % expr)
+            else:
+                # The carry is a per-lane bit: never a uniform scalar, whatever the scratch name hides.
+                self.set_s(mask_reg[1], expr, uniform=False)
+                self.masks.add(mask_reg[1])
+        self.emit('}')
+
+    def op_v_mad_u64_u32(self, ops, mods):
+        self.mad64(ops, mods, False)
+
+    def op_v_mad_i64_i32(self, ops, mods):
+        self.mad64(ops, mods, True)
+
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         if len(ops) != 3:
             raise Unsupported('v_cvt_pkrtz_f16_f32 with %d operands, expected 3' % len(ops))
@@ -8755,6 +8972,19 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
+               # v_mad_u64_u32 / v_mad_i64_i32: a * b + (chi:clo) from 16-bit partial products, so no 64-bit type.
+               # z is the carry of the 64-bit add (the unsigned form's lane-mask carry-out).
+               'uint mulhi32(uint a, uint b) {'
+               ' uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16;'
+               ' uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;'
+               ' uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);'
+               ' return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }',
+               'uint3 mad64u(uint a, uint b, uint clo, uint chi) {'
+               ' uint ph = mulhi32(a, b), pl = a * b, lo = pl + clo, c0 = lo < pl ? 1u : 0u, hs = ph + chi, hi = hs + c0;'
+               ' return uint3(lo, hi, (hs < ph || hi < hs) ? 1u : 0u); }',
+               'uint3 mad64i(uint a, uint b, uint clo, uint chi) {'
+               ' uint ph = mulhi32(a, b) - (asint(a) < 0 ? b : 0u) - (asint(b) < 0 ? a : 0u), pl = a * b, lo = pl + clo;'
+               ' return uint3(lo, ph + chi + (lo < pl ? 1u : 0u), 0u); }',
                'uint2 bfe64(uint lo, uint hi, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 64u - (s1 & 63u)); uint2 e = shr64u(lo, hi, s1);'
                ' e = uint2(e.x & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u)),'
                ' e.y & (w >= 64u ? 0xffffffffu : (w > 32u ? ((1u << ((w - 32u) & 31u)) - 1u) : 0u)));'

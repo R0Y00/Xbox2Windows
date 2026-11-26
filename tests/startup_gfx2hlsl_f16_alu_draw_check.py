@@ -11,6 +11,10 @@ one operation per lane, results in v12..v15 exported to mrt0. The vertex stage p
 the pixel stage cannot fold them. Every source word carries garbage in its upper half: the 16-bit operations read the
 low half only and write a result whose upper half is zero.
 
+The v_pk_{mul,add,fma}_f16 keys (name:half:group) draw four selector pairs per key and isolate one half of the result;
+their reference is tests/f16_packed_model.py (exact rationals, NaN/inf/-0/denormal/overflow/tie values), and one
+wrong expected word per run must be rejected.
+
 The expected words come from an exact rational model of binary16 arithmetic (Fraction, then one round to binary16),
 not from the lowering's expressions.
 """
@@ -26,6 +30,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
+import f16_packed_model as M  # noqa: E402
 from startup_flat_param_check import assemble, compile_hlsl, draw, root_blob  # noqa: E402
 from startup_gfx2hlsl_bit_alu_check import (  # noqa: E402
     POST_WORDS, PRE_WORDS, vs_source, vs_words, words_text)
@@ -130,7 +135,67 @@ DRAW['v_fmac_f16'] = [tuple(w | HIGH[(i + k) % 4] for k, w in enumerate(t)) for 
                       enumerate(FMAC_DOUBLE_ROUNDING)] + DRAW['v_fmac_f16'][4:]
 
 
+# v_pk_{mul,add,fma}_f16 keys 'name:half:group'. One key draws four lanes, each with its own op_sel / op_sel_hi pair
+# (every pair for mul and add, a covering sample of sixteen for fma), then isolates the low or the high half of the
+# result with an integer op, so the readback word is a 16-bit value (tagged below like the integer conversions).
+PK_OPS = {'v_pk_mul_f16': ('mul', 2), 'v_pk_add_f16': ('add', 2), 'v_pk_fma_f16': ('fma', 3)}
+
+
+def pk_parse(key):
+    name, half, group = key.split(':')
+    kind, arity = PK_OPS[name]
+    pairs = M.combos(arity)[int(group) * 4:int(group) * 4 + 4]
+    return name, kind, arity, half, pairs
+
+
+def pk_lane_ok(kind, words, sel, hi, half):
+    """A lane whose result half is a NaN must get it from a positive NaN operand: the sign of a NaN made by inf * 0 or
+    inf - inf differs between adapters, so such a lane could not be compared word for word."""
+    picks = [M.pick(w, (hi if half == 'hi' else sel)[i]) for i, w in enumerate(words)]
+    result = M.half_op(kind, *picks)
+    if not M.is_nan(result):
+        return True
+    return any(M.is_nan(h) for h in picks) and not any(M.is_nan(h) and M.sign(h) for h in picks)
+
+
+def pk_lanes(key):
+    name, kind, arity, half, pairs = pk_parse(key)
+    seeds = M.sample(sum(map(ord, key)), 400, arity)
+    lanes = []
+    for i in range(8):
+        sel, hi = pairs[i % 4]
+        word = next(w for w in seeds if pk_lane_ok(kind, w, sel, hi, half) and w not in lanes)
+        lanes.append(word)
+        seeds = [w for w in seeds if w != word]
+    return [tuple(w) + (0,) * (3 - arity) for w in lanes]
+
+
+PK_KEYS = ['%s:%s:%d' % (n, h, g) for n in PK_OPS for g in range(4) for h in ('lo', 'hi')]
+for _key in PK_KEYS:
+    DRAW[_key] = pk_lanes(_key)
+
+
+def pk_reference(key, x, lane):
+    name, kind, arity, half, pairs = pk_parse(key)
+    sel, hi = pairs[lane % 4]
+    word = M.packed(kind, x[:arity], sel, hi)
+    return word >> 16 if half == 'hi' else word & 0xffff
+
+
+def pk_body_source(key):
+    name, kind, arity, half, pairs = pk_parse(key)
+    lines = []
+    for lane, (sel, hi) in enumerate(pairs):
+        dst = 12 + lane
+        srcs = ', '.join('v%d' % (lane + 4 * i) for i in range(arity))
+        lines.append('%s v%d, %s op_sel:[%s] op_sel_hi:[%s]\n' % (name, dst, srcs, ','.join(map(str, sel)), ','.join(map(str, hi))))
+        lines.append('v_and_b32 v%d, 0xffff, v%d\n' % (dst, dst) if half == 'lo' else 'v_lshrrev_b32 v%d, 16, v%d\n' % (dst, dst))
+    return ''.join(lines)
+
+
 def body_source(op):
+    if op in PK_KEYS:
+        return pk_body_source(op)
     arity, vop1, _ = OPS[op]
     lines = []
     for lane in range(4):
@@ -179,11 +244,66 @@ BODY_WORDS = {
 }
 
 
+# Recorded llvm-mc (gfx1013) encodings of the v_pk_*_f16 fixtures (see pk_body_source).
+BODY_WORDS.update({
+    'v_pk_mul_f16:lo:0': bytes.fromhex(
+        '0c4010cc00090200ff181836ffff00000d4010cc010b0208ff1a1a36ffff00000e4010cc020d0210ff1c1c36ffff00000f4010cc030f0218ff1e1e36ffff0000'),
+    'v_pk_mul_f16:hi:0': bytes.fromhex(
+        '0c4010cc000902009018182c0d4010cc010b0208901a1a2c0e4010cc020d0210901c1c2c0f4010cc030f0218901e1e2c'),
+    'v_pk_mul_f16:lo:1': bytes.fromhex(
+        '0c4810cc00090200ff181836ffff00000d4810cc010b0208ff1a1a36ffff00000e4810cc020d0210ff1c1c36ffff00000f4810cc030f0218ff1e1e36ffff0000'),
+    'v_pk_mul_f16:hi:1': bytes.fromhex(
+        '0c4810cc000902009018182c0d4810cc010b0208901a1a2c0e4810cc020d0210901c1c2c0f4810cc030f0218901e1e2c'),
+    'v_pk_mul_f16:lo:2': bytes.fromhex(
+        '0c5010cc00090200ff181836ffff00000d5010cc010b0208ff1a1a36ffff00000e5010cc020d0210ff1c1c36ffff00000f5010cc030f0218ff1e1e36ffff0000'),
+    'v_pk_mul_f16:hi:2': bytes.fromhex(
+        '0c5010cc000902009018182c0d5010cc010b0208901a1a2c0e5010cc020d0210901c1c2c0f5010cc030f0218901e1e2c'),
+    'v_pk_mul_f16:lo:3': bytes.fromhex(
+        '0c5810cc00090200ff181836ffff00000d5810cc010b0208ff1a1a36ffff00000e5810cc020d0210ff1c1c36ffff00000f5810cc030f0218ff1e1e36ffff0000'),
+    'v_pk_mul_f16:hi:3': bytes.fromhex(
+        '0c5810cc000902009018182c0d5810cc010b0208901a1a2c0e5810cc020d0210901c1c2c0f5810cc030f0218901e1e2c'),
+    'v_pk_add_f16:lo:0': bytes.fromhex(
+        '0c400fcc00090200ff181836ffff00000d400fcc010b0208ff1a1a36ffff00000e400fcc020d0210ff1c1c36ffff00000f400fcc030f0218ff1e1e36ffff0000'),
+    'v_pk_add_f16:hi:0': bytes.fromhex(
+        '0c400fcc000902009018182c0d400fcc010b0208901a1a2c0e400fcc020d0210901c1c2c0f400fcc030f0218901e1e2c'),
+    'v_pk_add_f16:lo:1': bytes.fromhex(
+        '0c480fcc00090200ff181836ffff00000d480fcc010b0208ff1a1a36ffff00000e480fcc020d0210ff1c1c36ffff00000f480fcc030f0218ff1e1e36ffff0000'),
+    'v_pk_add_f16:hi:1': bytes.fromhex(
+        '0c480fcc000902009018182c0d480fcc010b0208901a1a2c0e480fcc020d0210901c1c2c0f480fcc030f0218901e1e2c'),
+    'v_pk_add_f16:lo:2': bytes.fromhex(
+        '0c500fcc00090200ff181836ffff00000d500fcc010b0208ff1a1a36ffff00000e500fcc020d0210ff1c1c36ffff00000f500fcc030f0218ff1e1e36ffff0000'),
+    'v_pk_add_f16:hi:2': bytes.fromhex(
+        '0c500fcc000902009018182c0d500fcc010b0208901a1a2c0e500fcc020d0210901c1c2c0f500fcc030f0218901e1e2c'),
+    'v_pk_add_f16:lo:3': bytes.fromhex(
+        '0c580fcc00090200ff181836ffff00000d580fcc010b0208ff1a1a36ffff00000e580fcc020d0210ff1c1c36ffff00000f580fcc030f0218ff1e1e36ffff0000'),
+    'v_pk_add_f16:hi:3': bytes.fromhex(
+        '0c580fcc000902009018182c0d580fcc010b0208901a1a2c0e580fcc020d0210901c1c2c0f580fcc030f0218901e1e2c'),
+    'v_pk_fma_f16:lo:0': bytes.fromhex(
+        '0c000ecc0009221cff181836ffff00000d080ecc010b2604ff1a1a36ffff00000e500ecc020d2a0cff1c1c36ffff00000f180ecc030f2e14ff1e1e36ffff0000'),
+    'v_pk_fma_f16:hi:0': bytes.fromhex(
+        '0c000ecc0009221c9018182c0d080ecc010b2604901a1a2c0e500ecc020d2a0c901c1c2c0f180ecc030f2e14901e1e2c'),
+    'v_pk_fma_f16:lo:1': bytes.fromhex(
+        '0c600ecc0009221cff181836ffff00000d680ecc010b2604ff1a1a36ffff00000e300ecc020d2a0cff1c1c36ffff00000f780ecc030f2e14ff1e1e36ffff0000'),
+    'v_pk_fma_f16:hi:1': bytes.fromhex(
+        '0c600ecc0009221c9018182c0d680ecc010b2604901a1a2c0e300ecc020d2a0c901c1c2c0f780ecc030f2e14901e1e2c'),
+    'v_pk_fma_f16:lo:2': bytes.fromhex(
+        '0c080ecc00092204ff181836ffff00000d200ecc010b260cff1a1a36ffff00000e380ecc020d2a14ff1c1c36ffff00000f100ecc030f2e1cff1e1e36ffff0000'),
+    'v_pk_fma_f16:hi:2': bytes.fromhex(
+        '0c080ecc000922049018182c0d200ecc010b260c901a1a2c0e380ecc020d2a14901c1c2c0f100ecc030f2e1c901e1e2c'),
+    'v_pk_fma_f16:lo:3': bytes.fromhex(
+        '0c680ecc00092204ff181836ffff00000d400ecc010b260cff1a1a36ffff00000e580ecc020d2a14ff1c1c36ffff00000f700ecc030f2e1cff1e1e36ffff0000'),
+    'v_pk_fma_f16:hi:3': bytes.fromhex(
+        '0c680ecc000922049018182c0d400ecc010b260c901a1a2c0e580ecc020d2a14901c1c2c0f700ecc030f2e1c901e1e2c'),
+})
+
+
 def ps_words(op):
     return PRE_WORDS + BODY_WORDS[op] + POST_WORDS
 
 
-def reference(op, x):
+def reference(op, x, lane=0):
+    if op in PK_KEYS:
+        return pk_reference(op, x, lane)
     return OPS[op][2](*x) & 0xffffffff
 
 
@@ -194,7 +314,7 @@ def translate(op):
 # The target is R32G32B32A32_FLOAT, so a small integer result is a binary32 denormal and FXC drops it when it comes
 # from a float to integer conversion. The integer-result operations therefore set bit 30 on the way out of the pixel
 # stage and in the expected word; the translated statements themselves are unchanged.
-INTEGER_RESULT = ('v_cvt_i16_f16', 'v_cvt_u16_f16')
+INTEGER_RESULT = ('v_cvt_i16_f16', 'v_cvt_u16_f16', *PK_KEYS)
 TAG = 0x40000000
 
 
@@ -203,8 +323,8 @@ def draw_text(op):
     return re.sub(r'F\(v(1[2-5])\)', r'F(v\1 | 0x%xu)' % TAG, text) if op in INTEGER_RESULT else text
 
 
-def draw_word(op, x):
-    return reference(op, x) | (TAG if op in INTEGER_RESULT else 0)
+def draw_word(op, x, lane=0):
+    return reference(op, x, lane) | (TAG if op in INTEGER_RESULT else 0)
 
 
 def controls():
@@ -232,8 +352,15 @@ def controls():
         check('%s: every draw reference has a zero upper half' % op,
               all(reference(op, x) >> 16 == 0 for x in DRAW[op]))
         check('%s: draw sets cover two draws of four lanes' % op, len(DRAW[op]) == 8)
+    for key in PK_KEYS:
+        check('%s: every draw reference has a zero upper half' % key,
+              all(reference(key, x, i) >> 16 == 0 for i, x in enumerate(DRAW[key])))
+        check('%s: draw sets cover two draws of four lanes' % key, len(DRAW[key]) == 8)
+        check('%s: no lane is a generated NaN' % key,
+              all(pk_lane_ok(pk_parse(key)[1], x[:pk_parse(key)[2]], *pk_parse(key)[4][i % 4], pk_parse(key)[3])
+                  for i, x in enumerate(DRAW[key])))
     if BODY_WORDS:
-        for op in OPS:
+        for op in (*OPS, *PK_KEYS):
             try:
                 text = translate(op)
             except G.Unsupported as e:
@@ -246,11 +373,11 @@ def controls():
 
 
 def check_binary(llvm_mc):
-    for op in OPS:
+    for op in (*OPS, *PK_KEYS):
         built = assemble(llvm_mc, body_source(op))
         if built != BODY_WORDS[op]:
             raise AssertionError('%s: assembled %s, recorded %s' % (op, built.hex(), BODY_WORDS[op].hex()))
-    for op in OPS:
+    for op in DRAW:
         for i in range(0, 8, 4):
             if assemble(llvm_mc, vs_source(DRAW[op][i:i + 4])) != vs_words(DRAW[op][i:i + 4]):
                 raise AssertionError('vertex fixture for %s differs from llvm-mc' % op)
@@ -265,13 +392,18 @@ def check_draw(dxc, renderer, adapter, fxc=None):
         directory = Path(tmp)
         for kind, compiler, vs_profile, ps_profile in compilers:
             for op, lanes in DRAW.items():
-                ps = compile_hlsl(compiler, kind, draw_text(op), 'ps_%s_%s' % (op, kind), ps_profile, directory)
+                ps = compile_hlsl(compiler, kind, draw_text(op), 'ps_%s_%s' % (op.replace(':', '_'), kind), ps_profile, directory)
                 for index in range(0, len(lanes), 4):
                     chunk = lanes[index:index + 4]
                     vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), ps_words(op), root_blob()).hlsl_vs(),
-                                      'vs_%s_%d_%s' % (op, index, kind), vs_profile, directory)
-                    expected = words_text(draw_word(op, x) for x in chunk)
+                                      'vs_%s_%d_%s' % (op.replace(':', '_'), index, kind), vs_profile, directory)
+                    expected = words_text(draw_word(op, x, index + n) for n, x in enumerate(chunk))
                     run = draw(renderer, adapter, vs, ps, expected)
+                    if op == PK_KEYS[0] and index == 0:
+                        # A wrong expected word must be reported: the comparison is not vacuous.
+                        wrong = words_text([draw_word(op, chunk[0], 0) ^ 1] + [draw_word(op, x, n + 1) for n, x in enumerate(chunk[1:])])
+                        if not draw(renderer, adapter, vs, ps, wrong).returncode:
+                            failures.append('%s %s wrong-value control accepted' % (kind, op))
                     if run.returncode:
                         failures.append('%s %s set %d' % (kind, op, index // 4))
                         print('%s %s set %d MISMATCH inputs %s\n%s' % (kind, op, index // 4, chunk, run.stderr.strip()),

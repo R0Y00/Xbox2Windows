@@ -100,6 +100,18 @@ def store(directory, consumer, dxc, env):
     refused = lines(result, 'refused: ')
     assert len(refused) == 1 and 'an output texture view was not created on the desktop' in refused[0], result.stderr[-3000:]
 
+    # A refused creation over a descriptor that holds a live view keeps that view: the Dispatch still writes the texture.
+    got, result = run(directory, consumer, env, 'texture-store-occupied', layout)
+    wrong = [i for i in range(halves) if got[i] != expected[i]]
+    assert not wrong, 'occupied slot: half=%d (%d halves differ)\n%s' % (wrong[0], len(wrong), result.stderr[-3000:])
+    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
+
+    # The same when the live token reached the slot by a memory copy in title memory instead of a creation there.
+    got, result = run(directory, consumer, env, 'texture-store-copied', layout)
+    wrong = [i for i in range(halves) if got[i] != expected[i]]
+    assert not wrong, 'copied token: half=%d (%d halves differ)\n%s' % (wrong[0], len(wrong), result.stderr[-3000:])
+    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
+
     # Refusals the runtime already had, each with its one logged reason and an untouched texture: an integer view
     # format, another manifest version, another stage, and (with a manifest line added here for a view the consumer
     # creates) the output texture named as an input too.

@@ -144,6 +144,7 @@ jobs:
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_dpp_quad_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_mad64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mul_hi_i32_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mul_mad_i24_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cube_check.py", "binary", "llvm-mc-15"], {}),
@@ -334,9 +335,11 @@ jobs:
             tests/startup_gfx2hlsl_s_bitset_check.py \
             tests/startup_gfx2hlsl_s_flbit_check.py \
             tests/startup_gfx2hlsl_s_ff1_check.py \
+            tests/startup_gfx2hlsl_src_scc_check.py \
             tests/startup_gfx2hlsl_s_quadmask_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
+            tests/startup_gfx2hlsl_mad64_check.py \
             tests/startup_gfx2hlsl_cmp_class_f16_sdwa_check.py \
             tests/startup_gfx2hlsl_mul_hi_i32_check.py \
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \
