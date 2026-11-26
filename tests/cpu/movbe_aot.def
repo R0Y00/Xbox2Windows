@@ -1,0 +1,18 @@
+EXPORTS
+    op_movbe_load16
+    op_movbe_load16_disp
+    op_movbe_load32
+    op_movbe_load32_disp
+    op_movbe_load64
+    op_movbe_load64_disp
+    op_movbe_store16
+    op_movbe_store16_disp
+    op_movbe_store32
+    op_movbe_store32_disp
+    op_movbe_store64
+    op_movbe_store64_disp
+    op_movbe_flags_cf_zf_of_pf
+    op_movbe_flags_sf_of_pf
+    op_movbe_flags_all_clear
+    op_r8_source_then_store
+    op_movbe_discarded_read

@@ -2,7 +2,23 @@
 // XAsync service can reject Begin, delay notification or enter the callback inline.
 #include "../src/startup_stubs/runtime_proxy.cpp"
 #include <array>
+#include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+
+static std::atomic<std::size_t> fail_allocation_size{0};
+void* operator new(std::size_t size)
+{
+    std::size_t expected = size;
+    if (size && fail_allocation_size.compare_exchange_strong(expected, 0)) {
+        throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 using Provider = decltype(&submit_provider);
@@ -92,6 +108,38 @@ int run(bool system)
         call(16,provider_handle,ptr("profile"),ptr(&container)) ||
         call(23,container,0,ptr(&good)) || call(23,container,0,ptr(&bad))) return 1;
     unsigned char byte=0x11;
+    const std::string long_name(80, 'c');
+    const std::string name_copy(long_name);
+    const std::size_t name_allocation = name_copy.capacity() + 1;
+    fail_allocation_size = name_allocation;
+    if (!x2w_save::valid_name(long_name) || fail_allocation_size != name_allocation) return 26;
+    fail_allocation_size = 0;
+    u64 long_container{}, long_update{};
+    if (call(16,provider_handle,ptr(long_name.c_str()),ptr(&long_container)) ||
+        call(23,long_container,0,ptr(&long_update))) return 22;
+    fail_allocation_size = name_allocation;  // Fail the same string copy under save_lock.
+    const u64 name_copy_result = call(25,long_update,ptr("preference"),ptr(&byte),1);
+    if (fail_allocation_size || name_copy_result != e_outofmemory) return 23;
+    if (!TryAcquireSRWLockExclusive(&save_lock)) return 24;
+    ReleaseSRWLockExclusive(&save_lock);
+    if (call(25,long_update,ptr("preference"),ptr(&byte),1) || call(27,long_update)) return 25;
+    call(24,long_update);
+    call(17,long_container);
+    const std::array<unsigned char, 1025> large_blob{};
+    for (const auto data_size : {std::size_t{1}, large_blob.size()}) {
+        fail_allocation_size = data_size == 1 ? sizeof(x2w_save::Action) : data_size;
+        u64 failed_stage{};
+        try {
+            failed_stage = call(25,good,ptr("preference"),ptr(large_blob.data()),data_size);
+        } catch (const std::bad_alloc&) {
+            return 20;
+        }
+        if (fail_allocation_size || failed_stage != e_outofmemory) {
+            std::fprintf(stderr, "staging %zu bytes: pending allocation=%zu, HRESULT=0x%08llx\n",
+                         data_size, fail_allocation_size.load(), static_cast<unsigned long long>(failed_stage));
+            return 21;
+        }
+    }
     if (call(25,good,ptr("preference"),ptr(&byte),1) || call(27,good) || value()!=0x11) return 2;
     byte=0x77;
     if (call(25,good,ptr("preference"),ptr(&byte),1) || call(26,bad,ptr("absent"))) return 3;
@@ -103,7 +151,7 @@ int run(bool system)
         real_query = reinterpret_cast<QueryApi>(GetProcAddress(dll,"QueryApiImpl"));
         if (!real_query) return 77;
         void* runtime{};
-        if (FAILED(real_query(&submit_async_family,&submit_async_family,&runtime)) || !runtime) return 77;
+        if (FAILED(load_real_query()(&submit_async_family,&submit_async_family,&runtime)) || !runtime) return 77;
         auto** methods = *static_cast<void***>(runtime);
         using CreateQueue = HRESULT(WINAPI*)(void*,unsigned,unsigned,void**);
         // XTaskQueueDispatchMode::Immediate for work and completion.
