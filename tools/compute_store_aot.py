@@ -79,6 +79,14 @@ ALU = {
     "v_mul_lo_u32": INTEGER["mul_lo_u32"][1],
     "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
 }
+# The VOP1 bit subset on one known word (AMD RDNA 2 ISA reference, VOP1 opcodes 56 and 59). v_bfrev_b32 reverses
+# the 32 bits. v_ffbh_i32 counts from the sign bit (bit 31 is position 0) to the first bit that differs from it,
+# and is 0xffffffff for 0 and 0xffffffff: v_ffbh_u32 of m = x ^ (x >> 31, arithmetic). firstbitlow(reversebits(m))
+# is 31 - firstbithigh(m) and 0xffffffff for m = 0, so the source appears only twice.
+VOP1_ALU = {
+    "v_bfrev_b32_e32": "reversebits({0})",
+    "v_ffbh_i32_e32": "firstbitlow(reversebits({0} ^ asuint(asint({0}) >> 31u)))",
+}
 # The scalar ALU subset, on known words only: s_<op> sD, a, b with two scalar sources (an SGPR holding a known
 # word, an integer inline constant or a 32-bit literal). The carry out of s_add_u32 and s_sub_u32 and the
 # nonzero flag of the logic forms go to SCC, which no accepted instruction reads. s_lshr_b32 is a logical
@@ -2452,6 +2460,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if dst > 255 or None in words:
                 raise ValueError("Unverified ALU operand")
             expression = ALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"(v_(?:bfrev_b32|ffbh_i32)_e32) v(\d+), {ALU_SOURCE}", line):
+            # VOP1 src0 is any source. The VOP3, SDWA and DPP spellings and source modifiers do not match.
+            op, dst = m[1], int(m[2])
+            word = alu_word(m[3], scalar, vector, pending)
+            if dst > 255 or word is None:
+                raise ValueError("Unverified ALU operand")
+            expression = VOP1_ALU[op].format(hlsl_word(word))
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
