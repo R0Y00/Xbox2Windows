@@ -79,7 +79,75 @@ def _run_cli(argv: list[str]) -> tuple[int, str, str]:
     return rc, stdout.getvalue(), stderr.getvalue()
 
 
+SEM_FAILCRITICALERRORS = 0x0001
+
+
+def _thread_error_mode() -> int:
+    kernel = pe_run_package.C.WinDLL("kernel32")
+    get_mode = kernel.GetThreadErrorMode
+    get_mode.argtypes, get_mode.restype = [], pe_run_package.W.DWORD
+    return get_mode()
+
+
+class _RecordingKernel:
+    """kernel32 for pe_run_package.run whose LoadLibraryExW records the thread error mode of each call."""
+
+    def __init__(self, real, modes):
+        self._real = real
+        self._modes = modes
+
+    def __getattr__(self, name):
+        function = getattr(self._real, name)
+        if name != "LoadLibraryExW":
+            return function
+        modes = self._modes
+
+        class Recorder:
+            argtypes = restype = None
+
+            def __call__(self, *args):
+                function.argtypes, function.restype = self.argtypes, self.restype
+                modes.append((args[0], _thread_error_mode()))
+                return function(*args)
+
+        return Recorder()
+
+
 class PeRunPackageCliTests(unittest.TestCase):
+    def test_provider_load_has_no_critical_error_dialog(self):
+        # A provider that is not a loadable image (here a 0-byte file) raises a critical error inside
+        # LoadLibraryExW. Without SEM_FAILCRITICALERRORS Windows shows a modal "Bad Image" dialog and the
+        # load blocks until someone closes it. The flag must be set for the provider load only: the
+        # thread's previous mode is back once the run returns, so the guest keeps the host's setting.
+        real_win_dll = pe_run_package.C.WinDLL
+        modes = []
+
+        def win_dll(name, *args, **kwargs):
+            library = real_win_dll(name, *args, **kwargs)
+            return _RecordingKernel(library, modes) if name == "kernel32" else library
+
+        system_kernel = Path(pe_run_package.os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "kernel32.dll"
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / "package"
+            pkg.mkdir()
+            (pkg / "app.exe").write_bytes(_minimal_pe32_plus())
+            mapper = Path(tmp) / "mapper.dll"
+            mapper.write_bytes(b"")
+            before = _thread_error_mode()
+            with mock.patch.object(pe_run_package.C, "WinDLL", win_dll):
+                rc, stdout, stderr = _run_cli([
+                    str(mapper), str(pkg), "app.exe", "--preflight-only",
+                    "--shim", "kernel32.dll", str(system_kernel),
+                ])
+            after = _thread_error_mode()
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(json.loads(stdout)["missing"], [])
+        self.assertEqual([Path(path).name.casefold() for path, _ in modes], ["kernel32.dll"])
+        for path, mode in modes:
+            self.assertTrue(mode & SEM_FAILCRITICALERRORS,
+                            f"LoadLibraryExW({path}) ran with thread error mode {mode:#x}")
+        self.assertEqual(after, before, "the thread error mode was not restored after the run")
+
     def test_positive_preflight_in_process_and_subprocess(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
