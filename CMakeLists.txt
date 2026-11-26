@@ -4538,6 +4538,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
+    # The debugger's function hooks and concurrent calls (#1281): the step window's bookkeeping, then two
+    # threads through one hooked function with the other thread held for each step, and without.
+    add_test(NAME startup_hook_window COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py")
+    add_test(NAME startup_hook_overlap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py" "$<TARGET_FILE:startup_launch_probe>")
+    set_tests_properties(startup_hook_window PROPERTIES TIMEOUT 30)
+    set_tests_properties(startup_hook_overlap PROPERTIES TIMEOUT 600)
     find_program(STARTUP_POWERSHELL NAMES powershell pwsh REQUIRED)
     add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")
@@ -4562,15 +4569,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
         "${CMAKE_CURRENT_BINARY_DIR}")
     set_tests_properties(startup_map_drive PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
-    # Two calls overlapping on the mapped letter. Expected to fail today: the launcher's entry hook is one
-    # patched byte per function, so a thread that enters while another is being stepped over runs untraced
-    # and its open keeps the unmapped name. Registered as WILL_FAIL so it is visible, documented, and
-    # starts failing the suite once the hook stops dropping concurrent calls.
+    # Two threads with their own caller-owned names in flight at once: all 64 opens are rewritten, succeed
+    # and restore their caller strings while the debugger holds the other threads for each step; the
+    # control without holding them (--suspend-others 0) must lose opens. Needs the step window (#1281).
     add_test(NAME startup_map_drive_overlap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
         "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
         "${CMAKE_CURRENT_BINARY_DIR}" overlap)
-    set_tests_properties(startup_map_drive_overlap PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 WILL_FAIL TRUE)
+    set_tests_properties(startup_map_drive_overlap PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
