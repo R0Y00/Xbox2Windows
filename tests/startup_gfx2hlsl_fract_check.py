@@ -170,8 +170,8 @@ check('both files spell a x2w-startup-shader revision', seed is not None and lit
       repr((seed and seed.group(1), literal and literal.group(1))))
 check('the two literals are identical', seed and literal and seed.group(1) == literal.group(1),
       repr((seed and seed.group(1), literal and literal.group(1))))
-check('the revision is x2w-startup-shader-19, after the fold of a copy of a plain constant scalar register',
-      bool(seed and seed.group(1) == 'x2w-startup-shader-19'), repr(seed and seed.group(1)))
+check('the revision is x2w-startup-shader-20, after format 50 (R10G10B10A2_UNORM) joined the FORMAT switch',
+      bool(seed and seed.group(1) == 'x2w-startup-shader-20'), repr(seed and seed.group(1)))
 
 
 def key_from_seed(word):

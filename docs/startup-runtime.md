@@ -208,9 +208,9 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-19`. Revision 19 folds `s_mov_b32` from a scalar register that
+The shader cache revision is `x2w-startup-shader-20`. Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch, so cached shaders from revision 19 are not reused. Revision 19 folds `s_mov_b32` from a scalar register that
 holds a plain constant, so later reads of the copy use the constant word. The matching compute
-(`x2w-startup-shader-19cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
+(`x2w-startup-shader-20cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
 (`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
 Revisions before 19 read a register copied from a constant as a run-time value.
 Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.

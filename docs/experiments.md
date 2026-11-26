@@ -402,6 +402,9 @@ ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|
 
 `BUF_FMT_16_16_SNORM` (format 24, DXGI `R16G16_SNORM` 37) sign-extends each half, divides by 32767 and clamps to -1.0, so -32768 and -32767 both give -1.0 (the Direct3D and Vulkan SNORM rule, as in LLVM 15 and Mesa `ac_formats`). The device run compares `round(v * 32767)` against the same byte decode, with a wrong reference that reads the halves unsigned and a mutated translation that does the same. The pattern the harness writes to t0 holds no 0x8000, so `startup_vertex_fetch_formats_controls` also evaluates the emitted expressions on 0x8000, 0x8001, 0x7fff, 0x0000, 0xffff and 0x4000 in each half, and four wrong forms (unsigned read, no clamp, divisor 32768, one half for both) must fail that check. The D3D12 draw has not been run on Linux.
 
+`BUF_FMT_2_10_10_10_UNORM` (gfx10 format 50, DXGI `R10G10B10A2_UNORM` 24) reads one dword with x, y and z as 10-bit fields in bits 9:0, 19:10 and 29:20 and w as the 2-bit field in bits 31:30, each divided by its maximum (1023, 1023, 1023, 3). This is the 10-bit-x layout that Mesa maps R10G10B10A2 to; `BUF_FMT_10_10_10_2_UNORM` (format 44) has a 2-bit x and is not added here. It is checked on Linux by the Python evaluation `startup_gfx2hlsl_tbuffer_2101010`, which also covers the DXGI table entry; the D3D12 draws `startup_vertex_fetch_formats_warp` and `startup_vertex_fetch_formats_hardware` read it back (stride 6 / offset 2 and through the descriptor path).
+
+
 In a graphics shader with only forward branches, a 32-bit root-table pointer
 can be advanced by a literal byte offset and copied with `s_mov_b32`. At a
 join the table and its offset must agree on every incoming path. A later
@@ -421,7 +424,7 @@ manifest's byte offset changes all 32 pixels and preserves the green values.
 
 A typed buffer view that the title creates through the runtime (`CreateShaderResourceView`, `BUFFER`, no flags, no structure stride) leaves no hardware descriptor in the table. For this case the draw builds word 3 the way the console driver builds it from the view, using `view_word3()` in `src/startup_stubs/buffer_format_word3.h`:
 
-- FORMAT is the code of the DXGI format whose typed read gives the same components. The 14 formats in the switch are covered: `R8_UNORM` 1, `R8_UINT` 5, `R8G8_UNORM` 14, `R32_FLOAT` 22, `R16G16_UNORM` 23, `R16G16_SNORM` 24, `R16G16_UINT` 27, `R16G16_FLOAT` 29, `R8G8B8A8_UNORM` 56, `R8G8B8A8_UINT` 60, `R32G32_FLOAT` 64, `R16G16B16A16_FLOAT` 71, `R32G32B32_FLOAT` 74 and `R32G32B32A32_FLOAT` 77. The codes are the LLVM 15 `llvm-mc -mcpu=gfx1013` encodings of the tbuffer `format:` operand.
+- FORMAT is the code of the DXGI format whose typed read gives the same components. The 15 formats in the switch are covered: `R8_UNORM` 1, `R8_UINT` 5, `R8G8_UNORM` 14, `R32_FLOAT` 22, `R16G16_UNORM` 23, `R16G16_SNORM` 24, `R16G16_UINT` 27, `R16G16_FLOAT` 29, `R10G10B10A2_UNORM` 50, `R8G8B8A8_UNORM` 56, `R8G8B8A8_UINT` 60, `R32G32_FLOAT` 64, `R16G16B16A16_FLOAT` 71, `R32G32B32_FLOAT` 74 and `R32G32B32A32_FLOAT` 77. The codes are the LLVM 15 `llvm-mc -mcpu=gfx1013` encodings of the tbuffer `format:` operand.
 - DST_SEL comes from `Shader4ComponentMapping`: a channel becomes 4 to 7, a forced 0 becomes 0 and a forced 1 becomes 1.
 
 The draw is refused, not read as zeros, whenever a translated formatted load has no resolved word 3:
