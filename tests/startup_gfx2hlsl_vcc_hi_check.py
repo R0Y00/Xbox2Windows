@@ -84,6 +84,12 @@ v_cndmask_b32_e32 v1, 1.0, v2, vcc_lo
 exp mrt0 v1, v1, v1, v1 done vm
 s_endpgm
 ''', '8003eabec103ebbef402047ef20402020f1800f801010101000081bf', 's_mov_b32 destination vcc_hi'),
+    # A whole scalar word is not a lane mask: the lowering would test bit 0 of 0x55555555 for every lane.
+    'SCALAR_MASK': ('''s_mov_b32 vcc_hi, 0x55555555
+v_cndmask_b32_e64 v2, 1.0, 2.0, vcc_hi
+exp mrt0 v2, v2, v2, v2 done vm
+s_endpgm
+''', 'ff03ebbe55555555020001d5f2e8ad010f1800f802020202000081bf', 's_mov_b32 destination vcc_hi'),
     # The 64-bit pair `vcc` names vcc_hi as its high word.
     'PAIR': ('''v_cmp_gt_u32_e64 vcc_hi, v0, 0x50005
 s_and_b64 s[2:3], vcc, exec
@@ -149,6 +155,11 @@ def controls():
             check('%s translates' % name, text is not None and 'vcc_hi' not in text, str(reason))
         else:
             check('%s refused: %s' % (name, refusal), text is None and reason == refusal, str(reason))
+    # A wide operand covering SGPR 107 (s_load_dwordx4 s[104:107]) writes vcc_hi: no free alias exists, so it stays refused.
+    wide = [(0, 0, 's_mov_b32', 's_mov_b32 vcc_hi, 0x1234'),
+            (4, 1, 's_load_dwordx4', 's_load_dwordx4 s[104:107], s[0:1], 0x0'),
+            (12, 2, 'v_mov_b32_e32', 'v_mov_b32_e32 v2, vcc_hi')]
+    check('a load into s[104:107] keeps vcc_hi refused', G.wave32_vcc_hi(wide) is wide)
     text, _ = translate('PS')
     if text is not None:
         check('PS keeps the compare and carry in the renamed register',

@@ -949,6 +949,27 @@ def writes_exec(name, ops):
 # In wave32 VCC is vcc_lo alone and vcc_hi is a free scalar register that compilers allocate like any other (RDNA 2
 # ISA, "VCC": in wave32 only VCC_LO is the condition mask). The translator models it as an ordinary SGPR the program
 # never names, taken from the top of the 106 (beyond the user-data and system registers set at entry).
+def vcc_hi_scalar_mask_read(ins):
+    """True when a VOP3 lane-mask source reads vcc_hi after a scalar instruction wrote it (or the program branches, so the
+    order is unknown): the renamed register then holds a whole word, not the current lane's bit, and the lowering would
+    test bit 0 of it for every lane. A compare or carry-out that wrote vcc_hi last keeps the per-lane form."""
+    scalar, branchy, read_after = False, False, False
+    reads = False
+    for _o, _n, name, asm in ins:
+        ops = parse(asm)[1]
+        branchy |= name.startswith(('s_cbranch', 's_branch'))
+        if (name.startswith('v_cmp_') and ops[:1] == ['vcc_hi']) or (VOP3B_SDST.match(name) and ops[1:2] == ['vcc_hi']):
+            scalar = False
+        elif ops[:1] == ['vcc_hi']:
+            scalar = scalar or name.startswith('s_') or name.startswith('v_readlane')
+        if name in ('v_cndmask_b32_e64', 'v_add_co_ci_u32_e64', 'v_sub_co_ci_u32_e64', 'v_subrev_co_ci_u32_e64') \
+                and ops[-1:] == ['vcc_hi']:
+            reads = True
+            read_after |= scalar
+    return read_after or (reads and branchy and any(
+        name.startswith('s_') and parse(asm)[1][:1] == ['vcc_hi'] for _o, _n, name, asm in ins))
+
+
 def wave32_vcc_hi(ins):
     """`ins` with every vcc_hi operand renamed to an unused SGPR when vcc_hi is provably an ordinary scalar register,
     else `ins`.
@@ -985,9 +1006,13 @@ def wave32_vcc_hi(ins):
                        or name in ('s_cbranch_vccz', 's_cbranch_vccnz') for _o, _n, name, asm in ins)
     if 'vcc_hi' not in masks and not odd and vcc_mask_use:
         return ins
+    if vcc_hi_scalar_mask_read(ins):
+        return ins
     named = set()
     for *_, asm in ins:
         for lo, hi, single in re.findall(r'\bs\[(\d+):(\d+)\]|\bs(\d+)\b', asm):
+            if lo and int(lo) <= 107 <= int(hi):
+                return ins   # a wide operand such as s[104:107] covers SGPR 107, which is vcc_hi: no free alias
             named.update(range(int(lo), int(hi) + 1) if lo else (int(single),))
     free = next((n for n in range(105, 63, -1) if n not in named), None)
     if free is None:
