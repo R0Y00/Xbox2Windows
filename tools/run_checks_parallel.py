@@ -42,18 +42,43 @@ def _validate_script_path(raw_path: str) -> str:
     return raw_path
 
 
+def _split_windows(line):
+    """Split on whitespace; quotes group text inside a word and are dropped, backslashes stay."""
+    words, current, quote, started = [], [], None, False
+    for char in line:
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                current.append(char)
+        elif char in "\"'":
+            quote, started = char, True
+        elif char.isspace():
+            if started:
+                words.append("".join(current))
+                current, started = [], False
+        else:
+            current.append(char)
+            started = True
+    if quote:
+        raise ValueError("No closing quotation")
+    if started:
+        words.append("".join(current))
+    return words
+
+
 def split_command(line, windows=None):
     """Split a listed line like a shell would, but keep backslashes in Windows paths.
 
     POSIX splitting treats a backslash as an escape and would turn `C:\\x2w\\a.py` into
-    `C:x2wa.py`. On Windows the line is split without escapes and matching quotes are removed.
+    `C:x2wa.py`. On Windows the line is split without escapes; quotes group words, also inside
+    one (`--llvm="C:\\Program Files\\a.dll"`), and are removed.
     """
     if windows is None:
         windows = os.name == "nt"
     if not windows:
         return shlex.split(line)
-    return [word[1:-1] if len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'" else word
-            for word in shlex.split(line, posix=False)]
+    return _split_windows(line)
 
 
 def read_check_files(directory):
