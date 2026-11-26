@@ -368,6 +368,9 @@ def controls():
     check('the same forms without a modifier or operand error translate', not any(refused(a) for a in (
         'v_ffbh_i32_e64 v1, v2', 'v_bfe_i32 v1, v2, v3, v4', 'v_bcnt_u32_b32 v1, v2, v3', 'v_bfrev_b32 v1, v2',
         'v_xor3_b32 v1, v2, v3, v4')))
+    check('v_bfm_b32 has no VOP2 spelling: _e32 refused, _e64 and the bare name translate',
+          refused('v_bfm_b32_e32 v1, v2, v3') and not refused('v_bfm_b32_e64 v1, v2, v3')
+          and not refused('v_bfm_b32 v1, v2, v3'))
     check('modifiers refused', all(refused(a) for a in (
         'v_ffbh_u32_e64 v1, v2 clamp', 'v_bfe_i32 v1, v2, v3, v4 clamp', 'v_bcnt_u32_b32 v1, v2, v3 clamp',
         'v_ffbl_b32_e64 v1, v2 mul:2', 'v_bfrev_b32_e64 v1, -v2', 'v_ffbh_i32_e64 v1, |v2|',
