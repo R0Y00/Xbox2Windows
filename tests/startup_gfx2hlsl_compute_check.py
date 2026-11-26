@@ -965,6 +965,40 @@ def check_mbcnt():
     assert 'uav 0 table 1 0' in translate('D').manifest()
 
 
+WAVE_BRANCH = 'decides for the whole wave and the one-lane model decides per lane'
+
+
+def check_wave_branches():
+    # A branch on the whole mask (vccz / vccnz / execnz) or on an SCC that depends on lane data decides once for the
+    # wave; the one-lane model would decide from its own lane. Outside a block s_cbranch_execz skips (that proof covers
+    # the branches inside it), such a branch is refused. An SCC from wave-uniform data is the same for every lane.
+    SPLICE.update({
+        's_cbranch_scc0 1': '010084bf', 's_cbranch_vccnz 65533': 'fdff87bf',
+        's_cbranch_execnz 65532': 'fcff89bf', 's_cbranch_execnz 65531': 'fbff89bf', 's_and_b32 exec_lo, exec_lo, vcc_lo': '7e6a7e87',
+        's_mov_b32 s0, exec_lo': '7e0380be', 's_mov_b32 exec_lo, s0': '0003febe',
+        's_or_b32 exec_lo, exec_lo, s0': '7e007e88'})
+    for line in ('s_and_b32 exec_lo, exec_lo, vcc_lo', 's_mov_b32 s0, exec_lo', 's_mov_b32 exec_lo, s0',
+                 's_or_b32 exec_lo, exec_lo, s0'):  # the decoder prints each hand-assembled word as its line
+        (_, _, name, text), = G.decode(bytes.fromhex(SPLICE[line]))
+        assert text == line, (line, text)
+    cmp3 = 'v_cmp_gt_u32 vcc_lo, 3, v0'
+    save = 's_and_saveexec_b32 s0, vcc_lo'
+    loop = ('v_mov_b32 v3, 0', 'v_add_nc_u32 v3, 1, v3', 'v_cmp_gt_u32 vcc_lo, 2, v3')
+    for name, lines in (
+            ('s_cbranch_vccz', (cmp3, 's_cbranch_vccz 1', 'v_mov_b32 v3, 0')),
+            ('s_cbranch_scc0', (cmp3, save, 's_cbranch_scc0 1', 'v_mov_b32 v3, 0', 's_or_b32 exec_lo, exec_lo, s0')),
+            ('s_cbranch_vccnz', (*loop, 's_cbranch_vccnz 65533')),
+            # a scalar iteration counter in the loop: the wave's count is not the lane's
+            ('s_cbranch_execnz', ('s_mov_b32 s0, exec_lo', *loop, 's_add_u32 s23, s7, 1',
+                                  's_and_b32 exec_lo, exec_lo, vcc_lo', 's_cbranch_execnz 65531',
+                                  's_mov_b32 exec_lo, s0'))):
+        refused('%s %s' % (name, WAVE_BRANCH), lambda lines=lines: translate('A', code=splice(*lines)))
+    translate('A', code=splice('s_cmp_lt_u32 s7, 4', 's_cbranch_scc1 1', 'v_mov_b32 v3, 0')).hlsl_cs()
+    # An execnz loop that only narrows EXEC and changes vector registers: a lane that left changes nothing.
+    translate('A', code=splice('s_mov_b32 s0, exec_lo', *loop, 's_and_b32 exec_lo, exec_lo, vcc_lo',
+                               's_cbranch_execnz 65532', 's_mov_b32 exec_lo, s0')).hlsl_cs()
+
+
 def check_descriptor_scc():
     # Case A loads the input descriptor into s[12:15] and stores through s[16:19].
     # Read s20's lane bit into the stored value. The SCC branches skip both dwords of the lane select.
@@ -1268,6 +1302,7 @@ def check_controls():
     assert expected('A-ff1') != expected('A')
     check_lds()
     check_descriptor_scc()
+    check_wave_branches()
     check_mbcnt()
     check_formatted_loads()
     a = translate('A')
@@ -1601,8 +1636,10 @@ def check_controls():
     compare = ['s_cbranch_execz 1', 'v_cmp_gt_u32 vcc_lo, 3, v0']
     for read in ('s_and_b32 s23, vcc_lo, exec_lo', 's_and_b32 s23, exec_lo, vcc_lo', 's_orn2_b32 s23, vcc_lo, exec_lo',
                  's_and_b32 vcc_lo, vcc_lo, exec_lo'):
-        translate('A', code=splice(*enter, *compare, read, *leave, 's_cbranch_vccz 1', 'v_mov_b32 v5, s20')
-                  if read.startswith('s_and_b32 vcc') else splice(*enter, *compare, read, *leave)).hlsl_cs()
+        translate('A', code=splice(*enter, *compare, read, *leave)).hlsl_cs()
+    # A vccz after the join decides for the whole wave (any lane's bit keeps it running): refused, not per lane.
+    refused(WAVE_BRANCH, lambda: translate('A', code=splice(
+        *enter, *compare, 's_and_b32 vcc_lo, vcc_lo, exec_lo', *leave, 's_cbranch_vccz 1', 'v_mov_b32 v5, s20')).hlsl_cs())
     assert translate('NM').hlsl_cs().endswith('''\
     if (pc == 1) {
         vcc = (exec & ((0x00000003u > v0) ? 1u : 0u));
