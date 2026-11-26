@@ -7,6 +7,8 @@ function entry, then removes the breakpoint at the hit limit. A `stop` file crea
 ends the run as the timeout does; one left from an earlier run is removed at start. The launcher keeps the debug heap off unless
 the caller sets _NO_DEBUG_HEAP=0. X2W_NOP_SOFT_ASSERTS=1 replaces a main-image INT3 with a NOP after
 the first continue, and the probe repeats one site when STARTUP_DEBUG_PROBE_ASSERTS is set.
+--assert-sites N steps over every hit at up to N distinct main-image sites, however often each
+repeats, and stops at the first hit of one more site.
 tests/startup_debug_probe.cpp is the main input: it hits two breakpoints, optionally repeats a
 third, reserves 256 MiB, prints its debug-heap flags, waits 3 s and exits 0.
 
@@ -211,6 +213,30 @@ def main(probe, calls_dll, group='all'):
             out, logdir = run(probe, work, "nop-repeat-control", {"STARTUP_DEBUG_PROBE_ASSERTS": str(repeats)})
             assert "process exited with 0x00000000" in out, out
             assert breakpoint_sites(logdir, image).count(repeated[0]) == repeats, text(logdir / "events.txt")
+
+            # --assert-sites 3: every hit at the three sites is stepped over, however often the third
+            # repeats, with no hit budget at all.
+            many = 20
+            out, logdir = run(probe, work, "assert-sites", {"STARTUP_DEBUG_PROBE_ASSERTS": str(many)},
+                              options=("--assert-sites", "3"))
+            assert "process exited with 0x00000000" in out, out
+            assert f"debug-probe repeated {many}\n" in text(logdir / "stdout.txt"), text(logdir / "stdout.txt")
+            assert breakpoint_sites(logdir, image).count(repeated[0]) == many, text(logdir / "events.txt")
+            # Control: a hit budget of three runs out at the repeated site's second hit.
+            out, _ = run(probe, work, "assert-sites-control", {"STARTUP_DEBUG_PROBE_ASSERTS": str(many)},
+                         options=("--continue-asserts", "3"))
+            assert f"stopped at breakpoint (0x80000003) at {image}+{repeated[0]:#x}" in out, out
+            # Two sites: the first hit at the third site stops the run.
+            out, logdir = run(probe, work, "assert-sites-two", {"STARTUP_DEBUG_PROBE_ASSERTS": str(many)},
+                              options=("--assert-sites", "2"))
+            assert f"stopped at breakpoint (0x80000003) at {image}+{repeated[0]:#x}" in out, out
+            assert breakpoint_sites(logdir, image).count(repeated[0]) == 1, text(logdir / "events.txt")
+            # X2W_STOP_AT still stops at a site the site budget covers.
+            out, _ = run(probe, work, "assert-sites-stop", {"X2W_STOP_AT": f"{sites[1]:x}"},
+                         options=("--assert-sites", "3"))
+            assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out, out
+            out, _ = run(probe, work, "assert-sites-negative", {}, options=("--assert-sites", "-1"))
+            assert "expected an --assert-sites value of 0 or greater" in out, out
 
             # X2W_DUMP_AT: a dump one second in, while the probe is still alive.
             out, logdir = run(probe, work, "dump", {"X2W_DUMP_AT": "1"})

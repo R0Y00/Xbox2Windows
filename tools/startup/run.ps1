@@ -19,6 +19,7 @@ param(
     [string]$BuildDir = "out/build/release",
     [int]$MemoryGiB = 14,
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
+    [int]$AssertSites = 0,                     # distinct main-image int3 sites whose every hit is stepped over
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
     [string]$StoragePath = "",                 # X2W_STORAGE_PATH: root of the console drive the title sees (it appends x2w-gamesave)
     [string]$ShaderCache = "out/startup/shader_cache",
@@ -82,7 +83,7 @@ $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
 try {
     & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs *> "$LogDir.out"
+        --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @traceArgs *> "$LogDir.out"
     $debuggerExit = $LASTEXITCODE
 } finally {
     # taskkill /T needs a live parent PID to reach the watcher's workers.

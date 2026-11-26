@@ -1,11 +1,16 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
 usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1]
+                       [--continue-asserts N] [--assert-sites N]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
 Stops at a second-chance exception, an uncontinued main-image breakpoint, or the timeout.
 A timeout of zero disables the timer. An assertion continuation limit of -1 removes that limit.
+--continue-asserts N steps over the first N main-image int3 hits in total. --assert-sites N instead
+steps over every hit at up to N distinct main-image int3 sites, so a site that repeats does not use
+the budget up however long the run lasts; the first hit at one more site stops the run. A hit is
+stepped over when either budget allows it.
 A file named `stop` created in <logdir> during the run ends it as the timeout does (checked twice a
 second; a stop file left from an earlier run is removed at start).
 """
@@ -124,12 +129,17 @@ def main():
         timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
         memory_gib = float(opts.get("--memory-gib", 16))
         skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
+        assert_sites = int(opts.get("--assert-sites", "0"))  # distinct sites whose every hit is continued
     except ValueError:
-        print("expected numeric --timeout and --memory-gib values and an integer --continue-asserts value")
+        print("expected numeric --timeout and --memory-gib values and integer --continue-asserts and "
+              "--assert-sites values")
         return 2
     stop_first = opts.get("--stop-first-chance") == "1"
     if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
+        return 2
+    if assert_sites < 0:
+        print("expected an --assert-sites value of 0 or greater")
         return 2
     # The job always sets JOB_MEMORY (0x200), so a limit of 0 would deny the process any commit.
     if not 1 <= memory_gib * 2**30 < 2**(8 * ctypes.sizeof(ctypes.c_size_t)):
@@ -770,7 +780,9 @@ def main():
                     log(f"X2W_LOG_AT ignored {rva:#x}: cannot arm a main-image instruction breakpoint")
                     del log_at[rva]
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
+                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts
+                       or ex_addr in asserts_seen and len(asserts_seen) <= assert_sites
+                       or ex_addr not in asserts_seen and len(asserts_seen) < assert_sites)
                   and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):

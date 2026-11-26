@@ -26,7 +26,7 @@ set -uo pipefail
 
 usage() {
     echo "usage: run.sh --exe EXE --data DIR --log DIR [--seconds 120] [--build-dir out/build/release]" >&2
-    echo "       [--memory-gib 14] [--continue-asserts 0] [--input-script S] [--storage DIR]" >&2
+    echo "       [--memory-gib 14] [--continue-asserts 0] [--assert-sites 0] [--input-script S] [--storage DIR]" >&2
     echo "       [--shader-cache out/startup/shader_cache] [--console 0|1] [--render] [--fake-user]" >&2
     echo "       [--gpu-mirror] [--host-cpu] [--translate] [--startup-below-40] [--trace-calls]" >&2
     echo "       [--hide-title-window]" >&2
@@ -35,18 +35,19 @@ usage() {
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 here="$repo/tools/startup"
-exe="" data="" log="" seconds=120 build_dir=out/build/release memory_gib=14 continue_asserts=0
+exe="" data="" log="" seconds=120 build_dir=out/build/release memory_gib=14 continue_asserts=0 assert_sites=0
 input_script="" storage="" shader_cache=out/startup/shader_cache console=1
 render="" fake_user="" gpu_mirror="" host_cpu="" translate="" below_40="" trace_calls="" hide_title=""
 while [ $# -gt 0 ]; do
     case $1 in
-        --exe|--data|--log|--seconds|--build-dir|--memory-gib|--continue-asserts|--input-script|--storage|\
+        --exe|--data|--log|--seconds|--build-dir|--memory-gib|--continue-asserts|--assert-sites|--input-script|--storage|\
         --shader-cache|--console)
             [ $# -ge 2 ] || usage
             case $1 in
                 --exe) exe=$2 ;; --data) data=$2 ;; --log) log=$2 ;; --seconds) seconds=$2 ;;
                 --build-dir) build_dir=$2 ;; --memory-gib) memory_gib=$2 ;;
                 --continue-asserts) continue_asserts=$2 ;;  # main-image int3s to log and step over
+                --assert-sites) assert_sites=$2 ;;          # distinct int3 sites whose every hit is stepped over
                 --input-script) input_script=$2 ;;          # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
                 --storage) storage=$2 ;;                    # X2W_STORAGE_PATH: persistent local storage root
                 --shader-cache) shader_cache=$2 ;; --console) console=$2 ;;
@@ -197,7 +198,7 @@ console_args=()
 [ "$console" = 1 ] || console_args=(--console "$console")
 "$wine" "$X2W_WIN_PYTHON" -B "$(win_path "$here/debug_launch.py")" "$(win_path "$exe")" "$(win_path "$data")" \
     "$(win_path "$log")" --timeout "$seconds" --memory-gib "$memory_gib" --trace-files 1 \
-    --continue-asserts "$continue_asserts" "${trace_args[@]}" "${console_args[@]}" > "$log_host.out" 2>&1
+    --continue-asserts "$continue_asserts" --assert-sites "$assert_sites" "${trace_args[@]}" "${console_args[@]}" > "$log_host.out" 2>&1
 debugger_exit=$?
 head -n 5 "$log_host.out"
 exit $debugger_exit
