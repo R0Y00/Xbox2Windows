@@ -204,10 +204,11 @@ void release_objects(IUnknown* (&objects)[2])
 // reference first, then the heap behind it. A heap must outlive the resources placed in it, so the two
 // releases are not interchangeable; the success path below releases them one at a time instead, because
 // it reports each count.
-void release_placed(ComPtr<ID3D12Heap>& heap, IUnknown* (&objects)[2])
+void release_placed(ComPtr<ID3D12Heap>& heap, IUnknown* (&objects)[2], bool unloaded = true)
 {
     release_objects(objects);
-    heap.Reset();
+    if (unloaded) heap.Reset();
+    else (void)heap.Detach();  // The still-loaded cache owns a placed buffer until process exit.
 }
 
 // Phase 1: load, warm one cache, unload explicitly, and check that this cache released what it owned.
@@ -235,6 +236,10 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
     // reference it holds, so the fixture owns it from here to the end of this function -- across the
     // unload -- and it is released last, after the cache and the fixture both let the placed buffer go.
     ComPtr<ID3D12Heap> heap;
+    const auto unload_after_error = [&] {
+        const bool unloaded = FreeLibrary(shim) && !GetModuleHandleW(L"d3d12_xs.dll");
+        release_placed(heap, objects, unloaded);
+    };
     ULONG heap_held = 0;
     if (!cache.slots) before = reference_count(device.Get());
 
@@ -243,15 +248,13 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
     if (warmed_heap) heap.Attach(warmed_heap);
     if (owned != cache.owned) {
         std::fprintf(stderr, "%s: probe reports %u cached objects, expected %u\n", cache.name, owned, cache.owned);
-        release_placed(heap, objects);
-        FreeLibrary(shim);
+        unload_after_error();
         return 5;
     }
     if (cache.heap != (heap.Get() != nullptr)) {
         std::fprintf(stderr, "%s: the probe %s a backing heap for the placed buffer, expected %s\n", cache.name,
                      heap ? "also handed over" : "handed over no", cache.heap ? "one" : "none");
-        release_placed(heap, objects);
-        FreeLibrary(shim);
+        unload_after_error();
         return 15;
     }
     if (heap) {
@@ -266,16 +269,14 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
             objects[slot] = object_probe(cache.probe_bits, slot);
             if (!objects[slot]) {
                 std::fprintf(stderr, "%s: the warmed cache owns no object in slot %u\n", cache.name, slot);
-                release_placed(heap, objects);
-                FreeLibrary(shim);
+                unload_after_error();
                 return 6;
             }
             held[slot] = reference_count(objects[slot]);
             if (held[slot] < 2) {
                 std::fprintf(stderr, "%s: slot %u reports %lu references, expected the cache's and this fixture's\n",
                              cache.name, slot, static_cast<unsigned long>(held[slot]));
-                release_placed(heap, objects);
-                FreeLibrary(shim);
+                unload_after_error();
                 return 6;
             }
         }
@@ -292,14 +293,12 @@ int unload_path(const std::wstring& path, IDXGIAdapter* adapter, const CacheCase
     if (!FreeLibrary(shim)) {
         std::fprintf(stderr, "%s: FreeLibrary failed: %lu\n", cache.name,
                      static_cast<unsigned long>(GetLastError()));
-        // The cache still owns the placed buffer here, so this run has already failed; the fixture gives
-        // back what it holds in the order it would have used otherwise.
-        release_placed(heap, objects);
+        release_placed(heap, objects, false);
         return 7;
     }
     if (GetModuleHandleW(L"d3d12_xs.dll")) {
         std::fprintf(stderr, "%s: d3d12_xs.dll is still loaded after FreeLibrary\n", cache.name);
-        release_placed(heap, objects);
+        release_placed(heap, objects, false);
         return 8;
     }
 
