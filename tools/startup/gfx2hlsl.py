@@ -1029,10 +1029,17 @@ def writes_exec(name, ops):
 # In wave32 VCC is vcc_lo alone and vcc_hi is a free scalar register that compilers allocate like any other (RDNA 2
 # ISA, "VCC": in wave32 only VCC_LO is the condition mask). The translator models it as an ordinary SGPR the program
 # never names, taken from the top of the 106 (beyond the user-data and system registers set at entry).
+def vcc_hi_whole_word_writer(name, ops):
+    """True when the instruction's first operand is vcc_hi and its name is a scalar instruction or an actual lane-read
+    writer (v_readlane, v_readfirstlane): the register then holds one whole word, not one bit per lane."""
+    return ops[:1] == ['vcc_hi'] and (name.startswith('s_') or name.startswith(('v_readlane', 'v_readfirstlane')))
+
+
 def vcc_hi_scalar_mask_read(ins):
-    """True when a VOP3 lane-mask source reads vcc_hi after a scalar instruction wrote it (or the program branches, so the
-    order is unknown): the renamed register then holds a whole word, not the current lane's bit, and the lowering would
-    test bit 0 of it for every lane. A compare or carry-out that wrote vcc_hi last keeps the per-lane form."""
+    """True when a VOP3 lane-mask source reads vcc_hi after a (whole-word) scalar or lane-read writer wrote it (or the
+    program branches, so the order is unknown): the renamed register then holds a whole word, not the current lane's
+    bit, and the lowering would test bit 0 of it for every lane. A compare or carry-out that wrote vcc_hi last keeps
+    the per-lane form."""
     scalar, branchy, read_after = False, False, False
     reads = False
     for _o, _n, name, asm in ins:
@@ -1040,14 +1047,14 @@ def vcc_hi_scalar_mask_read(ins):
         branchy |= name.startswith(('s_cbranch', 's_branch'))
         if (name.startswith('v_cmp_') and ops[:1] == ['vcc_hi']) or (VOP3B_SDST.match(name) and ops[1:2] == ['vcc_hi']):
             scalar = False
-        elif ops[:1] == ['vcc_hi']:
-            scalar = scalar or name.startswith('s_') or name.startswith('v_readlane')
+        elif vcc_hi_whole_word_writer(name, ops):
+            scalar = True
         if name in ('v_cndmask_b32_e64', 'v_add_co_ci_u32_e64', 'v_sub_co_ci_u32_e64', 'v_subrev_co_ci_u32_e64') \
                 and ops[-1:] == ['vcc_hi']:
             reads = True
             read_after |= scalar
     return read_after or (reads and branchy and any(
-        name.startswith('s_') and parse(asm)[1][:1] == ['vcc_hi'] for _o, _n, name, asm in ins))
+        vcc_hi_whole_word_writer(name, parse(asm)[1]) for _o, _n, name, asm in ins))
 
 
 def wave32_vcc_hi(ins):
