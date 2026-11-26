@@ -469,11 +469,12 @@ def binary(directory, assembler, objcopy, library):
     return 0
 
 
-def check_references(name, renderer, backend, shader, cases, *, allow_hardware_skip=False):
+def check_references(name, renderer, backend, shader, cases, *, allow_skip=False):
     paths = [path for path, _label, _diagnostic in cases]
     result = subprocess.run([renderer, backend, "--compute-store-batch", shader, *paths],
                             capture_output=True, text=True)
-    if allow_hardware_skip and backend == "hardware" and result.returncode == 77:
+    if allow_skip and result.returncode == 77:
+        print(result.stdout, result.stderr)
         return 77
     statuses = [line for line in result.stdout.splitlines() if line.startswith("case=")]
     messages = re.split(r"(?=^case=\d+ path=)", result.stderr, flags=re.MULTILINE)[1:]

@@ -5,12 +5,23 @@ import os
 import zlib
 
 
+def _require_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    return value
+
+
 @dataclass(frozen=True)
 class Segment:
     offset: int         # Physical byte offset in the open file
     stored: int         # Bytes excluding alignment padding
     size: int           # Decoded bytes in logical order
     codec: str
+
+    def __post_init__(self) -> None:
+        _require_int(self.offset, "segment.offset")
+        _require_int(self.stored, "segment.stored")
+        _require_int(self.size, "segment.size")
 
 
 class PagedResource:
@@ -23,13 +34,18 @@ class PagedResource:
         starts = []
         physical_end = logical_end = 0
         for segment in self.segments:
-            if segment.offset < physical_end or min(segment.stored, segment.size) <= 0:
+            offset = _require_int(segment.offset, "segment.offset")
+            stored = _require_int(segment.stored, "segment.stored")
+            size = _require_int(segment.size, "segment.size")
+            if not isinstance(segment.codec, str) or not segment.codec:
+                raise ValueError(f"Unsupported segment codec {segment.codec!r}")
+            if offset < physical_end or min(stored, size) <= 0:
                 raise ValueError("Overlapping, descending or empty segment")
-            physical_end = segment.offset + segment.stored
-            if physical_end > file_size or (segment.codec == "raw" and segment.stored != segment.size):
+            physical_end = offset + stored
+            if physical_end > file_size or (segment.codec == "raw" and stored != size):
                 raise ValueError("Segment extent disagrees with file or raw size")
             starts.append(logical_end)
-            logical_end += segment.size
+            logical_end += size
         self.starts = tuple(starts)
         self.size = logical_end
 
@@ -47,7 +63,10 @@ class PagedResource:
         return bytes(data)
 
     def read(self, offset, length, *, limit=64 << 20):
-        if offset < 0 or length < 0 or length > limit or offset + length > self.size:
+        offset = _require_int(offset, "offset")
+        length = _require_int(length, "length")
+        limit = _require_int(limit, "limit")
+        if limit < 0 or offset < 0 or length < 0 or length > limit or offset + length > self.size:
             raise ValueError("Logical range outside resource or read budget")
         index = bisect_right(self.starts, offset) - 1
         result = bytearray()

@@ -9,7 +9,7 @@ values of the missing components. Only BUF_FMT_8_UINT and BUF_FMT_8_UNORM were r
 (startup_r8_uint_check.py). This drives each table entry the way that check does: a source-built vertex
 stage with one tbuffer_load_format_xyzw from vertex buffer 1 is translated, its generated vertex body is
 called from a compute wrapper, and the four position components of 16 vertices are read back through
-offscreen_check --compute-store-case and compared with a reference that decodes the same bytes from the
+offscreen_check and compared with a reference that decodes the same bytes from the
 format definitions (little-endian fields from the lowest byte, UNORM n / (2^bits - 1), binary16 widened to
 binary32, missing X, Y and Z as 0 and a missing W as 1.0, or 1 for an integer format).
 
@@ -21,9 +21,11 @@ instruction but in word 3 of the buffer descriptor (FORMAT bits 12..18, DST_SEL 
 that word as an entry constant and the translation switches on it. Each format is run through a MUBUF
 xyz load with its own descriptor word, then descriptor words with swizzles and constants 0 and 1 run through
 the same translated body.
-Wrong references (channels swapped, a shift off by one field, a missing W read as 0, UNORM over 2^bits)
-and mutated translations must fail the readback.
+Each TBUFFER format runs its matching reference and each wrong reference that changes a word in one renderer
+batch. The first mismatched word must match the predicted index and values. Each distinct vertex or compute
+source compiles once in the fixture's temporary directory. Mutated translations dispatch separately.
 """
+import hashlib
 import re
 import struct
 import subprocess
@@ -31,6 +33,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from compute_load_format_check import check_references
 from startup_sampler_heap_check import root_blob
 from startup_stream_check import gfx2hlsl
 
@@ -441,24 +444,29 @@ def runtime_gate_controls():
 
 
 def compile_fetch(directory, compiler, name, source):
-    hlsl, binary = directory / 'fetch.hlsl', directory / 'fetch.cso'
-    hlsl.write_text(source, encoding='ascii')
-    # Compile the vertex entry as the startup tools do, then the same body in the compute wrapper.
-    subprocess.run([compiler, '-T', 'vs_6_0', '-E', 'main', '-Fo', binary, hlsl], check=True)
-    with hlsl.open('a', encoding='ascii') as handle:
-        handle.write(wrapper(name))
-    subprocess.run([compiler, '-T', 'cs_6_0', '-E', 'readback', '-Fo', binary, hlsl], check=True)
+    hlsl, output = directory / 'fetch.hlsl', directory / 'fetch.cso'
+    # Descriptor words can change without changing the vertex program. The readback wrapper
+    # also depends on the format, so key each stage by its complete input in this run's temporary directory.
+    for profile, entry, text in (('vs_6_0', 'main', source), ('cs_6_0', 'readback', source + wrapper(name))):
+        binary = directory / ('%s-%s.cso' % (profile, hashlib.sha256(text.encode('ascii')).hexdigest()))
+        if not binary.exists():
+            hlsl.write_text(text, encoding='ascii')
+            subprocess.run([compiler, '-T', profile, '-E', entry, '-Fo', output, hlsl], check=True)
+            output.replace(binary)
     return binary
 
 
-def run_reference(directory, consumer, adapter, binary, name, words, translated=None, word3=None):
-    case = directory / 'fetch.case'
-    translated = translated or pipeline(name)
+def write_reference(case, name, words, translated, word3=None):
     constants = [0] * 16
     constants[translated.uds.index(('stride', 0))] = FORMATS[name][1]
     if word3 is not None:
         constants[translated.uds.index(('descword3', 0))] = word3
     case.write_bytes(struct.pack('<337I', 1, *words, *constants))
+
+
+def run_reference(directory, consumer, adapter, binary, name, words, translated=None, word3=None):
+    case = directory / 'fetch.case'
+    write_reference(case, name, words, translated or pipeline(name), word3)
     return subprocess.run([consumer, adapter, '--compute-store-case', binary, case], capture_output=True, text=True)
 
 
@@ -469,26 +477,23 @@ def run(directory, compiler, consumer, adapter, name, source, words, translated=
 
 def check(directory, compiler, consumer, adapter):
     for name in FORMATS:
-        source = pipeline(name).hlsl_vs()
-        binary = compile_fetch(directory, compiler, name, source)
+        translated = pipeline(name)
+        binary = compile_fetch(directory, compiler, name, translated.hlsl_vs())
         correct = expected(name)
-        result = run_reference(directory, consumer, adapter, binary, name, correct)
-        if result.returncode == 77:
-            print(result.stdout, result.stderr)
-            return 77
-        if result.returncode:
-            raise RuntimeError('%s: %s%s' % (name, result.stdout, result.stderr))
-        print('%s: 16 vertices, stride %d, offset %d: %s' % (
-            name, FORMATS[name][1], FORMATS[name][2],
-            [line for line in result.stdout.splitlines() if 'mismatches=' in line][0]))
+        case = directory / 'fetch-correct.case'
+        write_reference(case, name, correct, translated)
+        references = [(case, '16 vertices, stride %d, offset %d' % FORMATS[name][1:3], None)]
         for label, wrong in WRONG:
             words = expected(name, **wrong)
             if words == correct:
                 continue
             first = next(i for i, (a, b) in enumerate(zip(words, correct)) if a != b)
-            bad = run_reference(directory, consumer, adapter, binary, name, words)
-            if bad.returncode != 1 or 'word=%d expected=' % first not in bad.stderr:
-                raise AssertionError('%s: reference %r escaped detection\n%s' % (name, label, bad.stderr))
+            case = directory / f'fetch-wrong-{len(references)}.case'
+            write_reference(case, name, words, translated)
+            diagnostic = f'word={first} expected={words[first]:08x} actual={correct[first]:08x}'
+            references.append((case, label, diagnostic))
+        if check_references(name, consumer, adapter, binary, references, allow_skip=True) == 77:
+            return 77
     for name, label, old, new in MUTATIONS:
         source = pipeline(name).hlsl_vs()
         binary = compile_fetch(directory, compiler, name, source.replace(old, new, 1))

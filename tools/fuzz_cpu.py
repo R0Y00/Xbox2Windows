@@ -3,12 +3,20 @@
 import argparse
 import ctypes
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import random
 import re
 import struct
 import sys
+import tempfile
 import types
+
+try:
+    import pefile
+    _PE_ERRORS: tuple[type[BaseException], ...] = (pefile.PEFormatError,)
+except ImportError:
+    _PE_ERRORS = ()
 
 WIDTHS = {
     "b": ("al", "dl", "BYTE PTR", 1),
@@ -2037,13 +2045,75 @@ def buffer_text(data, start, stop):
     return " ".join(f"{byte:02x}" for byte in data[start:stop])
 
 
+def _validate_count(count: int) -> None:
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+
+
+def _validate_input_file(path: Path, label: str) -> None:
+    if path.is_dir():
+        raise IsADirectoryError(f"{label} path is a directory: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} file not found: {path}")
+
+
+def _validate_output_path(path: Path, label: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"{label} output path must not be a symlink: {path}")
+    if path.is_dir():
+        raise IsADirectoryError(f"{label} output path is a directory: {path}")
+    for parent in path.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"{label} output parent is not a directory: {parent}")
+
+
+def _validate_distinct_paths(left: Path, right: Path, message: str) -> None:
+    left_resolved = left.resolve()
+    right_resolved = right.resolve()
+    if (
+        left_resolved == right_resolved
+        or left_resolved in right_resolved.parents
+        or right_resolved in left_resolved.parents
+        or (left.exists() and right.exists() and left.samefile(right))
+    ):
+        raise ValueError(message)
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write UTF-8 text to a sibling temp file and atomically replace path, unlinking temps on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(text)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area="leaf", mutant=None):
+    _validate_count(count)
+    for path, label in ((native, "native"), (lifted, "lifted"), (o2, "o2")):
+        _validate_input_file(Path(path), label)
+    if mutant is not None:
+        _validate_input_file(Path(mutant), "mutant")
     if first_difference(b"\x01\x02", b"\x01\x02") is not None:
         raise SystemExit("comparator self-test failed on equal bytes")
     if first_difference(b"\x01\x02", b"\x01\x03") != 1:
         raise SystemExit("comparator self-test failed on a changed byte")
     if mutant is not None and area not in MUTANTS:
-        raise SystemExit(f"no planted translator fault for --area {area}")
+        raise ValueError(f"no planted translator fault for --area {area}")
 
     functions = AREAS[area][0](seed, count)
     controls = [function for function in functions if function.refused]
@@ -2069,8 +2139,6 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
         loaded.append((library, prefix))
 
     native_library, lifted_library, o2_library = (item[0] for item in loaded[:3])
-    if count <= 0:
-        raise SystemExit("CPU_FUZZ_FUNCTIONS must be positive")
     selected = [function for function in functions if only is None or function.name == only]
 
     def function_inputs(function):
@@ -2155,14 +2223,20 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
 
 
 def emit(seed, count, asm_path, def_path, area="leaf"):
+    _validate_count(count)
+    asm_out = Path(asm_path)
+    def_out = Path(def_path)
+    _validate_output_path(asm_out, "asm")
+    _validate_output_path(def_out, "definition")
+    _validate_distinct_paths(asm_out, def_out, f"asm and definition outputs must be distinct: {asm_out}")
     generator, library = AREAS[area]
     functions = generator(seed, count)
     body = "\n\n".join(function.asm() for function in functions)
     asm = ("EXTERN __ImageBase:BYTE\n" if "__ImageBase" in body else "") + ".code\n\n" + body + "\n\nEND\n"
     definition = (f"LIBRARY {library}\nEXPORTS\n"
                   + "".join(f"    {function.name}\n" for function in functions if function.export))
-    Path(asm_path).write_text(asm, encoding="utf-8")
-    Path(def_path).write_text(definition, encoding="utf-8")
+    _write_atomic(asm_out, asm)
+    _write_atomic(def_out, definition)
 
 
 def plant_reload_shift(cpu_switch_aot, image, functions):
@@ -2364,33 +2438,39 @@ MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retar
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):
+    _validate_count(count)
+    image_path = Path(image)
+    out_path = Path(output)
+    _validate_input_file(image_path, "image")
+    _validate_output_path(out_path, "output")
+    _validate_distinct_paths(out_path, image_path, f"output path must be distinct from input image: {out_path}")
+    if mutant and area not in MUTANTS:
+        raise ValueError(f"no planted translator fault for --area {area}")
     lifter = translator_module(area)
     functions = AREAS[area][0](seed, count)
     if mutant:
-        if area not in MUTANTS:
-            raise SystemExit(f"no planted translator fault for --area {area}")
         MUTANTS[area][1](lifter, image, functions)
     # Negative controls stay in the image for the check to translate on their own.
     functions = [function for function in functions
                  if not function.refused and function.export and function.host_features is None]
     names = [export_name(function) for function in functions]
     try:
-        source, _ = lifter.translate(Path(image), names)
+        source, _ = lifter.translate(image_path, names)
     except ValueError as error:
         print(f"seed={seed:#x} functions={count}: {error}", file=sys.stderr)
         for function in functions:
             try:
-                lifter.translate(Path(image), [export_name(function)])
+                lifter.translate(image_path, [export_name(function)])
             except ValueError as inner:
                 print(f"refused {function.name}: {inner}", file=sys.stderr)
                 print(function.asm(), file=sys.stderr)
                 break
         return 1
-    Path(output).write_text(source, encoding="utf-8")
+    _write_atomic(out_path, source)
     return 0
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     emit_parser = commands.add_parser("emit")
@@ -2420,13 +2500,17 @@ def main(argv=None):
     check_parser.add_argument("--mutant", type=Path, help="a translation with the planted fault, which must mismatch")
     args = parser.parse_args(argv)
 
-    if args.command == "emit":
-        emit(args.seed, args.count, args.asm, args.definition, args.area)
-        return 0
-    if args.command == "translate":
-        return translate(args.seed, args.count, args.image, args.output, args.area, args.mutant)
-    return run_check(args.seed, args.count, args.native, args.lifted, args.o2, args.only, args.input_index,
-                     args.area, args.mutant)
+    try:
+        if args.command == "emit":
+            emit(args.seed, args.count, args.asm, args.definition, args.area)
+            return 0
+        if args.command == "translate":
+            return translate(args.seed, args.count, args.image, args.output, args.area, args.mutant)
+        return run_check(args.seed, args.count, args.native, args.lifted, args.o2, args.only, args.input_index,
+                         args.area, args.mutant)
+    except (OSError, ValueError, struct.error, KeyError, *_PE_ERRORS) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

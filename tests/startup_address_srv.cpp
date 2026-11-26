@@ -473,6 +473,53 @@ int draw_formatted_view(void* guest, void* list)
     return 0;
 }
 
+int draw_copied_vertex_buffer_srv(void* guest, void* list)
+{
+    constexpr UINT full_bytes = 512;
+    constexpr UINT short_bytes = 256;
+    static std::array<std::uint8_t, 65536 + full_bytes> storage{};
+    auto* records = reinterpret_cast<std::uint32_t*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
+    records[224 / sizeof(*records)] = 57;
+    records[288 / sizeof(*records)] = 181;
+
+    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, full_bytes, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&buffer), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+
+    const Word stride = invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    alignas(64) static std::array<std::uint8_t, 256> descriptors{};
+    Word cpu = 0;
+    if (!stride || stride > descriptors.size() / 3 ||
+        !bind_view_table(guest, list, cpu, 3, ptr(descriptors.data()), 3 * stride) ||
+        cpu != ptr(descriptors.data())) return 42;
+
+    ViewAt view{};
+    view.view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    view.address = ptr(records);
+    view.view.Buffer.NumElements = full_bytes / sizeof(*records);
+    invoke(guest, 70, ptr(&buffer), ptr(&view), cpu + stride);
+    view.view.Buffer.NumElements = short_bytes / sizeof(*records);
+    invoke(guest, 70, ptr(&buffer), ptr(&view), cpu + 2 * stride);
+    if (std::memcmp(descriptors.data() + stride, descriptors.data() + 2 * stride, stride) == 0) return 54;
+
+    const auto copy_and_draw = [&](Word source, LONG left, LONG right) {
+        invoke(guest, 24, 1, cpu, cpu + source * stride, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (std::memcmp(descriptors.data(), descriptors.data() + source * stride, stride) != 0) return false;
+        const D3D12_RECT strip{left, 0, right, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+        return true;
+    };
+    if (!copy_and_draw(1, 0, 2) || !copy_and_draw(2, 2, 6) || !copy_and_draw(1, 6, 8)) return 55;
+    std::printf("copied vertex buffer SRV with %llu-byte descriptors\n", static_cast<unsigned long long>(stride));
+    return 0;
+}
+
 int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
     static std::array<std::uint8_t, 65536 + 256> raw_buf0{};

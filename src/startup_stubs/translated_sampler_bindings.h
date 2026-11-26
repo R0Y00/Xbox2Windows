@@ -110,8 +110,10 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
     return statics;
 }
 
-inline UINT sampler_root_parameter(UINT srvs) { return srvs ? 2u : 1u; }
+// views: the SRVs and UAVs of the view table together.
+inline UINT sampler_root_parameter(UINT views) { return views ? 2u : 1u; }
 
+// Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.. right after them.
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
                                       const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0)
 {

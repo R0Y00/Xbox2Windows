@@ -208,10 +208,11 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-17`. Earlier translations lower `v_med3_f32` through a
-branchless median, which returns the smaller of the other two operands when a source is NaN. The matching
-compute (`x2w-startup-shader-17cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
-because those stages use the shared lowering.
+The shader cache revision is `x2w-startup-shader-18`. Revision 18 preserves the sign of zero in
+floating-point min, max, min3, max3 and med3. The matching compute (`x2w-startup-shader-18cs`) and fixed
+slot 57 mesh (`x2w-startup-mesh-57-3`) keys advance because those stages use the shared lowering.
+Revisions before 17 lower `v_med3_f32` through a branchless median, which returns the smaller of the
+other two operands when a source is NaN.
 Revisions before 16 lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
 Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
 rounding mode.
@@ -785,6 +786,8 @@ are not copied. Keep using the package root as `-DataDir`, then run the staged e
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+Use `-BuildDir` to select their build directory; relative paths are relative to the repository root,
+and absolute paths are used as supplied. The default is `out/build/release`.
 It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
@@ -1386,11 +1389,11 @@ cmake --build --preset release --target startup_inflate_probe
 
 ## DirectStorage destinations that are not writable
 
-A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in walks the destination with `VirtualQuery`, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `VirtualQuery` per region the destination spans, per request that reaches the copy.
+A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in reads the attributes of the destination's pages without touching them, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. When every page is resident and plain read-write (`QueryWorkingSetEx`: valid, `PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`, no guard bit), the request goes ahead; otherwise the destination is walked with `VirtualQuery`, which also accepts copy-on-write pages. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `QueryWorkingSetEx` per 512 pages of the declared capacity, per request that reaches the copy, plus the `VirtualQuery` walk when a page is not resident and plain read-write. On the title's multi-gigabyte regions each `VirtualQuery` scans to the end of the region, about 10 ms of kernel time per request (#2684).
 
 Failed requests report distinct status HRESULTs where the cause is known (#1843). A destination smaller than the data (`destination capacity exceeded`) reports `0x8007007A` (`ERROR_INSUFFICIENT_BUFFER`); a file read at or past the end, or crossing it, reports `0x80070026` (`ERROR_HANDLE_EOF`); every other cause stays `E_FAIL`. The same code is the `HRESULT` of the first-failure record. `OpenFile` with a null path returns `E_INVALIDARG`, `CreateQueue` with a null descriptor returns `E_INVALIDARG`, and a null output pointer returns `E_POINTER`; the output is set to null on every refusal. `tests/startup_dstorage_destination_check.cpp` pins each code on the real stand-in.
 
-`tests/startup_dstorage_destination_check.cpp` (ctest `startup_dstorage_destination`) sends memory-source requests through the real queue: a read-only, a guard and a no-access middle page, and a capacity one page past the committed pages. Each must fail with the process alive and the bytes of the pages before the bad one still `0xAA`. Afterwards, requests into a fully writable (`PAGE_READWRITE`) buffer and a copy-on-write (`PAGE_WRITECOPY`) mapped view on the same queue must write every byte:
+`tests/startup_dstorage_destination_check.cpp` (ctest `startup_dstorage_destination`) sends memory-source requests through the real queue: a read-only, a guard and a no-access middle page, and a capacity one page past the committed pages. Each must fail with the process alive and the bytes of the pages before the bad one still `0xAA`; the guard page must still be `PAGE_GUARD` afterwards, and a vectored exception handler must see no guard-page exception. A copy-on-write page followed by a no-access page must be refused with the first page still shared (`QueryWorkingSetEx`) and unchanged. A writable destination whose capacity is three pages but whose data is one page must succeed with the two unwritten pages still `0xAA`, and a committed page that was never touched (not resident) must be accepted. Afterwards, requests into a fully writable (`PAGE_READWRITE`) buffer and a copy-on-write (`PAGE_WRITECOPY`) mapped view on the same queue must write every byte:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
@@ -1459,7 +1462,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
-| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
@@ -1571,24 +1574,17 @@ unordered-access flag, and live in a default heap without heap flags:
   reusing the same title address or desktop pointer does not skip uploads or
   resolve a retired wrapper.
 
-`X2W_D3D12_RELEASE_RETIRED_VIEWS=1` (only with `X2W_D3D12_RELEASE_RETIRED=1`) ends the
-`view-refs` retention. Once a released class texture's release-time fences have passed,
-the drain (a try-lock, never blocking) replaces every tracked slot-18 descriptor slot
-that names it, in every heap and so every `CopyDescriptors*` copy, by a null SRV of the
-same dimension: the shadow entry and its ref are dropped, the desktop descriptor is
-rewritten with `CreateShaderResourceView(nullptr, ...)`, the view records naming the
-resource lose it, and the view token in title descriptor memory is cleared when it
-still carries that id. A draw that reads the slot afterwards binds a null texture
-(zeros). The texture is then freed by the normal rules: lists and submissions that hold
-it through `retire_hold` keep the desktop object until the recording is dropped or the
-submission's fence passes. No recorded list or submission reads a title heap's SRV
-descriptor (translated draws build their own descriptors from the tokens at draw time
-and hold what they sample), so the rewrite cannot reach GPU work. A slot that cannot be
-rewritten keeps its ref and the texture stays retained. Not covered: a title thread
-that writes the same slot at the moment of the drain, and a guest that uses the
-resource after its final release (unsupported with the switch, as before).
-`startup_resource_retire_views_*` reads the desktop descriptors back through a compute
-probe; the `keep` and `noretire` cases are the negative controls.
+A slot-18 descriptor and each tracked copy hold the resource until the slot is explicitly overwritten
+or its heap is destroyed. A later binding of that slot still reads the resource after the last guest
+Release and the release-time fences. A list or submission holding the resource keeps it alive after
+the slot is overwritten, until the recording is discarded or the submission retires.
+
+The legacy `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` setting only enables the retirement breakdown below and
+logs that clearing live slots is disabled. The memory-pressure A/B in
+[#2379](https://github.com/R0Y00/Xbox2Windows/issues/2379#issuecomment-7179801296) used the earlier
+experimental rewrite. `startup_resource_retire_views_*` checks GPU readback from the original and
+copied descriptors, and from a recorded copy behind a gated queue. It also checks retirement after
+explicit overwrite and normal completion, with the legacy setting on and off.
 
 `X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and
 `X2W_D3D12_BUDGET=1`) adds a diagnostic line to the heartbeat. It counts every
@@ -2205,11 +2201,30 @@ These are measured on one executable; treat them as hypotheses for others.
   `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
   channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
   `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads
-  and stores the same image are refused by name. The runtime does not bind UAVs on the translated
-  graphics path yet: it logs and does not use a translation whose manifest has a `uav` line. A
+  and stores the same image are refused by name. A
   hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
   texels of a 4x4 image back; deleting the store or exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
+- **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d table P O` line
+  as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
+  view the title created at that table entry (`resolve_pixel_uavs` in `d3d12_draw.inl`), on
+  mip 0 of a 2D texture, and the texture is in `UNORDERED_ACCESS` for the draw. Refusals are logged
+  with their reason and nothing is bound in place of the view. When the manifest is loaded, the
+  translation is not used for another image kind, a buffer line (`uav N raw table P O`,
+  the vertex-stage store of #2059), a view qualifier (`float`, `uint`, `sint`, as in the compute line), another source, extra fields such as
+  `channels`, an index out of order or more than eight views. At draw time,
+  the draw is not translated for no table at the parameter, an entry outside the bound table, an
+  entry without a view, a view that is not a UAV, a resource without `ALLOW_UNORDERED_ACCESS`, an
+  array, 3D, 1D or multisampled resource, a view of another dimension, mip or plane, an integer,
+  sRGB or non-colour format, a format without typed UAV store, and a texture that is also an SRV,
+  a render target or the depth texture of the draw; these checks run before any view of the draw is
+  written or any texture changes state. Indirect draws refuse a translation with a `uav` line. Compute UAVs and barriers between
+  draws that write and read the same texture are not covered. `tests/startup_pixel_uav_check.py`
+  draws the program above through the runtime with four 4x4 two-mip textures in which every word is
+  a distinct sentinel. The texel lands only in the texture the table names, and every other word of
+  the four textures stays unchanged; each refusal leaves every word unchanged. The exec-off variant
+  leaves the texel, and must fail once recompiled without its guard. Run
+  `ctest --preset release --no-tests=error -R '^startup_pixel_uav_' -V`.
 - **Explicit mip loads.** For 2D textures, 2D arrays and 3D textures, `image_load_mip` passes the final
   address register to `Texture.Load` as the mip level (`int4(x, y, slice, mip)` for an array, whose four
   registers are x, y, slice and mip). Ordinary `image_load` still reads mip zero.
