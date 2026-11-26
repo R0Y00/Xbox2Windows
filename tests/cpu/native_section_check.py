@@ -1,6 +1,7 @@
 """Compare every mapped section of the register probe with the Windows loader, on copies with patched section file fields.
 
 Windows reads raw section data in whole 0x200-byte file sectors, and leaves a section with PointerToRawData 0 zero-filled.
+Each section is compared up to the end of its last page: raw data past VirtualSize stays visible up to that page end.
 Raw data past the end of the file reads as zero, except that the last section's raw data must end inside the file and
 no raw range may reach 4 GiB; copies that break either rule must be refused by both loaders.
 """
@@ -19,6 +20,7 @@ from native_map_check import Mapper, STATUS
 
 FIELDS = {"VirtualSize": 8, "SizeOfRawData": 16, "PointerToRawData": 20}  # offsets in IMAGE_SECTION_HEADER
 SECTOR = 0x200
+PAGE = 0x1000  # x64 Windows page size
 ERROR_BAD_EXE_FORMAT = 193
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
@@ -33,6 +35,7 @@ CASES = [
     ("start inside a sector", ".rdata", lambda s, n: {"PointerToRawData": s.PointerToRawData + 0x10}, 0, True),
     ("start in the first sector", ".rdata", lambda s, n: {"PointerToRawData": SECTOR // 2}, 0, True),
     ("raw size below a sector", ".rdata", lambda s, n: {"SizeOfRawData": 0x10}, 0, True),
+    ("raw data past VirtualSize", ".rdata", lambda s, n: {"VirtualSize": 0x40}, 0, True),
     ("raw data crossing a sector", ".rdata",
      lambda s, n: {"PointerToRawData": s.PointerToRawData + SECTOR - 0x10, "SizeOfRawData": 0x20}, 0, True),
     ("rounded end past the file", ".rsrc",
@@ -51,12 +54,17 @@ REJECTIONS = [
 
 
 def layout(image):
-    """Return (name, rva, span) for each section; refuse images whose load would run code."""
+    """Return (name, rva, extent) for each section, the extent rounded up to whole pages; refuse images whose load
+    would run code."""
     with pefile.PE(str(image), fast_load=True) as pe:
         if pe.OPTIONAL_HEADER.AddressOfEntryPoint or pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].Size:
             raise AssertionError(f"{image.name}: needs no entry point and no imports to be loaded safely")
-        return [(s.Name.rstrip(b"\0").decode(), s.VirtualAddress, s.Misc_VirtualSize or s.SizeOfRawData)
+        return [(s.Name.rstrip(b"\0").decode(), s.VirtualAddress, pages(s.Misc_VirtualSize or s.SizeOfRawData))
                 for s in pe.sections]
+
+
+def pages(size):
+    return -(-size // PAGE) * PAGE
 
 
 def patch(source, target, name, edits, cut):
@@ -76,7 +84,7 @@ def patch(source, target, name, edits, cut):
     offset = fields.get("PointerToRawData", section.PointerToRawData)
     size = fields.get("SizeOfRawData", section.SizeOfRawData)
     exact = bytes(data[offset:offset + min(size, span)])
-    return (exact + bytes(span))[:span]
+    return (exact + bytes(pages(span)))[:pages(span)]
 
 
 def read(base, sections):

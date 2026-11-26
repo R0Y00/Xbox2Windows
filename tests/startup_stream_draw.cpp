@@ -284,9 +284,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const bool console_gate = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_GATE", nullptr, 0) != 0;
     const bool bc = console_view || console_gate || GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
-    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    StreamMrtFormat mrt{};
+    const bool typed = stream_mrt_format(format, mrt);
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
-    const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const bool single = typed;
     const bool legacy = !single;
     const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
@@ -322,15 +323,27 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_1D_SRV", nullptr, 0)) {
         extern int draw_1d_srvs(void*, void*);
         if (const int result = draw_1d_srvs(guest, list)) return result;
-    } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) || GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_MEMORY_SRV_DIAG", nullptr, 0)) {
+        extern int draw_memory_srv_diagnostics(ID3D12Device*, void*, void*);
+        if (const int result = draw_memory_srv_diagnostics(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_SINGLE_ELEMENT", nullptr, 0)) {
         extern int draw_single_element_srvs(void*, void*);
         if (const int result = draw_single_element_srvs(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0)) {
+        extern int draw_formatted_view(void*, void*);
+        if (const int result = draw_formatted_view(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0)) {
+        extern int draw_formatted_buffer(void*, void*);
+        if (const int result = draw_formatted_buffer(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_VOLUME_SRV", nullptr, 0)) {
+        extern int draw_volume_address_srvs(ID3D12Device*, void*, void*);
+        if (const int result = draw_volume_address_srvs(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0)) {
         extern int draw_d16_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_d16_srvs(desktop.Get(), guest, list)) return result;

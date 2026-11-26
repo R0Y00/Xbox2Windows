@@ -259,7 +259,10 @@ int main(int argc, char** argv)
     void* device = nullptr;
     void* pso = nullptr;
     const bool hardware = draw && std::strcmp(argv[4], "hardware") == 0;
-    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0;
+    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
+                          GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0) != 0 ||
+                          GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0) != 0 ||
+                          GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, textured,
                                                 adapter, device, pso)) return rc;
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
@@ -296,8 +299,8 @@ int main(int argc, char** argv)
     } else if (argc == 7 || argc == 8) {
         // A render-target format for the translated MRT export, and an optional root constant.
         format = static_cast<DXGI_FORMAT>(std::strtoul(argv[6], nullptr, 10));
-        if (format != DXGI_FORMAT_R32_UINT && format != DXGI_FORMAT_R32_SINT &&
-            format != DXGI_FORMAT_R32G32B32A32_FLOAT) return 2;
+        StreamMrtFormat mrt{};
+        if (!stream_mrt_format(format, mrt)) return 2;
         if (argc == 8) export_word = static_cast<UINT>(std::strtoul(argv[7], nullptr, 0));
     }
     wchar_t manifest[MAX_PATH];

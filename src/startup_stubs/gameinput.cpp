@@ -35,6 +35,7 @@ constexpr HRESULT reading_too_old = static_cast<HRESULT>(0x838A0004);
 constexpr std::uint32_t kind_keyboard = 0x00000010;
 constexpr std::uint32_t kind_gamepad = 0x00040000, kind_controller_bits = 0x0000000E;
 constexpr std::uint32_t status_connected = 0x47;  // connected, input enabled, output enabled, synchronized
+constexpr std::uint32_t family_xbox_one = 1;      // GameInputFamilyXboxOne (GameInputDeviceFamily)
 constexpr std::size_t max_keys = 32;
 constexpr std::size_t history_capacity = 64;
 
@@ -720,6 +721,16 @@ HRESULT __stdcall input_previous_reading(Object*, Reading* reference, std::uint3
     *out = make_reading(entry, kind, device);
     return S_OK;
 }
+
+// Microsoft's v0 GetTemporalReading was never implemented and was removed in v1.
+HRESULT __stdcall input_temporal_reading(Object*, u64 timestamp, Object* device, Reading** out)
+{
+    static LONG calls;
+    note("GameInput::GetTemporalReading", calls, timestamp, reinterpret_cast<u64>(device));
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
+    *out = nullptr;
+    return E_NOTIMPL;
+}
 using DeviceCallback = void(__stdcall*)(u64 token, void* context, Object* device, u64 timestamp, std::uint32_t current, std::uint32_t previous);
 HRESULT __stdcall input_register_device_callback(Object*, Object* device, std::uint32_t kind, std::uint32_t status_filter, std::uint32_t enumeration,
                                                  void* context, DeviceCallback callback, u64* token)
@@ -817,6 +828,7 @@ void build()
     input_table.slots[4] = reinterpret_cast<void*>(&input_current_reading);
     input_table.slots[5] = reinterpret_cast<void*>(&input_next_reading);
     input_table.slots[6] = reinterpret_cast<void*>(&input_previous_reading);
+    input_table.slots[7] = reinterpret_cast<void*>(&input_temporal_reading);
     input_table.slots[8] = reinterpret_cast<void*>(&input_register_callback);          // RegisterReadingCallback
     input_table.slots[9] = reinterpret_cast<void*>(&input_register_device_callback);
     input_table.slots[10] = reinterpret_cast<void*>(&input_register_short_callback);   // RegisterGuideButtonCallback
@@ -848,7 +860,9 @@ void build()
     std::memcpy(device_info + 4, ids, 4);
     for (int i = 0; i < 32; ++i) device_info[0x20 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceId
     for (int i = 0; i < 32; ++i) device_info[0x40 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceRootId
-    const std::uint32_t tail[4] = {2 /* family: Xbox One */, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
+    // GameInputDeviceFamily: Virtual -1, XboxOne 1 (XboxGIP / XInputHID), Xbox360 2 (XUSB22), Hid 3, I8042 4. The
+    // vendor/product above name an Xbox Series pad, a GIP device, so the family is XboxOne.
+    const std::uint32_t tail[4] = {family_xbox_one, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
     std::memcpy(device_info + 0x60, tail, sizeof(tail));
     // Virtual keyboard device info.
     std::memcpy(keyboard_device_info, &size, 4);
