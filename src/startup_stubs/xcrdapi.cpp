@@ -152,9 +152,33 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
+// True when every page of [start, end) is resident and plain read-write: valid in the working set, PAGE_READWRITE
+// or PAGE_EXECUTE_READWRITE, no guard bit. One QueryWorkingSetEx per 512 pages, so the cost follows the
+// destination's size, not the region's. Reads attributes only; no page is touched.
+static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
+{
+    PSAPI_WORKING_SET_EX_INFORMATION pages[512];
+    std::uintptr_t page = start & ~std::uintptr_t{0xFFF};
+    while (page < end) {
+        DWORD count = 0;
+        for (; count < 512 && page < end; ++count, page += 0x1000) pages[count].VirtualAddress = reinterpret_cast<void*>(page);
+        if (!QueryWorkingSetEx(GetCurrentProcess(), pages, count * sizeof(pages[0]))) return false;
+        for (DWORD i = 0; i < count; ++i) {
+            const auto& page_info = pages[i].VirtualAttributes;
+            const DWORD protect = static_cast<DWORD>(page_info.Win32Protection);
+            if (!page_info.Valid || page_info.Bad || (protect & PAGE_GUARD) ||
+                ((protect & 0xFF) != PAGE_READWRITE && (protect & 0xFF) != PAGE_EXECUTE_READWRITE))
+                return false;
+        }
+    }
+    return true;
+}
+
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
-// no-access page in between. Walks the regions one VirtualQuery at a time, so a destination that spans
-// regions of different protection is judged page by page. Nothing is written or touched.
+// no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
+// their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
+// destination to the VirtualQuery walk, which judges it region by region. That walk is slow on the title's
+// large regions: each query scans to the end of the region (#2684).
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
@@ -162,6 +186,7 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     if (!destination || bytes > UINTPTR_MAX - cursor) return false;
     x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
     const std::uintptr_t end = cursor + bytes;
+    if (resident_read_write(cursor, end)) return true;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION info{};
         if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
@@ -1507,6 +1532,18 @@ MemorySample memory_sample() noexcept
     return sample;
 }
 
+// The heartbeat interval in ms: 10000 unless X2W_HEARTBEAT_INTERVAL_MS holds a whole number from 1000
+// to 10000. Only tests set it, to see a sample without waiting 10 s; anything else keeps the default.
+DWORD heartbeat_interval_ms() noexcept
+{
+    char text[16];
+    const DWORD length = GetEnvironmentVariableA("X2W_HEARTBEAT_INTERVAL_MS", text, sizeof(text));
+    if (length == 0 || length >= sizeof(text)) return 10000;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    return (*end == '\0' && value >= 1000 && value <= 10000) ? static_cast<DWORD>(value) : 10000;
+}
+
 }  // namespace
 
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
@@ -1527,8 +1564,10 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         MemorySample last_memory;
-        for (int second = 10;; second += 10) {
-            Sleep(10000);
+        const DWORD interval_ms = heartbeat_interval_ms();
+        for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
+            const int second = static_cast<int>(elapsed_ms / 1000);
+            Sleep(interval_ms);
             // Sample the counters once for every line of this report, even while the worker is reporting
             // new failures.
             StorageFailureCounts failure_counts;

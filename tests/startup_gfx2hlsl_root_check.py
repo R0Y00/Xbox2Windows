@@ -51,7 +51,13 @@ TABLE_ROOT = container([(b"RTS0", struct.pack("<6I", 1, 1, 24, 0, 36, 0)
 def main():
     table = gfx2hlsl.parse_root(TABLE_ROOT)["params"]
     assert table == [dict(type=1, vis=0, reg=5, space=2, count=3)], table
-    vs, ps = code(12), code(0)
+    # --pending visits requests in key order, and every key hashes the cache revision. Pick the pixel
+    # export target (mrt0..mrt7) so that the valid request sorts after a bad one at the current revision.
+    vs = code(12)
+    for target in range(8):
+        ps = code(target)
+        if gfx2hlsl.pipeline_key(vs, ps, VALID_ROOT) > min(gfx2hlsl.pipeline_key(vs, ps, root) for root, _ in BAD.values()):
+            break
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         requests = {name: root for name, (root, _) in BAD.items()}

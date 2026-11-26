@@ -19,6 +19,7 @@ import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
+from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
 class Unsupported(Exception):
@@ -215,6 +216,46 @@ def validate_store_d16_x_word3(word3):
         raise Unsupported('buffer_store_format_d16_x unsupported descriptor FORMAT %d' % field)
     return code, info[0], info[1]
 
+
+# Compute buffer_store_format_xyzw (MUBUF 0x07) writes only formats with exactly four channels, the set and
+# conversions of tools/compute_store_aot.py: a channel-count mismatch writes nothing, since what the format unit
+# does with the extra components is not established here. Word 3 bounds and OOB_SELECT checks are those of
+# buffer_store_format_d16_x above; DST_SEL must be the identity X, Y, Z, W (0xfac).
+STORE_FORMAT_XYZW_FORMATS = {
+    50: ('BUF_FMT_2_10_10_10_UNORM', 4),
+    56: ('BUF_FMT_8_8_8_8_UNORM', 4),
+    71: ('BUF_FMT_16_16_16_16_FLOAT', 8),
+    75: ('BUF_FMT_32_32_32_32_UINT', 16),
+    77: ('BUF_FMT_32_32_32_32_FLOAT', 16),
+}
+STORE_FORMAT_XYZW_LEGACY_FORMATS = {
+    (9 << 3) | 0: 50,   # DFMT_2_10_10_10 + NFMT_UNORM
+    (10 << 3) | 0: 56,  # DFMT_8_8_8_8 + NFMT_UNORM
+    (12 << 3) | 7: 71,  # DFMT_16_16_16_16 + NFMT_FLOAT
+    (14 << 3) | 4: 75,  # DFMT_32_32_32_32 + NFMT_UINT
+    (14 << 3) | 7: 77,  # DFMT_32_32_32_32 + NFMT_FLOAT
+}
+
+
+def validate_store_format_xyzw_word3(word3):
+    """Validate V# word 3 for compute buffer_store_format_xyzw and return (code, name, elem_bytes)."""
+    name = 'buffer_store_format_xyzw'
+    if not isinstance(word3, int) or isinstance(word3, bool) or not 0 <= word3 <= 0xffffffff:
+        raise Unsupported('%s invalid descriptor word 3 %r' % (name, word3))
+    if word3 & STORE_D16_X_WORD3_ZERO_MASK:
+        raise Unsupported('%s unsupported descriptor word 3 flags 0x%08x' % (name, word3))
+    if (word3 & 0xfff) != 0xfac:
+        raise Unsupported('%s non-identity DST_SEL 0x%03x' % (name, word3 & 0xfff))
+    oob_select = (word3 >> 28) & 3
+    if oob_select not in (0, 3):
+        raise Unsupported('%s unsupported OOB_SELECT %d' % (name, oob_select))
+    field = (word3 >> DESC_FORMAT_SHIFT) & DESC_FORMAT_MASK
+    code = field if ((word3 >> 24) & 1) else STORE_FORMAT_XYZW_LEGACY_FORMATS.get(field)
+    info = STORE_FORMAT_XYZW_FORMATS.get(code)
+    if info is None:
+        raise Unsupported('%s descriptor FORMAT %d is not a handled 4-channel format' % (name, field))
+    return code, info[0], info[1]
+
 def starts_with_fetch_call(code):
     return len(code) >= 4 and struct.unpack_from('<I', code)[0] == FETCH_CALL
 
@@ -222,7 +263,8 @@ def starts_with_fetch_call(code):
 def parse_input_layout(text):
     """'ia1 <n>' then one '<semantic> <index> <format> <slot> <offset> <class> <step>' line per element."""
     lines = text.split('\n')
-    if not re.fullmatch(r'ia1 ([1-9]|[12][0-9]|3[0-2])', lines[0]) or lines[-1] != '' or len(lines) != int(lines[0][4:]) + 2:
+    # 'ia1 0' is a layout the pipeline declares with no elements: no fetched input has a source.
+    if not re.fullmatch(r'ia1 (0|[1-9]|[12][0-9]|3[0-2])', lines[0]) or lines[-1] != '' or len(lines) != int(lines[0][4:]) + 2:
         raise Unsupported('invalid input layout request')
     elements, ends = [], {}
     for line in lines[1:-1]:
@@ -274,6 +316,12 @@ def stream_fetch(vs_container, layout_text):
         if register not in inputs:
             raise Unsupported('vertex fetch record for input register %d outside the signature' % register)
         name, index, _ = inputs[register]
+        if not layout:
+            # Declared layout without elements: the input has no vertex buffer; its registers read as zero
+            # (shortcut: the zero default is an assumption, not a measurement).
+            fetch.append(dict(vgpr=vgpr, count=count, empty=True))
+            at += 5
+            continue
         match = [e for e in layout if (e['name'], e['index']) == (name, index)]
         if len(match) != 1:
             raise Unsupported('input layout has %d elements for vertex input register %d' % (len(match), register))
@@ -431,12 +479,14 @@ def check_encoding(code, off, n, name, asm):
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0x700 or word1 & 0xe0000000:
             raise Unsupported('%s with neg/abs: not a 16-bit integer source modifier' % name)
-    if name in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32'):
-        # VOP3A integer SAD forms take no source abs/neg; refuse those bits here so neg on an inline
+    if name in ('v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_sad_u32', 'v_msad_u8', *VOP3_ONLY_VEC_U):
+        # VOP3A integer forms take no source abs/neg; refuse those bits here so neg on an inline
         # integer does not print as -N and get accepted as a negative constant.
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0x700 or word1 & 0xe0000000:
             raise Unsupported('%s with neg/abs' % name)
+        if name in VOP3_ONLY_VEC_U and (word1 >> 18) & 0x1ff:
+            raise Unsupported('%s with unused src2 field set' % name)
     if name == 'v_cvt_off_f32_i4_e64':
         # Integer-nibble conversion: the instruction has one source, so only src0's VOP3A ABS (w0[8]) and NEG
         # (w1[29]) can carry a modifier. Masking all three bit positions of each field (w0[10:8], w1[31:29])
@@ -578,6 +628,16 @@ def fbits(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
 
+def ptr_high_symbol(source, offset):
+    """High word of a 64-bit pointer advanced by a literal offset: the original word, or the one a completed
+    s_addc_u32 produced for exactly that accumulated offset (an advanced word never equals another offset's)."""
+    return ('ptrhi', source) if not offset else ('ptrhi', source, offset)
+
+
+# Sources whose pointer is a 64-bit register pair (the low word 'ptr', the high word 'ptrhi').
+PTR64_SOURCES = ('root', 'vbtab')
+
+
 @functools.lru_cache(maxsize=None)
 def reg_range(tok):
     """'s[8:11]' -> ('s', 8, 11); 's8' -> ('s', 8, 8); 'v[1:3]' -> ('v', 1, 3); 'exec'/'vcc' pairs too."""
@@ -690,6 +750,58 @@ def clear_after(name, asm, may, clear):
     return out | {(word, h) for word, held in writes for h in held}
 
 
+def mask_lanes(name, asm):
+    """(operation, destination words, source word lists) of a bitwise scalar mask instruction, or None. Word p of
+    every operand holds the same lanes: wave half p of a 64-bit form."""
+    m = re.fullmatch(r's_(mov|and|andn2|or|orn2|nand|nor|xor|xnor)_b(32|64)', re.sub(r'_e(32|64)$', '', name))
+    if not m:
+        return None
+    words = [mask_words(op, 2 if m.group(2) == '64' else 1) for op in parse(asm)[1]]
+    if None in words or len(words) != (2 if m.group(1) == 'mov' else 3):
+        return None
+    return m.group(1), words[0], words[1:]
+
+
+def high_half_of_b32(lanes, word):
+    """True for a 32-bit form that names the high half of a mask (vcc_hi): its bit n is lane 32 + n, which the word
+    position of a one-word operand (always the low half) does not say, so no lane-wise rule applies to it."""
+    return word.endswith('_hi') and len(lanes[1]) == 1
+
+
+def exec_absorbs(name, asm, word):
+    """True when an instruction reads `word` only through an operation whose result bit is fixed while the exec bit
+    of the same lanes is clear: W & exec and exec & W give 0, ~(W & exec) and W | ~exec give 1."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or lanes[0] not in ('and', 'nand', 'orn2') or high_half_of_b32(lanes, word):
+        return False
+    a, c = lanes[2]
+    pairs = [(a, c)] if lanes[0] == 'orn2' else [(a, c), (c, a)]
+    return any(word in w and word not in e and all(e[p] == ('exec', 'exec_hi')[p] for p in range(len(w)) if w[p] == word)
+               for w, e in pairs)
+
+
+def kept_halves(name, asm, word, clear):
+    """Wave halves whose lanes keep their bit of `word` through `s_andn2 R, R, X` when X is clear for them: R & ~X
+    keeps bit n of R when bit n of X is clear. Empty for any other write of `word`."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or lanes[0] != 'andn2' or lanes[1] != lanes[2][0]:
+        return set()
+    return {h for p, w in enumerate(lanes[1]) if w == word for key, h in clear if key == lanes[2][1][p]}
+
+
+def lane_read(name, asm, word, halves):
+    """True when an instruction reads `word` as a lane mask, bit n of each result from bit n of the sources, with
+    `word` in a position whose lanes are in `halves`, any exec operand there the exec word of those lanes, and the
+    result there written to that exec word or back to `word`, not copied to another register."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or high_half_of_b32(lanes, word):
+        return False
+    _, dest, srcs = lanes
+    at = {p for src in srcs for p, w in enumerate(src) if w == word}
+    return bool(at) and at <= halves and all(dest[p] in (word, ('exec', 'exec_hi')[p]) for p in at) and all(
+        w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
+
+
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
@@ -721,6 +833,9 @@ def scalar_effects(name, asm):
         may |= EXEC_KEYS
     if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
         writes.add('scc')
+    # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too.
+    if 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
+        may.add('vcc_hi')
     return reads, writes, writes | may | ({'scc'} if base.startswith('s_') else set())
 
 # Forms with no scalar destination: their printed operands are all sources (v_cmpx writes only EXEC, which the
@@ -731,6 +846,9 @@ NO_SCALAR_DESTINATION = ('s_cbranch', 's_branch', 's_waitcnt', 's_nop', 's_endpg
 TWO_SCALAR_DESTINATIONS = ('v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale', 'v_mad_u64_u32', 'v_mad_i64_i32')
 # Symbols whose register also holds the value at run time: constants are assigned when set, entry root constants are
 # assigned at entry when a join needs it, and the others are assigned when tracked.
+# Longest uniform HLSL expression a VGPR keeps for a first-lane read: a chain past it is no longer recomputable.
+UNIFORM_EXPR_LIMIT = 4096
+
 RUN_TIME_SYMBOLS = ('const', 'ud', 'execcopy', 'fixed_buffer_word')
 
 
@@ -747,11 +865,12 @@ def names_one_value(sym):
     if sym is None:
         return False
     if sym[0] == 'desc':
-        # ('desc', source, load offset, dword) and, in a compute stage, the offset of the s_load that read it: the
-        # source does not record an addend on the pointer, so only the same load proves the same words.
+        # A compute descriptor can also carry an integer tag identifying the load or constant high word.
         return len(sym) == 4 or (len(sym) == 5 and isinstance(sym[4], int))
-    # An add on a pointer keeps its symbol and marks it 'added' (the offset is not in the tuple), so only an
-    # untouched pointer, exactly (kind, source), names one value.
+    # A table and a known byte offset identify one descriptor address. The legacy 'added'
+    # marker carries no offset, so two occurrences of it can denote different addresses.
+    if sym[0] == 'ptr' and len(sym) == 3 and sym[1][0] == 'table':
+        return isinstance(sym[2], int)
     return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
 
 
@@ -821,6 +940,12 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+MODIFIER_FREE_HANDLERS = frozenset((
+    'op_v_mov_b32', 'op_v_cvt_pkrtz_f16_f32', 'op_v_interp_p1_f32',
+    'op_v_interp_p2_f32', 'op_v_interp_mov_f32',
+))
+
+
 def smem_mods(mods):
     """Non-negative 21-bit signed immediate byte offset from SMEM modifiers, refusing unknown or negative forms."""
     imm = None
@@ -844,8 +969,19 @@ def smem_mods(mods):
 # only local arithmetic. Move copies its input bits. None reads a lane ID or another lane.
 UNIFORM_VALU = frozenset((
     'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_u32', 'v_cvt_f32_ubyte0', 'v_cvt_off_f32_i4',
+    'v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32',
     'v_mul_f32', 'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_med3_f32', 'v_mov_b32',
+    # Pure 32-bit integer ALU: each lane computes the result from its own sources only, so equal sources give
+    # equal results in every lane (no carry-out, no lane ID, no cross-lane read).
+    'v_add_nc_u32', 'v_sub_nc_u32', 'v_subrev_nc_u32', 'v_and_b32', 'v_or_b32', 'v_xor_b32', 'v_not_b32',
+    'v_lshlrev_b32', 'v_lshrrev_b32', 'v_ashrrev_i32', 'v_mul_lo_u32', 'v_mul_u32_u24',
+    'v_min_u32', 'v_max_u32', 'v_min_i32', 'v_max_i32',
 ))
+
+UNIFORM_LOAD_WORDS = {'buffer_load_dword': 1, 'buffer_load_dwordx2': 2, 'buffer_load_dwordx3': 3, 'buffer_load_dwordx4': 4,
+                      'buffer_load_format_x': 1, 'buffer_load_format_xy': 2, 'buffer_load_format_xyz': 3,
+                      'buffer_load_format_xyzw': 4}
+UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
@@ -1335,13 +1471,155 @@ MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
-def mesh_skeleton(ins, vcc_branches):
+MESH_LOOP_REFUSAL = 'slot 57 mesh: a loop outside the group-memory exchanges is not covered'
+MESH_TRIP_STEPS = ('s_add_u32', 's_add_i32', 's_sub_u32', 's_sub_i32')
+MESH_TRIP_MAX = 64
+
+
+def mesh_inline_u32(tok):
+    """An inline integer or float-bit SOP operand as a u32, or None."""
+    if tok in FLOATS:
+        return fbits(FLOATS[tok]) & 0xffffffff
+    m = re.fullmatch(r'-?(?:0x[0-9a-f]+|\d+)', tok)
+    if not m:
+        return None
+    value = int(tok, 0)
+    return value & 0xffffffff if value >= 0 else (value + (1 << 32)) & 0xffffffff
+
+
+def mesh_trip_count(init, step_name, step_imm, cmp_name, limit, latch_name, cmp_counter_left):
+    """Finite trip count for a scalar counted loop, or None when unbounded / unsupported."""
+    counter = init & 0xffffffff
+    step = step_imm & 0xffffffff
+    signed = '_i32' in cmp_name  # compare opcode alone
+    take_when_scc = latch_name == 's_cbranch_scc1'
+
+    def as_signed(word):
+        return word - (1 << 32) if word >= (1 << 31) else word
+
+    for trips in range(1, MESH_TRIP_MAX + 1):
+        if step_name.startswith('s_add'):
+            counter = (counter + step) & 0xffffffff
+        else:
+            counter = (counter - step) & 0xffffffff
+        left, right = (counter, limit) if cmp_counter_left else (limit, counter)
+        if signed:
+            left, right = as_signed(left), as_signed(right)
+        if cmp_name.endswith(('_eq_i32', '_eq_u32')):
+            scc = left == right
+        elif cmp_name.endswith(('_lg_i32', '_lg_u32')):
+            scc = left != right
+        elif cmp_name.endswith(('_gt_i32', '_gt_u32')):
+            scc = left > right
+        elif cmp_name.endswith(('_ge_i32', '_ge_u32')):
+            scc = left >= right
+        elif cmp_name.endswith(('_lt_i32', '_lt_u32')):
+            scc = left < right
+        elif cmp_name.endswith(('_le_i32', '_le_u32')):
+            scc = left <= right
+        else:
+            return None
+        if take_when_scc != scc:
+            return trips
+    return None
+
+
+def mesh_constant_trip(ins, header, latch, offsets):
+    """Prove one constant-trip SCC back-edge: (trips,) or None.
+
+    Shape (census "constant pattern", with an exact trip count): s_mov_b32 sN, C immediately before the
+    header; the body changes sN only by s_add/s_sub of a constant; the last body instruction is s_cmp of sN
+    against a constant; the latch is s_cbranch_scc0/scc1 back to the header. No other branch enters or leaves
+    the body, and the body does not write EXEC, touch a barrier, LDS, sendmsg, or export.
+    """
+    if header <= 0 or latch <= header or latch >= len(ins):
+        return None
+    latch_name = ins[latch][2]
+    if latch_name not in ('s_cbranch_scc0', 's_cbranch_scc1'):
+        return None
+    init_name, init_ops, _ = parse(ins[header - 1][3])
+    if init_name != 's_mov_b32' or len(init_ops) != 2 or not re.fullmatch(r's\d+', init_ops[0]):
+        return None
+    init_imm = mesh_inline_u32(init_ops[1])
+    if init_imm is None:
+        return None
+    counter = init_ops[0]
+    counter_n = int(counter[1:])
+    body = ins[header:latch]
+    if not body or not body[-1][2].startswith('s_cmp_'):
+        return None
+    cmp_name, cmp_ops, _ = parse(body[-1][3])
+    if len(cmp_ops) != 2:
+        return None
+    if cmp_ops[0] == counter:
+        cmp_counter_left, limit_tok = True, cmp_ops[1]
+    elif cmp_ops[1] == counter:
+        cmp_counter_left, limit_tok = False, cmp_ops[0]
+    else:
+        return None
+    limit = mesh_inline_u32(limit_tok)
+    if limit is None:
+        return None
+    step = None
+    for off, size, name, asm in body[:-1]:
+        if name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_call', 's_swappc')):
+            return None
+        if name.startswith(('ds_', 'exp')) or name in ('s_barrier', 's_sendmsg', 's_sendmsghalt'):
+            return None
+        _, ops, _ = parse(asm)
+        if writes_exec(name, ops) or name.startswith('v_cmpx') or name == 's_and_saveexec_b64':
+            return None
+        if name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm):
+            return None
+        writes = set()
+        for tok in destinations(name, ops):
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                writes.update(range(r[1], r[2] + 1))
+        if counter_n in writes:
+            if name not in MESH_TRIP_STEPS or len(ops) != 3 or ops[0] != counter:
+                return None
+            if ops[1] == counter and mesh_inline_u32(ops[2]) is not None:
+                imm = mesh_inline_u32(ops[2])
+            elif (ops[2] == counter and mesh_inline_u32(ops[1]) is not None
+                  and name.startswith('s_add')):
+                # Add is commutative; s_sub with the counter as SRC1 is a different recurrence.
+                imm = mesh_inline_u32(ops[1])
+            else:
+                return None
+            if step is not None:
+                return None
+            step = (name, imm)
+    if step is None:
+        return None
+    # No other branch may enter the body past the header or leave it before the latch.
+    for i, (off, _, name, asm) in enumerate(ins):
+        if not name.startswith(('s_cbranch', 's_branch')):
+            continue
+        target = int(parse(asm)[1][0].split('_')[1], 16)
+        dest = offsets.get(target)
+        if dest is None:
+            continue
+        if i == latch:
+            continue
+        if header <= i < latch and not (header <= dest <= latch):
+            return None
+        if header < dest <= latch and not (header <= i <= latch):
+            return None
+    trips = mesh_trip_count(init_imm, step[0], step[1], cmp_name, limit, latch_name, cmp_counter_left)
+    return (trips,) if trips is not None else None
+
+
+def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
     """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
 
     Accepted shape, in program order (anything else is refused with its own message):
     - Exchange: exec = 1 (lane 0 of each wave), the mask saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
       entry v5 >> 7 at byte 8, waits and passes a barrier; every other wave passes a barrier and reads byte 8 to v5.
     - Code up to the next barrier. Its only read of v5 may be one v_readfirstlane_b32 under exec = -1.
+      After a full EXEC reset, an unsigned GT or LT EXEC compare with defined operands may guard a forward
+      execz branch to that barrier. The skipped instructions only affect active lanes or dead scalars, and
+      both exchange arms replace EXEC, so a per-lane skip has the same visible effects as a per-wave skip.
     - Counts: one barrier; the wave whose index (s_bfe_u32 of s3, 4 bits at 24) is zero stores SGPR P at byte 0 and
       SGPR V at byte 4 under the saved lane-0 mask, waits, passes a barrier and sends one allocation request with
       m0 = P << 12 | V; every other wave passes a barrier and reads both words back into the same P and V.
@@ -1384,6 +1662,42 @@ def mesh_skeleton(ins, vcc_branches):
 
     offsets = {item[0]: i for i, item in enumerate(ins)}
     edges = {}
+    count_entry = count_entry_branch = None
+    # header index -> (latch index, trip count). Constant-trip loops are unrolled below.
+    constant_trips = {}
+    no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+    exchange_branch_refusal = 'slot 57 mesh: a branch enters or crosses a group-memory exchange'
+
+    def lane_only(i):
+        _, _, name, asm = ins[i]
+        return (name.startswith(('v_', 'buffer_load')) and not name.startswith(EXECZ_REFUSED)
+                and not scalar_effects(name, asm)[2])
+
+    def dead_count_entry_scalar(i):
+        _, _, name, asm = ins[i]
+        if not re.fullmatch(
+                r's_(and|or|xor|andn2|orn2|bfe|max|min|mul|add|sub|lshl|lshr|ashr|mov|movk)_[biu]\d+', name):
+            return False
+        _, must, may = scalar_effects(name, asm)
+        written = must | may
+        regs = written - {'scc'}
+        if not written or any(not re.fullmatch(r's\d+', reg) for reg in regs):
+            return False
+        # Uses within the skipped block are fine. Every path out of it joins at the count exchange.
+        if any(regs & scalar_effects(*ins[j][2:])[0] for j in range(count_at, len(ins))):
+            return False
+        if 'scc' in written:
+            for j in range(count_at, len(ins)):
+                reads, must, may = scalar_effects(*ins[j][2:])
+                if ins[j][2].startswith(('s_cbranch', 's_branch', 's_setpc', 's_call', 's_swappc', 's_endpgm')):
+                    return False
+                if 'scc' in reads:
+                    return False
+                if 'scc' in must:  # a may-write alone (s_barrier) neither reads nor kills it
+                    return True
+            return False
+        return True
+
     for lo, hi in ((0, start), (a_end, count_at), (b_end, len(ins))):
         for i in range(lo, hi):
             off, _, name, asm = ins[i]
@@ -1397,32 +1711,103 @@ def mesh_skeleton(ins, vcc_branches):
             dest = offsets.get(target)
             if dest is None:
                 raise Unsupported('slot 57 mesh: a branch target is not an instruction boundary')
-            # The first instruction of an exchange is also the preceding region's join.
-            # Branches must reconverge before that instruction.
             if not lo <= dest < hi:
-                raise Unsupported('slot 57 mesh: a branch enters or crosses a group-memory exchange')
+                # Both count exchange arms replace the incoming EXEC before lane-dependent work.
+                if lo != a_end or dest != count_at or name != 's_cbranch_execz':
+                    raise Unsupported(exchange_branch_refusal)
+                compare = i - 1
+                while compare >= lo and ins[compare][2] in ('s_nop', 's_waitcnt'):
+                    compare -= 1
+                if (compare <= lo or ins[compare - 1][3] != 's_mov_b64 exec, -1'
+                        or ins[compare][2] not in ('v_cmpx_gt_u32_e32', 'v_cmpx_lt_u32_e32')
+                        or any(not (no_effect(k) or lane_only(k) or dead_count_entry_scalar(k))
+                               for k in range(i + 1, dest))):
+                    raise Unsupported(exchange_branch_refusal)
+                _, sources, _ = parse(ins[compare][3])
+                if len(sources) != 2 or any(not (re.fullmatch(r'[sv]\d+', tok) or tok in FLOATS
+                                                 or pc_word(tok) is not None) for tok in sources):
+                    raise Unsupported(exchange_branch_refusal)
+                count_entry, count_entry_branch = compare, i
             if target <= off:
-                raise Unsupported('slot 57 mesh: a loop outside the group-memory exchanges is not covered')
+                proven = mesh_constant_trip(ins, dest, i, offsets)
+                if proven is None or dest in constant_trips:
+                    raise Unsupported(MESH_LOOP_REFUSAL)
+                constant_trips[dest] = (i, proven[0])
+                continue
             if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz') + MESH_VCC_BRANCHES:
                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
             edges[i] = dest
 
     targets = set(edges.values())
-    no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
+    if targets & set(constant_trips):
+        raise Unsupported(MESH_LOOP_REFUSAL)
+    if count_entry is not None and targets.intersection(range(count_entry, count_at)):
+        raise Unsupported(exchange_branch_refusal)
+    first_post_count_branch = next((i for i in edges if i >= b_end), None)
+    shift_branch = None
+    load_compare = None
+    execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
+
+    def live_at_join(reg, join):
+        pending, seen = [join], set()
+        while pending:
+            i = pending.pop()
+            if i >= len(ins) or i in seen:
+                continue
+            seen.add(i)
+            if i == count_at:
+                if reg in (env['prims'], env['verts']):
+                    return True
+                if reg != env['b_tmp']:
+                    pending.append(b_end)
+                continue
+            name, asm = ins[i][2:]
+            reads, writes, _ = scalar_effects(name, asm)
+            if reg in reads:
+                return True
+            if reg not in writes:
+                if i in edges:
+                    pending.append(edges[i])
+                if name not in ('s_branch', 's_endpgm'):
+                    pending.append(i + 1)
+        return False
+
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
+            # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
+            if (source == first_post_count_branch and source >= b_end + 2 and target == source + 2
+                    and ins[source + 1][2] == 's_lshl_b32' and ins[target][3] == 's_mov_b64 exec, -1'):
+                shift_branch = source
+                continue
+            if a_end <= source < target < count_at and load_compare is None:
+                loads = [i for i in range(source + 1, target) if ins[i][2] == 's_buffer_load_dword']
+                if len(loads) == 1:
+                    load = loads[0]
+                    compare = source - 1
+                    while compare > a_end and not writes_exec(ins[compare][2], parse(ins[compare][3])[1]):
+                        compare -= 1
+                    match = re.fullmatch(r'v_cmpx_gt_u32_e32 (s\d+), v(\d+)', ins[compare][3])
+                    dst = parse(ins[load][3])[1][0]
+                    if (compare <= a_end or ins[compare - 1][3] != 's_mov_b64 exec, -1' or not match
+                            or targets.intersection(range(compare, target))
+                            or any(i != load and not (no_effect(i) or lane_only(i))
+                                   for i in range(source + 1, target))
+                            or not re.fullmatch(r's\d+', dst) or not live_at_join(dst, target)):
+                        raise Unsupported(exchange_branch_refusal if target == count_at else execz_effects)
+                    load_compare, load_bound, load_thread = compare, match[1], int(match[2])
+                    wave_loads[ins[source][0]] = (ins[compare][0], load_bound, ins[load][0], dst)
+                    continue
             # The model skips per lane, while the guest skips per wave. The difference is invisible when
             # lanes with clear EXEC can only bypass predicated writes before the paths meet. A skipped
             # s_branch may land at the execz target or past it over instructions without effect (the
             # `s_branch .else` over `.empty: s_nop` of an if/else), so both paths meet with the same state.
             for i in range(source + 1, target):
-                _, _, name, asm = ins[i]
+                name = ins[i][2]
                 if not (no_effect(i) or name == 'exp'
                         or (name == 's_branch' and edges[i] >= target
                             and all(no_effect(k) for k in range(target, edges[i])))
-                        or (name.startswith(('v_', 'buffer_load')) and not name.startswith(EXECZ_REFUSED)
-                            and not scalar_effects(name, asm)[2])):
-                    raise Unsupported('slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes')
+                        or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))):
+                    raise Unsupported(execz_effects)
         elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
             raise Unsupported('slot 57 mesh: a branch bypasses an export')
 
@@ -1444,8 +1829,22 @@ def mesh_skeleton(ins, vcc_branches):
     exports = []
     incoming = {}
     falls = True
-    for index in (list(range(first, start)) + [start] + list(range(a_end, count_at)) + [None]
-                  + list(range(b_end, len(ins)))):
+    def region_walk(lo, hi):
+        """Instruction indices in [lo, hi), with each proven constant-trip body repeated and its latch dropped."""
+        order, i = [], lo
+        while i < hi:
+            if i in constant_trips:
+                latch, trips = constant_trips[i]
+                for _ in range(trips):
+                    order.extend(range(i, latch))
+                i = latch + 1
+                continue
+            order.append(i)
+            i += 1
+        return order
+
+    for index in (region_walk(first, start) + [start] + region_walk(a_end, count_at + 1)
+                  + region_walk(b_end, len(ins))):
         if index in targets:
             paths = incoming[index]
             if falls:
@@ -1476,7 +1875,7 @@ def mesh_skeleton(ins, vcc_branches):
             if base == a_bits or base in lane:
                 base = None
             continue
-        if index is None:
+        if index == count_at:
             if not wave_known:
                 raise Unsupported('slot 57 mesh count exchange: the compared register is not the wave index')
             out.append(span(count_at, b_end - 2) + (
@@ -1500,6 +1899,13 @@ def mesh_skeleton(ins, vcc_branches):
         if index in edges:
             if scc_stale and reads_scc(name, asm):
                 raise Unsupported('slot 57 mesh: an unmodelled SCC is read by a branch')
+            if index == shift_branch:
+                # Under full EXEC the preceding thread < limit comparison selects a contiguous prefix.
+                # A guest wave64 has any active lane exactly when its first thread is below the limit.
+                cmp = re.fullmatch(r'v_cmp_gt_u32_e32 vcc_lo, (0x[0-9a-f]+|[0-9]+), v(\d+)', ins[index - 2][3])
+                if mask != index - 1 or not cmp or int(cmp[2]) != thread:
+                    raise Unsupported('slot 57 mesh: scalar shift needs a proven wave EXEC predicate')
+                wave_limits[off] = int(cmp[1], 0)
             if name in MESH_VCC_BRANCHES:
                 if mask is not None or not vcc_compares:
                     raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
@@ -1511,7 +1917,11 @@ def mesh_skeleton(ins, vcc_branches):
             continue
         if name.startswith('ds_') or name in ('s_barrier', 's_sendmsg', 's_sendmsghalt'):
             raise Unsupported('slot 57 mesh: %s outside the group-memory exchanges' % name)
-        if name.startswith(('v_readlane', 'v_writelane')):
+        # Constant-lane v_writelane_b32 / v_readlane_b32 (#2413 T7, #2127): Stage lowers the idiom and
+        # refuses ordinary VGPR use, unwritten slots and non-constant lanes. The spill VGPR is not a
+        # per-lane value in this model, so it does not update the stale/pending sets below.
+        lane_spill = base_name in ('v_writelane_b32', 'v_readlane_b32')
+        if name.startswith(('v_readlane', 'v_writelane')) and not lane_spill:
             raise Unsupported('slot 57 mesh: lane spills are not covered')
         keep = ins[index]
         if base_name == 'v_readfirstlane_b32':
@@ -1528,7 +1938,8 @@ def mesh_skeleton(ins, vcc_branches):
                     writes_s.update(range(r[1], r[2] + 1))
         if 3 in writes_s or writes_s & lane:
             raise Unsupported('slot 57 mesh: the wave word s3 or the saved lane-0 mask is written')
-        if writes_s and name.startswith('v_') and keep[2] != 'x2w_mesh_group':
+        if (writes_s and name.startswith('v_') and keep[2] != 'x2w_mesh_group'
+                and base_name != 'v_readlane_b32'):
             raise Unsupported('slot 57 mesh: %s into an SGPR is not covered' % base_name)
         # Only the wave index of s3 is modelled.
         if not re.fullmatch(r's_bfe_u32 s\d+, s3, 0x40018', asm) and any(
@@ -1562,6 +1973,14 @@ def mesh_skeleton(ins, vcc_branches):
             stale |= pending
             pending.clear()
             mask, scc_stale = ('else', mask), True
+        elif index == count_entry:
+            if mask is not None or mesh_vregs(ops) & stale:
+                raise Unsupported(exchange_branch_refusal)
+            mask = 'count_entry'
+        elif index == load_compare:
+            if mask is not None or thread != load_thread or load_thread in stale:
+                raise Unsupported(execz_effects)
+            mask = 'wave_load'
         elif base_name.startswith('v_cmpx'):
             count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
             if (base_name != 'v_cmpx_gt_i32' or not after or mask is not None or count is None
@@ -1569,8 +1988,9 @@ def mesh_skeleton(ins, vcc_branches):
                 raise Unsupported('slot 57 mesh: an EXEC compare other than output count > thread index under '
                                   'exec = -1 is not covered')
             mask = count
-        elif writes_exec(name, ops) or re.search(r'\b(?:exec(?:_lo|_hi)?|src_execz|src_vccz)\b', asm) or (
-                name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm)):
+        elif (not lane_spill and (
+                writes_exec(name, ops) or re.search(r'\b(?:exec(?:_lo|_hi)?|src_execz|src_vccz)\b', asm) or (
+                    name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm)))):
             raise Unsupported('slot 57 mesh: %s on a wave mask is not covered' % base_name)
         # The thread index: v_mbcnt_lo(-1, wave << 6) then v_mbcnt_hi(-1, that) under exec = -1.
         if asm == 's_bfe_u32 %s, s3, 0x40018' % env['wave']:
@@ -1591,6 +2011,8 @@ def mesh_skeleton(ins, vcc_branches):
             thread_high = index + 1
         elif thread in writes_v and index != thread_high:
             raise Unsupported('slot 57 mesh: the thread index register is rewritten')
+        if lane_spill:
+            reads_v, writes_v = set(), set()
         if keep[2] != 'x2w_mesh_group' and reads_v & stale:
             raise Unsupported('slot 57 mesh: v%d is read where it is not defined for every lane (an entry value, or '
                               'left different per wave by an exchange)' % min(reads_v & stale))
@@ -1614,6 +2036,23 @@ def mesh_skeleton(ins, vcc_branches):
     return out
 
 
+def adjacent_address_carries(ins, targets):
+    """Map each candidate low add to its high-word carry read in the same basic block."""
+    pairs = {}
+    for index, (high_pc, _, name, asm) in enumerate(ins):
+        if name != 's_add_u32' or 'src_scc' not in asm or not index or high_pc in targets:
+            continue
+        low_pc, _, low_name, low_asm = ins[index - 1]
+        if low_name != 's_add_u32':
+            continue
+        low = parse(low_asm)[1]
+        if len(low) == 3 and re.fullmatch(r's\d+', low[0]):
+            reg = int(low[0][1:])
+            if reg < 105 and parse(asm)[1] == ['s%d' % (reg + 1), '0', 'src_scc']:
+                pairs[low_pc] = high_pc
+    return pairs
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -1635,6 +2074,8 @@ class Stage:
     bad_sgprs = None
     _uniform_written = None
     raw_code = b''
+    address_carry_pairs = ()
+    address_carry_reader = None
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -1646,7 +2087,13 @@ class Stage:
             self.ins = decode(self.raw_code, refusals) if decoded is None else decoded
         if kind == 'ms':
             self.mesh_vcc_branches = {}
-            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches)
+            self.mesh_wave_limits = {}
+            self.mesh_wave_loads = {}
+            # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
+            # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
+            self.mesh_source_ins = list(self.ins)
+            self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits, self.mesh_wave_loads)
+
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -1728,9 +2175,10 @@ class Stage:
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
-        then one SGPR per enabled group-ID axis (SV_GroupID), and v0..v2 holding SV_GroupThreadID. Where the root
-        parameters sit inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not
-        place (s0-s3 and any past the root's span) have no known value, so any numeric read of them is refused."""
+        then one SGPR per enabled group-ID axis (SV_GroupID), optional TG_SIZE when TG_SIZE_EN is set (only accepted
+        for at most 32 threads per group, #2274), and v0..v2 holding SV_GroupThreadID. Where the root parameters sit
+        inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not place (s0-s3 and
+        any past the root's span) have no known value, so any numeric read of them is refused."""
         user, groups, threads = self.pipe.entry
         if root_end > user:
             raise Unsupported('root signature needs s4-s%d, COMPUTE_PGM_RSRC2 gives %d user SGPRs' % (root_end - 1, user))
@@ -1742,6 +2190,9 @@ class Stage:
             self.used_s.add(n)
             self.entry_uniform_s.add(n)
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
+        tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
+        if tg_size is not None:
+            self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
             self.entry.append('v%d = tid.%s;' % (i, 'xyz'[i]))
@@ -1758,6 +2209,8 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'tg_size':
+                raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
@@ -1770,7 +2223,14 @@ class Stage:
 
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
+        if tok == 'src_scc':
+            # Source code 253 reads SCC as 0 or 1 (fits in 16 bits, so low16_only=True needs no mask).
+            # Refuse unless a modeled writer set SCC on the reaching path in this block.
+            if not getattr(self, 'scc_verified', False):
+                raise Unsupported('src_scc with unverified SCC')
+            return '(scc ? 1u : 0u)'
         if tok in ('vcc_lo', 'vcc'):
+            self.read_vcc()
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
             return 'exec'
@@ -1779,6 +2239,8 @@ class Stage:
             if m:
                 raise Unsupported('numeric use of m0 holding %s' % m[0])
             return 'm0'
+        if tok == 'null':
+            return '0x00000000u'
         r = reg_range(tok)
         if r:
             if r[0] == 'v':
@@ -1798,7 +2260,7 @@ class Stage:
     def is_lane_mask(self, tok):
         reg = reg_range(tok)
         return (tok in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
-                or bool(reg and reg[0] == 's' and reg[1] in self.masks))
+                or bool(reg and reg[0] == 's' and reg[1] in getattr(self, 'masks', ())))
 
     @staticmethod
     def split_neg(tok):
@@ -1812,13 +2274,37 @@ class Stage:
             return True, tok[1:]
         return False, tok
 
+    def reject_lane_mask_data(self, op, tok):
+        """The lane bit cannot represent a mask's word when it is read as data."""
+        source = tok
+        while True:
+            neg, operand = self.split_neg(source)
+            if neg:
+                source = operand
+            elif source.startswith('|') and source.endswith('|') and len(source) >= 2:
+                source = source[1:-1]
+            elif source.startswith(('abs(', 'sext(')) and source.endswith(')'):
+                source = source[source.index('(') + 1:-1]
+            else:
+                break
+        if self.is_lane_mask(source):
+            raise Unsupported('%s data operand %s is a lane mask' % (op, tok))
+
     def u_src(self, tok):
-        """uint expression for an integer-context source that the disassembler may print negated."""
-        # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
-        # pattern a float negation produces. Only handlers that model it ask for this; other integer
-        # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
+        """uint expression for an integer-context source that the disassembler may print with abs/neg."""
+        # In RDNA2 VOP3, `abs` clears bit 31 first and `-` / `neg(...)` flips bit 31 second (so `-|x|`
+        # forces bit 31 to 1, while `-x` flips bit 31). Only handlers that model them ask for this;
+        # other integer sources keep using u(), so an unexpected modifier stays refused.
         neg, tok = self.split_neg(tok)
-        return '(%s ^ 0x80000000u)' % self.u(tok) if neg else self.u(tok)
+        absolute = tok.startswith('|') and tok.endswith('|')
+        if absolute:
+            tok = tok[1:-1]
+        expr = self.u(tok)
+        if absolute:
+            expr = '(%s & 0x7fffffffu)' % expr
+        if neg:
+            expr = '(%s ^ 0x80000000u)' % expr
+        return expr
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
@@ -1841,6 +2327,8 @@ class Stage:
         return s[1] if s and s[0] == 'const' else None
 
     def const_u32(self, tok):
+        if tok == 'null':
+            return 0
         r = reg_range(tok)
         if r:
             if r[0] == 's' and r[1] == r[2]:
@@ -1854,8 +2342,73 @@ class Stage:
         except ValueError:
             return None
 
+    def read_vcc(self):
+        if getattr(self, 'has_branches', False):
+            self.vcc_events.setdefault(self.pc, []).append(('read_vcc', None))
+        elif getattr(self, 'vcc_lost', False):
+            raise Unsupported('vcc read after a descriptor load into s106/s107')
+
+    def mark_vcc_descriptor(self):
+        self.vcc_lost = True
+        self.vcc_descriptor_overwritten = False
+        if getattr(self, 'has_branches', False):
+            value = tuple(self.sym[i] for i in (106, 107))
+            self.vcc_events.setdefault(self.pc, []).append(('load_descriptor', value))
+
     def emit(self, text):
+        if 'vcc' in text:
+            assignment = re.match(r'vcc = (.*);$', text)
+            rhs = assignment.group(1) if assignment else text
+            if re.search(r'\bvcc\b', rhs):
+                self.read_vcc()
+            if assignment:
+                if getattr(self, 'has_branches', False):
+                    self.vcc_events.setdefault(self.pc, []).append(('write_vcc', None))
+                if getattr(self, 'vcc_lost', False):
+                    # The scalar symbols are provisional across branches, checked after translation.
+                    self.vcc_lost = False
+                    self.vcc_descriptor_overwritten = True
+                    if not getattr(self, 'has_branches', False):
+                        self.sym.pop(106, None)
+                        self.sym.pop(107, None)
         self.lines.append(text)
+
+    def check_vcc_paths(self):
+        """An overlapping descriptor must reach its use on every path, and VCC must be numeric at a mask read."""
+        if not self.has_branches or not any(event == 'load_descriptor' for events in self.vcc_events.values()
+                                           for event, _ in events):
+            return
+        offsets = [off for off, _, _ in self.blocks]
+        index = {off: i for i, off in enumerate(offsets)}
+        by_block = [[] for _ in offsets]
+        block = 0
+        for off, events in sorted(self.vcc_events.items()):
+            while block + 1 < len(offsets) and offsets[block + 1] <= off:
+                block += 1
+            by_block[block].extend(events)
+        todo = [(0, None)]
+        seen = set()
+        while todo:
+            block, state = todo.pop()
+            if (block, state) in seen:
+                continue
+            seen.add((block, state))
+            for event, value in by_block[block]:
+                if event == 'read_vcc' and state is not None:
+                    raise Unsupported('vcc read after a descriptor load into s106/s107')
+                if event == 'read_descriptor':
+                    if state is None or any(state[reg] != symbol for reg, symbol in value):
+                        raise Unsupported('descriptor operand overlaps s106/s107 without a matching load on every path')
+                if event == 'load_descriptor':
+                    state = value
+                elif event == 'write_vcc':
+                    state = None
+            term = self.blocks[block][2]
+            if term and term[0] in ('jump', 'branch'):
+                if term[-1] in index:
+                    todo.append((index[term[-1]], state))
+            if (not term or term[0] == 'branch') and block + 1 < len(offsets):
+                todo.append((block + 1, state))
 
     def clear_low16(self, n):
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
@@ -1919,9 +2472,29 @@ class Stage:
         """Emit an SCC assignment and track its uniformity from `proof` (an expression over the
         sources) when the emitted text names a register, such as m0, that the proof cannot judge."""
         self.scc_effect = 'emitted'
+        self.scc_verified = True
         if self.tracks_uniformity():
             self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
         self.emit('scc = %s;' % expr)
+
+    def record_scalar_uniformity(self, n, uniform):
+        if uniform:
+            self.varying_s.discard(n)
+            if self.defined_uniform_s is not None:
+                self.defined_uniform_s.add(n)
+            if self._uniform_written is not None:
+                self._uniform_written.add(n)
+        else:
+            self.varying_s.add(n)
+            if self.defined_uniform_s is not None:
+                self.defined_uniform_s.discard(n)
+            if self._uniform_written is not None:
+                self._uniform_written.discard(n)
+            if self.bad_sgprs is not None:
+                self.bad_sgprs.add(n)
+        # Only a proved assignment can add an SGPR to since_join. Unmodelled writes drop any stale mark.
+        if getattr(self, 'since_join', None) is not None:
+            (self.since_join.add if uniform else self.since_join.discard)(n)
 
     def set_s(self, n, expr, sym=None, scc=None, uniform=None):
         """Assign scalar register n at run time and/or symbolically.
@@ -1931,24 +2504,7 @@ class Stage:
         if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
             if uniform is None:
                 uniform = self.scalar_expr_uniform(expr)
-            if uniform:
-                self.varying_s.discard(n)
-                if self.defined_uniform_s is not None:
-                    self.defined_uniform_s.add(n)
-                if self._uniform_written is not None:
-                    self._uniform_written.add(n)
-            else:
-                self.varying_s.add(n)
-                if self.defined_uniform_s is not None:
-                    self.defined_uniform_s.discard(n)
-                if self._uniform_written is not None:
-                    self._uniform_written.discard(n)
-                if self.bad_sgprs is not None:
-                    self.bad_sgprs.add(n)
-            # Invariant: since_join gains an SGPR only here, when set_s proves it uniform; forget_writes drops any SGPR
-            # an instruction writes first, so a write through an unmodelled path never keeps a stale mark.
-            if getattr(self, 'since_join', None) is not None:
-                (self.since_join.add if uniform else self.since_join.discard)(n)
+            self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         getattr(self, 'float_const_s', {}).pop(n, None)
         if sym is not None:
@@ -1966,11 +2522,23 @@ class Stage:
         """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
         r = reg_range(tok)
         s = self.sym.get(r[1]) if r else None
+        if r and r[0] == 's' and r[1] <= 107 and r[2] >= 106:
+            if getattr(self, 'has_branches', False):
+                expected = tuple((i - 106, self.sym.get(i)) for i in range(max(106, r[1]), min(107, r[2]) + 1))
+                self.vcc_events.setdefault(self.pc, []).append(('read_descriptor', expected))
+            elif getattr(self, 'vcc_descriptor_overwritten', False):
+                raise Unsupported('descriptor operand %s overlaps a redefined vcc' % tok)
+        if r == ('s', 104, 107) and s and s[0] == 'desc' and (
+                s[3] % 4 or
+                any(self.sym.get(104 + i) != desc_word(s, s[3] + i) for i in range(1, 4))):
+            raise Unsupported('descriptor operand %s needs four consecutive words of the same descriptor' % tok)
         if s and s[0] == 'desc':
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
+            if len(s) > 2 and s[2]:
+                raise Unsupported('descriptor operand %s is a pointer with offset %s' % (tok, hex(s[2]) if isinstance(s[2], int) else s[2]))
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
@@ -2008,10 +2576,12 @@ class Stage:
         the block (its branches and loops included), which masks have that lane's bit clear, and the write must
         leave exec among them. Such a lane's bit then stays clear at every instruction the wave runs in the block,
         so the wave changes nothing of that lane there and its exec at the join is the model's. The proof starts at
-        the branch, so a block that a branch from outside enters keeps its exec writes refused. A live definition,
-        an unproven exec write, a refused effect, a branch leaving the block or a backward s_cbranch_execz is
-        refused.
-        One live definition is accepted: the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
+        the branch, so a block that a branch from outside enters keeps its exec writes refused. A definition live at
+        the join is accepted when every read of it after the join is proven (execz_live_read), or when it has the
+        shape below. Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
+        or a backward s_cbranch_execz is refused.
+
+        The other accepted live definition is the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
         or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
         exec_lo`, `s_and_b32 M, X, exec_lo` in either operand order). Every write of M in the block yields a value
         whose bit is 0 for any lane whose exec bit is clear there: the clear-mask proof keeps exec clear for that lane, and a copy of exec, or X & exec, has that bit clear. M is 0
@@ -2045,7 +2615,16 @@ class Stage:
                 value = reads | (out - writes)
                 if value != live_in[i]:
                     live_in[i], changed = value, True
-        refused = {}
+        self.waterfall_reads = {}
+        for close, target in jumps:
+            head = index.get(target)
+            if (head is not None and head + 3 < close and self.ins[close][2] == 's_cbranch_scc1'
+                    and self.ins[head][2] == 'v_readfirstlane_b32'
+                    and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
+                self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+        refused, into = {}, {}
+        for k, target in jumps:
+            into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
             if name != 's_cbranch_execz':
                 continue
@@ -2072,6 +2651,20 @@ class Stage:
                 not any(index.get(target) in range(b + 1, t) for target in targets)
             cand = {k for i in range(b + 1, t) for k in (effects[i][2] - EXEC_KEYS) & live if re.fullmatch(r'vcc|s\d+', k)}
             ok_masks = {k for k in cand if straight and self.phi_mask_ok(k, b, t, effects, succ, targets, index)}
+            # A live definition is still accepted when every read of it from the join on is proven (execz_live_read):
+            # the halves whose lanes keep their bit of the word through the block, and where exec is unchanged since
+            # the join on every path from it.
+            kept = {}
+            for i in range(b + 1, t):
+                for word in (effects[i][2] - EXEC_KEYS) & live:
+                    if kept.get(word, True):  # an empty set stays empty
+                        andn2 = i in before and not entered and self.ins[i][2].startswith('s_andn2')
+                        halves = kept_halves(*self.ins[i][2:], word, before[i]) if andn2 else set()
+                        kept[word] = kept.get(word, halves) & halves
+            def quiet(j):  # exec unchanged since the join on every path to j: a straight run from t, entered at t only
+                return t <= j and all(b <= k < t for k in into.get(t, ())) and not any(
+                    effects[k][2] & EXEC_KEYS for k in range(t, j)) and not any(k in into for k in range(t + 1, j + 1))
+            unread = {}
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
@@ -2084,12 +2677,142 @@ class Stage:
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
-                elif (may - EXEC_KEYS - ok_masks) & live:
-                    reason = 'definition of %s, live where the block joins' % ', '.join(
-                        sorted((may - EXEC_KEYS - ok_masks) & live))
+                elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
+                               if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
+                    named = [unread[word] for word in words if unread[word] >= 0]
+                    reason = 'definition of %s, live where the block joins' % ', '.join(words) + (
+                        ': read by %s after the join' % self.ins[min(named)][2] if named else '')
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
+        """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
+        definition, gives a lane the model skipped the wave's result; else the first read that is not proven, or -1
+        for m0 and SCC, which have implicit readers.
+
+        Such a lane's exec bit is clear at the join, in the model and in the wave (execz_refusals proves the block's
+        exec writes), and the two differ there at most in `word`. A read is proven when:
+        - exec is unchanged on every path from the join to it (`quiet`: the read ends a straight run that starts at
+          the join, which only the block enters, with no exec write in it) and it reads `word` only as W & exec,
+          ~(W & exec) or W | ~exec, exec of the same lanes (exec_absorbs): the lane's bit of the result is fixed
+          whatever its bit of `word` is, so the result agrees, and when it overwrites `word` the definition ends;
+        - the block keeps the lane's bit of `word` for its half (kept_halves: every write of `word` in the block is
+          s_andn2 R, R, X with X clear for the lane, checked over every path from the branch) and the read is a lane
+          mask read of that half (lane_read): the lane's bit of `word` is the model's, so its bit of the result is
+          too, and `word` written back that way keeps the property.
+        Any other read, a data read or a copy into another register included, is not proven. The search stops at
+        the first such read, nearest the join; the result is kept in `unread` for the block."""
+        if word in unread:
+            return unread[word]
+        if not re.fullmatch(r'vcc(_hi)?|s\d+', word):
+            unread[word] = -1
+            return -1
+        seen, work = {t}, [t]
+        for j in work:  # breadth first: the list grows while it is read
+            name, asm = self.ins[j][2:]
+            kept_read = word in effects[j][0] and halves and lane_read(name, asm, word, halves)
+            if word in effects[j][0] and not kept_read and not (exec_absorbs(name, asm, word) and quiet(j)):
+                unread[word] = j
+                return j
+            if kept_read or word not in effects[j][1]:
+                for s in succ[j]:
+                    if s not in seen:
+                        seen.add(s)
+                        work.append(s)
+        unread[word] = None
+        return None
+
+    def waterfall_refusal(self, head, close, effects, live_in, jumps):
+        """Return None when the lane can pick its own key at the head of the waterfall.
+
+        CMPX selects all remaining lanes with the first lane's key. WREXEC removes those lanes,
+        so each incoming lane participates exactly once. A lane-local body computes its value on
+        that visit. Other visits can only affect it through shared state or an escaping scalar.
+        """
+        ins = self.ins
+        _, key_ops, mods = parse(ins[head][3])
+        if (mods or len(key_ops) != 2 or not re.fullmatch(r's\d+', key_ops[0])
+                or not re.fullmatch(r'v\d+', key_ops[1])):
+            return 'unsupported key operands'
+        key = key_ops[0]
+        name, ops, mods = parse(ins[head + 1][3])
+        if re.sub(r'_e(32|64)$', '', name) != 'v_cmpx_eq_i32' or mods or ops != key_ops:
+            return 'the next instruction does not select lanes with the same key'
+        _, ops, mods = parse(ins[close - 1][3])
+        if mods or len(ops) != 2 or ops[0] != ops[1] or not re.fullmatch(r's\d+', ops[0]) or ops[0] == key:
+            return 'the closing mask is not a distinct remaining-lanes register'
+        remaining = ops[0]
+        # The b32 close covers only the low 32 lanes when the hardware uses wave64.
+        x, y, z = self.pipe.group
+        if x * y * z > 32:
+            return 'b32 remaining mask requires at most 32 threads per group'
+        copy = None
+        for i in reversed(range(head)):
+            _, _, op, asm = ins[i]
+            if op.startswith(('s_branch', 's_cbranch', 's_setpc', 's_endpgm', 's_movrel')):
+                break
+            if remaining in effects[i][2] or effects[i][2] & EXEC_KEYS:
+                if op == 's_mov_b32' and parse(asm)[1] == [remaining, 'exec_lo']:
+                    copy = i
+                break
+        if copy is None:
+            return 'remaining mask is not an unchanged copy of EXEC'
+        if any(ins[copy][0] < target <= ins[close][0] for branch, target in jumps if branch != close):
+            return 'another branch enters the saved mask or loop'
+        # Only ordinary lane-local operations and reads of a bound raw buffer. An instruction
+        # that observes the other lanes sharing this key cannot use this scalarization (e.g. mbcnt of EXEC).
+        body_writes = {key, 'scc'}  # WREXEC supplies SCC for the next iteration.
+        numeric_writes = {key}
+        descriptor_inputs, buffer_descriptors = set(), set()
+        reads_before_write = set()
+        defined = {key}
+        keyed = {key}  # scalars whose value depends on the key (so on the iteration) after the instructions so far
+        for j in range(head + 2, close - 1):
+            base, ops, mods = parse(ins[j][3])
+            base = re.sub(r'_e(32|64)$', '', base)
+            if base not in ('s_add_u32', 's_mov_b32', 's_and_b32', 's_or_b32', 's_lshl_b32', 's_waitcnt',
+                            'v_mov_b32', 'v_xor_b32', 'v_add_nc_u32', 's_load_dwordx4', 'buffer_load_dword'):
+                return 'body instruction %s is not proven lane-local' % base
+            if mods and not (base == 'buffer_load_dword' and mods == ['offen']):
+                return 'body instruction %s has unproved modifiers' % base
+            reads, writes, may_write = effects[j]
+            if (reads | may_write) & (EXEC_KEYS | {'vcc', 'vcc_hi', 'm0', remaining}):
+                return 'body reads or changes a lane mask or special register'
+            if base == 's_load_dwordx4':
+                dst = reg_range(ops[0]) if len(ops) == 3 else None
+                if not dst or dst[0] != 's' or dst[2] > 105:
+                    return 'descriptor load overlaps a special register'
+                descriptor_inputs.update(reads)
+            else:
+                numeric_writes.update(may_write)
+            if base == 'buffer_load_dword':
+                if len(ops) < 3:
+                    return 'buffer load has no descriptor'
+                buffer_descriptors.update(scalar_tokens(ops[2]))
+            reads_before_write.update(reads - defined)
+            defined.update(writes)
+            body_writes.update(may_write)
+            if (reads & keyed) or base == 'buffer_load_dword':
+                keyed.update(may_write)
+            else:
+                keyed -= writes
+        if reads_before_write & body_writes:
+            return 'body reads loop-carried scalar state'
+        # The data byte offset can use the key. Loading or modifying the resource descriptor
+        # with the key needs a separate proof that the runtime binds the whole range.
+        if descriptor_inputs & body_writes or buffer_descriptors & numeric_writes:
+            return 'per-lane descriptor selection requires a proven bound heap range'
+        # The close leaves EXEC and SCC zero. The last physical pass's other scalar
+        # values can differ per lane in this model and must be dead on every successor.
+        # A scalar written from loop-invariant inputs only (no read of the key or of a key-dependent scalar, no
+        # load through a body address) holds the same value in every iteration, so the last pass's value is each
+        # lane's own: it may be live. The key and anything computed from it may not.
+        if close + 1 < len(ins) and (body_writes - {'scc'}) & live_in[close + 1] & (keyed | {key}):
+            return 'body scalar is live at the loop exit'
+        if any(name.startswith('s_movrel') for _, _, name, _ in ins):
+            return 'relative scalar indexing can observe a loop register'
+        return None
 
     def phi_mask_ok(self, key, b, t, effects, succ, targets, index):
         """True when lane mask `key` ('vcc' for vcc_lo, or 'sN'), live at the join t of the s_cbranch_execz at b, is
@@ -2164,10 +2887,12 @@ class Stage:
         With ``with_cfg=True``, returns ``(joined, forward_splits, div_targets)`` where ``forward_splits`` keeps only
         writes on non-dominating forward arms between a target's dominators and the target (excluding loop back edges)
         and ``div_targets`` maps each ``s_cbranch_*`` offset to ``(writes, affected_targets)`` inside its divergent
-        CFG region (between the branch and its immediate post-dominator, or over the loop range for a backward edge)."""
+        CFG region (between the branch and its immediate post-dominator, or over the loop range for a backward edge).
+        A fourth item, ``(bounds, block_of, succ, div_blocks)``, is the block graph and that region's blocks per
+        ``s_cbranch_*`` offset, for the spill-slot proof (spill_reaching)."""
         ins = self.ins
         if not ins:
-            return ({}, {}, {}) if with_cfg else {}
+            return ({}, {}, {}, ([], {}, [], {})) if with_cfg else {}
         index = {off: i for i, (off, *_) in enumerate(ins)}
         calculated = getattr(self, 'calculated_pc', {})  # unit probes build a Stage without translate()
         branch = lambda name: name.startswith('s_cbranch') or name in ('s_branch', 's_setpc_b64')
@@ -2253,7 +2978,7 @@ class Stage:
                 new = {b} | set.intersection(*(pdom[s] for s in succ[b]))
                 if new != pdom[b]:
                     pdom[b], changed = new, True
-        div_targets = {}
+        div_targets, div_blocks = {}, {}
         for b, (lo, hi) in enumerate(bounds):
             off, _n, name, asm = ins[hi - 1]
             if not name.startswith('s_cbranch'):
@@ -2266,6 +2991,7 @@ class Stage:
                 loop_blks = range(min(t_blk, b), b + 1)
                 regs = set().union(*(writes[w] for w in loop_blks))
                 affected = {off_of[w] for w in loop_blks} & all_targets
+                div_blocks[off] = set(loop_blks)
             else:
                 stop = pdom[b] - {b}
                 ipd = max(stop, key=lambda x: len(pdom[x])) if stop else None
@@ -2278,9 +3004,10 @@ class Stage:
                     dtodo += succ[w]
                 regs = set().union(*(writes[w] for w in div)) if div else set()
                 affected = ({off_of[w] for w in div} | ({off_of[ipd]} if ipd is not None else set())) & all_targets
+                div_blocks[off] = div
             div_targets[off] = (regs, affected)
         self.flow = (index, block_of, succ, dom, writes, {})
-        return joined, forward_splits, div_targets
+        return joined, forward_splits, div_targets, (bounds, block_of, succ, div_blocks)
 
     def unjoined(self, target, last_write, regs):
         """The registers of regs whose program-order state is not proven at a branch target. A lane-mask mark or a
@@ -2310,6 +3037,11 @@ class Stage:
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         vcc_branches = getattr(self, 'mesh_vcc_branches', {})
+        wave_limits = getattr(self, 'mesh_wave_limits', {})
+        wave_loads = getattr(self, 'mesh_wave_loads', {})
+        wave_load_compares = {compare: bound for compare, bound, _, _ in wave_loads.values()}
+        wave_load_sites = {load for _, _, load, _ in wave_loads.values()}
+        execz_effects = 'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'
         vcc_compares = set().union(*vcc_branches.values())
         try:
             self.calculated_pc = calculated_pc_proof(self.ins, getattr(self, 'kind', None))
@@ -2327,11 +3059,18 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
+        if getattr(self, 'kind', None) == 'cs':
+            self.address_carry_pairs = adjacent_address_carries(self.ins, targets)
+        # Forward edges reach each block in disassembly order. A back edge could
+        # repeat a pointer advance before the next table load.
+        self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
+                                   and all(target > pc for pc, target in branches))
         # Targets that only forward s_cbranch_execz branches (and the fall-through) enter: on a taken edge the lane's
         # exec bit is 0 at the target. Compute stages have their own execz handling and are left out.
         names = {off: name for off, _n, name, _asm in self.ins}
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
+        back_targets = {to for pc, to in branches if to <= pc}
         self.mesh_allocation_block = None
         splits = set(targets)
         if getattr(self, 'kind', None) == 'ms' and targets:
@@ -2342,7 +3081,8 @@ class Stage:
             splits.update((self.mesh_allocation_block, self.ins[at + 2][0]))
         join_writes = self.join_writes(branches)
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
-        joined, forward_splits, div_targets = self.joined_registers(with_cfg=True)
+        joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
         init_wqm_exec = getattr(self, 'wqm_exec', False)
@@ -2367,12 +3107,17 @@ class Stage:
 
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
+            self.address_carry_reader = None
             uniform_vcc_compares = set()
             self.lines = []
             self.blocks = []          # (offset, [lines], terminator)
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
+            # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
+            self.uniform_cf = True
+            self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
+            self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.masks = set(init_masks)
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
@@ -2388,17 +3133,31 @@ class Stage:
             self.uniform_v = set()
             self.varying_s = set()
             self.scc_uniform = True
+            self.scc_verified = False
+            # Offset of the emitted, uniform SCC write that reaches here (None: none, or not proven), and the one
+            # each forward branch carries to its target.
+            self.scc_def, scc_in = None, {}
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
+            self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
+            self.divergent_branches = {}  # s_cbranch offset -> mnemonic, for branches not proven wave-uniform
+            self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
+            self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform) for constant-lane SGPR spills
+            self.vcc_events = {}
+            self.vcc_lost = self.vcc_descriptor_overwritten = False
             self.entry_table_pointers = {
                 reg: sym[1] for reg, sym in init_sym.items()
                 if isinstance(reg, int) and sym[0] == 'ptr' and sym[1][0] == 'table'
             }
             self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+            self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
+            self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform)
+            self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
+            self.heap_index_was = {}  # the marks the current instruction's destinations held before it
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
             self.defined_uniform_s = set(init_entry_uniform)
             self.bad_sgprs = set()
@@ -2422,11 +3181,23 @@ class Stage:
                 self.pc = off
                 self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
+                if off in targets:
+                    # Every path in carries the same uniform emitted write, which the lane and the wave both ran
+                    # last, whichever path each took (a per-lane s_cbranch_execz edge included); the SCC writes on a
+                    # back edge are not known yet.
+                    defs = ([self.scc_def] if falls else []) + scc_in.get(off, [])
+                    one_def = off not in back_targets and len(set(defs)) == 1
+                    self.scc_def = defs[0] if one_def else None
+                elif not falls:
+                    self.scc_def = None
+                if not falls:
+                    self.scc_verified = False
                 # Before the first branch target or terminator every path has run exactly the instructions above, so
                 # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
+                    self.heap_index.clear()  # another path into the join may hold a different word
                     pre_uniform = {
                         r for r in (self.defined_uniform_s if self.since_join is None else self.since_join)
                         if r not in self.varying_s and r not in self.masks
@@ -2470,6 +3241,7 @@ class Stage:
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.since_join, self.scc_uniform = kept_u, False
+                    self.scc_verified = self.scc_def is not None
                     # A constant is only known here if no other path into the join writes the register: a loop counter
                     # set before the loop and incremented in it reaches the loop head with a new value on every pass.
                     # set_s also assigns constants at run time, so the register reads its real value once it is dropped.
@@ -2494,6 +3266,7 @@ class Stage:
                     there = joined.get(b_target, set())
                     if b_target > off:
                         incoming.setdefault(b_target, []).append(({reg: self.sym.get(reg) for reg in there}, written & there))
+                        scc_in.setdefault(b_target, []).append(self.scc_def)
                     else:
                         for reg in there & written:
                             back, sym = self.sym.get(reg), kept.get(b_target, {}).get(reg)
@@ -2516,6 +3289,17 @@ class Stage:
                     if off in refused:
                         raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
+                    if off in wave_load_compares:
+                        bound = wave_load_compares[off]
+                        if not self.uniform_source(bound) or int(bound[1:]) not in self.defined_uniform_s:
+                            raise Unsupported(execz_effects)
+                        # Capture the bound at the compare, before any intervening SGPR write.
+                        self.emit('wave_any = (tid & ~63u) < %s;' % self.u(bound))
+                    if off in wave_load_sites:
+                        offset = smem_offset(parse(asm)[1][2])
+                        if not self.uniform_source(offset) or (
+                                re.fullmatch(r's\d+', offset) and int(offset[1:]) not in self.defined_uniform_s):
+                            raise Unsupported(execz_effects)
                     if off in vcc_compares and all(
                         not mesh_vregs([tok]) and self.uniform_source(tok)
                         for tok in parse(asm)[1][1:]
@@ -2523,22 +3307,48 @@ class Stage:
                         uniform_vcc_compares.add(off)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
-                        cond_uniform = cond in ('scc0', 'scc1') and self.scc_uniform
+                        if off in wave_loads:
+                            dst = wave_loads[off][3]
+                            if not self.uniform_source(dst) or int(dst[1:]) not in self.defined_uniform_s:
+                                raise Unsupported(execz_effects)
+                            self.u(dst)  # declare the variable; refuses a symbol with no run-time value
+                        cond_uniform = ((cond in ('scc0', 'scc1') and self.scc_uniform)
+                                        or off in wave_limits or off in wave_loads)
                         if off in vcc_branches:
                             if not vcc_branches[off] <= uniform_vcc_compares:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
                             cond_uniform = True
+                        if cond_uniform:
+                            self.uniform_branches.add(off)
                         if not cond_uniform:
+                            # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
+                            self.uniform_cf = False
+                            self.divergent_branches[off] = base
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
                             regs = {r for r in regs if isinstance(r, int)}
                             if b_target <= off:
+                                self.divergent_back_edges.append((b_target, off))
                                 regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
                     term = self.one(name, asm)
+                    if off in wave_limits:
+                        term = ('branch', '(tid & ~63u) >= %du' % wave_limits[off], term[2])
+                    if off in wave_loads:
+                        term = ('branch', '!wave_any', term[2])
                 except Unsupported as reason:
                     if refusals is None:
+                        if self.has_branches and ('read_vcc', None) in self.vcc_events.get(off, ()):
+                            # Some operand handlers refuse VCC before emitting code. Check whether
+                            # a path to this instruction has already overwritten the mask.
+                            self.blocks.append((start, self.lines, None))
+                            try:
+                                self.check_vcc_paths()
+                            except Unsupported as vcc_reason:
+                                reason = vcc_reason
+                            finally:
+                                self.blocks.pop()
                         if not hasattr(reason, 'instruction'):
                             reason.instruction = name  # for fail_reason(); the message itself is unchanged
                         raised_unsupported = reason
@@ -2554,6 +3364,8 @@ class Stage:
                 self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
                 if self.scc_effect:
                     scc_effects[off] = self.scc_effect
+                if self.scc_effect or not self.scc_verified:
+                    self.scc_def = off if self.scc_effect == 'emitted' and self.scc_verified and self.scc_uniform else None
                 if term:
                     self.pinned_low16_v.update(self.low16_only_v)
                     self.blocks.append((start, self.lines, term))
@@ -2579,6 +3391,12 @@ class Stage:
             refusals.append((reason, self.kind))
         if self.lines:
             self.blocks.append((start, self.lines, None))
+        for at, reason in self.quad_flow_refusals(branches, targets):
+            if refusals is None:
+                error = Unsupported(reason)
+                error.instruction = names[at]
+                raise error
+            refusals.append((reason, self.kind))
         self.materialized = materialize  # declarations() assigns these before the body (and before any loop)
         if set(scc_effects.values()) - {'emitted'}:
             for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
@@ -2586,7 +3404,22 @@ class Stage:
                 if refusals is None:
                     raise Unsupported(reason)
                 refusals.append((reason, self.kind))
+        for at, name in self.derivative_sites:
+            # A divergent back edge that spans the call lets lanes of one quad leave the loop at different passes, so
+            # the call runs again with uneven quads even though no divergent branch precedes it in program order.
+            if any(target <= at <= branch for target, branch in self.divergent_back_edges):
+                reason = ('%s needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform '
+                          'control flow' % name)
+                if refusals is None:
+                    raise Unsupported(reason)
+                refusals.append((reason, self.kind))
         self.pinned_low16_v.update(self.low16_only_v)
+        try:
+            self.check_vcc_paths()
+        except Unsupported as reason:
+            if refusals is None:
+                raise
+            refusals.append((str(reason), self.kind))
         leak = self.pinned_low16_v & self.whole_read_v
         if leak:
             reason = 'whole-word read of v%d after odd d16 image_load' % min(leak)
@@ -2605,7 +3438,8 @@ class Stage:
                 continue
             seen.add((off, stale))
             size, name, asm = instructions[off]
-            if stale and off not in self.calculated_pc and reads_scc(name, asm):
+            if (stale and off not in self.calculated_pc and off not in getattr(self, 'ptr_addc_pcs', ())
+                    and reads_scc(name, asm)):
                 yield stale, name
             if off in effects:
                 stale = effects[off] if effects[off] != 'emitted' else None
@@ -2638,6 +3472,55 @@ class Stage:
     def tracks_uniformity(self):
         return all(hasattr(self, name) for name in ('uniform_v', 'varying_s', 'scc_uniform'))
 
+    def vgpr_writer(self, reg, before, after=-1):
+        """Index of the last instruction in self.ins[after + 1:before] that may write VGPR reg (the first operand,
+        and the second of v_swap_b32), or None."""
+        for i in range(before - 1, after, -1):
+            _, _, name, asm = self.ins[i]
+            ops = parse(asm)[1]
+            for tok in (ops[:2] if name.startswith('v_swap') else ops[:1]):
+                r = reg_range(tok)
+                if r and r[0] == 'v' and r[1] <= reg <= r[2]:
+                    return i
+        return None
+
+    def tid_shift(self, count, source):
+        """The uniform expression of `v_lshrrev_b32 vD, count, source` in the entry block of a compute program, or None.
+
+        The X thread id (v0, each local id has its own VGPR) is below the group's X size, so a right shift by n with
+        size <= 1 << n clears every thread-id bit. That gives 0 for the thread id itself, and for a vector built as
+        (uniform << K) + v0 with n <= K and size <= 1 << K the low K bits of the base are clear, the sum does not
+        carry, and the result is the same in every lane. Program order is execution order here, so the nearest
+        earlier writer is the definition; v0 must be unwritten at the definition and the scalar unwritten after it."""
+        src, now = reg_range(source), self.pc_index()
+        if (not re.fullmatch(r'0x[0-9a-f]+|\d+', count) or int(count, 0) >= 32 or not src or src[0] != 'v' or
+                src[1] != src[2] or now is None):
+            return None
+        n, size = int(count, 0), getattr(self.pipe, 'group', (1 << 31,))[0]
+        if size > 1 << n:
+            return None
+        defined = self.vgpr_writer(src[1], now)
+        if src[1] == 0 and defined is None:
+            return '0u'
+        if defined is None:
+            return None
+        _, _, name, asm = self.ins[defined]
+        _, d, mods = parse(asm)
+        base = re.sub(r'_e(32|64)$', '', name)
+        scalar = reg_range(d[1]) if len(d) == 4 else None
+        if (base != 'v_lshl_add_u32' or mods or not scalar or scalar[0] != 's' or scalar[1] != scalar[2] or
+                scalar[1] > 105 or d[3] != 'v0' or not re.fullmatch(r'0x[0-9a-f]+|\d+', d[2]) or
+                n > int(d[2], 0) or int(d[2], 0) >= 32 or size > 1 << int(d[2], 0) or
+                self.vgpr_writer(0, defined) is not None or not self.uniform_source(d[1])):
+            return None
+        for _, _, later, later_asm in self.ins[defined + 1:now]:
+            if scalar[1] in scalar_destinations(later, later_asm) or 'any' in scalar_destinations(later, later_asm):
+                return None
+        return '((s%d << %du) >> %du)' % (scalar[1], int(d[2], 0), n)
+
+    def pc_index(self):
+        return next((i for i, ins in enumerate(self.ins) if ins[0] == self.pc), None)
+
     def uniform_source(self, tok):
         r = reg_range(tok)
         if r:
@@ -2654,7 +3537,7 @@ class Stage:
             if sym:
                 return sym[0] in ('const', 'ud', 'fixed_buffer_word')
             return lo not in self.varying_s
-        if tok in FLOATS:
+        if tok == 'null' or tok in FLOATS:
             return True
         try:
             int(tok, 0)
@@ -2664,6 +3547,22 @@ class Stage:
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
+        if (getattr(self, 'vcc_lost', False) or
+                (getattr(self, 'has_branches', False) and
+                 ('vcc' in asm or name.startswith(IMPLICIT_VCC_READ)))):
+            # Read operands even in handlers that refuse a mask as numeric data before calling u().
+            # VOPC's two-operand spelling has an implicit destination, and v_cmpx e64 prints an unused SDST.
+            if name.startswith('v_cmpx') and name.endswith('_e64') and len(ops) == 3:
+                reads = scalar_tokens(' '.join(ops[1:]))
+            elif name.startswith('v_cmp') and len(ops) == 2:
+                reads = scalar_tokens(' '.join(ops))
+            else:
+                reads, _, _ = scalar_effects(name, asm)
+            if reads & {'vcc', 'vcc_hi'}:
+                self.read_vcc()
+        # v_bfm_b32 exists only as VOP3 (opcode 0x363); a VOP2 spelling is not an instruction.
+        if name.endswith('_e32') and (name[:-4] in VOP3_ONLY_VEC_U or name[:-4] == 'v_bfm_b32'):
+            raise Unsupported(name)
         base = re.sub(r'_e(32|64)$', '', name)
         # Compute the proof before lowering, since a destination can also be a source.
         dst = None
@@ -2687,7 +3586,40 @@ class Stage:
                     sources = [re.sub(r'^-(?=[^\d.])', '', tok).strip('|') for tok in sources]
                 if sources and all(self.uniform_source(tok) for tok in sources):
                     dst = candidate[1]
+        # A compute load through a read-only descriptor (a descriptor is never both loaded and stored) with a uniform
+        # address reads the same dword in every lane. Entry block only: the value has no recomputable expression.
+        loaded = (dst is None and base in UNIFORM_LOADS and len(ops) == 4 and self.tracks_uniformity() and
+                  getattr(self, 'kind', None) == 'cs' and not getattr(self, 'past_entry', True) and
+                  getattr(self, 'exec_known', False) and
+                  all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods) and
+                  not ('idxen' in mods and 'offen' in mods) and (ops[1] == 'off') == ('idxen' not in mods and 'offen' not in mods) and
+                  (ops[1] == 'off' or self.uniform_source(ops[1])) and self.uniform_source(ops[3]))
+        loaded_regs = ()
+        if loaded:
+            candidate = reg_range(ops[0])
+            # Exactly the registers the opcode writes, as many as its name says.
+            count = UNIFORM_LOAD_WORDS[base]
+            if candidate and candidate[0] == 'v' and candidate[2] <= 255 and candidate[2] - candidate[1] + 1 == count:
+                dst, loaded_regs = candidate[1], range(candidate[1], candidate[2] + 1)
+            else:
+                loaded = False
+        # A shift right of the X thread id, or of (uniform << K) + thread id, that leaves no thread-id bit.
+        shifted = None
+        if (dst is None and base == 'v_lshrrev_b32' and not mods and len(ops) == 3 and
+                self.tracks_uniformity() and hasattr(self, 'uniform_expr') and getattr(self, 'kind', None) == 'cs' and
+                not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)):
+            candidate = reg_range(ops[0])
+            shifted = self.tid_shift(ops[1], ops[2])
+            if shifted is not None and candidate and candidate[0] == 'v' and candidate[1] == candidate[2]:
+                dst = candidate[1]
+            else:
+                shifted = None
         self.last_v = None
+        if hasattr(self, 'heap_index'):  # unit probes build a Stage without the tracking state
+            # Any write ends a register's mark; the lowering below sets the new one, if any.
+            wrote = scalar_destinations(name, asm)
+            wrote = set(self.heap_index) if 'any' in wrote else wrote & set(self.heap_index)
+            self.heap_index_was = {r: self.heap_index.pop(r) for r in wrote}
         term = self.lower(base, asm, ops, mods)
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
@@ -2702,17 +3634,97 @@ class Stage:
                         self.defined_uniform_s.discard(r)
                     self.bad_sgprs.add(r)
         if dst is not None:
-            self.uniform_v.add(dst)
+            self.uniform_v.update(loaded_regs or (dst,))
+            for reg in loaded_regs:
+                getattr(self, 'uniform_expr', {}).pop(reg, None)
             if hasattr(self, 'uniform_expr'):
                 # Proven sources are scalars, constants and VGPRs; each VGPR needs its own current expression.
                 expr = self.last_v[1] if self.last_v and self.last_v[0] == dst else None
                 vs = [int(n) for n in re.findall(r'\bv(\d+)\b', expr or '')]
-                if expr is None or any(n not in self.uniform_expr for n in vs):
+                if shifted is not None:
+                    self.uniform_expr[dst] = shifted
+                elif expr is None or loaded or any(n not in self.uniform_expr for n in vs):
+                    self.uniform_expr.pop(dst, None)
+                elif sum(len(self.uniform_expr[n]) for n in vs) > UNIFORM_EXPR_LIMIT:
+                    # A VGPR used as both operands (v10 = v10 + v10) doubles the text each time: past the limit the
+                    # chain has no recomputable expression, so a first-lane read of it is refused.
                     self.uniform_expr.pop(dst, None)
                 else:
                     self.uniform_expr[dst] = re.sub(r'\bv(\d+)\b', lambda m: '(%s)' % self.uniform_expr[int(m[1])],
                                                     expr)
         return term
+
+    def quad_flow_straight(self):
+        """Whether a DPP quad read sits in straight-line code (the quad intrinsics then run in uniform flow)."""
+        return not getattr(self, 'has_branches', True) and not getattr(self, 'blocks', [])
+
+    def quad_flow_allowed(self):
+        """Whether a DPP quad read in a pixel program with branches or loops may be lowered now and proven over the
+        whole program after translation (Stage.quad_flow_refusals). Unit probes without translate() cannot."""
+        return getattr(self, 'kind', None) == 'ps' and getattr(self, 'quad_flow_reads', None) is not None
+
+    def note_quad_flow(self, base):
+        if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
+            self.quad_flow_reads.append((self.pc, base))
+
+    def quad_flow_refusals(self, branches, targets):
+        """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
+
+        The one-lane model runs each lane as its own HLSL thread through the pc dispatch, so the QuadReadLaneAt /
+        QuadReadAcross* of a lane reads its neighbours only when all four threads of the quad reach that statement
+        together (same block, same pass of the dispatch loop) with the word the guest lanes hold. The guest runs
+        the wave as one: its scalar branches are wave-wide, and the quad is whole when EXEC is the s_wqm mask. A
+        read is kept when, on every path to it:
+        - the s_wqm exec, exec that proved whole-quad EXEC ran first: it sits before every branch and target;
+        - no other instruction that can write EXEC reaches it (so EXEC is still that mask and every VGPR write ran
+          on all four lanes, helper lanes included);
+        - every conditional branch that reaches it is wave-uniform (SCC proven uniform by the translator), or an
+          execz/execnz branch, whose EXEC is the whole-quad mask by the rule above and so never taken. A vccz/vccnz
+          branch, or SCC from lane data, can split a quad, and the read is refused.
+        Then the four threads ran the same branch outcomes, so they are in the same block on the same dispatch
+        pass. No wave size is assumed: the SM 6.0 quad operations need only the 2x2 quad of four lanes."""
+        reads = getattr(self, 'quad_flow_reads', [])
+        if not reads:
+            return []
+        index, block_of, succ, _dom, _writes, _reached = self.flow
+        after = {}
+
+        def reaches(src, dst):
+            a, b = index[src], index[dst]
+            if block_of[a] == block_of[b] and a < b:
+                return True
+            start = block_of[a]
+            if start not in after:
+                seen, todo = set(), list(succ[start])
+                while todo:
+                    blk = todo.pop()
+                    if blk not in seen:
+                        seen.add(blk)
+                        todo += succ[blk]
+                after[start] = seen
+            return block_of[b] in after[start]
+        # No branch or target (a dead read behind an early s_endpgm): nothing for the s_wqm to precede.
+        first = min([off for off, _ in branches] + list(targets), default=float('inf'))
+        writers = [off for off, _n, name, asm in self.ins if writes_exec(name, parse(asm)[1])
+                   and not (re.sub(r'_e(32|64)$', '', name) in ('s_wqm_b32', 's_wqm_b64')
+                            and parse(asm)[1] in (['exec', 'exec'], ['exec_lo', 'exec_lo']))]
+        out = []
+        for at, base in reads:
+            if self.wqm_set_at is None or self.wqm_set_at >= first:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the s_wqm exec, exec does not '
+                                'run before every branch' % (base, at)))
+                continue
+            writer = next((w for w in writers if reaches(w, at)), None)
+            if writer is not None:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the EXEC write at +0x%x reaches '
+                                'it' % (base, at, writer)))
+                continue
+            split = next((b for b, name in sorted(self.divergent_branches.items())
+                          if name not in ('s_cbranch_execz', 's_cbranch_execnz') and reaches(b, at)), None)
+            if split is not None:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: %s at +0x%x is not proven '
+                                'wave-uniform' % (base, at, self.divergent_branches[split], split)))
+        return out
 
     def dpp_pair(self, base, asm, ops, mods):
         """A DPP16 spelling whose SRC0 is a quad pair broadcast (#2125 item C).
@@ -2737,7 +3749,7 @@ class Stage:
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
         if perm not in DPP_PAIR:
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
-        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
+        if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False) or
                 not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
             raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
                               % (base, perms[0]))
@@ -2749,6 +3761,7 @@ class Stage:
         if not src:
             raise Unsupported('%s_dpp source %s' % (base, ops[1]))
         word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         self.used_v.add(DPP_SCRATCH)
         self.uniform_v.discard(DPP_SCRATCH)
@@ -2796,6 +3809,7 @@ class Stage:
                 self.varying_s.add(reg)
             if base in ('s_add_u32', 's_addc_u32'):
                 self.scc_uniform = False
+                self.scc_verified = False
             return None
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
@@ -2810,10 +3824,13 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
+                if getattr(self, 'wqm_set_at', False) is None:
+                    self.wqm_set_at = getattr(self, 'pc', None)  # where the quad-read flow proof starts
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
                 self.scc_uniform = False  # the hardware SCC result is not modelled
+            self.scc_verified = False
             return None
         if base == 's_setreg_imm32_b32':
             # The write itself changes nothing the lowering models, except MODE[1:0] (the binary32 rounding mode):
@@ -2858,6 +3875,8 @@ class Stage:
             self.emit('GroupMemoryBarrierWithGroupSync();')
             return None
         if base.startswith('s_cbranch_'):
+            if base[10:].startswith('vcc'):
+                self.read_vcc()
             if getattr(self, 'kind', None) == 'ms' and base in ('s_cbranch_scc0', 's_cbranch_scc1') and not self.scc_uniform:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
@@ -2914,6 +3933,8 @@ class Stage:
             return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
+            if mods and handler.__name__ in MODIFIER_FREE_HANDLERS:
+                raise Unsupported('%s with %s' % (base, mods))
             return handler(ops, mods)
         if base in MUBUF_ATOMIC_OPS:
             return self.buffer_atomic(base, ops, mods)
@@ -2928,6 +3949,8 @@ class Stage:
             return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
+        if base in VEC_H:
+            return self.half_alu(base, ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             # A missing source used to raise IndexError and an extra one was dropped without a word.
@@ -2955,19 +3978,50 @@ class Stage:
                 raise Unsupported('%s with %s' % (base, mods))
             if len(ops) != arity + 1:
                 raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
+            if base in VOP3_ONLY_VEC_U:
+                dst = reg_range(ops[0])
+                if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+                    raise Unsupported('%s destination %s' % (base, ops[0]))
+                for src in ops[1:1 + arity]:
+                    if self.is_lane_mask(src):
+                        raise Unsupported('%s on a lane mask' % base)
+                    sr = reg_range(src)
+                    if sr is not None:
+                        if sr[1] != sr[2] or (sr[0] == 'v' and sr[1] > 255) or (sr[0] == 's' and sr[1] > 105):
+                            raise Unsupported('%s source %s' % (base, src))
+                    elif src not in FLOATS and src not in ('m0', 'null'):
+                        try:
+                            val = int(src, 0)
+                        except ValueError:
+                            raise Unsupported('operand %r' % src)
+                        if not -0x80000000 <= val <= 0xffffffff:
+                            raise Unsupported('%s source %s' % (base, src))
             if base == 'v_and_b32':
                 c0, c1 = self.const_u32(ops[1]), self.const_u32(ops[2])
                 args = [self.u(ops[1], low16_only=c1 is not None and (c1 & 0xffff0000) == 0),
                         self.u(ops[2], low16_only=c0 is not None and (c0 & 0xffff0000) == 0)]
+            elif base == 'v_mad_u32_u16':
+                # S0 and S1 read only bits [15:0]; S2 reads all 32 bits.
+                args = [self.u(ops[1], low16_only=True),
+                        self.u(ops[2], low16_only=True),
+                        self.u(ops[3])]
             else:
                 args = [self.u(o) for o in ops[1:1 + arity]]
-            if base in ('v_sad_u8', 'v_sad_u16', 'v_sad_u32'):
+            if base in ('v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_sad_u32', 'v_msad_u8'):
                 pipe = getattr(self, 'pipe', None)
                 if pipe is not None and isinstance(getattr(pipe, 'uses_sad', None), set):
                     pipe.uses_sad.add(base)
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
-            return self.scalar(base, ops)
+            return self.scalar(base, ops, mods) if mods else self.scalar(base, ops)
+        if base == 's_addc_u32':
+            # Only the high word of an advanced descriptor pointer; the carry is not modelled.
+            hi = reg_range(ops[1]) if len(ops) == 3 else None
+            if hasattr(self, 'scc_uniform') and self.tracks_uniformity():
+                self.scc_uniform = False
+            if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
+                return None
+            raise Unsupported(base)
         if base == 's_getpc_b64':
             # RDNA 2 GETPC returns the address of its successor: the shader's load address plus a known byte
             # offset, which is not an integer this model can emit. It is elided only when the program also
@@ -2980,10 +4034,13 @@ class Stage:
     # lane k of its own quad (RDNA 2 ISA, "DPP": a lane reads lane (lane & ~3) | perm[lane & 3] of the row; LLVM 15
     # AMDGPU DPP quad_perm). A pixel stage's four consecutive lanes are a 2x2 pixel quad (lane = x & 1 | (y & 1) << 1),
     # which is what SM 6.0 QuadReadLaneAt(value, k) reads, so the stage is compiled as ps_6_0 (Stage.needs_sm6).
-    # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
-    # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
-    # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (pair
-    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
+    # Accepted only where the whole quad is proven active: the entry straight-line prefix of a pixel stage that ran
+    # s_wqm exec, exec and whose EXEC is still that mask (helper lanes are active, so no source lane is off). A later
+    # uniform loop or forward branch elsewhere in the stage does not drop the proof: every path still reaches the
+    # broadcast with the same EXEC and cannot jump back to the prefix. bound_ctrl then has nothing to
+    # decide (the source lane is never disabled), so it is accepted and ignored. A broadcast after a branch target,
+    # after EXEC changed, or with divergent EXEC stays refused, as do other DPP controls (pair broadcasts, row shifts,
+    # mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
@@ -3005,9 +4062,13 @@ class Stage:
             raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
         if fields.get('bound_ctrl', '1') != '1':
             raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
-        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', [])
-                or not getattr(self, 'exec_known', False)):
+        if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        # A branch to offset zero also makes the nominal entry block re-entrant.
+        # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
+        if (not getattr(self, 'exec_known', False) or
+                (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
+            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
@@ -3028,6 +4089,7 @@ class Stage:
         rewritten = 'v%d' % self.DPP_TEMP
         rewritten = '|%s|' % rewritten if absolute else rewritten
         rewritten = '-' + rewritten if neg else rewritten
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
         operands = [ops[0], rewritten] + ops[2:]
@@ -3044,6 +4106,8 @@ class Stage:
     # proved whole-quad EXEC: the hardware can return 0 or the old value for a source lane whose EXEC bit
     # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Other permutations, fi:1 without that proof, DPP8, row shifts and partial masks stay refused.
     def dpp(self, base, ops, mods):
+        if base in VOP3_ONLY_VEC_U:
+            raise Unsupported('DPP form of %s' % base)
         # fi:1 (fetch inactive, DPP16 dword bit 18; LLVM AMDGPU `fi`, Mesa ACO fetch_inactive) only decides what a
         # disabled source lane returns. Every lowering below is taken only with the whole quad proven active, so no
         # source lane is disabled and it decides nothing.
@@ -3088,12 +4152,12 @@ class Stage:
                 src_neg_abs.append((neg, absolute, base_tok))
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
-        if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
-                or not getattr(self, 'exec_known', False)):
+        if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
             raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
         if not getattr(self, 'wqm_exec', False):
             raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                               'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         if kind == 'f':
@@ -3111,13 +4175,57 @@ class Stage:
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
 
+    def half_operand(self, tok, kind):
+        """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
+        if kind in ('i16', 'u16'):
+            if tok in FLOATS:  # an inline float constant is a binary16 word at 16-bit width, not binary32
+                word = struct.unpack('<H', struct.pack('<e', FLOATS[tok]))[0]
+                src = '%du' % word
+            else:
+                src = self.u(tok)
+            if kind == 'i16':
+                return 'float(asint((%s & 0xffffu) << 16u) >> 16)' % src
+            return 'float(%s & 0xffffu)' % src
+        neg = False
+        if tok.startswith('-') and (not re.match(r'-[\d.]', tok) or re.match(r'-0x', tok)):
+            neg, tok = True, tok[1:]
+        absolute = tok.startswith('|') and tok.endswith('|')
+        if absolute:
+            tok = tok[1:-1]
+        if tok in FLOATS:
+            text = repr(struct.unpack('<e', struct.pack('<e', FLOATS[tok]))[0])  # inline constants are binary16 here
+        elif tok == '-0':
+            text = '0.0'
+        else:
+            text = 'f16tof32(%s & 0xffffu)' % self.u(tok)
+        if absolute:
+            text = 'abs(%s)' % text
+        return '(-%s)' % text if neg else text
+
+    def half_alu(self, base, ops, mods):
+        """16-bit VALU: operands are the low 16 bits, the result fills the low 16 bits and zeroes the rest (RDNA 2)."""
+        arity, kind, text, result = VEC_H[base]
+        if len(ops) != arity + 1:
+            raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
+        if any(m != 'clamp' for m in mods) or ('clamp' in mods and result != 'h'):
+            raise Unsupported('%s with %s' % (base, mods))
+        args = [self.half_operand(o, kind) for o in ops[1:1 + arity]]
+        if base in ('v_fmac_f16', 'v_mac_f16'):
+            args.append(self.half_operand(ops[0], 'h'))
+        expr = text.format(*args)
+        if result == 'h':
+            if 'clamp' in mods:
+                expr = 'saturate(%s)' % expr
+            expr = 'f16rn(%s)' % expr
+        self.set_v(reg_range(ops[0])[1], expr)
+
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
-    # v_mov_b32 is the same path with the selected source as its result,
+    # v_mov_b32 is the same path with the selected source as its result, v_cndmask_b32 selects with VCC,
     # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
     # dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
-        if base == 'v_cvt_off_f32_i4':
+        if base in ('v_cvt_off_f32_i4', *VOP3_ONLY_VEC_U):
             raise Unsupported('SDWA form of %s' % base)
         fields = {}
         out_mods = []
@@ -3138,8 +4246,15 @@ class Stage:
         elif base == 'v_mov_b32':
             arity, text = 1, '{0}'
             # A lane mask is one bit per lane here, so a byte or word of it is not the hardware's field.
-            if fields.get('src0_sel') != 'DWORD' and self.is_lane_mask(ops[1].removeprefix('sext(').removesuffix(')')):
+            if fields.get('src0_sel') == 'DWORD':
+                self.reject_lane_mask_data(base, ops[1])
+            elif self.is_lane_mask(ops[1].removeprefix('sext(').removesuffix(')')):
                 raise Unsupported('v_mov_b32 SDWA %s of lane mask %s' % (fields.get('src0_sel'), ops[1]))
+        elif base == 'v_cndmask_b32' and len(ops) == 4 and ops[3] == 'vcc_lo':
+            # The VOP2 select: its lane mask is always VCC, printed as the fourth operand, and read like the
+            # plain select's mask (op_v_cndmask_b32).
+            mask = self.u(ops[3]).replace('{', '{{').replace('}', '}}')
+            arity, text = 2, '(%s & 1) ? {1} : {0}' % mask
         else:
             raise Unsupported('SDWA form of %s' % base)
         sources = []
@@ -3171,6 +4286,59 @@ class Stage:
                       destination in self.low16_only_v)
         self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
 
+    def pointer_add(self, base, dname, srcs, syms):
+        """Propagate a descriptor pointer through s_add_u32 sD, sP, <literal> / s_addc_u32 sD+1, sP+1, 0.
+
+        The pair advances a table or root pointer by a literal byte offset, into the same or
+        another register pair. The offset rides in the low word as ('ptr', source, offset); the
+        high word keeps ('ptrhi', source). The low-word carry is taken as zero: the base is a
+        table or root address and the offset is below 1 MiB. Anything else returns False.
+        """
+        if base not in ('s_add_u32', 's_addc_u32') or len(srcs) != 2 or not syms[0]:
+            return False
+        if getattr(self, 'has_branches', False):
+            if (not getattr(self, 'forward_table_adds', False) or base != 's_add_u32'
+                    or syms[0][0] != 'ptr' or syms[0][1][0] != 'table'):
+                return False
+        reg = reg_range(dname)
+        if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
+            return False
+        d = reg[1]
+        if base == 's_add_u32':
+            if syms[0][0] != 'ptr' or not re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|\d+)', srcs[1]):
+                return False
+            added = int(srcs[1], 0)
+            if added > 0xfffff:
+                raise Unsupported('descriptor pointer offset %s' % srcs[1])
+            before = syms[0][2] if len(syms[0]) > 2 else 0
+            if not isinstance(before, int):
+                raise Unsupported('add through a pointer with unknown byte offset')
+            if getattr(self, 'forward_table_adds', False) and before + added > 0xfffff:
+                raise Unsupported('accumulated table pointer offset %#x' % (before + added))
+            self.sym[d] = ('ptr', syms[0][1], before + added)
+            if syms[0][1][0] in PTR64_SOURCES and d + 1 <= 105:
+                # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
+                # instruction starts so that the high-word add is accepted right behind it and nowhere else.
+                size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
+                self.ptr_low_add = (d, self.pc + size, syms[0][1], before, before + added)
+                # The pair stays open until the matching s_addc_u32 completes it. The high register is left as it
+                # is (in place it is still the original high source); a load through an open pair is refused.
+                self.__dict__.setdefault('ptr_open_pairs', set()).add(d)
+            return True
+        low = self.sym.get(d - 1)
+        mark = getattr(self, 'ptr_low_add', None)
+        hi = reg_range(srcs[0])
+        # The high operand is judged by what it holds, not by where it sits: a copied high word still counts.
+        if (not mark or srcs[1] != '0' or not low or low[0] != 'ptr' or not hi or hi[0] != 's'
+                or mark[:2] != (d - 1, getattr(self, 'pc', 0)) or low[1] != mark[2]
+                or self.sym.get(hi[1]) != ptr_high_symbol(mark[2], mark[3])):
+            return False
+        self.sym[d] = ptr_high_symbol(mark[2], mark[4])
+        getattr(self, 'ptr_open_pairs', set()).discard(d - 1)
+        # This s_addc_u32 is the only reader of the low add's elided carry; any other SCC reader stays refused.
+        self.__dict__.setdefault('ptr_addc_pcs', set()).add(self.pc)
+        return True
+
     # scalar ALU with descriptor-word bookkeeping
     def exec_absorbed_source(self, base, srcs):
         """Index of a joined source of the instruction at a branch target whose stale value cannot reach bit 0 of
@@ -3190,7 +4358,7 @@ class Stage:
                 return i
         return None
 
-    def scalar(self, base, ops):
+    def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
         # refusal. s_movk_i32 keeps its own exact check for the immediate it folds.
@@ -3199,9 +4367,16 @@ class Stage:
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
-        if base in SCC_UNMODELLED and self.tracks_uniformity():
-            self.scc_uniform = False
         dst = reg_range(ops[0])
+        if base == 's_add_u32' and self.address_carry_reader is not None and self.pc == self.address_carry_reader:
+            if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+                raise Unsupported('s_add_u32 destination %s' % ops[0])
+            # The immediately preceding numeric add emitted the carry; no branch can enter here.
+            self.set_s(dst[1], '(scc ? 1u : 0u)')
+            self.set_scc('false')  # 0 + a single bit never produces another carry.
+            return None
+        if base in SCC_UNMODELLED and self.tracks_uniformity() and ops[0] != 'null':
+            self.scc_uniform = False
         pair = base.endswith('_b64')
         srcs = ops[1:]
         # 64-bit operands name the low register; exec/vcc name themselves.
@@ -3215,13 +4390,14 @@ class Stage:
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         lane_complement = False
-        # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
-        word_pack = base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
+        # s_mul_hi_{u,i}32 need the whole 32-bit word of each source, like the halfword pack.
+        word_pack = base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_mul_hi_i32')
         word_absdiff = base == 's_absdiff_i32'
         if shift_add or word_complement or word_pack or word_absdiff:
-            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
+            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_{u,i}32 into an
             # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
-            mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
+            mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+                         if base in ('s_mul_hi_u32', 's_mul_hi_i32')
                          else self.is_lane_mask(dname))
             # Bit i of ~(S0 op S1) depends only on bit i of each source, so with every source a lane mask the lane's
             # bit of the result is exact. Only an SGPR destination is taken; a mixed mask and plain word is not.
@@ -3239,6 +4415,8 @@ class Stage:
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
+            if base in ('s_mul_hi_u32', 's_mul_hi_i32') and len(srcs) != 2:
+                raise Unsupported('%s with %d operands, expected 3' % (base, len(ops)))
             if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
                 raise Unsupported('%s destination %s' % (base, dname))
             for source in srcs:
@@ -3253,23 +4431,60 @@ class Stage:
             r = reg_range(t)
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
+        mask_dest = dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo', 'exec_hi', 'vcc_hi')
+        if base == 's_mov_b64' and ops[0] == 'vcc' and len(ops) == 2:
+            source = reg_range(ops[1])
+            if source and source[0] == 's':
+                words = (syms[0], self.sym.get(source[2]))
+                if any(word and word[0] == 'desc' for word in words):
+                    if (source[1] % 2 or source[2] != source[1] + 1 or
+                            any(not word or word[0] != 'desc' for word in words)):
+                        raise Unsupported('mask from descriptor data: vcc needs an even pair of descriptor words')
+                    self.sym[106], self.sym[107] = words
+                    self.mark_vcc_descriptor()
+                    return None
+        tg_srcs = [
+            reg for tok in ops[1:] for r in (reg_range(tok),) if r and r[0] == 's'
+            for reg in range(r[1], r[2] + 1) if self.sym.get(reg) == ('tg_size',)
+        ]
+        if tg_srcs:
+            # Wave-ID bits TG_SIZE[11:6] (mask 0xfc0) are identically 0 for <= 32 threads per group (1 wave).
+            if (base == 's_and_b32' and not mods and len(srcs) == 2
+                    and dst and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105):
+                other = (srcs[1] if syms[0] == ('tg_size',) and syms[1] != ('tg_size',)
+                         else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
+                         else None)
+                if other is not None and self.const_u32(other) == 0xfc0:
+                    self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                    return None
+            raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
+                raise Unsupported('src_scc with unverified SCC')
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
+                self.scc_verified = False
                 if self.tracks_uniformity():
                     self.scc_uniform = False
             if shift_add or word_complement or word_absdiff:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
+            if self.pointer_add(base, dname, srcs, syms):
+                return None
             if dname == 'm0':
                 if scc:
                     raise Unsupported('scc from descriptor data')
                 self.sym['m0'] = syms[0] if base == 's_mov_b32' else ('descnum',)
                 return None
-            if dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
+            if mask_dest:
                 raise Unsupported('mask from descriptor data')
-            d = reg_range(dname)[1]
+            if dname == 'null':
+                raise Unsupported('scc from descriptor data' if (scc or base in SCC_UNMODELLED)
+                                  else '%s into null on descriptor data' % base)
+            if not dst or dst[0] != 's':
+                raise Unsupported('%s destination %s' % (base, ops[0]))
+            d = dst[1]
             own = self.sym.get(d)
             raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
                    if getattr(self, 'kind', None) in ('cs', 'vs') and len(syms) == 2 else None)
@@ -3288,6 +4503,10 @@ class Stage:
                             self.sym[d + 1] = hi
                         elif self.tracks_uniformity():
                             self.varying_s.add(d + 1)
+            elif (own and own[0] == 'ptr' and base in ('s_add_u32', 's_addc_u32')
+                  and not getattr(self, 'has_branches', False)):
+                # With branches the offset is not tracked: the 'added' mark below stays, and the join refuses it.
+                raise Unsupported('%s adds a non-literal to a descriptor pointer' % base)
             elif raw is not None:
                 self.sym[d] = raw
                 if raw[0] == 'desc':
@@ -3299,7 +4518,7 @@ class Stage:
                     self.sym[d] = own[:4] + ('modified',)
                     getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
                 else:
-                    self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
+                    self.sym[d] = own[:2] + ('added',)  # this operation has no proven byte offset
             else:
                 self.sym[d] = ('descnum',)
             return None
@@ -3311,11 +4530,29 @@ class Stage:
         needed = max((int(i) for i in re.findall(r'\{(\d+)\}', text)), default=-1) + 1
         if len(srcs) < needed:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), needed + 1))
+        if dname == 'null':
+            if any(self.is_lane_mask(t) for t in srcs):
+                raise Unsupported('%s into null on a lane mask' % base)
+            if pair:
+                raise Unsupported('%s into null' % base)
+            if base in SCC_UNMODELLED and getattr(self, 'pc', None) not in getattr(self, 'address_carry_pairs', ()):
+                raise Unsupported('%s into null: SCC is not modelled' % base)
         absorbed = self.exec_absorbed_source(base, srcs)
         if absorbed is not None:
             self.used_s.add(reg_range(srcs[absorbed])[1])
         values = [t if i == absorbed else self.u(t) for i, t in enumerate(srcs)]
         expr = text.format(*values)
+        if base == 's_add_u32' and getattr(self, 'pc', None) in self.address_carry_pairs:
+            for tok in srcs:
+                self.reject_lane_mask_data(base, tok)
+                r = reg_range(tok)
+                if r and r[1] in getattr(self, 'join_masks', ()):
+                    raise Unsupported('address carry on a lane mask joined at a branch target')
+            # Compute carry before writing the low register, which can also be an addend.
+            self.set_scc('(%s) < %s' % (expr, values[0]))
+            self.address_carry_reader = self.address_carry_pairs[self.pc]
+        elif base in SCC_UNMODELLED:
+            self.scc_verified = False
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
@@ -3343,7 +4580,13 @@ class Stage:
             if scc:
                 self.set_scc(scc.replace('$', var))
             return None
-        d = reg_range(dname)[1]
+        if dname == 'null':
+            if scc:
+                self.set_scc(scc.replace('$', '(%s)' % expr))
+            return None
+        if not dst or dst[0] != 's':
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        d = dst[1]
         is_mask = pair or any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
                               for t in srcs) and base.split('_')[1] in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor', 'xnor', 'not', 'cselect')
         if base in ('s_mov_b32', 's_mov_b64', 's_movk_i32') and re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', srcs[0]) and srcs[0] not in FLOATS:
@@ -3361,6 +4604,8 @@ class Stage:
                 if r and r[0] == 's' and r[1] == r[2]:
                     c = self.is_const(r[1])
                     return c if c is not None else getattr(self, '_pre_fconst', getattr(self, 'float_const_s', {})).get(r[1])
+                if tok == 'null':
+                    return 0
                 if tok in FLOATS:
                     return fbits(FLOATS[tok])
                 if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', tok) and tok not in FLOATS:
@@ -3401,6 +4646,15 @@ class Stage:
             self.scc_effect = 'a lane-mask complement'
             if self.tracks_uniformity():
                 self.scc_uniform = False
+        if (base == 's_lshl_b32' and hasattr(self, 'heap_index') and re.fullmatch(r'0x[0-9a-f]+|[0-9]+', srcs[1])
+                and int(srcs[1], 0) == 5):
+            # index << 5 is the byte offset of a 32-byte resource-heap record. The index is named only when it is a
+            # root constant word (the dispatch knows it) or a word an s_buffer_load wrote (refused by name).
+            r = reg_range(srcs[0])
+            if syms[0] and syms[0][0] == 'ud' and self.pipe.uds[syms[0][1]][0] == 'rootconst':
+                self.heap_index[d] = self.pipe.uds[syms[0][1]]
+            elif r and r[0] == 's' and {**self.heap_index, **self.heap_index_was}.get(r[1]) == ('bufword',):
+                self.heap_index[d] = ('buffer',)
         if is_mask:
             self.masks.add(d)
         if pair and base != 's_mov_b64':
@@ -3412,6 +4666,7 @@ class Stage:
     def set_exec_scc(self, expr):
         self.exec_known = False
         self.scc_effect = 'emitted'
+        self.scc_verified = True
         self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
         if hasattr(self, 'scc_uniform'):
             self.scc_uniform = False
@@ -3530,6 +4785,60 @@ class Stage:
         value = sopk_imm(ops[1], True)
         self.scalar_cmov([ops[0], '0x%x' % value], mods, False, 's_cmovk_i32')
 
+    def op_s_bitset0_b32(self, ops, mods):
+        return self.scalar_bitset(ops, mods, clear=True)
+
+    def op_s_bitset1_b32(self, ops, mods):
+        return self.scalar_bitset(ops, mods, clear=False)
+
+    def scalar_bitset(self, ops, mods, clear):
+        """s_bitset0/1_b32: clear or set bit S0[4:0] of D in place; SCC unchanged.
+
+        RDNA 2 ISA SOP1 0x1b / 0x1d (and the pixel_aot / #1579 lowering): D.u &= ~(1u << (S0.u & 31))
+        or D.u |= (1u << (S0.u & 31)). The destination is also a source (READ_MODIFY_WRITE). Only a
+        plain user SGPR destination is accepted; lane masks and descriptor-bearing SGPRs stay refused
+        so a partial word cannot be treated as a full 32-bit scalar.
+        """
+        name = 's_bitset%d_b32' % (0 if clear else 1)
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2 unmodified' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        d = dst[1]
+        if self.is_lane_mask(ops[0]) or d in self.masks:
+            raise Unsupported('%s on a lane mask' % name)
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        bit_sym = None
+        if ops[1] == 'null':
+            index_imm = 0
+        elif imm:
+            index_imm = int(ops[1], 0) & 31
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+                raise Unsupported('%s on a lane mask' % name)
+            bit_sym = self.sym.get(src[1])
+            if bit_sym and bit_sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('%s on %s data' % (name, bit_sym[0]))
+            index_imm = bit_sym[1] & 31 if bit_sym and bit_sym[0] == 'const' else None
+        sym = self.sym.get(d)
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('%s on %s data' % (name, sym[0]))
+        prev = self.S(d)
+        bit = self.u(ops[1])
+        mask = '(1u << (%s & 31))' % bit
+        result = '(%s & ~%s)' % (prev, mask) if clear else '(%s | %s)' % (prev, mask)
+        if sym and sym[0] == 'const' and index_imm is not None:
+            value = ((sym[1] & ~(1 << index_imm)) if clear else (sym[1] | (1 << index_imm))) & 0xffffffff
+            self.set_s(d, '0x%08xu' % value, ('const', value))
+        else:
+            self.set_s(d, result)
+        self.masks.discard(d)
+        return None
+
     def scalar_cmov(self, ops, mods, pair, name=None):
         """D = SCC ? S0 : D on plain SGPR destinations; SCC is unchanged."""
         name = name or 's_cmov_b%d' % (64 if pair else 32)
@@ -3618,7 +4927,11 @@ class Stage:
         if len(ops) != 3:
             raise Unsupported('s_load with %d operands' % len(ops))
         dst, base = reg_range(ops[0]), reg_range(ops[1])
-        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
+        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[1] > 105 or dst[2] > 107:
+            raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
+        # s106/s107 are vcc: only a descriptor load, which emits no code, may end there (s[104:107]).
+        into_vcc = dst[2] > 105
+        if into_vcc and (dst[1] > 104 or dst[2] != 107):
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if not base or base[0] != 's' or base[2] - base[1] != 1 or base[2] > 105:
             raise Unsupported('s_load base %s' % ops[1])
@@ -3628,6 +4941,15 @@ class Stage:
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
+        if len(p) > 2 and not isinstance(p[2], int):
+            # The 'added' mark (an add whose offset is not tracked, as in a program with branches): no byte offset.
+            raise Unsupported('s_load through s%d: the pointer was advanced by an untracked offset' % base[1])
+        base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
+        if (base_off or len(p) > 2) and p[1][0] in PTR64_SOURCES:
+            # An advanced 64-bit pointer needs its high word completed by the matching s_addc_u32;
+            # a table pointer is 32 bits wide and has no high word.
+            if base[1] in getattr(self, 'ptr_open_pairs', ()) or self.sym.get(base[1] + 1) != ptr_high_symbol(p[1], base_off):
+                raise Unsupported('s_load through s%d: its high word is not the matching advanced pair' % base[1])
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
         token = smem_offset(ops[2])
         known = self.const_soffset(token) if p[1] != ('smpheap',) else None
@@ -3645,14 +4967,14 @@ class Stage:
             if imm is not None:
                 raise Unsupported('SMEM literal offset %s with offset:%#x' % (ops[2], imm))
             if p[1][0] == 'root':
+                if into_vcc:
+                    raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
                 buf = self.pipe.resource((p[1], None), 'buf')
                 for i in range(count):
-                    self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
+                    self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, base_off + off + 4 * i))
                 return
-            # The pointer symbol does not record an addend or a rewritten high word, so two loads through such a
-            # pointer may read different words under the same (source, offset). In a compute or vertex stage (the
-            # stages that accept a raw descriptor conversion before a store) those loads are told apart by the
-            # offset of the s_load; loads through the untouched pair keep one identity.
+            # A compute or vertex raw-store conversion must distinguish loads through different high words
+            # even when the source and byte offset match. Keep the load PC for a changed pointer pair.
             # A 32-bit table pointer carries a high word the program sets to a constant: loads through the same
             # untouched low word and the same constant read the same words (tag -1 - constant).
             hi = self.sym.get(base[1] + 1)
@@ -3663,8 +4985,14 @@ class Stage:
             else:
                 load = (self.pc,)
             for i in range(count):
-                self.sym[dst[1] + i] = ('desc', p[1], off, i) + load
+                self.sym[dst[1] + i] = ('desc', p[1], base_off + off, i) + load
+            if into_vcc:
+                self.mark_vcc_descriptor()
             return
+        if into_vcc:
+            raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
+        if base_off:
+            raise Unsupported('s_load through %s advanced by %#x' % (p[1], base_off))
         if p[1] == ('smpheap',):
             if self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
@@ -3687,7 +5015,30 @@ class Stage:
                 self.sym[dst[1] + i] = ('const', 0, 'unassigned')
             self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
             return
+        if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
+            return self.heap_record(dst, base, token, imm, count)
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
+
+    def heap_record(self, dst, base, token, imm, count):
+        """s_load_dwordx4 D, <resource heap pointer>, R in a compute program, where R is a root constant word
+        shifted left by 5 with no later write of R and no branch target in between: D is the buffer descriptor in
+        the 32-byte heap record that the root constant indexes. The manifest names the root constant; the dispatch
+        reads the record. Only this exact form is modelled."""
+        what = 's_load of a resource heap record'
+        r = reg_range(token)
+        index = getattr(self, 'heap_index', {}).get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
+        if index == ('buffer',):
+            raise Unsupported('%s whose index is read from a buffer' % what)
+        if not index or index[0] != 'rootconst':
+            raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
+        if count != 4:
+            raise Unsupported('%s of %d dwords' % (what, count))
+        if imm is not None:
+            raise Unsupported('%s with offset:%#x' % (what, imm))
+        if self.sym.get(base[2]) != ('const', 0):
+            raise Unsupported('%s through a pointer whose high word is not a constant zero' % what)
+        for i in range(count):
+            self.sym[dst[1] + i] = ('desc', ('resheap',) + index[1:], 0, i)
 
     def op_s_bfm_b32(self, ops, mods):
         """Fold constant bitfield masks: titles build inline sampler words with them."""
@@ -3698,6 +5049,8 @@ class Stage:
             r = reg_range(o)
             if r and r[0] == 's':
                 vals.append(self.is_const(r[1]))
+            elif o == 'null':
+                vals.append(0)
             else:
                 try:
                     vals.append(int(o, 0))
@@ -3712,7 +5065,16 @@ class Stage:
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
             return None
-        d = reg_range(ops[0])[1]
+        if ops[0] == 'null':
+            if any(self.is_lane_mask(t) for t in ops[1:3]):
+                raise Unsupported('s_bfm_b32 into null on a lane mask')
+            self.u(ops[1])
+            self.u(ops[2])
+            return None
+        dst = reg_range(ops[0])
+        if not dst:
+            raise Unsupported('s_bfm_b32 destination %s' % ops[0])
+        d = dst[1]
         if None not in vals:
             value = (((1 << (vals[0] & 31)) - 1) << (vals[1] & 31)) & 0xffffffff
             self.set_s(d, '0x%08xu' % value, ('const', value))
@@ -3720,8 +5082,64 @@ class Stage:
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
         return None
 
+    def op_s_bfm_b64(self, ops, mods):
+        """s_bfm_b64: D.u64 = ((1ULL << S0.u[5:0]) - 1) << S1.u[5:0], SCC unchanged.
+
+        Unlike the mask-style 64-bit scalar ops (which keep one lane bit), this is a real 64-bit value, so both
+        destination words are written. The width is masked to six bits here and the offset inside shl64, which
+        also drops the bits shifted past bit 63; every HLSL shift count stays below 32."""
+        if mods:
+            raise Unsupported('s_bfm_b64 with %s' % (mods,))
+        if len(ops) != 3:
+            raise Unsupported('s_bfm_b64 with %d operands, expected 3' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[1] % 2 or dst[2] > 105:
+            raise Unsupported('s_bfm_b64 destination %s' % ops[0])
+        vals = []
+        for o in ops[1:]:
+            r = reg_range(o)
+            if o in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') or (
+                    r and (r[0] != 's' or r[1] != r[2] or r[1] > 105)):
+                raise Unsupported('s_bfm_b64 source %s' % o)
+            if r and r[1] in self.masks:
+                # A lane mask is not a number. Every source is read and checked before any destination state
+                # changes, so a source aliasing the destination cannot lose its mask flag first.
+                raise Unsupported('s_bfm_b64 source %s holds a lane mask' % o)
+            if r:
+                vals.append(self.is_const(r[1]))
+            else:
+                try:
+                    vals.append(int(o, 0))
+                except ValueError:
+                    vals.append(None)
+        d = dst[1]
+        if None in vals:
+            width, offset = self.u(ops[1]), self.u(ops[2])  # may refuse; still before any write
+        # Both words are uniform only if both sources are. Judged before the destination changes, so an aliased
+        # source is classified by its old value and an older proof for s[d] or s[d+1] cannot survive.
+        uniform = self.tracks_uniformity() and all(self.uniform_source(o) for o in ops[1:])
+        self.masks.discard(d)
+        self.masks.discard(d + 1)
+        if None not in vals:
+            value = (((1 << (vals[0] & 63)) - 1) << (vals[1] & 63)) & 0xffffffffffffffff
+            for i, word in enumerate((value & 0xffffffff, value >> 32)):
+                self.set_s(d + i, '0x%08xu' % word, ('const', word))
+            return None
+        # Both words come from locals computed before either destination is written, so a source may be the destination.
+        self.sym.pop(d, None)
+        self.sym.pop(d + 1, None)
+        if self.tracks_uniformity():
+            for word in (d, d + 1):
+                self.record_scalar_uniformity(word, uniform)
+        self.used_s.update((d, d + 1))
+        self.emit('{ uint bw = %s & 63u; uint2 t = shl64(bw >= 32u ? 0xffffffffu : (1u << (bw & 31u)) - 1u, '
+                  'bw >= 32u ? (1u << (bw & 31u)) - 1u : 0u, %s); s%d = t.x; s%d = t.y; }' % (width, offset, d, d + 1))
+        return None
+
     def scalar_const(self, tok):
         """Value of a 32-bit scalar source that is known at translation time, else None."""
+        if tok == 'null':
+            return 0
         r = reg_range(tok)
         if r:
             return self.is_const(r[1]) if r[0] == 's' and r[1] == r[2] else None
@@ -3784,6 +5202,7 @@ class Stage:
             if self.tracks_uniformity():
                 (self.varying_s.discard if uniform else self.varying_s.add)(r)
         self.scc_effect = 'emitted'
+        self.scc_verified = True
         if self.tracks_uniformity():
             self.scc_uniform = uniform
         return None
@@ -3849,6 +5268,8 @@ class Stage:
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i), uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
+            if hasattr(self, 'heap_index'):
+                self.heap_index[dst[1] + i] = ('bufword',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -4000,7 +5421,7 @@ class Stage:
         return key
 
     def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False,
-                            raw_conversion_ok=False):
+                            raw_conversion_ok=False, uniform_off=False):
         """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
@@ -4012,7 +5433,7 @@ class Stage:
             elif m != 'offen':
                 raise Unsupported('%s modifier %s' % (kind_label, m))
         offen = 'offen' in mods
-        if len(ops) != 4 or (not offen and not (allow_scalar_address and glc and ops[1] == 'off')):
+        if len(ops) != 4 or not (offen or ops[1] == 'off' and (allow_scalar_address and glc or uniform_off)):
             raise Unsupported('%s without the offen address form' % kind_label)
         data = reg_range(ops[0])
         if not data or data[0] != 'v' or data[2] - data[1] != data_count - 1 or data[2] > 255:
@@ -4024,7 +5445,7 @@ class Stage:
         key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
-            if not offen:
+            if not offen and not uniform_off:
                 raise Unsupported('%s off requires a scalar register soffset' % kind_label)
             offset += int(ops[3], 0)
         else:
@@ -4046,7 +5467,12 @@ class Stage:
             return self.op_buffer_store_vs(ops, mods, count)
         if self.kind != 'cs':
             raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
-        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True)
+        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True,
+                                                        uniform_off=True)
+        # The `off` form (no VGPR address, MUBUF offen = idxen = 0) gives every lane the same byte address, so the
+        # lanes race; with one proven value in all of them any order stores the same words.
+        if ops[1] == 'off' and not all(self.proven_uniform_v(n) for n in range(src[1], src[2] + 1)):
+            raise Unsupported('buffer store off with data not proven wave-uniform')
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
         # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
@@ -4227,6 +5653,10 @@ class Stage:
             raise Unsupported('vertex stage calls a fetch routine and the pipeline declares no input layout')
         base = self.pipe.ud(('basevertex',))
         for e in self.pipe.vs_fetch:
+            if e.get('empty'):
+                for i in range(e['count']):
+                    self.set_v(e['vgpr'] + i, '0u')
+                continue
             key = (('vbtab',), 16 * e['slot'])
             buf = self.pipe.resource(key, 'buf')
             stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
@@ -4495,6 +5925,66 @@ class Stage:
             uav, word3, stride, num_records, idx_expr, voff_expr, soff_expr, imm_offset, val_expr)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
+    def op_buffer_store_format_xyzw(self, ops, mods):
+        """Lower compute MUBUF buffer_store_format_xyzw (opcode 0x07) in the idxen form with an inline soffset.
+
+        FORMAT, stride and num_records are read at dispatch from the same entry constants as
+        buffer_store_format_d16_x, with its bounds and OOB_SELECT rules. Only 4-channel formats write
+        (STORE_FORMAT_XYZW_FORMATS); any other descriptor makes the store a no-op.
+        """
+        name = 'buffer_store_format_xyzw'
+        if self.kind != 'cs':
+            raise Unsupported(name)  # the unknown-op refusal
+        raw = getattr(self, 'raw_code', b'')
+        pc = getattr(self, 'pc', None)
+        if raw and pc is not None and pc + 8 <= len(raw):
+            w0, w1 = struct.unpack_from('<II', raw, pc)
+            if (w0 & 0x00030000) or (w1 & 0x00200000):
+                raise Unsupported('%s illegal MUBUF encoding bits (lds/reserved)' % name)
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands, expected 4' % (name, len(ops)))
+        idxen = False
+        imm_offset = None
+        for m in mods:
+            if m == 'idxen' and not idxen:
+                idxen = True
+            elif m == 'offen':
+                raise Unsupported('%s offen address form (only idxen is modelled)' % name)
+            elif m.startswith('offset:') and imm_offset is None and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
+                imm_offset = int(m[7:], 0)
+                if imm_offset > 0xfff:
+                    raise Unsupported('%s modifier %s' % (name, m))
+            else:
+                raise Unsupported('%s modifier %s' % (name, m))
+        if not idxen:
+            raise Unsupported('%s without idxen (only the idxen address form is modelled)' % name)
+        src = reg_range(ops[0])
+        if not src or src[0] != 'v' or src[2] - src[1] != 3 or src[2] > 255:
+            raise Unsupported('%s data %s' % (name, ops[0]))
+        vaddr = reg_range(ops[1])
+        if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
+            raise Unsupported('%s vaddr %s for idxen' % (name, ops[1]))
+        if not re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
+            raise Unsupported('%s soffset %s (only a non-negative inline constant is modelled)' % (name, ops[3]))
+        rsrc = reg_range(ops[2])
+        if not rsrc or rsrc[0] != 's' or rsrc[2] - rsrc[1] != 3 or rsrc[2] > 105:
+            raise Unsupported('%s descriptor %s' % (name, ops[2]))
+        key = self.store_descriptor(ops[2], 4, name, stride0_ok=False)
+        first = self.sym.get(rsrc[1])
+        if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
+            raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
+        idx = self.u(ops[1])
+        data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
+        uav = self.pipe.uav(key, 'raw')
+        uav_index = self.pipe.uavs[key]['index']
+        word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
+        stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
+        num_records = 'ud%d' % self.pipe.ud(('uav_numrecords', uav_index))
+        self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
+        call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
+            uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
+        self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
+
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
 
@@ -4535,9 +6025,38 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
-            raise Unsupported('unverified 1D image sample address or modifiers')
+        # A 1D image has one coordinate. sample_lz and sample_l carry the explicit level in the next
+        # address dword, so their address is x then level; Texture1D.SampleLevel takes the location as a
+        # float, which is what the `one` branch below builds. Anything else stays refused by name.
+        if one:
+            expected = {'sample': 1, 'lz': 1, 'l': 2}.get(how)
+            if expected is None or len(cs) != expected or not dmask:
+                raise Unsupported('unverified 1D image %s address or modifiers' % how)
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or (how != 'sample' and m in ('dlc', 'glc', 'slc'))):
+                    raise Unsupported('1D image %s modifier %s' % (how, m))
         lod = bias = None
+        grads = None
+        if how == 'd':
+            # Address dwords are ddx then ddy (one per coordinate axis each) and then the coordinates, so a 2D
+            # sample is six registers, a 2D array seven and a volume nine. Offsets, bias, clamp, a16 and the
+            # other layout-changing modifiers are refused; only cache-policy bits are accepted.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_sample_d modifier %s' % m)
+            if dmask == 0:
+                raise Unsupported('image_sample_d with an empty dmask')
+            if one:
+                raise Unsupported('image_sample_d on a 1D image')
+            axes = 3 if dim == 'SQ_RSRC_IMG_3D' else 2
+            want = 3 * axes + (1 if dim == 'SQ_RSRC_IMG_2D_ARRAY' else 0)
+            if want == 9 and len(cs) == 16 and not ops[1].startswith('['):
+                # A contiguous nine-dword volume address is encoded as a sixteen-register range; the rest is padding.
+                cs = cs[:9]
+            if len(cs) != want:
+                raise Unsupported('image_sample_d with %d address registers' % len(cs))
+            grads = (cs[:axes], cs[axes:2 * axes])
+            cs = cs[2 * axes:]
         if how in ('l', 'b'):
             # image_sample_l: the address dwords are the coordinates and then the explicit level. image_sample_b:
             # the RDNA 2 ISA (section 8.2.5, "{ offset } { bias } { z-compare } { derivative } { body }") puts one
@@ -4552,16 +6071,23 @@ class Stage:
                     raise Unsupported('%s modifier %s' % (name, m))
             if dmask == 0:
                 raise Unsupported('%s with an empty dmask' % name)
-            if len(cs) != (4 if three else 3):
+            expected = 4 if three else (2 if one else 3)
+            if len(cs) != expected:
                 raise Unsupported('%s with %d address registers' % (name, len(cs)))
             if how == 'l':
                 lod, cs = cs[-1], cs[:-1]
             else:
                 # The bias is added to the LOD derived from the coordinate derivatives of the pixel quad: only a
-                # pixel stage that still runs with its entry mask has them. Elsewhere the plain sample is lowered
-                # to level 0, which would drop the bias, so the bias form is refused instead.
-                if self.kind != 'ps' or not self.exec_known or len(self.blocks) > 0:
-                    raise Unsupported('image_sample_b needs implicit derivatives: pixel stage, entry mask, no branches')
+                # pixel stage that still runs with its entry mask and wave-uniform control flow has them.
+                # Elsewhere the plain sample is lowered to level 0, which would drop the bias, so the bias form is
+                # refused instead. A uniform join (scc with scc_uniform) or later loop does not drop the proof
+                # (M200-01 B/L). Divergent EXEC or a vcc/exec-conditioned branch before the sample stays refused.
+                if (self.kind != 'ps' or not self.exec_known or
+                        not getattr(self, 'uniform_cf', True)):
+                    raise Unsupported('image_sample_b needs implicit derivatives: pixel stage with the entry EXEC '
+                                     'mask and wave-uniform control flow')
+                if hasattr(self, 'derivative_sites'):
+                    self.derivative_sites.append((self.pc, 'image_sample_b'))
                 bias, cs = cs[0], cs[1:]
         if how == 'get_lod':
             # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
@@ -4573,8 +6099,11 @@ class Stage:
             if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
                 raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
             # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
-            if not self.exec_known or len(self.blocks) > 0:
-                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage, entry mask, no branches')
+            if not self.exec_known or not getattr(self, 'uniform_cf', True):
+                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage with the entry EXEC '
+                                 'mask and wave-uniform control flow')
+            if hasattr(self, 'derivative_sites'):
+                self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):
@@ -4639,12 +6168,12 @@ class Stage:
                 if heap or not words or self.default_sampler_words(words):
                     raise Unsupported('image_get_lod with a sampler that is not constant (LOD limits and bias unknown)')
                 smp = self.pipe.sampler(tuple(self.lod_sampler_words('image_get_lod', words)), lod_limits=True)
-            elif how in ('sample', 'l', 'lz') and (heap or (words and self.default_sampler_words(words))):
+            elif how in ('sample', 'l', 'lz', 'd') and (heap or (words and self.default_sampler_words(words))):
                 # A heap sampler, or the fixed default that stands in for one, keeps its unbounded static LOD range: the
                 # descriptor is read at run time, so its MIN_LOD, MAX_LOD and bias are not validated here (#2221).
                 self.pipe.lod_unvalidated.add(name)
                 smp = heap or self.pipe.sampler(tuple(words))
-            elif how in ('sample', 'l', 'lz') and words:
+            elif how in ('sample', 'l', 'lz', 'd') and words:
                 # A constant descriptor carries its LOD limits like image_sample_b, under the same bias and range
                 # validation. A mip filter of 0 (base level only) keeps the ordinary sampler, as before: refusing it
                 # would drop every pipeline with an all-zero inline sampler, and only the bias form needs it refused.
@@ -4664,7 +6193,11 @@ class Stage:
             if how == 'sample' and self.kind == 'cs':
                 # A compute lane has no pixel quad to supply derivatives; level 0 would be a guess.
                 raise Unsupported('image_sample with implicit LOD in a compute program')
-            if how == 'l':
+            if how == 'd':
+                axes = len(grads[0])
+                dx, dy = ['float%d(%s)' % (axes, ', '.join(self.f(r) for r in g)) for g in grads]
+                call = '%s.SampleGrad(%s, %s, %s, %s)' % (tex, smp, uv, dx, dy)
+            elif how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'b':
                 # SampleBias adds the bias to the implicit LOD, like the ISA's _B suffix ("Add this BIAS to the LOD
@@ -4816,6 +6349,12 @@ class Stage:
     def op_image_sample_b(self, ops, mods):
         self.image(ops, mods, 'b')
 
+    def op_image_sample_d(self, ops, mods):
+        self.image(ops, mods, 'd')
+
+    def op_image_sample_c_d(self, ops, mods):
+        raise Unsupported('image_sample_c_d: SampleCmpGrad needs shader model 6.8; only c and c_lz are lowered')
+
     def op_image_get_lod(self, ops, mods):
         self.image(ops, mods, 'get_lod')
 
@@ -4937,6 +6476,9 @@ class Stage:
         tex = self.pipe.resource(key, 'tex2d')
         return dst, addr, words, channels[masks[0]], tex
 
+    def op_image_gather4(self, ops, mods):
+        raise Unsupported('image_gather4 requires the guest implicit mip level')
+
     def op_image_gather4_lz(self, ops, mods):
         dst, addr, words, (channel_name, _), tex = self.gather_2d_setup(
             'image_gather4_lz', ops, mods, 2, 'two contiguous address registers', mip_preclamp=True)
@@ -5012,6 +6554,44 @@ class Stage:
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
 
+    def op_v_pack_b32_f16(self, ops, mods):
+        """D[15:0] = S0.f16, D[31:16] = S1.f16 (AMD RDNA 2 ISA, VOP3 V_PACK_B32_F16).
+
+        op_sel[i] selects the high half of source i (LLVM 15 VOP3Instructions.td: V_PACK_B32_F16 is VOP3_OPSEL).
+        The neg and abs source modifiers act on the sign bit (bit 15) of the selected half, abs first. The halves
+        are copied as bits, like pixel_aot's lowering of the same instruction: no binary16 denormal flush and no
+        NaN quieting is modelled (an assumption, not measured). Register sources only: an inline float constant
+        on a binary16 operand is a binary16 value, not the binary32 word u() would give. A destination op_sel bit
+        and clamp are refused, and so is any modifier other than the one op_sel:[a,b,c] spelling the decoder
+        prints."""
+        sel = [0, 0, 0]
+        for m in mods:
+            match = re.fullmatch(r'op_sel:\[([01]),([01]),([01])\]', m)
+            if not match:
+                raise Unsupported('v_pack_b32_f16 modifier %s' % m)
+            sel = [int(x) for x in match.groups()]
+        dst = reg_range(ops[0]) if ops else None
+        if sel[2] or len(ops) != 3 or not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            raise Unsupported('v_pack_b32_f16 form %s %s' % (', '.join(ops), ' '.join(mods)))
+        halves = []
+        for i, tok in enumerate(ops[1:3]):
+            neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+            tok = tok[1:] if neg else tok
+            absolute = tok.startswith('|') and tok.endswith('|')
+            tok = tok[1:-1] if absolute else tok
+            reg = reg_range(tok)
+            if not reg or reg[1] != reg[2] or reg[0] not in ('v', 's'):
+                raise Unsupported('v_pack_b32_f16 source %s' % ops[1 + i])
+            # The high half needs the whole word; the low half reads only bits 15:0, so a register whose high half
+            # is undefined (after an odd-count d16 load) stays readable here.
+            half = '(%s >> 16)' % self.u(tok) if sel[i] else '(%s & 0xffffu)' % self.u(tok, low16_only=True)
+            if absolute:
+                half = '(%s & 0x7fffu)' % half
+            if neg:
+                half = '(%s ^ 0x8000u)' % half
+            halves.append(half)
+        self.set_v(dst[1], '%s | (%s << 16)' % (halves[0], halves[1]))
+
     def op_v_cvt_pk_u8_f32(self, ops, mods):
         # VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides:
         #   D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])
@@ -5042,17 +6622,292 @@ class Stage:
         self.set_v(dst[1], '((%s & ~(0xffu << %s)) | (((((%s - 1u) < 0x7f800000u) ? uint(round(min(%s, 255.0))) : 0u) & 0xffu) << %s))'
                    % (rest, shift, bits, value, shift))
 
-    def op_s_ff1_i32_b32(self, ops, mods):
-        if self.kind != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':
-            raise Unsupported('s_ff1_i32_b32 requires compute exec_lo')
+    def op_s_ff0_i32_b32(self, ops, mods):
+        """Find first zero bit; SCC unchanged (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot ff0_i32_b32: D = firstbitlow(~S0)
+        (0xffffffff when every bit of S0 is set). Lane masks and descriptor-bearing
+        SGPRs are refused.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff0_i32_b32 with %d operands, expected 2 unmodified' % len(ops))
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
-            raise Unsupported('s_ff1_i32_b32 requires one SGPR destination')
-        if self.past_entry or not self.exec_known:
-            raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
-        # At dispatch entry even the last partial wave starts at lane zero.
-        # FF1 reports its index and leaves SCC unchanged.
-        self.set_s(dst[1], '0u', ('const', 0))
+            raise Unsupported('s_ff0_i32_b32 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_ff0_i32_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            zeros = (~value) & 0xffffffff
+            folded = 0xffffffff if zeros == 0 else (zeros & -zeros).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_ff0_i32_b32 source %s' % ops[1])
+        if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+            raise Unsupported('s_ff0_i32_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_ff0_i32_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            zeros = (~value) & 0xffffffff
+            folded = 0xffffffff if zeros == 0 else (zeros & -zeros).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src_u = self.u(ops[1])
+        self.set_s(dst[1], 'firstbitlow(~%s)' % src_u)
+        return None
+
+    def op_s_ff1_i32_b32(self, ops, mods):
+        """Find first set bit in a 32-bit scalar; SCC unchanged (#2022 Item F).
+
+        The compute-entry special case on `exec_lo` still folds to lane 0. Every other accepted
+        source uses `firstbitlow` (0xffffffff when the word is zero), matching `pixel_aot`.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_ff1_i32_b32 destination %s' % ops[0])
+        if ops[1] == 'exec_lo':
+            if self.kind != 'cs':
+                raise Unsupported('s_ff1_i32_b32 of exec_lo outside compute')
+            if getattr(self, 'past_entry', False) or not getattr(self, 'exec_known', False):
+                raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
+            # At dispatch entry even the last partial wave starts at lane zero.
+            self.set_s(dst[1], '0u', ('const', 0))
+            return None
+        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            # firstbitlow of zero is -1; otherwise the lowest set bit index.
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_ff1_i32_b32 source %s' % ops[1])
+        if src[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_ff1_i32_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        self.set_s(dst[1], 'firstbitlow(%s)' % self.u(ops[1]))
+        return None
+
+    def op_s_ff1_i32_b64(self, ops, mods):
+        """Find first set bit of a 64-bit source; SCC unchanged (#2022 Item F).
+
+        A 32-bit SOP1 literal or inline constant zero-extends to 64 bits (high word 0)
+        and folds. An SGPR pair uses the same 64-bit firstbitlow scan as SCALAR_BITS
+        (`_ctz64` / #2072). Kept as a Stage method so immediates are not refused by the
+        pair-only SCALAR_BITS template.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b64 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_ff1_i32_b64 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            # Encoding: one 32-bit literal/inline; the ISA zero-extends it (hi = 0).
+            value = int(ops[1], 0) & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != 1:
+            raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
+        if any(r in self.masks for r in range(src[1], src[2] + 1)):
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        lo, hi = self.S(src[1]), self.S(src[2])
+        self.masks.discard(dst[1])
+        self.set_s(dst[1], _ctz64(lo, hi))
+        return None
+
+    def op_s_abs_i32(self, ops, mods):
+        """Signed absolute value; SCC = result != 0 (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot: D = asint(S0) < 0 ? (0u - S0) : S0 (INT_MIN stays).
+        Lane masks and descriptor-bearing SGPRs are refused so a projected bit is not treated
+        as a full signed word.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_abs_i32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_abs_i32 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_abs_i32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        src_sym = None
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('s_abs_i32 source %s' % ops[1])
+            if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+                raise Unsupported('s_abs_i32 on a lane mask')
+            src_sym = self.sym.get(src[1])
+            if src_sym and src_sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('s_abs_i32 on %s data' % src_sym[0])
+            value = src_sym[1] & 0xffffffff if src_sym and src_sym[0] == 'const' else None
+        if value is not None:
+            folded = (-value if value & 0x80000000 else value) & 0xffffffff
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            return None
+        expr = '(asint(%s) < 0 ? (0u - %s) : %s)' % ((self.u(ops[1]),) * 3)
+        self.set_s(dst[1], expr, scc='$ != 0')
+        return None
+
+    def op_s_flbit_i32_b32(self, ops, mods):
+        """Find first bit high (leading-zero count); SCC unchanged (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot dpp_ffbh_u32: D = S0 == 0 ? 0xffffffff : 31 - firstbithigh(S0).
+        Lane masks and descriptor-bearing SGPRs are refused.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_flbit_i32_b32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_flbit_i32_b32 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_flbit_i32_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            folded = 0xffffffff if value == 0 else 31 - (value.bit_length() - 1)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_flbit_i32_b32 source %s' % ops[1])
+        if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+            raise Unsupported('s_flbit_i32_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_flbit_i32_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            folded = 0xffffffff if value == 0 else 31 - (value.bit_length() - 1)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src_u = self.u(ops[1])
+        self.set_s(dst[1], '(%s == 0u ? 0xffffffffu : 31u - firstbithigh(%s))' % (src_u, src_u))
+        return None
+
+    def op_s_quadmask_b64(self, ops, mods):
+        """Collapse each nibble of a 64-bit source into bits of D.lo; D.hi = 0 (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot: bit g of D.lo is 1 iff nibble g of the 64-bit source is
+        nonzero (sixteen nibbles → bits 0..15). SCC = (D.lo | D.hi) != 0.
+        Integer inline constants are 64-bit; 32-bit literals zero-extend.
+        Lane masks and descriptor SGPRs are refused.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_quadmask_b64 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[2] > 105 or dst[1] % 2:
+            raise Unsupported('s_quadmask_b64 destination %s' % ops[0])
+        if any(r in self.masks for r in range(dst[1], dst[2] + 1)) or self.is_lane_mask(ops[0]):
+            raise Unsupported('s_quadmask_b64 on a lane mask')
+
+        def nibble_mask(word):
+            folded = 0
+            for group in range(8):
+                if word & (0xf << (group * 4)):
+                    folded |= 1 << group
+            return folded
+
+        def nibble_expr(src_u):
+            return '(%s)' % ' | '.join(
+                '((%s & 0x%xu) != 0u ? %du : 0u)' % (src_u, 0xf << (g * 4), 1 << g)
+                for g in range(8))
+
+        imm = re.fullmatch(r'0x[0-9a-fA-F]{1,8}|-?\d+', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffffffffffff
+            folded = nibble_mask(value & 0xffffffff) | (nibble_mask(value >> 32) << 8)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            self.set_s(dst[1] + 1, '0u', ('const', 0))
+            return None
+        src = reg_range(ops[1])
+        if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != 1 or src[1] % 2:
+            raise Unsupported('s_quadmask_b64 source %s' % ops[1])
+        if any(r in self.masks for r in range(src[1], src[2] + 1)):
+            raise Unsupported('s_quadmask_b64 on a lane mask')
+        for n in range(src[1], src[2] + 1):
+            sym = self.sym.get(n)
+            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('s_quadmask_b64 on %s data' % sym[0])
+        lo_sym, hi_sym = self.sym.get(src[1]), self.sym.get(src[2])
+        if (lo_sym and lo_sym[0] == 'const' and hi_sym and hi_sym[0] == 'const'):
+            folded = nibble_mask(lo_sym[1] & 0xffffffff) | (nibble_mask(hi_sym[1] & 0xffffffff) << 8)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            self.set_s(dst[1] + 1, '0u', ('const', 0))
+            return None
+        lo_u, hi_u = self.S(src[1]), self.S(src[2])
+        # Low 8 bits from the low word; next 8 bits from the high word. High result word is 0.
+        expr = '((%s) | ((%s) << 8u))' % (nibble_expr(lo_u), nibble_expr(hi_u))
+        self.set_s(dst[1], expr, scc='$ != 0')
+        self.set_s(dst[1] + 1, '0u', ('const', 0))
+        return None
+
+    def op_s_quadmask_b32(self, ops, mods):
+        """Collapse each nibble of S0 to one bit of D; SCC = result != 0 (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot: bit g of D is 1 iff nibble g of S0 is nonzero.
+        Lane masks and descriptor-bearing SGPRs are refused.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_quadmask_b32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_quadmask_b32 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_quadmask_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            folded = 0
+            for group in range(8):
+                if value & (0xf << (group * 4)):
+                    folded |= 1 << group
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_quadmask_b32 source %s' % ops[1])
+        if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+            raise Unsupported('s_quadmask_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_quadmask_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            folded = 0
+            for group in range(8):
+                if value & (0xf << (group * 4)):
+                    folded |= 1 << group
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            return None
+        src_u = self.u(ops[1])
+        parts = ['((%s & 0x%xu) != 0u ? %du : 0u)' % (src_u, 0xf << (g * 4), 1 << g) for g in range(8)]
+        self.set_s(dst[1], '(%s)' % ' | '.join(parts), scc='$ != 0')
+        return None
 
     # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
     def op_x2w_mesh_lane0(self, ops, mods):
@@ -5141,14 +6996,28 @@ class Stage:
     def op_v_mbcnt_hi_u32_b32(self, ops, mods):
         self.op_v_mbcnt_lo_u32_b32(ops, mods, high=True)
 
+    def proven_uniform_v(self, n):
+        """VGPR n holds one value in every lane EXEC enables now. In the entry block EXEC is known; past it, a
+        recomputable expression proves no join, EXEC write or overwrite lies between the definition and here."""
+        if not self.tracks_uniformity() or n not in self.uniform_v:
+            return False
+        # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
+        if getattr(self, 'past_entry', True):
+            return n in getattr(self, 'uniform_expr', {}) and getattr(self, 'has_branches', False)
+        return getattr(self, 'exec_known', False)
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
-        # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
-        if (mods or not self.tracks_uniformity() or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v or
-                (src[1] not in getattr(self, 'uniform_expr', {}) or not getattr(self, 'has_branches', False)
-                 if past_entry else not getattr(self, 'exec_known', False))):
+        waterfalls = getattr(self, 'waterfall_reads', {})
+        if getattr(self, 'pc', None) in waterfalls and not (src and self.proven_uniform_v(src[1])):
+            reason = waterfalls[self.pc]
+            if reason:
+                raise Unsupported('compute readfirstlane waterfall: ' + reason)
+            self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
+            return
+        if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
+                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
         if past_entry:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
@@ -5158,13 +7027,92 @@ class Stage:
         else:
             self.set_s(dst[1], self.u(ops[1]))
 
-    # ---- SGPR spill to VGPR lanes (#2125, item E) --------------------------------------------
+    # ---- SGPR spill to VGPR lanes (#2125 item E; mesh #2413 T7 / #2127) ----------------------
     # The compiler parks a scalar in one lane of a VGPR: `v_writelane_b32 vN, sM, k` writes sM into lane k
     # and `v_readlane_b32 sD, vN, k` reads it back (AMD RDNA 2 ISA reference, VOP3 lane ops; LLVM 15
     # AMDGPU spill lowering). Both ignore EXEC. With a constant k and a VGPR that no other instruction
     # touches, vN is only a table of scalar slots, so one scalar variable per (vN, k) is an exact model
     # and no other lane is ever read. Anything else keeps the one-lane model out of reach and is refused.
-    SPILL_LANES = 32
+    # Lanes 0..63 cover a wave64 program. A wave32 program uses only bits 4:0 of the lane select (RDNA 2 ISA,
+    # v_readlane/v_writelane: the lane is taken modulo the wave size), so k and k + 32 name one slot there and two in
+    # wave64; the translator does not know the wave size, so a VGPR whose lanes include such a pair is refused.
+    # Slot 57 mesh is wave64 (#2127). Vertex stages use the same model: the two instructions touch no other lane and no stage input.
+    #
+    # With branches the slot variable is assigned on the pixel's own path, while the hardware slot holds the last
+    # write on the wave's path. The two paths differ only inside the region of a branch not proven uniform (an
+    # s_cbranch_execz or _vccz the pixel takes alone, or an SCC branch on varying data), where the wave also runs
+    # the blocks this pixel skips. spill_reaching gives the writes that can supply a read, written on every path.
+    # One write: every path into the read ran it, so the slot is one more scalar register; it is accepted unless
+    # the write lies in such a region that the read is outside (a loop or arm the wave can run after this pixel
+    # left it). Several writes: the value is chosen by the path, so every write must lie outside every such region;
+    # the reload then keeps a constant only if all of them stored it, and is not claimed uniform.
+    SPILL_LANES = 64
+    SPILL_STAGES = ('ps', 'vs', 'ms')
+
+    def spill_reaching(self, cfg):
+        """Instruction index of each v_readlane_b32 -> the v_writelane_b32 indices that can supply its (VGPR, lane), or
+        None when some path from the entry reaches it with none. Forward must-dataflow over the blocks: a slot is
+        written at a join only if it is written on every incoming edge (intersection) and the writes that can supply
+        it are the union over those edges, iterated to a fixed point so a later write in a loop body reaches the loop
+        head through the back edge."""
+        bounds, _, succ, _ = cfg
+        lane_ops = {}
+        for i, (_, _, name, asm) in enumerate(self.ins):
+            base = re.sub(r'_e(32|64)$', '', name)
+            ops = parse(asm)[1] if base in ('v_writelane_b32', 'v_readlane_b32') else ()
+            if len(ops) == 3:
+                try:
+                    lane = int(ops[2], 0)  # 3 and 0x3 are one slot
+                except ValueError:
+                    lane = ops[2]  # an SGPR lane, refused by spill_operands
+                lane_ops[i] = (base == 'v_writelane_b32', ops[0 if base == 'v_writelane_b32' else 1], lane)
+        into = [{}] + [None] * (len(bounds) - 1)  # None: no path reaches the block yet
+        reach = {}
+        changed = True
+        while changed:
+            changed = False
+            for b, (lo, hi) in enumerate(bounds):
+                if into[b] is None:
+                    continue
+                state = dict(into[b])
+                for i in range(lo, hi):
+                    if i in lane_ops:
+                        write, vreg, lane = lane_ops[i]
+                        if write:
+                            state[vreg, lane] = frozenset([i])
+                        else:
+                            reach[i] = state.get((vreg, lane))
+                for t in succ[b]:
+                    new = state if into[t] is None else {k: into[t][k] | state[k] for k in into[t].keys() & state.keys()}
+                    if new != into[t]:
+                        into[t], changed = new, True
+        return reach
+
+    def spill_join(self, n, lane):
+        """(sym, uniform) of the slot a v_readlane_b32 reads in a program with branches, or a refusal naming what
+        failed (see the comment above SPILL_LANES)."""
+        i = self.descriptor_instruction_index
+        writes = self.spill_reach.get(i)
+        if writes is None:
+            raise Unsupported('v_readlane_b32 reads v%d lane %d with no v_writelane_b32 of it on some path' % (n, lane))
+        if max(writes) > i:
+            raise Unsupported('v_readlane_b32 reads v%d lane %d written later in a loop (loop-carried)' % (n, lane))
+        if any(w not in self.spill_writes for w in writes):
+            raise Unsupported('v_readlane_b32 reads v%d lane %d from a v_writelane_b32 that was not translated' % (n, lane))
+        _, block_of, _, div_blocks = self.spill_cfg
+        here = block_of[i]
+        for off, blocks in sorted(div_blocks.items()):
+            if off in self.uniform_branches or not any(block_of[w] in blocks for w in writes):
+                continue
+            if len(writes) > 1:
+                raise Unsupported('v_readlane_b32 joins %d writes of v%d lane %d, one inside the region of the branch at '
+                                  '%#x, which is not proven uniform' % (len(writes), n, lane, off))
+            if here not in blocks:
+                raise Unsupported('v_readlane_b32 reads v%d lane %d outside the region of the branch at %#x that writes '
+                                  'it, which is not proven uniform' % (n, lane, off))
+        stored = [self.spill_writes[w] for w in sorted(writes)]
+        sym = stored[0][0] if all(s == stored[0][0] for s, _ in stored) else None
+        return sym, len(stored) == 1 and stored[0][1]
 
     def spill_operands(self, name, ops, mods):
         if mods or len(ops) != 3:
@@ -5178,18 +7126,42 @@ class Stage:
             lane = int(ops[2], 0)
         except ValueError:
             raise Unsupported('%s requires a constant lane, got %s' % (name, ops[2])) from None
+        kind = getattr(self, 'kind', None)
         if not 0 <= lane < self.SPILL_LANES:
             raise Unsupported('%s lane %d outside 0..%d' % (name, lane, self.SPILL_LANES - 1))
-        if getattr(self, 'kind', None) != 'ps':
-            raise Unsupported('%s is lowered in pixel stages only' % name)
-        if getattr(self, 'has_branches', True) or not self.tracks_uniformity():
+        if kind not in self.SPILL_STAGES:
+            raise Unsupported('%s is lowered in pixel, vertex and mesh stages only' % name)
+        if not self.tracks_uniformity() or (getattr(self, 'has_branches', True) and
+                                            (kind != 'ps' or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
+        if kind in ('ps', 'vs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
+            self.require_spill_lanes_apart(vreg[1], name)
         return vreg[1], sreg, lane
+
+    def require_spill_lanes_apart(self, n, name):
+        """Refuse when two lanes of spill VGPR v<n> differ by 32: one slot in wave32, two in wave64."""
+        lanes = set()
+        for _, _, op, asm in getattr(self, 'ins', ()):
+            if re.sub(r'_e(32|64)$', '', op) not in ('v_writelane_b32', 'v_readlane_b32'):
+                continue
+            ops = parse(asm)[1]
+            if len(ops) == 3 and n in [r[1] for r in map(reg_range, ops[:2]) if r and r[0] == 'v']:
+                try:
+                    lanes.add(int(ops[2], 0))
+                except ValueError:
+                    continue  # a register lane is refused where it is read
+        for lane in lanes:
+            if lane + 32 in lanes:
+                raise Unsupported('%s: v%d lanes %d and %d are one slot in wave32 and two in wave64'
+                                  % (name, n, lane, lane + 32))
 
     def require_spill_only(self, n, name):
         """Refuse unless every instruction naming v<n> is a lane write or read of it."""
-        for _, _, op, asm in getattr(self, 'ins', ()):
+        # Mesh: scan the pre-skeleton program. The accepted group-memory exchanges rewrite to
+        # x2w_mesh_* / s_nop, which would hide ordinary use of exchange VGPRs (v5 and temps).
+        source = getattr(self, 'mesh_source_ins', None) or getattr(self, 'ins', ())
+        for _, _, op, asm in source:
             if re.sub(r'_e(32|64)$', '', op) in ('v_writelane_b32', 'v_readlane_b32'):
                 continue
             for lo, hi, single in re.findall(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', asm):
@@ -5200,11 +7172,15 @@ class Stage:
     def op_v_writelane_b32(self, ops, mods):
         n, src, lane = self.spill_operands('v_writelane_b32', ops, mods)
         if src is None:
+            # Slot 57 mesh keeps ordinary scalar spills only (R0Y00 on #2637). Raw EXEC words are not
+            # proven under the one-lane model (exec_hi would be wrong under full EXEC; exec_lo under
+            # a lane-0 mask would reload per thread). mesh_entry_aot still models EXEC for #2127.
             if ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0'):
                 raise Unsupported('v_writelane_b32 source %s is a lane mask or m0' % ops[1])
-            value, sym, uniform = self.u(ops[1]), None, True
-            if re.fullmatch(r'0x[0-9a-f]{8}u', value):
-                sym = ('const', int(value[2:-1], 16))
+            else:
+                value, sym, uniform = self.u(ops[1]), None, True
+                if re.fullmatch(r'0x[0-9a-f]{8}u', value):
+                    sym = ('const', int(value[2:-1], 16))
         else:
             if self.is_lane_mask(ops[1]) or (self.sym.get(src[1]) or ('',))[0] not in ('', 'const', 'ud', 'fixed_buffer_word'):
                 raise Unsupported('v_writelane_b32 source s%d holds a lane mask or descriptor' % src[1])
@@ -5213,6 +7189,8 @@ class Stage:
             uniform = self.uniform_source(ops[1])
         slots = self.__dict__.setdefault('spill_slots', {})
         slots[(n, lane)] = (sym, uniform)
+        if getattr(self, 'spill_reach', None) is not None:
+            self.spill_writes[self.descriptor_instruction_index] = (sym, uniform)
         self.emit('sp%d_%d = %s;' % (n, lane, value))
 
     def op_v_readlane_b32(self, ops, mods):
@@ -5221,15 +7199,19 @@ class Stage:
         n, dst, lane = self.spill_operands('v_readlane_b32', ops, mods)
         if dst is None:
             raise Unsupported('v_readlane_b32 requires an SGPR destination')
-        slot = getattr(self, 'spill_slots', {}).get((n, lane))
-        if slot is None:
-            raise Unsupported('v_readlane_b32 reads v%d lane %d before any v_writelane_b32 wrote it' % (n, lane))
-        sym, uniform = slot
+        if getattr(self, 'has_branches', False):
+            sym, uniform = self.spill_join(n, lane)
+        else:
+            slot = getattr(self, 'spill_slots', {}).get((n, lane))
+            if slot is None:
+                raise Unsupported('v_readlane_b32 reads v%d lane %d before any v_writelane_b32 wrote it' % (n, lane))
+            sym, uniform = slot
         self.set_s(dst[1], 'sp%d_%d' % (n, lane), sym=sym, uniform=uniform)
 
     def op_v_mov_b32(self, ops, mods):
         if len(ops) != 2:
             raise Unsupported('v_mov_b32 with %d operands, expected 2' % len(ops))
+        self.reject_lane_mask_data('v_mov_b32', ops[1])
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_swap_b32(self, ops, mods):
@@ -5264,16 +7246,22 @@ class Stage:
             raise Unsupported('v_cndmask_b32 with %s' % mods)
         if len(ops) not in (3, 4):
             raise Unsupported('v_cndmask_b32 with %d operands, expected 3 or 4' % len(ops))
+        for source in ops[1:3]:
+            self.reject_lane_mask_data('v_cndmask_b32', source)
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
         self.set_v(reg_range(ops[0])[1],
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
+        if ops[1].startswith(('-', '|')):
+            raise Unsupported('interpolation source modifier %s' % ops[1])
         attr, comp = self.note_attr(ops[2], 'linear')
         self.set_v(reg_range(ops[0])[1], 'U(i.param%d.%s)' % (attr, comp))
 
@@ -5554,6 +7542,48 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, 'hi')
 
+    def packed_half(self, base, arity, text, ops, mods):
+        """v_pk_{mul,add,fma}_f16: the same binary16 operation on two lanes of a VGPR pair of halves.
+
+        Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
+        modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
+        Not modelled, so refused: neg_lo, neg_hi, clamp, any other modifier, and a source that is not a plain VGPR
+        (an inline constant or a literal reaches the high lane in a way that is not proven; hold it in a VGPR first).
+        """
+        if len(ops) != arity + 1:
+            raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
+        sel = {'op_sel': [0] * arity, 'op_sel_hi': [1] * arity}
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key not in sel or not (value.startswith('[') and value.endswith(']')):
+                raise Unsupported('%s with %s' % (base, m))
+            bits = value[1:-1].split(',')
+            if len(bits) != arity or any(b not in ('0', '1') for b in bits):
+                raise Unsupported('%s with %s' % (base, m))
+            sel[key] = [int(b) for b in bits]
+        for tok in ops:
+            r = reg_range(tok)
+            if not r or r[0] != 'v' or r[1] != r[2] or tok != 'v%d' % r[1]:
+                raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
+        lanes = []
+        for picks in (sel['op_sel'], sel['op_sel_hi']):
+            args = []
+            for tok, hi, both in zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi'])):
+                word = self.u(tok, low16_only=not any(both))
+                args.append('f16tof32(%s)' % ('(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word))
+            lanes.append('f16rn(%s)' % text.format(*args))
+        d = reg_range(ops[0])[1]
+        self.set_v(d, '%s | (%s << 16)' % tuple(lanes))
+
+    def op_v_pk_mul_f16(self, ops, mods):
+        self.packed_half('v_pk_mul_f16', 2, '{0} * {1}', ops, mods)
+
+    def op_v_pk_add_f16(self, ops, mods):
+        self.packed_half('v_pk_add_f16', 2, '{0} + {1}', ops, mods)
+
+    def op_v_pk_fma_f16(self, ops, mods):
+        self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
+
     def cube(self, kind, ops, mods):
         """v_cube{id,sc,tc,ma}_f32: LLVM's ConstantFoldAMDGCNCubeIntrinsic.
 
@@ -5640,6 +7670,17 @@ class Stage:
         self.clear_low16(dst[2])
         self.used_v.update((dst[1], dst[2]))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+        # Scalar or literal sources give every lane the same result, under the conditions Stage.one uses for VALU.
+        pair = reg_range(ops[2])
+        sources = [ops[1]] + (['%s%d' % (pair[0], pair[1]), '%s%d' % (pair[0], pair[2])] if pair else [])
+        if (self.tracks_uniformity() and not any(reg_range(t)[0] == 'v' for t in sources if reg_range(t)) and
+                all(self.uniform_source(t) for t in sources) and
+                (getattr(self, 'past_entry', False) and hasattr(self, 'uniform_expr') or
+                 not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False))):
+            self.uniform_v.update((dst[1], dst[2]))
+            if hasattr(self, 'uniform_expr'):
+                for n, half in ((dst[1], 'x'), (dst[2], 'y')):
+                    self.uniform_expr[n] = '%s(%s, %s, %s).%s' % (helper, low, high, amount, half)
 
     def carry_out_op(self, ops, mods, kind):
         """v_{add,sub,subrev}_co_u32 D, SDST, S0, S1: a 32-bit add or subtract with a carry or borrow out.
@@ -5754,6 +7795,60 @@ class Stage:
 
     def op_v_ashrrev_i64(self, ops, mods):
         self.shift64(ops, mods, 'shr64i')
+
+    def mad64(self, ops, mods, signed):
+        """v_mad_u64_u32 / v_mad_i64_i32: D = S0 * S1 + S2 modulo 2^64, two 32-bit factors, 64-bit S2.
+
+        The unsigned form also writes the carry-out of the 64-bit add to a lane mask. The signed carry-out
+        is not established, so the signed form is accepted only with the discarding null destination."""
+        name = 'v_mad_i64_i32' if signed else 'v_mad_u64_u32'
+        if mods:
+            raise Unsupported('%s with %s' % (name, mods))
+        if len(ops) != 5:
+            raise Unsupported('%s with %d operands, expected 5' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1 or dst[2] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        mask = ops[1]
+        mask_reg = reg_range(mask)
+        if signed:
+            if mask != 'null':
+                raise Unsupported('%s carry-out %s: only null is lowered' % (name, mask))
+        elif mask not in ('vcc', 'vcc_lo') and not (
+                mask_reg and mask_reg[0] == 's' and mask_reg[1] == mask_reg[2] and mask_reg[1] <= 105):
+            raise Unsupported('%s carry-out %s' % (name, mask))
+        for tok in ops[2:4]:
+            r = reg_range(tok)
+            if tok in FLOATS or tok in ('exec', 'exec_lo') or (
+                    r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255) or (r[0] == 's' and r[1] > 105))):
+                raise Unsupported('%s factor %s' % (name, tok))
+        for tok in ops[2:5]:
+            r = reg_range(tok)
+            if tok in ('vcc', 'vcc_lo', 'vcc_hi') or (r and r[0] == 's' and any(
+                    w in self.masks for w in range(r[1], r[2] + 1))):
+                # u() would supply the per-lane 0/1 projection, not the architectural 32-bit mask.
+                raise Unsupported('%s reads the lane mask %s as an integer' % (name, tok))
+        low, high = self.i64_words(ops[4])
+        self.emit('{ uint3 r = %s(%s, %s, %s, %s);' % ('mad64i' if signed else 'mad64u',
+                                                         self.u(ops[2]), self.u(ops[3]), low, high))
+        self.set_v(dst[1], 'r.x')
+        self.set_v(dst[2], 'r.y')
+        if not signed:
+            expr = 'r.z' if self.exec_known else '(exec & r.z)'
+            if mask in ('vcc', 'vcc_lo'):
+                self.emit('vcc = %s;' % expr)
+            else:
+                # The carry is a per-lane bit: never a uniform scalar, whatever the scratch name hides.
+                self.set_s(mask_reg[1], expr, uniform=False)
+                self.masks.add(mask_reg[1])
+        self.emit('}')
+
+    def op_v_mad_u64_u32(self, ops, mods):
+        self.mad64(ops, mods, False)
+
+    def op_v_mad_i64_i32(self, ops, mods):
+        self.mad64(ops, mods, True)
+
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         if len(ops) != 3:
             raise Unsupported('v_cvt_pkrtz_f16_f32 with %d operands, expected 3' % len(ops))
@@ -5851,8 +7946,6 @@ class Stage:
             f16 = name.endswith('_f16')
             writes_exec = name in ('v_cmpx_class_f32', 'v_cmpx_class_f16')
             sdwa = name != base
-            if f16 and sdwa:
-                raise Unsupported('SDWA form of %s' % name)
             if sdwa:
                 self.check_compare_sdwa_destination(base, writes_exec, ops)
             if len(ops) == 3:
@@ -5862,7 +7955,20 @@ class Stage:
                 dst, (value, mask) = 'exec', ops
             else:
                 raise Unsupported('%s with %d operands' % (base, len(ops)))
-            if sdwa:
+            if sdwa and f16:
+                # SDWA half class: classes bits [15:0] of a plain register. src0_sel DWORD and WORD_0 both
+                # leave those bits where class16 reads them; WORD_1, a byte, sext() and the abs/neg spellings
+                # (which print |v|, -v, abs(), neg()) would classify other bits, so they are refused.
+                selections = [m for m in mods if m.startswith('src0_sel:')]
+                if selections not in (['src0_sel:DWORD'], ['src0_sel:WORD_0']):
+                    raise Unsupported('SDWA form of %s with %s' % (name, ' '.join(selections) or 'no src0_sel'))
+                if not reg_range(value):
+                    raise Unsupported('%s with source %s' % (base, value))
+                if mask in FLOATS:
+                    raise Unsupported('%s mask %s: expected an integer class mask' % (base, mask))
+                _word, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods)
+                value = self.u(value)
+            elif sdwa:
                 value, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods, float_src0=True)
             elif f16:
                 # abs() and - apply to bit 15 of the half, before the class test.
@@ -5992,6 +8098,8 @@ class Stage:
                               % next(f for f in flags if f.startswith('en:'))[3:])
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+        if target == 'null':
+            return None  # the null target writes no render target; its only effect is the vm discard above
         if target == 'mrtz':
             if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
                     or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
@@ -6078,13 +8186,15 @@ class Stage:
                 raise Unsupported('branch into the middle of a block (+0x%x)' % off)
             return index[off]
         out.append('    uint pc = 0;')
+        wave_load_blocks = {off + n for off, n, _, _ in self.ins if off in getattr(self, 'mesh_wave_loads', {})}
         if loops:
             out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
         for i, (off, lines, term) in enumerate(self.blocks):
             if off == getattr(self, 'mesh_allocation_block', None):
                 out.append('    {')
             else:
-                out.append('    %sif (pc == %d) {' % ('else ' if loops and i else '', i))
+                attribute = '[branch] ' if off in wave_load_blocks else ''
+                out.append('    %s%sif (pc == %d) {' % ('else ' if loops and i else '', attribute, i))
             out += ['        ' + line for line in lines]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
             if not term:
@@ -6112,6 +8222,8 @@ class Stage:
         if getattr(self, 'spill_slots', None):
             lines.append('    uint %s;' % ', '.join('sp%d_%d = 0' % k for k in sorted(self.spill_slots)))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
+        if getattr(self, 'mesh_wave_loads', {}):
+            lines.append('    bool wave_any = false;')
         if getattr(self, 'used_atomic', None):
             if 'uint' in self.used_atomic:
                 lines.append('    uint ao = 0;')
@@ -6178,7 +8290,7 @@ LDS_UNUSED_W1_MASK = {
 VEC_F = {
     'v_add_f32': (2, '{0} + {1}'), 'v_sub_f32': (2, '{0} - {1}'), 'v_subrev_f32': (2, '{1} - {0}'),
     'v_mul_f32': (2, '{0} * {1}'), 'v_mul_legacy_f32': (2, 'mul_legacy({0}, {1})'),
-    'v_min_f32': (2, 'min({0}, {1})'), 'v_max_f32': (2, 'max({0}, {1})'),
+    'v_min_f32': (2, 'minmax_zero32({0}, {1}, false)'), 'v_max_f32': (2, 'minmax_zero32({0}, {1}, true)'),
     'v_fmac_f32': (2, '{0} * {1} + {2}'), 'v_mac_f32': (2, 'mad32({0}, {1}, {2}, false)'),
     'v_fma_f32': (3, '{0} * {1} + {2}'), 'v_mad_f32': (3, 'mad32({0}, {1}, {2}, false)'),
     'v_mad_legacy_f32': (3, 'mad32({0}, {1}, {2}, true)'),
@@ -6188,7 +8300,23 @@ VEC_F = {
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'fract32({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
-    'v_med3_f32': (3, 'med3_32({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
+    'v_med3_f32': (3, 'med3_32({0}, {1}, {2})'),
+    'v_min3_f32': (3, 'minmax_zero32({0}, minmax_zero32({1}, {2}, false), false)'),
+    'v_max3_f32': (3, 'minmax_zero32({0}, minmax_zero32({1}, {2}, true), true)'),
+}
+# 16-bit VALU: (sources, source kind, float or uint expression of the sources, result kind). 'h' sources are
+# binary16 read from the low half and computed in binary32; an 'h' result is rounded back to binary16. The
+# i16/u16 conversions to binary16 read the low half as an integer; the conversions to integers truncate toward
+# zero, saturate to the 16-bit range and read NaN as 0.
+VEC_H = {
+    'v_add_f16': (2, 'h', '{0} + {1}', 'h'), 'v_sub_f16': (2, 'h', '{0} - {1}', 'h'),
+    'v_subrev_f16': (2, 'h', '{1} - {0}', 'h'), 'v_mul_f16': (2, 'h', '{0} * {1}', 'h'),
+    'v_min_f16': (2, 'h', 'min({0}, {1})', 'h'), 'v_max_f16': (2, 'h', 'max({0}, {1})', 'h'),
+    'v_fmac_f16': (2, 'h', 'fma16o({0}, {1}, {2})', 'h'), 'v_fmamk_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
+    'v_fmaak_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
+    'v_cvt_f16_i16': (1, 'i16', '{0}', 'h'), 'v_cvt_f16_u16': (1, 'u16', '{0}', 'h'),
+    'v_cvt_i16_f16': (1, 'h', 'isnan({0}) ? 0u : (uint(int(clamp(trunc({0}), -32768.0, 32767.0))) & 0xffffu)', 'u'),
+    'v_cvt_u16_f16': (1, 'h', 'isnan({0}) ? 0u : uint(clamp(trunc({0}), 0.0, 65535.0))', 'u'),
 }
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
@@ -6203,7 +8331,7 @@ VEC_U_TO_F = {
 # operands are uints; the result is a uint expression
 VEC_U = {
     'v_add_nc_u32': (2, '{0} + {1}'), 'v_sub_nc_u32': (2, '{0} - {1}'), 'v_subrev_nc_u32': (2, '{1} - {0}'),
-    'v_mul_lo_u32': (2, '{0} * {1}'), 'v_mul_hi_u32': (2, 'mul_hi_u32({0}, {1})'), 'v_and_b32': (2, '{0} & {1}'), 'v_or_b32': (2, '{0} | {1}'), 'v_xor_b32': (2, '{0} ^ {1}'),
+    'v_mul_lo_u32': (2, '{0} * {1}'), 'v_mul_hi_u32': (2, 'mul_hi_u32({0}, {1})'), 'v_mul_hi_i32': (2, 'mul_hi_i32({0}, {1})'), 'v_and_b32': (2, '{0} & {1}'), 'v_or_b32': (2, '{0} | {1}'), 'v_xor_b32': (2, '{0} ^ {1}'),
     'v_not_b32': (1, '~{0}'), 'v_lshlrev_b32': (2, '{1} << ({0} & 31)'), 'v_lshrrev_b32': (2, '{1} >> ({0} & 31)'),
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
@@ -6217,10 +8345,13 @@ VEC_U = {
     'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_mad_i32_i24': (3, 'asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8) + {2}'),
+    'v_mad_u32_u16': (3, '({0} & 0xffffu) * ({1} & 0xffffu) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_xor3_b32': (3, '{0} ^ {1} ^ {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
     'v_xad_u32': (3, '({0} ^ {1}) + {2}'), 'v_bfi_b32': (3, '({0} & {1}) | (~{0} & {2})'),
     'v_mul_u32_u24': (2, '({0} & 0xffffffu) * ({1} & 0xffffffu)'),
+    # v_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0] (same field rule as s_bfm_b32).
+    'v_bfm_b32': (2, '(((1u << ({0} & 31)) - 1) << ({1} & 31))'),
     'v_mul_i32_i24': (2, 'asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8)'),
     # Per-lane bit operations (AMD RDNA 2 ISA reference). The bitscan results count from the most significant
     # bit for the "h" forms and read 0xffffffff when no bit qualifies; firstbitlow(0) is already 0xffffffff.
@@ -6232,10 +8363,58 @@ VEC_U = {
     'v_ffbh_u32': (1, '({0} == 0u ? 0xffffffffu : 31u - firstbithigh({0}))'),
     'v_ffbh_i32': (1, '({0} == 0u || {0} == 0xffffffffu ? 0xffffffffu : 31u - firstbithigh(asint({0}) < 0 ? ~{0} : {0}))'),
     'v_bfrev_b32': (1, 'reversebits({0})'),
+    # Unsigned sums of absolute differences (AMD RDNA 2 ISA reference, VOP3 opcodes 0x15a to 0x15d and 0x171), all
+    # modulo 2^32. src1 is the reference: v_msad_u8 leaves out each byte lane whose src1 byte is zero, as in
+    # tools/pixel_aot.py.
     'v_sad_u8': (3, 'sad_u8({0}, {1}, {2})'),
+    'v_sad_hi_u8': (3, 'sad_hi_u8({0}, {1}, {2})'),
     'v_sad_u16': (3, 'sad_u16({0}, {1}, {2})'),
     'v_sad_u32': (3, 'sad_u32({0}, {1}, {2})'),
+    'v_msad_u8': (3, 'msad_u8({0}, {1}, {2})'),
+    # Saturating 32-to-16-bit integer packs (AMD RDNA 2 ISA reference, VOP3A opcodes 0x36a and 0x36b; saturation
+    # bounds per Mesa NIR pack_uvec2_to_uint / pack_ivec2_to_uint selected in ACO): src0 -> low 16 bits, src1 -> high 16 bits.
+    'v_cvt_pk_u16_u32': (2, 'min({0}, 0xffffu) | (min({1}, 0xffffu) << 16u)'),
+    'v_cvt_pk_i16_i32': (2, '(asuint(clamp(asint({0}), -32768, 32767)) & 0xffffu) | '
+                            '(asuint(clamp(asint({1}), -32768, 32767)) << 16u)'),
 }
+
+
+def _mul24_hi_i32():
+    """High 32 bits of the 48-bit product of two signed 24-bit fields, in 32-bit integer arithmetic.
+
+    With a = ah * 2^12 + al (al in 0..4095, ah the sign-extended top 12 bits) the product is
+    hh * 2^24 + mid * 2^12 + lo, so p >> 12 = hh * 2^12 + t with t = mid + (lo >> 12), and
+    p >> 32 = (hh + (t >> 12)) >> 8 exactly (floor division nests), which stays inside 32 bits.
+    """
+    def top(n):
+        return '(asint({%d} << 8) >> 20)' % n
+
+    def low(n):
+        return 'asint({%d} & 0xfffu)' % n
+    hh = '(%s * %s)' % (top(0), top(1))
+    mid = '(%s * %s + %s * %s)' % (top(0), low(1), low(0), top(1))
+    t = '(%s + ((%s * %s) >> 12))' % (mid, low(0), low(1))
+    return 'asuint(((%s + (%s >> 12)) >> 8))' % (hh, t)
+
+
+VEC_U.update({
+    # AMD RDNA 2 ISA reference: the 24-bit multiplies read the low 24 bits of each source, the signed forms as a
+    # two's complement field. The mul and mad forms keep the low 32 bits of the product; the hi forms keep bits 63..32
+    # of the 48-bit product. The 24-bit field is sign-extended with a left shift of 8 and an arithmetic right shift.
+    # v_mul_hi_u32_u24 is deliberately not lowered. Its result is at most 0xffff, so as a float output word it is
+    # always a binary32 denormal, and FXC 10.0.26100 at ps_5_1 (the startup path) folds a float output whose
+    # provable range lies below 0x00800000 to a constant zero (any form tried, even a plain shift without a
+    # product). The same words through a uint4 output survive, and DXC keeps them. v_mul_hi_i32_i24 can reach
+    # the whole 32-bit range, so FXC keeps it. A refusal is visible; zeros are not.
+    'v_mul_hi_i32_i24': (2, _mul24_hi_i32()),
+    'v_xnor_b32': (2, '~({0} ^ {1})'),
+    # v_alignbit_b32 takes bits [S2[4:0] + 31 : S2[4:0]] of the 64-bit value {S0, S1}; a zero shift returns S1 and
+    # the guard avoids a shift by 32. v_alignbyte_b32 does the same with S2[1:0] * 8 bits.
+    'v_alignbit_b32': (3, '(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))'),
+    'v_alignbyte_b32': (3, '(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - ({2} & 3u) * 8u))))'),
+})
+
+VOP3_ONLY_VEC_U = frozenset(('v_cvt_pk_u16_u32', 'v_cvt_pk_i16_i32'))
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 # Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
 # no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
@@ -6259,8 +8438,9 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((({1} >> 16) & 127) >= 32 ? 0xffffffffu : ((1u << (({1} >> 16) & 31)) - 1))', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
-    # s_mul_hi_u32: high 32 bits of the unsigned 64-bit product; SCC unchanged.
+    # s_mul_hi_{u,i}32: high 32 bits of the unsigned/signed 64-bit product; SCC unchanged.
     's_mul_hi_u32': ('mul_hi_u32({0}, {1})', None),
+    's_mul_hi_i32': ('mul_hi_i32({0}, {1})', None),
     # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
     's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
     's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
@@ -6304,6 +8484,53 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 self.set_scc((cast % op).format(self.u(ops[0]), '0x%08xu' % sopk_imm(ops[1], signed)))
             return handler
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_cmpk())
+# Scalar bit counts and scans with a 32-bit result. `lo`/`hi` are the uint words of the source: a 32-bit source has only
+# `lo`. The scans return 0xffffffff (-1) when no bit qualifies. Only the counts set SCC (result != 0).
+def _clz64(lo, hi):
+    return ('(%(h)s != 0u ? 31u - firstbithigh(%(h)s) : (%(l)s != 0u ? 63u - firstbithigh(%(l)s) : 0xffffffffu))'
+            % {'l': lo, 'h': hi})
+
+
+def _ctz64(lo, hi):
+    return ('(%(l)s != 0u ? firstbitlow(%(l)s) : (%(h)s != 0u ? 32u + firstbitlow(%(h)s) : 0xffffffffu))'
+            % {'l': lo, 'h': hi})
+
+
+def _flbit_i64(lo, hi):
+    # first bit that differs from the sign bit: complement a negative value, then count leading zeros
+    neg = '((%s & 0x80000000u) != 0u)' % hi
+    return _clz64('(%s ? ~%s : %s)' % (neg, lo, lo), '(%s ? ~%s : %s)' % (neg, hi, hi))
+
+
+# name -> (source is a register pair, expression over (lo, hi), SCC rule or None)
+SCALAR_BITS = {
+    's_bcnt0_i32_b32': (False, lambda lo, hi: '(32u - countbits(%s))' % lo, '$ != 0'),
+    's_bcnt1_i32_b32': (False, lambda lo, hi: 'countbits(%s)' % lo, '$ != 0'),
+    's_bcnt0_i32_b64': (True, lambda lo, hi: '(64u - countbits(%s) - countbits(%s))' % (lo, hi), '$ != 0'),
+    's_bcnt1_i32_b64': (True, lambda lo, hi: '(countbits(%s) + countbits(%s))' % (lo, hi), '$ != 0'),
+    's_ff0_i32_b64': (True, lambda lo, hi: _ctz64('(~%s)' % lo, '(~%s)' % hi), None),
+    # s_ff1_i32_b64 stays on Stage.op_s_ff1_i32_b64 (immediates + SGPR pairs) so SCALAR_BITS
+    # does not overwrite the zero-extended immediate fold from #2022 Item F.
+    's_flbit_i32_b64': (True, _clz64, None),
+    's_flbit_i32_i64': (True, _flbit_i64, None),
+}
+for _name, (_pair, _expr, _scc) in SCALAR_BITS.items():
+    def _make_scalar_bits(name=_name, pair=_pair, expr=_expr, scc=_scc):
+        def handler(self, ops, mods):
+            if len(ops) != 2 or mods:
+                raise Unsupported('%s requires two unmodified operands' % name)
+            dst, src = reg_range(ops[0]), reg_range(ops[1])
+            if dst is None or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+                raise Unsupported('%s destination %s' % (name, ops[0]))
+            if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != (1 if pair else 0):
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            if any(r in self.masks for r in range(src[1], src[2] + 1)):
+                raise Unsupported('%s on a lane mask' % name)
+            lo, hi = self.S(src[1]), self.S(src[2])
+            self.masks.discard(dst[1])
+            self.set_s(dst[1], expr(lo, hi), scc=scc)
+        return handler
+    setattr(Stage, 'op_' + _name, _make_scalar_bits())
 # s_bitcmp1_b32 / s_bitcmp0_b32: SCC = S0[S1[4:0]] == 1 / == 0.
 for _bit in (0, 1):
     def _make_bitcmp(bit=_bit):
@@ -6399,6 +8626,7 @@ class Pipeline:
     uses_gather_2d_lod = False
     uses_store_d16_x = False
     uses_sad = ()
+    uses_store_format_xyzw = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
 
@@ -6412,10 +8640,17 @@ class Pipeline:
         # one is enabled). Without hardware inputs the model assumes the center pair alone: v0, v1.
         self.persp_center_vgpr = 0
         if ps_hw_inputs is not None:
+            # SPI_PS_INPUT_ADDR allocates the entry VGPRs in bit order; SPI_PS_INPUT_ENA chooses which of the
+            # allocated inputs are loaded. Every enabled input is also allocated (LLVM AMDGPUAsmPrinter
+            # getSIProgramInfo: "all enabled inputs are tagged in InputAddr as well"; SIISelLowering
+            # processPSInputArgs marks an input allocated, then enabled only when it is used).
             ena, addr = ps_hw_inputs
-            if ena != addr or not 0 <= ena <= 0xffff:
+            if not (0 <= ena <= 0xffff and 0 <= addr <= 0xffff):
                 raise Unsupported('unverified pixel input enable/address combination')
-            self.persp_center_vgpr = (2 if addr & 1 else 0) if addr & 2 else None
+            if ena & ~addr:
+                raise Unsupported('contradictory pixel input enable/address masks: an enabled input is not allocated')
+            # Layout from the address mask; an input allocated but not enabled holds no loaded value.
+            self.persp_center_vgpr = (2 if addr & 1 else 0) if ena & 2 else None
             if ena & (1 << 15):
                 # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
                 # line stipple through sample coverage each occupy one VGPR.
@@ -6429,6 +8664,7 @@ class Pipeline:
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
+        self.uses_store_format_xyzw = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -6527,7 +8763,8 @@ class Pipeline:
         return lines
 
     def common(self):
-        out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
+        import pixel_aot
+        out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)', FLOAT_MINMAX,
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                # Match pixel_aot: round the product before adding and flush denormals to signed zero.
                'float ftz32(float value) {',
@@ -6554,16 +8791,35 @@ class Pipeline:
                '}',
                # v_med3_f32 with a NaN source is the minimum of the three (ISA "343 V_MED3_F32"), so the test is
                # on the encoding: a float isnan() may be folded away by the compiler. D3D min() returns the
-               # other operand, so min(min(a, b), c) over a NaN source is the smallest of the non-NaN ones.
+               # other operand, so the min3 chain over a NaN source is the smallest of the non-NaN ones. min, max
+               # and med3 go through minmax_zero32, which orders -0 below +0 and passes a NaN to D3D min/max.
                # Same body as med3_32 in tools/pixel_aot.py.
                'float med3_32(float a, float b, float c) {',
                '    uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);',
-               '    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));',
+               '    return top > 0x7f800000u',
+               '        ? minmax_zero32(minmax_zero32(a, b, false), c, false)',
+               '        : minmax_zero32(minmax_zero32(a, b, false), minmax_zero32(minmax_zero32(a, b, true), c, false), true);',
                '}',
                # High half of an unsigned 32x32 product, by halfword products so it fits 32-bit HLSL.
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
                ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
+               'uint mul_hi_i32(uint a, uint b) { return mul_hi_u32(a, b) - ((a >> 31) != 0u ? b : 0u)'
+               ' - ((b >> 31) != 0u ? a : 0u); }',
+               # a * b + c for binary16 inputs with one rounding (#2073). The first form recovered the binary32 sum error
+               # with a floating-point TwoSum; an NVIDIA driver (RTX 3070 Ti, 32.0.16.2101) simplified that error term to
+               # zero despite `precise`, so ties rounded the wrong way. fma16_rne works on the encodings in 32-bit integer
+               # arithmetic, so no driver floating-point rewrite can reach it. Infinities and NaNs keep float semantics.
+               pixel_aot.SALU_HELPERS['fma16_rne'],
+               'float fma16o(float a, float b, float c) {',
+               '    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) return a * b + c;',
+               '    return f16tof32(fma16_rne(f32tof16(a), f32tof16(b), f32tof16(c)));',
+               '}',
+               # binary32 to binary16 rounded to nearest even: f32tof16 truncates, a binary16 result must round (#1723).
+               'uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
+               ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
+               ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
+               ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'
@@ -6592,6 +8848,19 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
+               # v_mad_u64_u32 / v_mad_i64_i32: a * b + (chi:clo) from 16-bit partial products, so no 64-bit type.
+               # z is the carry of the 64-bit add (the unsigned form's lane-mask carry-out).
+               'uint mulhi32(uint a, uint b) {'
+               ' uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16;'
+               ' uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;'
+               ' uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);'
+               ' return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }',
+               'uint3 mad64u(uint a, uint b, uint clo, uint chi) {'
+               ' uint ph = mulhi32(a, b), pl = a * b, lo = pl + clo, c0 = lo < pl ? 1u : 0u, hs = ph + chi, hi = hs + c0;'
+               ' return uint3(lo, hi, (hs < ph || hi < hs) ? 1u : 0u); }',
+               'uint3 mad64i(uint a, uint b, uint clo, uint chi) {'
+               ' uint ph = mulhi32(a, b) - (asint(a) < 0 ? b : 0u) - (asint(b) < 0 ? a : 0u), pl = a * b, lo = pl + clo;'
+               ' return uint3(lo, ph + chi + (lo < pl ? 1u : 0u), 0u); }',
                'uint2 bfe64(uint lo, uint hi, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 64u - (s1 & 63u)); uint2 e = shr64u(lo, hi, s1);'
                ' e = uint2(e.x & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u)),'
                ' e.y & (w >= 64u ? 0xffffffffu : (w > 32u ? ((1u << ((w - 32u) & 31u)) - 1u) : 0u)));'
@@ -6765,6 +9034,83 @@ class Pipeline:
             out.append(
                 'uint sad_u32(uint a, uint b, uint c) {'
                 ' return (a > b ? a - b : b - a) + c; }')
+        # v_sad_hi_u8 and v_msad_u8 share the four-lane absolute-difference sum of sad_u8, so it is factored into
+        # sad4_u8, whose `masked` argument leaves out each byte lane whose src1 byte is zero (v_msad_u8's reference
+        # rule). The table formulas match tools/pixel_aot.py exactly: sad_hi_u8 is (sad4_u8(a, b, false) << 16) + c
+        # and msad_u8 is sad4_u8(a, b, true) + c, both modulo 2^32. sad_u8 above keeps its inlined four-term form so
+        # a translation that uses only v_sad_u8 is unchanged.
+        if 'v_sad_hi_u8' in self.uses_sad or 'v_msad_u8' in self.uses_sad:
+            out.append(
+                'uint sad4_u8(uint a, uint b, bool masked) {'
+                ' return (masked && ((b & 0xffu) == 0u) ? 0u : uint(abs(int(a & 0xffu) - int(b & 0xffu))))'
+                ' + (masked && (((b >> 8) & 0xffu) == 0u) ? 0u : uint(abs(int((a >> 8) & 0xffu) - int((b >> 8) & 0xffu))))'
+                ' + (masked && (((b >> 16) & 0xffu) == 0u) ? 0u : uint(abs(int((a >> 16) & 0xffu) - int((b >> 16) & 0xffu))))'
+                ' + (masked && (((b >> 24) & 0xffu) == 0u) ? 0u : uint(abs(int((a >> 24) & 0xffu) - int((b >> 24) & 0xffu)))); }')
+        if 'v_sad_hi_u8' in self.uses_sad:
+            out.append(
+                'uint sad_hi_u8(uint a, uint b, uint c) { return (sad4_u8(a, b, false) << 16u) + c; }')
+        if 'v_msad_u8' in self.uses_sad:
+            out.append(
+                'uint msad_u8(uint a, uint b, uint c) { return sad4_u8(a, b, true) + c; }')
+        if self.uses_store_format_xyzw:
+            legacy = ['        %sif (field == %du) fmt = %du;' % ('' if i == 0 else 'else ', field, code)
+                      for i, (field, code) in enumerate(sorted(STORE_FORMAT_XYZW_LEGACY_FORMATS.items()))]
+            out.extend((
+                'uint store_unorm(uint bits, float scale) {',
+                '    float x = asfloat(bits);',
+                '    if (isnan(x)) return 0u;',
+                '    precise float saturated = saturate(x);',
+                '    precise float scaled = saturated * scale;',
+                '    return (uint)floor(scaled + 0.5f);',
+                '}',
+                'void store_format_xyzw(RWByteAddressBuffer buf, uint word3, uint stride, uint num_records, '
+                'uint idx, uint voff, uint soff, uint imm_off, uint4 v) {',
+                '    if ((word3 & 0xcef80000u) != 0u || (word3 & 0xfffu) != 0xfacu) return;',
+                '    uint oob_sel = (word3 >> 28u) & 3u;',
+                '    if ((oob_sel != 0u && oob_sel != 3u) || stride > 0x3fffu) return;',
+                '    uint field = (word3 >> 12u) & 127u;',
+                '    uint fmt = 0u;',
+                '    if (((word3 >> 24u) & 1u) != 0u) {',
+                '        fmt = field;',
+                '    } else {',
+                *legacy,
+                '    }',
+                '    uint elem_bytes = (fmt == 75u || fmt == 77u) ? 16u : fmt == 71u ? 8u : (fmt == 50u || fmt == 56u) ? 4u : 0u;',
+                '    if (elem_bytes == 0u) return;',
+                '    if (voff > 0xffffffffu - imm_off) return;',
+                '    uint rec_off = voff + imm_off;',
+                '    uint addr = 0u;',
+                '    if (oob_sel == 3u) {',
+                '        if (stride != 0u) return;',
+                '        if (soff > 0xffffffffu - rec_off) return;',
+                '        addr = soff + rec_off;',
+                '        if (elem_bytes > num_records || addr > num_records - elem_bytes) return;',
+                '    } else {',
+                '        if (stride == 0u) return;',
+                '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;',
+                '        if (idx > (0xffffffffu - rec_off) / stride) return;',
+                '        uint elem_addr = idx * stride + rec_off;',
+                '        if (soff > 0xffffffffu - elem_addr) return;',
+                '        addr = elem_addr + soff;',
+                '    }',
+                '    if ((addr & 3u) != 0u) return;',
+                '    uint uav_bytes = 0u;',
+                '    buf.GetDimensions(uav_bytes);',
+                '    if (uav_bytes < elem_bytes || addr > uav_bytes - elem_bytes) return;',
+                '    if (elem_bytes == 16u) {',
+                '        buf.Store4(addr, v);',
+                '    } else if (fmt == 71u) {',
+                '        buf.Store2(addr, uint2(pack16_rne(asfloat(v.x)) | (pack16_rne(asfloat(v.y)) << 16u), '
+                'pack16_rne(asfloat(v.z)) | (pack16_rne(asfloat(v.w)) << 16u)));',
+                '    } else if (fmt == 56u) {',
+                '        buf.Store(addr, store_unorm(v.x, 255.0f) | (store_unorm(v.y, 255.0f) << 8u) '
+                '| (store_unorm(v.z, 255.0f) << 16u) | (store_unorm(v.w, 255.0f) << 24u));',
+                '    } else {',
+                '        buf.Store(addr, store_unorm(v.x, 1023.0f) | (store_unorm(v.y, 1023.0f) << 10u) '
+                '| (store_unorm(v.z, 1023.0f) << 20u) | (store_unorm(v.w, 3.0f) << 30u));',
+                '    }',
+                '}',
+            ))
         return out
 
     def interface(self, for_pixel):
@@ -6887,10 +9233,16 @@ class ComputePipeline(Pipeline):
     def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
         from compute_store_aot import checked_group, entry_registers
         try:
-            self.entry = entry_registers(rsrc2)  # (user SGPRs, {axis: group-ID SGPR}, thread-ID VGPRs)
+            tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
+                          and 0 <= rsrc2 < (1 << 32) and bool((rsrc2 >> 10) & 1))
+            self.entry = entry_registers(rsrc2 & ~(1 << 10) if tg_size_en else rsrc2)
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
+        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32:
+            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
+        user, groups, _ = self.entry
+        self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
@@ -6944,10 +9296,14 @@ class ComputePipeline(Pipeline):
                 where = 'table %d %d' % (source[1], off or 0)
             elif source[0] == 'root':
                 where = 'root %d' % source[1]
+            elif source[0] == 'resheap' and len(source) == 3 and r['kind'] == 'buf':
+                where = 'heap rootconst %d %d' % source[1:]  # the 32-byte heap record that root constant word indexes
             else:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for (source, off), r in self.uavs.items():
+            if source[0] != 'table':
+                raise Unsupported('store through %s' % (source,))
             where = 'table %d %d' % (source[1], off)
             if r['kind'] == 'raw':
                 lines.append('uav %d %s' % (r['index'], where))
@@ -6988,10 +9344,16 @@ def fnv(data, h=1469598103934665603):
     return h
 
 
-def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
-    """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-17'))))
-    return fnv(layout, key) if layout else key
+def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
+    """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout.
+
+    A pipeline with a stream description (req_<key>.psin) also hashes its pixel input masks: b'psin1' and then
+    SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
+    signature and input layout but different masks are then two requests with their own results. Without a
+    description the key is unchanged."""
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-18'))))
+    key = fnv(layout, key) if layout else key
+    return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
 
 def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
@@ -6999,7 +9361,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-17cs')
+    key = fnv(b'x2w-startup-shader-18cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
@@ -7181,14 +9543,15 @@ def has_complete_mesh57_bytecode(path):
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
-                 ps_attr_map=None):
+                 ps_attr_map=None, ps_hw_inputs=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
+                        ps_hw_inputs=ps_hw_inputs)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -7258,14 +9621,14 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
 
 def classify_decoded(ins):
     text = ' '.join(x[3] for x in ins if x[2] == 'exp')
-    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or not text else 'other'  # no export: a depth-only pixel shader
+    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or 'null' in text or not text else 'other'  # no export: a depth-only pixel shader
 
 
 def classify(blob):
     return classify_decoded(decode(strip_header(blob)))
 
 
-def load_request(out_dir, key, refusals=None, pair_info=None):
+def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_key=False):
     """Read a base request or an RTV variant and classify the source stages."""
     decoded = {}
 
@@ -7277,27 +9640,21 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
         decoded[kind] = ins
         return kind
 
-    name = os.path.join(out_dir, 'req_%016x' % key)
-    request = ''
-    formats = ()
-    base = key
-    if os.path.isfile(name + '.rtv'):
-        with open(name + '.rtv', encoding='ascii') as file:
-            request = file.read(256)
-        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
-            raise Unsupported('invalid RTV variant request')
-        base, *formats = map(int, request.split()[1:])
-        if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
-            raise Unsupported('invalid RTV variant values')
-        name = os.path.join(out_dir, 'req_%016x' % base)
+    request, base, formats, description = request_source(out_dir, key)
+    name = os.path.join(out_dir, 'req_%016x' % base)
     a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     if pair_info is not None and not request:
         import hashlib
         pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
     # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
     layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
-    if request and pipeline_key(a, b, root, layout) != base:
-        raise Unsupported('RTV variant source key mismatch')
+    if request or validate_base_key:
+        # The masks of a stream description are part of the key (pipeline_key).
+        masks = read_ps_inputs(description, base)
+        if pipeline_key(a, b, root, layout, masks) != base:
+            raise Unsupported('RTV variant source key mismatch' if request else
+                              'pixel input description names another pipeline' if masks is not None else
+                              'shader request source key mismatch')
     fetch = attr_map = None
     if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
         # Slot 86 records complete containers in canonical (VS, PS) order.
@@ -7322,8 +9679,100 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
     return kinds, root, formats, request, fetch, decoded, attr_map
 
 
+def request_source(out_dir, key):
+    """The source of a graphics request: (rtv1 line or '', source key, RTV formats, stream description path).
+
+    A base request is its own source. An RTV variant (req_<key>.rtv) names its source pipeline and is translated
+    from that pipeline's blobs and stream description, req_<source>.psin. This is the one place that names the
+    description a request depends on: the translation reads its masks from that path, and pending_keys checks
+    the same path to withdraw a published result or retry a failure after the description changes or, for a
+    result recorded as translated with it (dependency_record), is removed. The path is returned whether or not the
+    file exists. An invalid variant line is refused by name."""
+    name = os.path.join(out_dir, 'req_%016x' % key)
+    request = ''
+    formats = ()
+    base = key
+    if os.path.isfile(name + '.rtv'):
+        with open(name + '.rtv', encoding='ascii') as file:
+            request = file.read(256)
+        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
+            raise Unsupported('invalid RTV variant request')
+        base, *formats = map(int, request.split()[1:])
+        if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
+            raise Unsupported('invalid RTV variant values')
+    return request, base, formats, os.path.join(out_dir, 'req_%016x.psin' % base)
+
+
+def request_ps_inputs(out_dir, key):
+    """The pixel input masks (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR) of one graphics request, or None.
+
+    They come from the stream description request_source() names: req_<key>.psin, the separately captured
+    description of exactly that pipeline (see read_ps_inputs), or for an RTV variant its source pipeline's. The
+    masks are part of the request's identity: the key must equal pipeline_key() of the stage blobs, root
+    signature, input layout and these masks, so a description copied from another pipeline, left stale after a
+    stage change or rewritten with another mask pair is refused, never applied. No file means no captured
+    description: the translation keeps its model without hardware inputs."""
+    _, base, _, description = request_source(out_dir, key)
+    masks = read_ps_inputs(description, base)
+    if masks is None:
+        return None
+    name = os.path.join(out_dir, 'req_%016x' % base)
+    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+    layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
+    if pipeline_key(a, b, root, layout, masks) != base:
+        raise Unsupported('pixel input description names another pipeline')
+    return masks
+
+
+def dependency_record(out_dir, key):
+    """<key>.psdep: written when a graphics request is translated with a stream description, before its manifest.
+
+    It marks a result as known to depend on the description request_source() names, so pending_keys can withdraw
+    that result when the description is removed. A legacy request that never had a description has no record, and
+    its inputs are not read again. The record holds the description line the result was translated with."""
+    return os.path.join(out_dir, '%016x.psdep' % key)
+
+
+def record_dependency(out_dir, key, base, masks):
+    path = dependency_record(out_dir, key)
+    line = 'psin1 %016x ena=0x%04x addr=0x%04x\n' % (base, *masks)
+    with suppress(FileNotFoundError, UnicodeError), open(path) as existing:
+        if existing.read() == line:
+            return
+    temporary = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        with open(temporary, 'w') as record:
+            record.write(line)
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.remove(temporary)
+
+
+def read_ps_inputs(path, key):
+    """The (enable, address) masks in the stream description at `path` (req_<key>.psin), one ASCII line
+    'psin1 <key> ena=<mask> addr=<mask>' (the key as 16 hex digits, the masks as 0x-prefixed 16-bit values), or
+    None without the file. The line must name `key`; a malformed line or a missing mask is refused by name."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, 'rb') as file:
+        line = file.read(128)
+    fields = line.decode('ascii', 'replace').split()
+    if not re.fullmatch(rb'psin1 [0-9a-f]{16}(?: (?:ena|addr)=0x[0-9a-f]{1,4}){0,2}\n?', line):
+        raise Unsupported('invalid pixel input description')
+    masks = dict(field.split('=') for field in fields[2:])
+    if len(masks) != len(fields) - 2:
+        raise Unsupported('invalid pixel input description')
+    if int(fields[1], 16) != key:
+        raise Unsupported('pixel input description names another pipeline')
+    for field, label in (('ena', 'enable'), ('addr', 'address')):
+        if field not in masks:
+            raise Unsupported('pixel input %s mask missing from the stream description' % label)
+    return int(masks['ena'], 16), int(masks['addr'], 16)
+
+
 def mesh57_key(ms, ps, root):
-    value = fnv(b'x2w-startup-mesh-57-2')
+    value = fnv(b'x2w-startup-mesh-57-3')
     for part in (ms, ps, root):
         value = fnv(part, fnv(struct.pack('<Q', len(part)), value))
     return value
@@ -7348,11 +9797,13 @@ def translate_mesh57(out_dir, key):
     if ps:
         pixel = decode(strip_header(ps))
         # A pixel shader with no colour output ends in a null-target export (LLVM SILateBranchLowering, Mesa ACO create_fs_null_export): depth-only.
-        null_only = {a.split()[1] for _, _, op, a in pixel if op == 'exp'} == {'null'}
+        targets = {a.split()[1] for _, _, op, a in pixel if op == 'exp'}
+        null_only = targets == {'null'}
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
-        if null_only:
-            raise Unsupported('slot 57 mesh with a depth-only pixel stage is not covered')
+        # The slot 57 depth-only profile is the null export alone; the general pixel path keeps its mixed forms.
+        if 'null' in targets and not null_only:
+            raise Unsupported('slot 57 pixel stage mixes the null export with another export')
     pipe = MeshPipeline(ms, ps or None, root)
     sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
     if ps:
@@ -7398,15 +9849,32 @@ def translate_request(out_dir, key):
             open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
             return 'unsupported: %s' % reason
     try:
-        kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key)
+        try:
+            _, base, _, description = request_source(out_dir, key)
+            if os.path.isfile(dependency_record(out_dir, key)) and not os.path.isfile(description):
+                raise Unsupported('pixel input description missing for a request translated with one')
+            kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
+            ps_inputs = request_ps_inputs(out_dir, key)
+            if ps_inputs is not None:
+                record_dependency(out_dir, key, base, ps_inputs)  # before the manifest is published
+        except Unsupported:
+            # A result published earlier was translated from sources or masks this request no longer confirms.
+            with suppress(FileNotFoundError):
+                os.remove(os.path.join(out_dir, '%016x.txt' % key))
+            raise
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch,
-                        ps_attr_map=attr_map)
+    result = translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
+                          vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
+    if ps_inputs is not None and result == 'ok':
+        # An unchanged manifest is not rewritten; mark it as checked against this description (pending_keys).
+        with suppress(FileNotFoundError):
+            os.utime(os.path.join(out_dir, '%016x.txt' % key))
+    return result
 
 
 REFUSALS_CAVEAT = ('Counts after the first refusal are approximate. Skipped instructions leave later state '
@@ -7457,7 +9925,8 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, _, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        kinds, root, formats, request, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        ps_inputs = request_ps_inputs(out_dir, key)
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
         return refusals
@@ -7477,7 +9946,7 @@ def request_refusals(out_dir, key, pair_info=None):
         if set(kinds) != {'vs', 'ps'}:
             raise Unsupported('stages %s' % sorted(kinds))
         pipe = Pipeline(kinds['vs'], kinds['ps'], root, rtv_formats=formats, vs_fetch=fetch,
-                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map)
+                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
         op = 'hlsl_vs'
         pipe.hlsl_vs()
         op = 'hlsl_ps'
@@ -7728,8 +10197,21 @@ def pending_keys(out_dir, skip_failed):
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
         ready_bytecode = has_complete_mesh57_bytecode if mesh else has_bytecode
         manifest = result + ('.ms57.txt' if mesh else '.txt')
-        # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if os.path.isfile(manifest):
+        # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008). The stream
+        # description the translation reads (request_source: the request's own, or an RTV variant's source
+        # pipeline's) is a dependency like the request file. Rewritten after the result was published, the result
+        # is checked again, so one translated with other masks is not kept in silence; rewritten after a refusal,
+        # the request is retried.
+        described = None
+        lost = False
+        if m.group(2) in ('a', 'rtv'):
+            with suppress(Unsupported, OSError, UnicodeError):  # no description, or a variant line refused later
+                described = os.path.getmtime(request_source(out_dir, key)[3])
+            # A result translated with a description recorded it (dependency_record). With that description gone,
+            # the result is checked again and withdrawn; a legacy request without a record is not read again.
+            lost = described is None and os.path.isfile(result + '.psdep')
+        if os.path.isfile(manifest) and not lost and not (
+                described is not None and described > os.path.getmtime(manifest)):
             if manifest_only or all(ready_bytecode(result + s) for s in stages):
                 continue
             if mesh and has_complete_mesh57_bytecode(result + '.ms57.cso'):
@@ -7737,8 +10219,12 @@ def pending_keys(out_dir, skip_failed):
                     if b'ps none' in published.read().splitlines():
                         continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
-        # A repeated pass retries a failure only once its request is rewritten.
-        if skip_failed and os.path.exists(fail) and os.path.getmtime(fail) >= os.path.getmtime(os.path.join(out_dir, name)):
+        # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
+        # still published without its recorded description is checked even with an older .fail, which a success on
+        # the manifest-only path leaves in place.
+        recheck = lost and os.path.isfile(manifest)
+        if skip_failed and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= max(
+                os.path.getmtime(os.path.join(out_dir, name)), described or 0):
             continue
         keys.append(key)
     return keys
