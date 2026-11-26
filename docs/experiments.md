@@ -256,6 +256,12 @@ nonempty component mask. The image draw test samples the alpha channel of a two-
 Texture1D at two coordinates and compares exact words. Selecting red changes both results.
 Run `ctest --preset dev -R startup_image_3d --no-tests=error` for this and the 3D controls.
 
+The explicit-level fixture binds a three-mip Texture1D with a distinct value per mip.
+With LOD inputs 1 and 2, `image_sample_lz` reads level 0 and `image_sample_l` reads the
+provided level. A variant that fixes the explicit LOD at zero returns the level-zero
+value when the reference expects level 2. Run
+`ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_image_1d($|_)' -V`.
+
 The runtime binds an explicit or default 1D view and uploads single-array-slice CPU-backed textures
 using their desktop copyable footprints. Run `ctest --preset dev -R '^startup_1d_srv_' --no-tests=error`
 to check RGBA8 texel and alpha values, rebinding, and a mismatched 2D view on hardware and WARP.

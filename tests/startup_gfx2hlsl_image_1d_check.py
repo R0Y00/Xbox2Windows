@@ -1,6 +1,6 @@
 """1D image sampling in tools/startup/gfx2hlsl.py (issue #1721).
 
-usage: startup_gfx2hlsl_image_1d_check.py
+usage: startup_gfx2hlsl_image_1d_check.py [draw <dxc> <offscreen_check> <warp|hardware>]
 
 A 1D image has one coordinate, and `image_sample_lz` / `image_sample_l` carry the explicit level in the next
 address dword. The translator accepted 1D only for the implicit-level `image_sample`, so the two explicit-level
@@ -14,7 +14,10 @@ The instruction bytes are **constructed here** from the field layout the checked
 """
 import os
 import struct
+import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
@@ -156,3 +159,53 @@ if failures:
         print('  ' + text)
     sys.exit(1)
 print('PASS')
+
+
+def draw(dxc, renderer, adapter):
+    from startup_image_3d_check import FULLSCREEN_VS, WORDS_1D, compile_hlsl, translate as translate_pair
+
+    # Use the existing Texture1D draw, with v1 reading the provided root constant for the explicit LOD.
+    sample = encode_mimg(IMG_SAMPLE, vdata=0, srsrc=16, ssamp=24)
+    words = WORDS_1D.replace(bytes.fromhex('ff02027e0000803e'), bytes.fromhex('0902027e'))
+    assert sample in words
+
+    def texel(level):
+        x = (4 >> level) * 3 // 4
+        rgba = ((1 + x + 32 * level) / 128, x, 0, 0.75 if x else 0.5)
+        return ','.join(f'{struct.unpack("<I", struct.pack("<f", c))[0]:08x}' for c in rgba)
+
+    with tempfile.TemporaryDirectory() as scratch:
+        directory = Path(scratch)
+        vs = compile_hlsl(dxc, 'dxc', FULLSCREEN_VS, 'fullscreen', 'vs_6_0', directory)
+        for opcode, label in [(IMG_SAMPLE_LZ, 'lz'), (IMG_SAMPLE_L, 'l')]:
+            pipe = translate_pair(words.replace(sample, encode_mimg(opcode, vdata=0, srsrc=16, ssamp=24)))
+            shader = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), label, 'ps_6_0', directory)
+
+            def read(program, lod, expected):
+                args = [renderer, adapter, '--startup-image-1d-mips', str(vs), str(program), str(lod), texel(expected)]
+                run = subprocess.run(args, capture_output=True, text=True)
+                if run.returncode == 77:
+                    print(run.stdout + run.stderr)
+                    sys.exit(77)
+                return run
+
+            for lod in (1, 2):
+                level = lod if label == 'l' else 0
+                run = read(shader, lod, level)
+                assert run.returncode == 0, run.stdout + run.stderr
+                print(run.stdout, end='')
+                print(f'{adapter} sample_{label} LOD input {lod}: matched mip {level}')
+            if label == 'l':
+                source = pipe.hlsl_ps()
+                mutant = source.replace('SampleLevel(q0, F(v0), F(v1))', 'SampleLevel(q0, F(v0), 0.0)')
+                assert mutant != source, source
+                wrong = compile_hlsl(dxc, 'dxc', mutant, 'fixed_zero', 'ps_6_0', directory)
+                wrong_zero = read(wrong, 2, 2)
+                assert wrong_zero.returncode == 1 and 'actual=' + texel(0) in wrong_zero.stderr, wrong_zero.stderr
+                print(f'{adapter} fixed-zero shader read mip zero where mip two was expected')
+
+
+if len(sys.argv) > 1:
+    if len(sys.argv) != 5 or sys.argv[1] != 'draw':
+        sys.exit(__doc__)
+    draw(*sys.argv[2:])
