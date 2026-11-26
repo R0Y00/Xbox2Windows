@@ -155,8 +155,10 @@ int main(int argc, char** argv)
     ok = expect(live(live_objects, status_kind) == 0, "a status array released by its only owner was not freed") && ok;
     if (!ok) return 1;
 
-    // B. A submitted entry keeps its file and status array alive after the guest releases them, and the
-    // queue's worker has left by the time the queue's final Release returns.
+    // B. A submitted entry keeps its source file alive after the guest releases it, the status entry
+    // completes, and the queue's worker has left by the time the queue's final Release returns. The
+    // status array keeps the guest's own reference for the checks below, so it can be read after
+    // completion; section C proves the entry retains it when the guest has released it.
     void* file1 = nullptr;
     void* status1 = nullptr;
     void* queue1 = nullptr;
@@ -183,13 +185,10 @@ int main(int argc, char** argv)
     // A barrier behind the request: when it runs, the request's entry has released its references.
     reinterpret_cast<EnqueueSignalFn>(queue->vtable[5])(queue, &barrier, 0x101);
 
-    // The guest drops its own references while the entries are pending.
+    // The guest drops the file while the request is pending.
     reinterpret_cast<ReleaseFn>(static_cast<Object*>(file1)->vtable[2])(file1);
-    reinterpret_cast<ReleaseFn>(status->vtable[2])(status);
     ok = expect(live(live_objects, file_kind) == 1,
                 "a file referenced by a pending entry was freed by the guest's Release") && ok;
-    ok = expect(live(live_objects, status_kind) == 1,
-                "a status array referenced by a pending entry was freed by the guest's Release") && ok;
     if (!ok) return 1;
 
     reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
@@ -200,7 +199,9 @@ int main(int argc, char** argv)
     ok = expect(reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0) == S_OK, "the request status is not S_OK") && ok;
     ok = expect(destination == payload, "the request did not write the file bytes") && ok;
     ok = expect(live(live_objects, file_kind) == 0, "the entry did not drop its file reference") && ok;
-    ok = expect(live(live_objects, status_kind) == 0, "the entry did not drop its status-array reference") && ok;
+    ok = expect(live(live_objects, status_kind) == 1, "the status array lost the guest's reference before the checks") && ok;
+    reinterpret_cast<ReleaseFn>(status->vtable[2])(status);
+    ok = expect(live(live_objects, status_kind) == 0, "the status array was not freed at its last reference") && ok;
     ok = expect(live_workers() == 1, "the queue's worker is not reported running before the queue is released") && ok;
     if (!ok) return 1;
 
@@ -278,4 +279,3 @@ int main(int argc, char** argv)
               "the queue worker left before the queue was freed");
     return 0;
 }
-
