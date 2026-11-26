@@ -46,6 +46,7 @@ All 320 words are compared, so a word outside the written records must keep the 
 and Y group IDs at entry, drop the store, drop case B's immediate offset, drop case C's exec predicate, or drop a
 scalar statement inside case J's block; each must change the readback.
 """
+import itertools
 import struct
 import subprocess
 import sys
@@ -241,6 +242,49 @@ WORDS_H = bytes.fromhex(
 # whole wave skips it.
 SOURCE_K = SOURCE_J.replace('v_cmp_gt_u32 vcc_lo, 3, v0\n', 'v_mov_b32 v6, s7\nv_cmp_eq_u32_e32 vcc_lo, 1, v6\n')
 WORDS_K = WORDS_J.replace(bytes.fromhex('8300887d'), bytes.fromhex('07020c7e' '810c847d'))
+
+# Case P is the compiler's i1 phi with a per-lane old value (a blend). M (s23) holds lanes tid.x < 4 before the branch; the
+# block, entered by lanes tid.x < 3 * group, clears M for the lanes it runs (s_andn2 with exec) and ORs in the odd lanes
+# (a compare masked with exec); the lane select after the join reads M per lane. Group 0 skips the block with the whole
+# wave, groups 1 and 2 enter with a partial wave (3 and 6 lanes) and group 3 with all of it. Case Q is the same with M set
+# to all ones before the branch and `s_orn2 M, C, exec_lo` in the block.
+SOURCE_P = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v4, 2, v3
+buffer_load_dword v5, v4, s[12:15], 0 offen
+s_waitcnt vmcnt(0)
+s_mul_i32 s24, s7, 3
+v_cmp_gt_u32 s23, 4, v0
+s_mov_b32 s21, exec_lo
+v_cmp_gt_u32 vcc_lo, s24, v0
+s_mov_b32 exec_lo, vcc_lo
+s_cbranch_execz 5
+s_andn2_b32 s23, s23, exec_lo
+v_and_b32 v6, 1, v0
+v_cmp_ne_u32 vcc_lo, 0, v6
+s_and_b32 s22, vcc_lo, exec_lo
+s_or_b32 s23, s23, s22
+s_mov_b32 exec_lo, s21
+v_not_b32 v6, v5
+v_cndmask_b32 v7, v5, v6, s23
+buffer_store_dword v7, v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_P = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '0783148f' '1400064a' '82060834' '001030e004050380' '703f8cbf'
+    '07831893' '1700c4d484000200' '7e0395be' '1800887d' '6a03febe' '050088bf' '177e178a' '81000c36' '800c8a7d'
+    '6a7e1687' '17161788' '1503febe' '056f0c7e' '070001d5050d5e00' '001070e004070480' '000081bf')
+SOURCE_Q = (SOURCE_P.replace('v_cmp_gt_u32 s23, 4, v0\n', 's_mov_b32 s23, -1\n').replace('s_cbranch_execz 5', 's_cbranch_execz 3')
+            .replace('s_andn2_b32 s23, s23, exec_lo\n', '')
+            .replace('s_and_b32 s22, vcc_lo, exec_lo\ns_or_b32 s23, s23, s22\n', 's_orn2_b32 s23, vcc_lo, exec_lo\n'))
+WORDS_Q = (WORDS_P.replace(bytes.fromhex('1700c4d484000200'), bytes.fromhex('c10397be'))
+           .replace(bytes.fromhex('050088bf'), bytes.fromhex('030088bf')).replace(bytes.fromhex('177e178a'), b'')
+           .replace(bytes.fromhex('6a7e168717161788'), bytes.fromhex('6a7e178b')))
 
 # Case M is case H with the nested if as an if/else. Each arm has its own s_cbranch_execz; the then arm stores the
 # first word, s_andn2_b32 of the saved mask switches to the else arm, which stores the second, and s_mov_b32
@@ -460,6 +504,8 @@ CASES = {
     'H': (SOURCE_H, WORDS_H, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'M': (SOURCE_M, WORDS_M, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'K': (SOURCE_K, WORDS_K, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
+    'P': (SOURCE_P, WORDS_P, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
+    'Q': (SOURCE_Q, WORDS_Q, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
     'N': (SOURCE_N, WORDS_N, USER7 | tidig(1), (16, 1, 1), (1, 1, 1)),
@@ -710,6 +756,11 @@ def expected(name):
                                 i = (gx + 3 * gy + 6 * gz) * 24 + tx + 2 * ty + 6 * tz
                                 stride = 0 if name == 'A-ff1' else STRIDE
                                 out[i] = ((input_word(i) * 33) & MASK) ^ ((KEY + i * stride) & MASK)
+                            elif name in ('P', 'Q'):
+                                i = gx * 8 + tx
+                                old = 1 if name == 'Q' else int(tx < 4)
+                                mask = (tx & 1) if tx < 3 * gx else old  # the block's lanes take the compare, others keep M
+                                out[i] = ~input_word(i) & MASK if mask else input_word(i)
                             elif name == 'K':
                                 i = gx * 8 + tx
                                 if gx == 1:  # only group 1's wave enters the block
@@ -1037,6 +1088,24 @@ def check_off_stores():
         refused('buffer store off with data not proven wave-uniform', lambda code=code: lines(*code))
 
 
+def check_execz_mask_exact():
+    """Exhaustive 4-lane wave: the one-lane model of an s_cbranch_execz block (a lane with exec clear skips it) leaves a
+    skipped lane's mask bit as M held it; the wave runs the block whenever any lane is active. Which block writes keep
+    that bit: preserving ones always, a compare / exec-masked move only if M was 0, an s_orn2 with exec only if M was 1s."""
+    full = 15
+    writes = {'cmp': lambda m, e, c: c & e, 'mov_exec': lambda m, e, c: e, 'andn2': lambda m, e, c: m & ~e & full,
+              'blend': lambda m, e, c: (m & ~e & full) | (c & e), 'or_cmp': lambda m, e, c: m | (c & e),
+              'orn2': lambda m, e, c: (c | ~e) & full}
+    for name, write in writes.items():
+        bad = set()
+        for m, e, c in itertools.product(range(16), repeat=3):
+            wave = write(m, e, c) if e else m
+            if any(((wave ^ m) >> lane) & 1 for lane in range(4) if not (e >> lane) & 1):
+                bad.add(m)
+        want = {'cmp': set(range(1, 16)), 'mov_exec': set(range(1, 16)), 'orn2': set(range(15))}.get(name, set())
+        assert bad == want, (name, sorted(bad))
+
+
 def check_controls():
     carry = translate('address-carry').hlsl_cs()
     assert 's21 = (scc ? 1u : 0u);' in carry
@@ -1117,6 +1186,7 @@ def check_controls():
             raise AssertionError('graphics store accepted')
     check_hand_words()
     check_off_stores()
+    check_execz_mask_exact()
     for name in ('O-dword', 'O-shift'):
         hlsl = translate(name).hlsl_cs().splitlines()
         assert any('u0.Store' in line for line in hlsl), (name, hlsl)
@@ -1447,6 +1517,35 @@ def check_controls():
                                               ['s_cmp_eq_u32 s20, 0'] + cnd_s)))
     refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'],
                                               ['s_mov_b32 s7, s20'] + cnd_s)))
+    # A block that leaves the mask bit of a lane it skips unchanged is exact whatever M held before the branch:
+    # `s_andn2 M, M, exec_lo` and `s_or M, M, T` with T exec-masked in the block (the compiler's i1 phi with a
+    # per-lane old value). A compare into M, or an s_orn2 with exec, changes a skipped lane's bit: accepted only
+    # when M was zeroed (compare) or set to all ones (orn2) before the branch.
+    SPLICE.update({'s_andn2_b32 s20, s20, exec_lo': '147e148a', 's_andn2_b32 vcc_lo, vcc_lo, exec_lo': '6a7e6a8a',
+                   's_and_b32 s22, s7, exec_lo': '077e1687', 's_and_b32 s22, s7, s7': '07071687',
+                   's_or_b32 s20, s20, s22': '14161488', 's_or_b32 vcc_lo, vcc_lo, s22': '6a166a88',
+                   's_or_b32 s20, s20, s7': '14071488', 's_andn2_b32 s20, s7, exec_lo': '077e148a',
+                   's_orn2_b32 s20, s7, exec_lo': '077e148b', 'v_cmp_gt_u32 vcc_lo, 3, v0': '8300887d'})
+    blend = ['s_andn2_b32 s20, s20, exec_lo', 's_and_b32 s22, s7, exec_lo', 's_or_b32 s20, s20, s22']
+    for write, read in ((blend, cnd_s), (blend[:1], cnd_s),
+                        (['s_andn2_b32 vcc_lo, vcc_lo, exec_lo', 's_and_b32 s22, s7, exec_lo',
+                          's_or_b32 vcc_lo, vcc_lo, s22'], cnd_vcc)):
+        phi_text(phi([], write, read))
+    phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc))       # compare into a zeroed M
+    phi_text(phi(['s_mov_b32 s20, -1'], ['s_orn2_b32 s20, s7, exec_lo'], cnd_s))           # orn2 into an all-ones M
+    # controls: the same writes without their set-up, an unmasked term, M not the first source, mixed classes,
+    # and a whole-mask read after a preserving block
+    refused(live('vcc'), lambda: phi_text(phi([], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
+    refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, -1'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
+    for zero in ([], ['s_mov_b32 s20, 0']):
+        refused(live('s20'), lambda zero=zero: phi_text(phi(zero, ['s_orn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, -1'], ['s_mov_b32 s20, exec_lo'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo', 's_orn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi([], [blend[0], 's_or_b32 s20, s20, s7'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi([], [blend[0], 's_and_b32 s22, s7, s7', blend[2]], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi([], ['s_andn2_b32 s20, s7, exec_lo'], cnd_s)))
+    for read in (['s_cmp_eq_u32 s20, 0'] + cnd_s, ['s_mov_b32 s7, s20'] + cnd_s):
+        refused(live('s20'), lambda read=read: phi_text(phi([], blend, read)))
     # An implicit-LOD sample has no derivatives in a compute lane; the level-zero form translates.
     load = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40')
     sample = 'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D'
@@ -1501,6 +1600,11 @@ CONTROLS = {
     'h-inner-unpredicated': ('H', 'if (exec & 1) u0.Store(a, v5);', 'u0.Store(a, v5);'),
     'm-else-unswitched': ('M', 'exec = (s0 & ~exec) & 1;', 'exec = (s0) & 1;'),  # the then lanes run the else arm
     'k-block-entered': ('K', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),  # skipped waves run it
+    'p-dropped-andn2': ('P', 's23 = (s23 & ~exec) & 1;', 's23 = (s23) & 1;'),  # an entering lane keeps its old bit
+    'p-dropped-or': ('P', 's23 = (s23 | s22) & 1;', 's23 = (s23) & 1;'),  # an entering lane loses its compare bit
+    'p-block-entered': ('P', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),  # skipping lanes run the block
+    'q-block-entered': ('Q', 'pc = ((exec & 1) == 0) ? 2 : 1;', 'pc = 1; exec = 1;'),
+    'q-not-all-ones': ('Q', 's23 = 0xffffffffu;', 's23 = 0u;'),  # M not set before the branch: skipped lanes read 0
     'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
                           'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),
     'g-overlap': ('G', 'v7 = lds[(a + 144u)', 'v7 = lds[(v6 + 144u)'),

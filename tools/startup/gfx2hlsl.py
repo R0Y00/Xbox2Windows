@@ -2508,7 +2508,12 @@ class Stage:
         whose bit is 0 for any lane whose exec bit is clear there: the clear-mask proof keeps exec clear for that lane, and a copy of exec, or X & exec, has that bit clear. M is 0
         at the branch on every path (nothing branches or lands between the zeroing and the branch). So for a lane
         the model skips, the wave's M has that lane's bit 0 whether the wave ran the block or not, which is the
-        model's M (0); a lane that runs the block runs it in the model too. This holds only while M is read per
+        model's M (0); a lane that runs the block runs it in the model too. Writes that leave a skipped lane's bit
+        as it was are accepted for any M: `s_andn2_b32 M, M, exec_lo` and `s_or_b32 M, M, T` where T is an exec-masked
+        value computed in the block (`s_and_b32 T, X, exec_lo` or a v_cmp result), the blend the compiler emits for an
+        i1 phi whose other input is a per-lane value. A v_cmp into M (not v_cmpx) needs M zeroed before the branch
+        like the moves above, and `s_orn2_b32 M, X, exec_lo` needs M set to all ones (`s_mov_b32 M, -1`). Zeroing
+        and all-ones writes do not mix. This holds only while M is read per
         lane. A whole-mask read (s_cbranch_vccz/vccnz, s_cmp, a plain copy, a data operand) sees the other lanes'
         bits, which the one-lane model does not have, so any such read of M reachable after the join, before M is
         rewritten, keeps the refusal. The reads accepted are the lane select of v_cndmask, the carry-in of v_addc /
@@ -2673,34 +2678,52 @@ class Stage:
         return None
 
     def phi_mask_ok(self, key, b, t, effects, succ, targets, index):
-        """True when lane mask `key` ('vcc' for vcc_lo, or 'sN'), live at the join t of the s_cbranch_execz at b, is
-        the zeroed-then-set-from-exec shape execz_refusals accepts (see its docstring): every write of it in the
-        block is a 32-bit move of exec_lo or an s_and with exec_lo into it alone, the last write before the branch
-        is `s_mov_b32 M, 0` with no branch and no branch target after it up to the branch, and after the join it is
-        only read per lane. The caller has checked that the block is straight-line."""
+        """True when lane mask `key` ('vcc' for vcc_lo, or 'sN'), live at the join t of the s_cbranch_execz at b, leaves the
+        bit of every lane the model skips as the wave has it (see execz_refusals), and after the join it is only read per
+        lane. A lane the model skips has its exec bit clear for the whole block (the exec proof), and the wave runs the block
+        iff some lane is active, so the model is exact iff the block never changes that lane's bit of M. Every write of M
+        in the block is one of (mask_write_class), a 32-bit M written alone:
+          'keep'  s_andn2 M, M, exec_lo; s_or M, M, T with T written in the block by s_and with exec_lo or a v_cmp
+                  (bit 0 for a lane whose exec bit is clear): the lane's bit is unchanged, whatever M held before.
+          'zero'  s_mov M, exec_lo; s_and M, X, exec_lo; a v_cmp into M (VOPC writes 0 for an inactive lane): bit 0,
+                  exact only when M was zero before the branch: the last write before it is `s_mov_b32 M, 0`.
+          'ones'  s_orn2 M, X, exec_lo: bit 1, exact only when M was all ones before it: `s_mov_b32 M, -1`.
+        Zeroing or setting M before the branch needs no branch and no branch target after it up to the branch; 'zero' and
+        'ones' writes do not mix. Any other write (M reused as an offset) is accepted only if a later 'zero' or 'ones'
+        write overwrites it, since a 'keep' write would carry its bits for a skipped lane. The caller has checked that the block is straight-line."""
         name = 'vcc_lo' if key == 'vcc' else key
+        classes, temps, stale = set(), set(), False
         for i in range(b + 1, t):
-            if key not in effects[i][2]:
-                continue
+            wrote = effects[i][2]
             _, ops, _ = parse(self.ins[i][3])
             base = re.sub(r'_e(32|64)$', '', self.ins[i][2])
-            if not ops or ops[0] != name:
+            if key in wrote:
+                if not ops or ops[0] != name:
+                    return False
+                kind = self.mask_write_class(base, ops, name, temps)
+                if kind is None:
+                    stale = True   # data in M (an s_movk used as an offset): only a later full overwrite makes it exact
+                else:
+                    classes.add(kind)
+                    stale = stale and kind == 'keep'
+            for w in wrote - {key} - EXEC_KEYS:
+                if self.exec_masked_def(base, ops, w):
+                    temps.add(w)
+                else:
+                    temps.discard(w)
+        if stale or ('zero' in classes and 'ones' in classes):
+            return False
+        need = {'zero': '0', 'ones': '-1'}.get(next(iter(classes & {'zero', 'ones'}), None))
+        if need is not None:
+            # The setting: the last instruction before the branch that may write M.
+            z = next((k for k in range(b - 1, -1, -1) if key in effects[k][2]), None)
+            if z is None:
                 return False
-            if base == 's_mov_b32' and ops[1:] == ['exec_lo']:
-                continue
-            if base == 's_and_b32' and len(ops) == 3 and 'exec_lo' in ops[1:]:
-                continue
-            return False
-        # The zeroing: the last instruction before the branch that may write M.
-        z = next((k for k in range(b - 1, -1, -1) if key in effects[k][2]), None)
-        if z is None:
-            return False
-        _, ops, _ = parse(self.ins[z][3])
-        if self.ins[z][2] != 's_mov_b32' or ops != [name, '0']:
-            return False
-        if any(self.ins[k][2].startswith(('s_cbranch', 's_branch', 's_setpc')) for k in range(z + 1, b)) or \
-                any(index.get(x) in range(z + 1, b + 1) for x in targets):
-            return False
+            _, ops, _ = parse(self.ins[z][3])
+            if self.ins[z][2] not in ('s_mov_b32', 's_movk_i32') or ops != [name, need]:
+                return False
+            if any(self.ins[k][2].startswith(('s_cbranch', 's_branch', 's_setpc')) for k in range(z + 1, b)) or                     any(index.get(x) in range(z + 1, b + 1) for x in targets):
+                return False
         # After the join, until M is rewritten, every read must be per lane.
         seen, todo = set(), [t]
         while todo:
@@ -2714,6 +2737,37 @@ class Stage:
             if key not in writes:
                 todo.extend(succ[i])
         return True
+
+    @staticmethod
+    def exec_masked_def(base, ops, key):
+        """True when this instruction writes `key` ('sN' or 'vcc') with a value whose bit is 0 for a lane whose exec bit is
+        clear: s_and with exec_lo into it, or a v_cmp (not v_cmpx) into it."""
+        name = 'vcc_lo' if key == 'vcc' else key
+        if not ops or ops[0] != name:
+            return False
+        if base == 's_and_b32':
+            return len(ops) == 3 and 'exec_lo' in ops[1:]
+        return base.startswith('v_cmp') and not base.startswith('v_cmpx')
+
+    @staticmethod
+    def mask_write_class(base, ops, name, temps):
+        """'keep', 'zero' or 'ones' for a write of mask `name` inside an execz block (see phi_mask_ok), else None."""
+        key = 'vcc' if name == 'vcc_lo' else name
+        if base == 's_mov_b32' and ops[1:] == ['exec_lo']:
+            return 'zero'
+        if base == 's_and_b32' and len(ops) == 3 and 'exec_lo' in ops[1:]:
+            return 'zero'
+        if base.startswith('v_cmp') and not base.startswith('v_cmpx'):
+            return 'zero'
+        if base == 's_orn2_b32' and len(ops) == 3 and ops[2] == 'exec_lo':
+            return 'ones'
+        if base == 's_andn2_b32' and ops == [name, name, 'exec_lo']:
+            return 'keep'
+        if base == 's_or_b32' and len(ops) == 3 and name in ops[1:]:
+            other = ops[2] if ops[1] == name else ops[1]
+            if other != name and ('vcc' if other == 'vcc_lo' else other) in temps:
+                return 'keep'
+        return None
 
     def per_lane_read(self, i, key):
         """True when instruction i reads mask `key` only as a lane select or carry, or into exec (s_and_saveexec,
