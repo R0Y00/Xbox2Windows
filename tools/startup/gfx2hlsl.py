@@ -996,6 +996,7 @@ UNIFORM_LOAD_WORDS = {'buffer_load_dword': 1, 'buffer_load_dwordx2': 2, 'buffer_
                       'buffer_load_format_x': 1, 'buffer_load_format_xy': 2, 'buffer_load_format_xyz': 3,
                       'buffer_load_format_xyzw': 4}
 UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
+UNIFORM_IMAGE_LOADS = frozenset(('image_load',))
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
@@ -2246,6 +2247,7 @@ class Stage:
     # per-instance sets, so nothing is shared across Stage instances.
     needs_sm6 = False         # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
     exec_known = False        # unit probes without __init__ customize this explicitly when needed
+    has_image_writes = True   # proved False in translate() only when no image write exists in the dispatch
     loads_after_exec_write = ()  # compute loads reached from an EXEC writer through the block graph
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
@@ -3468,9 +3470,11 @@ class Stage:
             name in DERIVATIVE_OPS for _off, _n, name, _asm in self.ins)
         self.uses_quad_vote = False
         joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.has_image_writes = any(name.startswith(('image_store', 'image_atomic')) for _, _, name, _ in self.ins)
         self.loads_after_exec_write = set()
+        all_uniform_loads = UNIFORM_LOADS | UNIFORM_IMAGE_LOADS
         if (back_targets and getattr(self, 'kind', None) == 'cs' and
-                any(name in UNIFORM_LOADS for _, _, name, _ in self.ins)):
+                any(name in all_uniform_loads for _, _, name, _ in self.ins)):
             # A later block can reach an earlier load through one or more edges. exec_known only sees
             # instructions already translated. Follow the CFG, including paths outside a loop's textual range.
             bounds, _, succ, _ = self.spill_cfg
@@ -3484,7 +3488,7 @@ class Stage:
                 if block not in visited:
                     visited.add(block)
                     lo, hi = bounds[block]
-                    self.loads_after_exec_write.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in UNIFORM_LOADS)
+                    self.loads_after_exec_write.update(pc for pc, _, name, _ in self.ins[lo:hi] if name in all_uniform_loads)
                     pending.extend(succ[block])
         self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
@@ -4136,6 +4140,71 @@ class Stage:
             return False
         return True
 
+    def uniform_image_load_regs(self, base, ops, mods):
+        """Return the range of destination VGPRs written uniformly by `image_load`, or () when unproved."""
+        if (base not in UNIFORM_IMAGE_LOADS or len(ops) < 3 or not self.tracks_uniformity() or
+                getattr(self, 'kind', None) != 'cs' or not getattr(self, 'exec_known', False) or
+                getattr(self, 'has_image_writes', True)):
+            return ()
+        past_entry = getattr(self, 'past_entry', None)
+        if past_entry is None or (past_entry and (getattr(self, 'uniform_expr', None) is None or
+                                                self.pc in getattr(self, 'loads_after_exec_write', ()))):
+            return ()
+        rsrc = reg_range(ops[2])
+        first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 7 and rsrc[2] <= 105 else None
+        if (not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or
+                first[3] % 8 or not names_one_value(first)):
+            return ()
+        masks = getattr(self, 'masks', ())
+        varying_s = getattr(self, 'varying_s', ())
+        modified = getattr(self.pipe, 'modified', ())
+        other_modified = getattr(self.pipe, 'other_modified', ())
+        stored = self.pipe.stored_images() if hasattr(self.pipe, 'stored_images') else (getattr(self.pipe, 'uavs', None) or ())
+        key = desc_key(first)
+        if key in modified or key in other_modified or key in stored:
+            return ()
+        for i in range(8):
+            reg = rsrc[1] + i
+            word = desc_word(first, first[3] + i)
+            if (reg in masks or reg in varying_s or self.sym.get(reg) != word or
+                    desc_key(word) in modified):
+                return ()
+        dims = [m for m in mods if m.startswith('dim:')]
+        dmasks = [m for m in mods if m.startswith('dmask:')]
+        if len(dims) != 1 or len(dmasks) != 1:
+            return ()
+        dim = dims[0][4:]
+        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY'):
+            return ()
+        try:
+            dmask = int(dmasks[0][6:], 0)
+        except ValueError:
+            return ()
+        if not dmask or (dmask & ~0xf):
+            return ()
+        packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+        allowed = ('unorm', 'glc', 'slc', 'dlc') + (('a16',) if packed_2d else ())
+        if any(not m.startswith(('dim:', 'dmask:')) and m not in allowed for m in mods):
+            return ()
+        coords = ops[1]
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            if not r or r[0] != 'v':
+                return ()
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        expected_addr = 1 if packed_2d else (3 if dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY') else 2)
+        if len(cs) != expected_addr:
+            return ()
+        if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 and self.uniform_source(c) for c in cs):
+            return ()
+        candidate = reg_range(ops[0])
+        count = bin(dmask).count('1')
+        if not candidate or candidate[0] != 'v' or candidate[2] > 255 or candidate[2] - candidate[1] + 1 != count:
+            return ()
+        return range(candidate[1], candidate[2] + 1)
+
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         if (getattr(self, 'vcc_lost', False) or
@@ -4200,6 +4269,12 @@ class Stage:
                 dst, loaded_regs = candidate[1], range(candidate[1], candidate[2] + 1)
             else:
                 loaded = recomputed = False
+        if dst is None:
+            img_regs = self.uniform_image_load_regs(base, ops, mods)
+            if img_regs:
+                dst, loaded_regs = img_regs.start, img_regs
+                loaded = not getattr(self, 'past_entry', True)
+                recomputed = getattr(self, 'past_entry', False)
         # A shift right of a value built from the X thread id that leaves no thread-id bit.
         shifted = None
         if (dst is None and base == 'v_lshrrev_b32' and not mods and len(ops) == 3 and
