@@ -4538,19 +4538,21 @@ python3 -B tests/compute_mimg_float_store_d16_check.py --binary llvm-mc-15 llvm-
 
 ### gfx1013 2D image atomics
 
-The gfx1013 profile accepts `image_atomic_add`, `image_atomic_umax` and
-`image_atomic_cmpswap` on a 2D `R32_UINT` UAV at mip 0 and lowers them with
-the gfx1030 image atomic lowering described below. The emitted HLSL is
-identical for both targets. The atomics return nothing: `glc` and the other
-cache, `a16`, `d16`, `tfe`, `lwe` and `r128` flags stay refused, as on gfx1030.
-On gfx1013 every other image atomic (`sub`, `and`, `or`, `xor`, `umin`,
+The gfx1013 profile accepts `image_atomic_add`, `image_atomic_umin`,
+`image_atomic_umax` and `image_atomic_cmpswap` on a 2D `R32_UINT` UAV at mip 0
+and lowers them with the gfx1030 image atomic lowering described below. The
+emitted HLSL is identical for both targets. The atomics return nothing: `glc`
+and the other cache, `a16`, `d16`, `tfe`, `lwe` and `r128` flags stay refused, as
+on gfx1030. On gfx1013 every other image atomic (`sub`, `and`, `or`, `xor`,
 `swap`, `inc`, `dec`) is refused by name. So are the signed and float formats,
 a nonzero UAV mip, array and 3D dimensions, a second atomic and a store to the
-same image.
+same image. `umin` stays unsigned (`InterlockedMin` without `asint`); the
+minmax operand `0x80000011` makes unsigned ordering differ from signed `smin`
+on the CPU reference (M200-01 A).
 
 The fixtures are the gfx1030 cases with the gfx1013 profile. One add writes
 unique texels, a contended add sends two lanes to each texel of one row, and a
-`umax` and a `cmpswap` each write unique texels. Each runs with one and two
+`umin`, a `umax` and a `cmpswap` each write unique texels. Each runs with one and two
 groups, and the readback compares all 336 words of a three-mip texture with a
 CPU reference, including the untouched texels and mips. For each case and
 group count, one mutant must mismatch at the first word its reference
