@@ -8359,6 +8359,25 @@ class Stage:
             r = reg_range(tok)
             return set(range(r[1], r[2] + 1)) if r and r[0] == 'v' else set()
 
+        def mix_low_only(n, ops, mods, r):
+            """v_fma_mix* reads register r only as a binary16 LOW half (op_sel_hi set, op_sel clear for every source that
+            names it): the lower 16 bits a plain v_interp_p2_f16 wrote, never the undefined upper half."""
+            if n not in ('v_fma_mix_f32', 'v_fma_mixlo_f16', 'v_fma_mixhi_f16'):
+                return False
+            half, pick = [0, 0, 0], [0, 0, 0]
+            for m in mods:
+                if m.startswith('op_sel_hi:['):
+                    half = [int(x) for x in m[11:-1].split(',')]
+                elif m.startswith('op_sel:['):
+                    pick = [int(x) for x in m[8:-1].split(',')]
+            named = False
+            for tok, is_half, is_pick in zip(ops[1:4], half, pick):
+                if r in regs(tok.lstrip('-').strip('|')):
+                    named = True
+                    if not is_half or is_pick:
+                        return False
+            return named
+
         pending, stale, high_undefined = {}, set(), set()
         for off, n, ops, mods in rows:
             branch_boundary = off in targets or n.startswith('s_cbranch') or n in ('s_branch', 's_setpc_b64')
@@ -8388,7 +8407,7 @@ class Stage:
                 if r in stale:
                     raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
                                       'a v_interp_p2_f16 that wrote another register' % (r, n))
-                if r in high_undefined and not (low_reader and r == int(ops[1][1:])):
+                if r in high_undefined and not (low_reader and r == int(ops[1][1:])) and not mix_low_only(n, ops, mods, r):
                     raise Unsupported('%s reads the upper 16 bits of the v_interp_p2_f16 result v%d: not modelled' %
                                       (n, r))
             if n == 'v_interp_p1ll_f16' and interp:
@@ -8416,6 +8435,10 @@ class Stage:
             elif low_reader:
                 high_undefined.discard(int(ops[0][1:]))
                 stale.discard(int(ops[0][1:]))
+            elif n == 'v_fma_mix_f32' and ops:
+                # The whole 32-bit destination is rewritten (a binary32 result): no half of the old value survives.
+                high_undefined.difference_update(written)
+                stale.difference_update(written)
         # I and J: never written anywhere
         base = pair if pair is not None else (getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0) or 0)
         for off, n, ops, mods in rows:
