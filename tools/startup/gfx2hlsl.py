@@ -2896,7 +2896,7 @@ class Stage:
         if base == 's_mov_b32' and ops[1:] == ['exec_lo']:
             return 'zero'
         lane = lambda x: ('vcc' if x == 'vcc_lo' else x) in temps | enc   # a lane mask: bit 0 is this lane's bit
-        if base == 's_and_b32' and len(ops) == 3 and 'exec_lo' in ops[1:]:
+        if base == 's_and_b32' and len(ops) == 3 and 'exec_lo' in ops[1:] and lane(ops[2] if ops[1] == 'exec_lo' else ops[1]):
             return 'zero'
         if base.startswith('v_cmp') and not base.startswith('v_cmpx'):
             return 'zero'

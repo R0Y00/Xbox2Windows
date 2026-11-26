@@ -1661,16 +1661,22 @@ def check_controls():
         return splice(*enter, *zero, *between, 's_cbranch_execz %d' % (len(write) + len(inside)), *write, *inside,
                       *leave, *read)
     phi_text = lambda code: translate('A', code=code).hlsl_cs()
+    SPLICE.update({'s_and_b32 s20, exec_lo, vcc_lo': '7e6a1487'})
     cnd_vcc, cnd_s = ['v_cndmask_b32 v5, v5, v6, vcc_lo'], ['v_cndmask_b32 v5, v5, v6, s20']
     for zero, write, read in ((['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], cnd_vcc),
                               (['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo'], cnd_s),
-                              (['s_mov_b32 vcc_lo, 0'], ['s_and_b32 vcc_lo, s7, exec_lo'], cnd_vcc),
-                              (['s_mov_b32 s20, 0'], ['s_and_b32 s20, s7, exec_lo'], cnd_s),
-                              (['s_mov_b32 s20, 0'], ['s_and_b32 s20, exec_lo, s7'], cnd_s)):
+                              (['s_mov_b32 vcc_lo, 0'], ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_and_b32 vcc_lo, vcc_lo, exec_lo'], cnd_vcc),
+                              (['s_mov_b32 s20, 0'], ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_and_b32 s20, vcc_lo, exec_lo'], cnd_s),
+                              (['s_mov_b32 s20, 0'], ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_and_b32 s20, exec_lo, vcc_lo'], cnd_s)):
         text = phi_text(phi(zero, write, read))
         # the lane select reads the mask's lane bit, which the block set from exec (the model runs the block for
         # every lane it models, and skips it only where exec is clear, leaving the zeroing)
         assert '& 1) ? ' in text and ('vcc = (exec) & 1;' in text or 's20 = ' in text), text
+    # an s_and of exec with data (a group id) is not a lane mask: its lane bit is at bit `lane` in the wave
+    for write in (['s_and_b32 vcc_lo, s7, exec_lo'], ['s_and_b32 s20, s7, exec_lo']):
+        refused('definition of ' + ('vcc' if 'vcc_lo, s7' in write[0] else 's20') + ', live where the block joins',
+                lambda write=write: phi_text(phi(['s_mov_b32 %s, 0' % ('vcc_lo' if 'vcc_lo, s7' in write[0] else 's20')],
+                                                 write, cnd_vcc if 'vcc_lo, s7' in write[0] else cnd_s)))
     # s_and with exec reads the lane bit only (the result is a lane mask): accepted
     phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['s_mov_b32 vcc_lo, exec_lo'], ['s_and_b32 s20, vcc_lo, exec_lo'] + cnd_vcc))
     # so does s_and_saveexec with the mask as its source (exec &= the lane bit); with the mask as its destination
