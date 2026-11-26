@@ -12,6 +12,10 @@ no output word and leaves the input as written:
 - dispatch-input-unplaced: memory between the two placed buffers;
 - dispatch-input-copied: a buffer placed at an offset the desktop cannot alias, so it is a separate copy;
 - dispatch-input-token: the token of a texture view.
+
+Last, dispatch-input-memory-view replaces the input descriptor with the token of a buffer view (device slot 70) of
+memory no buffer is placed over, 16 bytes in, and writes the input words there after the view exists: all 320
+words match. The stand-in places that buffer in the consumer's own heap, outside its placement index.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -77,8 +81,12 @@ def main(consumer, dxc, adapter):
             assert len(refused) == 1 and refused[0].endswith('refused: ' + reason), '%s:\n%s' % (mode, result.stderr[-3000:])
             assert len(census) == 3 and census[1].endswith(f'reason "{reason}": 1 keys, 1 dispatches'), (mode, census)
             assert len(where) == 1, (mode, result.stderr[-3000:])
-        print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match; {len(CONTROLS)} inputs '
-              'refused, each with its own reason and an untouched output)')
+        got, result = dispatch(directory, consumer, env, 'dispatch-input-memory-view')
+        assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and             not lines(result, 'refused: '), result.stderr[-3000:]
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors[0]
+        print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
+              f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
 
 
 if __name__ == '__main__':
