@@ -32,8 +32,9 @@ with a point sampler, mip filter point, MAX_LOD 2. u depends on x only, so the L
   inside       the sample inside the s_cbranch_execz block of x == 0, after u -= 0.5 there: the quad enters together,
                the helper column masked with its stale u: LOD 1
   kill         v_cmpx keeps x == 0, s_cbranch_execnz past an s_endpgm, u -= 0.5, sample: the quad goes on, LOD 1
-  inside_y     the same block entered by the row y == 0 only: the rows are told apart by the vertical derivative of the
-               vote, the other row's lanes follow and the quad stays together: LOD 1
+  inside_y     u is the same in every lane and v = 0.25 + 0.5 * y: the block is entered by the row y == 0 only, the quad
+               stays together and the LOD comes from the vertical derivative: LOD 1 - 1 = 0. The vote itself is drawn
+               alone (VOTE_CASES): one lane of the quad set at each position, and each half of the helper dropped.
   uni_loop     a loop of two passes on a constant SGPR counter (SCC proven uniform): sample, then u -= 0.5 on every
                lane; the second pass reads u = (-0.375, 0.125), LOD 0
 Refused: the sample inside or after a block a VCC branch skips (the guest takes a VCC branch once per wave, with EXEC
@@ -110,6 +111,9 @@ FIXTURES = {
 }
 # name: (source, text of the refusal)
 REFUSED = {
+    # The plain s_mov_b64 exec, s[N] restore of a mask saved before s_wqm is a lane-exec break too (main accepts the form).
+    'restore_mov': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_mov_b64 exec, s[12:13]\nv_add_f32_e32 v2, -0.5, v2\n' + SAMPLE + EXPORT,
+                    'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # A constant 32-bit EXEC write is no more exact than a mask one: lanes 32..63 keep their old bits in wave64.
     'exec_lo_const': (PROLOGUE + 's_mov_b32 exec_lo, -1\nv_add_f32_e32 v2, -0.5, v2\n' + SAMPLE + EXPORT,
                       'image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
@@ -154,6 +158,11 @@ REFUSED = {
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
+    'restore_mov': (
+        '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff000008'
+        '0d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087e0c04febef10404067fc08cbf280f94f0010a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
     'inside_y': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
         '121210ff1204060000003ef302027eff02067e0000803e0902087eff02047e0000003e90000e2c070d0c7ef00c0c10ff0c'
@@ -352,6 +361,8 @@ def controls():
         G.Stage.derivative_exec_ok = saved
     # A lane-exec break before the sample keeps it refused: s_wqm of a narrowed EXEC is a no-op in the one-lane model.
     refused('wqm_break', 'image_sample_b needs implicit derivatives')
+    # The drawn vote helper is the text the translation emits.
+    assert '\n'.join(G.QUAD_ANY_HLSL) in pipeline('inside').hlsl_ps()
     cells = {name: reference(name) for name in FIXTURES}
     print('image_sample_b after a join, under a v_cmpx EXEC, after a uniform branch, inside an EXEC branch and '
           'past a kill branch: SampleBias; references %s'
@@ -376,21 +387,53 @@ def mutants(name, hlsl):
         out.append(('without the branch write', hlsl.replace(write.group(0), '')))
     if name in ('cmpx', 'inside', 'kill'):
         out.append(('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', ''))))
-    if name == 'inside_y':
-        # The row that is off in the vote's x direction (y = 1) is only seen through the vertical derivative.
-        out.append(('vote without the vertical derivative', hlsl.replace('abs(ddy_fine(row))', '0.0')))
     out.append(('bias ignored', hlsl.replace(CALL, CALL.replace('F(v1))', '0.0)'))))
     for label, text in out:
         assert text != hlsl, (name, label)
     return out
 
 
+# The vote helper alone (QUAD_ANY_HLSL, the text the translation emits), drawn on the covered pixel (0, 0): a pixel shader
+# whose bit is set on one lane of the quad only. The covered pixel answers 1 for every position of that lane, and each
+# half of the helper is the only way to see one of them: the drawn lane is in row 0, column 0, so a lane at (1, 0) is
+# seen through ddx_fine and a lane at (0, 1) through ddy_fine, and a lane at (1, 1) through both. Red is the answer.
+VOTE_PS = """
+%s
+float4 main(float4 pos : SV_Position) : SV_Target {
+    uint x = (uint)pos.x & 1u, y = (uint)pos.y & 1u;
+    return float4(x2w_quad_any(%s) ? 1.0 : 0.0, 0.0, 0.0, 1.0);
+}
+"""
+ONE, ZERO = '3f800000,00000000,00000000,3f800000', '00000000,00000000,00000000,3f800000'
+# name: (bit of the lane, red answer of the covered pixel); the quad is x, y in {0, 1}^2
+VOTE_CASES = {
+    'lane_10': ('(x == 1u && y == 0u) ? 1u : 0u', ONE),
+    'lane_01': ('(x == 0u && y == 1u) ? 1u : 0u', ONE),
+    'lane_11': ('(x == 1u && y == 1u) ? 1u : 0u', ONE),
+    'lane_00': ('(x == 0u && y == 0u) ? 1u : 0u', ONE),
+    'none': ('0u', ZERO),
+}
+# what each case must stop answering when a half of the helper is dropped
+VOTE_MUTANTS = {
+    'lane_10': ('abs(ddx_fine(lane))', 'without the horizontal derivative'),
+    'lane_01': ('abs(ddy_fine(row))', 'without the vertical derivative'),
+}
+
+
+def vote_hlsl(bit, mutant=None):
+    helper = '\n'.join(G.QUAD_ANY_HLSL)
+    if mutant:
+        assert mutant in helper, mutant
+        helper = helper.replace(mutant, '0.0')
+    return VOTE_PS % (helper, bit)
+
+
 def check_draw(dxc, renderer, adapter, fxc=None):
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
 
     def draw(vs, ps, expected, sampler):
-        run = subprocess.run([renderer, adapter, '--startup-image-2d-array-mips', str(vs), str(ps), '0', expected,
-                              sampler], capture_output=True, text=True)
+        run = subprocess.run([renderer, adapter, '--startup-image-2d-array-mips', str(vs), str(ps), '0', expected]
+                             + ([sampler] if sampler else []), capture_output=True, text=True)
         if run.returncode == 77:
             print(run.stdout + run.stderr)
             sys.exit(77)
@@ -421,6 +464,25 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                                              % (adapter, kind, name, label, run.stdout, run.stderr))
                     seen.append('%s -> %s' % (label, got.group(1)))
                 print('%s %s %s: GPU == CPU reference %s; %s' % (adapter, kind, name, want, '; '.join(seen)),
+                      flush=True)
+            for name, (bit, want) in VOTE_CASES.items():
+                ps = compile_hlsl(compiler, kind, vote_hlsl(bit), 'vote_%s_%s' % (name, kind), ps_profile, directory)
+                run = draw(vs, ps, want, None)
+                if run.returncode:
+                    raise AssertionError('%s %s vote %s: GPU differs from the CPU reference %s\n%s%s'
+                                         % (adapter, kind, name, want, run.stdout, run.stderr))
+                seen = []
+                if name in VOTE_MUTANTS:
+                    cut, label = VOTE_MUTANTS[name]
+                    ps = compile_hlsl(compiler, kind, vote_hlsl(bit, cut), 'vote_%s_m_%s' % (name, kind),
+                                      ps_profile, directory)
+                    run = draw(vs, ps, want, None)
+                    got = re.search(r'actual=(\S+)', run.stderr)
+                    if run.returncode == 0 or not got:
+                        raise AssertionError('%s %s vote %s: the helper %s matched the reference\n%s%s'
+                                             % (adapter, kind, name, label, run.stdout, run.stderr))
+                    seen.append('%s -> %s' % (label, got.group(1)))
+                print('%s %s vote %s: GPU == CPU reference %s; %s' % (adapter, kind, name, want, '; '.join(seen)),
                       flush=True)
 
 

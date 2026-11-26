@@ -92,6 +92,9 @@ FIXTURES = {
                  + QUERY + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(1, 8), Fraction(5, 8))),
 }
 REFUSED = {
+    # The plain s_mov_b64 exec, s[N] restore of a mask saved before s_wqm is a lane-exec break too (main accepts the form).
+    'restore_mov': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_mov_b64 exec, s[12:13]\nv_add_f32_e32 v2, -0.5, v2\n' + QUERY + EXPORT,
+                    'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
     # A constant 32-bit EXEC write is no more exact than a mask one: lanes 32..63 keep their old bits in wave64.
     'exec_lo_const': (PROLOGUE + 's_mov_b32 exec_lo, -1\nv_add_f32_e32 v2, -0.5, v2\n' + QUERY + EXPORT,
                       'image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform control flow'),
@@ -121,6 +124,11 @@ REFUSED = {
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
+    'restore_mov': (
+        '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff000008'
+        '0d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7e0c04febef10404067fc08cbf080380f1020a'
+        'c400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
     'inside_y': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
         '121210ff1204060000003eff02067e0000803e8002187e80021a7eff02047e0000003e90000e2c070d0c7ef00c0c10ff0c'
@@ -244,9 +252,6 @@ def mutants(name, hlsl):
         return [('without the branch write', hlsl.replace(write.group(0), ''))]
     if name in ('cmpx', 'inside', 'kill'):
         return [('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', '')))]
-    if name == 'inside_y':
-        # The row that is off (y = 1) is only seen through the vertical derivative of the vote.
-        return [('vote without the vertical derivative', hlsl.replace('abs(ddy_fine(row))', '0.0'))]
     return []
 
 

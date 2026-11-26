@@ -3508,6 +3508,7 @@ class Stage:
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
             self.wqm_count, self.execcopy_epoch = 0, {}
+            self.helper_restore = False
             # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
             self.uniform_cf = True
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
@@ -4092,7 +4093,9 @@ class Stage:
         lane-exec break happened: an s_wqm of a narrowed EXEC (a no-op here, while the guest turns on the lanes of
         every touched quad) or a discard under an unknown EXEC. The callers also need uniform_cf, which a branch
         that parts a quad clears; an EXEC branch decided per quad (quad_vote) does not."""
-        return self.exec_known or (getattr(self, 'quad_exec', False) and not getattr(self, 'lane_exec_breaks', None))
+        # A restored pre-s_wqm mask (helper_restore) is the entry mask, but the guest's helper lanes are off from here.
+        return ((self.exec_known and not getattr(self, 'helper_restore', False))
+                or (getattr(self, 'quad_exec', False) and not getattr(self, 'lane_exec_breaks', None)))
 
     def uniform_source(self, tok):
         r = reg_range(tok)
@@ -5397,6 +5400,7 @@ class Stage:
                 if copy:
                     if hasattr(self, 'lane_exec_breaks') and self.helper_off_copy(srcs[0], syms[0]):
                         self.lane_exec_breaks.append((self.pc, '%s %s' % (base, ', '.join(ops))))
+                        self.helper_restore = True
                     # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
                     self.wqm_exec = False  # and the copy can be older than the WQM
                     if hasattr(self, 'uniform_v'):
