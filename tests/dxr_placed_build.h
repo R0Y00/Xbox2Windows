@@ -86,11 +86,19 @@ public:
         };
         const auto blas = place(0, dest_offset + bottom_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
         const auto tlas = place(1, dest_offset + top_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
-        const auto bs = place(2, scratch_offset + scratch_bytes(bottom_size), scratch_state) + scratch_offset;
-        const auto ts = place(3, scratch_offset + scratch_bytes(top_size), scratch_state) + scratch_offset;
+        // The controls also name a scratch buffer as a destination (a buffer that is not an acceleration structure) and
+        // read a 256-byte view at it, so a scratch buffer must cover the result size and that view as well. The sizes
+        // come from the device: a GPU with a larger result than scratch size must still see a placed buffer here, so the
+        // refusal under test is the state, not the range.
+        constexpr UINT64 view_bytes = 256;
+        const auto decoy_bytes = [&](const auto& sizes) {
+            return scratch_offset + (std::max)({scratch_bytes(sizes), sizes.ResultDataMaxSizeInBytes, view_bytes});
+        };
+        const auto bs = place(2, decoy_bytes(bottom_size), scratch_state) + scratch_offset;
+        const auto ts = place(3, decoy_bytes(top_size), scratch_state) + scratch_offset;
         titles_[0] = {blas, bs, bottom_size};
         titles_[1] = {tlas, ts, top_size};
-        big_as_ = place(8, 4096, dest_state);
+        big_as_ = place(8, (std::max)({UINT64(4096), scratch_bytes(bottom_size), scratch_bytes(top_size)}), dest_state);
         const auto short_scratch = place(4, scratch_offset + top_size.ScratchDataSizeInBytes - 1, scratch_state) + scratch_offset;
         constexpr UINT64 unmapped = 0x1000; // outside the user allocation range
         // Each refusal names its cause (not only E_INVALIDARG) and publishes nothing.
