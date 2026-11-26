@@ -164,6 +164,46 @@ class FormReferenceCliPositiveTests(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX permission modes only")
+class FormReferencePermissionModeTests(unittest.TestCase):
+    def test_child_umask_modes_preserved_by_cli_rewrite(self) -> None:
+        with_mode = {"gfx1013.tsv": 0o600, "rdna2.tsv": 0o664, "x64_zen2.tsv": 0o644}
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / "docs"
+            _populate_docs_dir(docs)
+
+            fresh_dir = root / "fresh"
+            replaced_dir = root / "replaced"
+            replaced_dir.mkdir()
+            for name, mode in with_mode.items():
+                stale = replaced_dir / name
+                stale.write_text("stale\n", encoding="utf-8")
+                stale.chmod(mode)
+            for out_dir in (fresh_dir, replaced_dir):
+                proc = subprocess.run(
+                    [sys.executable, "-B", str(TOOL), str(docs), "--out-dir", str(out_dir)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    umask=0o027,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            self.assertEqual(
+                {p.name: p.stat().st_mode & 0o777 for p in fresh_dir.iterdir()},
+                {name: 0o640 for name in form_reference.OUTPUT_TSV_NAMES},
+            )
+            self.assertEqual(
+                {p.name: p.stat().st_mode & 0o777 for p in replaced_dir.iterdir()},
+                with_mode,
+            )
+            for name in form_reference.OUTPUT_TSV_NAMES:
+                fresh = (fresh_dir / name).read_bytes()
+                self.assertTrue(fresh.startswith(b"# "))
+                self.assertEqual((replaced_dir / name).read_bytes(), fresh)
+
+
 class FormReferenceCliNegativeTests(unittest.TestCase):
     def _assert_exit_1_clean(self, argv: list[str], *, fragment: str, check_subproc: bool = True) -> None:
         code, out, err = _run_main(argv)

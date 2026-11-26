@@ -208,9 +208,12 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-18`. Revision 18 preserves the sign of zero in
-floating-point min, max, min3, max3 and med3. The matching compute (`x2w-startup-shader-18cs`) and fixed
-slot 57 mesh (`x2w-startup-mesh-57-3`) keys advance because those stages use the shared lowering.
+The shader cache revision is `x2w-startup-shader-20`. Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch, so cached shaders from revision 19 are not reused. Revision 19 folds `s_mov_b32` from a scalar register that
+holds a plain constant, so later reads of the copy use the constant word. The matching compute
+(`x2w-startup-shader-20cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
+(`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
+Revisions before 19 read a register copied from a constant as a run-time value.
+Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
 Revisions before 17 lower `v_med3_f32` through a branchless median, which returns the smaller of the
 other two operands when a source is NaN.
 Revisions before 16 lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
@@ -1591,8 +1594,9 @@ explicit overwrite and normal completion, with the legacy setting on and off.
 resource whose final guest Release happened and whose desktop object is still
 alive, once, by the first cause that applies. Format: `reason=count/bytes(oldest Nf)`,
 bytes from the budget ticket, `oldest` in frames since the final Release:
-- `view-refs`: a tracked slot 18 descriptor still names it;
-  `view-refs-in-visible-heap` is the part with a descriptor in a shader-visible heap.
+- `view-refs`: a tracked descriptor slot still names it (a slot 18 SRV, and since
+  Slice 3a a slot 19 UAV, 20 RTV or 21 DSV); `view-refs-in-visible-heap` is the
+  slot-18 part with a descriptor in a shader-visible heap.
 - `list-hold`, `flight`: a closed or recording list, or a submission, holds a
   desktop reference.
 - `queued-waiting-fence`: queued, the release-time fence of a queue has not passed;
@@ -1610,24 +1614,46 @@ recorded and no line is built.
 
 Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
 targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
-described above. A resource leaves the class for good when a UAV/RTV/DSV view is
-created for it (slots 19 to 21, also a refused one), when a slot 18 SRV targets
-an untracked descriptor slot or is copied out of tracked heaps, when it is passed
-to MakeResident or Evict (slots 34 and 35), or when it is presented. A slot 18
-SRV keeps the resource only when the desktop created the view: desktop view
-creation returns `void`, so a removed device is the only failure it reports, and
-a slot whose creation failed is recorded without a reference. Tracked
-slot 18 SRVs (including slot 70 `device_memory_srv`) keep the resource retained
+described above. A descriptor slot the shim shadows (`HeapInfo::shadow`) holds one
+reference for each materialized view it names: a slot 18 SRV, and since Slice 3a
+also a slot 19 UAV (one for the view resource and one for its counter resource),
+a slot 20 RTV and a slot 21 DSV. `note_view` adds the references when a view is
+written into a tracked slot (writing the same view again adds nothing), and the
+same functions release exactly the references they added: `note_view` on an
+overwrite, `note_copy` when a copy moves another view over the slot or into
+another tracked slot, and the heap's `Release` through `retire_drop_heap_views`
+when the slot's heap is destroyed. A view the desktop did not create (a removed
+device) is recorded unmaterialized: it releases the slot's previous references
+and adds none. A resource leaves the class for good when a view call targets a
+descriptor slot no heap shadow tracks, or a copy moves a tracked view into an
+untracked heap (`retire_leave_class`, slots 18-21, a slot 19 counter too), when
+it is passed to MakeResident or Evict (slots 34 and 35), or when it is presented.
+Tracked views (including slot 70 `device_memory_srv`) keep the resource retained
 while any descriptor slot in `HeapInfo::shadow` names it (updated across
 `note_view`, `CopyDescriptors*`, and heap `Release`), and translated draws hold
 bound textures via `retire_hold`. Only wrappers can be in the class; a raw
 desktop pointer never is. Sampler feedback is not checked: no device slot of the
 stand-in reaches it.
 
+The 19-21 references free nothing on their own yet: the class still excludes a
+texture created with the render-target, depth-stencil or unordered-access flag
+(`retire_classify`), and desktop creates a UAV/RTV/DSV only on a resource that
+carries the matching flag. A class texture's 19-21 view call is therefore the
+console-only case the shim refuses (a UAV of a depth texture, an RTV of a texture
+without render-target); it records no view, adds no reference, and the texture
+still retires once it is released and its fences have passed. The accounting is
+the prerequisite for a later slice that admits those textures. The slots 19-21
+fallback is unchanged: in a heap the shim does not shadow the call keeps
+`retire_leave_class`, so nothing is freed under a descriptor the shim cannot
+follow. `X2W_D3D12_RELEASE_RETIRED_VIEWS` no longer clears live descriptors; it is a legacy
+diagnostic that logs that clearing is disabled and enables the retirement
+breakdown. A tracked descriptor reference in any of slots 18-21 keeps its resource
+until the slot is overwritten, copied over, or its heap is destroyed (#2679).
+
 The final guest release signals a private desktop fence on every queue the
 stand-in created. The desktop object is released when all of those fences have
-passed, all tracked slot 18 SRV descriptor refs have dropped to zero, and no
-recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
+passed, all tracked descriptor references (slots 18-21) have dropped to zero, and
+no recorded list or submission still holds it. A copy (list slot 17), texture copy (16),
 resolve destination (19), or translated draw SRV bind that the stand-in forwards
 makes the list hold a desktop reference to each resource of the class it names,
 source and destination, until the list is Reset, fails to Close or is destroyed. A list
@@ -1669,8 +1695,18 @@ and a translated draw that samples such a texture through a descriptor table (th
 token's resolution and the draw's `retire_hold`: the readback holds the sampled texels and
 a clear sentinel corner, and the texture leaves the budget only after the closed draw
 recording is dropped); the `_off_` case checks that an ordinary committed texture (no
-title memory) still records its upload. The fixture-only exports `x2w_d3d12_retire_probe`,
-`x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
+title memory) still records its upload. Since Slice 3a the title fixture also drives the
+19-21 descriptor references: case 8 creates an RTV, a DSV and a UAV (and a buffer UAV with
+a counter resource) in tracked heap slots and checks through the retire probe that each
+materialized view adds one reference per slot - slot 19 one for its resource and one for
+its counter - that the same view written again adds nothing, and that overwrite, a
+`CopyDescriptorsSimple` copy and heap destruction each release exactly what was added
+(including a view in an untracked desktop heap, which adds none); case 9 checks the
+`view_slot` fallback in both switch modes: a refused RTV on a class texture in a tracked
+slot stays in the class and retires, while the same call into a descriptor slot the shim
+does not shadow keeps `retire_leave_class` and the texture stays retained. The fixture-only
+exports `x2w_d3d12_retire_probe` (which reports the resource's tracked slot references as
+`view_refs`), `x2w_d3d12_resource_index_probe`, `x2w_d3d12_texture_upload_probe` and
 `x2w_d3d12_written_probe` read the bookkeeping the shim keeps; the retire probe returns
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
@@ -2062,9 +2098,18 @@ These are measured on one executable; treat them as hypotheses for others.
   and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
   already lowers the same forms. The VOP2 select `v_cndmask_b32_sdwa` lowers the same way, with VCC as
-  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Float SDWA forms and a
+  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Most float SDWA forms and a
   `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
+  The one float exception is the binary16 arithmetic set `v_add_f16`, `v_sub_f16`, `v_subrev_f16` and
+  `v_mul_f16` (`_sdwa`). `src0_sel`/`src1_sel` accept `WORD_0`, `WORD_1` or `DWORD` (`DWORD` reads the
+  low half, as the 16-bit operation does); sources are single VGPRs, with `abs` and `neg`. The result
+  is rounded once to binary16 and written to `dst_sel:WORD_0` or `WORD_1`, with `UNUSED_PAD` zeroing the
+  other half (the default) and `UNUSED_PRESERVE` keeping the old one. Refused: `dst_sel:DWORD` and byte
+  selects, `sext()`, `clamp`, output modifiers, `UNUSED_SEXT`, and non-VGPR sources. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_f16_alu"`: the check covers the accepted and
+  refused forms, and the draws on WARP and hardware read back every selector and unused mode against a
+  CPU binary16 reference.
   The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
   too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
   the compare reads the extended value as its type. f32 SDWA compares stay refused (#1920). The
@@ -2078,7 +2123,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
   first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
   same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
-  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, as are `row_*`, `wave_*`, partial masks and `fi`. Run
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages and a changed EXEC are refused (branches and loops: see below), as are `row_*`, `wave_*`, partial masks and `fi`. Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
   draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
   with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
@@ -2094,6 +2139,24 @@ These are measured on one executable; treat them as hypotheses for others.
   check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
   fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.
   [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
+- **DPP quad reads in branches and loops.** The quad swaps, broadcasts and pair broadcasts above also lower in a pixel
+  program with branches or loops when a whole-program check proves that the four threads of the quad reach the read
+  together: the `s_wqm exec, exec` runs before every branch and target, no other EXEC write can reach the read (an
+  exact-mask restore after the last read is fine), and every conditional branch that can reach it is wave-uniform
+  (SCC proven uniform; `s_cbranch_execz`/`execnz` under the whole-quad mask). A `vccz`/`vccnz` loop, SCC taken from a
+  lane mask, an EXEC write inside the loop and a late `s_wqm` are refused with the offset that breaks the proof. No
+  wave size is assumed. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_flow"`: the draws on
+  WARP and hardware run swap, broadcast and pair reads inside a five-pass scalar loop with an `if`, compare 16 x 16
+  pixels with a CPU reference, and require wrong-lane translations to fail.
+- **wave32 `vcc_hi`.** In wave32 only `vcc_lo` is the condition mask and compilers allocate `vcc_hi` like any other
+  scalar register. The decoder prints wave32 syntax, so the translator renames `vcc_hi` to an SGPR the program never
+  names only when that is exact in both wave sizes: no instruction names the 64-bit pair `vcc`, and either a VALU
+  compare or carry-out writes `vcc_hi` (or an odd SGPR), a VOP3 mask source reads one (a misaligned pair in wave64),
+  or no VALU instruction and no `vccz`/`vccnz` branch uses `vcc_lo` as a lane mask (in wave64 those see `vcc_hi` for lanes 32..63). Otherwise `vcc_hi` stays refused; scalar writes into `vcc_hi` or
+  `exec_hi` are now refusals instead of a Python TypeError. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
+  pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
+  compare bit, the carry or read `vcc_hi` as zero as failing controls.
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -2729,20 +2792,24 @@ hardware or driver glitch count.
 
 ## APU heap stand-in
 
-With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` commits. The
-heap is a first-fit free list in a static table of 4096 extents, guarded by one lock. `ApuFree` gives a
-block back and merges it with free neighbours, so streaming code that allocates and frees repeatedly no
-longer exhausts the heap. While nothing has been freed the offsets are the ones a bump allocator hands out.
+With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` reserves
+(`MEM_RESERVE`, 0 bytes committed up front). The heap is a first-fit free list in a static table of 4096
+extents, guarded by one lock. `ApuAlloc` commits the 4 KiB page span covering the allocated block on demand
+(`MEM_COMMIT`), rolling back the free-list change and returning `E_OUTOFMEMORY` if commit fails. `ApuFree`
+gives a block back, merges it with free neighbours, and decommits strictly interior 4 KiB pages
+(`[ceil_page(free_begin), floor_page(free_end))` via `MEM_DECOMMIT`) so partial boundary pages shared with
+live neighbours stay committed and streaming code that allocates and frees repeatedly no longer exhausts the
+heap or commit charge. While nothing has been freed the offsets are the ones a bump allocator hands out.
 
 - A block is aligned in address (a power of two, 16 at least; 0, anything below 16 and a value that is not a power of two
   all mean 16). Size and alignment are 32 bits. `ApuCreateHeap` creates and publishes the heap under one lock, so
   competing first calls cannot reset a heap that already has live blocks. A heap whose 64 KiB-rounded size
-  exceeds 4 GiB is refused with `E_INVALIDARG` without committing memory, so every block fits the APU range.
+  exceeds 4 GiB is refused with `E_INVALIDARG` without reserving or committing memory, so every block fits the APU range.
 - Null or non-writable output (`virtual_address` or optional `apu_address`) is `E_POINTER` without
-  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, or a full extent table is
-  `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
+  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, a full extent table, or a failed
+  page commit is `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
   and writes null to the virtual-address output when writable.
-- A block that is reused is zeroed, as fresh heap memory is.
+- A block that is reused is zeroed, as fresh heap memory is (including still-committed shared boundary pages).
 - `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
   already freed) is `E_INVALIDARG` and changes nothing.
 - `ApuIsVirtualAddressValid` and the two map calls read the published heap bounds under the heap lock and
@@ -2753,7 +2820,9 @@ The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4)
 rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
 check loads the stub, checks non-permissive traps, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment,
 coalescing, every refused call, shape-context allocation and partial-failure rollback, `AcpHalCreate`, and the
-address validity/mapping exports, then runs 4 threads of 1000 rounds against an interval map of live blocks:
+address validity/mapping exports, runs 4 threads of 1000 rounds against an interval map of live blocks, and
+verifies on-demand commit, interior-page decommit, shared-boundary-page preservation, and commit-failure
+rollback against `GetProcessMemoryInfo().PagefileUsage` and `VirtualQuery` in a 64 MiB heap:
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V

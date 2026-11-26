@@ -414,6 +414,15 @@ WORDS_F = bytes.fromhex(
     '7fc08cbf00008abfff08103a80000000ff101036fc0000001000d8d8080000067fc08cbf8002107e'
     'a400d8d8080000077fc08cbf0786158f1500124a83121234001074e009060480000081bf')
 
+# Case F-two-fills keeps the first bank and writes each lane's byte address to a second bank.
+# Broadcast lane 37 from the second bank while the peer read still addresses the first.
+SOURCE_F2 = SOURCE_F.replace('ds_write_b32 v4, v5 offset:16',
+                             'ds_write_b32 v4, v5 offset:16\nds_write_b32 v4, v4 offset:320').replace(
+                                 'v8 offset:164', 'v8 offset:468')
+WORDS_F2 = WORDS_F.replace(bytes.fromhex('100034d804050000'),
+                           bytes.fromhex('100034d804050000400134d804040000')).replace(
+                               bytes.fromhex('a400d8d808000007'), bytes.fromhex('d401d8d808000007'))
+
 SOURCE_G = """\
 s_mov_b32 s10, s6
 s_mov_b32 s11, 0
@@ -521,6 +530,7 @@ CASES = {
     'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'E': (*saveexec_fixture(), USER7 | TGID_X | tidig(1), (1, 1, 1), (4, 1, 1)),
     'F': (SOURCE_F, WORDS_F, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
+    'F-two-fills': (SOURCE_F2, WORDS_F2, USER7 | TGID_X | (2 << 15), (64, 1, 1), (2, 1, 1)),
     'J': (SOURCE_J, WORDS_J, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'H': (SOURCE_H, WORDS_H, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'M': (SOURCE_M, WORDS_M, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
@@ -747,11 +757,12 @@ def expected(name):
                 index = 2 * (64 * group + lane)
                 out[index:index + 2] = [stored[base + first], stored[base + second]]
         return out
-    if name == 'F':
+    if name in ('F', 'F-two-fills'):
         for group in range(2):
             for lane in range(64):
                 index = (64 * group + lane) * 2
-                out[index:index + 2] = [256 * group + (lane ^ 32), 256 * group + 37]
+                broadcast = 4 * 37 if name == 'F-two-fills' else 256 * group + 37
+                out[index:index + 2] = [256 * group + (lane ^ 32), broadcast]
         return out
     if name == 'E':
         # Group IDs 0..3 encode (old EXEC, S0) = (0,0), (0,1), (1,0), (1,1).
@@ -926,7 +937,7 @@ def check_lds():
         ('82000834', '00cb087e82000834', 'unchanged entry local X'),  # v_swap also writes its second operand
         ('82000834', '82020834', 'one bounded dword'),              # use Y instead of X
         (store, '040134d804050000', 'one bounded dword'),             # last lane exceeds the 512-byte allocation
-        (store, store + store, 'one bounded dword'),                  # overlapping fill
+        (store, store + store, 'disjoint'),                           # overlapping fill
         (wait + barrier, nop + barrier, 'completed fill'),
         (barrier, '01008abf', 'one barrier'),                         # nonzero reserved immediate
         (barrier, nop, 'after the fill barrier'),
@@ -952,6 +963,26 @@ def check_lds():
     at_end = patch(at_end, broadcast, '9401d8d808000007')
     assert 'lds[(v4 + 256u) >> 2] = v5;' in translate('F', code=at_end).hlsl_cs()
     assert 'groupshared uint lds[8192];' in translate('F', rsrc2=base | 64 << 15).hlsl_cs()
+
+    second = '400134d804040000'
+    second_read = 'd401d8d808000007'
+    hlsl = translate('F-two-fills').hlsl_cs()
+    assert hlsl.index('lds[(v4 + 320u) >> 2] = v4;') < hlsl.index(sync) < hlsl.index('v7 = lds[')
+    reversed_fills = patch(WORDS_F2, store + second, second + store)
+    assert 'v7 = lds[(v8 + 468u) >> 2];' in translate('F-two-fills', code=reversed_fills).hlsl_cs()
+    for old, new, reason in (
+        (second, '', 'initialized span'),                             # omit the second fill
+        (second, '0c0134d804040000', 'disjoint'),                     # final word of the first bank
+        (second_read, '1001d8d808000007', 'initialized span'),         # first word in the gap
+        (second, '040334d804040000', 'bounded'),                      # last lane exceeds allocation
+        (second, '400134d805040000', 'address'),                      # unproven address VGPR
+        (second, '400136d804040000', 'optional byte offset'),          # GDS
+        (second, '400135d804040000', 'reserved bit'),                 # hidden encoding bit
+        (second, '400134d804040100', 'unused operand field'),         # unused DATA1
+        (second, second + '800234d804040000', 'two'),                 # third fill
+        (second, nop + second, 'bounded'),                            # address proof no longer adjacent
+    ):
+        refused(reason, lambda: translate('F-two-fills', code=patch(WORDS_F2, old, new)))
 
     pair = '0524dcd806000006'
     # The first result overwrites v6. Both loads must use the address saved before that write.
@@ -1688,6 +1719,7 @@ CONTROLS = {
     'd-hi': ('D', 'v9 = v8;', f'v9 = v8 + {MBCNT_COUNT};'),
     'd-exec': ('D', 'if (exec & 1) v10 =', 'v10 ='),
     'f-peer': ('F', '0x00000080u ^ v4', 'v4'),
+    'f-second-fill': ('F-two-fills', 'lds[(v4 + 320u) >> 2] = v4;', 'lds[(v4 + 320u) >> 2] = 0u;'),
     'f-broadcast': ('F', 'lds[(v8 + 164u) >> 2]', 'lds[(v8 + 160u) >> 2]'),
     'j-scalar-dropped': ('J', '        s22 = s7 * ud1;\n', ''),
     'h-inner-unpredicated': ('H', 'if (exec & 1) u0.Store(a, v5);', 'u0.Store(a, v5);'),
@@ -1706,6 +1738,7 @@ CONTROLS = {
 
 # First bad word for controls with a pinned mismatch.
 CONTROL_MISMATCH = {
+    'f-second-fill': 'word=1 expected=00000094 actual=00000000',
     'd-mask': 'word=8 expected=00000008 actual=00000009',
     'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
     'd-x-only': 'word=16 expected=00000009 actual=00000007',
