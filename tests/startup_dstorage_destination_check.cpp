@@ -12,6 +12,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -33,9 +34,16 @@ using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
 constexpr unsigned page = 4096;
 constexpr unsigned pages = 3;
 constexpr unsigned bytes = pages * page;
-constexpr unsigned cases = 12;
+constexpr unsigned cases = 15;
 unsigned char source[bytes];
 int failures;
+volatile LONG guard_notifications;  // first-chance guard-page exceptions any thread raised
+
+LONG CALLBACK count_guard(EXCEPTION_POINTERS* info)
+{
+    if (info->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) InterlockedIncrement(&guard_notifications);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 Object* status;
 Object* queue;
@@ -84,6 +92,14 @@ unsigned char* fresh_region()
     return region;
 }
 
+// A guard page must still be armed after the check; other protections are not checked here.
+bool guard_kept(const unsigned char* at, DWORD protect)
+{
+    if (!(protect & PAGE_GUARD)) return true;
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(at, &info, sizeof(info)) && (info.Protect & PAGE_GUARD);
+}
+
 // Refusal: the middle page, or the last, is made unusable in the way `how` names.
 void refused(const char* name, DWORD protect, bool decommit_last)
 {
@@ -94,12 +110,15 @@ void refused(const char* name, DWORD protect, bool decommit_last)
     if (decommit_last) ok = VirtualFree(region + 2 * page, page, MEM_DECOMMIT) != 0;
     else ok = VirtualProtect(region + page, page, protect, &old) != 0;
     if (!ok) { fail(name, "could not change the page"); VirtualFree(region, 0, MEM_RELEASE); return; }
+    const LONG guards_before = guard_notifications;
     const long hr = run_request(region, bytes, decommit_last ? page : bytes);
     if (hr == -1) fail(name, "no completion");
+    else if (guard_notifications != guards_before) fail(name, "the check raised a guard-page exception");
     else if (hr == 0) fail(name, "request succeeded");
     // The page the case changed is not read (a guard or no-access page would trip the check itself).
     else if (!untouched(region, 0, page)) fail(name, "first page was written");
     else if (!decommit_last && !untouched(region, 2 * page, bytes)) fail(name, "last page was written");
+    else if (!guard_kept(region + page, protect)) fail(name, "guard page lost its guard bit");
     else std::printf("ok: %s refused, bytes before the bad page intact\n", name);
     VirtualFree(region, 0, MEM_RELEASE);
 }
@@ -126,6 +145,8 @@ int main(int argc, char** argv)
     status = static_cast<Object*>(status_pointer);
     queue = static_cast<Object*>(queue_pointer);
     for (unsigned i = 0; i < bytes; ++i) source[i] = static_cast<unsigned char>(i % 251);
+    // Observes every first-chance exception before any handler of the stand-in: the check must raise none.
+    if (!AddVectoredExceptionHandler(1, count_guard)) return 1;
 
     refused("read-only middle page", PAGE_READONLY, false);
     refused("guard middle page", PAGE_READWRITE | PAGE_GUARD, false);
@@ -141,6 +162,25 @@ int main(int argc, char** argv)
     else if (std::memcmp(region, source, bytes) != 0) fail("writable control", "bytes differ");
     else std::printf("ok: writable control after the refusals wrote every byte\n");
     VirtualFree(region, 0, MEM_RELEASE);
+
+    // Committed but never touched: not in the working set, so judged by the VirtualQuery walk, and writable.
+    auto* untouched_region = static_cast<unsigned char*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!untouched_region) return 1;
+    const long cold_hr = run_request(untouched_region, bytes, bytes);
+    if (cold_hr != 0) fail("non-resident destination", "request failed");
+    else if (std::memcmp(untouched_region, source, bytes) != 0) fail("non-resident destination", "bytes differ");
+    else std::printf("ok: non-resident writable destination wrote every byte\n");
+    VirtualFree(untouched_region, 0, MEM_RELEASE);
+
+    // The check covers every page of the declared capacity; past the data it must leave each byte as it was.
+    unsigned char* roomy = fresh_region();
+    if (!roomy) return 1;
+    const long roomy_hr = run_request(roomy, bytes, page);
+    if (roomy_hr != 0) fail("capacity past the data", "request failed");
+    else if (std::memcmp(roomy, source, page) != 0) fail("capacity past the data", "data bytes differ");
+    else if (!untouched(roomy, page, bytes)) fail("capacity past the data", "a byte past the data changed");
+    else std::printf("ok: capacity past the data wrote the data, later bytes unchanged\n");
+    VirtualFree(roomy, 0, MEM_RELEASE);
 
     // Copy-on-write destination (PAGE_WRITECOPY) is also allowed and must succeed.
     HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, bytes, nullptr);
@@ -160,6 +200,42 @@ int main(int argc, char** argv)
         UnmapViewOfFile(cow);
     }
     if (mapping) CloseHandle(mapping);
+
+    // A copy-on-write page followed by a no-access page: the request is refused, and the first page stays
+    // shared (the check took no private copy of it) with its bytes unchanged.
+    HANDLE shared_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 2 * page, nullptr);
+    auto* filler = shared_mapping ? static_cast<unsigned char*>(MapViewOfFile(shared_mapping, FILE_MAP_WRITE, 0, 0, 2 * page)) : nullptr;
+    auto* cow_pair = shared_mapping ? static_cast<unsigned char*>(MapViewOfFile(shared_mapping, FILE_MAP_COPY, 0, 0, 2 * page)) : nullptr;
+    DWORD old_protect = 0;
+    if (!filler || !cow_pair) {
+        fail("copy-on-write before no-access", "MapViewOfFile");
+    } else {
+        std::memset(filler, 0xAA, 2 * page);
+        volatile unsigned char sink = cow_pair[0];  // a read maps the first page in, still shared
+        (void)sink;
+        PSAPI_WORKING_SET_EX_INFORMATION first{};
+        first.VirtualAddress = cow_pair;
+        if (!VirtualProtect(cow_pair + page, page, PAGE_NOACCESS, &old_protect)) {
+            fail("copy-on-write before no-access", "VirtualProtect");
+        } else if (!QueryWorkingSetEx(GetCurrentProcess(), &first, sizeof(first)) || !first.VirtualAttributes.Valid ||
+                   !first.VirtualAttributes.Shared) {
+            fail("copy-on-write before no-access", "first page not resident and shared before the request");
+        } else {
+            const long pair_hr = run_request(cow_pair, 2 * page, 2 * page);
+            first.VirtualAttributes.Flags = 0;
+            const bool queried = QueryWorkingSetEx(GetCurrentProcess(), &first, sizeof(first)) != 0;
+            const bool still_shared = queried && (first.VirtualAttributes.Valid ? first.VirtualAttributes.Shared
+                                                                                : first.VirtualAttributes.Invalid.Shared);
+            if (pair_hr == -1) fail("copy-on-write before no-access", "no completion");
+            else if (pair_hr == 0) fail("copy-on-write before no-access", "request succeeded");
+            else if (!untouched(cow_pair, 0, page)) fail("copy-on-write before no-access", "first page was written");
+            else if (!still_shared) fail("copy-on-write before no-access", "first page became private");
+            else std::printf("ok: copy-on-write before no-access refused, first page still shared\n");
+        }
+    }
+    if (cow_pair) UnmapViewOfFile(cow_pair);
+    if (filler) UnmapViewOfFile(filler);
+    if (shared_mapping) CloseHandle(shared_mapping);
 
     // Distinct failure codes: a destination too small for the data, and a read past the end of a file.
     const long insufficient = static_cast<long>(HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
