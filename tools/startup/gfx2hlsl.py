@@ -3546,6 +3546,13 @@ class Stage:
             if r[2] > r[1]:
                 self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
 
+    def lane_mask_exact(self):
+        """True where the one-lane model of a wave mask is exact: a compute group of one thread has one participating lane
+        per wave, so the lane's bit is the whole mask and its high word is 0. Anywhere else the mask holds other lanes'
+        bits that a numeric read would see."""
+        group = getattr(getattr(self, 'pipe', None), 'group', None)
+        return getattr(self, 'kind', None) == 'cs' and bool(group) and group[0] * group[1] * group[2] == 1
+
     def reads_mask_high(self, toks):
         """First single-register operand that is the high word of a wave64 lane mask, else None."""
         high = getattr(self, 'mask_high', ())
@@ -3572,7 +3579,7 @@ class Stage:
             masks = [high] if high else []
         tags = self.mask_source_tags(base, ops)
         result = self._lower(base, asm, ops, mods)
-        if masks:
+        if masks and not self.lane_mask_exact():
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
         self.propagate_mask_tags(base, ops, tags)
         return result

@@ -844,6 +844,21 @@ def check_lane_mask_derived_word():
     refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex('6a0c0a7e'))))  # v_cvt_f32_u32 v5, vcc_lo
 
 
+def check_lane_mask_single_thread_group():
+    """A one-thread group has one participating lane per wave: its lane bit is the whole mask (high word 0), so the one-lane
+    model is exact and a numeric read stays lowered (dispatch case E). With two threads the same program is refused."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    cvt = bytes.fromhex('6a0c0a7e')       # v_cvt_f32_u32 v5, vcc_lo: the mask as a number
+    code = splice_words(compare, cvt)
+    assert 'v5 = ' in translate('A', code=code, group=(1, 1, 1)).hlsl_cs()
+    for group in ((2, 1, 1), (1, 2, 1), (1, 1, 2), (4, 1, 1)):
+        refused('as numeric data', lambda: translate('A', code=code, group=group))
+    xor_chunks = [bytes.fromhex(w) for w in ('000084d491000200', '8004027d', '6a008089')]
+    high = splice_words(*xor_chunks, bytes.fromhex('01020a7e'))   # v_mov_b32 v5, s1: the high word
+    assert 'v5 = ' in translate('A', code=high, group=(1, 1, 1)).hlsl_cs()
+    refused('as numeric data', lambda: translate('A', code=high, group=(2, 1, 1)))
+
+
 def check_lane_mask_high_word():
     """The high word of a wave64 mask (the ballot's upper 32 bits) is modelled as 0: a move of it is refused."""
     chunks = [bytes.fromhex(w) for w in ('0000 84d4 9100 0200'.replace(' ', ''),   # v_cmp_gt_i32 s[0:1], 17, v0
@@ -1171,6 +1186,7 @@ def check_controls():
     check_mbcnt()
     check_lane_mask_data()
     check_lane_mask_high_word()
+    check_lane_mask_single_thread_group()
     check_lane_mask_derived_word()
     check_lane_mask_scalar_data()
     check_lane_mask_tag_propagation()
