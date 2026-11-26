@@ -1404,6 +1404,12 @@ MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
 # Vector ALU forms that take a lane mask as a per-lane select or carry, which the one-lane model handles.
 MASK_AWARE_VALU = frozenset({'v_cndmask_b32', 'v_cndmask_b16', 'v_readlane_b32', 'v_writelane_b32', 'v_readfirstlane_b32'})
 MASK_AWARE_VALU_RE = re.compile(r'^v_cmpx?_|_co(_ci)?_|addc|subb|_co$|^v_mad_[iu]64_[iu]32$|^v_(cndmask|readlane|writelane|readfirstlane)_')
+# Scalar ALU forms that move or combine lane masks bit by bit, which the one-lane model handles (s_ff1_i32_b32 refuses
+# anything but exec_lo at the entry mask itself). Any other scalar op that
+# reads a lane mask (s_cmp*, s_cmpk*, s_bcnt*, s_lshr, s_add ...) reads the whole wave's word as a number.
+MASK_AWARE_SALU_RE = re.compile(r'^s_(mov|and|or|xor|andn2|orn2|nand|nor|xnor|not|cselect|wqm|cbranch|and_saveexec|or_saveexec|'
+                                r'xor_saveexec|andn2_saveexec|orn2_saveexec|nand_saveexec|nor_saveexec|xnor_saveexec|'
+                                r'ff1|bitset[01]|setpc|getpc|swappc|branch|waitcnt|endpgm|nop)(_|$)')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
@@ -3191,6 +3197,8 @@ class Stage:
         if base.startswith('v_mov_b32'):   # the high word of a wave64 mask has no one-lane value
             masks = [t for t in ops[1:] if reg_range(t) and reg_range(t)[0] == 's'
                      and reg_range(t)[1] in getattr(self, 'mask_high', ())]
+        if base.startswith('s_') and not MASK_AWARE_SALU_RE.match(base):
+            masks = [t for t in (ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:]) if self.is_lane_mask(t.strip())]
         result = self._lower(base, asm, ops, mods)
         if masks:
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))

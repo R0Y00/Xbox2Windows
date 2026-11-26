@@ -819,6 +819,22 @@ def check_lane_mask_data():
         refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
 
 
+LANE_MASK_SCALAR_DATA = (
+    ('s_cmpk_gt_u32 vcc_lo, 0x64', '6400eab5'),   # c7_ballot_cmp: the ballot word compared as a number
+    ('s_cmp_lg_u32 vcc_lo, 0', '6a8007bf'),
+    ('s_lshr_b32 s6, vcc_lo, 1', '6a810690'),
+    ('s_add_u32 s6, vcc_lo, 1', '6a810680'),
+)
+
+
+def check_lane_mask_scalar_data():
+    """A scalar op that reads a wave mask as a number sees every lane's bit on hardware; mask-only scalar ops stay."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    for _, word in LANE_MASK_SCALAR_DATA:
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
+    translate('A', code=splice_words(compare, bytes.fromhex('6a7e0687'))).hlsl_cs()   # s_and_b32 s6, vcc_lo, exec_lo
+
+
 def check_lane_mask_high_word():
     """The high word of a wave64 mask (the ballot's upper 32 bits) is modelled as 0: a move of it is refused."""
     chunks = [bytes.fromhex(w) for w in ('0000 84d4 9100 0200'.replace(' ', ''),   # v_cmp_gt_i32 s[0:1], 17, v0
@@ -1094,6 +1110,7 @@ def check_controls():
     check_mbcnt()
     check_lane_mask_data()
     check_lane_mask_high_word()
+    check_lane_mask_scalar_data()
     check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.

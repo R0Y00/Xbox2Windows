@@ -189,6 +189,12 @@ EARLIER = {
     'mask in the entry block': 'v_mov_b32 data operand s2 is a lane mask',
     'median of three of a lane mask': 'v_med3_f32 reads lane mask s2 as numeric data',
     'unsigned to float conversion of a mask': 'v_cvt_f32_u32 reads lane mask s2 as numeric data',
+    # A scalar op that reads a lane mask as a number is refused where it is lowered (before the read).
+    'aliased load first word': 's_buffer_load_dwordx2 reads lane mask s2 as numeric data',
+    'aliased load second word': 's_buffer_load_dwordx2 reads lane mask s2 as numeric data',
+    'varying scalar buffer offset': 's_buffer_load_dword reads lane mask s2 as numeric data',
+    'mask through scalar arithmetic': 's_add_u32 reads lane mask s2 as numeric data',
+    'mask through scalar condition': 's_cmp_eq_u32 reads lane mask vcc_lo as numeric data',
 }
 for label, instructions in REFUSED:
     got = run(*instructions)
