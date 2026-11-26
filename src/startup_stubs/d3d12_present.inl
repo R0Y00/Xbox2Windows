@@ -97,7 +97,7 @@ HWND output_window()
     return output_handle;
 }
 
-bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
+bool create_window_presenter(ID3D12CommandQueue* queue, HWND window, UINT plane_capacity)
 {
     WindowPresenter& p = window_presenter;
     ID3D12Device* device = device_of(the_device);
@@ -136,7 +136,7 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
     if (SUCCEEDED(hr)) hr = p.list->Close();
     if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p.fence));
     p.reached = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (SUCCEEDED(hr)) hr = p.compositor.create(device, DXGI_FORMAT_R8G8B8A8_UNORM, window_planes);
+    if (SUCCEEDED(hr)) hr = p.compositor.create(device, DXGI_FORMAT_R8G8B8A8_UNORM, plane_capacity);
     log("x2w-present window swap chain %ux%u -> 0x%08lx", p.width, p.height, static_cast<unsigned long>(hr));
     check_device("window presenter", 0);
     return SUCCEEDED(hr);
@@ -159,14 +159,14 @@ bool presentable_surface(ID3D12Resource* surface)
 // plane_surfaces[step.plane] is that plane's surface (resting in COMMON and presentable), or null to
 // leave it out. Returns false if not shown.
 bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* steps, unsigned count,
-                       ID3D12Resource* const* plane_surfaces)
+                       ID3D12Resource* const* plane_surfaces, UINT plane_capacity)
 {
     X2W_ZONE("window present (blit + fence wait)");
     WindowPresenter& p = window_presenter;
     if (p.failed || !queue || !steps || !count || !plane_surfaces) return false;
     HWND window = output_window();
     if (!window) return false;
-    if (!p.chain && !create_window_presenter(queue, window)) {
+    if (!p.chain && !create_window_presenter(queue, window, plane_capacity)) {
         p.failed = true;
         return false;
     }

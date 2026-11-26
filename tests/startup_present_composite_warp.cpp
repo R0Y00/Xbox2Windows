@@ -321,7 +321,7 @@ int main(int argc, char** argv)
         return 1;
     }
     x2w_startup::PlaneCompositor compositor;
-    const HRESULT created = compositor.create(gpu.device, DXGI_FORMAT_R8G8B8A8_UNORM, 4);
+    const HRESULT created = compositor.create(gpu.device, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
     if (FAILED(created)) {
         std::printf("FAIL: compositor setup 0x%08lx\n", static_cast<unsigned long>(created));
         return 1;
@@ -384,6 +384,12 @@ int main(int argc, char** argv)
             std::printf("FAIL: baseline: %u steps, want 1\n", steps);
         }
         expect("baseline", pixels, want, exact);
+    }
+
+    const HRESULT composite_created = compositor.create(gpu.device, DXGI_FORMAT_R8G8B8A8_UNORM, 4);
+    if (FAILED(composite_created)) {
+        std::printf("FAIL: multi-plane compositor setup 0x%08lx\n", static_cast<unsigned long>(composite_created));
+        return 1;
     }
 
     // Stacked: black, overlay, top.

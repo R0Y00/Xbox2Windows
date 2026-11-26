@@ -6107,7 +6107,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             const PresentedPlanes presented = presented_planes(planes, plane_parameters);
             if (presented.count)
                 shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), presented.steps, presented.count,
-                                                    presented.drawable);
+                                                    presented.drawable, present_composite_enabled() ? window_planes : 1);
             if (present_composite_enabled() && presented.top && presented.top_plane > 0) {
                 raw_surface = presented.top;
                 raw_plane = presented.top_plane;

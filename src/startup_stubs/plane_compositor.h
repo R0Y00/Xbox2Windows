@@ -32,8 +32,7 @@ namespace x2w_startup {
 
 class PlaneCompositor {
 public:
-    // Shaders, root signature and the opaque and blend pipelines for a target of `target_format`,
-    // and a shader-visible heap for up to `max_planes` plane views.
+    // Create the opaque pipeline and a heap for up to `max_planes` views. More than one plane also needs a blend pipeline.
     HRESULT create(ID3D12Device* device, DXGI_FORMAT target_format, UINT max_planes)
     {
         release();
@@ -52,7 +51,8 @@ public:
         HRESULT hr = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&textures_));
         if (SUCCEEDED(hr)) hr = D3DCompile(source, sizeof(source) - 1, "present", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, nullptr);
         if (SUCCEEDED(hr)) hr = D3DCompile(source, sizeof(source) - 1, "present", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, nullptr);
-        if (SUCCEEDED(hr)) hr = D3DCompile(source, sizeof(source) - 1, "present", nullptr, nullptr, "ps_over", "ps_5_0", 0, 0, &ps_over, nullptr);
+        if (SUCCEEDED(hr) && max_planes_ > 1)
+            hr = D3DCompile(source, sizeof(source) - 1, "present", nullptr, nullptr, "ps_over", "ps_5_0", 0, 0, &ps_over, nullptr);
         if (SUCCEEDED(hr)) {
             const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
             D3D12_ROOT_PARAMETER parameter{};
@@ -82,7 +82,7 @@ public:
             desc.RTVFormats[0] = target_format;
             desc.SampleDesc.Count = 1;
             hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&opaque_));
-            if (SUCCEEDED(hr)) {
+            if (SUCCEEDED(hr) && ps_over) {
                 desc.PS = {ps_over->GetBufferPointer(), ps_over->GetBufferSize()};
                 D3D12_RENDER_TARGET_BLEND_DESC& blend = desc.BlendState.RenderTarget[0];
                 blend.BlendEnable = TRUE;
@@ -113,7 +113,7 @@ public:
     UINT record(ID3D12Device* device, ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE target, UINT width,
                 UINT height, const PlaneStep* steps, unsigned count, ID3D12Resource* const* plane_surfaces)
     {
-        if (!opaque_ || !blend_ || !list || !steps || !plane_surfaces) return 0;
+        if (!opaque_ || !list || !steps || !plane_surfaces) return 0;
         ID3D12Resource* drawn[16] = {};
         bool blended[16] = {};
         UINT planes = 0;
