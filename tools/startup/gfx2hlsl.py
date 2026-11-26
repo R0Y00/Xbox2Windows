@@ -8636,7 +8636,7 @@ class Pipeline:
         # rule). The table formulas match tools/pixel_aot.py exactly: sad_hi_u8 is (sad4_u8(a, b, false) << 16) + c
         # and msad_u8 is sad4_u8(a, b, true) + c, both modulo 2^32. sad_u8 above keeps its inlined four-term form so
         # a translation that uses only v_sad_u8 is unchanged.
-        if self.uses_sad & {'v_sad_hi_u8', 'v_msad_u8'}:
+        if 'v_sad_hi_u8' in self.uses_sad or 'v_msad_u8' in self.uses_sad:
             out.append(
                 'uint sad4_u8(uint a, uint b, bool masked) {'
                 ' return (masked && ((b & 0xffu) == 0u) ? 0u : uint(abs(int(a & 0xffu) - int(b & 0xffu))))'
