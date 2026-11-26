@@ -250,14 +250,15 @@ check('bitwise sequence reads and updates SCC cleanly',
       emitted)
 
 # 4. Distinguishing carry case: compare sets SCC=0, then s_add_u32 0xffffffff + 1 wraps and sets hardware
-#    carry SCC=1 without an HLSL SCC update. Reading src_scc afterwards must refuse rather than read stale 0.
+#    carry SCC=1. The add emits that carry, so the src_scc read afterwards sees it (not the stale compare result).
 carry_seq = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ONE)
              + encode_sop2(SOP2_ADD_U32, S1, LITERAL, S_ONE, literal=0xFFFFFFFF)
              + encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC)
              + encode_sopp(SOPP_ENDPGM))
-check('s_add_u32 carry after compare leaves SCC unverified and is refused',
-      refused_reason(carry_seq) == 'src_scc with unverified SCC',
-      repr(refused_reason(carry_seq)))
+_asm, emitted, _stage = translate_program(carry_seq)
+carry_line = 'scc = (0xffffffffu + 0x00000001u) < (0xffffffffu);'
+check('s_add_u32 carry after compare is emitted ahead of the src_scc read',
+      carry_line in emitted and emitted.index(carry_line) < emitted.index('0x3f800000u * (scc ? 1u : 0u)'), emitted)
 
 # 5. s_add_u32 reading src_scc as an input before overwriting SCC is accepted (input read precedes write),
 #    while a second src_scc after s_add_u32 is refused.
@@ -265,13 +266,25 @@ add_reads_scc = (encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
                  + encode_sop2(SOP2_ADD_U32, S1, S_SCC, S_ONE)
                  + encode_sopp(SOPP_ENDPGM))
 asm, emitted, _stage = translate_program(add_reads_scc)
+read_line = 's1 = (scc ? 1u : 0u) + 0x00000001u;'
 check('s_add_u32 reading incoming verified src_scc is accepted',
-      's1 = (scc ? 1u : 0u) + 0x00000001u;' in emitted, emitted)
-check('reading src_scc after s_add_u32 is refused',
+      read_line in emitted, emitted)
+# The destination reads the incoming SCC before this add's own carry replaces it (the carry is emitted after the write).
+check('s_add_u32 src_scc operand is read before the add writes SCC',
+      emitted.index(read_line) < emitted.index('scc = ((scc ? 1u : 0u) + 0x00000001u) < ((scc ? 1u : 0u));'), emitted)
+check('s_add_u32 whose destination is also a source and reads src_scc is refused',
       refused_reason(encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
-                     + encode_sop2(SOP2_ADD_U32, S1, S_SCC, S_ONE)
-                     + encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC)
-                     + encode_sopp(SOPP_ENDPGM)) == 'src_scc with unverified SCC')
+                     + encode_sop2(SOP2_ADD_U32, S1, S1, S_SCC)
+                     + encode_sopp(SOPP_ENDPGM)) == 's_add_u32 reads src_scc with a destination that is also a source '
+                                                    'or a special register')
+_asm, emitted, _stage = translate_program(
+    encode_sopc(SOPC_CMP_EQ_U32, S_ZERO, S_ZERO)
+    + encode_sop2(SOP2_ADD_U32, S1, S_SCC, S_ONE)
+    + encode_sop2(SOP2_MUL_I32, S28, S_1_0, S_SCC)
+    + encode_sopp(SOPP_ENDPGM))
+carry_line = 'scc = ((scc ? 1u : 0u) + 0x00000001u) < ((scc ? 1u : 0u));'
+check('reading src_scc after s_add_u32 sees the add\'s carry',
+      carry_line in emitted and emitted.index(carry_line) < emitted.index('0x3f800000u * (scc ? 1u : 0u)'), emitted)
 
 # 6. Across a control-flow join: branch skips an SCC write to target 0x0c, so the two paths into the join carry
 #    different SCC writes and src_scc there is refused unless a modeled writer runs inside the joined block first.

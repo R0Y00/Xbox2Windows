@@ -98,8 +98,10 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     v3 = (v1 & 0xffffffu) * (0x00000002u & 0xffffffu) + v0;
     v3 = (v2 & 0xffffffu) * (0x00000006u & 0xffffffu) + v3;
     s24 = s10 * 0x00000003u;
+    scc = (s24 + s14) < (s24);
     s24 = s24 + s14;
     s25 = s11 * 0x00000006u;
+    scc = (s24 + s25) < (s24);
     s24 = s24 + s25;
     s24 = s24 * 0x00000018u;
     v3 = s24 + v3;
