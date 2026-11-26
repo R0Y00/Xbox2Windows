@@ -670,11 +670,24 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     if (!suballoc) return 56;
     auto* const odd = reinterpret_cast<std::uint32_t*>((reinterpret_cast<std::uintptr_t>(suballoc) & ~std::uintptr_t{0xffff}) + 65536 + 0x104);
     odd[0] = 201;
+    *reinterpret_cast<std::uint32_t*>(reinterpret_cast<unsigned char*>(odd) - 4) = 55;  // read by the raw view at page + 0x100 below
     structured.view.Buffer.FirstElement = 0;
     structured.view.Buffer.StructureByteStride = 12;
     structured.address = ptr(odd);
     invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
     draw(6);
+
+    // An unplaced raw view at page + 1 is refused as before (the exact-start copy is only for structured and typed views):
+    // the previous descriptor stays, so column 7 still reads 201.
+    raw.view.Buffer.FirstElement = 0;
+    raw.address = ptr(reinterpret_cast<unsigned char*>(odd) - 0x103);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(7);
+
+    // A raw view that overlaps the copy made for the structured view above (page + 0x100) takes its own backing of the page.
+    raw.address = ptr(reinterpret_cast<unsigned char*>(odd) - 4);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(8);
 
     // An unplaced buffer in an allocation above the 256 MiB limit is not wrapped as an existing heap; its
     // upload copy must still publish the bytes at the address.
@@ -685,7 +698,7 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     raw.address = ptr(large);
     raw.view.Buffer.FirstElement = 4;
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
-    draw(7);
+    draw(9);
     return 0;
 }
 

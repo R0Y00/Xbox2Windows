@@ -21,6 +21,7 @@ def check_refusal_lines(log):
     expected = [
         buffer_unavailable.replace("FIRST", "4"),  # injected wrapper allocation failure
         buffer_unavailable.replace("FIRST", "0"),  # unaligned interior address
+        buffer_unavailable.replace("FIRST", "0"),  # unplaced raw view at page + 1
         prefix
         + r"unavailable acceleration structure at the supplied address: reason=as_wrong_state "
         + r"res\{dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "
@@ -54,7 +55,7 @@ def check(directory, consumer, backend):
     )
     if actual is None:
         return 77
-    values = (17, 63, 141, 141, 99, 17, 201, 77)
+    values = (17, 63, 141, 141, 99, 17, 201, 201, 55, 77)
     row = b"".join(bytes((v, 0, 0, 255)) for v in values)
     expected = row * 4
     if actual != expected:

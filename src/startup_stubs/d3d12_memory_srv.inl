@@ -189,7 +189,8 @@ bool address_resource_overlap(u64 address, u64 span)
     bool found = false;
     AcquireSRWLockShared(&note_lock);
     resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
-        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+        if (wrapper->own().tiled_address_srv || wrapper->own().exact_copy ||
+            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
         const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes
@@ -238,7 +239,7 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
         if (info.placement != Placement::none ||
-            info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            wrapper->own().exact_copy || info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
@@ -295,7 +296,7 @@ void clear_unplaced_buffers(Wrapper* device)
 }
 
 Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
-                                u64 elem_bytes)
+                                u64 elem_bytes, bool raw)
 {
     if (address_resource_overlap(address, span_bytes)) return nullptr;
     u64 page_start = 0, page_span = 0;
@@ -313,7 +314,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
     // a multiple of the element size past it, no FirstElement can name the address: back the view with an upload copy that
     // starts at the address itself (checked above to lie inside memory the title owns).
-    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes);
+    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes, raw);
     if (exact) {
         page_start = address;
         page_span = span_bytes;
@@ -436,6 +437,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     rdesc.Flags = is_upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
+    w->own().exact_copy = exact;
     note_resource(w, &rdesc, page_span);
     if (!is_upload) {
         w->own().budget = x2w_budget::resource(desktop, native_resource.Get(), x2w_budget::placed);
@@ -713,7 +715,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
         if (!buffer) {
-            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes);
+            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes,
+                                            input->view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW);
         }
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
