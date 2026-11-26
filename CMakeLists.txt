@@ -871,6 +871,19 @@ set_tests_properties(startup_storage_refused_reuse startup_storage_refused_reuse
 set_tests_properties(startup_storage_refused_reuse_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
     "FAIL: R1 destination taken as data matches the stream prefix in 0 of 4096 byte")
 
+# #2788: the DirectStorage stand-in frees its COM objects at final Release, the queue's worker leaves
+# before the queue is freed, and a pending entry keeps the status array and source file it uses alive
+# after the guest releases them. The control deletes at zero without that accounting and must fail.
+add_executable(startup_xcrdapi_lifetime tests/startup_xcrdapi_lifetime.cpp)
+target_compile_features(startup_xcrdapi_lifetime PRIVATE cxx_std_17)
+add_dependencies(startup_xcrdapi_lifetime startup_stub_xcrdapi)
+add_test(NAME startup_xcrdapi_lifetime
+         COMMAND startup_xcrdapi_lifetime "$<TARGET_FILE:startup_stub_xcrdapi>")
+add_test(NAME startup_xcrdapi_lifetime_naive_control
+         COMMAND startup_xcrdapi_lifetime "$<TARGET_FILE:startup_stub_xcrdapi>" control)
+set_tests_properties(startup_xcrdapi_lifetime startup_xcrdapi_lifetime_naive_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_xcrdapi_lifetime_naive_control PROPERTIES WILL_FAIL TRUE)
+
 # Test-only BCPack encoder (tests/bcpack_encoder.h): random synthetic streams must decode back to their
 # symbols. Interleaving with a 7-byte cycle budget is the negative control.
 add_executable(bcpack_encoder_check tests/bcpack_encoder_check.cpp)

@@ -75,6 +75,24 @@ struct QueueObject : Object {
     HANDLE error_event = nullptr;
 };
 
+// Live stand-in objects by kind, and running queue workers. The lifetime fixture reads them through
+// x2w_xcrdapi_live_objects and x2w_xcrdapi_live_workers to prove that a final Release frees the
+// object and that the queue's worker has left (#2788).
+LONG live_by_kind[4];
+LONG live_workers;
+
+// Test-only mutant (#2788): X2W_TEST_XCRDAPI_LIFETIME_MUTANT=naive deletes at final Release without
+// stopping the worker or retaining the objects a queue entry uses. The fixture must reject it.
+bool naive_lifetime_mutant() noexcept
+{
+    static const bool naive = [] {
+        char text[16];
+        const DWORD length = GetEnvironmentVariableA("X2W_TEST_XCRDAPI_LIFETIME_MUTANT", text, sizeof(text));
+        return length == 5 && std::memcmp(text, "naive", 5) == 0;
+    }();
+    return naive;
+}
+
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
 // tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
 // like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
@@ -91,6 +109,7 @@ struct Entry {
     std::unique_ptr<ULONG_PTR[]> tokens;
     std::size_t token_count = 0;
     Object* array;
+    Object* source;  // request: the file the entry reads, retained while the entry is pending
     unsigned index;
     void* fence;
     u64 value;
@@ -115,6 +134,10 @@ struct QueueWork {
     struct Unrecorded* deferred_head = nullptr;  // snapshot of unrecorded entries, in order; guarded by mutex
     struct Unrecorded* deferred_tail = nullptr;
     bool completing = false;     // a thread owns completion of snapshot entries, so they stay in order; guarded by mutex
+    bool stopping = false;       // final Release asked the worker to leave; guarded by mutex
+    bool destroy_on_worker = false;  // the final Release ran on the worker itself; guarded by mutex
+    HANDLE thread = nullptr;     // kept for the join; closed by the releasing thread, guarded by the setup mutex
+    DWORD thread_id = 0;         // guarded by the setup mutex
     std::condition_variable drained;  // signaled when the worker finishes an entry
     u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
     u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
@@ -304,15 +327,23 @@ long __stdcall query_interface(Object* self, const GUID* riid, void** out)
     return S_OK;
 }
 unsigned long __stdcall add_ref(Object* self) { return static_cast<unsigned long>(InterlockedIncrement(&self->refs)); }
+
+void destroy_object(Object* self) noexcept;
+
+// Final Release of a queue: stop the worker, wait for it to leave, then drop the entries that never
+// ran. Returns true when the worker owns the destruction (Release ran on the worker itself).
+// Defined after the entry helpers below.
+bool shutdown_queue(Object* self);
+
 unsigned long __stdcall release(Object* self)
 {
     const auto refs = static_cast<unsigned long>(InterlockedDecrement(&self->refs));
-    if (refs == 0 && self->kind == queue) {
-        auto& object = *static_cast<QueueObject*>(self);
-        const std::lock_guard guard(object.error_mutex);
-        if (object.error_event) CloseHandle(std::exchange(object.error_event, nullptr));
-    }
-    return refs;
+    if (refs != 0) return refs;
+    // The factory is a process singleton: it stays alive for the life of the process (#2788).
+    if (self->kind == factory) return 0;
+    if (self->kind == queue && !naive_lifetime_mutant() && shutdown_queue(self)) return 0;
+    destroy_object(self);
+    return 0;
 }
 
 void** make_table(unsigned kind);
@@ -327,7 +358,51 @@ Object* make(unsigned kind)
     object->kind = kind;
     object->refs = 1;
     object->handle = INVALID_HANDLE_VALUE;
+    InterlockedIncrement(&live_by_kind[kind / 0x20 - 1]);
     return object;
+}
+
+void destroy_object(Object* self) noexcept
+{
+    const unsigned index = self->kind / 0x20 - 1;
+    if (self->kind == queue) {
+        auto* object = static_cast<QueueObject*>(self);
+        {
+            const std::lock_guard guard(object->error_mutex);
+            if (object->error_event) CloseHandle(std::exchange(object->error_event, nullptr));
+        }
+        delete object;
+    } else if (self->kind == file) {
+        auto* object = static_cast<FileObject*>(self);
+        if (object->handle != INVALID_HANDLE_VALUE) CloseHandle(std::exchange(object->handle, INVALID_HANDLE_VALUE));
+        delete object;
+    } else if (self->kind == status) {
+        delete[] self->results;
+        delete self;
+    } else {
+        return;  // the factory singleton is never freed
+    }
+    InterlockedDecrement(&live_by_kind[index]);
+}
+
+// The status array an entry completes and the file a request reads must outlive the guest's Release
+// while the entry is pending: the entry owns one reference on each until it is consumed (#2788).
+void retain_entry_object(Object* object) noexcept
+{
+    if (object && !naive_lifetime_mutant()) InterlockedIncrement(&object->refs);
+}
+
+void release_entry_object(Object* object) noexcept
+{
+    if (object && !naive_lifetime_mutant()) release(object);
+}
+
+void release_entry(Entry& entry) noexcept
+{
+    release_entry_object(entry.source);
+    entry.source = nullptr;
+    release_entry_object(entry.array);
+    entry.array = nullptr;
 }
 
 // Factory slot 4, PC IDStorageFactory::OpenFile(PCWSTR path, REFIID riid, void** ppv).
@@ -975,6 +1050,8 @@ void complete_deferred(Object* self, QueueWork* work);
 
 bool deferred_pending(const QueueWork& work);
 
+void discard_entries(QueueWork* work) noexcept;
+
 DWORD WINAPI queue_worker(void* parameter)
 {
     on_queue_worker = true;
@@ -984,7 +1061,10 @@ DWORD WINAPI queue_worker(void* parameter)
         Entry entry;
         {
             std::unique_lock lock(work.mutex);
-            work.wake.wait(lock, [&] { return !work.submitted.empty() && !deferred_pending(work); });
+            work.wake.wait(lock, [&] {
+                return work.stopping || (!work.submitted.empty() && !deferred_pending(work));
+            });
+            if (work.stopping) break;
             entry = std::move(work.submitted.front());
             work.submitted.pop_front();
         }
@@ -1008,6 +1088,7 @@ DWORD WINAPI queue_worker(void* parameter)
             copy_reason(reason, "unknown exception");
         }
         if (failed) fail_entry(self, entry, reason);
+        release_entry(entry);
         {
             const std::lock_guard guard(work.mutex);
             if (work.submitted.empty()) {
@@ -1018,6 +1099,23 @@ DWORD WINAPI queue_worker(void* parameter)
         work.drained.notify_all();
         complete_deferred(self, &work);
     }
+    bool destroy = false;
+    {
+        const std::lock_guard guard(work.mutex);
+        destroy = work.destroy_on_worker;
+    }
+    if (destroy) {
+        // The final Release ran on this worker (a fence callback released the queue). The worker cannot
+        // join itself: it drops the entries that never ran and frees the queue as it exits.
+        discard_entries(&work);
+        self->work = nullptr;
+        delete &work;
+        destroy_object(self);
+        InterlockedDecrement(&live_workers);
+        return 0;
+    }
+    InterlockedDecrement(&live_workers);
+    return 0;
 }
 
 // Guards queue setup: building a queue's work, starting its worker and the unrecorded list.
@@ -1062,8 +1160,10 @@ bool start_worker(Object* self, QueueWork* work)
         return false;
     }
     work->worker_started = true;
+    work->thread = worker;
+    work->thread_id = GetThreadId(worker);
+    InterlockedIncrement(&live_workers);
     ResumeThread(worker);
-    CloseHandle(worker);
     return true;
 }
 
@@ -1075,11 +1175,20 @@ struct Unrecorded {
     u64 after;
     Entry::Type type;
     Object* array;
+    Object* source;  // request: the file the entry would read, retained until the node is dropped
     unsigned index;
     void* fence;
     u64 value;
     unsigned char bytes[sizeof(StorageRequest)];
 };
+
+void release_unrecorded(Unrecorded& node) noexcept
+{
+    release_entry_object(node.source);
+    node.source = nullptr;
+    release_entry_object(node.array);
+    node.array = nullptr;
+}
 
 // True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
 // worker starts no newer entry then, so a deferred completion and a normal one keep the same order.
@@ -1131,13 +1240,25 @@ bool has_unrecorded(Object* self)
     return self->unrecorded_head != nullptr;
 }
 
-void defer_unrecorded(Object* self, const Entry& entry)
+void defer_unrecorded(Object* self, Entry& entry)
 {
-    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value, {}};
+    auto* node = new (std::nothrow) Unrecorded{};
     if (!node) {
         fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        release_entry(entry);
         return;
     }
+    node->next = nullptr;
+    node->submission_id = 0;
+    node->after = 0;
+    node->type = entry.type;
+    node->array = entry.array;
+    node->source = entry.source;
+    node->index = entry.index;
+    node->fence = entry.fence;
+    node->value = entry.value;
+    entry.array = nullptr;
+    entry.source = nullptr;  // the node now owns the entry's references
     if (entry.type == Entry::request) std::memcpy(node->bytes, entry.bytes, sizeof node->bytes);
     const std::lock_guard guard(setup_mutex());
     (self->unrecorded_tail ? self->unrecorded_tail->next : self->unrecorded_head) = node;
@@ -1155,6 +1276,7 @@ void fail_unrecorded(Object* self)
     while (node) {
         Unrecorded* const next = node->next;
         fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+        release_unrecorded(*node);
         delete node;
         node = next;
     }
@@ -1172,6 +1294,7 @@ void fail_waiting(Object* self, QueueWork* work)
             work->waiting.pop_front();
         }
         fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        release_entry(entry);
     }
 }
 
@@ -1300,11 +1423,58 @@ void complete_deferred(Object* self, QueueWork* work)
         }
         if (node) {
             fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+            release_unrecorded(*node);
             delete node;
         } else {
             fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+            release_entry(entry);
         }
     }
+}
+
+// Drops every entry that will never run and releases the objects those entries held. Called after the
+// worker has left, so no other thread touches the queue.
+void discard_entries(QueueWork* work) noexcept
+{
+    for (Entry& entry : work->waiting) release_entry(entry);
+    work->waiting.clear();
+    for (Entry& entry : work->submitted) release_entry(entry);
+    work->submitted.clear();
+    for (Entry& entry : work->failing) release_entry(entry);
+    work->failing.clear();
+    Unrecorded* node = work->deferred_head;
+    work->deferred_head = work->deferred_tail = nullptr;
+    while (node) {
+        Unrecorded* const next = node->next;
+        release_unrecorded(*node);
+        delete node;
+        node = next;
+    }
+    work->cached_streams.clear();
+}
+
+bool shutdown_queue(Object* self)
+{
+    QueueWork* work = self->work;
+    if (!work) return false;
+    bool on_worker;
+    {
+        const std::lock_guard guard(work->mutex);
+        work->stopping = true;
+        on_worker = work->worker_started && GetCurrentThreadId() == work->thread_id;
+        if (on_worker) work->destroy_on_worker = true;
+    }
+    work->wake.notify_all();
+    if (on_worker) return true;  // the worker frees the queue as it exits
+    if (work->thread) {
+        WaitForSingleObject(work->thread, INFINITE);
+        CloseHandle(work->thread);
+        work->thread = nullptr;
+    }
+    discard_entries(work);
+    self->work = nullptr;
+    delete work;
+    return false;
 }
 
 // Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.
@@ -1346,6 +1516,15 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
     entry.type = Entry::request;
     std::memcpy(entry.bytes, request, sizeof entry.bytes);
     const u64 options = *reinterpret_cast<const u64*>(request);
+    if (!(options & memory_source_option)) {
+        // The request keeps the file it reads alive until its turn: the guest may Release it after
+        // EnqueueRequest (#2788).
+        auto* source = *reinterpret_cast<Object* const*>(request + 0x20);
+        if (source && x2w_local::readable(source, sizeof(Object)) && source->kind == file) {
+            retain_entry_object(source);
+            entry.source = source;
+        }
+    }
     if (options & (1ull << 21)) {
         const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(request + 0x08);
         const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
@@ -1380,6 +1559,7 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
     InterlockedExchange(&array->results[index], static_cast<LONG>(0x8000000A));  // E_PENDING until its turn
     Entry entry{};
     entry.type = Entry::status_entry;
+    retain_entry_object(array);
     entry.array = array;
     entry.index = index;
     push(self, std::move(entry));
@@ -1545,6 +1725,23 @@ DWORD heartbeat_interval_ms() noexcept
 }
 
 }  // namespace
+
+// Fixture-only probes (#2788): objects alive by kind (0 = every kind) and running queue workers.
+extern "C" __declspec(dllexport) unsigned long x2w_xcrdapi_live_objects(unsigned kind)
+{
+    if (kind == 0) {
+        unsigned long total = 0;
+        for (LONG count : live_by_kind) total += static_cast<unsigned long>(count);
+        return total;
+    }
+    if (kind != factory && kind != file && kind != status && kind != queue) return 0;
+    return static_cast<unsigned long>(live_by_kind[kind / 0x20 - 1]);
+}
+
+extern "C" __declspec(dllexport) unsigned long x2w_xcrdapi_live_workers()
+{
+    return static_cast<unsigned long>(live_workers);
+}
 
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
 {
