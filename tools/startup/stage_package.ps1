@@ -74,7 +74,8 @@ function Get-FinalStagingPath([string]$Path) {
         $missing.Insert(0, (Split-Path -Leaf $existing))
         $existing = $parent
     }
-    $final = [X2wStagingFinalPath]::Resolve($existing)
+    $nativePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($existing)
+    $final = [X2wStagingFinalPath]::Resolve($nativePath)
     foreach ($part in $missing) { $final = [IO.Path]::Combine($final, $part) }
     return $final
 }

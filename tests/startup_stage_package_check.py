@@ -1,4 +1,5 @@
 """Exercise safe startup staging using synthetic files; no game package is needed."""
+import ctypes
 import os
 from pathlib import Path
 import subprocess
@@ -141,6 +142,25 @@ def main():
             assert (safe / "side.DLL").read_bytes() == b"beside child"
         finally:
             inside.rmdir()
+
+        # Volume GUID paths are returned as provider-qualified paths by PowerShell.
+        # Staging to a sibling must work, while the underlying package is still protected.
+        volume = ctypes.create_unicode_buffer(1024)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetVolumeNameForVolumeMountPointW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel.GetVolumeNameForVolumeMountPointW.restype = ctypes.c_int
+        if kernel.GetVolumeNameForVolumeMountPointW(package.anchor, volume, len(volume)):
+            volume_package = volume.value + str(package)[len(package.anchor):]
+            nested = package / "volume-nested"
+            result = call(powershell, volume_package, exe.name, nested)
+            assert result.returncode != 0 and "separate from PackageDir" in result.stderr, result.stdout + result.stderr
+            assert not nested.exists()
+            safe = root / "volume-safe"
+            result = call(powershell, volume_package, exe.name, safe)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert (safe / exe.name).read_bytes() == original[exe.name]
+        else:
+            print("volume GUID control skipped: temporary volume has no GUID path")
     print("safe startup staging: isolated executable/DLL copy, package preservation and overwrite/path guards passed")
 
 
