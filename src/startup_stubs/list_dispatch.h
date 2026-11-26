@@ -2,7 +2,7 @@
 
 // Command-list slot 14, Dispatch(x, y, z). A dispatch is forwarded to the desktop list only when the list is open,
 // can run compute, a desktop compute pipeline and a desktop compute root signature are bound, the compute root declares
-// no parameters other than root SRVs (the compute root-argument slots 35, 37, 39, 41, 43 and 45 are not forwarded yet, so a root that needs
+// no parameters other than root SRVs (of the compute root-argument slots, only slot 43 (root SRV) is forwarded; 35, 37, 39, 41 and 45 are not forwarded yet, so a root that needs
 // arguments would run with them unset), and every group count is within the D3D12 limit of 65535 per dimension. Zero groups on any axis is valid and runs nothing.
 
 #include <d3d12.h>
