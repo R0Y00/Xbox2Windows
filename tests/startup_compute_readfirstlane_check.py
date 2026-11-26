@@ -231,14 +231,20 @@ def dispatch(dxc, runner, adapter):
             print(proc.stdout, end='')
             if proc.returncode == 77:
                 return 77
+            diagnostics = []
+            for line in proc.stderr.splitlines():
+                if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                    print(line, file=sys.stderr)
+                else:
+                    diagnostics.append(line)
             if mutation:
                 want = CONTROLS[mutation][2]
-                first = proc.stderr.strip().splitlines()[:1]
+                first = diagnostics[:1]
                 if proc.returncode != 1 or first != [want]:
                     raise AssertionError('control %s: expected exit 1 with %r, got exit %d %r'
                                          % (mutation, want, proc.returncode, proc.stderr))
                 print('control %s (%s): rejected at %s' % (mutation, adapter, first[0]))
-            elif proc.returncode or proc.stderr:
+            elif proc.returncode or diagnostics:
                 raise AssertionError('baseline (%s): %s' % (adapter, proc.stderr or 'exit %d' % proc.returncode))
             else:
                 print('baseline (%s): all %d words match' % (adapter, WORDS))
