@@ -136,6 +136,7 @@ jobs:
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_compute_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_compute_spill_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_compute_mask_spill_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_lds_b64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_lds_b128_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_calculated_target_check.py", "binary", "llvm-mc-15"], {}),
@@ -323,6 +324,7 @@ jobs:
             tests/startup_gfx2hlsl_neg_check.py \
             tests/startup_gfx2hlsl_compute_check.py \
             tests/startup_gfx2hlsl_compute_spill_check.py \
+            tests/startup_gfx2hlsl_compute_mask_spill_check.py \
             tests/startup_compute_lds_b64_check.py \
             tests/startup_compute_lds_b128_check.py \
             tests/startup_compute_translate_check.py \

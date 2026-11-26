@@ -150,7 +150,8 @@ VARIANTS = {
     'lane-mask': (SOURCE_S, [('v_writelane_b32 v40, s16, 4\nv_writelane_b32 v40, s17, 5\nv_writelane_b32 v40, s18, 6\n'
                               'v_writelane_b32 v40, s19, 7\nv_mov_b32 v1, 1',
                               'v_cmp_gt_u32 s20, 12, v0\nv_writelane_b32 v40, s20, 4\nv_mov_b32 v1, 1')],
-                  'holds a lane mask or descriptor', 'a compare result held in an SGPR (step 2 of #2022)'),
+                  'one of them a lane mask', 'a compare result spilled in one arm where the other arm spills a descriptor '
+                  '(lane masks have their own fixtures in tests/startup_gfx2hlsl_compute_mask_spill_check.py)'),
     'wrong-lane': (SOURCE_S, [('v_readlane_b32 s13, v40, 1', 'v_readlane_b32 s13, v40, 5')],
                    'descriptor whose words were rewritten', 'word 1 of the descriptor reloaded from the lane of word 5'),
     'unproven-descriptor': (SOURCE_S, [(S_ENTRY, ''), ('v_mov_b32 v1, 1', S_ENTRY + 'v_mov_b32 v1, 1'),

@@ -4146,6 +4146,22 @@ if(EXISTS "${INTAKE_PYTHON}")
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
+    # gfx2hlsl constant-lane SGPR spills of lane masks in compute stages (#1723).
+    add_test(NAME startup_gfx2hlsl_compute_mask_spill_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_mask_spill_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_compute_mask_spill_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_mask_spill_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_compute_mask_spill_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS m-saveexec-dropped m-mask-inverted v-branch-inverted)
+            add_test(NAME startup_gfx2hlsl_compute_mask_spill_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_mask_spill_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_gfx2hlsl_compute_mask_spill_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
+        endforeach()
+    endforeach()
     # gfx2hlsl bounded 64-bit LDS exchanges (ds_write_b64, ds_read_b64) across s_barrier (Refs #2274, #1541).
     add_test(NAME startup_compute_lds_b64_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_b64_check.py")
