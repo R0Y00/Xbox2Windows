@@ -183,6 +183,7 @@
 
 #include "startup_stubs/linear_buffer_report.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/memory_srv_buffer.h"
 #include "startup_stubs/placed_buffer_range.h"
 #include "startup_stubs/resource_budget.h"
 
@@ -321,6 +322,7 @@ public:
         const UINT64 offset = static_cast<UINT64>(static_cast<char*>(address) - static_cast<char*>(range.base));
         ID3D12Resource* resource = nullptr;
         if (linear_buffer_mode() == LinearBufferMode::automatic) {
+            static const bool unbounded_existing_heap = x2w_local::env_on("X2W_D3D12_UNBOUNDED_EXISTING_HEAP");
             record.info.feature_hr = feature(device);
             const bool allowed = SUCCEEDED(record.info.feature_hr) || linear_detail::mutant("ignore-feature");
             if (!allowed)
@@ -331,6 +333,8 @@ public:
                 record.info.share_hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);  // an open heap would pin the view
             else if (range.type != MEM_PRIVATE)
                 record.info.share_hr = E_INVALIDARG;
+            else if (!unbounded_existing_heap && !unplaced_existing_heap_allowed(allocation_bytes(range.base)))
+                record.info.share_hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
             else
                 record.info.share_hr = share(device, range, offset, width, uav, &resource, &record.info.heap_generation,
                                              backing_budget);
@@ -862,6 +866,7 @@ private:
             ID3D12Heap* heap = nullptr;
             HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&device3));
             if (SUCCEEDED(hr)) {
+                x2w_local::commit_lazy_block(range.base);
                 ++totals_.heap_opens;
                 hr = device3->OpenExistingHeapFromAddress(range.base, IID_PPV_ARGS(&heap));
                 device3->Release();
