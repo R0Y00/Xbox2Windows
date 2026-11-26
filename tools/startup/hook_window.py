@@ -50,12 +50,19 @@ class ReturnBook:
     different entry address, so both registrations are kept."""
 
     def __init__(self):
-        self._pending = {}  # return address -> list of (tid, stack slot, description, entry)
+        # return address -> list of (tid, stack slot, description, entry, restore)
+        self._pending = {}
 
-    def add(self, address, tid, slot, description, entry=None):
-        kept = [item for item in self._pending.get(address, [])
-                if (item[0], item[1], item[3]) != (tid, slot, entry)]
-        kept.append((tid, slot, description, entry))
+    def add(self, address, tid, slot, description, entry=None, restore=None):
+        """Registers a call. restore, if given, undoes a change made to the call's arguments; it runs
+        once, when the call returns. A re-trap of the same call keeps the first restore: it holds the
+        caller's original state, the second one would hold the already changed one."""
+        items = self._pending.get(address, [])
+        for item in items:
+            if (item[0], item[1], item[3]) == (tid, slot, entry):
+                restore = item[4] or restore
+        kept = [item for item in items if (item[0], item[1], item[3]) != (tid, slot, entry)]
+        kept.append((tid, slot, description, entry, restore))
         self._pending[address] = kept
 
     def pending(self, address):
@@ -63,12 +70,16 @@ class ReturnBook:
         return bool(self._pending.get(address))
 
     def take(self, address, tid, slot):
-        """Descriptions of the calls that return here on this thread and slot."""
+        """Descriptions of the calls that return here on this thread and slot. Their restore callbacks
+        have run when this returns."""
         items = self._pending.get(address, [])
-        done = [item[2] for item in items if (item[0], item[1]) == (tid, slot)]
-        if done:
+        taken = [item for item in items if (item[0], item[1]) == (tid, slot)]
+        if taken:
             self._pending[address] = [item for item in items if (item[0], item[1]) != (tid, slot)]
-        return done
+        for item in taken:
+            if item[4]:
+                item[4]()
+        return [item[2] for item in taken]
 
 
 class StepWindow:

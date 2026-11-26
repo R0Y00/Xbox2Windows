@@ -165,6 +165,19 @@ def returns_bookkeeping():
     assert book.take(0x20, 1, 0x200) == ["CreateFileW", "NtCreateFile retrapped"]
     assert book.take(0x20, 1, 0x200) == []
 
+    # A restore callback runs once, when its call returns, and only for that call.
+    undone = []
+    book.add(0x40, 1, 0x400, "mapped", 0x5000, restore=lambda: undone.append("first"))
+    book.add(0x40, 2, 0x400, "other thread", 0x5000, restore=lambda: undone.append("second"))
+    assert book.take(0x40, 1, 0x400) == ["mapped"] and undone == ["first"]
+    assert book.take(0x40, 1, 0x400) == [] and undone == ["first"], "a restore must not run twice"
+    # A re-trap of the same call keeps the first restore (the caller's original state).
+    book.add(0x50, 1, 0x500, "x", 0x5000, restore=lambda: undone.append("original"))
+    book.add(0x50, 1, 0x500, "x", 0x5000, restore=lambda: undone.append("rewritten twice"))
+    book.take(0x50, 1, 0x500)
+    assert undone == ["first", "second"][:1] + ["original"], undone
+    assert book.take(0x40, 2, 0x400) == ["other thread"] and undone[-1] == "second"
+
     # The launcher asks whether any call still returns to an address before it lets a hit-limited
     # breakpoint run free: a returned call must not keep it armed, a waiting one must.
     assert not book.pending(0x20) and not book.pending(0x99)
