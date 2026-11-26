@@ -110,6 +110,14 @@ std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>>& pending_gpu_writes()
     static std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>> m;
     return m;
 }
+// X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers a recording wrote (list slots 15 and 17), under the same
+// rule. A copied buffer stops being refreshed from its title memory only once a recording that writes it is
+// submitted; a recording that is discarded leaves it refreshed (linear_buffer_backing.h).
+std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>>& pending_linear_writes()
+{
+    static std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>> m;
+    return m;
+}
 
 bool list_wrote(Wrapper* list, ID3D12Resource* resource)
 {
@@ -125,11 +133,13 @@ void discard_list_gpu_writes(Wrapper* self)
 {
     AcquireSRWLockExclusive(&pending_writes_lock);
     pending_gpu_writes().erase(self);
+    pending_linear_writes().erase(self);
     ReleaseSRWLockExclusive(&pending_writes_lock);
 }
 
 void commit_list_gpu_writes(Wrapper* self)
 {
+    std::vector<ID3D12Resource*> linear;
     AcquireSRWLockShared(&pending_writes_lock);
     if (const auto it = pending_gpu_writes().find(self); it != pending_gpu_writes().end()) {
         for (ID3D12Resource* resource : it->second) {
@@ -138,7 +148,10 @@ void commit_list_gpu_writes(Wrapper* self)
             state.done = true;
         }
     }
+    if (const auto it = pending_linear_writes().find(self); it != pending_linear_writes().end()) linear = it->second;
     ReleaseSRWLockShared(&pending_writes_lock);
+    // After the recording's ExecuteCommandLists, outside the lock (the backing takes its own).
+    for (ID3D12Resource* resource : linear) linear_buffers().note_gpu_write(resource);
 }
 
 // A copy or resolve destination will hold what the GPU wrote once `self` is submitted. A title-backed texture
@@ -148,6 +161,25 @@ void mark_gpu_written(Wrapper* self, const CopyEndpoint& destination)
     if (!destination.wrapper || !destination.wrapper->own().title_memory) return;
     AcquireSRWLockExclusive(&pending_writes_lock);
     auto& writes = pending_gpu_writes()[self];
+    if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
+    ReleaseSRWLockExclusive(&pending_writes_lock);
+}
+
+// X2W_D3D12_LINEAR_BUFFERS: a copied linear buffer that a recorded copy writes keeps the GPU's bytes once
+// `self` is submitted, and is no longer refreshed from its title memory from then on (linear_buffer_backing.h).
+// Until then the write is pending on the recording: Reset or a failed Close drops it with the texture writes.
+void note_linear_gpu_write(Wrapper* self, const CopyEndpoint& destination)
+{
+    if (!destination.wrapper || !destination.wrapper->own().title_memory ||
+        x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off)
+        return;
+    if (x2w_startup::linear_detail::mutant("gpuw-at-record")) {
+        // Mutant: the backing changes at recording, so a discarded recording still stops its refreshes.
+        linear_buffers().note_gpu_write(destination.resource);
+        return;
+    }
+    AcquireSRWLockExclusive(&pending_writes_lock);
+    auto& writes = pending_linear_writes()[self];
     if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
     ReleaseSRWLockExclusive(&pending_writes_lock);
 }
@@ -218,6 +250,7 @@ void __stdcall list_copy_buffer_region(Wrapper* self, u64 destination, u64 desti
         note_mesh_xmem_write(self, to.wrapper, destination_offset, bytes, 15, source_kind,
                              srv_word || mesh_record ? from.resource : nullptr, source_offset);
     }
+    note_linear_gpu_write(self, to);
     if (indirect_copy_ranges()) {
         const auto* info = to.wrapper ? resource_info(to.wrapper) : nullptr;
         note_copy_gpu_range(self, to.resource, destination_offset, bytes, authoritative && info &&
@@ -247,6 +280,7 @@ void __stdcall list_copy_resource(Wrapper* self, u64 destination, u64 source)
     if (to_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         note_mesh_xmem_write(self, to.wrapper, 0, to_desc.Width, 17, "buffer");
         note_copy_gpu_range(self, to.resource, 0, to_desc.Width, false);
+        note_linear_gpu_write(self, to);
     } else mark_gpu_written(self, to);
     InterlockedIncrement(&list_resource_copies);
 }

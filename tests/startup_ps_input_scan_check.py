@@ -199,11 +199,23 @@ def unit_checks():
         (['exp mrt0 off, off, v6, v7 done vm'], [6, 7]),
         (['exp mrt0 v5, v6, v7, v8 done vm'], [5, 6, 7, 8]),
         (['v_cmpx_lt_f32_sdwa v1, v2 src0_sel:WORD_0 src1_sel:WORD_1'], [1, 2]),
+        # Accumulating forms read their destination; v_writelane_b32 keeps the other lanes of it.
+        (['v_fmac_f32_e64 v2, v0, v1'], [0, 1, 2]),
+        (['v_writelane_b32 v2, s0, 1'], [2]),
+        (['v_mov_b32_e32 v2, 0', 'v_fmac_f32_e32 v2, v0, v1'], [0, 1]),
     )
     for asm, live in cases:
         got = sorted(S.contract_of_decoded(lines(*asm)).live_in)
         assert got == live, (asm, got, live)
     print('destination rule: %d decoded-text cases' % len(cases))
+
+    # The same on gfx1013 VOP2 encodings: an accumulator that was never written is a live-in register.
+    accumulators = ((0x1f, 'v_mac_f32_e32'), (0x2b, 'v_fmac_f32_e32'), (0x06, 'v_mac_legacy_f32_e32'),
+                    (0x36, 'v_fmac_f16_e32'), (0x3c, 'v_pk_fmac_f16'))
+    for op, name in accumulators:
+        code = shader((w(vop2(op, 2, 1, v(0))), '%s v2, v0, v1' % name), exp(2, 2, 2, 2))
+        assert sets(contract_of(code)) == ([0, 1, 2], [], []), (name, sets(contract_of(code)))
+    print('accumulator rule: %d encoded forms read their destination' % len(accumulators))
 
     # A flow the text cannot resolve makes every written-later first read ambiguous.
     for flow in ('s_setpc_b64 s[2:3]', 's_branch 0x4', 's_cbranch_join s2'):

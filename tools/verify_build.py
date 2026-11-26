@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -69,7 +70,7 @@ def decode_torrent(data):
 
 def inventory(root):
     files = {}
-    for path in root.rglob("*"):
+    for path in sorted(root.rglob("*")):
         if path.is_file():
             name = path.relative_to(root).as_posix()
             stat = path.stat()
@@ -179,7 +180,15 @@ def compare_layout(path, payload, disk):
     }
 
 
-def main(argv=None):
+def _write_json_atomic(destination: Path, payload: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=destination.parent) as staging_dir:
+        staged = Path(staging_dir) / destination.name
+        staged.write_text(payload, encoding="utf-8")
+        os.replace(staged, destination)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--output", type=Path)
@@ -188,12 +197,16 @@ def main(argv=None):
         root = args.directory.resolve(strict=True)
     except OSError as exc:
         parser.error(f"cannot read {args.directory}: {exc.strerror or exc}")
-    destination = args.output or Path(__file__).resolve().parents[1] / "out" / "integrity" / (root.name + ".json")
+    if not root.is_dir():
+        parser.error(f"not a directory: {args.directory}")
+    destination = args.output if args.output is not None else Path(__file__).resolve().parents[1] / "out" / "integrity" / (root.name + ".json")
     if destination.resolve().is_relative_to(root):
         parser.error("Choose an output outside the input directory")
+    if destination.exists() and destination.is_dir():
+        parser.error(f"Output path is an existing directory: {destination}")
 
     def manifest(pattern: str) -> Path:
-        matches = [path for path in root.glob(pattern) if path.is_file()]
+        matches = [path for path in sorted(root.glob(pattern)) if path.is_file()]
         if len(matches) != 1:
             parser.error(f"expected exactly one {pattern} file in {root}, found {len(matches)}")
         return matches[0]
@@ -214,7 +227,10 @@ def main(argv=None):
             raise ValueError("Invalid torrent file list or piece length")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.error(f"{torrent.name} is not a readable multi-file torrent: {type(exc).__name__}: {exc}")
-    before = inventory(root)
+    try:
+        before = inventory(root)
+    except OSError as exc:
+        parser.error(f"cannot scan {root}: {exc}")
     sizes = {p: stat[0] for p, stat in before.items()}
     missing = sorted(payload - sizes.keys())
     wrong_size = [row | {"disk_bytes": sizes[row["path"]]} for row in entries
@@ -236,15 +252,17 @@ def main(argv=None):
         report["pieces"] = verify_pieces(root, entries, sizes, piece_length, hashes)
     except ValueError as exc:
         parser.error(f"{torrent.name} is not a readable multi-file torrent: {exc}")
-    after = inventory(root)
-    changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
-    report["changed_during_verification"] = changed
-    report["torrent_payload_passed"] = not (missing or wrong_size or report["pieces"]["issues"] or changed)
-    report["finished_utc"] = datetime.now(timezone.utc).isoformat()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    temporary.replace(destination)
+    except OSError as exc:
+        parser.error(f"cannot verify torrent pieces: {exc}")
+    try:
+        after = inventory(root)
+        changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+        report["changed_during_verification"] = changed
+        report["torrent_payload_passed"] = not (missing or wrong_size or report["pieces"]["issues"] or changed)
+        report["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        _write_json_atomic(destination, json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    except (OSError, ValueError) as exc:
+        parser.error(f"cannot write report {destination}: {exc}")
     print(f"Payload passed: {report['torrent_payload_passed']} | Report: {destination}", flush=True)
     return 0 if report["torrent_payload_passed"] else 1
 

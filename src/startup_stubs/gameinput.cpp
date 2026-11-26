@@ -35,6 +35,7 @@ constexpr HRESULT reading_too_old = static_cast<HRESULT>(0x838A0004);
 constexpr std::uint32_t kind_keyboard = 0x00000010;
 constexpr std::uint32_t kind_gamepad = 0x00040000, kind_controller_bits = 0x0000000E;
 constexpr std::uint32_t status_connected = 0x47;  // connected, input enabled, output enabled, synchronized
+constexpr std::uint32_t family_xbox_one = 1;      // GameInputFamilyXboxOne (GameInputDeviceFamily)
 constexpr std::size_t max_keys = 32;
 constexpr std::size_t history_capacity = 64;
 
@@ -859,7 +860,9 @@ void build()
     std::memcpy(device_info + 4, ids, 4);
     for (int i = 0; i < 32; ++i) device_info[0x20 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceId
     for (int i = 0; i < 32; ++i) device_info[0x40 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceRootId
-    const std::uint32_t tail[4] = {2 /* family: Xbox One */, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
+    // GameInputDeviceFamily: Virtual -1, XboxOne 1 (XboxGIP / XInputHID), Xbox360 2 (XUSB22), Hid 3, I8042 4. The
+    // vendor/product above name an Xbox Series pad, a GIP device, so the family is XboxOne.
+    const std::uint32_t tail[4] = {family_xbox_one, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
     std::memcpy(device_info + 0x60, tail, sizeof(tail));
     // Virtual keyboard device info.
     std::memcpy(keyboard_device_info, &size, 4);
