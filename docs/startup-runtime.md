@@ -2792,20 +2792,24 @@ hardware or driver glitch count.
 
 ## APU heap stand-in
 
-With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` commits. The
-heap is a first-fit free list in a static table of 4096 extents, guarded by one lock. `ApuFree` gives a
-block back and merges it with free neighbours, so streaming code that allocates and frees repeatedly no
-longer exhausts the heap. While nothing has been freed the offsets are the ones a bump allocator hands out.
+With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` reserves
+(`MEM_RESERVE`, 0 bytes committed up front). The heap is a first-fit free list in a static table of 4096
+extents, guarded by one lock. `ApuAlloc` commits the 4 KiB page span covering the allocated block on demand
+(`MEM_COMMIT`), rolling back the free-list change and returning `E_OUTOFMEMORY` if commit fails. `ApuFree`
+gives a block back, merges it with free neighbours, and decommits strictly interior 4 KiB pages
+(`[ceil_page(free_begin), floor_page(free_end))` via `MEM_DECOMMIT`) so partial boundary pages shared with
+live neighbours stay committed and streaming code that allocates and frees repeatedly no longer exhausts the
+heap or commit charge. While nothing has been freed the offsets are the ones a bump allocator hands out.
 
 - A block is aligned in address (a power of two, 16 at least; 0, anything below 16 and a value that is not a power of two
   all mean 16). Size and alignment are 32 bits. `ApuCreateHeap` creates and publishes the heap under one lock, so
   competing first calls cannot reset a heap that already has live blocks. A heap whose 64 KiB-rounded size
-  exceeds 4 GiB is refused with `E_INVALIDARG` without committing memory, so every block fits the APU range.
+  exceeds 4 GiB is refused with `E_INVALIDARG` without reserving or committing memory, so every block fits the APU range.
 - Null or non-writable output (`virtual_address` or optional `apu_address`) is `E_POINTER` without
-  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, or a full extent table is
-  `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
+  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, a full extent table, or a failed
+  page commit is `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
   and writes null to the virtual-address output when writable.
-- A block that is reused is zeroed, as fresh heap memory is.
+- A block that is reused is zeroed, as fresh heap memory is (including still-committed shared boundary pages).
 - `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
   already freed) is `E_INVALIDARG` and changes nothing.
 - `ApuIsVirtualAddressValid` and the two map calls read the published heap bounds under the heap lock and
@@ -2816,7 +2820,9 @@ The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4)
 rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
 check loads the stub, checks non-permissive traps, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment,
 coalescing, every refused call, shape-context allocation and partial-failure rollback, `AcpHalCreate`, and the
-address validity/mapping exports, then runs 4 threads of 1000 rounds against an interval map of live blocks:
+address validity/mapping exports, runs 4 threads of 1000 rounds against an interval map of live blocks, and
+verifies on-demand commit, interior-page decommit, shared-boundary-page preservation, and commit-failure
+rollback against `GetProcessMemoryInfo().PagefileUsage` and `VirtualQuery` in a 64 MiB heap:
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
