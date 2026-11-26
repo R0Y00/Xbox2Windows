@@ -8211,7 +8211,7 @@ class Stage:
         self.set_v(d, '%s | (%s << 16)' % tuple(lanes))
 
     def op_v_pk_mul_f16(self, ops, mods):
-        self.packed_half('v_pk_mul_f16', 2, '{0} * {1}', ops, mods)
+        self.packed_half('v_pk_mul_f16', 2, 'mul16({0}, {1})', ops, mods)
 
     def op_v_pk_add_f16(self, ops, mods):
         self.packed_half('v_pk_add_f16', 2, '{0} + {1}', ops, mods)
@@ -8952,7 +8952,7 @@ VEC_F = {
 # zero, saturate to the 16-bit range and read NaN as 0.
 VEC_H = {
     'v_add_f16': (2, 'h', '{0} + {1}', 'h'), 'v_sub_f16': (2, 'h', '{0} - {1}', 'h'),
-    'v_subrev_f16': (2, 'h', '{1} - {0}', 'h'), 'v_mul_f16': (2, 'h', '{0} * {1}', 'h'),
+    'v_subrev_f16': (2, 'h', '{1} - {0}', 'h'), 'v_mul_f16': (2, 'h', 'mul16({0}, {1})', 'h'),
     'v_min_f16': (2, 'h', 'min({0}, {1})', 'h'), 'v_max_f16': (2, 'h', 'max({0}, {1})', 'h'),
     'v_fmac_f16': (2, 'h', 'fma16o({0}, {1}, {2})', 'h'), 'v_fmamk_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
     'v_fmaak_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
@@ -9458,6 +9458,8 @@ class Pipeline:
                # zero despite `precise`, so ties rounded the wrong way. fma16_rne works on the encodings in 32-bit integer
                # arithmetic, so no driver floating-point rewrite can reach it. Infinities and NaNs keep float semantics.
                pixel_aot.SALU_HELPERS['fma16_rne'],
+               # A binary16 product is exact in binary32. Keep its sign when the result is zero (#2746).
+               'float mul16(float a, float b) { precise float product = a * b; return product; }',
                'float fma16o(float a, float b, float c) {',
                '    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) return a * b + c;',
                '    return f16tof32(fma16_rne(f32tof16(a), f32tof16(b), f32tof16(c)));',
@@ -10045,7 +10047,7 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
     SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
     signature and input layout but different masks are then two requests with their own results. Without a
     description the key is unchanged."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-22'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-23'))))
     key = fnv(layout, key) if layout else key
     return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
@@ -10055,7 +10057,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-22cs')
+    key = fnv(b'x2w-startup-shader-23cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key

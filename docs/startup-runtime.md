@@ -208,7 +208,8 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-Graphics and compute use cache revisions `x2w-startup-shader-22` and `x2w-startup-shader-22cs`.
+Graphics and compute use cache revisions `x2w-startup-shader-23` and `x2w-startup-shader-23cs`.
+Revision 23 preserves the sign of zero in binary16 multiply, including the packed and SDWA forms.
 Revision 22 invalidates compute shaders that assumed the entry EXEC mask at a load reached on a later
 loop iteration after an EXEC write. The two cache keys advance together.
 Revision 21 refuses a compute lane-mask form that revision 20 translated (`s_and_b32 M, X, exec_lo` with X data).

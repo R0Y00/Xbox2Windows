@@ -587,6 +587,14 @@ def controls():
               all(pk_lane_ok(pk_parse(key)[1], x[:pk_parse(key)[2]], *pk_parse(key)[4][i % 4], pk_parse(key)[3])
                   for i, x in enumerate(DRAW[key])))
     if BODY_WORDS:
+        # Non-precise multiplication can lose -0 on RDNA 4 while giving the expected word elsewhere.
+        # Check the qualifier and its use even when this host's driver preserves both forms.
+        products = (('plain', translate('v_mul_f16'), 4),
+                    ('packed', translate('v_pk_mul_f16:lo:0'), 8),
+                    ('SDWA', sdwa_draw_text(next(cfg for cfg in SDWA_DRAW if cfg[0] == 'v_mul_f16')), 4))
+        for form, text, count in products:
+            check('%s binary16 multiply preserves its zero sign' % form,
+                  'precise float product = a * b; return product;' in text and text.count('f16rn(mul16(') == count)
         for op in (*OPS, *PK_KEYS):
             try:
                 text = translate(op)

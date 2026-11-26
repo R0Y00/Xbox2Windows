@@ -92,6 +92,7 @@ def run(asm, regs):
     dst, expr = re.fullmatch(r'(v\d+) = (.*);', s.lines[0]).groups()
     env = {f'v{i}': v for i, v in enumerate(regs)}
     env.update(
+        mul16=lambda a, b: a * b,
         f16tof32=lambda x: h2f(x), fma16o=fma16o, f16rn=lambda x: 0x7e00 if math.isnan(x) else (f2h(x) if abs(x) < 65520.0 else (0xfc00 if x < 0 else 0x7c00)), asuint=lambda x: x, saturate=lambda x: min(max(x, 0.0), 1.0),
         abs=abs, min=min, max=max, clamp=lambda x, lo, hi: min(max(x, lo), hi),
         trunc=lambda x: float(int(x)), isnan=math.isnan,
