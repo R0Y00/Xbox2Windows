@@ -3697,6 +3697,12 @@ class Stage:
         low, high = tags
         self.tag_compare_pair(base, ops)
         saveexec = base.startswith('s_') and 'saveexec' in base
+        if MASK_COPY_SALU_RE.match(base) and not (low or high):
+            # a copy of plain data: the destination no longer holds a lane mask, whatever an earlier path or join left
+            for tok in destinations(base, ops):
+                r = reg_range(tok)
+                if r and r[0] == 's':
+                    self.masks.difference_update(range(r[1], r[2] + 1))
         scalar = bool(MASK_COPY_SALU_RE.match(base)) and (low or high)
         pair_select = base.startswith('s_cselect') and base.endswith('b64')
         if not (saveexec or scalar or pair_select):

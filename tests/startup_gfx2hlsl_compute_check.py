@@ -971,6 +971,21 @@ def check_lane_mask_compare_pair():
     translate('A', code=splice_words(bytes.fromhex('05810781'), bytes.fromhex('040084d491000200'))).hlsl_cs()
 
 
+def check_lane_mask_copy_of_data_clears_tag():
+    """A copy of plain data into a register that held a lane mask on an earlier path (a loop back edge) leaves no mask tag:
+    `s_load` through that pair is not a read of a mask. A copy of the mask itself is refused too."""
+    loop = bytes.fromhex('0e00c4d483000200'   # v_cmp_gt_u32 s14, 3, v0
+                         '800394be'           # s_mov_b32 s20, 0
+                         '06038ebe'           # L: s_mov_b32 s14, s6  (the table pointer)
+                         '80038fbe'           # s_mov_b32 s15, 0
+                         '070608f4000000fa'   # s_load_dwordx4 s[24:27], s[14:15], 0x0
+                         '7fc08cbf' '14811481' '14830abf'   # s_waitcnt; s_add_i32 s20, s20, 1; s_cmp_lt_u32 s20, 3
+                         'f7ff85bf')          # s_cbranch_scc1 L
+    translate('A', code=splice_words(loop)).hlsl_cs()
+    mask_copy = loop.replace(bytes.fromhex('06038ebe'), bytes.fromhex('0e038ebe'))   # s_mov_b32 s14, s14: the mask itself
+    refused('s_load through s14', lambda: translate('A', code=splice_words(mask_copy)).hlsl_cs())
+
+
 def check_lane_mask_high_word_copy_and_overwrite():
     """A copy of a mask's high word is itself only a high word (no low-word tag, so no '& 1' on a numeric use in a one-thread
     group), and a wide write over a tagged pair ends the tag (no false refusal of the new value)."""
@@ -1295,6 +1310,7 @@ def check_controls():
     check_lane_mask_data()
     check_lane_mask_high_word()
     check_lane_mask_compare_pair()
+    check_lane_mask_copy_of_data_clears_tag()
     check_lane_mask_single_thread_group()
     check_lane_mask_high_word_copy_and_overwrite()
     check_lane_mask_derived_word()
