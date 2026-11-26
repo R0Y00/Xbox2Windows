@@ -101,8 +101,10 @@ FIXTURES = {
                + SAMPLE + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(-3, 8), Fraction(5, 8)), -1),
     'kill': (PROLOGUE + CMPX + 's_cbranch_execnz BB1\ns_endpgm\nBB1:\n' + SUB + SAMPLE + EXPORT,
              (Fraction(-3, 8), Fraction(5, 8)), -1),
-    'inside_y': (PROLOGUE + 'v_lshrrev_b32_e32 v7, 16, v0\nv_cmp_eq_u32_e32 vcc, 0, v7\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n' + SUB
-                 + SAMPLE + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(-3, 8), Fraction(5, 8)), -1),
+    # u is the same in every lane and v = 0.25 + 0.5 * y, so the LOD comes from the vertical derivative alone; only the row
+    # y == 0 enters the block. (u0, u1) is (u of the drawn pixel, u + the footprint along y): 4 * 0.5 = 2, LOD 1 - 1 = 0.
+    'inside_y': (PROLOGUE + 'v_mov_b32_e32 v2, 0x3e000000\nv_lshrrev_b32_e32 v7, 16, v0\nv_cvt_f32_u32_e32 v6, v7\nv_mul_f32_e32 v6, 0.5, v6\nv_add_f32_e32 v3, 0x3e800000, v6\nv_cmp_eq_u32_e32 vcc, 0, v7\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\nv_mov_b32_e32 v14, 0\n'
+                 + SAMPLE + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(1, 8), Fraction(5, 8)), -1),
     'uni_loop': (PROLOGUE + 's_mov_b32 s30, 2\nBB1:\n' + SAMPLE + SUB + 's_add_i32 s30, s30, -1\ns_cmp_lg_u32 s30, 0\n'
                  's_cbranch_scc1 BB1\n' + EXPORT, (Fraction(-3, 8), Fraction(1, 8)), -1),
 }
@@ -152,15 +154,16 @@ REFUSED = {
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
+    'inside_y': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003ef302027eff02067e0000803e0902087eff02047e0000003e90000e2c070d0c7ef00c0c10ff0c'
+        '06060000803e800e847d6a2480be040088bf80021c7e7fc08cbf280f94f0010ac4007e00fe88703f8cbf0f1800f80a0b0c'
+        '0d000081bf'
+    ),
     'exec_lo_const': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
         '121210ff1204060000003ef302027eff02067e0000803e0902087ec103febef10404067fc08cbf280f94f0010ac400703f'
         '8cbf0f1800f80a0b0c0d000081bf'
-    ),
-    'inside_y': (
-        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
-        '121210ff1204060000003ef302027eff02067e0000803e0902087e90000e2c800e847d6a2480be040088bff10404067fc0'
-        '8cbf280f94f0010ac4007e00fe88703f8cbf0f1800f80a0b0c0d000081bf'
     ),
     'restore_helper': (
         '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff000008'

@@ -86,9 +86,10 @@ FIXTURES = {
                (Fraction(-3, 8), Fraction(5, 8))),
     'kill': (PROLOGUE + 'v_cmpx_eq_u32_e32 0, v8\ns_cbranch_execnz BB1\ns_endpgm\nBB1:\nv_add_f32_e32 v2, -0.5, v2\n'
              + QUERY + EXPORT, (Fraction(-3, 8), Fraction(5, 8))),
-    'inside_y': (PROLOGUE + 'v_lshrrev_b32_e32 v7, 16, v0\nv_cmp_eq_u32_e32 vcc, 0, v7\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\n'
-                 'v_add_f32_e32 v2, -0.5, v2\n' + QUERY + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT,
-                 (Fraction(-3, 8), Fraction(5, 8))),
+    # u is the same in every lane and v = 0.25 + 0.5 * y, so the LOD comes from the vertical derivative alone; only the row
+    # y == 0 enters the block. (u0, u1) is (u of the drawn pixel, u + the footprint along y): 4 * 0.5 = 2, LOD 1 - 1 = 0.
+    'inside_y': (PROLOGUE + 'v_mov_b32_e32 v2, 0x3e000000\nv_lshrrev_b32_e32 v7, 16, v0\nv_cvt_f32_u32_e32 v6, v7\nv_mul_f32_e32 v6, 0.5, v6\nv_add_f32_e32 v3, 0x3e800000, v6\nv_cmp_eq_u32_e32 vcc, 0, v7\ns_and_saveexec_b64 s[0:1], vcc\ns_cbranch_execz BB1\nv_mov_b32_e32 v14, 0\n'
+                 + QUERY + 'BB1:\ns_or_b64 exec, exec, s[0:1]\n' + EXPORT, (Fraction(1, 8), Fraction(5, 8))),
 }
 REFUSED = {
     # A constant 32-bit EXEC write is no more exact than a mask one: lanes 32..63 keep their old bits in wave64.
@@ -120,15 +121,16 @@ REFUSED = {
 }
 # llvm-mc-19 -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize64,-wavefrontsize32 of the label-resolved sources
 WORDS_HEX = {
+    'inside_y': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
+        '121210ff1204060000003eff02067e0000803e8002187e80021a7eff02047e0000003e90000e2c070d0c7ef00c0c10ff0c'
+        '06060000803e800e847d6a2480be040088bf80021c7e7fc08cbf080380f1020ac4007e00fe88703f8cbf0f1800f80a0b0c'
+        '0d000081bf'
+    ),
     'exec_lo_const': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
         '121210ff1204060000003eff02067e0000803e8002187e80021a7ec103febef10404067fc08cbf080380f1020ac400703f'
         '8cbf0f1800f80a0b0c0d000081bf'
-    ),
-    'inside_y': (
-        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0'
-        '121210ff1204060000003eff02067e0000803e8002187e80021a7e90000e2c800e847d6a2480be040088bff10404067fc0'
-        '8cbf080380f1020ac4007e00fe88703f8cbf0f1800f80a0b0c0d000081bf'
     ),
     'restore_helper': (
         '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff000008'
@@ -240,12 +242,11 @@ def mutants(name, hlsl):
     write = re.search(r'\n\s*if \(exec & 1\) v2 = U\((-0\.5|F\(0x3fc00000u\)) \+ F\(v2\)\);', hlsl)
     if name.startswith('join'):
         return [('without the branch write', hlsl.replace(write.group(0), ''))]
-    if name in ('cmpx', 'inside', 'kill', 'inside_y'):
-        out = [('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', '')))]
-        if name == 'inside_y':
-            # The row that is off in the vote's x direction (y = 1) is only seen through the vertical derivative.
-            out.append(('vote without the vertical derivative', hlsl.replace('abs(ddy_fine(row))', '0.0')))
-        return out
+    if name in ('cmpx', 'inside', 'kill'):
+        return [('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', '')))]
+    if name == 'inside_y':
+        # The row that is off (y = 1) is only seen through the vertical derivative of the vote.
+        return [('vote without the vertical derivative', hlsl.replace('abs(ddy_fine(row))', '0.0'))]
     return []
 
 
