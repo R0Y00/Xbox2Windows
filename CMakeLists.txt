@@ -3729,7 +3729,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: a plain image_sample past a uniform join keeps its implicit LOD (Sample, not level 0).
     add_test(NAME startup_image_sample_implicit_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_implicit_lod_check.py")
-    # Startup shader translator: image_get_lod on a 2D texture (CalculateLevelOfDetail / Unclamped).
+    # Startup shader translator: image_get_lod on 2D and 2D-array textures.
     add_test(NAME startup_gfx2hlsl_image_get_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_image_get_lod_check.py")
     foreach(adapter IN ITEMS warp hardware)

@@ -15090,6 +15090,15 @@ The two adapters and WARP [measured on the desktop](https://github.com/R0Y00/Xbo
 differed at exact half-mip boundaries with point mip filtering. The regression uses linear
 filtering for the fractional lower clamp. Native console readback remains open.
 
+The same startup lowering admits 2D arrays with three guest address registers.
+DXIL `CalculateLOD` takes just the two spatial coordinates for a `Texture2DArray`;
+the slice is not part of the level calculation. The portable controls verified
+both dimensions, including a non-sequential address with a different slice register,
+and retained the existing derivative, sampler and mask refusals.
+The array-view fixture compares raw translated and direct HLSL readbacks for
+two encoded slice values and two gradients against the independent LOD reference.
+The array GPU lane was not run on Apple Silicon.
+
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_image_get_lod_view_' -V
 ```

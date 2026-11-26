@@ -7274,13 +7274,15 @@ class Stage:
                     raise Unsupported('image_sample_b with a per-lane bias past a divergent EXEC')
                 bias, cs = cs[0], cs[1:]
         if how == 'get_lod':
-            # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
-            # (Mesa nir_texop_lod, which ACO emits as image_get_lod; GLSL textureQueryLod x/y). Only the 2D form with
-            # two address registers and dmask 0x1-0x3 is lowered; the cache-policy bits are the only other modifiers.
+            # Mesa nir_texop_lod returns the clamped LOD followed by the computed LOD.
+            # DXIL CalculateLOD uses only spatial coordinates, including on Texture2DArray;
+            # the guest array form still consumes a third address register for the slice.
             for m in mods:
                 if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
                     raise Unsupported('image_get_lod modifier %s' % m)
-            if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
+            want_addr = 3 if dim == 'SQ_RSRC_IMG_2D_ARRAY' else 2
+            if (self.kind != 'ps' or dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_2D_ARRAY') or
+                    not dmask or dmask & ~3 or len(cs) != want_addr):
                 raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
             # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
             if not self.derivative_exec_ok() or not getattr(self, 'uniform_cf', True):
@@ -7377,7 +7379,7 @@ class Stage:
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
             elif one:
                 uv = self.f(cs[0])
-            elif three:
+            elif three and how != 'get_lod':
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
                 uv = 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1]))
@@ -7398,8 +7400,7 @@ class Stage:
                 # sample_b_sampler.
                 call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
             elif how == 'get_lod':
-                # HLSL CalculateLevelOfDetail (clamped) and CalculateLevelOfDetailUnclamped (SM 4.1+). Which clamps
-                # each side applies besides the sampler's (the view's mip range) is assumed to agree.
+                # The view mip-range clamp is assumed to agree on both sides.
                 call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
                     tex, smp, uv, tex, smp, uv)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps':
