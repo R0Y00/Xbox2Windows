@@ -5504,6 +5504,42 @@ class Stage:
         # FF1 reports its index and leaves SCC unchanged.
         self.set_s(dst[1], '0u', ('const', 0))
 
+    def op_s_abs_i32(self, ops, mods):
+        """Signed absolute value; SCC = result != 0 (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot: D = asint(S0) < 0 ? (0u - S0) : S0 (INT_MIN stays).
+        Lane masks and descriptor-bearing SGPRs are refused so a projected bit is not treated
+        as a full signed word.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_abs_i32 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_abs_i32 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_abs_i32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        src_sym = None
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('s_abs_i32 source %s' % ops[1])
+            if self.is_lane_mask(ops[1]) or src[1] in self.masks:
+                raise Unsupported('s_abs_i32 on a lane mask')
+            src_sym = self.sym.get(src[1])
+            if src_sym and src_sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('s_abs_i32 on %s data' % src_sym[0])
+            value = src_sym[1] & 0xffffffff if src_sym and src_sym[0] == 'const' else None
+        if value is not None:
+            folded = (-value if value & 0x80000000 else value) & 0xffffffff
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            return None
+        expr = '(asint(%s) < 0 ? (0u - %s) : %s)' % ((self.u(ops[1]),) * 3)
+        self.set_s(dst[1], expr, scc='$ != 0')
+        return None
+
     # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
     def op_x2w_mesh_lane0(self, ops, mods):
         # `s_mov_b64 exec, 1` leaves lane 0 of each wave running. The saved copy of that mask is not modelled.
