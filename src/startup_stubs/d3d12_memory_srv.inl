@@ -548,6 +548,8 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
     note_resource(resource, &desc, bytes);
     tiled_srv_textures.emplace(resource, TiledAddressTexture{device, resource, desc, {}});
     tiled_srv_addresses.emplace(address, resource);
+    // address_resource_overlap reads tiled_address_srv: a buffer refused for overlap may be publishable now.
+    x2w_startup::note_placement_change();
     return resource;
 }
 
@@ -679,10 +681,12 @@ x2w_startup::SrvRefusalCache& buffer_refusal_cache()
     return cache;
 }
 
-x2w_startup::SrvRefusalKey buffer_refusal_key(const D3D12_RESOURCE_DESC& resource, const MemoryShaderResourceView& input, u64 span_bytes)
+x2w_startup::SrvRefusalKey buffer_refusal_key(const Wrapper* device, const D3D12_RESOURCE_DESC& resource,
+                                              const MemoryShaderResourceView& input, u64 span_bytes)
 {
     const auto& view = input.view;
     x2w_startup::SrvRefusalKey key;
+    key.device = reinterpret_cast<u64>(device);
     key.address = input.address;
     key.span_bytes = span_bytes;
     key.view_a = (u64{static_cast<UINT>(view.Format)} << 32) | (u64{static_cast<UINT>(view.ViewDimension)} << 16) | view.Shader4ComponentMapping;
@@ -733,7 +737,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
-        const auto refusal_key = buffer_refusal_key(*resource, *input, span_bytes);
+        const auto refusal_key = buffer_refusal_key(self, *resource, *input, span_bytes);
         const auto refusal_stamp = buffer_refusal_stamp(input->address);
         if (buffer_refusal_cache().hit(refusal_key, refusal_stamp, GetTickCount64())) {
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,

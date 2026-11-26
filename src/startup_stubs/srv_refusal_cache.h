@@ -40,6 +40,7 @@ inline void note_placement_change()
 }
 
 struct SrvRefusalKey {
+    std::uint64_t device = 0;      // the device wrapper: every placement lookup is per device
     std::uint64_t address = 0;
     std::uint64_t span_bytes = 0;
     std::uint64_t view_a = 0;      // format, dimension, component mapping
@@ -49,7 +50,7 @@ struct SrvRefusalKey {
     std::uint64_t resource_b = 0;  // width
     bool operator==(const SrvRefusalKey& o) const
     {
-        return address == o.address && span_bytes == o.span_bytes && view_a == o.view_a && view_b == o.view_b &&
+        return device == o.device && address == o.address && span_bytes == o.span_bytes && view_a == o.view_a && view_b == o.view_b &&
                view_c == o.view_c && resource_a == o.resource_a && resource_b == o.resource_b;
     }
 };
@@ -114,7 +115,7 @@ private:
     static std::size_t slot(const SrvRefusalKey& k)
     {
         std::uint64_t h = 1469598103934665603ull;
-        for (std::uint64_t v : {k.address, k.span_bytes, k.view_a, k.view_b, k.view_c, k.resource_a, k.resource_b})
+        for (std::uint64_t v : {k.device, k.address, k.span_bytes, k.view_a, k.view_b, k.view_c, k.resource_a, k.resource_b})
             h = (h ^ v) * 1099511628211ull;
         return static_cast<std::size_t>((h ^ (h >> 32)) % kSlots);
     }

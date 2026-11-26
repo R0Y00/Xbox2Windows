@@ -4,6 +4,7 @@
 // --mutate generation: expect a changed placement generation to still hit.
 // --mutate commit: expect a changed committed-byte count of the allocation to still hit.
 // --mutate key: expect a different view to hit an entry noted for another view.
+// --mutate device: expect the same request on another device to hit an entry noted for the first device.
 // --mutate age: expect an entry older than the age limit to still hit.
 // --mutate hits: expect an entry used more than the hit limit to still hit.
 // --mutate invalid: expect a stamp that could not be read to be cached.
@@ -33,6 +34,7 @@ void check(const char* name, bool condition)
 x2w_startup::SrvRefusalKey request(std::uint64_t address, std::uint64_t first_element)
 {
     x2w_startup::SrvRefusalKey key;
+    key.device = 0x5000;
     key.address = address;
     key.span_bytes = 0x4000;
     key.view_a = 0x1234;
@@ -99,6 +101,11 @@ int main(int argc, char** argv)
         const bool other_view = cache.hit(request(0x7000001000ull, 8), stamp(5, 0x1000), 110);
         check("another view of the same address misses", mutated("key") ? other_view : !other_view);
         check("another address misses", !cache.hit(request(0x7000002000ull, 0), stamp(5, 0x1000), 110));
+        auto other_device = request(0x7000001000ull, 0);
+        other_device.device += 0x100;
+        const bool device_hit = cache.hit(other_device, stamp(5, 0x1000), 110);
+        check("the same request on another device misses (placement lookups are per device)",
+              mutated("device") ? device_hit : !device_hit);
         auto wider = request(0x7000001000ull, 0);
         wider.span_bytes += 4;
         check("another span misses", !cache.hit(wider, stamp(5, 0x1000), 110));
