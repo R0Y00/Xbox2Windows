@@ -153,29 +153,16 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
 }
 
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
-// no-access page in between. Walks the regions one VirtualQuery at a time, so a destination that spans
-// regions of different protection is judged page by page. Nothing is written or touched.
+// no-access page in between. Probes one byte per page with a value-preserving write (probe_writable), so
+// a refusal changes no byte and a tripped guard page is re-armed. Not VirtualQuery: on the title's large
+// regions each query walks the whole region, which cost one storage thread ~20 s of kernel time per load.
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
-    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
-    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - start) return false;
     x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
-    const std::uintptr_t end = cursor + bytes;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
-            return false;
-        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-        const DWORD protect = info.Protect & 0xFF;
-        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
-            protect != PAGE_EXECUTE_WRITECOPY)
-            return false;
-        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
-        if (region_end <= cursor) return false;
-        cursor = region_end;
-    }
-    return true;
+    return x2w_local::probe_writable(start, bytes) == bytes;
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.

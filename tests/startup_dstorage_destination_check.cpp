@@ -33,7 +33,7 @@ using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
 constexpr unsigned page = 4096;
 constexpr unsigned pages = 3;
 constexpr unsigned bytes = pages * page;
-constexpr unsigned cases = 12;
+constexpr unsigned cases = 13;
 unsigned char source[bytes];
 int failures;
 
@@ -84,6 +84,14 @@ unsigned char* fresh_region()
     return region;
 }
 
+// A guard page the check tripped must be armed again afterwards; other protections are not checked here.
+bool guard_kept(const unsigned char* at, DWORD protect)
+{
+    if (!(protect & PAGE_GUARD)) return true;
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(at, &info, sizeof(info)) && (info.Protect & PAGE_GUARD);
+}
+
 // Refusal: the middle page, or the last, is made unusable in the way `how` names.
 void refused(const char* name, DWORD protect, bool decommit_last)
 {
@@ -100,6 +108,7 @@ void refused(const char* name, DWORD protect, bool decommit_last)
     // The page the case changed is not read (a guard or no-access page would trip the check itself).
     else if (!untouched(region, 0, page)) fail(name, "first page was written");
     else if (!decommit_last && !untouched(region, 2 * page, bytes)) fail(name, "last page was written");
+    else if (!guard_kept(region + page, protect)) fail(name, "guard page lost its guard bit");
     else std::printf("ok: %s refused, bytes before the bad page intact\n", name);
     VirtualFree(region, 0, MEM_RELEASE);
 }
@@ -141,6 +150,16 @@ int main(int argc, char** argv)
     else if (std::memcmp(region, source, bytes) != 0) fail("writable control", "bytes differ");
     else std::printf("ok: writable control after the refusals wrote every byte\n");
     VirtualFree(region, 0, MEM_RELEASE);
+
+    // The check probes every page of the declared capacity; past the data it must leave each byte as it was.
+    unsigned char* roomy = fresh_region();
+    if (!roomy) return 1;
+    const long roomy_hr = run_request(roomy, bytes, page);
+    if (roomy_hr != 0) fail("capacity past the data", "request failed");
+    else if (std::memcmp(roomy, source, page) != 0) fail("capacity past the data", "data bytes differ");
+    else if (!untouched(roomy, page, bytes)) fail("capacity past the data", "a byte past the data changed");
+    else std::printf("ok: capacity past the data wrote the data, later bytes unchanged\n");
+    VirtualFree(roomy, 0, MEM_RELEASE);
 
     // Copy-on-write destination (PAGE_WRITECOPY) is also allowed and must succeed.
     HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, bytes, nullptr);
