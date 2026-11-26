@@ -310,6 +310,8 @@ view it held before. That view would still be bindable and would be copied by `C
 although the slot's record no longer keeps its resource alive. Translated draws already resolve the
 slot to nothing.
 
+A refused UAV, RTV or DSV leaves the previous descriptor and its tracking record in place.
+
 The first of each are logged (`x2w-d3d12 Device::slot<n> view dimension ...`), and when a view still
 removes the device, its forwarded description and the resource's shape are logged
 (`removing view desc`). Run

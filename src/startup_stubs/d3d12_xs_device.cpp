@@ -4200,21 +4200,22 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             }
         }
     }
-    // A refused SRV leaves a null SRV in its destination: the skipped call would otherwise leave the slot's previous
-    // descriptor there, still bindable and copied by CopyDescriptors, while record_view(false) has already dropped the
-    // reference that kept its resource alive. The null takes the requested dimension where it is a texture one.
-    const auto clear_refused_srv = [&] {
+    // Replace a refused SRV in both the desktop heap and the descriptor record. A skipped UAV, RTV or DSV
+    // does not write a replacement to the desktop heap, so its previous descriptor record must stay live.
+    const auto refuse_view = [&] {
         if constexpr (N == 18) {
             UINT requested = D3D12_SRV_DIMENSION_TEXTURE2D;
             if (args[1] && x2w_local::readable(reinterpret_cast<const void*>(args[1]), 8))
                 std::memcpy(&requested, reinterpret_cast<const unsigned char*>(args[1]) + 4, sizeof(requested));
             const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = null_srv_desc(requested);
             device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+            record_view(false);
+        } else if constexpr (N == 17) {
+            record_view(false);  // Translated constant-buffer views use only the descriptor record.
         }
     };
     if (skip) {
-        record_view(false);
-        clear_refused_srv();
+        refuse_view();
         static LONG skipped;
         if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
         return 0;
@@ -4236,8 +4237,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             const auto actual = resource->GetDesc().Format;
             const auto verdict = x2w_startup::packed_view(mapped, actual, x2w_startup::packed_stand_in_of(resource));
             if (verdict == x2w_startup::PackedView::refused) {
-                record_view(false);
-                clear_refused_srv();
+                refuse_view();
                 static LONG refused;
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 Device::slot%d view skipped: packed format %d on a texture of format %d that does not stand in for it",

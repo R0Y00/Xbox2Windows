@@ -13,6 +13,7 @@
 //   (c) a slot that holds a valid view of a second texture (its colour is read first) receives a refused TEXTURE2D
 //       SRV of a buffer. The device is not removed and the slot reads zero: the refusal leaves a null SRV, not the
 //       old descriptor. A CopyDescriptorsSimple copy of the slot over another valid view reads zero too.
+//   (d) a refused UAV replacement leaves the prior descriptor and its title token intact.
 //
 // `off` is the negative control and needs X2W_D3D12_VIEW_DEFAULTS=off: (a) must then fail, printing
 // "FAIL: (a) default view reads 0.000 0.000 0.000 0.000 ... device not removed", and nothing else may fail.
@@ -384,6 +385,33 @@ int main(int argc, char** argv)
     if (!c.expect(2, nullptr, "(c) slot after the refused replacement", &failed)) return 4;
     invoke<void>(c.guest, 24, 1u, c.slot(3), c.slot(2), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (!c.expect(3, nullptr, "(c) copy of the refused slot", &failed)) return 4;
+
+    auto uav_desc = texture_desc;
+    uav_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const auto uav_texture = c.committed(uav_desc, "UAV texture");
+    if (!uav_texture) return 4;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    const auto uav_slot = c.slot(1);
+    invoke<void>(c.guest, 19, uav_texture.Get(), static_cast<IUnknown*>(nullptr), &uav, uav_slot);
+    if (!c.device_ok()) return 5;
+    std::array<std::uint32_t, 8> before{}, after{};
+    std::memcpy(before.data(), reinterpret_cast<const void*>(uav_slot), sizeof(before));
+    if (!before[0] || before[2] != 19) {
+        std::puts("FAIL: (d) no valid UAV token before the replacement");
+        return 4;
+    }
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    uav.Texture3D = {0, 0, 1};
+    invoke<void>(c.guest, 19, uav_texture.Get(), static_cast<IUnknown*>(nullptr), &uav, uav_slot);
+    std::memcpy(after.data(), reinterpret_cast<const void*>(uav_slot), sizeof(after));
+    if (after != before) {
+        std::puts("FAIL: (d) refused UAV replacement changed the live descriptor token");
+        failed = true;
+    } else {
+        std::puts("(d) refused UAV replacement kept the live descriptor token");
+    }
 
     if (!c.device_ok()) {
         std::puts("FAIL: device removed after the cases");
