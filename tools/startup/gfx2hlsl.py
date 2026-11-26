@@ -3780,6 +3780,13 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
+            elif (ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'quad_exec', False)
+                    and getattr(self, 'uniform_cf', False) and not getattr(self, 'lane_exec_breaks', None)):
+                # s_wqm exec, exec on a narrowed EXEC: every lane of a quad with an active lane turns on. Exact in the
+                # one-lane model as a vote of the four lanes' bits (the quad runs this statement together while
+                # uniform_cf holds and no lane's EXEC bit has already left the guest's).
+                self.emit('exec = x2w_quad_any(exec) ? 1u : 0u;')
+                self.uses_quad_vote = True
             elif hasattr(self, 'lane_exec_breaks'):
                 # Any other s_wqm is a no-op here, while the guest turns on the inactive lanes of every touched quad
                 # (or writes a whole-quad mask somewhere): a lane's EXEC bit may be 0 where the guest's is 1.

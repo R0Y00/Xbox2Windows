@@ -90,6 +90,9 @@ FIXTURES = {
     # still offers its address; nothing is drawn differently from the plain sample.
     'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + QUERY + EXPORT,
                 (Fraction(1, 8), Fraction(5, 8))),
+    # s_wqm exec, exec on a narrowed EXEC turns the whole quad back on (see tests/startup_image_sample_b_flow_check.py).
+    'wqm': (PROLOGUE + 'v_cmpx_eq_u32_e32 0, v8\ns_wqm_b64 exec, exec\nv_add_f32_e32 v2, -0.5, v2\n' + QUERY + EXPORT,
+            (Fraction(-3, 8), Fraction(1, 8))),
 }
 REFUSED = {
     'vcc_inside': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccz BB1\n' + QUERY + 'BB1:\n' + EXPORT,
@@ -142,6 +145,9 @@ WORDS_HEX = {
     ),
     'restore': (
         '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7e7e0cfe877fc08cbf080380f1020ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'wqm': (
+        '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7e8010a47d7e0afebef10404067fc08cbf080380f1020ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
 }
 CALL = ('t = float4(r0.CalculateLevelOfDetail(q0, float2(F(v2), F(v3))), '
@@ -199,6 +205,8 @@ def mutants(name, hlsl):
         return [('without the branch write', hlsl.replace(write.group(0), ''))]
     if name in ('cmpx', 'inside', 'kill'):
         return [('every lane writes u', hlsl.replace(write.group(0), write.group(0).replace('if (exec & 1) ', '')))]
+    if name == 'wqm':
+        return [('s_wqm as a no-op', hlsl.replace('exec = x2w_quad_any(exec) ? 1u : 0u;', ''))]
     return []
 
 
