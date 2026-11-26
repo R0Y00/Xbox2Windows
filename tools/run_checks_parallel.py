@@ -183,6 +183,9 @@ def main(argv=None) -> int:
         parser.error("the following arguments are required: scripts (or --from-dir)")
     try:
         scripts = [_validate_script_path(script) for script in args.scripts]
+        for number, script in enumerate(scripts):
+            if script in scripts[:number]:
+                raise ValueError(f"duplicate command-line script: {script}")
         checks = [([script], None) for script in scripts]
         if args.from_dir:
             checks = merge_checks(checks, args.from_dir)
