@@ -101,6 +101,10 @@ FIXTURES = {
              (Fraction(-3, 8), Fraction(5, 8)), -1),
     'uni_loop': (PROLOGUE + 's_mov_b32 s30, 2\nBB1:\n' + SAMPLE + SUB + 's_add_i32 s30, s30, -1\ns_cmp_lg_u32 s30, 0\n'
                  's_cbranch_scc1 BB1\n' + EXPORT, (Fraction(-3, 8), Fraction(1, 8)), -1),
+    # The exact mask saved before s_wqm and restored before the op (the usual compiled pixel shader): a cleared lane
+    # still offers its address; nothing is drawn differently from the plain sample.
+    'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + SAMPLE + EXPORT,
+                (Fraction(1, 8), Fraction(5, 8)), -1),
 }
 # name: (source, text of the refusal)
 REFUSED = {
@@ -179,6 +183,9 @@ WORDS_HEX = {
     ),
     'scalar_in_block': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087ef3039cbe8210847d6a2480be010088bf80039cbe7e00fe881c02027e7fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'restore': (
+        '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003ef302027eff02067e0000803e0902087e7e0cfe877fc08cbf280f94f0010ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
 }
 BRANCH = re.compile(r'^(s_c?branch\w*) (BB\d+)$')
@@ -260,7 +267,7 @@ def controls():
     for name, (_source, text) in REFUSED.items():
         refused(name, text)
     # The quad votes: the EXEC branches of inside, kill and join_pixel, one vote each; v_cmpx alone needs none.
-    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0)):
+    for name, votes in (('inside', 1), ('kill', 1), ('cmpx', 0), ('join_pixel', 1), ('join_helper', 1), ('scc', 0), ('restore', 0)):
         text = pipeline(name).hlsl_ps()
         assert text.count('x2w_quad_any(exec)') == votes, (name, text)
     # The gate is the vote's: with the EXEC rule of #2659 (the entry mask only) the divergent-EXEC fixtures are refused.

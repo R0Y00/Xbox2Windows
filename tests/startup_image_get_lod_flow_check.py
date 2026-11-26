@@ -86,6 +86,10 @@ FIXTURES = {
                (Fraction(-3, 8), Fraction(5, 8))),
     'kill': (PROLOGUE + 'v_cmpx_eq_u32_e32 0, v8\ns_cbranch_execnz BB1\ns_endpgm\nBB1:\nv_add_f32_e32 v2, -0.5, v2\n'
              + QUERY + EXPORT, (Fraction(-3, 8), Fraction(5, 8))),
+    # The exact mask saved before s_wqm and restored before the op (the usual compiled pixel shader): a cleared lane
+    # still offers its address; nothing is drawn differently from the plain sample.
+    'restore': ('s_mov_b64 s[12:13], exec\n' + PROLOGUE + 's_and_b64 exec, exec, s[12:13]\n' + QUERY + EXPORT,
+                (Fraction(1, 8), Fraction(5, 8))),
 }
 REFUSED = {
     'vcc_inside': (PROLOGUE + 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccz BB1\n' + QUERY + 'BB1:\n' + EXPORT,
@@ -135,6 +139,9 @@ WORDS_HEX = {
     ),
     'scalar_in_block': (
         '7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7ef3039cbe8210847d6a2480be010088bf80039cbe7e00fe881c02027e7fc08cbf080380f1020ac400703f8cbf0f1800f80a0b0c0d000081bf'
+    ),
+    'restore': (
+        '7e048cbe7e0afebe04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbeff001036ffff0000080d127ef0121210ff1204060000003eff02067e0000803e8002187e80021a7e7e0cfe877fc08cbf080380f1020ac400703f8cbf0f1800f80a0b0c0d000081bf'
     ),
 }
 CALL = ('t = float4(r0.CalculateLevelOfDetail(q0, float2(F(v2), F(v3))), '
