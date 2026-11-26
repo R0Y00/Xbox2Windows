@@ -1,18 +1,22 @@
 // Checks the negative cache of refused buffer memory SRVs (device slot 70, src/startup_stubs/srv_refusal_cache.h)
-// without a device. A refusal decided by the request and the stand-in state alone (memory independent) is reused for
-// the same request and placement generation. A refusal that depends on what is committed at the address is never
-// reused by the default lookup: pages can move with the same committed total (reserve 128 KiB, commit the upper
-// 64 KiB, refuse; decommit it, commit the lower 64 KiB, retry at once), which no region stamp can see.
+// without a device. Every cached refusal carries an exact proof:
+//   independent: same request and placement generation;
+//   fully_committed: the allocation is fully committed and its stamp is unchanged;
+//   witness_page: the one page found uncommitted is still uncommitted in the same allocation.
+// The reported page move (reserve 128 KiB, commit the upper 64 KiB, refuse; decommit it, commit the lower 64 KiB,
+// retry at once; same base, size and committed total) must miss, because its witness page is now committed.
 // --mutate generation: expect a changed placement generation to still hit.
-// --mutate memory: expect the default lookup to reuse a memory dependent refusal (the page-move case).
+// --mutate witness: expect the page move to still hit (the witness page is not asked).
+// --mutate stamp: expect a fully_committed entry to hit under a changed stamp.
 // --mutate key: expect a different view to hit an entry noted for another view.
 // --mutate device: expect the same request on another device to hit an entry noted for the first device.
 // --mutate age: expect an entry older than the age limit to still hit.
 // --mutate hits: expect an entry used more than the hit limit to still hit.
-// --mutate invalid: expect a memory dependent entry with an unreadable stamp to hit under the opt-in.
+// --mutate unproven: expect a refusal without a proof to be cached.
 // Each mutated run is a negative control and must fail.
 #include "startup_stubs/srv_refusal_cache.h"
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 
@@ -33,9 +37,29 @@ void check(const char* name, bool condition)
     std::printf("FAIL %s\n", name);
 }
 
-x2w_startup::SrvRefusalKey request(std::uint64_t address, std::uint64_t first_element)
+using namespace x2w_startup;
+
+constexpr std::uint64_t kBase = 0x7000000000ull;
+constexpr std::uint64_t kPage = 0x10000;  // 64 KiB
+
+// A fake allocation of two 64 KiB pages: which are committed. The real question is a VirtualQuery of one page.
+std::array<bool, 2> committed{};
+
+bool page_still_uncommitted(const SrvRefusalProof& proof)
 {
-    x2w_startup::SrvRefusalKey key;
+    if (mutated("witness")) return true;
+    return !committed[(proof.witness - kBase) / kPage];
+}
+
+bool never_asked(const SrvRefusalProof&)
+{
+    check("only a witness_page entry asks about a page", false);
+    return true;
+}
+
+SrvRefusalKey request(std::uint64_t address, std::uint64_t first_element)
+{
+    SrvRefusalKey key;
     key.device = 0x5000;
     key.address = address;
     key.span_bytes = 0x4000;
@@ -47,16 +71,31 @@ x2w_startup::SrvRefusalKey request(std::uint64_t address, std::uint64_t first_el
     return key;
 }
 
-x2w_startup::SrvRefusalStamp stamp(std::uint64_t generation, std::uint64_t commit)
+SrvRefusalStamp stamp(std::uint64_t generation, std::uint64_t commit)
 {
-    x2w_startup::SrvRefusalStamp s;
+    SrvRefusalStamp s;
     s.valid = true;
     s.generation = generation;
-    s.base = 0x7000000000ull;
-    s.size = 0x20000;  // 128 KiB reservation
+    s.base = kBase;
+    s.size = 2 * kPage;  // 128 KiB reservation
     s.commit = commit;
     s.flags = 1;
     return s;
+}
+
+SrvRefusalProof independent()
+{
+    return SrvRefusalProof{SrvRefusalKind::independent, 0, 0, true};
+}
+
+SrvRefusalProof fully_committed()
+{
+    return SrvRefusalProof{SrvRefusalKind::fully_committed, 0, 0, true};
+}
+
+SrvRefusalProof witness_page(std::uint64_t page)
+{
+    return SrvRefusalProof{SrvRefusalKind::witness_page, kBase + page * kPage, kBase, true};
 }
 
 } // namespace
@@ -64,114 +103,132 @@ x2w_startup::SrvRefusalStamp stamp(std::uint64_t generation, std::uint64_t commi
 int main(int argc, char** argv)
 {
     if (argc == 3 && std::strcmp(argv[1], "--mutate") == 0) mutation = argv[2];
-    using namespace x2w_startup;
-    const std::uint64_t kHalf = 0x10000;  // 64 KiB
 
     {
         SrvRefusalCache cache;
-        const auto key = request(0x7000001000ull, 0);
-        check("an empty cache misses", !cache.hit(key, stamp(5, 0), 100));
-        cache.note(key, stamp(5, 0), 100, true);
-        check("a memory independent refusal hits for the same request and generation", cache.hit(key, stamp(5, 0), 150));
-        check("a hit repeats", cache.hit(key, stamp(5, 0), 160));
-        // The commit state is irrelevant to such a refusal: it was decided without reading memory.
-        check("a memory independent refusal ignores the committed total", cache.hit(key, stamp(5, kHalf), 170));
-    }
-    {
-        SrvRefusalCache cache;
-        const auto key = request(0x7000001000ull, 0);
-        cache.note(key, stamp(5, 0), 100, true);
-        const bool hit = cache.hit(key, stamp(6, 0), 110);
+        const auto key = request(kBase + 0x1000, 0);
+        check("an empty cache misses", !cache.hit(key, stamp(5, 0), 100, never_asked));
+        cache.note(key, stamp(5, 0), 100, independent());
+        check("an independent refusal hits for the same request and generation", cache.hit(key, stamp(5, 0), 150, never_asked));
+        check("a hit repeats", cache.hit(key, stamp(5, 0), 160, never_asked));
+        check("an independent refusal ignores the memory", cache.hit(key, stamp(5, kPage), 170, never_asked));
+        const bool hit = cache.hit(key, stamp(6, 0), 180, never_asked);
         check("a new placement generation misses (a resource may now cover the address)", mutated("generation") ? hit : !hit);
     }
     {
-        // Reported sequence: reserve 128 KiB, commit the upper 64 KiB, the slot-70 request refuses; decommit the
-        // upper half, commit and fill the lower half (same base, same reservation, same committed total), retry at once.
+        // The reported sequence. Request at the allocation base; only the upper page is committed.
         SrvRefusalCache cache;
-        const auto key = request(0x7000000000ull, 0);
-        const auto upper_committed = stamp(5, kHalf);
-        const auto lower_committed = stamp(5, kHalf);  // identical stamp: the move is invisible
-        cache.note(key, upper_committed, 100, false);
-        bool hit = cache.hit(key, lower_committed, 101);
-        if (mutated("memory")) hit = cache.hit(key, lower_committed, 101, true) || hit;
-        check("the page move with an equal stamp runs the full path", !hit);
-        check("a memory dependent refusal never hits by default", !cache.hit(key, upper_committed, 102));
-        // Opt-in accepts exactly this staleness, so it must be off unless asked for.
-        check("the opt-in reuses a memory dependent refusal for an equal stamp", cache.hit(key, upper_committed, 103, true));
-        check("the opt-in still misses on a different committed total", !cache.hit(key, stamp(5, 2 * kHalf), 104, true));
-        auto moved = stamp(5, kHalf);
-        moved.base += 0x10000;
-        check("the opt-in misses on another base", !cache.hit(key, moved, 104, true));
-        auto flagged = stamp(5, kHalf);
-        flagged.flags = 2;
-        check("the opt-in misses on other flags", !cache.hit(key, flagged, 104, true));
-        check("the opt-in misses on a new generation", !cache.hit(key, stamp(6, kHalf), 104, true));
+        const auto key = request(kBase, 0);
+        committed = {false, true};
+        cache.note(key, stamp(5, kPage), 100, witness_page(0));
+        check("the refusal still holds while the witness page is uncommitted", cache.hit(key, stamp(5, kPage), 101, page_still_uncommitted));
+        // Decommit the upper page, commit the lower one: same base, same reservation, same committed total.
+        committed = {true, false};
+        check("the equal stamp does not hide the page move", stamp(5, kPage) == stamp(5, kPage));
+        check("after the page move the full path runs (the witness page is committed)",
+              !cache.hit(key, stamp(5, kPage), 102, page_still_uncommitted));
+        // A request that starts in the upper page walks from the base too: the witness is still the lower page.
+        committed = {false, true};
+        const auto upper = request(kBase + kPage, 0);
+        cache.note(upper, stamp(5, kPage), 110, witness_page(0));
+        check("a request in the upper page is proven by the same witness", cache.hit(upper, stamp(5, kPage), 111, page_still_uncommitted));
+        committed = {true, true};
+        check("committing the witness page makes it miss", !cache.hit(upper, stamp(5, 2 * kPage), 112, page_still_uncommitted));
     }
     {
         SrvRefusalCache cache;
-        cache.note(request(0x7000001000ull, 0), stamp(5, 0), 100, true);
-        const bool other_view = cache.hit(request(0x7000001000ull, 8), stamp(5, 0), 110);
+        const auto key = request(kBase, 0);
+        committed = {false, true};
+        cache.note(key, stamp(5, kPage), 100, witness_page(0));
+        auto other_allocation = stamp(5, kPage);
+        other_allocation.base += 0x100000;
+        check("another allocation base misses", !cache.hit(key, other_allocation, 101, page_still_uncommitted));
+        SrvRefusalStamp unreadable = stamp(5, kPage);
+        unreadable.valid = false;
+        check("an unreadable allocation stamp misses", !cache.hit(key, unreadable, 101, page_still_uncommitted));
+        check("a new generation misses", !cache.hit(key, stamp(6, kPage), 101, page_still_uncommitted));
+        cache.note(request(kBase, 1), unreadable, 100, witness_page(0));
+        check("a witness entry that needs the allocation is not cached without a stamp",
+              !cache.hit(request(kBase, 1), stamp(5, kPage), 101, page_still_uncommitted));
+        // The address page itself was uncommitted: no allocation is involved (base 0), only that page is asked.
+        SrvRefusalProof address_page{SrvRefusalKind::witness_page, kBase, 0, true};
+        committed = {false, false};
+        cache.note(request(kBase, 2), unreadable, 100, address_page);
+        check("an uncommitted address hits without an allocation stamp", cache.hit(request(kBase, 2), unreadable, 101, page_still_uncommitted));
+        committed = {true, false};
+        check("a committed address misses", !cache.hit(request(kBase, 2), unreadable, 102, page_still_uncommitted));
+    }
+    {
+        SrvRefusalCache cache;
+        const auto key = request(kBase, 0);
+        cache.note(key, stamp(5, 2 * kPage), 100, fully_committed());
+        check("a fully committed allocation hits under the same stamp", cache.hit(key, stamp(5, 2 * kPage), 101, never_asked));
+        const bool hit = cache.hit(key, stamp(5, kPage), 102, never_asked);
+        check("a fully committed refusal misses when the stamp changes", mutated("stamp") ? hit : !hit);
+        auto resized = stamp(5, 2 * kPage);
+        resized.size += kPage;
+        check("a resized allocation misses", !cache.hit(key, resized, 102, never_asked));
+        auto moved = stamp(5, 2 * kPage);
+        moved.base += kPage;
+        check("another base misses", !cache.hit(key, moved, 102, never_asked));
+    }
+    {
+        SrvRefusalCache cache;
+        cache.note(request(kBase + 0x1000, 0), stamp(5, 0), 100, independent());
+        const bool other_view = cache.hit(request(kBase + 0x1000, 8), stamp(5, 0), 110, never_asked);
         check("another view of the same address misses", mutated("key") ? other_view : !other_view);
-        check("another address misses", !cache.hit(request(0x7000002000ull, 0), stamp(5, 0), 110));
-        auto other_device = request(0x7000001000ull, 0);
+        check("another address misses", !cache.hit(request(kBase + 0x2000, 0), stamp(5, 0), 110, never_asked));
+        auto other_device = request(kBase + 0x1000, 0);
         other_device.device += 0x100;
-        const bool device_hit = cache.hit(other_device, stamp(5, 0), 110);
+        const bool device_hit = cache.hit(other_device, stamp(5, 0), 110, never_asked);
         check("the same request on another device misses (placement lookups are per device)",
               mutated("device") ? device_hit : !device_hit);
-        auto wider = request(0x7000001000ull, 0);
+        auto wider = request(kBase + 0x1000, 0);
         wider.span_bytes += 4;
-        check("another span misses", !cache.hit(wider, stamp(5, 0), 110));
-        auto resource = request(0x7000001000ull, 0);
+        check("another span misses", !cache.hit(wider, stamp(5, 0), 110, never_asked));
+        auto resource = request(kBase + 0x1000, 0);
         resource.resource_b += 1;
-        check("another resource width misses", !cache.hit(resource, stamp(5, 0), 110));
+        check("another resource width misses", !cache.hit(resource, stamp(5, 0), 110, never_asked));
     }
     {
         SrvRefusalCache cache;
-        const auto key = request(0x7000001000ull, 0);
-        cache.note(key, stamp(5, 0), 100, true);
-        const bool old_hit = cache.hit(key, stamp(5, 0), 100 + SrvRefusalCache::kMaxAgeMs + 1);
+        const auto key = request(kBase, 0);
+        cache.note(key, stamp(5, 0), 100, independent());
+        const bool old_hit = cache.hit(key, stamp(5, 0), 100 + SrvRefusalCache::kMaxAgeMs + 1, never_asked);
         check("an entry older than the age limit misses", mutated("age") ? old_hit : !old_hit);
-        check("an entry exactly at the age limit still hits", [&] {
-            SrvRefusalCache fresh;
-            fresh.note(key, stamp(5, 0), 100, true);
-            return fresh.hit(key, stamp(5, 0), 100 + SrvRefusalCache::kMaxAgeMs);
-        }());
-        check("a clock that went backwards misses", [&] {
-            SrvRefusalCache fresh;
-            fresh.note(key, stamp(5, 0), 100, true);
-            return !fresh.hit(key, stamp(5, 0), 50);
-        }());
+        SrvRefusalCache fresh;
+        fresh.note(key, stamp(5, 0), 100, independent());
+        check("an entry exactly at the age limit still hits", fresh.hit(key, stamp(5, 0), 100 + SrvRefusalCache::kMaxAgeMs, never_asked));
+        SrvRefusalCache backwards;
+        backwards.note(key, stamp(5, 0), 100, independent());
+        check("a clock that went backwards misses", !backwards.hit(key, stamp(5, 0), 50, never_asked));
     }
     {
         SrvRefusalCache cache;
-        const auto key = request(0x7000001000ull, 0);
-        cache.note(key, stamp(5, 0), 100, true);
+        const auto key = request(kBase, 0);
+        cache.note(key, stamp(5, 0), 100, independent());
         bool all = true;
-        for (std::uint32_t i = 0; i < SrvRefusalCache::kMaxHits; ++i) all = cache.hit(key, stamp(5, 0), 110) && all;
+        for (std::uint32_t i = 0; i < SrvRefusalCache::kMaxHits; ++i) all = cache.hit(key, stamp(5, 0), 110, never_asked) && all;
         check("the entry hits up to the hit limit", all);
-        const bool over = cache.hit(key, stamp(5, 0), 110);
+        const bool over = cache.hit(key, stamp(5, 0), 110, never_asked);
         check("past the hit limit the full path runs again", mutated("hits") ? over : !over);
-        cache.note(key, stamp(5, 0), 120, true);  // the full path refused again and re-noted
-        check("a re-noted entry hits again", cache.hit(key, stamp(5, 0), 121));
+        cache.note(key, stamp(5, 0), 120, independent());  // the full path refused again and re-noted
+        check("a re-noted entry hits again", cache.hit(key, stamp(5, 0), 121, never_asked));
     }
     {
         SrvRefusalCache cache;
-        const auto key = request(0x7000001000ull, 0);
-        SrvRefusalStamp unreadable = stamp(5, kHalf);
-        unreadable.valid = false;
-        cache.note(key, unreadable, 100, false);
-        const bool hit = cache.hit(key, unreadable, 110, true);
-        check("a memory dependent refusal with an unreadable stamp is never cached", mutated("invalid") ? hit : !hit);
-        // An unreadable stamp does not matter to a memory independent refusal.
-        cache.note(key, unreadable, 100, true);
-        check("a memory independent refusal does not need the stamp", cache.hit(key, unreadable, 110));
+        const auto key = request(kBase, 0);
+        SrvRefusalProof none = independent();
+        none.proven = mutated("unproven");
+        cache.note(key, stamp(5, 0), 100, none);
+        check("a refusal without a proof is never cached", !cache.hit(key, stamp(5, 0), 101, never_asked));
     }
     {
         SrvRefusalCache cache;
-        const auto key = request(0x7000001000ull, 0);
-        cache.note(key, stamp(5, 0), 100, true);
+        const auto key = request(kBase, 0);
+        cache.note(key, stamp(5, 0), 100, independent());
         cache.clear();
-        check("clear forgets everything", !cache.hit(key, stamp(5, 0), 110));
+        check("clear forgets everything", !cache.hit(key, stamp(5, 0), 110, never_asked));
         const auto before = srv_placement_generation().load();
         note_placement_change();
         check("note_placement_change advances the generation", srv_placement_generation().load() == before + 1);

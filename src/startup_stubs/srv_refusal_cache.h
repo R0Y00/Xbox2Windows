@@ -13,16 +13,21 @@
 //   - the same stand-in state: the placement generation, which advances whenever a resource is indexed, retired,
 //     published or released, or an unplaced buffer is created or dropped (note_placement_change);
 //   - an entry younger than kMaxAgeMs and used fewer than kMaxHits times.
-// Two kinds of refusal exist, and only one is exact:
-//   - memory independent: decided by the request and by stand-in state alone (a live resource overlaps, the span has no
+// Three kinds of refusal exist, each with its own exact proof (SrvRefusalKind):
+//   - independent: decided by the request and by stand-in state alone (a live resource overlaps, the span has no
 //     page extent, a placed buffer owns the page, the found buffer is too small for the view). The key and the
-//     placement generation prove it, so it is cached by default;
-//   - memory dependent: decided by what is committed at the address. Commit and decommit happen behind the stand-ins,
-//     and a region-information stamp (base, size, committed bytes, flags) cannot see pages that move with the same
-//     total (reserve 128 KiB, commit the upper half, refuse; decommit it, commit the lower half, retry at once: the
-//     stamp is identical but the buffer is now readable). Such a refusal is cached only when the caller opts in
-//     (allow_memory_dependent), accepting that a retry within kMaxAgeMs can be refused again.
-// A miss runs the full resolution unchanged. The default lookup never refuses what the full path would publish.
+//     placement generation prove it;
+//   - fully_committed: the allocation holding the address is private and every byte of it is committed, and the
+//     buffer does not fit the allocation. A region-information stamp (base, size, committed bytes, flags) with the
+//     committed bytes equal to the size cannot hide a page move: there is no uncommitted page left to move;
+//   - witness_page: the walk from the allocation base found a page that is not committed (or belongs to another
+//     allocation) before the end of the buffer. The refusal holds exactly as long as that one page is still not
+//     committed in the same allocation, so a hit re-asks only that page (the caller's still_refuses) and the
+//     allocation base. Commit and decommit happen behind the stand-ins, and a committed-byte total cannot see pages
+//     that move with the same total (reserve 128 KiB, commit the upper half, refuse; decommit it, commit the lower
+//     half, retry at once: the totals are equal but the witness page is now committed, so the entry misses).
+// A refusal decided by a later step that no proof covers is not cached. A miss runs the full resolution unchanged.
+// A hit never refuses what the full path would publish.
 
 #include <array>
 #include <atomic>
@@ -60,6 +65,15 @@ struct SrvRefusalKey {
     }
 };
 
+enum class SrvRefusalKind : std::uint8_t { independent, fully_committed, witness_page };
+
+struct SrvRefusalProof {
+    SrvRefusalKind kind = SrvRefusalKind::independent;
+    std::uint64_t witness = 0;  // witness_page: an address of the page that is not committed
+    std::uint64_t base = 0;     // witness_page: the allocation base the walk started from
+    bool proven = false;        // false: nothing proves this refusal, it is not cached
+};
+
 struct SrvRefusalStamp {
     bool valid = false;  // the region information could be read
     std::uint64_t generation = 0;
@@ -81,31 +95,43 @@ public:
     static constexpr std::uint32_t kMaxHits = 1024;
 
     // True when this request was refused under the same stand-in and memory state a moment ago.
-    bool hit(const SrvRefusalKey& key, const SrvRefusalStamp& stamp, std::uint64_t now_ms,
-             bool allow_memory_dependent = false)
+    // still_refuses(proof) answers a witness_page entry: the page is still not committed in the allocation.
+    template <class StillRefuses>
+    bool hit(const SrvRefusalKey& key, const SrvRefusalStamp& stamp, std::uint64_t now_ms, StillRefuses&& still_refuses)
     {
+        SrvRefusalProof proof;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const Entry& e = entries_[slot(key)];
+            if (!e.used || !(e.key == key) || now_ms < e.noted_ms || now_ms - e.noted_ms > kMaxAgeMs || e.hits >= kMaxHits ||
+                e.stamp.generation != stamp.generation)
+                return false;
+            proof = e.proof;
+            if (proof.kind == SrvRefusalKind::fully_committed && !(e.stamp == stamp)) return false;
+            // base 0: the address page itself was not committed, no allocation was involved.
+            if (proof.kind == SrvRefusalKind::witness_page && proof.base != 0 && !(stamp.valid && stamp.base == proof.base))
+                return false;
+        }
+        // The page question is asked outside the lock; the entry is re-checked before it counts a hit.
+        if (proof.kind == SrvRefusalKind::witness_page && !still_refuses(proof)) return false;
         std::lock_guard<std::mutex> lock(mutex_);
         Entry& e = entries_[slot(key)];
-        if (!e.used || !(e.key == key) || now_ms < e.noted_ms ||
-            now_ms - e.noted_ms > kMaxAgeMs || e.hits >= kMaxHits) {
-            return false;
-        }
-        if (e.memory_independent) {
-            if (e.stamp.generation != stamp.generation) return false;
-        } else if (!allow_memory_dependent || !(e.stamp == stamp)) {
-            return false;
-        }
+        if (!e.used || !(e.key == key) || e.hits >= kMaxHits || e.stamp.generation != stamp.generation) return false;
         ++e.hits;
         return true;
     }
 
-    // Remember a refusal the full resolution just produced. memory_independent: it does not depend on what is
-    // committed at the address (see above); the stamp's generation is then the only state it needs.
-    void note(const SrvRefusalKey& key, const SrvRefusalStamp& stamp, std::uint64_t now_ms, bool memory_independent)
+    // Remember a refusal the full resolution just produced, with the proof that keeps it exact. A proof that needs the
+    // memory stamp is refused when the stamp could not be read.
+    void note(const SrvRefusalKey& key, const SrvRefusalStamp& stamp, std::uint64_t now_ms, const SrvRefusalProof& proof)
     {
-        if (!memory_independent && !stamp.valid) return;
+        if (!proof.proven) return;
+        const bool needs_stamp = proof.kind == SrvRefusalKind::fully_committed ||
+                                 (proof.kind == SrvRefusalKind::witness_page && proof.base != 0);
+        if (needs_stamp && !stamp.valid) return;
+        if (proof.kind == SrvRefusalKind::witness_page && proof.witness == 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[slot(key)] = Entry{true, key, stamp, now_ms, 0, memory_independent};
+        entries_[slot(key)] = Entry{true, key, stamp, now_ms, 0, proof};
     }
 
     void clear()
@@ -121,7 +147,7 @@ private:
         SrvRefusalStamp stamp;
         std::uint64_t noted_ms = 0;
         std::uint32_t hits = 0;
-        bool memory_independent = false;
+        SrvRefusalProof proof;
     };
 
     static std::size_t slot(const SrvRefusalKey& k)

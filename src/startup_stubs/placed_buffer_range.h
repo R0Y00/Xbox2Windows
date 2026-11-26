@@ -30,6 +30,10 @@ struct PlacedBufferRange {
     bool covered = false;      // [base, address + width) is committed and belongs to that allocation
     bool region_info = false;  // proven by one region-information call, without VirtualQuery
     unsigned queries = 0;      // VirtualQuery calls made, for the stand-in's totals
+    // Why a buffer is not covered, for the refusal cache (srv_refusal_cache.h): the first page, from the allocation
+    // base to the end of the buffer, that is not committed in that allocation. 0 when none was found (covered, or the
+    // answer came from the region information alone).
+    std::uintptr_t witness = 0;
 };
 
 // exact is what slot 133 uses. The other two exist only for the negative controls in
@@ -118,7 +122,10 @@ inline bool measure_placed_buffer(const void* address, std::uint64_t width, Plac
     // The walk from the base, stopped at the end of the buffer: regions after it cannot change the answer.
     MEMORY_BASIC_INFORMATION info{};
     ++out.queries;
-    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT) return false;
+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT) {
+        out.witness = start;  // the address itself is not committed
+        return false;
+    }
     out.base = info.AllocationBase;
     out.type = info.Type;
     if (width > UINTPTR_MAX - start) return true;  // the end does not exist; the full walk refuses it too
@@ -128,8 +135,10 @@ inline bool measure_placed_buffer(const void* address, std::uint64_t width, Plac
     while (cursor < end) {
         ++out.queries;
         if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) ||
-            region.AllocationBase != out.base || region.State != MEM_COMMIT)
+            region.AllocationBase != out.base || region.State != MEM_COMMIT) {
+            out.witness = cursor;  // the walk stopped here: this page is not committed in the allocation
             return true;
+        }
         cursor = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
     }
     out.covered = true;
