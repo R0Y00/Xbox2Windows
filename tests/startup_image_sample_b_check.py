@@ -456,6 +456,13 @@ def with_branch_before_sample(data, sopp_op):
     return data[:off] + insert + data[off:]
 
 
+def with_divergent_back_edge_after_sample(data, sopp_op):
+    """Insert s_cbranch_<op> right after the sample_b, jumping back to it: the branch comes later in program order, but
+    the sample runs again on the next pass, with lanes that left the loop at different passes."""
+    off, size = next((o, s) for o, s, _n, a in G.decode(data) if 'image_sample_b' in a)
+    return data[:off + size] + sopp(sopp_op, -(size // 4 + 1)) + data[off + size:]
+
+
 def controls():
     assert WORDS, 'no recorded words'
     locate()
@@ -469,7 +476,9 @@ def controls():
             ('s_cbranch_vccz', lambda d: with_branch_before_sample(d, 6)),
             ('s_cbranch_vccnz', lambda d: with_branch_before_sample(d, 7)),
             ('s_cbranch_execz', lambda d: with_branch_before_sample(d, 8)),
-            ('s_cbranch_execnz', lambda d: with_branch_before_sample(d, 9))):
+            ('s_cbranch_execnz', lambda d: with_branch_before_sample(d, 9)),
+            ('s_cbranch_vccnz back edge after the sample', lambda d: with_divergent_back_edge_after_sample(d, 7)),
+            ('s_cbranch_execnz back edge after the sample', lambda d: with_divergent_back_edge_after_sample(d, 9))):
         try:
             G.Pipeline(VS_WORDS, mutate(plain), root_blob()).hlsl_ps()
         except G.Unsupported as error:

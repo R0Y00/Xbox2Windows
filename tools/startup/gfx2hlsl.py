@@ -2685,6 +2685,8 @@ class Stage:
             self.wqm_exec = init_wqm_exec
             # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
             self.uniform_cf = True
+            self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
+            self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
             self.masks = set(init_masks)
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
@@ -2865,6 +2867,7 @@ class Stage:
                             regs, affected = div_targets.get(off, (set(), set()))
                             regs = {r for r in regs if isinstance(r, int)}
                             if b_target <= off:
+                                self.divergent_back_edges.append((b_target, off))
                                 regs.update(r for r in joined.get(b_target, ()) if isinstance(r, int))
                             for tgt_off in affected:
                                 bad_at_target.setdefault(tgt_off, set()).update(regs)
@@ -2919,6 +2922,15 @@ class Stage:
         if set(scc_effects.values()) - {'emitted'}:
             for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
                 reason = 'scc from %s in %s' % ('descriptor data' if kind == 'descriptor' else kind, name)
+                if refusals is None:
+                    raise Unsupported(reason)
+                refusals.append((reason, self.kind))
+        for at, name in self.derivative_sites:
+            # A divergent back edge that spans the call lets lanes of one quad leave the loop at different passes, so
+            # the call runs again with uneven quads even though no divergent branch precedes it in program order.
+            if any(target <= at <= branch for target, branch in self.divergent_back_edges):
+                reason = ('%s needs implicit derivatives: pixel stage with the entry EXEC mask and wave-uniform '
+                          'control flow' % name)
                 if refusals is None:
                     raise Unsupported(reason)
                 refusals.append((reason, self.kind))
@@ -5252,6 +5264,8 @@ class Stage:
                         not getattr(self, 'uniform_cf', True)):
                     raise Unsupported('image_sample_b needs implicit derivatives: pixel stage with the entry EXEC '
                                      'mask and wave-uniform control flow')
+                if hasattr(self, 'derivative_sites'):
+                    self.derivative_sites.append((self.pc, 'image_sample_b'))
                 bias, cs = cs[0], cs[1:]
         if how == 'get_lod':
             # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
@@ -5266,6 +5280,8 @@ class Stage:
             if not self.exec_known or not getattr(self, 'uniform_cf', True):
                 raise Unsupported('image_get_lod needs implicit derivatives: pixel stage with the entry EXEC '
                                  'mask and wave-uniform control flow')
+            if hasattr(self, 'derivative_sites'):
+                self.derivative_sites.append((self.pc, 'image_get_lod'))
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):

@@ -41,7 +41,7 @@ def sopp(op, simm):
     return struct.pack('<I', (simm & 0xffff) | op << 16 | 0x17f << 23)
 
 
-def stage(dmask=1, dim=1, branch=False, divergent=False, join=False, cf_op=None, word2=MIP_POINT):
+def stage(dmask=1, dim=1, branch=False, divergent=False, join=False, cf_op=None, word2=MIP_POINT, back_op=None):
     w = bytearray(C.WORDS['lz'])
     assert w[W2_AT:W2_AT + 4] == bytes.fromhex('80039abe'), w[W2_AT:W2_AT + 4].hex()
     w[W2_AT:W2_AT + 4] = struct.pack('<II', 0xbe9a03ff, word2)  # s_mov_b32 s26, literal
@@ -51,6 +51,8 @@ def stage(dmask=1, dim=1, branch=False, divergent=False, join=False, cf_op=None,
     if dmask == 3:  # export v4, v5
         struct.pack_into('<II', w, EXPORT_AT, 0xf800180f, 4 | 5 << 8 | 4 << 16 | 5 << 24)
     code = bytes(w)
+    if back_op is not None:  # s_cbranch_<op> right after the read, back to it (a divergent back edge spanning the read)
+        code = code[:AT + 8] + sopp(back_op, -3) + code[AT + 8:]
     insert = b''
     if branch:  # s_cbranch_scc0 to the next instruction: uniform control flow before the read
         insert += sopp(4, 0)
@@ -97,6 +99,8 @@ def controls():
     refused(stage(dmask=4), 'image_get_lod form')
     refused(stage(dim=5), 'image_get_lod form')  # SQ_RSRC_IMG_2D_ARRAY
     refused(stage(divergent=True), 'image_get_lod needs implicit derivatives')
+    for op in (7, 9):  # vccnz, execnz back edge after the read
+        refused(stage(back_op=op), 'image_get_lod needs implicit derivatives')
     for op in (6, 7, 8, 9):  # vccz, vccnz, execz, execnz
         refused(stage(cf_op=op), 'image_get_lod needs implicit derivatives')
     refused(stage(word2=MIP_POINT | 1), 'image_get_lod with a sampler LOD bias')
