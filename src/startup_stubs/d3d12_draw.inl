@@ -1638,11 +1638,11 @@ bool heap_srvs_ready(Wrapper* self, const Translation& tr, const Pass& pass, boo
             if (value == ~u64{0}) return refuse(i, "root constant out of range", srv.a);
             index = static_cast<std::uint32_t>(value);
         } else {
-            std::uint64_t extra = 0;
+            std::uint32_t extra = 0;  // the shader's offset arithmetic wraps at 32 bits
             if (srv.a >= 0) {
                 const std::uint64_t value = constant();
                 if (value == ~u64{0}) return refuse(i, "root constant out of range", srv.a);
-                extra = u64{static_cast<std::uint32_t>(value) & srv.mask} * srv.times;
+                extra = (static_cast<std::uint32_t>(value) & srv.mask) * srv.times;
             }
             if (srv.word_param >= 16 || srv.word_byte < 0) return refuse(i, "table out of range", srv.word_param);
             const u64 table_entry = pass.view_tables[srv.word_param].record(static_cast<u64>(srv.word_byte), 16);
@@ -1650,15 +1650,15 @@ bool heap_srvs_ready(Wrapper* self, const Translation& tr, const Pass& pass, boo
             if (!table_entry || !x2w_local::readable(reinterpret_cast<const void*>(table_entry), 16))
                 return refuse(i, "table buffer descriptor is not bound", srv.word_param);
             std::memcpy(table_words, reinterpret_cast<const void*>(table_entry), 16);
-            const u64 at = u64{srv.at} + extra;
+            const std::uint32_t at = srv.at + extra;
             const u64 address = table_words[0] | (u64{table_words[1] & 0xffff} << 32);
             const UINT stride = (table_words[1] >> 16) & 0x3fff;
             if (table_words[0] == view_token_magic || !list_upload_range(self, address + at, 4).resource)
                 return refuse(i, "index word is not in the list's upload memory", at);
-            if (at + 4 > u64{stride ? stride : 1} * table_words[2]) return refuse(i, "index word is outside its table buffer", at);
+            if (u64{at} + 4 > u64{stride ? stride : 1} * table_words[2]) return refuse(i, "index word is outside its table buffer", at);
             std::memcpy(&index, reinterpret_cast<const void*>(address + at), 4);
         }
-        const u64 entry = index > (0xffffffffu >> 5) ? 0 : pass.title_view_heap.record(std::uint32_t{index << 5}, 32);
+        const u64 entry = pass.title_view_heap.record(std::uint32_t{index << 5}, 32);  // s_lshl_b32 discards the high bits
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
             return refuse(i, "record is outside the list's view heap", index);
         std::uint32_t words[2] = {};

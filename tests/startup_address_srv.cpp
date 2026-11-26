@@ -122,7 +122,9 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
             // The heap-record case (X2W_TEST_HEAP_SRV) uses the same four strips: keys 2 and 3 name records the two-entry
             // heap does not hold, and each such draw must be refused.
             for (UINT key = 0; key < 4; ++key) {
-                invoke(list, 40, 1, 1, ptr(&key), 0);
+                // Word case, key 3: the byte offset root constant * 4 wraps at 32 bits to 4, as the shader's own s_mul_i32 does.
+                const UINT value = heap_word && key == 3 ? 0x40000001u : key;
+                invoke(list, 40, 1, 1, ptr(&value), 0);
                 draw(static_cast<LONG>(swap * 4 + key));
             }
         }

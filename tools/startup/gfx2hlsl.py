@@ -5434,9 +5434,14 @@ class Stage:
             self.set_s(d, result, align4=acc_align4)
         offset = self.heap_word_offset(ops[0], sym) if hasattr(self, 'heap_index') else None
         if offset:
-            p, w, scale, plus = offset
-            self.heap_index[d] = ('rc', p, w, scale, plus + imm & 0xffffffff) if add else (
-                'rc', p, w, scale * imm & 0xffffffff, plus * imm & 0xffffffff)
+            p, w, scale, plus, *mask = offset
+            if mask:
+                # (word & mask) plus a constant keeps its mask; a multiply of a masked word is not named.
+                if add:
+                    self.heap_index[d] = ('rc', p, w, scale, plus + imm & 0xffffffff, mask[0])
+            else:
+                self.heap_index[d] = ('rc', p, w, scale, plus + imm & 0xffffffff) if add else (
+                    'rc', p, w, scale * imm & 0xffffffff, plus * imm & 0xffffffff)
         self.masks.discard(d)
         return None
 

@@ -10,7 +10,7 @@ being root constant word 0 of parameter 1, and writes texel (0, 0) to the target
 at heap records 0 and 1 and draws a one-pixel-wide strip per key, twice with the two textures swapped. Keys 0 and 1 must
 show the texture at their record, so the second pass must show the other texture; key 2 names a record that is not in the
 title's view heap and key 3 a second record past it: those draws are refused by name and leave the cleared target. A draw that
-ignored the index (always record 0), did not re-read it, or guessed a texture for a missing record fails one of these.
+(Word case: key 3 is root constant 0x40000001, whose byte offset x 4 wraps to 4 at 32 bits as the shader computes it, so it is drawn with record 0 where a 64-bit offset would be refused.) ignored the index (always record 0), did not re-read it, or guessed a texture for a missing record fails one of these.
 """
 import os
 import struct
@@ -81,8 +81,8 @@ s_load_dwordx8 s[16:23], s[10:11], s27
 ''')
 # case: (program, manifest line, consumer mode, record each key names)
 CASES = {
-    'rootconst': (PROGRAM, 'srv 0 tex2d heap rootconst 1 0', '1', (0, 1)),
-    'word': (PROGRAM_WORD, 'srv 1 tex2d heap word table 0 64 at 0 rootconst 1 0 times 4', 'word', (1, 0)),
+    'rootconst': (PROGRAM, 'srv 0 tex2d heap rootconst 1 0', '1', (0, 1), False),
+    'word': (PROGRAM_WORD, 'srv 1 tex2d heap word table 0 64 at 0 rootconst 1 0 times 4', 'word', (1, 0), True),
 }
 REFUSED = {
     'shift by 6': (PROGRAM.replace('s9, 5', 's9, 6'), 'not a root constant shifted left by 5'),
@@ -109,7 +109,7 @@ def manifest(source):
 
 
 def check_host():
-    for name, (program, line, _, _) in CASES.items():
+    for name, (program, line, _, _, _) in CASES.items():
         lines = manifest(program)
         assert line in lines, (name, lines)
     for name, (source, reason) in REFUSED.items():
@@ -128,19 +128,19 @@ def check_host():
     print('startup_pixel_heap_srv: host controls ok (1 binding, %d refusals, no-flag refusal)' % len(REFUSED))
 
 
-def expected(swap, records):
+def expected(swap, records, wrap=False):
     """One pass: four strips (keys 0..3), the texture at the record a key names (^ swap) for keys 0 and 1, else the cleared target."""
     column = []
     for key in range(4):
         if key < 2:
             column.append(bytes((16 + 128 * (records[key] ^ swap), (0, 32)[key], 0, 255)))
         else:
-            column.append(CLEARED)
+            column.append(bytes((16 + 128 * (records[1] ^ swap), 255, 0, 255)) if wrap and key == 3 else CLEARED)
     return column
 
 
 def draw(folder, consumer, backend, kind, compiler, case='rootconst'):
-    program, manifest_line, mode, records = CASES[case]
+    program, manifest_line, mode, records, wrap = CASES[case]
     cache = folder / 'cache'
     cache.mkdir()
     vs, ps, signature, pixels = (folder / name for name in ('vs', 'ps', 'root', 'pixels'))
@@ -167,7 +167,7 @@ def draw(folder, consumer, backend, kind, compiler, case='rootconst'):
         raise SystemExit(77)
     assert result.returncode == 0, result.stdout + result.stderr
     data = pixels.read_bytes()
-    want = b''.join(bytes(pixel) for swap in (0, 1) for pixel in expected(swap, records))
+    want = b''.join(bytes(pixel) for swap in (0, 1) for pixel in expected(swap, records, wrap))
     columns = [data[4 * x:4 * x + 4] for x in range(8)]
     rows = [data[32 * y:32 * y + 32] for y in range(4)]
     assert len(set(rows)) == 1, 'rows differ: ' + data.hex()
@@ -175,8 +175,8 @@ def draw(folder, consumer, backend, kind, compiler, case='rootconst'):
     # Two passes, two refused keys per pass, each refused by name and never drawn with a guessed texture.
     refused = result.stderr.count('heap record refused (record is outside the list')
     other = result.stderr.count('heap record refused (record is not a shader-resource view')
-    assert refused + other == 4, (refused, other, result.stderr[-2000:])
-    print(f'{kind} {backend} {case}: heap records 0 and 1 drawn, swapped views followed, 4 records refused by name')
+    assert refused + other == (2 if wrap else 4), (refused, other, result.stderr[-2000:])
+    print(f'{kind} {backend} {case}: heap records 0 and 1 drawn, swapped views followed, records refused by name' + (', a wrapped byte offset read as the shader does' if wrap else '') + '')
 
 
 if __name__ == '__main__':
