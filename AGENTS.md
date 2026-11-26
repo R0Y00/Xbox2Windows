@@ -273,7 +273,9 @@ newer versions may print a different `exp` spelling.
 | `src/` | Windows runtime shims and shared shader helpers. |
 | `tools/` | Offline translators, PE/image probes and inventory tools. |
 | `tests/` | C++, HLSL, MASM and Python fixtures. `tests/cpu/` holds the PE fixtures. |
-| `docs/experiments.md` | Measured results, assumptions and reproduction commands. |
+| `docs/experiments.md` | Older measured results, assumptions and reproduction commands. New notes go in `docs/experiments/<topic>.md`. |
+| `tests/cmake/` | One `<family>.cmake` file per test family or pull request, included by `CMakeLists.txt` (see its README). |
+| `tests/checks/` | Text files that add Python checks to the Linux CI jobs; see its README. |
 | `game-files/` | Local inputs; gitignored. Never commit or upload. |
 | `out/` | Build, generated sources and reports; gitignored. |
 

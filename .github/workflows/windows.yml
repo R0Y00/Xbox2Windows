@@ -148,8 +148,10 @@ jobs:
               (["tests/compute_dpp_row_shr_check.py", *COMMON_LLVM], {}),
               (["tests/startup_compute_lds_dual_atomics_check.py", "binary", "llvm-mc-15"], {}),
           ]
-          sys.exit(runpy.run_path("tools/run_checks_parallel.py",
-                                  run_name="run_checks_parallel")["run_checks"](CHECKS))
+          runner = runpy.run_path("tools/run_checks_parallel.py", run_name="run_checks_parallel")
+          # Checks listed in tests/checks/pixel-binary/*.txt run after the inline list.
+          CHECKS = runner["merge_checks"](CHECKS, "tests/checks/pixel-binary")
+          sys.exit(runner["run_checks"](CHECKS))
           PY
   python-linux:
     name: Run platform-independent Python checks on Linux
@@ -169,6 +171,7 @@ jobs:
       - name: Run Python checks
         run: |
           python -B tools/run_checks_parallel.py \
+            --from-dir tests/checks/python-linux \
             tests/script_state_check.py \
             tests/resource_root_check.py \
             tests/pe_authentihash_check.py \

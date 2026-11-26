@@ -83,6 +83,7 @@ LLVM_LIB="$LLVM_PREFIX/lib/libLLVM-15.dylib" \
 
 The [CI workflow](../.github/workflows/windows.yml) runs the platform-independent Python suite on Ubuntu 24.04 with Python 3.12 (`python-linux`) and the `gfx1013` machine-code checks on Ubuntu 22.04 with LLVM 15 (`pixel-binary`).
 Both jobs use `tools/run_checks_parallel.py`; the machine-code matrix supplies per-check LLVM arguments and environment overrides.
+Besides the inline lists, both jobs also run the checks listed in `tests/checks/python-linux/*.txt` and `tests/checks/pixel-binary/*.txt` (`--from-dir`); a new check can go in its own file there, see [tests/checks/README.md](../tests/checks/README.md).
 The runner lists checks that exit 77 under `SKIPPED:` and other nonzero exits under `FAILED:`. Either summary makes the runner exit 1 so CI catches required checks that did not run. Open a skipped check's log group to see its output.
 
 On Debian/Ubuntu, install `python3-venv` first. Without it, `python3 -m venv` fails with `ensurepip is not available`:
