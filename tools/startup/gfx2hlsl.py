@@ -3901,7 +3901,8 @@ class Stage:
         low, high = tags
         self.tag_compare_pair(base, ops)
         saveexec = base.startswith('s_') and 'saveexec' in base
-        if MASK_COPY_SALU_RE.match(base) and not (low or high):
+        if MASK_COPY_SALU_RE.match(base) and not base.startswith('s_wqm') and not (low or high):
+            # (s_wqm is a no-op in _lower(): it writes nothing, so the old mask stays in its destination.)
             # a 32-bit copy of plain data: the destination no longer holds a lane mask, whatever an earlier path or join
             # left. A 64-bit pair copy keeps its tag: scalar() lowers every b64 move as a mask copy (the lane bit only),
             # so the truncated word must stay refused as numeric data.
