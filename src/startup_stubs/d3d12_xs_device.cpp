@@ -6353,7 +6353,11 @@ HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* p
     x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
     Wrapper* w = wrap(resource, resource_kind);
     if (!w) {
-        resource->Release();  // title_memory came from the title's allocator, which has no free hook here
+        // The title-memory block is not returned here. __XMemAllocationHooks__ is documented as
+        // {alloc, free, ...} (title_alloc_hook above), but the free entry's signature and attributes
+        // have not been verified against the title, so this failure path still leaks the block. A
+        // follow-up has to confirm those before calling it.
+        resource->Release();
         return E_OUTOFMEMORY;
     }
     w->own().budget = x2w_budget::committed(device_of(self), resource, props->Type);
