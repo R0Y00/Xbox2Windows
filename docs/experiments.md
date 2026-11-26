@@ -9119,6 +9119,10 @@ cmake --build --preset dev --target startup_indirect_dispatch
 ctest --preset dev --no-tests=error -R '^startup_indirect_count_(warp|hardware)$' -V
 ```
 
+On a multi-GPU system, set `$env:XBOX2WINDOWS_ADAPTER` to a case-insensitive part of the hardware
+adapter's name, then run `startup_indirect_count_hardware`. The fixture prints the selected adapter,
+driver, GPU-written count and fenced result. An unmatched or overlong hardware selector fails the test.
+
 #### Root constants in an indirect dispatch signature
 
 Device slot 41 also accepts a compute signature with a root signature, whose

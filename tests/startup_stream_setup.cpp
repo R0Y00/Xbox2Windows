@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "adapter_name_filter.h"
 #include "startup_stream_setup.h"
 
 using Microsoft::WRL::ComPtr;
@@ -79,32 +80,20 @@ int pick_stream_adapter(bool hardware, ComPtr<IDXGIAdapter>& adapter)
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
     if (!hardware) return SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))) ? 0 : 4;
 
-    wchar_t wanted[128]{};
-    const DWORD length = GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", wanted, 128);
-    if (length >= 128) {
-        std::fputs("XBOX2WINDOWS_ADAPTER is longer than 127 characters\n", stderr);
-        return 4;
-    }
+    AdapterNameFilter filter;
+    if (!filter.read()) return 4;
     ComPtr<IDXGIFactory6> factory6;
     if (FAILED(factory.As(&factory6))) return 77;
     for (UINT n = 0;; ++n) {
         ComPtr<IDXGIAdapter1> candidate;
         const HRESULT hr = factory6->EnumAdapterByGpuPreference(
             n, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
-        if (hr == DXGI_ERROR_NOT_FOUND) {
-            if (!length) return 77;
-            std::fprintf(stderr, "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
-            return 4;
-        }
+        if (hr == DXGI_ERROR_NOT_FOUND) return filter.no_match();
         if (FAILED(hr)) return 4;
         DXGI_ADAPTER_DESC1 desc{};
         if (FAILED(candidate->GetDesc1(&desc))) return 4;
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-        bool matches = length == 0;
-        for (const wchar_t* p = desc.Description; !matches && *p; ++p) {
-            matches = _wcsnicmp(p, wanted, length) == 0;
-        }
-        if (matches && SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0,
+        if (filter.matches(desc.Description) && SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0,
                                                     __uuidof(ID3D12Device), nullptr))) {
             adapter = candidate;
             return 0;

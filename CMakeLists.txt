@@ -4030,6 +4030,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
         "$<TARGET_FILE:startup_stream_rasterizer>" hardware filter)
     set_tests_properties(startup_stream_adapter_filter PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    add_test(NAME startup_indirect_dispatch_adapter_filter COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hardware_adapter_filter_check.py"
+        "$<TARGET_FILE:startup_indirect_dispatch>" hardware count)
+    set_tests_properties(startup_indirect_dispatch_adapter_filter PROPERTIES TIMEOUT 30)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
