@@ -49,10 +49,10 @@ def check_request(blobs, key, diagnostic=None, rtv_request=None, layout=None):
 
 def main():
     # Independently executed C++ runtime fnv_bytes/cached_translation known-answer vector.
-    # Revision x2w-startup-shader-25 excludes NUL. Stored order is a, b, root, then optional input layout.
+    # Revision x2w-startup-shader-26 excludes NUL. Stored order is a, b, root, then optional input layout.
     vector = (b"\x00VS\xff", b"PS\x00\x80", b"RTS0\x00")
-    assert gfx2hlsl.pipeline_key(*vector) == 0xdf78b28cb80d4c5a
-    assert gfx2hlsl.pipeline_key(*vector, b"ia\x00\xfe") == 0x466483d084260802
+    assert gfx2hlsl.pipeline_key(*vector) == 0x41b9fb9ae4dc6e5d
+    assert gfx2hlsl.pipeline_key(*vector, b"ia\x00\xfe") == 0xe40a4153273da41
     blobs = (VERTEX, PIXEL, ROOT)
     canonical = gfx2hlsl.pipeline_key(*blobs)
     check_request(blobs, canonical)
