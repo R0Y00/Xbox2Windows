@@ -4363,7 +4363,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             record_view(false);  // Translated constant-buffer views use only the descriptor record.
         } else if constexpr (N == 19) {
             // A translated compute Dispatch tells this refusal from a descriptor that holds no view by the record.
-            if (uav_denied) record_view(false);
+            // A refused creation leaves a descriptor that still holds a live view as it is.
+            if (uav_denied && !desktop_slot_has_live_view(args[D])) record_view(false);
         }
     };
     if (skip) {

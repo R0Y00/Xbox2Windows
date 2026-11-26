@@ -107,6 +107,16 @@ std::uint32_t shadow_id(u64 desktop_handle)
     ReleaseSRWLockShared(&note_lock);
     return id;
 }
+// True when the desktop descriptor already holds a view that was created on the desktop.
+bool desktop_slot_has_live_view(u64 desktop_handle)
+{
+    AcquireSRWLockShared(&note_lock);
+    const std::uint32_t* slot = shadow_slot(desktop_handle);
+    const std::uint32_t id = slot ? *slot : 0;
+    const bool live = id && id - 1 < view_records().size() && view_materialized()[id - 1];
+    ReleaseSRWLockShared(&note_lock);
+    return live;
+}
 
 constexpr std::uint32_t view_token_magic = 0x56573258;  // "X2WV"
 
