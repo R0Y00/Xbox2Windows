@@ -119,6 +119,33 @@ def fixture(name, wqm=True):
     return text + EXPORT_TEXT, words + EXPORT
 
 
+def modified_fixture(modifiers=(1 << 20, 1 << 21, 3 << 20)):
+    """Read a different negative normal in each lane, then multiply the modified source by 1."""
+    text = WQM_TEXT + 'v_mov_b32_e32 v9, -2.0\nv_mov_b32_e32 v11, 1.0\nv_or_b32_e32 v10, v0, v9\n'
+    words = WQM + struct.pack('<2I', 0x7e000000 | 9 << 17 | 1 << 9 | 245,
+                              0x7e000000 | 11 << 17 | 1 << 9 | 242)
+    words += vop2_plain(V_OR, 10, 0, 9)
+    for i, (perm, mode) in enumerate(zip(SWAPS, modifiers), 1):
+        source = {0: 'v10', 1 << 20: '-v10', 1 << 21: '|v10|', 3 << 20: '-|v10|'}[mode]
+        text += dpp_text('v_mul_f32_dpp', 'v%d, %s, v11' % (i, source), perm) + '\n'
+        low, high = struct.unpack('<2I', vop2_dpp(0x08, i, 10, 11, perm))
+        words += struct.pack('<2I', low, high | mode)
+    text += 'v_mov_b32_e32 v4, v10\n'
+    words += struct.pack('<I', 0x7e000000 | 4 << 17 | 1 << 9 | 266)
+    return text + EXPORT_TEXT, words + EXPORT
+
+
+def modified_image():
+    words = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            words.extend((0x40000000 | (x ^ 1) | y << 16,
+                          0x40000000 | x | (y ^ 1) << 16,
+                          0xc0000000 | (x ^ 1) | (y ^ 1) << 16,
+                          0xc0000000 | x | y << 16))
+    return words
+
+
 def pixel_words(x, y, name='or'):
     """The four exported words of pixel (x, y): the position of its neighbour in the quad for each swap, then its own.
     For 'min' each word is the unsigned minimum of the neighbour position and the own position."""
@@ -197,6 +224,16 @@ def controls():
     check('bound_ctrl:1 is accepted (a quad_perm source is always in range)', refused(base + ' bound_ctrl:1') is None)
     check('quad broadcast also translates', refused(base.replace('[1,0,3,2]', '[0,0,0,0]')) is None)
     check('pair broadcast also translates', refused(base.replace('[1,0,3,2]', '[1,1,3,3]')) is None)
+    # Float quad swaps accept the source neg/abs of the plain operation (RDNA 2 ISA 12.19).
+    # The permuted word is read first, then neg/abs apply, so -v0 negates the neighbour lane.
+    neg = Probe()
+    neg.one('v_add_f32_dpp', 'v_add_f32_dpp v5, -v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf')
+    check('float swap with -v0 negates the neighbour word', '(-F(QuadReadAcrossX(v0)))' in ' '.join(neg.lines))
+    absolute = Probe()
+    absolute.one('v_add_f32_dpp', 'v_add_f32_dpp v5, |v0|, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf')
+    check('float swap with |v0| takes abs of the neighbour word', 'abs(F(QuadReadAcrossX(v0)))' in ' '.join(absolute.lines))
+    check('modifiers on the destination are refused',
+          refused('v_mul_f32_dpp -v1, v0, v0 quad_perm:[1,0,3,2]') is not None)
     cases = [
         ('identity [0,1,2,3]', base.replace('[1,0,3,2]', '[0,1,2,3]'), {}),
         ('partial row_mask', base.replace('row_mask:0xf', 'row_mask:0x3'), {}),
@@ -206,7 +243,7 @@ def controls():
         ('fi:0 spelling', base + ' fi:0', {}),
         ('fi:1 with EXEC no longer the entry mask', base + ' fi:1', {'exec_known': False}),
         ('fi:1 with entry EXEC not proven whole-quad', base + ' fi:1', {'wqm_exec': False}),
-        ('negated source', 'v_add_f32_dpp v5, -v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
+        ('integer negated source', 'v_or_b32_dpp v5, -v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('SGPR source', 'v_mov_b32_dpp v5, s0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('operation without a table entry', 'v_cvt_f64_f32_dpp v[5:6], v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('vertex stage', base, {'kind': 'vs'}),
@@ -305,6 +342,8 @@ def controls():
 
 
 def check_binary(llvm_mc):
+    text, words = modified_fixture()
+    check('llvm-mc assembles the DPP source modifiers to the same words', assemble(llvm_mc, text) == words)
     for name in NAMES:
         text, words = fixture(name)
         check('llvm-mc assembles the %s fixture to the same words' % name, assemble(llvm_mc, text) == words)
@@ -365,6 +404,21 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 run = draw(renderer, adapter, vs, ps, partial)
                 check('%s %s: reference with swap %d dropped is rejected' % (adapter, name, index),
                       run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
+
+
+        good = words_file(directory, 'modified_reference', modified_image())
+        for i, modifiers in enumerate(((1 << 20, 1 << 21, 3 << 20), (0, 1 << 21, 3 << 20),
+                                       (1 << 20, 0, 3 << 20), (1 << 20, 1 << 21, 1 << 21))):
+            text = pipeline(modified_fixture(modifiers)[1]).hlsl_ps()
+            ps = compile_hlsl(dxc, 'dxc', text, 'ps_modified_%d' % i, 'ps_6_0', directory)
+            run = draw(renderer, adapter, vs, ps, good)
+            if i == 0:
+                check('%s neg/abs/neg-abs: all pixels equal the quad reference' % adapter,
+                      run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout,
+                      run.stdout + run.stderr)
+            else:
+                check('%s omitted DPP modifier %d fails the readback' % (adapter, i),
+                      run.returncode == 1 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
 
 
 def main():

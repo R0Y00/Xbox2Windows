@@ -71,12 +71,12 @@ def check_plain_load_layouts(llvm_mc):
     d16_ps = shader(bytes.fromhex('080f00f000040480')).hlsl_ps()
     assert 'v4 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in d16_ps, d16_ps
     assert 'v5 = pack16_d16(t.z, ud4) | (pack16_d16(t.w, ud4) << 16);' in d16_ps, d16_ps
-    try:
-        shader(bytes.fromhex('080f04f000040480'))
-    except G.Unsupported as error:
-        assert 'image_load_mip' in str(error) and 'd16' in str(error), error
-    else:
-        raise AssertionError('d16 image_load_mip accepted')
+    d16_mip_pipe = shader(bytes.fromhex('080f04f000040480'))
+    d16_mip_ps = d16_mip_pipe.hlsl_ps()
+    assert 'r0.Load(int3(v0, v1, v2))' in d16_mip_ps, d16_mip_ps
+    assert 'v4 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in d16_mip_ps, d16_mip_ps
+    assert 'v5 = pack16_d16(t.z, ud4) | (pack16_d16(t.w, ud4) << 16);' in d16_mip_ps, d16_mip_ps
+    assert 'd16srv 0 exact' in d16_mip_pipe.manifest().splitlines(), d16_mip_pipe.manifest()
 
     for flag, encoded in (('tfe', '080f01f000040400'),
                           ('r128', '088f00f000040400'), ('lwe', '080f02f000040400'),
@@ -108,8 +108,8 @@ def check(llvm_mc):
         assert f'srv 0 {kind} table 0 0' in pipe.manifest(), name
         assert 'SamplerState' not in pipe.hlsl_ps(), name
         print(f'{name}: {address}, {kind}, no sampler')
-    # Packed data, packed addresses and fault-status returns need separate lowering.
-    for flag, byte, mask in (('d16', 7, 0x80), ('a16', 7, 0x40), ('tfe', 2, 0x01)):
+    # Packed addresses and fault-status returns remain refused on image_load_mip.
+    for flag, byte, mask in (('a16', 7, 0x40), ('tfe', 2, 0x01)):
         unsupported = bytearray.fromhex(CASES[0][2])
         unsupported[byte] |= mask
         try:
