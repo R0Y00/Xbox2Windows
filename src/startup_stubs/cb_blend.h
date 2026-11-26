@@ -73,6 +73,16 @@ inline D3D12_BLEND alpha_form(D3D12_BLEND f)
     }
 }
 
+// BlendOp enum -> D3D12_BLEND for SrcBlendAlpha / DestBlendAlpha. On the alpha channel CONSTANT_ALPHA
+// reads the constant's alpha, as CONSTANT_COLOR does there, so BLEND_FACTOR / INV_BLEND_FACTOR express
+// it without AlphaBlendFactorSupported. Only the colour slots need ALPHA_FACTOR for it.
+inline D3D12_BLEND alpha_factor(std::uint32_t op, bool alpha_factor_supported)
+{
+    if (!alpha_factor_supported && op == 19) return D3D12_BLEND_BLEND_FACTOR;
+    if (!alpha_factor_supported && op == 20) return D3D12_BLEND_INV_BLEND_FACTOR;
+    return factor(op, alpha_factor_supported);
+}
+
 // CombFunc enum -> D3D12_BLEND_OP; 0 when unknown.
 inline D3D12_BLEND_OP combine(std::uint32_t fcn)
 {
@@ -92,7 +102,7 @@ inline bool min_max(D3D12_BLEND_OP op) { return op == D3D12_BLEND_OP_MIN || op =
 
 // control: CB_BLENDn_CONTROL. target_mask: the render target's CB_TARGET_MASK nibble, taken as
 // R=1, G=2, B=4, A=8 (component order of an unswapped colour format). alpha_factor_supported:
-// D3D12_FEATURE_DATA_D3D12_OPTIONS13::AlphaBlendFactorSupported, needed for CONSTANT_ALPHA.
+// D3D12_FEATURE_DATA_D3D12_OPTIONS13::AlphaBlendFactorSupported, needed for CONSTANT_ALPHA in a colour slot.
 inline Decoded decode(std::uint32_t control, std::uint32_t target_mask, bool alpha_factor_supported)
 {
     using namespace detail;
@@ -118,7 +128,7 @@ inline Decoded decode(std::uint32_t control, std::uint32_t target_mask, bool alp
     const std::uint32_t alpha_dst = separate ? field(control, 24, 28) : color_dst;
 
     const D3D12_BLEND src = factor(color_src, alpha_factor_supported), dst = factor(color_dst, alpha_factor_supported);
-    const D3D12_BLEND src_a = factor(alpha_src, alpha_factor_supported), dst_a = factor(alpha_dst, alpha_factor_supported);
+    const D3D12_BLEND src_a = alpha_factor(alpha_src, alpha_factor_supported), dst_a = alpha_factor(alpha_dst, alpha_factor_supported);
     if (!src || !dst || !src_a || !dst_a) {
         const std::uint32_t bad = !src ? color_src : !dst ? color_dst : !src_a ? alpha_src : alpha_dst;
         out.reason = bad == 11 || bad == 12 ? "BOTH_SRC_ALPHA / BOTH_INV_SRC_ALPHA factor"

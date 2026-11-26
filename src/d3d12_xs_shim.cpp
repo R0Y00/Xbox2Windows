@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "d3d12x_device_slots.h"
+#include "startup_stubs/d3d12_teardown.h"
 
 namespace {
 // Observed console root-signature flag bits set by XboxBvhBuilder.dll.
@@ -269,4 +270,24 @@ extern "C" HRESULT WINAPI d3d12_xs_ConfigureVirtualMemoryX(const void* config)
     if (accepted) vm_state.value = value;
     ReleaseSRWLockExclusive(&vm_state.lock);
     return accepted ? S_OK : DXGI_ERROR_INVALID_CALL;
+}
+
+// Lifetime boundary of the desktop D3D12 objects this module keeps in function-local statics
+// (startup_stubs/d3d12_draw.inl, startup_stubs/rect_indirect_args.h, #2572). Those caches own a device,
+// a root signature and a pipeline state per device for as long as this DLL is loaded, and the loader
+// detaches the module before their destructors run:
+//   lpReserved != nullptr  the process is exiting. Windows has already stopped the display driver, so a
+//                          Release() there faults inside the driver (amdxc64 offset 0x35f2a19, through
+//                          D3D12Core!CPipelineState::FinalRelease) and the loader ends the process with
+//                          __fastfail(7). The caches detach their references instead of releasing them.
+//   lpReserved == nullptr  FreeLibrary unloads the module while the process and the driver stay alive:
+//                          the caches release the objects they own.
+// This DllMain runs before this module's atexit table: the static runtime reaches the user entry before
+// it runs the table on detach, which the cpu_native_crt_lifecycle fixture measures (a global destructor
+// runs after DllMain(DLL_PROCESS_DETACH), docs/experiments.md), so the destructors see the flag below.
+// startup_stubs/d3d12_teardown.h has the details.
+extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
+{
+    if (reason == DLL_PROCESS_DETACH && reserved) x2w_startup::d3d12_process_terminating = true;
+    return TRUE;
 }

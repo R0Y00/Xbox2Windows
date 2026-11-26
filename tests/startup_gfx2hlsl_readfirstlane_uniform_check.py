@@ -81,9 +81,9 @@ ACCEPTED = [
      ['v7 = U(1.0 / F(s2));']),
     # The clamp to [0, 0.5] of a scalar, as compiled shaders write it.
     ('median of three', ('v_med3_f32 v7, s2, 0, 0.5',),
-     ['v7 = U(med3(F(s2), F(0x00000000u), 0.5));']),
+     ['v7 = U(med3_32(F(s2), F(0x00000000u), 0.5));']),
     ('median of three scalar sources', ('v_med3_f32 v7, s2, -s3, |s2| clamp',),
-     ['v7 = U(saturate(med3(F(s2), (-F(s3)), abs(F(s2)))));']),
+     ['v7 = U(saturate(med3_32(F(s2), (-F(s3)), abs(F(s2)))));']),
     ('move', ('v_mov_b32_e32 v7, s2',), ['v7 = s2;']),
     ('literal move', ('v_mov_b32_e32 v7, 0x1234',), ['v7 = 0x00001234u;']),
     ('chain with an in-place write', ('v_mul_f32_e64 v7, s2, 2.0', 'v_cvt_u32_f32_e32 v7, v7'),
@@ -175,8 +175,17 @@ check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7
 # (tests/startup_gfx2hlsl_readfirstlane_recompute_check.py covers that rule).
 got = run(MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')
 check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 = s2;'], repr(got))
-# Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
-EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
+# These instructions refuse before v_readfirstlane_b32 is reached.
+EARLIER = {
+    'op_sel overwrite': 'modifier op_sel:[0,0]',
+    'modified move overwrite': "v_mov_b32 with ['clamp']",
+    'mask from uniform compare': 'v_mov_b32 data operand s2 is a lane mask',
+    'vcc': 'v_mov_b32 data operand vcc_lo is a lane mask',
+    'exec': 'v_mov_b32 data operand exec_lo is a lane mask',
+    'compare into SGPR': 'v_mov_b32 data operand s2 is a lane mask',
+    'saved exec': 'v_mov_b32 data operand s2 is a lane mask',
+    'mask in the entry block': 'v_mov_b32 data operand s2 is a lane mask',
+}
 for label, instructions in REFUSED:
     got = run(*instructions)
     check(f'{label} refused', got == EARLIER.get(label, REFUSAL), repr(got))

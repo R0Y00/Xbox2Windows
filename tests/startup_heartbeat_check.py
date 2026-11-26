@@ -61,10 +61,25 @@ def wait_for_sample(log, predicate):
     raise AssertionError("no matching heartbeat sample: " + log.read_text(errors="replace")[-1200:])
 
 
+def released_is_valid(peak_mib, current_mib, released):
+    """After the extra commit is freed: the peak never falls, and the commit drops by at least 8 MiB."""
+    return released[1] >= peak_mib and released[2] <= current_mib - 8
+
+
+def controls():
+    """Negative controls: the check above must reject a fallen peak and a commit that did not drop."""
+    assert released_is_valid(100, 50, (3, 100, 40)), "equal peak must pass"
+    assert released_is_valid(100, 50, (3, 120, 40)), "a peak raised by the heartbeat thread must pass"
+    assert not released_is_valid(100, 50, (3, 99, 40)), "a falling peak must fail"
+    assert not released_is_valid(100, 50, (3, 100, 45)), "a commit that dropped less than 8 MiB must fail"
+    print("controls ok")
+
+
 def main(xmem_path, xcrdapi_path):
     log = Path(tempfile.gettempdir()) / f"x2w-heartbeat-{os.getpid()}.txt"
     log.write_bytes(b"")
     os.environ["X2W_TRAP_LOG"] = str(log)
+    os.environ["X2W_HEARTBEAT_INTERVAL_MS"] = "1000"  # three samples in about 3 s, not 30 s
     xcrdapi = C.WinDLL(str(Path(xcrdapi_path).resolve()), use_last_error=True, winmode=0x900)
     kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
     pointer, number = C.c_void_p, C.c_size_t
@@ -72,6 +87,7 @@ def main(xmem_path, xcrdapi_path):
     factory = pointer()
     assert get_factory(None, C.byref(factory)) == 0 and factory.value, "DStorageGetFactory failed"
     first_sample = wait_for_sample(log, lambda sample: sample[3] == "unknown")
+    assert first_sample[0] < 10, f"the interval override was ignored: first sample at {first_sample[0]} s"
     library = C.WinDLL(str(Path(xmem_path).resolve()), use_last_error=True, winmode=0x900)
     allocate = bind(library, "XMemAllocatePhysicalPages", [number, C.POINTER(number), C.POINTER(number)], C.c_int)
     release = bind(library, "XMemFreePhysicalPages", [number, C.POINTER(number)], C.c_int)
@@ -106,9 +122,9 @@ def main(xmem_path, xcrdapi_path):
         assert free(extra, 0, WIN_RELEASE), C.get_last_error()
         extra = None
         released = wait_for_sample(log, lambda sample: sample[0] > second_mark and sample[3] == "2")
-        assert released[1] == peak_mib and released[2] <= current_mib - 8, (peak_mib, current_mib, released)
+        assert released_is_valid(peak_mib, current_mib, released), (peak_mib, current_mib, released)
         print(f"sections unknown at {first_sample[0]} s, then {sections} at {second_mark} s; "
-              f"commit fell from {current_mib} to {released[2]} MiB at unchanged peak {peak_mib} MiB")
+              f"commit fell from {current_mib} to {released[2]} MiB with peak {peak_mib} MiB then {released[1]} MiB")
     finally:
         if extra:
             free(extra, 0, WIN_RELEASE)
@@ -125,4 +141,6 @@ def main(xmem_path, xcrdapi_path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    controls()
+    if sys.argv[1:] != ["controls"]:
+        main(sys.argv[1], sys.argv[2])

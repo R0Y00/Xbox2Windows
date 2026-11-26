@@ -24,6 +24,18 @@ WAVE = (1 << 64) - 1
 LANE_SPILL_OPS = {"v_writelane_b32", "v_readlane_b32"}
 VGPR_OPERAND = re.compile(r"\bv(?:(\d+)\b|\[(\d+):(\d+)\])")
 LDS_BYTES = 1 << 16
+FLAT_SCRATCH_WRITE = re.compile(r"s_setreg_imm32_b32 hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\), (.+)")
+# The immediate spellings compute_store_aot accepts for the same write (a copy of its pattern).
+IMM32_LITERAL = re.compile(
+    r"-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|nan|inf(?:inity)?)",
+    re.IGNORECASE,
+)
+
+
+def flat_scratch_write(line):
+    """A whole-register immediate write of either half of the scratch base."""
+    match = FLAT_SCRATCH_WRITE.fullmatch(line)
+    return match is not None and IMM32_LITERAL.fullmatch(match[1]) is not None
 
 
 def branch_target(offset, operand):
@@ -186,6 +198,12 @@ class Wave:
             if self.vcc is None:
                 raise ValueError("Undefined wave predicate")
             return self.vcc
+        if t == "src_scc":
+            if self.scc is None:
+                raise ValueError("Undefined scalar predicate in src_scc")
+            if isinstance(self.scc, Dyn):
+                raise ValueError("Dynamic scalar predicate in src_scc")
+            return int(self.scc)
         if re.fullmatch(r"-?\d+\.\d+", t):
             return struct.unpack("<I", struct.pack("<f", float(t)))[0]
         return int(t, 0)
@@ -307,7 +325,7 @@ class Wave:
             )
         return [f"({cond.expr} ? {t} : {f})" for t, f in zip(*arms)]
 
-    def join_arms(self, decoded, expressions, jumps, pc, offset, target_offset, cond):
+    def join_arms(self, decoded, expressions, jumps, pc, target_offset, cond, *, branch_on_true):
         """Run both arms of a uniform branch on a constant predicate and merge them.
 
         Only scalar ALU and loads may appear inside an arm; the arms write no
@@ -338,6 +356,9 @@ class Wave:
             if (self.exec, self.vcc, self.m0) != before:
                 raise ValueError("A descriptor join arm changed EXEC, VCC or M0")
             outcomes.append((self.s, self.pending, self.pending_v))
+        # Outcomes are in fall-through, taken order. Select needs true, false.
+        if branch_on_true:
+            outcomes.reverse()
         (true_s, true_p, true_v), (false_s, false_p, false_v) = outcomes
         self.pending_v = true_v | false_v
         if true_s.keys() != false_s.keys():
@@ -364,6 +385,20 @@ class Wave:
             "s_buffer_load_dwordx16",
         ):
             self.load(op, args)
+            return
+        if op in ("s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"):
+            if len(args) != 2:
+                raise ValueError(f"Expected two operands for {op}")
+            a, b = (self.scalar(t, True) for t in args)
+            if a is UNDEF or b is UNDEF:
+                self.scc = None
+                return
+            if type(a) is not int or type(b) is not int:
+                raise ValueError("Dynamic scalar predicate")
+            mask = 63 if op.endswith("_b64") else 31
+            width = WAVE if op.endswith("_b64") else U32
+            bit = ((a & width) >> (b & mask)) & 1
+            self.scc = bit == (1 if op.startswith("s_bitcmp1_") else 0)
             return
         if op.startswith("s_cmp_"):
             a, b = (self.scalar(t, True) for t in args)
@@ -724,6 +759,8 @@ class Wave:
             offset, line = decoded[pc]
             pc += 1
             op, _, tail = line.partition(" ")
+            if flat_scratch_write(line):
+                continue
             args = tail.split(", ")
             if op in LANE_SPILL_OPS:
                 self.lane_spill(op, args)
@@ -744,6 +781,10 @@ class Wave:
                 return True
             if op in ("s_inst_prefetch", "s_nop"):
                 continue
+            if op == "s_clause":
+                if not re.fullmatch(r"0x[0-9a-fA-F]+|0|[1-9]\d*", tail) or not 0 <= int(tail, 0) <= 0x3F:
+                    raise ValueError(f"Invalid s_clause operand: {tail}")
+                continue
             if op == "s_barrier":
                 if self.ds_writes_pending:
                     raise ValueError("LDS store not waited before the barrier")
@@ -761,10 +802,10 @@ class Wave:
                     self.ds_writes_pending = False
                 if "vmcnt" in tail:
                     self.pending_v.clear()
-            elif op == "s_cbranch_scc0" and isinstance(self.scc, Dyn):
+            elif op in ("s_cbranch_scc0", "s_cbranch_scc1") and isinstance(self.scc, Dyn):
                 pc = self.join_arms(
-                    decoded, expressions, jumps, pc, offset,
-                    branch_target(offset, tail), self.scc,
+                    decoded, expressions, jumps, pc, branch_target(offset, tail),
+                    self.scc, branch_on_true=op == "s_cbranch_scc1",
                 )
             elif op == "s_branch" or op.startswith("s_cbranch_"):
                 if (
@@ -914,6 +955,16 @@ def run_group(waves, decoded, expressions):
     Each wave runs to its next barrier before any wave goes on. Stores become
     visible to every wave only when all of them have reached the barrier.
     """
+    # Whole-register immediate writes of the scratch base lower to nothing when
+    # nothing can read either half: scratch_* and flat_* memory forms and
+    # s_getreg_* (which these lowerers do not lower for any register). Check every
+    # instruction, including skipped arms, since the wave model does not track the
+    # written value and only checks the instructions it executes.
+    if any(flat_scratch_write(line) for _, line in decoded):
+        for _, line in decoded:
+            op = line.partition(" ")[0]
+            if op.startswith(("scratch_", "flat_", "s_getreg_")):
+                raise ValueError(f"Mesh scratch-base write may be observed by {op}")
     lds = {}
     for wave in waves:
         wave.lds = lds

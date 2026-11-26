@@ -41,10 +41,12 @@ Limits:
 """
 
 import argparse
+from collections.abc import Sequence
 import csv
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import re
 import statistics
@@ -393,20 +395,53 @@ def print_table(records):
               f"  {summary['draw_outcome']} {summary['draw_detail']} {summary['controls']}")
 
 
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_paths(
+    dxc: Path,
+    renderer: Path,
+    out: Path | None,
+    work_dir: Path | None,
+) -> None:
+    if work_dir is not None and work_dir.exists() and not work_dir.is_dir():
+        raise ValueError(f"--work-dir path is not a directory: {work_dir}")
+    if out is not None:
+        if out.exists() and out.is_dir():
+            raise ValueError(f"--out path is a directory: {out}")
+        if out.parent.exists() and not out.parent.is_dir():
+            raise ValueError(f"--out parent is not a directory: {out.parent}")
+        if _same_path(out, dxc):
+            raise ValueError(f"--out path collides with --dxc: {out}")
+        if _same_path(out, renderer):
+            raise ValueError(f"--out path collides with --renderer: {out}")
+
+
 def write_report(path, payload, records):
+    path = Path(path)
+    if path.exists() and path.is_dir():
+        raise ValueError(f"--out path is a directory: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.suffix.lower() == ".json":
-        path.write_text(json.dumps({**payload, "variants": records}, indent=1) + "\n",
-                        encoding="utf-8")
-        return
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for record in records:
-            writer.writerow({**record, **summarize(record)})
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging_dir:
+        staged = Path(staging_dir) / path.name
+        if path.suffix.lower() == ".json":
+            staged.write_text(
+                json.dumps({**payload, "variants": records}, indent=1) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            with staged.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                for record in records:
+                    writer.writerow({**record, **summarize(record)})
+        os.replace(staged, path)
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dxc", type=Path, help="DXC executable")
@@ -457,6 +492,12 @@ def main(argv=None):
         if not getattr(args, option).is_file():
             parser.error(f"--{option} not found: {getattr(args, option)}")
 
+    try:
+        _validate_paths(args.dxc, args.renderer, args.out, args.work_dir)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     temporary = None
     try:
         if args.work_dir:
@@ -468,7 +509,7 @@ def main(argv=None):
         identity, records = measure(names, args.dxc, args.renderer, args.adapter, work,
                                     args.repeat, args.compile_timeout, args.pipeline_timeout,
                                     args.seed)
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -479,9 +520,14 @@ def main(argv=None):
         print(line)
     print_table(records)
     if args.out:
+        try:
+            version = dxc_version(args.dxc)
+        except (OSError, ValueError) as exc:
+            print(f"error: failed to query dxc version: {exc}", file=sys.stderr)
+            return 1
         payload = {
             "recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "dxc": str(args.dxc), "dxc_version": dxc_version(args.dxc),
+            "dxc": str(args.dxc), "dxc_version": version,
             "target": TARGET, "adapter": args.adapter, "identity": identity,
             "seed": f"0x{args.seed:08x}",
             "repeat": args.repeat, "compile_timeout_s": args.compile_timeout,
@@ -489,7 +535,7 @@ def main(argv=None):
         }
         try:
             write_report(args.out, payload, records)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             print(f"error: failed to write {args.out}: {exc}", file=sys.stderr)
             return 1
         print(f"\nwrote {args.out}")

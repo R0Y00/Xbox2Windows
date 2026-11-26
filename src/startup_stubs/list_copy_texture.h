@@ -12,8 +12,8 @@ namespace x2w_list_copy_texture {
 enum class Kind : std::uint32_t { subresource = 0, placed_footprint = 1 };
 
 // What the check needs to know about one side of the copy. For a subresource side, width/height/depth are
-// the subresource's size in blocks (texels for an uncompressed format). For a footprint side, the footprint
-// size in blocks, the row pitch in bytes, the byte offset and the bytes per block are used, and
+// the subresource's size in texels (a 2x2 mip of a block-compressed format is 2x2). For a footprint side, the
+// footprint size in texels, the row pitch in bytes, the byte offset and the bytes per block are used, and
 // resource_bytes is the size of the buffer.
 struct Side {
     Kind kind;
@@ -61,7 +61,7 @@ enum class Verdict {
     bad_offset,         // a footprint offset that is not a multiple of 512
     footprint_overflow, // the footprint reaches past the end of its buffer
     sample_mismatch,    // the two sides differ in sample count
-    bad_alignment,      // a block-compressed copy that does not start on a block
+    bad_alignment,      // a block-compressed copy that does not start on a block, or a box that does not end on one
     bad_subresource,    // an index outside the resource's mips * array slices * planes
     format_mismatch,    // the two sides name different formats
     partial_multisample, // a multisampled copy that is not the whole subresource at the origin
@@ -140,19 +140,31 @@ inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uin
     }
     if (dst.samples != src.samples) return Verdict::sample_mismatch;
     if (dst.format != src.format) return Verdict::format_mismatch;
-    const Box whole{0, 0, 0, src.width, src.height, src.depth};
+    const Side& tex = dst.kind == Kind::subresource ? dst : src;  // the side that knows the block size
+    // D3D12 measures a block-compressed region in whole blocks: a 2x2 or 1x1 mip spans one 4x4 block, and
+    // GetCopyableFootprints describes it as a 4x4 footprint, so each side's extent rounds up to the block.
+    const auto extent = [](std::uint32_t v, std::uint32_t block) {
+        return block > 1 ? (std::uint64_t{v} + block - 1) / block * block : std::uint64_t{v};
+    };
+    const std::uint64_t src_w = extent(src.width, tex.block_w), src_h = extent(src.height, tex.block_h);
+    const std::uint64_t dst_w = extent(dst.width, tex.block_w), dst_h = extent(dst.height, tex.block_h);
+    const auto narrow = [](std::uint64_t v) { return static_cast<std::uint32_t>(v > 0xffffffffu ? 0xffffffffu : v); };
+    const Box whole{0, 0, 0, narrow(src_w), narrow(src_h), src.depth};
     const Box use = box ? *box : whole;
     if (use.left >= use.right || use.top >= use.bottom || use.front >= use.back) return Verdict::bad_box;
-    if (use.right > src.width || use.bottom > src.height || use.back > src.depth) return Verdict::source_overflow;
-    const Side& tex = dst.kind == Kind::subresource ? dst : src;  // the side that knows the block size
+    if (use.right > src_w || use.bottom > src_h || use.back > src.depth) return Verdict::source_overflow;
     if (x % tex.block_w || use.left % tex.block_w || y % tex.block_h || use.top % tex.block_h) return Verdict::bad_alignment;
+    // The box must also end on a block, even where it ends at the edge of a smaller mip: a {0,0,2,2} box on a 2x2 or
+    // a {0,0,6,6} box on a 6x6 block-compressed mip makes the desktop list's Close fail with E_INVALIDARG, so every
+    // command recorded in it is lost (measured without the debug layer on WARP and on an RX 6600).
+    if (use.right % tex.block_w || use.bottom % tex.block_h) return Verdict::bad_alignment;
     const std::uint32_t w = use.right - use.left, h = use.bottom - use.top, d = use.back - use.front;
     // D3D12 requires a null source box even if an explicit box would cover the whole subresource.
     const bool depth_stencil = src.depth_stencil || dst.depth_stencil;
     if ((src.samples > 1 || depth_stencil) &&
-        (box || x || y || z || w != dst.width || h != dst.height || d != dst.depth))
+        (box || x || y || z || w != dst_w || h != dst_h || d != dst.depth))
         return src.samples > 1 ? Verdict::partial_multisample : Verdict::partial_depth_stencil;
-    if (std::uint64_t{x} + w > dst.width || std::uint64_t{y} + h > dst.height || std::uint64_t{z} + d > dst.depth)
+    if (std::uint64_t{x} + w > dst_w || std::uint64_t{y} + h > dst_h || std::uint64_t{z} + d > dst.depth)
         return Verdict::dest_overflow;
     for (const Side* s : {&dst, &src}) {
         if (s->kind != Kind::placed_footprint) continue;

@@ -1,4 +1,5 @@
 """Check typed gfx1013 colour exports through the wrapped draw and offline cache."""
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import re
@@ -6,6 +7,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 
 from startup_stream_check import container, gfx2hlsl
 from startup_stream_draw_check import vertex, vop1
@@ -59,91 +61,114 @@ def check(work, consumer, backend, kind, dxc, fxc):
     if not Path(compiler).is_file():
         print(f'{kind} compiler unavailable')
         return 77
-    cache = work / 'cache'
-    cache.mkdir()
-    vs, ps, root, output = (work / name for name in ('vs', 'ps', 'root', 'pixels'))
+    vs, ps = work / 'vs', work / 'ps'
     vs.write_bytes(vertex())
-    env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
-               X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache), X2W_FXC=fxc if kind == 'fxc' else '')
-    args = [consumer, vs, ps, root, backend, output]
 
-    def draw(fmt, word=0, wanted_draw=True):
-        result = subprocess.run(args + [str(fmt), str(word)], env=env, capture_output=True, text=True)
-        if result.returncode == 77:
-            raise SystemExit(77)
-        print(result.stdout, end='')
-        debug = next((line for line in result.stderr.splitlines() if 'debug layer:' in line), '')
-        assert debug, result.stderr
-        print(debug)
-        assert not re.search(r'x2w-d3d12-debug.*sev=[012]\b', result.stderr), result.stderr
-        actual_draw = '-> drawn;' in result.stderr
-        assert result.returncode == 0 and actual_draw == wanted_draw, result.stderr
-        return output.read_bytes(), result.stderr
+    def session(name):
+        """Private cache, root and output files, so sessions can run side by side."""
+        cache = work / name
+        cache.mkdir()
+        root, output = cache / 'root', cache / 'pixels'
+        env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
+                   X2W_D3D12_DEBUG='1', X2W_SHADER_CACHE=str(cache), X2W_FXC=fxc if kind == 'fxc' else '')
+        args = [consumer, vs, ps, root, backend, output]
 
-    def queue_request(fmt, formats):
-        pixels, log = draw(fmt, wanted_draw=False)
-        assert 'no RTV translation' in log, log
-        base = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
-        line = 'rtv1 ' + ' '.join(map(str, (base, *formats)))
-        key = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
-        assert (cache / f'req_{key}.rtv').read_text() == line
-        return key, line, pixels
+        def draw(fmt, word=0, wanted_draw=True):
+            result = subprocess.run(args + [str(fmt), str(word)], env=env, capture_output=True, text=True)
+            if result.returncode == 77:
+                raise SystemExit(77)
+            print(result.stdout, end='')
+            debug = next((line for line in result.stderr.splitlines() if 'debug layer:' in line), '')
+            assert debug, result.stderr
+            print(debug)
+            assert not re.search(r'x2w-d3d12-debug.*sev=[012]\b', result.stderr), result.stderr
+            actual_draw = '-> drawn;' in result.stderr
+            assert result.returncode == 0 and actual_draw == wanted_draw, result.stderr
+            return output.read_bytes(), result.stderr
 
-    def request(fmt, formats):
-        key, line, pixels = queue_request(fmt, formats)
-        subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', cache], env=env, check=True)
-        assert (cache / f'{key}.txt').read_text().splitlines()[-1] == line
-        return key, pixels
+        def queue_request(fmt, formats):
+            pixels, log = draw(fmt, wanted_draw=False)
+            assert 'no RTV translation' in log, log
+            base = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
+            line = 'rtv1 ' + ' '.join(map(str, (base, *formats)))
+            key = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
+            assert (cache / f'req_{key}.rtv').read_text() == line
+            return key, line, pixels
 
-    def compile_pair(key):
-        for stage in ('vs', 'ps'):
-            compile_shader(compiler, kind, stage, cache / f'{key}.{stage}.hlsl', cache / f'{key}.{stage}.cso',
-                           cache / f'{key}.{stage}.asm')
-        return signature(cache / f'{key}.ps.asm')
+        def request(fmt, formats):
+            key, line, pixels = queue_request(fmt, formats)
+            subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', cache], env=env, check=True)
+            assert (cache / f'{key}.txt').read_text().splitlines()[-1] == line
+            return key, pixels
+
+        def compile_pair(key):
+            for stage in ('vs', 'ps'):
+                compile_shader(compiler, kind, stage, cache / f'{key}.{stage}.hlsl', cache / f'{key}.{stage}.cso',
+                               cache / f'{key}.{stage}.asm')
+            return signature(cache / f'{key}.ps.asm')
+
+        return SimpleNamespace(cache=cache, root=root, output=output, env=env, draw=draw,
+                               queue_request=queue_request, request=request, compile_pair=compile_pair)
+
+    main = session('cache')
+    cache, root, output, env = main.cache, main.root, main.output, main.env
+    draw, queue_request, request, compile_pair = main.draw, main.queue_request, main.request, main.compile_pair
 
     ps.write_bytes(pixel((INTEGER_WORD, 2, 3, 4), unorm=True))
-    variants = {}
-    for fmt, expected_type, channels in INTEGER_FORMATS:
-        key, cleared = request(fmt, (fmt, 28))
-        variants[fmt] = key
+    integer_sessions = {fmt: session(f'int{fmt}') for fmt, _, _ in INTEGER_FORMATS}
+
+    def integer_format(fmt, expected_type, channels):
+        s = integer_sessions[fmt]
+        key, cleared = s.request(fmt, (fmt, 28))
         # The harness clears every target to (0, 0, 1, 1); integer channels hold those values as words.
         assert cleared == struct.pack(f'<{channels}I', *(0, 0, 1, 1)[:channels]) + bytes.fromhex('0000ffff'), cleared.hex()
-        outputs = compile_pair(key)
+        outputs = s.compile_pair(key)
         assert outputs == {'0': expected_type, '1': 'float'}, outputs
-        manifest = cache / f'{key}.txt'
+        manifest = s.cache / f'{key}.txt'
         manifest.rename(str(manifest) + '.pending')
-        env['X2W_TEST_PUBLISH_MANIFEST'] = str(manifest)
-        pixels, log = draw(fmt)
-        del env['X2W_TEST_PUBLISH_MANIFEST']
-        assert Path(str(output) + '.first').read_bytes() == cleared
+        s.env['X2W_TEST_PUBLISH_MANIFEST'] = str(manifest)
+        pixels, log = s.draw(fmt)
+        del s.env['X2W_TEST_PUBLISH_MANIFEST']
+        assert Path(str(s.output) + '.first').read_bytes() == cleared
         assert f'2 targets (format {fmt}) -> 0x00000000' in log, log
         words = (INTEGER_WORD, 2, 3, 4)[:channels]
         assert pixels == struct.pack(f'<{channels}I4B', *words, 255, 0, 0, 255), pixels.hex()
         print(f'{kind} {backend} {expected_type} format {fmt} MRT0={pixels[:4 * channels].hex()}; UNORM MRT1=ff0000ff')
         if fmt == 42:
             for unverified in REFUSED_INTEGER_FORMATS:
-                line = f'rtv1 {gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())} {unverified} 28'
+                line = f'rtv1 {gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), s.root.read_bytes())} {unverified} 28'
                 refused = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
-                marker = cache / f'req_{refused}.rtv'
+                marker = s.cache / f'req_{refused}.rtv'
                 marker.write_text(line)
-                result = gfx2hlsl.translate_request(cache, int(refused, 16))
+                result = gfx2hlsl.translate_request(s.cache, int(refused, 16))
                 assert re.fullmatch(rf'unsupported: unverified (UINT|SINT) RTV format {unverified}', result), result
-                assert not (cache / f'{refused}.txt').exists()
+                assert not (s.cache / f'{refused}.txt').exists()
                 # Later --pending runs would retry this synthetic request on every valid format.
                 marker.unlink()
             print(f'{kind} {backend} three-channel integer formats {REFUSED_INTEGER_FORMATS} refused at translation')
             # A pre-existing base translation may lack its original request files.
-            base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}'
-            compile_pair(base)
+            base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), s.root.read_bytes()):016x}'
+            s.compile_pair(base)
             for ext in ('a', 'b', 'root'):
-                (cache / f'req_{base}.{ext}').unlink()
+                (s.cache / f'req_{base}.{ext}').unlink()
+        return key
+
+    # Each format needs two device creations and two compiles; run them side by side in private caches.
+    with ThreadPoolExecutor(max_workers=len(INTEGER_FORMATS)) as pool:
+        futures = [pool.submit(integer_format, *entry) for entry in INTEGER_FORMATS]
+        variants = {entry[0]: future.result() for entry, future in zip(INTEGER_FORMATS, futures)}
     assert len({variants[f] for f, _, _ in INTEGER_FORMATS}) == len(INTEGER_FORMATS)
-    # A SINT artifact under the UINT cache key must be refused before PSO creation.
-    unsigned = cache / f'{variants[42]}.txt'
-    unsigned.write_bytes((cache / f'{variants[43]}.txt').read_bytes())
-    pixels, log = draw(42, wanted_draw=False)
+    # This cache still has the compiled base and UINT pair. Substitute only the signed manifest.
+    # On a base hit the runtime must also republish the three source blobs removed above.
+    uint = integer_sessions[42]
+    unsigned = uint.cache / f'{variants[42]}.txt'
+    unsigned.write_bytes((integer_sessions[43].cache / f'{variants[43]}.txt').read_bytes())
+    pixels, log = uint.draw(42, wanted_draw=False)
     assert 'RTV manifest mismatch' in log and 'desktop pipeline for' not in log, log
     assert pixels.hex() == '000000000000ffff', pixels.hex()
+    base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), uint.root.read_bytes()):016x}'
+    for ext, source in (('a', vs), ('b', ps), ('root', uint.root)):
+        assert (uint.cache / f'req_{base}.{ext}').read_bytes() == source.read_bytes(), ext
     print(f'{kind} {backend} stale signedness control: refused before PSO creation')
 
     def low_bits_control(key, fmt, trunc, expected):
