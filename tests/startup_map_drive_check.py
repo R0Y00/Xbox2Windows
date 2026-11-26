@@ -67,6 +67,10 @@ shutil.rmtree(package, ignore_errors=True)
 os.makedirs(package)
 with open(os.path.join(package, "map_drive_probe.txt"), "w", encoding="ascii", newline="") as handle:
     handle.write("mapped ok")
+if overlap_mode:
+    # The second thread's file has a longer name; the contents tell the files apart in the trace-free case.
+    with open(os.path.join(package, "map_drive_probe_second_longer_name.txt"), "w", encoding="ascii", newline="") as handle:
+        handle.write("second file")
 
 if not overlap_mode:
     # The launcher exits 0 whether or not the child succeeded, so the child's own output is the signal.
@@ -106,14 +110,17 @@ OPENS = 64  # two threads, 32 opens each
 def overlap(label, extra):
     """One two-thread run: (every open mapped and succeeded and every caller name restored, text, unprotected)."""
     stdout, trace, launcher_out = run(letter, f"{letter}={package}", label, mode="overlap", extra=extra)
-    mapped_ok = sum(1 for line in trace.splitlines() if " NtCreateFile " in line and "(mapped from " in line
-                    and line.rstrip().endswith("-> 0x00000000"))
+    def mapped_opens(name):
+        return sum(1 for line in trace.splitlines() if " NtCreateFile " in line and "(mapped from " in line
+                   and line.rstrip().endswith("-> 0x00000000") and f"\\{name} from " in line)
+    first, second = mapped_opens("map_drive_probe.txt"), mapped_opens("map_drive_probe_second_longer_name.txt")
+    mapped_ok = first + second
     rewrites = trace.count("MAP ")
     summary = re.search(r"hook windows: entries=\d+ windows=\d+ unprotected=(\d+)", launcher_out + trace)
     unprotected = int(summary.group(1)) if summary else -1
     good = f"overlap ok: {OPENS} opens across two threads, both caller names intact" in stdout \
-        and mapped_ok == OPENS and rewrites == OPENS
-    return good, f"{stdout.strip()!r} (mapped opens traced {mapped_ok}, rewrites {rewrites})", unprotected
+        and first == second == OPENS // 2 and rewrites == OPENS
+    return good, f"{stdout.strip()!r} (mapped opens traced {first} + {second}, rewrites {rewrites})", unprotected
 
 
 if overlap_mode:

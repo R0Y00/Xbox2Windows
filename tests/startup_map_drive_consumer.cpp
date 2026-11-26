@@ -116,14 +116,26 @@ struct Overlap {
     int opens;
     LONG completed;
     LONG broken;
+    LONG wrong_file;  // an open that reached a file other than the one its own thread named
 };
+
+// The two threads name DIFFERENT files of DIFFERENT lengths, so a name buffer shared between the calls in
+// flight would hand one thread the other's name (or a cut-off one) instead of its own file.
+struct Worker {
+    Overlap* shared;
+    int index;
+};
+const wchar_t* const overlap_file[2] = {L"map_drive_probe.txt", L"map_drive_probe_second_longer_name.txt"};
+
 
 DWORD WINAPI overlap_thread(LPVOID parameter)
 {
-    auto* shared = static_cast<Overlap*>(parameter);
-    wchar_t name[64];
-    _snwprintf_s(name, 64, _TRUNCATE, L"\\??\\%c:\\map_drive_probe.txt", shared->letter);
-    wchar_t built[64];
+    auto* worker = static_cast<Worker*>(parameter);
+    Overlap* shared = worker->shared;
+    const wchar_t* const file_name = overlap_file[worker->index];
+    wchar_t name[96];
+    _snwprintf_s(name, 96, _TRUNCATE, L"\\??\\%c:\\%ls", shared->letter, file_name);
+    wchar_t built[96];
     wcscpy_s(built, name);
 
     UNICODE_STRING string{};
@@ -139,6 +151,7 @@ DWORD WINAPI overlap_thread(LPVOID parameter)
     NtCreateFileFn create = nullptr;
     NtCloseFn close = nullptr;
     if (!ntdll || !resolve(ntdll, create, close)) return 1;
+    const size_t file_length = std::wcslen(file_name);
 
     WaitForSingleObject(shared->start, INFINITE);
     for (int index = 0; index < shared->opens; ++index) {
@@ -148,7 +161,16 @@ DWORD WINAPI overlap_thread(LPVOID parameter)
                                        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
                                        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
         if (result < 0) return 1;
+        // Which file did the call open? It has to be this thread's own, not the other thread's.
+        wchar_t final_path[MAX_PATH * 2]{};
+        const DWORD got = GetFinalPathNameByHandleW(handle, final_path, MAX_PATH * 2, FILE_NAME_NORMALIZED);
+        const bool own_file = got > file_length && got < MAX_PATH * 2 &&
+            _wcsicmp(final_path + got - file_length, file_name) == 0 && final_path[got - file_length - 1] == L'\\';
         close(handle);
+        if (!own_file) {
+            InterlockedIncrement(&shared->wrong_file);
+            return 1;
+        }
         if (string.Length != length || string.MaximumLength != maximum || string.Buffer != buffer ||
             std::wcscmp(string.Buffer, built) != 0) {
             InterlockedIncrement(&shared->broken);
@@ -167,8 +189,9 @@ int overlapping_names()
     shared.letter = probe_letter();
     shared.opens = 32;
     if (!shared.start) return 1;
-    HANDLE threads[2] = {CreateThread(nullptr, 0, overlap_thread, &shared, 0, nullptr),
-                         CreateThread(nullptr, 0, overlap_thread, &shared, 0, nullptr)};
+    Worker workers[2] = {{&shared, 0}, {&shared, 1}};
+    HANDLE threads[2] = {CreateThread(nullptr, 0, overlap_thread, &workers[0], 0, nullptr),
+                         CreateThread(nullptr, 0, overlap_thread, &workers[1], 0, nullptr)};
     if (!threads[0] || !threads[1]) return 1;
     SetEvent(shared.start);
     WaitForMultipleObjects(2, threads, TRUE, 30000);
@@ -177,6 +200,10 @@ int overlapping_names()
     CloseHandle(shared.start);
     if (first != WAIT_OBJECT_0 || second != WAIT_OBJECT_0) {
         std::printf("overlap threads did not finish\n");
+        return 1;
+    }
+    if (shared.wrong_file) {
+        std::printf("overlap: %ld opens reached another thread's file (a name was shared between calls)\n", shared.wrong_file);
         return 1;
     }
     if (shared.broken) {
