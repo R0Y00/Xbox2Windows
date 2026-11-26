@@ -12,6 +12,13 @@ Each operation is lowered by the translator, then the emitted HLSL line is run o
               (sign clear) or 0x80000000 (sign set), as measured on RDNA 2 (CVT_FLR_RPI_EXCEPTIONAL).
   ldexp:      S0 * 2^S1 with S1 a signed integer.
 Not covered: denormal inputs and results of v_ldexp_f32 (the denormal mode decides them) and signaling-NaN payloads.
+
+Profile this oracle states: the NORMAL domain only (normal inputs, normal results, zero, inf, NaN). The binary32 denormal
+selection (MODE[5:4]) is not modelled by the startup translator: a write that selects it is accepted and changes no emitted
+line, so the emitted code follows the desktop compiler's own denormal behaviour (flushing, as measured on WARP and one
+desktop GPU). ref_cvt_flr and ref_ldexp compute denormal words exactly, ref_frexp_mant answers a signed zero; none of
+these denormal rows is a guest guarantee, and a desktop result on them says nothing about the console. A guest profile
+for denormals needs a source-built native reference that records the selected mode, the input and the output words.
 """
 import math
 import re
