@@ -402,6 +402,14 @@ def disassemble_words(code):
 
 
 def check_controls():
+    # Low-level translator probes use the immutable empty alignment class fallback.
+    from startup_gfx2hlsl_sop2_complement_check import Probe
+
+    probe = Probe()
+    probe.exec_known = True
+    probe.one('s_wqm_b32', 's_wqm_b32 exec_lo, exec_lo')
+    assert probe.wqm_exec
+
     for raw, expected_asm in DECODE_CASES:
         size, _name, asm, _ = D.decode_instruction(raw, 0)
         assert size == 8 and asm == expected_asm, (asm, expected_asm)

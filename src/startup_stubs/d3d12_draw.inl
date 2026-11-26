@@ -1943,6 +1943,29 @@ struct FormattedBufferDescriptor {
     std::uint32_t words[8] = {};
 };
 
+// Word 3 of a buffer descriptor as a formatted load decodes it (words[3]): the title's hardware word, or for a typed
+// buffer view the title created (words[0] its token) the word the driver builds from its format and component
+// mapping. Returns the refusal, with an unsupported FORMAT in format. Draws and compute Dispatch share it.
+const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
+{
+    if (words[0] == view_token_magic) {
+        ViewRecord record{};
+        AcquireSRWLockShared(&note_lock);
+        const bool known = words[1] < view_records().size();
+        if (known) record = view_records()[words[1]];
+        ReleaseSRWLockShared(&note_lock);
+        if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        std::memcpy(&view, record.desc, 40);
+        return x2w_startup::view_word3(view, words[3]);
+    }
+    if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code)) {
+        format = code;
+        return "unsupported FORMAT";
+    }
+    return x2w_startup::descriptor_word3_refusal(words[3]);
+}
+
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
     const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
@@ -1965,25 +1988,8 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
-        if (descriptor.words[0] == view_token_magic) {
-            // A typed buffer view the title created: the driver builds word 3 from its format and component mapping.
-            ViewRecord record{};
-            AcquireSRWLockShared(&note_lock);
-            const bool known = descriptor.words[1] < view_records().size();
-            if (known) record = view_records()[descriptor.words[1]];
-            ReleaseSRWLockShared(&note_lock);
-            if (!known || record.slot != 18 || record.desc_bytes < 40)
-                return refuse(ud.a, "missing hardware descriptor");
-            D3D12_SHADER_RESOURCE_VIEW_DESC view;
-            std::memcpy(&view, record.desc, 40);
-            if (const char* reason = x2w_startup::view_word3(view, descriptor.words[3])) return refuse(ud.a, reason);
-            descriptor.entry = entry;
-            continue;
-        }
-        const auto format = x2w_startup::formatted_buffer_code(descriptor.words[3]);
-        if (!x2w_startup::formatted_buffer_supported(format))
-            return refuse(ud.a, "unsupported FORMAT", format);
-        if (const char* reason = x2w_startup::descriptor_word3_refusal(descriptor.words[3])) return refuse(ud.a, reason);
+        std::uint32_t format = 0;
+        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
         descriptor.entry = entry;
     }
     return true;

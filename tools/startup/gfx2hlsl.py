@@ -3979,7 +3979,7 @@ class Stage:
                     self.wqm_set_at = getattr(self, 'pc', None)  # where the quad-read flow proof starts
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
-            if hasattr(self, 'align4_v'):
+            if isinstance(self.align4_v, set):
                 self.align4_v.clear()
             if hasattr(self, 'scc_uniform'):
                 self.scc_uniform = False  # the hardware SCC result is not modelled
@@ -4785,7 +4785,7 @@ class Stage:
                     self.wqm_exec = False  # and the copy can be older than the WQM
                     if hasattr(self, 'uniform_v'):
                         self.uniform_v.clear()
-                    if hasattr(self, 'align4_v'):
+                    if isinstance(self.align4_v, set):
                         self.align4_v.clear()
                     return None
                 self.exec_known = False
