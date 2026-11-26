@@ -537,12 +537,6 @@ float sin32(float value) {
 float cos32(float value) {
     return cos(turns(value) * 6.28318548f);
 }
-// Finite binary32 to binary16, round toward zero, then widen for the float target.
-float export16(float value) {
-    uint h = f32tof16(value);
-    if (abs(f16tof32(h)) > abs(value)) h--;
-    return f16tof32(h);
-}
 // v_cvt_f32_f16: widen the binary16 in the low half of a word, built from its encoding so that
 // desktop denormal handling cannot change it. Subnormal halves stay exact as m * 2^-24; NaN payloads widen.
 float widen16(uint word) {
@@ -581,6 +575,14 @@ uint narrow16(float value) {
     }
     uint rounded = (full + 0xfffu + ((full >> 13) & 1u)) >> 13;
     return sign | min(((exponent - 113u) << 10) + rounded, 0x7c00u);
+}
+// Finite binary32 to binary16, round toward zero, then widen for the float target. Built on the integer
+// helpers: a driver may fold f16tof32(f32tof16(x)) into x and lose the correction. The round-to-nearest-even
+// result is one step too large exactly when it exceeds the input in magnitude, so step it back toward zero.
+float export16(float value) {
+    uint h = narrow16(value);
+    if (abs(widen16(h)) > abs(value)) h--;
+    return widen16(h);
 }
 """
 

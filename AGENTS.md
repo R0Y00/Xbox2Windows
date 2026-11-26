@@ -176,6 +176,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_abs_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_quadmask_b64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_ff0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_bitset_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_s_flbit_check.py
@@ -215,6 +216,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_bfm_b64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_data_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_get_lod_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
@@ -271,6 +273,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_getpc_refusal_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_arity_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sad_hi_msad_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_pk_int16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_null_check.py
 ```
