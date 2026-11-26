@@ -1951,6 +1951,25 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME startup_sharedexp_target_${adapter} COMMAND offscreen_check ${adapter} --startup-sharedexp-target)
     set_tests_properties(startup_sharedexp_target_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 endforeach()
+# Presented planes (src/startup_stubs/present_planes.h): the plane record layout and the composite order
+# on synthetic records. The control reads 0x40-byte records and composites plane 0 alone, and must FAIL.
+add_executable(startup_present_planes tests/startup_present_planes_check.cpp)
+target_include_directories(startup_present_planes PRIVATE src)
+target_compile_features(startup_present_planes PRIVATE cxx_std_17)
+add_test(NAME startup_present_planes COMMAND startup_present_planes)
+add_test(NAME startup_present_planes_control COMMAND startup_present_planes --control)
+set_tests_properties(startup_present_planes_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+# The window's plane composite (src/startup_stubs/plane_compositor.h) read back on WARP: a single-plane
+# baseline, stacked planes with transparent, partly transparent and opaque overlays, and skipped repeats
+# and empty records. The control composites only the black first plane and must FAIL.
+add_executable(startup_present_composite_warp tests/startup_present_composite_warp.cpp)
+target_include_directories(startup_present_composite_warp PRIVATE src)
+target_compile_features(startup_present_composite_warp PRIVATE cxx_std_17)
+target_link_libraries(startup_present_composite_warp PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_present_composite_warp COMMAND startup_present_composite_warp)
+add_test(NAME startup_present_composite_warp_control COMMAND startup_present_composite_warp --control)
+set_tests_properties(startup_present_composite_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+set_tests_properties(startup_present_composite_warp_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: " SKIP_RETURN_CODE 77 TIMEOUT 60)
 # Static samplers built from smp and smpc manifest lines (src/startup_stubs/translated_sampler_bindings.h).
 add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison_check.cpp)
 target_include_directories(startup_sampler_comparison_check PRIVATE src)

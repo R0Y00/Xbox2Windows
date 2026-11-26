@@ -55,6 +55,8 @@
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/present_planes.h"
+#include "startup_stubs/plane_compositor.h"
 
 #include <d3d12.h>
 #include "command_list_slot_names.h"
@@ -1881,7 +1883,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     if (FAILED(readback->Map(0, &range, &mapped))) return;
     AcquireSRWLockExclusive(&shown_lock);
     shown_pixels.resize(shown_width * shown_height);
-    std::uint64_t sum = 0;
+    std::uint64_t sum = 0, alpha_sum = 0;
     for (int y = 0; y < shown_height; ++y) {
         const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                           static_cast<UINT64>(y) * desc.Height / shown_height * footprint.Footprint.RowPitch;
@@ -1890,6 +1892,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
             const unsigned r = rgba ? texel[0] : texel[2], g = texel[1], b = rgba ? texel[2] : texel[0];
             shown_pixels[y * shown_width + x] = (r << 16) | (g << 8) | b;
             sum += r + g + b;
+            alpha_sum += texel[3];
         }
     }
     ReleaseSRWLockExclusive(&shown_lock);
@@ -1922,8 +1925,9 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     const LONG count = InterlockedIncrement(&shown_frames);
-    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
-                  desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
+    std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255, mean alpha %.2f/255",
+                  desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height),
+                  alpha_sum / (1.0 * shown_width * shown_height));
     if ((count > 0 && count <= 3) || count % 40 == 0) log("x2w-render presented %s", shown_note);
 }
 
@@ -5953,6 +5957,63 @@ void report_budget(ID3D12CommandQueue* queue)
     log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu", local, nonlocal, text, counts.unmeasured);
 }
 
+// The planes of a present, resolved to real resources the window presenter can draw.
+// X2W_PRESENT_PLANE=<n> (diagnostic) keeps plane n alone (plane 0 when n is past the count);
+// otherwise every plane is kept and the window composites them (present_planes.h).
+struct PresentedPlanes {
+    Wrapper* surfaces[window_planes] = {};
+    x2w_startup::PlaneStep steps[window_planes];
+    unsigned count = 0;  // composite steps
+    // The topmost composited plane's surface (the one shown and read back for diagnostics).
+    Wrapper* top() const { return count ? surfaces[steps[count - 1].plane] : nullptr; }
+};
+PresentedPlanes presented_planes(UINT planes, const void* plane_parameters)
+{
+    static const long wanted = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_PRESENT_PLANE", value, sizeof(value)) ? std::atol(value) : -1L;
+    }();
+    const auto readable = [](const void* address, std::size_t bytes) { return x2w_local::readable(address, bytes); };
+    PresentedPlanes out;
+    std::uint64_t shown[window_planes] = {};
+    const unsigned total = planes < window_planes ? planes : window_planes;
+    const unsigned only = wanted >= 0 ? (static_cast<unsigned long>(wanted) < planes ? static_cast<unsigned>(wanted) : 0u) : ~0u;
+    for (unsigned i = 0; i < total; ++i) {
+        if (only != ~0u && i != only) continue;
+        const std::uint64_t resource = x2w_startup::present_plane_resource(plane_parameters, planes, i, readable);
+        Wrapper* const surface = resource ? as_wrapper(reinterpret_cast<void*>(resource)) : nullptr;
+        if (!surface || surface->own().kind != resource_kind || !surface->own().real) continue;
+        out.surfaces[i] = surface;
+        if (presentable_surface(static_cast<ID3D12Resource*>(surface->own().real))) shown[i] = resource;
+    }
+    out.count = x2w_startup::composite_steps(shown, total, out.steps, window_planes);
+    // A known surface the window cannot draw is still the one reported and read back.
+    if (!out.count)
+        for (unsigned i = 0; i < total && !out.count; ++i)
+            if (out.surfaces[i]) out.steps[out.count++] = x2w_startup::PlaneStep{i, false};
+    return out;
+}
+
+// The first presents and every 300th: each plane's first resource and its shape.
+void log_present_planes(LONG frame, UINT planes, const void* plane_parameters)
+{
+    if (frame > 2 && frame % 300 != 0) return;
+    static LONG lines;
+    if (!first_calls(lines, 24)) return;
+    const auto readable = [](const void* address, std::size_t bytes) { return x2w_local::readable(address, bytes); };
+    for (unsigned i = 0; i < planes && i < 4; ++i) {
+        const std::uint64_t resource = x2w_startup::present_plane_resource(plane_parameters, planes, i, readable);
+        Wrapper* const surface = resource ? as_wrapper(reinterpret_cast<void*>(resource)) : nullptr;
+        if (!surface || surface->own().kind != resource_kind || !surface->own().real) {
+            log("x2w-present frame %ld plane %u/%u: resource %p is not a known resource", frame, i, planes, reinterpret_cast<void*>(resource));
+            continue;
+        }
+        const D3D12_RESOURCE_DESC desc = static_cast<ID3D12Resource*>(surface->own().real)->GetDesc();
+        log("x2w-present frame %ld plane %u/%u: %llux%u format %d flags=0x%x", frame, i, planes,
+            static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, static_cast<UINT>(desc.Flags));
+    }
+}
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -5988,17 +6049,25 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
     }
     bool shown_in_window = false;
+    log_present_planes(frame, planes, plane_parameters);
+    const PresentedPlanes presented = presented_planes(planes, plane_parameters);
     {
-        Wrapper* surface = nullptr;
-        const auto* words = static_cast<const u64*>(plane_parameters);
-        if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
-            surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
+        Wrapper* const surface = presented.top();
         capture::present(frame, surface);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
-        // Render mode: the presented surface goes to the title's window through a swap chain.
-        if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
-            shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        // Render mode: the presented planes go to the output window through a swap chain.
+        // The compositor draws the steps in order and leaves out planes without a drawable surface.
+        if (render_mode() && surface) {
+            ID3D12Resource* plane_surfaces[window_planes] = {};
+            for (unsigned i = 0; i < presented.count; ++i) {
+                const unsigned plane = presented.steps[i].plane;
+                auto* const resource = static_cast<ID3D12Resource*>(presented.surfaces[plane]->own().real);
+                if (presentable_surface(resource)) plane_surfaces[plane] = resource;
+            }
+            shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), presented.steps, presented.count,
+                                                plane_surfaces);
+        }
         InterlockedExchange(&last_frame_shown, shown_in_window ? 1 : 0);
         if (render_mode()) present_signature(self, surface, frame);
     }
@@ -6011,16 +6080,12 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
     }
     if (render_mode() && frame % (shown_in_window ? 60 : 6) == 0 && planes && plane_parameters) {
-        // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
-        const auto* words = static_cast<const u64*>(plane_parameters);
-        if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
-            Wrapper* surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
-            if (surface && surface->own().kind == resource_kind && surface->own().real)
-                read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
-            else
-                std::snprintf(shown_note, sizeof(shown_note), "presented object %p is not a known resource",
-                              *reinterpret_cast<void* const*>(words[2]));
-        }
+        // Plane records: present_planes.h.
+        Wrapper* const surface = presented.top();
+        if (surface)
+            read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+        else
+            std::snprintf(shown_note, sizeof(shown_note), "presented plane has no known resource");
     }
     if (shown_in_window) {
         if (frame % 30 == 0) {
