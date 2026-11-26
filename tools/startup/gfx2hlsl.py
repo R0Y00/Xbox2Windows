@@ -8158,8 +8158,9 @@ def request_source(out_dir, key):
     A base request is its own source. An RTV variant (req_<key>.rtv) names its source pipeline and is translated
     from that pipeline's blobs and stream description, req_<source>.psin. This is the one place that names the
     description a request depends on: the translation reads its masks from that path, and pending_keys checks
-    the same path to withdraw a published result or retry a failure after the description changes. The path is
-    returned whether or not the file exists. An invalid variant line is refused by name."""
+    the same path to withdraw a published result or retry a failure after the description changes or, for a
+    result recorded as translated with it (dependency_record), is removed. The path is returned whether or not the
+    file exists. An invalid variant line is refused by name."""
     name = os.path.join(out_dir, 'req_%016x' % key)
     request = ''
     formats = ()
@@ -8194,6 +8195,31 @@ def request_ps_inputs(out_dir, key):
     if pipeline_key(a, b, root, layout, masks) != base:
         raise Unsupported('pixel input description names another pipeline')
     return masks
+
+
+def dependency_record(out_dir, key):
+    """<key>.psdep: written when a graphics request is translated with a stream description, before its manifest.
+
+    It marks a result as known to depend on the description request_source() names, so pending_keys can withdraw
+    that result when the description is removed. A legacy request that never had a description has no record, and
+    its inputs are not read again. The record holds the description line the result was translated with."""
+    return os.path.join(out_dir, '%016x.psdep' % key)
+
+
+def record_dependency(out_dir, key, base, masks):
+    path = dependency_record(out_dir, key)
+    line = 'psin1 %016x ena=0x%04x addr=0x%04x\n' % (base, *masks)
+    with suppress(FileNotFoundError, UnicodeError), open(path) as existing:
+        if existing.read() == line:
+            return
+    temporary = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        with open(temporary, 'w') as record:
+            record.write(line)
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.remove(temporary)
 
 
 def read_ps_inputs(path, key):
@@ -8295,8 +8321,13 @@ def translate_request(out_dir, key):
             return 'unsupported: %s' % reason
     try:
         try:
+            _, base, _, description = request_source(out_dir, key)
+            if os.path.isfile(dependency_record(out_dir, key)) and not os.path.isfile(description):
+                raise Unsupported('pixel input description missing for a request translated with one')
             kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
             ps_inputs = request_ps_inputs(out_dir, key)
+            if ps_inputs is not None:
+                record_dependency(out_dir, key, base, ps_inputs)  # before the manifest is published
         except Unsupported:
             # A result published earlier was translated from sources or masks this request no longer confirms.
             with suppress(FileNotFoundError):
@@ -8643,10 +8674,15 @@ def pending_keys(out_dir, skip_failed):
         # is checked again, so one translated with other masks is not kept in silence; rewritten after a refusal,
         # the request is retried.
         described = None
+        lost = False
         if m.group(2) in ('a', 'rtv'):
             with suppress(Unsupported, OSError, UnicodeError):  # no description, or a variant line refused later
                 described = os.path.getmtime(request_source(out_dir, key)[3])
-        if os.path.isfile(manifest) and not (described is not None and described > os.path.getmtime(manifest)):
+            # A result translated with a description recorded it (dependency_record). With that description gone,
+            # the result is checked again and withdrawn; a legacy request without a record is not read again.
+            lost = described is None and os.path.isfile(result + '.psdep')
+        if os.path.isfile(manifest) and not lost and not (
+                described is not None and described > os.path.getmtime(manifest)):
             if manifest_only or all(ready_bytecode(result + s) for s in stages):
                 continue
             if mesh and has_complete_mesh57_bytecode(result + '.ms57.cso'):

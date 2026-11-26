@@ -25,7 +25,10 @@ target's result exists and are translated as new requests, leaving that result u
 rewritten in place with another pair after its result was published is checked again, refused by name and
 its old result withdrawn. The watcher follows the description each translation reads (an RTV variant reads its
 source pipeline's): a wrong pair in a base description withdraws the base and its variant, and the corrected
-description, newer than their failures, publishes both again without touching the request files.
+description, newer than their failures, publishes both again without touching the request files. A result
+translated with a description records it (<key>.psdep): removing only the base description withdraws the base
+and its variant and refuses both by name, while a legacy request that never had a description has no record
+and is not checked again.
 """
 import os
 import re
@@ -33,7 +36,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, G, compile_hlsl, root_blob
@@ -288,6 +291,39 @@ def controls():
         check('both republished from the restored description (position v4), .a and .rtv untouched',
               all(m.is_file() for m in manifests) and [packed_line(text) for text in texts] == [[4], [4]]
               and all((path.read_bytes(), path.stat().st_mtime_ns) == state for path, state in sources.items())
+              and pending(cache) == [])
+        # Only the base description removed: both results were translated with it, so both are withdrawn.
+        records = [cache / ('%016x.psdep' % key) for key in (t, v)]
+        check('both results record the description line they were translated with',
+              all(r.is_file() and r.read_text() == describe(t, TARGET) for r in records))
+        for path in fails:
+            with suppress(FileNotFoundError):
+                path.unlink()
+        description.unlink()
+        check('a removed description queues the base and its RTV variant', pending(cache) == sorted([t, v]))
+        watch_pass(cache)
+        check('both refused by name as missing their description and both published results withdrawn',
+              not any(m.is_file() for m in manifests) and all(f.is_file() for f in fails)
+              and all('pixel input description missing for a request translated with one' in f.read_text()
+                      for f in fails))
+        check('the refusals are not retried while the description stays missing', pending(cache) == [])
+        for path in fails:
+            if path.is_file():
+                stamp = path.stat().st_mtime - 100
+                os.utime(path, (stamp, stamp))
+        description.write_bytes(describe(t, TARGET).encode('ascii'))
+        check('the description restored again queues both', pending(cache) == sorted([t, v]))
+        watch_pass(cache)
+        check('both republished from the restored description',
+              all(m.is_file() for m in manifests) and pending(cache) == [])
+
+    # A legacy request that never had a description: no dependency record, and its result stays done.
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        legacy = put_request(cache, ps_words(4))
+        watch_pass(cache)
+        check('a legacy request publishes without a dependency record and is not checked again',
+              (cache / ('%016x.txt' % legacy)).is_file() and not (cache / ('%016x.psdep' % legacy)).exists()
               and pending(cache) == [])
 
     # Re-keying a cache keeps both pipelines and their descriptions, each naming its own key.
