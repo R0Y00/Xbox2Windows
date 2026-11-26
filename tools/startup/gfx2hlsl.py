@@ -3137,10 +3137,13 @@ class Stage:
     # lane k of its own quad (RDNA 2 ISA, "DPP": a lane reads lane (lane & ~3) | perm[lane & 3] of the row; LLVM 15
     # AMDGPU DPP quad_perm). A pixel stage's four consecutive lanes are a 2x2 pixel quad (lane = x & 1 | (y & 1) << 1),
     # which is what SM 6.0 QuadReadLaneAt(value, k) reads, so the stage is compiled as ps_6_0 (Stage.needs_sm6).
-    # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
-    # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
-    # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (pair
-    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
+    # Accepted only where the whole quad is proven active: the entry straight-line prefix of a pixel stage that ran
+    # s_wqm exec, exec and whose EXEC is still that mask (helper lanes are active, so no source lane is off). A later
+    # uniform loop or forward branch elsewhere in the stage does not drop the proof: every path still reaches the
+    # broadcast with the same EXEC, and blocks is empty until the first branch target. bound_ctrl then has nothing to
+    # decide (the source lane is never disabled), so it is accepted and ignored. A broadcast after a branch target,
+    # after EXEC changed, or with divergent EXEC stays refused, as do other DPP controls (pair broadcasts, row shifts,
+    # mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
@@ -3162,9 +3165,10 @@ class Stage:
             raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
         if fields.get('bound_ctrl', '1') != '1':
             raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
-        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', [])
-                or not getattr(self, 'exec_known', False)):
-            raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        # blocks non-empty means a branch target was reached: the broadcast is no longer in the entry prefix.
+        # has_branches alone is not enough to refuse: a later loop in the same stage is the M200-01/003 shape.
+        if (self.kind != 'ps' or getattr(self, 'blocks', []) or not getattr(self, 'exec_known', False)):
+            raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
             # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
