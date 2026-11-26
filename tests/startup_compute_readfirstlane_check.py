@@ -213,8 +213,114 @@ def controls(llvm_mc=None):
 
     if llvm_mc:
         check_binary(llvm_mc)
+    log_ceil_controls(llvm_mc)
     waterfall.controls(llvm_mc)
-    print('Compute readfirstlane one-path, loop-counter, waterfall and refusal checks passed')
+    print('Compute readfirstlane one-path, loop-counter, log2/ceil, waterfall and refusal checks passed')
+
+
+LOG_CEIL_LOG_LINE = 's21 = v8;'
+LOG_CEIL_CEIL_LINE = 's22 = v9;'
+
+
+def build_log_ceil_words():
+    ws = list(struct.unpack('<5I', bytes.fromhex('06038abe80038bbe05030cf4000000fa7fc08cbf')))
+    ws += sop2('s_lshl_b32', 's20', 's7', 2) + sop2('s_add_u32', 's20', 's20', 5)
+    ws += vop1('v_cvt_f32_u32_e32', 'v7', 's20') + vop1('v_log_f32_e32', 'v7', 'v7')
+    ws += vop2('v_mul_f32_e32', 'v8', '2.0', 'v7') + vop1('v_cvt_u32_f32_e32', 'v8', 'v8')
+    ws += vop1('v_readfirstlane_b32', 's21', 'v8')
+    ws += vop1('v_ceil_f32_e32', 'v9', 'v7') + vop1('v_cvt_u32_f32_e32', 'v9', 'v9')
+    ws += vop1('v_readfirstlane_b32', 's22', 'v9')
+    ws += sop2('s_lshl_b32', 's21', 's21', 8) + sop2('s_or_b32', 's21', 's21', 's22')
+    ws += sop2('s_lshl_b32', 's23', 's7', 2) + vop2('v_add_nc_u32_e32', 'v4', 's23', 'v0')
+    ws += vop2('v_add_nc_u32_e32', 'v5', 's21', 'v4') + vop2('v_lshlrev_b32_e32', 'v4', 2, 'v4')
+    ws += list(struct.unpack('<2I', bytes.fromhex('001070e004050480'))) + sopp('s_endpgm')
+    return struct.pack('<%dI' % len(ws), *ws)
+
+
+LOG_CEIL_WORDS = build_log_ceil_words()
+
+
+def log_ceil_expected():
+    out = [SENTINEL] * WORDS
+    for gx, base_val in ((0, 0x403), (1, 0x604)):
+        for tx in range(LOCAL[0]):
+            idx = gx * LOCAL[0] + tx
+            out[idx] = (base_val + idx) & MASK
+    return out
+
+
+def log_ceil_controls(llvm_mc=None):
+    hlsl = translate(LOG_CEIL_WORDS).hlsl_cs()
+    for snippet in ('v7 = U(log2(F(v7)));', 'v9 = U(ceil(F(v7)));', LOG_CEIL_LOG_LINE, LOG_CEIL_CEIL_LINE, 'u0.Store(a, v5);'):
+        assert hlsl.count(snippet) == 1, (snippet, hlsl)
+    for old_ws, new_ws in (
+            (vop1('v_log_f32_e32', 'v7', 'v7'), vop1('v_log_f32_e32', 'v7', 'v0')),
+            (vop1('v_ceil_f32_e32', 'v9', 'v7'), vop1('v_ceil_f32_e32', 'v9', 'v0'))):
+        refused('v_readfirstlane_b32 requires a proven uniform source',
+                lambda code=patch(LOG_CEIL_WORDS, pack_hex(*old_ws), pack_hex(*new_ws)): translate(code))
+    saved = G.UNIFORM_VALU
+    try:
+        for removed in ('v_log_f32', 'v_ceil_f32'):
+            G.UNIFORM_VALU = saved - {removed}
+            refused('v_readfirstlane_b32 requires a proven uniform source', lambda: translate(LOG_CEIL_WORDS))
+    finally:
+        G.UNIFORM_VALU = saved
+    if llvm_mc:
+        decoded = G.decode(LOG_CEIL_WORDS)
+        lines = [asm for _, _, _, asm in decoded]
+        proc = subprocess.run(
+            [llvm_mc, '-arch=amdgcn', '-mcpu=gfx1013', '-mattr=+wavefrontsize64,-wavefrontsize32', '-show-encoding'],
+            input='\n'.join(lines) + '\n', capture_output=True, text=True, check=True)
+        built = b''.join(bytes(int(b, 16) for b in m.group(1).split(','))
+                         for m in re.finditer(r'encoding: \[([^\]]*)\]', proc.stdout))
+        assert built == LOG_CEIL_WORDS, (built.hex(), LOG_CEIL_WORDS.hex())
+
+
+LOG_CEIL_CONTROLS = {
+    'dropped-log2-read': (LOG_CEIL_LOG_LINE, 's21 = 0u;', 'word=0 expected=00000403 actual=00000003'),
+    'dropped-ceil-read': (LOG_CEIL_CEIL_LINE, 's22 = 0u;', 'word=0 expected=00000403 actual=00000400'),
+}
+
+
+def log_ceil_dispatch(td, dxc, runner, adapter):
+    hlsl = translate(LOG_CEIL_WORDS).hlsl_cs()
+    case = td / 'log_ceil.case'
+    case.write_bytes(
+        struct.pack('<I', GROUPS[0] | (GROUPS[1] << 8) | (GROUPS[2] << 16))
+        + struct.pack('<%dI' % WORDS, *log_ceil_expected())
+        + struct.pack('<16I', KEY, STRIDE, *([0] * 14)))
+    for label, mutation in [('log_ceil_baseline', None)] + [(k, k) for k in LOG_CEIL_CONTROLS]:
+        text = hlsl
+        if mutation:
+            old, new, _ = LOG_CEIL_CONTROLS[mutation]
+            assert text.count(old) == 1, mutation
+            text = text.replace(old, new)
+        src, cso = td / f'{label}.hlsl', td / f'{label}.cso'
+        src.write_text(text, encoding='ascii')
+        subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
+        proc = subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)],
+                              capture_output=True, text=True)
+        print(proc.stdout, end='')
+        if proc.returncode == 77:
+            return 77
+        diagnostics = []
+        for line in proc.stderr.splitlines():
+            if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                print(line, file=sys.stderr)
+            else:
+                diagnostics.append(line)
+        if mutation:
+            want = LOG_CEIL_CONTROLS[mutation][2]
+            first = diagnostics[:1]
+            if proc.returncode != 1 or first != [want]:
+                raise AssertionError('control %s: expected exit 1 with %r, got exit %d %r'
+                                     % (mutation, want, proc.returncode, proc.stderr))
+            print('control %s (%s): rejected at %s' % (mutation, adapter, first[0]))
+        elif proc.returncode or diagnostics:
+            raise AssertionError('log_ceil baseline (%s): %s' % (adapter, proc.stderr or 'exit %d' % proc.returncode))
+        else:
+            print('log_ceil baseline (%s): all %d words match' % (adapter, WORDS))
+    return 0
 
 
 CONTROLS = {
@@ -270,6 +376,9 @@ def dispatch(dxc, runner, adapter):
                 raise AssertionError('baseline (%s): %s' % (adapter, proc.stderr or 'exit %d' % proc.returncode))
             else:
                 print('baseline (%s): all %d words match' % (adapter, WORDS))
+        rc = log_ceil_dispatch(td, dxc, runner, adapter)
+        if rc:
+            return rc
         return waterfall.dispatch(td, dxc, runner, adapter)
 
 
