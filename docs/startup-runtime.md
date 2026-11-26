@@ -208,9 +208,15 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-21`. Revision 21 refuses a compute lane-mask form that revision 20 translated (`s_and_b32 M, X, exec_lo` with X data, see docs/experiments.md), so its cached compute shaders are not reused. Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch, so cached shaders from revision 19 are not reused. Revision 19 folds `s_mov_b32` from a scalar register that
-holds a plain constant, so later reads of the copy use the constant word. The matching compute
-(`x2w-startup-shader-21cs`) key advances because that stage uses the shared lowering. The fixed slot 57 mesh
+Graphics and compute use cache revisions `x2w-startup-shader-24` and `x2w-startup-shader-24cs`.
+Revision 24 invalidates translations that revision 23 wrongly accepted: `vcc_hi_scalar_mask_read` now also
+treats a whole-word lane-read writer (`v_readfirstlane`/`v_readlane`) of vcc_hi, in branch order too, as
+making a later VOP3 lane-mask read of vcc_hi refuse instead of lowering to bit 0. The two cache keys advance together.
+Revision 22 invalidates compute shaders that assumed the entry EXEC mask at a load reached on a later
+loop iteration after an EXEC write. The two cache keys advance together.
+Revision 21 refuses a compute lane-mask form that revision 20 translated (`s_and_b32 M, X, exec_lo` with X data).
+Revision 20 decodes MTBUF/MUBUF format 50 (`R10G10B10A2_UNORM`) in the run-time FORMAT switch.
+Revision 19 folds `s_mov_b32` from a scalar register that holds a plain constant, so later reads of the copy use the constant word. The fixed slot 57 mesh
 (`x2w-startup-mesh-57-3`) key stays, because that shader is not translated from guest code.
 Revisions before 19 read a register copied from a constant as a run-time value.
 Revision 18 preserves the sign of zero in floating-point min, max, min3, max3 and med3.
@@ -1456,7 +1462,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
-| `X2W_XMEM_LAZY_STARTUP=1` | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks placed by `X2W_XMEM_STARTUP_BELOW_40` stay committed up front. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
+| `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
@@ -2792,24 +2798,20 @@ hardware or driver glitch count.
 
 ## APU heap stand-in
 
-With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` reserves
-(`MEM_RESERVE`, 0 bytes committed up front). The heap is a first-fit free list in a static table of 4096
-extents, guarded by one lock. `ApuAlloc` commits the 4 KiB page span covering the allocated block on demand
-(`MEM_COMMIT`), rolling back the free-list change and returning `E_OUTOFMEMORY` if commit fails. `ApuFree`
-gives a block back, merges it with free neighbours, and decommits strictly interior 4 KiB pages
-(`[ceil_page(free_begin), floor_page(free_end))` via `MEM_DECOMMIT`) so partial boundary pages shared with
-live neighbours stay committed and streaming code that allocates and frees repeatedly no longer exhausts the
-heap or commit charge. While nothing has been freed the offsets are the ones a bump allocator hands out.
+With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` commits. The
+heap is a first-fit free list in a static table of 4096 extents, guarded by one lock. `ApuFree` gives a
+block back and merges it with free neighbours, so streaming code that allocates and frees repeatedly no
+longer exhausts the heap. While nothing has been freed the offsets are the ones a bump allocator hands out.
 
 - A block is aligned in address (a power of two, 16 at least; 0, anything below 16 and a value that is not a power of two
   all mean 16). Size and alignment are 32 bits. `ApuCreateHeap` creates and publishes the heap under one lock, so
   competing first calls cannot reset a heap that already has live blocks. A heap whose 64 KiB-rounded size
-  exceeds 4 GiB is refused with `E_INVALIDARG` without reserving or committing memory, so every block fits the APU range.
+  exceeds 4 GiB is refused with `E_INVALIDARG` without committing memory, so every block fits the APU range.
 - Null or non-writable output (`virtual_address` or optional `apu_address`) is `E_POINTER` without
-  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, a full extent table, or a failed
-  page commit is `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
+  allocating; size 0 is `E_INVALIDARG`; no room, an offset past 32 bits, or a full extent table is
+  `E_OUTOFMEMORY`. A refused call leaves the heap and the optional APU-address output as they were,
   and writes null to the virtual-address output when writable.
-- A block that is reused is zeroed, as fresh heap memory is (including still-committed shared boundary pages).
+- A block that is reused is zeroed, as fresh heap memory is.
 - `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
   already freed) is `E_INVALIDARG` and changes nothing.
 - `ApuIsVirtualAddressValid` and the two map calls read the published heap bounds under the heap lock and
@@ -2820,9 +2822,7 @@ The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4)
 rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
 check loads the stub, checks non-permissive traps, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment,
 coalescing, every refused call, shape-context allocation and partial-failure rollback, `AcpHalCreate`, and the
-address validity/mapping exports, runs 4 threads of 1000 rounds against an interval map of live blocks, and
-verifies on-demand commit, interior-page decommit, shared-boundary-page preservation, and commit-failure
-rollback against `GetProcessMemoryInfo().PagefileUsage` and `VirtualQuery` in a 64 MiB heap:
+address validity/mapping exports, then runs 4 threads of 1000 rounds against an interval map of live blocks:
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
@@ -2915,7 +2915,8 @@ experimental `x2w_xmem_page_stats` export.
 
 The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
 its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
-committed, is zeroed on reuse, and is chosen before a fresh slot. The experimental `x2w_xmem_slab_stats`
+committed, is zeroed on reuse, and is chosen before a fresh slot; once all slots of a slab are freed and
+unpinned, the empty slab is closed and its commit is returned to the OS. The experimental `x2w_xmem_slab_stats`
 export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
 calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
 injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages

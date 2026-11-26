@@ -262,7 +262,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(xmem_lazy_commit_off PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE ENVIRONMENT "X2W_XMEM_LAZY_COMMIT=0")
     add_test(NAME xmem_lazy_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_lazy_startup_check.py" "$<TARGET_FILE:xmem_shim>")
-    set_tests_properties(xmem_lazy_startup PROPERTIES TIMEOUT 60
+    set_tests_properties(xmem_lazy_startup PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE
         ENVIRONMENT "X2W_XMEM_LAZY_COMMIT=1;X2W_XMEM_LAZY_STARTUP=1")
     # Control: with X2W_XMEM_LAZY_STARTUP off, the startup blocks are committed as before.
     add_test(NAME xmem_lazy_startup_off COMMAND "${INTAKE_PYTHON}" -B
@@ -1267,6 +1267,7 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
+target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
 
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
@@ -4541,6 +4542,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_texture_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_slot67_indirect_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot67_indirect_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
+        set_tests_properties(startup_slot67_indirect_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_compute_dispatch_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_heap_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})

@@ -377,7 +377,7 @@ class Wave:
         self.s, self.pending, self.scc = merged, true_p | false_p, None
         return join
 
-    def scalar_op(self, op, args):
+    def scalar_op(self, op, args, *, dynamic_bitcmp=False):
         d, *src = args
         if op in (
             "s_load_dwordx4",
@@ -391,16 +391,31 @@ class Wave:
         if op in ("s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"):
             if len(args) != 2:
                 raise ValueError(f"Expected two operands for {op}")
-            a, b = (self.scalar(t, True) for t in args)
+            wide = op.endswith("_b64")
+            src0, src1 = args
+            if wide and (re.fullmatch(r"s\d+", src0) or src0 in ("exec_lo", "exec_hi", "vcc_lo", "vcc_hi")):
+                raise ValueError(f"Expected a 64-bit scalar operand for {op}")
+            if not wide and (src0.startswith("s[") or src0 in ("exec", "vcc")):
+                raise ValueError(f"Expected a 32-bit scalar operand for {op}")
+            if src1.startswith("s[") or src1 in ("exec", "vcc"):
+                raise ValueError(f"Expected a 32-bit bit-index operand for {op}")
+            a, b = (self.scalar(token, True) for token in args)
             if a is UNDEF or b is UNDEF:
                 self.scc = None
                 return
+            test_one = op.startswith("s_bitcmp1_")
+            if dynamic_bitcmp and not wide and {type(a), type(b)} <= {int, str} and str in (type(a), type(b)):
+                value = f"asuint({a})" if type(a) is str else f"{a & U32}u"
+                index = f"(asuint({b}) & 31u)" if type(b) is str else f"{b & 31}u"
+                cmp_op = "!=" if test_one else "=="
+                self.scc = Dyn(f"(({value} & (1u << {index})) {cmp_op} 0u)")
+                return
             if type(a) is not int or type(b) is not int:
                 raise ValueError("Dynamic scalar predicate")
-            mask = 63 if op.endswith("_b64") else 31
-            width = WAVE if op.endswith("_b64") else U32
+            mask = 63 if wide else 31
+            width = WAVE if wide else U32
             bit = ((a & width) >> (b & mask)) & 1
-            self.scc = bit == (1 if op.startswith("s_bitcmp1_") else 0)
+            self.scc = bit == test_one
             return
         if op.startswith("s_cmp_"):
             a, b = (self.scalar(t, True) for t in args)
@@ -746,7 +761,10 @@ class Wave:
         """Execute the wave, yielding at each group barrier."""
         jumps = {offset: i for i, (offset, _) in enumerate(decoded)}
         for _, line in decoded:
-            dest = line.partition(" ")[2].split(", ")[0]
+            op, _, tail = line.partition(" ")
+            if op.startswith(("s_cmp_", "s_bitcmp")):
+                continue
+            dest = tail.split(", ")[0]
             if re.fullmatch(r"s\d+", dest):
                 self.written.add(int(dest[1:]))
             elif dest.startswith("s["):
@@ -925,6 +943,12 @@ class Wave:
                         raise ValueError("Unsupported live export")
             elif op.startswith("image_"):
                 self.image_op(op, tail, expressions)
+            elif op.startswith("s_bitcmp"):
+                # A runtime bit predicate is supported only as the input to a verified descriptor join.
+                next_is_join_branch = not arm and pc < stop and decoded[pc][1].split(" ", 1)[0] in (
+                    "s_cbranch_scc0", "s_cbranch_scc1",
+                )
+                self.scalar_op(op, args, dynamic_bitcmp=next_is_join_branch)
             elif op.startswith("s_"):
                 self.scalar_op(op, args)
             elif op.startswith("v_"):

@@ -3876,7 +3876,13 @@ out-of-range cases. A separate mesh program with one changed compare operand
 adds two controls. Windows WARP with the D3D12 debug layer enabled matched
 all 1,024 pixels for each of the eight cases. Physical hardware and startup
 pipeline integration remain open in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
-[Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45485172952)
+
+The bounded mesh lowerers reuse the concrete scalar bit tests described below.
+They also accept a 32-bit test of a constant-buffer word immediately followed
+by an SCC branch that forms a verified descriptor join. Both branch polarities
+and constant-buffer bit indices have readback controls. Descriptor words,
+unwritten operands and 64-bit dynamic predicates remain refused.
+Reproduce with `mesh_bitcmp_cpu` and `mesh_bitcmp_draw_{warp,hardware}`.
 
 ### Sampler heap samplers in bounded runtime mesh
 
@@ -15181,26 +15187,17 @@ ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
 
 ### Startup compute 32-bit float image store
 
-The startup compute translator also accepts a 2D 32-bit `image_store` (with or
-without the integer-coordinate `unorm` modifier) when all four DMASK bits are
-set, coordinates are two full-width VGPRs, data comes from four consecutive
-VGPRs and the eight image descriptor words come from an unmodified fixed table
-offset. The translator emits `asfloat(uint4(...))` into a `RWTexture2D<float4>`
-under the lane's EXEC bit and records `uav N tex2d float table P O channels 4`
-in the version 2 compute manifest. Pixel-stage 2D `image_store` also accepts
-`unorm`.
+The startup compute translator accepts the full-mask FP32 image_store on
+dim:SQ_RSRC_IMG_2D_ARRAY with three full-width address VGPRs for x, y and layer.
+It emits an RWTexture2DArray<float4> store under the lane EXEC bit and records
+uav N tex2da float table P O channels 4 in the version 2 manifest.
+The startup runtime still needs the array UAV binding in #2742. Pixel arrays,
+packed D16 arrays and the 1D, 3D and cube store forms remain refused.
 
-The standalone dispatch reuses the source and CPU reference from the
-[gfx1013 2D float store fixture](#gfx1013-2d-float-image-stores-and-mip-loads).
-Two groups write 16 texels to mip zero of an `R32G32B32A32_FLOAT` UAV while
-comparing all 1,344 words across three mips. A second program masks out the
-second row. Omitting the store, swapping R/B, swapping RG/BA and dropping the
-EXEC guard produce 64, 32, 64 and 32 mismatches respectively.
-
-```powershell
-cmake --build --preset release --target offscreen_check
-ctest --preset release --no-tests=error -R '^startup_compute_image_store(_warp|_hardware)?$' -V
-```
+The standalone GPU fixture writes the same four words into mip zero of layer 1
+and layer 3 of a four-layer allocation. It compares all 5,376 words and detects
+64 differences with the store omitted and 128 with the layer changed. Use the
+startup_compute_image_store CTests above to repeat the comparison.
 
 ### Explicit-LOD 2D gather
 
@@ -15980,7 +15977,7 @@ Past the entry block of a program with branches, the read does not copy the VGPR
 
 A lane that was inactive at the definition keeps an older VGPR value; the recomputed expression gives every lane the first active lane's value instead. `exec` need not be known at the definition. A conditional branch between the definition and the read is a fall-through, not a join, and is accepted. The one case where hardware can differ is a read with no active lane: it returns lane 0's VGPR, which the program cannot rely on. `tests/startup_gfx2hlsl_readfirstlane_recompute_check.py` checks the accepted forms (including one-path scalars and uniform loop counters both inside and after loops) and refuses each condition above, including a definition under a narrower `exec` than the read, a rewritten scalar input, a loop back edge, a divergent `else`-arm write before a join, a non-uniform loop back-edge and a join where two definitions reach.
 
-A compute buffer load through a read-only descriptor and uniform address is also accepted past the entry block when the entry EXEC mask is still known. The lowering saves the uniform value in a function-scope temporary so the read uses the value held when the load ran, even if the offset scalar later changes. A narrowed mask may be empty. In that case RDNA 2 reads the previous lane-zero VGPR, which an unguarded reload cannot reproduce. Branch targets, EXEC writes and VGPR overwrites invalidate the proof between the load and read. The source-built controls cover scalar and vector addresses, the second dword, formatted loads, and a lane-zero sentinel followed by empty EXEC.
+A compute buffer load through a read-only descriptor and uniform address is also accepted past the entry block when the entry EXEC mask is still known. The lowering saves the uniform value in a function-scope temporary so the read uses the value held when the load ran, even if the offset scalar later changes. A narrowed mask may be empty. In that case RDNA 2 reads the previous lane-zero VGPR, which an unguarded reload cannot reproduce. Branch targets, EXEC writes and VGPR overwrites invalidate the proof between the load and read. A loop may revisit the load after changing EXEC. The lowering follows control-flow edges from EXEC writers to catch this case, including detours outside the loop's instruction range. A loop that changes EXEC only after it exits still qualifies. The source-built controls cover scalar and vector addresses, the second dword, formatted loads, and a lane-zero sentinel followed by empty EXEC.
 
 [`tests/startup_compute_readfirstlane_check.py`](../tests/startup_compute_readfirstlane_check.py) pairs that unit coverage with a source-built gfx1013 compute fixture (`(4, 1, 1)` local threads x `(2, 1, 1)` groups) containing both a one-path SGPR across a uniform forward branch join and a four-iteration uniform loop counter read via `v_readfirstlane_b32` inside the loop and after exit, machine-code refusal patches (non-uniform `s_cbranch_vccnz` back-edge, divergent `else`/`then` write before a join, lane-mask loop update) and 320-word GPU readback with pinned `dropped-one-path`, `dropped-loop-read` and `dropped-post-loop` negative controls. Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 25H2 (build 26200.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 7900 XTX (driver 32.0.32029.2010).
 
@@ -16770,6 +16767,25 @@ Run the two backends with `ctest --preset release --no-tests=error -j 1 -R '^sta
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
+```
+
+### GPU-written indirect Dispatch
+
+For a translated slot 67 pipeline with fixed-table raw buffers, command-list slot 61 accepts one rootless
+Dispatch record in a placed argument buffer. It binds the same translated pipeline and descriptors as direct
+Dispatch, transitions the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the group counts.
+
+The fixture records a compute producer, a copy of the argument record and the indirect consumer on one list.
+After the queue fence it checks both guard words, all three argument words, the input and all 320 output words.
+Counts of 2 and 5 write exactly that many words. Direct Dispatch with the same bindings and counts must produce
+the same outputs. Omitting the producer leaves the zero record and the output sentinel intact. Omitting the
+translation preserves the output and reports the refusal. Other controls exercise multiple commands, a count
+buffer, an out-of-range record and an argument buffer also bound as shader output.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer
+ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
+python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 ```
 
 ### Entry values from a buffer descriptor

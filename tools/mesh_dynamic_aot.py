@@ -154,6 +154,11 @@ class RuntimeWave(Wave):
         """Handle sampler heap and texture descriptor words; False for any other scalar op."""
         if self.geometry.sampler_heap_sgpr is None:
             return False
+        if op.startswith(("s_cmp_", "s_bitcmp")):
+            found = self.descriptor_operand(args)
+            if found:
+                self.refuse_descriptor_use(op, found)
+            return False
         dest, *sources = args
         if op == "s_load_dwordx8":
             self.load_texture(args)
@@ -283,11 +288,11 @@ class RuntimeWave(Wave):
             raise ValueError(f"Unproven runtime geometry word {value.index} in {token}")
         return value
 
-    def scalar_op(self, op, args):
+    def scalar_op(self, op, args, *, dynamic_bitcmp=False):
         if op == "s_cmp_eq_u32":
             left, right = (super(RuntimeWave, self).scalar(t, True) for t in args)
             if left is UNDEF or right is UNDEF:
-                return super().scalar_op(op, args)
+                return super().scalar_op(op, args, dynamic_bitcmp=dynamic_bitcmp)
             if isinstance(right, RuntimeWord):
                 left, right = right, left
             if isinstance(left, RuntimeWord) and type(right) is int:
@@ -298,7 +303,7 @@ class RuntimeWave(Wave):
                 return
         if self.descriptor_scalar_op(op, args):
             return
-        super().scalar_op(op, args)
+        super().scalar_op(op, args, dynamic_bitcmp=dynamic_bitcmp)
 
     def vector_op(self, op, args, expressions):
         found = self.descriptor_operand(args if op.startswith("v_cmpx_") else args[1:])

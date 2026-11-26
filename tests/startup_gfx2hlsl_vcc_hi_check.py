@@ -103,6 +103,54 @@ v_mov_b32_e32 v2, 1
 exp mrt0 v2, v2, v2, v2 done vm
 s_endpgm
 ''', '8003ffbe8102047e0f1800f802020202000081bf', 's_mov_b32 destination exec_hi'),
+    # A v_readfirstlane_b32 into vcc_hi writes a whole word too: a straight-line VOP3 mask source read of it would
+    # test bit 0 of that word for every lane, so the rename is refused (the old rule caught only s_ and v_readlane).
+    'READFIRSTLANE_MASK': ('''v_mov_b32_e32 v2, s0
+v_readfirstlane_b32 vcc_hi, v2
+v_cndmask_b32_e64 v1, 1.0, 2.0, vcc_hi
+exp mrt0 v1, v1, v1, v1 done vm
+s_endpgm
+''', '0002047e0205d67e010001d5f2e8ad010f1800f801010101000081bf', 'v_readfirstlane_b32 requires a proven uniform source'),
+    # The same writer with the mask read across a branch boundary: the order is unknown, so it is refused as well.
+    'READFIRSTLANE_BRANCH': ('''v_mov_b32_e32 v2, s0
+v_readfirstlane_b32 vcc_hi, v2
+s_cbranch_execz skip
+v_cndmask_b32_e64 v1, 1.0, 2.0, vcc_hi
+exp mrt0 v1, v1, v1, v1 done vm
+s_endpgm
+skip:
+s_endpgm
+''', '0002047e0205d67e0a0a88bf010001d5f2e8ad010f1800f801010101000081bf000081bf',
+        'v_readfirstlane_b32 requires a proven uniform source'),
+    # Branch-only: the VOP3 mask read comes before the whole-word writer in source order and a back edge reaches it,
+    # so no sequential read_after applies: only the branchy writer check refuses. The old rule (s_ and v_readlane
+    # writers only) renamed this one, so the old branchy check never saw a lane-read writer.
+    'READFIRSTLANE_BACK_EDGE': ('''loop:
+v_cndmask_b32_e64 v1, 1.0, 2.0, vcc_hi
+v_add_nc_u32_e32 v3, v1, v0
+exp mrt0 v3, v0, v0, v0 done vm
+v_mov_b32_e32 v2, s0
+v_readfirstlane_b32 vcc_hi, v2
+s_branch loop
+''', '010001d5f2e8ad010101064a0f1800f8030000000002047e0205d67e0a0a82bf',
+        'operand \'vcc_hi\''),
+    # The same shape with a v_readlane_b32 writer: refused by the pre-existing branchy writer check.
+    'READLANE_BACK_EDGE': ('''loop:
+v_cndmask_b32_e64 v1, 1.0, 2.0, vcc_hi
+v_add_nc_u32_e32 v3, v1, v0
+exp mrt0 v3, v0, v0, v0 done vm
+v_readlane_b32 vcc_hi, v2, s0
+s_branch loop
+''', '010001d5f2e8ad010101064a0f1800f8030000006b0060d7020100000a0a82bf',
+        'operand \'vcc_hi\''),
+    # The same lane-read writer with only scalar reads of vcc_hi: exact in either wave size, so it translates.
+    'READFIRSTLANE_SCALAR': ('''v_mov_b32_e32 v2, s0
+v_readfirstlane_b32 vcc_hi, v2
+s_add_u32 s1, vcc_hi, 16
+v_add_nc_u32_e32 v5, s1, v0
+exp mrt0 v5, v0, v0, v0 done vm
+s_endpgm
+''', '0002047e0205d67e6b90018001000a4a0f1800f805000000000081bf', None),
 }
 
 
@@ -160,6 +208,11 @@ def controls():
             (4, 1, 's_load_dwordx4', 's_load_dwordx4 s[104:107], s[0:1], 0x0'),
             (12, 2, 'v_mov_b32_e32', 'v_mov_b32_e32 v2, vcc_hi')]
     check('a load into s[104:107] keeps vcc_hi refused', G.wave32_vcc_hi(wide) is wide)
+    # Negative control for the whole-word writer rule: the readfirstlane mask-read fixtures must be stopped by
+    # wave32_vcc_hi itself. The old rule (only s_ and v_readlane writers) renamed them, so this check fails there.
+    for name in ('READFIRSTLANE_MASK', 'READFIRSTLANE_BRANCH', 'READFIRSTLANE_BACK_EDGE'):
+        ins = G.decode(G.strip_header(bytes.fromhex(FIXTURES[name][1])))
+        check('%s is refused before the vcc_hi rename' % name, G.wave32_vcc_hi(ins) is ins)
     text, _ = translate('PS')
     if text is not None:
         check('PS keeps the compare and carry in the renamed register',
