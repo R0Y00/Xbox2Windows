@@ -44,7 +44,7 @@ REVISION_WARNING = re.compile(r"WARNING: shader cache \S+ was written by stand-i
                               r"x2w-startup-shader-89, compute x2w-startup-shader-89cs, but the translator \S+ is "
                               r"revision graphics x2w-startup-shader-90, compute x2w-startup-shader-90cs, mesh57 "
                               r"x2w-startup-mesh-57-9: .*Fix: rebuild the stand-ins .*")
-LEGACY_WARNING = re.compile(r"WARNING: shader cache \S+ holds requests but no revision.txt: .*Fix: .*")
+LEGACY_WARNING = re.compile(r"WARNING: shader cache \S+ holds requests but no revision.txt, so their revision is unknown: .*Fix: .*")
 MOVED_NOTE = re.compile(r"moved the old shader cache \S+ to \S+cache\.old-[0-9]{8}-[0-9]{6}")
 HIDE_WARNING = "WARNING: --hide-title-window needs --render (no output window without it); it has no effect"
 # Synthetic package values; not any title's. Only the first of each tag counts, as in run.ps1.
