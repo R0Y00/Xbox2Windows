@@ -1,5 +1,6 @@
-// Source-built check of the AcpHal stand-in APU heap (src/startup_stubs/acphal.cpp): ApuFree returns blocks,
-// neighbours coalesce, bad requests leave the heap alone and concurrent callers never get overlapping blocks.
+// Source-built check of the AcpHal stand-in APU heap (src/startup_stubs/acphal.cpp): ApuCreateHeap reserves,
+// ApuAlloc commits on demand, ApuFree returns blocks, coalesces neighbours and decommits interior pages without
+// disturbing shared boundary pages, bad requests leave the heap alone and concurrent callers never overlap.
 // Usage: startup_acphal_apu_free <AcpHal.dll>
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -8,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 
 #include <atomic>
 #include <cstddef>
@@ -161,6 +163,23 @@ void bad_requests()
     std::uint32_t apu = 0xDEADBEEF;
     check(free_fn(nullptr) == ok, "free(null) is a no-op");
     check(take(nullptr, 64) == no_pointer, "null output");
+    if (void* ro = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)) {
+        auto* ro_ptr = static_cast<void**>(ro);
+        auto* ro_apu = static_cast<std::uint32_t*>(ro);
+        check(take(ro_ptr, 64, 16, &apu) == no_pointer && apu == 0xDEADBEEF,
+              "read-only virtual_address returns E_POINTER and leaves apu unchanged");
+        out = const_cast<void*>(sentinel);
+        check(take(&out, 64, 16, ro_apu) == no_pointer && !out,
+              "read-only apu_address returns E_POINTER and zeroes virtual_address");
+        out = const_cast<void*>(sentinel);
+        check(take(&out, 0, 16, ro_apu) == no_pointer && !out,
+              "read-only apu_address with size 0 returns E_POINTER");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    } else {
+        check(false, "VirtualAlloc PAGE_READONLY for ApuAlloc negative control");
+    }
+    check_empty("unwritable ApuAlloc outputs");
+    out = const_cast<void*>(sentinel);
     check(take(&out, usable + 16, 16, &apu) == no_memory && !out && apu == 0xDEADBEEF, "larger than the heap");
     out = const_cast<void*>(sentinel);
     check(take(&out, 0xFFFFFFFFull, 16, &apu) == no_memory && !out, "size near 2^32");
@@ -283,6 +302,12 @@ void concurrent()
 // block that overlaps a live one, or leave a live block unfreeable.
 void first_creation(CreateFn create)
 {
+    // A heap that would cross 4 GiB by one byte (rounded up to 64 KiB) is refused before any memory is
+    // committed and leaves no heap behind; the creations below still succeed.
+    check(create(0xFFFFFFFFull, 2) == invalid, "heap crossing 4 GiB by one byte is refused");
+    check(create(0xFFFFFFFFull, 0xFFFFFFFFull) == invalid, "two maximal 32-bit sizes are refused");
+    void* refused = nullptr;
+    check(take(&refused, 64) == no_memory && !refused, "refused ApuCreateHeap leaves no heap");
     constexpr unsigned callers = 4;
     std::atomic<bool> go{false};
     std::atomic<int> bad{0};
@@ -376,6 +401,23 @@ void hal_and_address_mapping()
     }
     void* hal = nullptr;
     check(hal_create_fn(&hal) == ok && hal != nullptr, "AcpHalCreate returns stand-in object");
+    {
+        constexpr unsigned callers = 4;
+        std::atomic<bool> go{false};
+        std::atomic<int> bad{0};
+        void* objects[callers] = {};
+        std::vector<std::thread> threads;
+        for (unsigned id = 0; id < callers; ++id)
+            threads.emplace_back([&, id] {
+                while (!go.load()) std::this_thread::yield();
+                if (hal_create_fn(&objects[id]) != ok || !objects[id]) ++bad;
+            });
+        go = true;
+        for (auto& t : threads) t.join();
+        check(bad.load() == 0, "concurrent AcpHalCreate calls succeed");
+        for (unsigned i = 0; i < callers; ++i)
+            check(objects[i] == hal, "concurrent AcpHalCreate returns the same stand-in object");
+    }
     if (hal) {
         auto* const* vtable = *reinterpret_cast<void* const* const*>(hal);
         auto connect = reinterpret_cast<HalConnectFn>(vtable[0]);
@@ -401,12 +443,27 @@ void hal_and_address_mapping()
     check(valid_fn(nullptr) == 0, "ApuIsVirtualAddressValid(null) is 0");
     check(valid_fn(&failures) == 0, "ApuIsVirtualAddressValid(foreign) is 0");
     check(valid_fn(heap_base - 1) == 0, "ApuIsVirtualAddressValid(before heap) is 0");
+    check(valid_fn(heap_base) == 0, "ApuIsVirtualAddressValid(reserved offset 0) is 0");
+    check(valid_fn(heap_base + 0x100) == 0, "ApuIsVirtualAddressValid(inside reserved guard) is 0");
+    check(valid_fn(heap_base + first_offset - 1) == 0, "ApuIsVirtualAddressValid(last reserved byte) is 0");
+    check(valid_fn(heap_base + first_offset) != 0, "ApuIsVirtualAddressValid(first allocatable byte) is 1");
+    check(valid_fn(heap_base + heap_size - 1) != 0, "ApuIsVirtualAddressValid(last heap byte) is 1");
     check(valid_fn(heap_base + heap_size) == 0, "ApuIsVirtualAddressValid(at heap end) is 0");
     check(map_fn(nullptr) == 0, "ApuMapVirtualAddress(null) is 0");
     check(map_fn(&failures) == 0, "ApuMapVirtualAddress(foreign) is 0");
     check(map_fn(heap_base - 1) == 0, "ApuMapVirtualAddress(before heap) is 0");
+    check(map_fn(heap_base) == 0, "ApuMapVirtualAddress(reserved offset 0) is 0");
+    check(map_fn(heap_base + 0x100) == 0, "ApuMapVirtualAddress(inside reserved guard) is 0");
+    check(map_fn(heap_base + first_offset - 1) == 0, "ApuMapVirtualAddress(last reserved byte) is 0");
+    check(map_fn(heap_base + first_offset) == first_offset, "ApuMapVirtualAddress(first allocatable byte)");
+    check(map_fn(heap_base + heap_size - 1) == heap_size - 1, "ApuMapVirtualAddress(last heap byte)");
     check(map_fn(heap_base + heap_size) == 0, "ApuMapVirtualAddress(at heap end) is 0");
     check(map_apu_fn(0) == nullptr, "ApuMapApuAddress(0) is null");
+    check(map_apu_fn(1) == nullptr, "ApuMapApuAddress(1 in reserved guard) is null");
+    check(map_apu_fn(0x100) == nullptr, "ApuMapApuAddress(0x100 in reserved guard) is null");
+    check(map_apu_fn(first_offset - 1) == nullptr, "ApuMapApuAddress(last reserved byte) is null");
+    check(map_apu_fn(first_offset) == heap_base + first_offset, "ApuMapApuAddress(first allocatable byte)");
+    check(map_apu_fn(heap_size - 1) == heap_base + heap_size - 1, "ApuMapApuAddress(last heap byte)");
     check(map_apu_fn(heap_size) == nullptr, "ApuMapApuAddress(heap_size) is null");
     check(map_apu_fn(heap_size + 0x1000) == nullptr, "ApuMapApuAddress(past end) is null");
 
@@ -475,11 +532,182 @@ void check_non_permissive_traps(const char* self_exe, const char* dll_path)
     check_trap_case(self_exe, dll_path, "ApuMapVirtualAddress", 0xE2570108u);
     check_trap_case(self_exe, dll_path, "AcpHalReleaseShapeContexts", 0xE2570102u);
 }
+
+SIZE_T pagefile_usage(SIZE_T* peak_out = nullptr)
+{
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        check(false, "GetProcessMemoryInfo succeeds");
+        if (peak_out) *peak_out = 0;
+        return 0;
+    }
+    if (peak_out) *peak_out = pmc.PeakPagefileUsage;
+    return pmc.PagefileUsage;
+}
+
+bool query_mem(const void* address, MEMORY_BASIC_INFORMATION& mbi)
+{
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) == sizeof(mbi)) return true;
+    check(false, "VirtualQuery succeeds");
+    return false;
+}
+
+int run_commit_check(const char* dll_path)
+{
+    SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", "1");
+    HMODULE module = LoadLibraryA(dll_path);
+    if (!module) return std::printf("FAIL: cannot load %s\n", dll_path), 2;
+    alloc_fn = reinterpret_cast<AllocFn>(GetProcAddress(module, "ApuAlloc"));
+    free_fn = reinterpret_cast<FreeFn>(GetProcAddress(module, "ApuFree"));
+    map_apu_fn = reinterpret_cast<MapApuFn>(GetProcAddress(module, "ApuMapApuAddress"));
+    auto create = reinterpret_cast<CreateFn>(GetProcAddress(module, "ApuCreateHeap"));
+    if (!alloc_fn || !free_fn || !map_apu_fn || !create) return std::printf("FAIL: missing export\n"), 2;
+
+    // Warm up GetProcessMemoryInfo before measuring baseline commit.
+    (void)pagefile_usage();
+    const SIZE_T base_commit = pagefile_usage();
+
+    constexpr u64 large_heap = 64ull * 1024 * 1024;
+    constexpr u64 page_size = 0x1000;
+    constexpr SIZE_T slack = 256 * 1024;
+    check(create(large_heap, 0) == ok, "64 MiB ApuCreateHeap succeeds");
+    const SIZE_T after_create_commit = pagefile_usage();
+    check(after_create_commit <= base_commit + slack,
+          "PagefileUsage stays near 0 growth after 64 MiB ApuCreateHeap");
+
+    auto* first_addr = static_cast<unsigned char*>(map_apu_fn(first_offset));
+    check(first_addr != nullptr, "ApuMapApuAddress(first_offset) returns non-null after 64 MiB ApuCreateHeap");
+    if (!first_addr) return 1;
+    unsigned char* const base = first_addr - first_offset;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (query_mem(base, mbi)) {
+        check(mbi.State == MEM_RESERVE && mbi.RegionSize == large_heap,
+              "entire 64 MiB heap starts in MEM_RESERVE state");
+    }
+    if (query_mem(first_addr, mbi)) {
+        check(mbi.State == MEM_RESERVE && mbi.RegionSize == large_heap - first_offset,
+              "allocatable 64 MiB range starts in MEM_RESERVE state");
+    }
+
+    // Allocate A (4 MiB + 2 KiB -> 1025 pages) and adjacent B (1 MiB + 2 KiB -> shares boundary page).
+    constexpr u64 size_a = 0x400800;
+    constexpr u64 size_b = 0x100800;
+    void* a = take_ok(size_a, 16);
+    check(a == first_addr, "first sub-block starts at first_offset");
+    const SIZE_T after_a_commit = pagefile_usage();
+    check(after_a_commit >= after_create_commit + 0x400000 && after_a_commit <= after_create_commit + 0x401000 + slack,
+          "PagefileUsage grows only by first sub-block pages");
+    if (query_mem(a, mbi)) {
+        check(mbi.State == MEM_COMMIT && mbi.RegionSize >= 0x401000, "first sub-block pages are MEM_COMMIT");
+    }
+    if (query_mem(first_addr + 0x401000, mbi)) {
+        check(mbi.State == MEM_RESERVE, "pages past first sub-block remain MEM_RESERVE");
+    }
+    std::memset(a, 0xA5, size_a);
+
+    void* b = take_ok(size_b, 16);
+    check(b == static_cast<unsigned char*>(a) + size_a, "second sub-block is adjacent on shared boundary page");
+    const SIZE_T after_b_commit = pagefile_usage();
+    check(after_b_commit <= after_a_commit + 0x100000 + slack,
+          "PagefileUsage grows only by second sub-block newly committed pages");
+    bool a_intact = true;
+    for (u64 i = 0; i < size_a; ++i) a_intact = a_intact && static_cast<const unsigned char*>(a)[i] == 0xA5;
+    check(a_intact, "first sub-block bytes remain intact after committing adjacent block on shared page");
+    std::memset(b, 0x5A, size_b);
+
+    // Free A: interior pages [0x10000, 0x410000) must return to MEM_RESERVE while shared page [0x410000, 0x411000) stays MEM_COMMIT.
+    check(free_fn(a) == ok, "ApuFree first sub-block succeeds");
+    if (query_mem(first_addr, mbi)) {
+        check(mbi.State == MEM_RESERVE && mbi.RegionSize == 0x400000,
+              "interior pages of freed first sub-block return to MEM_RESERVE");
+    }
+    if (query_mem(first_addr + 0x400000, mbi)) {
+        check(mbi.State == MEM_COMMIT,
+              "shared boundary page stays MEM_COMMIT while adjacent second block is live");
+    }
+    const SIZE_T after_free_a_commit = pagefile_usage();
+    check(after_free_a_commit + 0x380000 <= after_b_commit,
+          "PagefileUsage drops after interior freed pages are decommitted");
+    if (query_mem(b, mbi)) {
+        check(mbi.State == MEM_COMMIT && mbi.RegionSize >= size_b,
+              "adjacent live block stays MEM_COMMIT after freeing first block");
+        if (mbi.State == MEM_COMMIT) {
+            bool b_intact = true;
+            for (u64 i = 0; i < size_b; ++i) b_intact = b_intact && static_cast<const unsigned char*>(b)[i] == 0x5A;
+            check(b_intact, "adjacent live block bytes on shared boundary page remain intact and readable");
+        }
+    }
+
+    // Reallocate A while B is still live: re-commits interior pages and zeroes still-committed shared boundary page.
+    void* a2 = take_ok(size_a, 16);
+    check(a2 == a, "reallocated sub-block reuses freed span");
+    bool a2_zero = true;
+    for (u64 i = 0; i < size_a; ++i) a2_zero = a2_zero && static_cast<const unsigned char*>(a2)[i] == 0;
+    check(a2_zero, "reallocated sub-block is zeroed including shared boundary page");
+    bool b_still_intact = true;
+    for (u64 i = 0; i < size_b; ++i) b_still_intact = b_still_intact && static_cast<const unsigned char*>(b)[i] == 0x5A;
+    check(b_still_intact, "adjacent live block remains untouched when neighbor reallocates");
+
+    check(free_fn(a2) == ok, "ApuFree reallocated first sub-block");
+    check(free_fn(b) == ok, "ApuFree second sub-block");
+    if (query_mem(first_addr, mbi)) {
+        check(mbi.State == MEM_RESERVE && mbi.RegionSize == large_heap - first_offset,
+              "entire allocatable heap returns to MEM_RESERVE after freeing all blocks");
+    }
+    const SIZE_T after_free_all_commit = pagefile_usage();
+    check(after_free_all_commit <= after_create_commit + slack,
+          "PagefileUsage returns near baseline after freeing all blocks");
+
+    // Verify commit-failure rollback leaves the heap intact if a process commit limit can be applied.
+    SIZE_T peak_commit = 0;
+    (void)pagefile_usage(&peak_commit);
+    if (HANDLE job = CreateJobObjectW(nullptr, nullptr)) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.ProcessMemoryLimit = peak_commit + 2 * 1024 * 1024;
+        if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits) &&
+            AssignProcessToJobObject(job, GetCurrentProcess())) {
+            void* oom = reinterpret_cast<void*>(0x1234);
+            std::uint32_t apu = 0xDEADBEEF;
+            check(take(&oom, 16ull * 1024 * 1024, 16, &apu) == no_memory && !oom && apu == 0xDEADBEEF,
+                  "commit failure in VirtualAlloc(MEM_COMMIT) returns E_OUTOFMEMORY cleanly");
+            void* small_ok = nullptr;
+            std::uint32_t small_apu = 0;
+            check(take(&small_ok, page_size, 16, &small_apu) == ok && small_ok == first_addr && small_apu == first_offset,
+                  "heap free list remains uncorrupted after commit failure");
+            if (small_ok) check(free_fn(small_ok) == ok, "free small block after commit-failure rollback check");
+        }
+        CloseHandle(job);
+    }
+
+    return failures ? 1 : 0;
+}
+
+void check_on_demand_commit(const char* self_exe, const char* dll_path)
+{
+    std::string cmd = std::string("\"") + self_exe + "\" --commit-check \"" + dll_path + "\"";
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        check(false, "CreateProcessA for on-demand commit check");
+        return;
+    }
+    const DWORD wait_rc = WaitForSingleObject(pi.hProcess, 15000);
+    DWORD exit_code = 1;
+    const BOOL got_code = GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    check(wait_rc == WAIT_OBJECT_0 && got_code && exit_code == 0, "on-demand commit child check passes");
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
     if (argc == 4 && std::strcmp(argv[1], "--trap-control") == 0) return run_trap_control(argv[2], argv[3]);
+    if (argc == 3 && std::strcmp(argv[1], "--commit-check") == 0) return run_commit_check(argv[2]);
     if (argc != 2) return std::printf("usage: startup_acphal_apu_free <AcpHal.dll>\n"), 2;
     SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", "1");
     HMODULE module = LoadLibraryA(argv[1]);
@@ -510,6 +738,7 @@ int main(int argc, char** argv)
     table_full();
     concurrent();
     check_non_permissive_traps(argv[0], argv[1]);
+    check_on_demand_commit(argv[0], argv[1]);
     std::printf(failures ? "startup_acphal_apu_free: %d failure(s)\n" : "startup_acphal_apu_free: ok\n", failures);
     return failures ? 1 : 0;
 }

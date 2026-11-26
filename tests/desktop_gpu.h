@@ -34,7 +34,7 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
-                              UINT vertices = 3);
+                              UINT vertices = 3, const std::uint32_t* constants = nullptr);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
                                UINT width = 1, UINT height = 1);
@@ -78,6 +78,7 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            const char* amplification = nullptr);
 bool check_mesh_amplified_draw(ID3D12Device*, const char* amplification, const char* mesh,
                                const char* pixel, const char* fixture);
+bool check_mesh_shader_pipeline(ID3D12Device* device, bool force_fallback);
 bool check_mesh_heap_sampler_draw(ID3D12Device*, const char* mesh, const char* pixel, const char* fixture);
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
                               const char* pixel, const char* fixture, MeshDrawMode mode = MeshDrawMode::color,
