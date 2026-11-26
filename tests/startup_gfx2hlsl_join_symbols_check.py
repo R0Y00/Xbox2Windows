@@ -118,6 +118,30 @@ SOURCES = {
                          's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
                          '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf04040cf4000000fa7f'
                          'c08cbf7e06fe88080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    # The join instruction is itself a branch: its incoming edge must not carry the kept arm descriptor to the next
+    # target, where the read after the restore would translate (refused). EXEC_DESC_BRANCH_IN has the branch inside
+    # the window, after a plain join instruction: the branch ends the window too (refused).
+    'EXEC_DESC_JOIN_BRANCH': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                              's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                              's_waitcnt lgkmcnt(0)\ns_branch 0\n'
+                              's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                              's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                              '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf000082bf7e06fe88'
+                              '080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    'EXEC_DESC_JOIN_SCC': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                           's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                           's_waitcnt lgkmcnt(0)\ns_cbranch_scc1 1\ns_endpgm\n'
+                           's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                           's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                           '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf010085bf000081bf'
+                           '7e06fe88080f00f000040400703f8cbf0f1800f804050607000081bf'),
+    'EXEC_DESC_BRANCH_IN': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
+                            's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
+                            's_waitcnt lgkmcnt(0)\ns_nop 0\ns_branch 1\ns_endpgm\n'
+                            's_or_b64 exec, exec, s[6:7]\nimage_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n'
+                            's_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                            '8002007e8002027e8002047e8004847d6a2486be030088bf04040cf4000000fa7fc08cbf000080bf010082bf'
+                            '000081bf7e06fe88080f00f000040400703f8cbf0f1800f804050607000081bf'),
     'EXEC_DESC_AFTER': ('v_mov_b32 v0, 0\nv_mov_b32 v1, 0\nv_mov_b32 v2, 0\nv_cmp_eq_u32 vcc, 0, v2\n'
                         's_and_saveexec_b64 s[6:7], vcc\ns_cbranch_execz 3\ns_load_dwordx8 s[16:23], s[8:9], 0x0\n'
                         's_waitcnt lgkmcnt(0)\ns_or_b64 exec, exec, s[6:7]\n'
@@ -196,6 +220,7 @@ def root(*params):
 ROOTS = {'DESC_CALC': ('t', 1), 'PAIR_READ': ('t', 1), 'PAIR_ROOT': ('t', 1), 'PAIR_WRITE': ('t', 1), 'DESC_LOAD': ('t', 1),
          'DESC_WORD': ('t', 1), 'DESC_SAME': ('t', 1), 'DESC_ONE_PATH': ('t', 1), 'EXEC_DESC_MASKED': ('t', 1),
          'EXEC_DESC_AFTER': ('t', 1), 'EXEC_DESC_SCALAR_JOIN': ('t', 1), 'EXEC_DESC_RELOAD': ('t', 1),
+         'EXEC_DESC_JOIN_BRANCH': ('t', 1), 'EXEC_DESC_JOIN_SCC': ('t', 1), 'EXEC_DESC_BRANCH_IN': ('t', 1),
          'PTR_OFFSETS': ('t', 1)}
 
 
@@ -265,7 +290,9 @@ def check_controls():
     assert '        t = r0.Load(int3(v0, v1, 0));' in masked, masked
     # ... and still refused for a read after the restore (a lane that skipped the arm is active again).
     refused('EXEC_DESC_AFTER', "holds ('joined at a branch target',)")
-    refused('EXEC_DESC_SCALAR_JOIN', 'numeric use of s17 holding joined at a branch target')
+    for branchy in ('EXEC_DESC_JOIN_BRANCH', 'EXEC_DESC_JOIN_SCC', 'EXEC_DESC_BRANCH_IN'):
+        refused(branchy, "holds ('joined at a branch target',)")
+    refused('EXEC_DESC_SCALAR_JOIN','numeric use of s17 holding joined at a branch target')
     reloaded = translate('EXEC_DESC_RELOAD').hlsl_ps().splitlines()
     assert '        t = r0.Load(int3(v0, v1, 0));' in reloaded, reloaded
     reload = translate_cs('CS_RELOAD')

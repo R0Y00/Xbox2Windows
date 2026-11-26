@@ -3114,6 +3114,11 @@ class Stage:
                 if off in targets and self.exec_keep and name.startswith('s_'):
                     # The join instruction itself runs with exec == 0 on the taken edge: a scalar read of a kept word ends it here.
                     self.end_exec_keep_scalar_read(name, asm)
+                if off in targets and self.exec_keep and (
+                        name.startswith('s_cbranch') or name in ('s_branch', 's_setpc_b64')):
+                    # The join instruction is itself a branch: end_exec_keep only runs at the top of the next
+                    # instruction, so retire the kept words before the branch records its incoming edge.
+                    self.retire_exec_keep(set(self.exec_keep))
                 if name.startswith('s_cbranch') or name == 's_branch' or (
                         name == 's_setpc_b64' and self.calculated_pc.get(off) is not None):
                     b_target = self.calculated_pc[off] if name == 's_setpc_b64' else int(parse(asm)[1][0].split('_')[1], 16)
