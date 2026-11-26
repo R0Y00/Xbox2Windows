@@ -2249,6 +2249,7 @@ class Stage:
             if getattr(self, 'since_join', None) is not None:
                 (self.since_join.add if uniform else self.since_join.discard)(n)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
+        getattr(self, 'mask_high', set()).discard(n)
         getattr(self, 'float_const_s', {}).pop(n, None)
         if sym is not None:
             self.sym[n] = sym
@@ -3187,6 +3188,9 @@ class Stage:
         masks = []
         if base.startswith('v_') and not base.startswith('v_mov_b32') and base not in MASK_AWARE_VALU and not MASK_AWARE_VALU_RE.search(base):
             masks = [t for t in (o.strip().lstrip('-|').rstrip('|') for o in ops[1:]) if self.is_lane_mask(t)]
+        if base.startswith('v_mov_b32'):   # the high word of a wave64 mask has no one-lane value
+            masks = [t for t in ops[1:] if reg_range(t) and reg_range(t)[0] == 's'
+                     and reg_range(t)[1] in getattr(self, 'mask_high', ())]
         result = self._lower(base, asm, ops, mods)
         if masks:
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
@@ -4013,6 +4017,9 @@ class Stage:
             self.masks.add(d)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
+            if is_mask:
+                # The modelled high word is 0, but the hardware's holds the other lanes' bits: no numeric read of it.
+                self.mask_high = getattr(self, 'mask_high', set()) | {d + 1}
         elif pair:
             self.set_s(d + 1, self.S(high) if high is not None else '0u', uniform=high_uniform)
         return None

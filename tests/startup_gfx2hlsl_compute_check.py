@@ -819,6 +819,15 @@ def check_lane_mask_data():
         refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
 
 
+def check_lane_mask_high_word():
+    """The high word of a wave64 mask (the ballot's upper 32 bits) is modelled as 0: a move of it is refused."""
+    chunks = [bytes.fromhex(w) for w in ('0000 84d4 9100 0200'.replace(' ', ''),   # v_cmp_gt_i32 s[0:1], 17, v0
+                                         '8004027d',                                 # v_cmp_lt_i32 vcc, 0, v2
+                                         '6a008089')]                                # s_xor_b64 s[0:1], vcc, s[0:1]
+    refused('as numeric data', lambda: translate('A', code=splice_words(*chunks, bytes.fromhex('01020a7e'))))
+    assert 'v5 = ud0;' in translate('A', code=splice_words(*chunks, bytes.fromhex('04020a7e'))).hlsl_cs()
+
+
 def splice_words(*chunks, at=STORE_A):
     return WORDS_A[:at] + b''.join(chunks) + WORDS_A[at:]
 
@@ -1084,6 +1093,7 @@ def check_controls():
     check_descriptor_scc()
     check_mbcnt()
     check_lane_mask_data()
+    check_lane_mask_high_word()
     check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.
