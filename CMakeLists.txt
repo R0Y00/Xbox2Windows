@@ -4589,6 +4589,10 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_pixel_heap_srv_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")
             set_tests_properties(startup_pixel_heap_srv_${compiler}_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+            add_test(NAME startup_pixel_heap_srv_word_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_pixel_heap_srv_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}" word)
+            set_tests_properties(startup_pixel_heap_srv_word_${compiler}_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
             add_test(NAME startup_mrt_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${compiler}" "${DXC_EXECUTABLE}" "${STARTUP_FXC}")

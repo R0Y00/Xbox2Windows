@@ -9667,9 +9667,12 @@ class Pipeline:
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             source, off = key
-            where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0), 'vbtab': 'vb %d' % ((off or 0) // 16),
-                     'root': 'root %d' % (source[1] if len(source) > 1 else 0)}.get(source[0])
-            if where is None and source[0] == 'resheap' and off in (None, 0):
+            where = None
+            if source[0] in ('table', 'vbtab', 'root'):
+                where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0),
+                         'vbtab': 'vb %d' % ((off or 0) // 16),
+                         'root': 'root %d' % (source[1] if len(source) > 1 else 0)}[source[0]]
+            elif source[0] == 'resheap' and off in (None, 0):
                 where = heap_where(source)
             if where is None:
                 raise Unsupported('resource through %s' % (source,))

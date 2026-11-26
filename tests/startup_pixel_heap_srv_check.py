@@ -43,6 +43,13 @@ WORDS = {
     'v_mul_f32_e32 v5, 0x3e000000, v5': 'ff0a0a100000003e',
     'exp mrt0 v4, v5, v6, v7 done vm': '0f1800f804050607',
     's_endpgm': '000081bf',
+    's_mov_b32 s25, 0': '800399be',
+    's_mov_b32 s24, s8': '080398be',
+    's_load_dwordx4 s[12:15], s[24:25], 0x40': '0c0308f4400000fa',
+    's_mul_i32 s28, s9, 4': '09841c93',
+    's_buffer_load_dword s26, s[12:15], s28': '860620f400000038',
+    's_lshl_b32 s27, s26, 5': '1a851b8f',
+    's_load_dwordx8 s[16:23], s[10:11], s27': '05040cf400000036',
 }
 # s8 is the (unused) descriptor table, s9 the root constant, s10 the 32-bit heap pointer, s11 its high word.
 PROGRAM = """s_mov_b32 s11, 0
@@ -58,11 +65,29 @@ v_mul_f32_e32 v5, 0x3e000000, v5
 exp mrt0 v4, v5, v6, v7 done vm
 s_endpgm
 """
+# The same program with the index read from a word of a buffer: the descriptor at table byte 64 (s[12:15]), the word at
+# byte key * 4 (root constant word * 4). The consumer's buffer holds records 1, 0, 5, 7 for keys 0..3.
+PROGRAM_WORD = PROGRAM.replace('''s_lshl_b32 s24, s9, 5
+s_load_dwordx8 s[16:23], s[10:11], s24
+''', '''s_mov_b32 s25, 0
+s_mov_b32 s24, s8
+s_load_dwordx4 s[12:15], s[24:25], 0x40
+s_mul_i32 s28, s9, 4
+s_waitcnt lgkmcnt(0)
+s_buffer_load_dword s26, s[12:15], s28
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s27, s26, 5
+s_load_dwordx8 s[16:23], s[10:11], s27
+''')
+# case: (program, manifest line, consumer mode, record each key names)
+CASES = {
+    'rootconst': (PROGRAM, 'srv 0 tex2d heap rootconst 1 0', '1', (0, 1)),
+    'word': (PROGRAM_WORD, 'srv 1 tex2d heap word table 0 64 at 0 rootconst 1 0 times 4', 'word', (1, 0)),
+}
 REFUSED = {
     'shift by 6': (PROGRAM.replace('s9, 5', 's9, 6'), 'not a root constant shifted left by 5'),
     'a buffer record in a pixel stage': (PROGRAM.replace('s_load_dwordx8 s[16:23]', 's_load_dwordx4 s[16:19]'), 'of 4 dwords'),
 }
-MANIFEST_LINE = 'srv 0 tex2d heap rootconst 1 0'
 
 
 def root(flags=HEAP_FLAG):
@@ -84,8 +109,9 @@ def manifest(source):
 
 
 def check_host():
-    lines = manifest(PROGRAM)
-    assert MANIFEST_LINE in lines, lines
+    for name, (program, line, _, _) in CASES.items():
+        lines = manifest(program)
+        assert line in lines, (name, lines)
     for name, (source, reason) in REFUSED.items():
         try:
             manifest(source)
@@ -102,25 +128,26 @@ def check_host():
     print('startup_pixel_heap_srv: host controls ok (1 binding, %d refusals, no-flag refusal)' % len(REFUSED))
 
 
-def expected(swap):
-    """One pass: four strips (keys 0..3) of four rows, texture (key ^ swap) for keys 0 and 1, the cleared target otherwise."""
+def expected(swap, records):
+    """One pass: four strips (keys 0..3), the texture at the record a key names (^ swap) for keys 0 and 1, else the cleared target."""
     column = []
     for key in range(4):
         if key < 2:
-            column.append(bytes((16 + 128 * (key ^ swap), (0, 32)[key], 0, 255)))
+            column.append(bytes((16 + 128 * (records[key] ^ swap), (0, 32)[key], 0, 255)))
         else:
             column.append(CLEARED)
     return column
 
 
-def draw(folder, consumer, backend, kind, compiler):
+def draw(folder, consumer, backend, kind, compiler, case='rootconst'):
+    program, manifest_line, mode, records = CASES[case]
     cache = folder / 'cache'
     cache.mkdir()
     vs, ps, signature, pixels = (folder / name for name in ('vs', 'ps', 'root', 'pixels'))
     vs.write_bytes(vertex())
-    ps.write_bytes(container(0, [word for word, in struct.iter_unpack('<I', encode(PROGRAM))]))
+    ps.write_bytes(container(0, [word for word, in struct.iter_unpack('<I', encode(program))]))
     env = dict(os.environ, X2W_D3D12_PERMISSIVE='1', X2W_D3D12_LIST_NOOP='1', X2W_D3D12_RENDER='1',
-               X2W_TEST_JOINED_TABLE='1', X2W_TEST_HEAP_SRV='1', X2W_SHADER_CACHE=str(cache),
+               X2W_TEST_JOINED_TABLE='1', X2W_TEST_HEAP_SRV=mode, X2W_SHADER_CACHE=str(cache),
                X2W_FXC=str(compiler) if kind == 'fxc' else '')
     env['PATH'] = str(Path(compiler).resolve().parent) + os.pathsep + env['PATH']
     cmd = [consumer, vs, ps, signature]
@@ -131,7 +158,7 @@ def draw(folder, consumer, backend, kind, compiler):
     subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], env=env, check=True)
     text_file, = cache.glob('*.txt')
     text = text_file.read_text(encoding='ascii')
-    assert text.splitlines().count(MANIFEST_LINE) == 1, text
+    assert text.splitlines().count(manifest_line) == 1, text
     for stage in ('vs', 'ps'):
         compile_shader(compiler, kind, stage, text_file.with_suffix(f'.{stage}.hlsl'),
                        text_file.with_suffix(f'.{stage}.cso'), folder / f'{stage}.asm')
@@ -140,7 +167,7 @@ def draw(folder, consumer, backend, kind, compiler):
         raise SystemExit(77)
     assert result.returncode == 0, result.stdout + result.stderr
     data = pixels.read_bytes()
-    want = b''.join(bytes(pixel) for swap in (0, 1) for pixel in expected(swap))
+    want = b''.join(bytes(pixel) for swap in (0, 1) for pixel in expected(swap, records))
     columns = [data[4 * x:4 * x + 4] for x in range(8)]
     rows = [data[32 * y:32 * y + 32] for y in range(4)]
     assert len(set(rows)) == 1, 'rows differ: ' + data.hex()
@@ -149,19 +176,20 @@ def draw(folder, consumer, backend, kind, compiler):
     refused = result.stderr.count('heap record refused (record is outside the list')
     other = result.stderr.count('heap record refused (record is not a shader-resource view')
     assert refused + other == 4, (refused, other, result.stderr[-2000:])
-    print(f'{kind} {backend}: heap records 0 and 1 drawn, swapped views followed, 4 records refused by name')
+    print(f'{kind} {backend} {case}: heap records 0 and 1 drawn, swapped views followed, 4 records refused by name')
 
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         check_host()
     elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
-        for line in PROGRAM.splitlines() + ['s_lshl_b32 s24, s9, 6', 's_load_dwordx4 s[16:19], s[10:11], s24']:
+        for line in PROGRAM_WORD.splitlines() + PROGRAM.splitlines() + ['s_lshl_b32 s24, s9, 6', 's_load_dwordx4 s[16:19], s[10:11], s24']:
             assert assemble(sys.argv[2], line + '\n') == bytes.fromhex(WORDS[line]), line
         print('heap srv fixture instructions match gfx1013 assembly')
-    elif len(sys.argv) == 6:
-        consumer, backend, kind, dxc, fxc = sys.argv[1:]
+    elif len(sys.argv) in (6, 7):
+        consumer, backend, kind, dxc, fxc = sys.argv[1:6]
         with tempfile.TemporaryDirectory() as temporary:
-            draw(Path(temporary), consumer, backend, kind, fxc if kind == 'fxc' else dxc)
+            draw(Path(temporary), consumer, backend, kind, fxc if kind == 'fxc' else dxc,
+                 sys.argv[6] if len(sys.argv) == 7 else 'rootconst')
     else:
         raise SystemExit(__doc__)
