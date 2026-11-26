@@ -88,7 +88,7 @@ def main(consumer, dxc, adapter):
         assert not errors, errors[0]
         # Opt-in X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT: an input in a placed buffer that does not alias title memory holds
         # its bytes only in title memory (the desktop copy is zeros). Off, it is refused; on, the bytes are snapshotted
-        # into the upload ring and all 320 words match; with title memory zero (dispatch-input-copied) the dispatch runs
+        # into the snapshot pool and all 320 words match; with title memory zero (dispatch-input-copied) the dispatch runs
         # on zeros: not refused, not the expected words, not untouched.
         snapshot_env = dict(env, X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT='1')
         got, result = dispatch(directory, consumer, env, 'dispatch-input-snapshot')
@@ -101,6 +101,16 @@ def main(consumer, dxc, adapter):
         got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-copied')
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
         assert got != expected and got != untouched, 'a snapshot of zero title memory must not give the expected words'
+        # Long run: 48 frames of dispatches whose 8 MiB title-memory input is snapshotted each frame, the queue completed between
+        # frames: 384 MiB in all, three times the snapshot pool (128 MiB). The pool must be recycled: every frame translates,
+        # gives the first frame's words (the consumer exits 85 if one does not), the last frame matches the CPU reference
+        # and no reservation is refused.
+        got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-snapshot-long')
+        assert got == expected and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert not lines(result, 'reservation refused'), lines(result, 'reservation refused')
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) >= 1, result.stderr[-3000:]
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors[0]
         # An all-zero descriptor is an unbound buffer: the dispatch runs on zeros instead of being refused (the empty
         # control above has a nonzero base and stays refused).
         got, result = dispatch(directory, consumer, env, 'dispatch-input-null')
