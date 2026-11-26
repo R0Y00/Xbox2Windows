@@ -175,6 +175,67 @@ void invalid_releases_are_refused()
     CHECK(!slots.release(0, slot.offset));                  // already free
     counters(slots, 1, 0, per_slab);
 }
+
+void reclaiming_empty_slabs_closes_handles()
+{
+    Slots slots(slot_bytes);
+    Factory factory;
+    std::vector<Slots::Slot> first_slab, second_slab;
+    for (std::uint64_t i = 0; i < per_slab; ++i) first_slab.push_back(fresh(slots, factory));
+    for (std::uint64_t i = 0; i < 10; ++i) second_slab.push_back(fresh(slots, factory));
+    counters(slots, 2, per_slab + 10, per_slab - 10);
+
+    // Releasing all of slab 0 while slab 1 stays live closes only slab 0 and leaves a tombstone at index 0.
+    for (const auto& slot : first_slab) CHECK(slots.release(slot.slab_index, slot.offset));
+    std::vector<int> closed;
+    slots.reclaim_empty_slabs([&](int h) { closed.push_back(h); });
+    CHECK(closed.size() == 1 && closed[0] == 100);
+    counters(slots, 1, 10, per_slab - 10);
+    CHECK(slots.slabs().size() == 2 && slots.slabs()[0] == 0 && slots.slabs()[1] == 101);
+    CHECK(!slots.release(0, 0));  // tombstone slab refuses release
+
+    // Next acquire skips the closed slab 0 and uses slab 1.
+    const auto next = acquire(slots, factory);
+    CHECK(next.slab == 101 && next.slab_index == 1 && next.offset == 10 * slot_bytes);
+    second_slab.push_back(next);
+
+    // Releasing the last live slab pops both it and the preceding tombstone.
+    for (const auto& slot : second_slab) CHECK(slots.release(slot.slab_index, slot.offset));
+    slots.reclaim_empty_slabs([&](int h) { closed.push_back(h); });
+    CHECK(closed.size() == 2 && closed[1] == 101);
+    counters(slots, 0, 0, 0);
+    CHECK(slots.slabs().empty());
+
+    // Reclaiming a trailing empty slab while an earlier slab stays live preserves the earlier slab's full state.
+    first_slab.clear();
+    second_slab.clear();
+    for (std::uint64_t i = 0; i < per_slab; ++i) first_slab.push_back(fresh(slots, factory));
+    for (std::uint64_t i = 0; i < 5; ++i) second_slab.push_back(fresh(slots, factory));
+    CHECK(slots.release(0, 0));
+    for (const auto& slot : second_slab) CHECK(slots.release(slot.slab_index, slot.offset));
+    closed.clear();
+    slots.reclaim_empty_slabs([&](int h) { closed.push_back(h); });
+    CHECK(closed.size() == 1 && closed[0] == 103);
+    counters(slots, 1, per_slab - 1, 1);
+    CHECK(slots.slabs().size() == 1 && slots.slabs()[0] == 102);
+
+    // Reusing the one free slot in slab 0 works, then the next acquire opens a fresh slab (does not overwrite slab 0).
+    const auto reused = acquire(slots, factory);
+    CHECK(reused.slab == 102 && reused.slab_index == 0 && reused.offset == 0);
+    counters(slots, 1, per_slab, 0);
+    const auto opened = acquire(slots, factory);
+    CHECK(opened.slab == 104 && opened.slab_index == 1 && opened.offset == 0);
+    counters(slots, 2, per_slab + 1, per_slab - 1);
+
+    // Release everything and reclaim all remaining slabs.
+    for (const auto& slot : first_slab) CHECK(slots.release(slot.slab_index, slot.offset));
+    CHECK(slots.release(opened.slab_index, opened.offset));
+    closed.clear();
+    slots.reclaim_empty_slabs([&](int h) { closed.push_back(h); });
+    CHECK(closed.size() == 2 && closed[0] == 102 && closed[1] == 104);
+    counters(slots, 0, 0, 0);
+    CHECK(slots.slabs().empty());
+}
 }  // namespace
 
 int main()
@@ -186,6 +247,7 @@ int main()
     a_failing_factory_changes_nothing();
     unwinding_a_fresh_slot_gives_it_back();
     invalid_releases_are_refused();
+    reclaiming_empty_slabs_closes_handles();
     std::puts("xmem slab slots: all checks passed");
     return 0;
 }
