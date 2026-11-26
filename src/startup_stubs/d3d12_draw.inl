@@ -79,6 +79,7 @@ SRWLOCK draw_lock = SRWLOCK_INIT;
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
+LONG formatted_draws_refused;  // draws whose formatted buffer load had no resolved descriptor word 3 (also untranslated)
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
 
 void count_null_binding(x2w_local::NullCause cause)
@@ -243,7 +244,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-14";
+    constexpr char revision[] = "x2w-startup-shader-17";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -363,7 +364,7 @@ void publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-14cs";  // tools/startup/gfx2hlsl.py compute_key
+    constexpr char compute_revision[] = "x2w-startup-shader-17cs";  // tools/startup/gfx2hlsl.py compute_key
     u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
@@ -426,7 +427,7 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         return copy_title_bytes(out.data(), pointer, out.size());
     };
     if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
-    constexpr char revision[] = "x2w-startup-mesh-57-1";
+    constexpr char revision[] = "x2w-startup-mesh-57-2";
     const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(revision, sizeof(revision) - 1))));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
@@ -711,6 +712,27 @@ void request_translation(Wrapper* pipeline)
     if (first_calls(lookups, 16))
         log("x2w-render ExecuteIndirect looks up translation for pipeline %p (%s)", static_cast<void*>(pipeline),
             known ? "already known" : "new");
+}
+
+// Side-effect-free pipeline key lookup for ExecuteIndirect refusal attribution: never writes
+// translation request files and returns 0 when the pipeline has no known console shader key.
+u64 known_pipeline_key(Wrapper* pipeline)
+{
+    if (!pipeline) return 0;
+    if (pipeline->own().mesh86_key) return pipeline->own().mesh86_key;
+    if (pipeline->own().compute_trace_key) return pipeline->own().compute_trace_key;
+    if (pipeline->own().real) return 0;
+    AcquireSRWLockShared(&draw_lock);
+    const auto& by_pipeline = translation_by_pipeline();
+    const auto known = by_pipeline.find(pipeline);
+    u64 key = known != by_pipeline.end() && known->second && known->second->translation
+        ? known->second->translation->key : 0;
+    ReleaseSRWLockShared(&draw_lock);
+    if (!key) {
+        const PipelineInfo* info = pipeline_info(pipeline);
+        if (info && info->path == 86 && info->stream_translation) key = info->stream_translation->key;
+    }
+    return key;
 }
 
 bool needs_rtv_variant(DXGI_FORMAT format)
@@ -1576,6 +1598,21 @@ struct IndexedValidationPipeline {
     x2w_startup::ComPtr<ID3D12Device> device;
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+
+    // Lifetime boundary: this record owns the device it was built for, its root signature and its
+    // pipeline, from the first validation that asked for them until the module that holds it is
+    // unloaded. It is a function-local static in indexed_validation_pipeline() below, so it is destroyed
+    // during that module's CRT teardown (startup_stubs/d3d12_teardown.h). On process exit the display
+    // driver may already be stopped and releasing a pipeline state then fails inside it (amdxc64, #2572),
+    // so the three references are detached and nothing reaches the driver. FreeLibrary keeps the process
+    // and the driver alive: no flag, and the members above release their objects normally.
+    ~IndexedValidationPipeline()
+    {
+        if (!x2w_startup::d3d12_process_terminating) return;
+        device.Detach();
+        root.Detach();
+        pipeline.Detach();
+    }
 };
 
 IndexedValidationPipeline& indexed_validation_pipeline(ID3D12Device* device)
@@ -1799,6 +1836,7 @@ struct FormattedBufferDescriptor {
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
     const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
+        InterlockedIncrement(&formatted_draws_refused);
         static LONG refused;
         if (first_calls(refused, 6))
             log("x2w-draw %016llx srv %d: formatted buffer refused (%s %u)", tr.key, slot, reason, detail);
@@ -1817,11 +1855,25 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
-        if (descriptor.words[0] == view_token_magic)
-            return refuse(ud.a, "missing hardware descriptor");
+        if (descriptor.words[0] == view_token_magic) {
+            // A typed buffer view the title created: the driver builds word 3 from its format and component mapping.
+            ViewRecord record{};
+            AcquireSRWLockShared(&note_lock);
+            const bool known = descriptor.words[1] < view_records().size();
+            if (known) record = view_records()[descriptor.words[1]];
+            ReleaseSRWLockShared(&note_lock);
+            if (!known || record.slot != 18 || record.desc_bytes < 40)
+                return refuse(ud.a, "missing hardware descriptor");
+            D3D12_SHADER_RESOURCE_VIEW_DESC view;
+            std::memcpy(&view, record.desc, 40);
+            if (const char* reason = x2w_startup::view_word3(view, descriptor.words[3])) return refuse(ud.a, reason);
+            descriptor.entry = entry;
+            continue;
+        }
         const auto format = x2w_startup::formatted_buffer_code(descriptor.words[3]);
         if (!x2w_startup::formatted_buffer_supported(format))
             return refuse(ud.a, "unsupported FORMAT", format);
+        if (const char* reason = x2w_startup::descriptor_word3_refusal(descriptor.words[3])) return refuse(ud.a, reason);
         descriptor.entry = entry;
     }
     return true;
@@ -1998,13 +2050,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
                 // The view recorded from the title names a packed format: follow a stand-in texture,
                 // and bind nothing for a texture the view does not fit (packed_target_format.h).
-                const auto verdict = x2w_startup::packed_view(desc.Format, texture->GetDesc().Format, x2w_startup::packed_stand_in_of(texture));
-                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                const auto actual = texture->GetDesc().Format;
+                const auto verdict = x2w_startup::packed_view(desc.Format, actual, x2w_startup::packed_stand_in_of(texture));
+                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = actual;
                 if (verdict == x2w_startup::PackedView::refused) {
                     static LONG refused;
                     if (first_calls(refused, 6))
                         log("x2w-draw   %016llx srv %u: packed format %d on a texture of format %d that does not stand in for it; binding null",
-                            tr->key, i, desc.Format, texture->GetDesc().Format);
+                            tr->key, i, desc.Format, actual);
                     texture = nullptr;
                     desc = {};
                     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2027,7 +2080,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 return false;
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
-            if (texture) require_state(self, texture, sampled_state(self, texture));
+            if (texture) {
+                require_state(self, texture, sampled_state(self, texture));
+                if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
+            }
             const bool had_texture = texture != nullptr;
             bool mismatched = false;
             static LONG shown;
@@ -2132,7 +2188,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
-        if (bytes > (16u << 20)) bytes = 16u << 20;
+        if (bytes > (16u << 20)) {
+            bytes = 16u << 20;
+            // Formatted loads past the copy would read zeros on the desktop; refuse the draw instead.
+            if (formatted.entry) {
+                InterlockedIncrement(&formatted_draws_refused);
+                static LONG refused;
+                if (first_calls(refused, 6))
+                    log("x2w-draw %016llx srv %u: formatted buffer refused (buffer larger than the 16 MiB draw copy)", tr->key, i);
+                ReleaseSRWLockExclusive(&draw_lock);
+                return false;
+            }
+        }
         // A buffer binding that ends up without a readable range counts as a null binding with its cause.
         const auto count_buffer = [&](bool bound) {
             x2w_local::BindingFacts buffer_facts;
@@ -2172,6 +2239,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // slot the title leaves empty here; why is not known yet.
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
         if (!have && formatted.entry) {
+            InterlockedIncrement(&formatted_draws_refused);
             static LONG refused;
             if (first_calls(refused, 6))
                 log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
@@ -2332,15 +2400,14 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
 void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
 {
     x2w_startup::SamplerSource source;
-    u64 view_heap = 0;
+    x2w_startup::ViewHeapSelection view_heaps;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
         for (UINT i = 0; i < count; ++i) {
             for (const HeapInfo& heap : heap_infos()) {
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
-                    heap.logical_count > heap.count)
-                    view_heap = heap.wrapper;
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
@@ -2349,18 +2416,17 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
         ReleaseSRWLockShared(&note_lock);
     }
     auto& pass = pass_of(self);
-    if (pass.source_view_heap != view_heap)
+    if (pass.source_view_heap != view_heaps.graphics) {
         for (auto& table : pass.view_tables) table = {};
-    pass.source_view_heap = view_heap;
+    }
+    pass.compute_tables.set_view_heap(view_heaps.compute);
+    pass.source_view_heap = view_heaps.graphics;
     pass.title_samplers = source;
 }
 
-// List slot 36 (desktop 32 + 4), SetGraphicsRootDescriptorTable(parameter, GPU handle): the table's
-// address in the title's descriptor memory is kept for the draw.
-void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+// The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).
+x2w_startup::ViewTable resolve_title_table(const Pass& pass, u64 gpu_handle)
 {
-    if (parameter >= 16) return;
-    auto& pass = pass_of(self);
     x2w_startup::ViewTable table;
     AcquireSRWLockShared(&note_lock);
     for (const HeapInfo& heap : heap_infos()) {
@@ -2371,7 +2437,38 @@ void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
         if (table.address) break;
     }
     ReleaseSRWLockShared(&note_lock);
-    pass.view_tables[parameter] = table;
+    return table;
+}
+
+// List slot 36 (desktop 32 + 4), SetGraphicsRootDescriptorTable(parameter, GPU handle): the table's
+// address in the title's descriptor memory is kept for the draw.
+void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+{
+    if (parameter >= 16) return;
+    auto& pass = pass_of(self);
+    pass.view_tables[parameter] = resolve_title_table(pass, gpu_handle);
+}
+// List slot 35 (desktop 31 + 4), SetComputeRootDescriptorTable(parameter, GPU handle). Recorded only for a later
+// Dispatch; slot 33 keeps the desktop compute root bind.
+void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+{
+    static LONG dropped;
+    if (!self->own().list_open) return;
+    auto& pass = pass_of(self);
+    if (!pass.compute_tables.set_table(parameter, resolve_title_table(pass, gpu_handle)) && first_calls(dropped, 4))
+        log("x2w-render compute descriptor table dropped: parameter %u (%u parameters are kept)", parameter,
+            x2w_startup::ComputeTables::max_parameters);
+}
+// Keeps the words of a root constants call; a call outside the 16 x 8 words kept is logged and cut or dropped.
+static void store_root_constants(x2w_root_constants::Store& store, const char* kind, UINT parameter, UINT count,
+                                 const std::uint32_t* data, UINT offset)
+{
+    if (!count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
+    const auto result = store.set(parameter, count, data, offset);
+    static LONG refused;
+    if (result != x2w_root_constants::Result::stored && first_calls(refused, 4))
+        log("x2w-render %s root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)", kind,
+            result == x2w_root_constants::Result::dropped ? "dropped" : "truncated", parameter, offset, count);
 }
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
@@ -2387,6 +2484,16 @@ void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, co
         (*pass.root)[parameter].type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
         count <= 8 - offset && offset + count <= (*pass.root)[parameter].constants_count)
         pass.constant_words_bound[parameter] |= static_cast<unsigned char>(((1u << count) - 1) << offset);
+}
+// List slot 37 (desktop 33 + 4), SetComputeRoot32BitConstant(parameter, value, offset).
+void __stdcall list_compute_constant(Wrapper* self, UINT parameter, UINT value, UINT offset)
+{
+    store_root_constants(pass_of(self).compute_constants, "compute", parameter, 1, &value, offset);
+}
+// List slot 39 (desktop 35 + 4), SetComputeRoot32BitConstants(parameter, count, data, offset).
+void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
+{
+    store_root_constants(pass_of(self).compute_constants, "compute", parameter, count, data, offset);
 }
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)

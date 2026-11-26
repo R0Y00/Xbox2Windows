@@ -13,9 +13,12 @@ per distinct root, so each key matches what the runtime would compute for that c
 Translate the result with gfx2hlsl.py --pending <shader cache>.
 """
 import argparse
+from collections.abc import Sequence
 import glob
 import mmap
 import os
+from pathlib import Path
+import struct
 import sys
 import zlib
 
@@ -108,10 +111,21 @@ def chunks(view, counts):
         at += 64
 
 
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
 def streams(archive, counts):
     """Yield (archive offset, inflated bytes); a zlib stream that starts on the 64-byte boundary right
     after the previous one continues it, so a program split between the two is carved whole."""
-    with open(archive, 'rb') as file:
+    path = Path(archive)
+    if path.is_dir():
+        raise ValueError(f"Archive path is a directory: {archive}")
+    if not path.is_file():
+        raise ValueError(f"Missing archive file: {archive}")
+    with open(path, 'rb') as file:
         if os.fstat(file.fileno()).st_size == 0:
             return
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as view:
@@ -133,9 +147,14 @@ def read_roots(paths):
     roots = []
     for path in paths:
         if not os.path.exists(path):
-            sys.exit('root signature path not found: %s' % path)
-        files = sorted(glob.glob(os.path.join(path, 'req_*.root'))) if os.path.isdir(path) else [path]
+            raise ValueError('root signature path not found: %s' % path)
+        if os.path.isdir(path):
+            files = sorted(glob.glob(os.path.join(glob.escape(os.fspath(path)), 'req_*.root')))
+        else:
+            files = [path]
         for name in files:
+            if os.path.isdir(name):
+                raise ValueError('root signature path is a directory: %s' % name)
             with open(name, 'rb') as file:
                 blob = file.read()
             if blob and blob not in roots:
@@ -163,46 +182,63 @@ def write_request(cache, key, a, b, root):
     return 'written'
 
 
-def main():
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('archive')
     parser.add_argument('cache')
     parser.add_argument('--roots', nargs='+', help='req_*.root files or directories (default: the cache)')
-    args = parser.parse_args()
-    roots = read_roots(args.roots or [args.cache])
-    if not roots:
-        sys.exit('no root signature found: run the title once with a shader cache, or pass --roots')
-    os.makedirs(args.cache, exist_ok=True)
+    args = parser.parse_args(argv)
     # streams counts joined runs of consecutive zlib streams
     counts = dict(streams=0, oversized=0, programs=0, incomplete=0, ps=0, vs=0, other=0, undecodable=0,
                   pairs=0, written=0, existing=0, failed=0)
-    for _, data in streams(args.archive, counts):
-        counts['streams'] += 1
-        previous = None  # (stage, offset, program) of the program carved just before
-        for at, program in carve(data):
-            counts['programs'] += 1
-            if not complete(program):
-                counts['incomplete'] += 1
-                previous = None
-                continue
-            stage = stage_of(program)
-            counts[stage] += 1
-            # directly following: the vertex program starts on the 256-byte step after the pixel program
-            if stage == 'vs' and previous and previous[0] == 'ps' and at == next_step(previous[1], previous[2]):
-                counts['pairs'] += 1
-                for root in roots:
-                    # The runtime hashes its first recorded blob (the pixel program here) first.
-                    # pipeline_key names its parameters vs_code, ps_code; only the order matters.
-                    key = gfx2hlsl.pipeline_key(previous[2], program, root)
-                    counts[write_request(args.cache, key, previous[2], program, root)] += 1
-            previous = (stage, at, program)
+    try:
+        archive = Path(args.archive)
+        cache = Path(args.cache)
+        if archive.is_dir():
+            raise ValueError(f'Archive path is a directory: {args.archive}')
+        if not archive.is_file():
+            raise ValueError(f'Archive path is not a regular file: {args.archive}')
+        if _same_path(cache, archive):
+            raise ValueError(f'Cache directory collides with archive: {args.cache}')
+        for root_path in args.roots or ():
+            if _same_path(cache, Path(root_path)):
+                raise ValueError(f'Cache directory collides with --roots path: {args.cache}')
+        if cache.exists() and not cache.is_dir():
+            raise ValueError(f'Cache path is not a directory: {args.cache}')
+        roots = read_roots(args.roots or [args.cache])
+        if not roots:
+            raise ValueError('no root signature found: run the title once with a shader cache, or pass --roots')
+        os.makedirs(args.cache, exist_ok=True)
+        for _, data in streams(args.archive, counts):
+            counts['streams'] += 1
+            previous = None  # (stage, offset, program) of the program carved just before
+            for at, program in carve(data):
+                counts['programs'] += 1
+                if not complete(program):
+                    counts['incomplete'] += 1
+                    previous = None
+                    continue
+                stage = stage_of(program)
+                counts[stage] += 1
+                # directly following: the vertex program starts on the 256-byte step after the pixel program
+                if stage == 'vs' and previous and previous[0] == 'ps' and at == next_step(previous[1], previous[2]):
+                    counts['pairs'] += 1
+                    for root in roots:
+                        # The runtime hashes its first recorded blob (the pixel program here) first.
+                        # pipeline_key names its parameters vs_code, ps_code; only the order matters.
+                        key = gfx2hlsl.pipeline_key(previous[2], program, root)
+                        counts[write_request(args.cache, key, previous[2], program, root)] += 1
+                previous = (stage, at, program)
+    except (OSError, ValueError, struct.error, zlib.error) as error:
+        parser.exit(1, f'{error}\n')
     counts['roots'] = len(roots)
     print(' '.join('%s=%d' % item for item in counts.items()))
     if counts['failed']:
-        sys.exit('%d request(s) could not be written' % counts['failed'])
+        parser.exit(1, '%d request(s) could not be written\n' % counts['failed'])
     if not counts['pairs']:
-        sys.exit('no program pair found in %s' % args.archive)
+        parser.exit(1, 'no program pair found in %s\n' % args.archive)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
