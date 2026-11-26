@@ -15777,6 +15777,8 @@ guarded block and take the latch until the counter reaches 4. The translator rep
 Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
 `binary llvm-mc-15` to reassemble the fixture.
 
+`subset_after` tracks pre-branch mask-subset facts (`sM <= EXEC`) across instructions and joins into `Stage.execz_refusals`, so saving `s22 <= EXEC` (or `s_mov_b32 exec_lo, s22` before `s_cbranch_execz`) proves `s_mov_b32 exec_lo, s22` inside the skipped block (#2645 T1). On the no-exit variant (`O-loop-subset`) DXC `cs_6_0` produces `[9, 1, 2, 9, 9, 9, 9, 9]` while `LOOP_BREAK_WORDS` still refuses `+0x30` with `loop exit crosses a backward s_cbranch_scc0`, and pre-branch narrowing (`s_and_saveexec_b32`, `v_cmpx_gt_u32`), mask overwrites, and unproven joins remain refused as `exec write`.
+
 ### Startup compute formatted buffer reads
 
 The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using

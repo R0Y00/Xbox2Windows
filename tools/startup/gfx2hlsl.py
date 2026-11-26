@@ -763,6 +763,41 @@ def clear_after(name, asm, may, clear):
     return out | {(word, h) for word, held in writes for h in held}
 
 
+EXEC_SUBSET = frozenset({('exec', 0), ('exec_hi', 1)})
+
+
+def subset_after(name, asm, may, clear):
+    """Forward step before an s_cbranch_execz: scalar words known to have bit 0 wherever current EXEC has bit 0.
+
+    When EXEC is unchanged, bitwise mask instructions propagate those subset facts via clear_after and non-mask
+    writes drop them. When EXEC is written, facts on the written wave half are dropped unless a move assigns EXEC
+    from a scalar mask word (so that word equals the new EXEC) or an OR widens EXEC with an existing bitmask.
+    Indirect scalar writes (s_movrel*) drop all non-EXEC facts."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base.startswith('s_movrel'):
+        return EXEC_SUBSET
+    if not (may & EXEC_KEYS):
+        return frozenset(clear_after(name, asm, may, clear)) | EXEC_SUBSET
+    kept = ({0} if 'exec' not in may else set()) | ({1} if 'exec_hi' not in may else set())
+    shape = clear_shape(name, asm)
+    if shape and shape != 'cmpx':
+        op, saving, count, words = shape
+        if op == 'or' and (saving == '_saveexec' or any(
+                all(src[p] == ('exec', 'exec_hi')[p] for p in range(count)) for src in words[1:])):
+            return frozenset(clear_after(name, asm, may, clear)) | EXEC_SUBSET
+        out = {fact for fact in clear if fact[1] in kept and fact[0] not in may - EXEC_KEYS}
+        if op == 'mov' and saving is None:
+            dest, src = words
+            for p, dw in enumerate(dest):
+                if dw in EXEC_KEYS:
+                    h = 0 if dw == 'exec' else 1
+                    sw = src[p]
+                    if re.fullmatch(r's\d+|vcc(_hi)?', sw):
+                        out.add((sw, h))
+            return frozenset(out) | EXEC_SUBSET
+    return frozenset(fact for fact in clear if fact[1] in kept and fact[0] not in may - EXEC_KEYS) | EXEC_SUBSET
+
+
 def mask_lanes(name, asm):
     """(operation, destination words, source word lists) of a bitwise scalar mask instruction, or None. Word p of
     every operand holds the same lanes: wave half p of a 64-bit form."""
@@ -2917,6 +2952,18 @@ class Stage:
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+        pre_sub = [EXEC_SUBSET] + [None] * (len(self.ins) - 1)
+        changed = bool(self.ins)
+        while changed:
+            changed = False
+            for i in range(len(self.ins)):
+                if pre_sub[i] is None:
+                    continue
+                after = subset_after(*self.ins[i][2:], effects[i][2], pre_sub[i])
+                for s in succ[i]:
+                    if pre_sub[s] is None or not pre_sub[s] <= after:
+                        pre_sub[s] = after if pre_sub[s] is None else (pre_sub[s] & after)
+                        changed = True
         refused, into = {}, {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
@@ -2929,7 +2976,7 @@ class Stage:
                 continue
             live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
             # Facts before each instruction the wave can reach from the branch: the largest sets every path keeps.
-            entry = frozenset({('exec', 0), ('exec_hi', 1)})
+            entry = pre_sub[b] or EXEC_SUBSET
             before = {b + 1: entry} if b + 1 < t else {}
             entered = any(index.get(target) in range(b + 1, t) for k, target in jumps if not b < k < t)
             changed = not entered
@@ -2937,7 +2984,7 @@ class Stage:
                 changed = False
                 for i in range(b + 1, t):
                     if i in before:
-                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | entry
+                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | EXEC_SUBSET
                         for s in succ[i]:
                             if b < s < t and before.get(s, after) & after != before.get(s):
                                 before[s], changed = before.get(s, after) & after, True
@@ -2975,7 +3022,7 @@ class Stage:
                             and target in index and index[target] <= b for latch, target in jumps):
                         reason = 'loop exit crosses a backward s_cbranch_scc0'
                 elif may & EXEC_KEYS and (entered or i in before and
-                                          not entry <= clear_after(inner, inner_asm, may, before[i])):
+                                          not EXEC_SUBSET <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
