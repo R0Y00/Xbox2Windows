@@ -5573,6 +5573,88 @@ because their per-lane regions can overlap. The fixtures compare every UAV
 word and detect a wrong qword offset, a missing data word, or reversed dual
 read offsets at word 0.
 
+### Group-shared LDS on gfx1013
+
+`--cpu gfx1013 --lds-bytes N` declares a group LDS allocation of N bytes (a multiple of 4, at most the
+32 KiB D3D12 groupshared limit) and lowers LDS as `groupshared uint lds[N / 4]`, shared by every thread of
+the group ([#1541](https://github.com/R0Y00/Xbox2Windows/issues/1541)). gfx1013 has no private LDS
+profile, so the allocation alone selects this mode; without it, DS instructions and `s_barrier` are
+refused as before. `v_lshlrev_b32 vD, k, vL` on a local-ID VGPR gives an address word
+`local << k`, and the existing integer ALU subset combines address words. Each DS instruction reads its
+byte address from a VGPR, adds the instruction offset (`offset0`/`offset1` in elements of the access
+size, times 64 for the `st64` forms), and accesses word `(address >> 2) + i`. The accepted forms are:
+
+- `ds_write_b32`, `ds_read_b32`, `ds_write_b64`, `ds_read_b64`, `ds_write_b128` and `ds_read_b128`;
+- `ds_write2_b32`, `ds_read2_b32`, `ds_write2st64_b32`, `ds_read2st64_b32`, `ds_write2_b64`,
+  `ds_read2_b64`, `ds_write2st64_b64` and `ds_read2st64_b64`, with two different offsets;
+- the non-returning `ds_add_u32`, `ds_sub_u32`, `ds_and_b32`, `ds_or_b32`, `ds_xor_b32`, `ds_min_u32` and
+  `ds_max_u32`, as HLSL `Interlocked*` operations (`ds_sub_u32` adds the negated value);
+- `s_barrier`.
+
+The profile is one guest wave per group. A group of at most 32 threads is one wave at either guest wave
+width and needs no statement. A group of 33 to 64 threads needs `--wave-size 64`, the caller's statement that
+the program runs as wave64; that statement is accepted only with a shared LDS allocation. Larger groups, and
+groups of more than 32 threads under `--wave-size 32`, are several guest waves and are refused.
+
+Within that one wave, DS instructions take effect in program order: every DS instruction is followed by
+`GroupMemoryBarrierWithGroupSync()`, so a read sees the writes of every earlier instruction from all lanes
+and a later write cannot overtake an earlier read. The HLSL barrier waits for the whole group, which on the
+desktop may run as several host waves; with one guest wave this reproduces the guest order. With several
+guest waves the per-instruction barriers would also order DS operations between waves before `s_barrier`,
+which the guest program does not guarantee, so that case is left until it has its own native comparison.
+`s_barrier` becomes the same barrier and adds one only where no DS barrier precedes it. Barriers need
+uniform control flow, so a DS instruction or `s_barrier` after a lane guard is refused.
+
+The caller guarantees the LDS input contract, which is not checked:
+- every access is in bounds and aligned: b32 accesses to 4 bytes, wider ones to their size;
+- every word that a read or an atomic touches was written earlier in the group;
+- no two lanes of one non-atomic write store to the same word.
+
+Outside the contract, each access is still guarded by `index < N / 4`: a word past the allocation reads as
+zero and is not written, and the low two address bits are dropped. That rule keeps an access from reaching
+other words; it is not compared with hardware. Not lowered yet: the returning (`_rtn`) forms, whose results depend on the
+order of lanes that update one word; `ds_write_b96`/`ds_read_b96`; byte, short and d16 accesses; signed
+min/max; float atomics; and `ds_permute`/`ds_bpermute` and the other lane-routing forms on gfx1013.
+
+`compute_store_aot_lds_shared` runs eight 64-thread wave64 programs with a 1024-byte allocation on one and
+two groups (one group for the four-word programs), and compares every UAV word with a CPU reference. Each lane
+writes its own words, and after a barrier reads another lane's:
+- the next lane's word and the mirrored lane's word (`63 - l`);
+- pairs 64 words apart through `write2`/`read2` and `st64`;
+- a qword and qword pairs, written with `ds_write2_b64` and read with `ds_read2st64_b64`, and the other way
+  round;
+- a 16-byte record of the next lane.
+
+A counter program sets seven words, has every lane add, subtract, AND, OR, XOR, take the minimum and take
+the maximum of its index or a mixed word, and reads them back. With two groups, each group's sums cover
+only its own threads, which shows that each group has its own LDS. Three mutations of the programs must
+mismatch at the first word they change:
+- the next-but-one lane, at word 0;
+- an `st64` read spelled as a plain `read2`, at word 1;
+- `ds_min_u32` in place of `ds_max_u32`, at word 11.
+
+The translation controls check the barrier count, the `Interlocked*` methods, the allocation guard on every
+access and the rejections listed above. The one-wave controls accept a 32-thread group without a statement
+and refuse 64 threads without one, 64 threads and a 32 x 2 group under wave32, 128 threads under wave64, and
+the wave64 statement without a shared allocation or on gfx1030. Every program is also assembled and disassembled with LLVM 15 for gfx1013, and the CLI must emit the
+same HLSL.
+
+Measured on `b96960b` with this change, Windows 10 build 19045:
+
+| Adapter | Result | Debug layer |
+|---|---|---|
+| WARP 1.0.22 (the app-local `d3d10warp.dll`) | passed | enabled |
+| NVIDIA GeForce RTX 3080, driver 32.0.15.9174 | passed | enabled |
+
+The mutations mismatched at their expected words on both adapters. Of the gfx1013 forms in
+`tools/form_coverage.py`, the test adds only `s_barrier`, because the gfx1030 private-LDS fixtures already
+record the DS mnemonics.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_shared_(warp|hardware)$' -V
+```
+
 An optional `--constant-descriptor BYTE_OFFSET` binds a second table entry to
 b0. It must be distinct from the 16-byte u0 descriptor. The translator accepts
 aligned immediate `s_buffer_load_dword`, `s_buffer_load_dwordx2`, and
@@ -6572,6 +6654,18 @@ The fixture in `tests/compute_alu_med3_check.py` keeps the guarded read and stor
 
 The translator rejects `clamp`, `op_sel`, neg and abs on a source, which LLVM does not accept for these opcodes. It also rejects the 16-bit and binary32 medians, a register range, an unknown, pending or descriptor SGPR, an unknown VGPR and a literal wider than 32 bits, each with `Unsupported compute instruction`. A destination past `v255` gets `Unverified ALU operand`. A result used as a store address or as a guard operand is rejected, and so is a chain of medians whose expression exceeds the limit. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_med3_(warp|hardware)$' -V`. Without Windows, `tests/compute_alu_med3_check.py controls` runs the exact-text and rejection checks.
 
+#### VOP1 bit reverse and signed leading-bit count
+
+Two VOP1 forms lower on one known word, with the same sources, data-only results and 1024-character limit as the forms above:
+
+| Instruction | Result |
+|---|---|
+| `v_bfrev_b32_e32 vD, a` | `reversebits(a)`: bit i of the result is bit 31 - i of `a` |
+| `v_ffbh_i32_e32 vD, a` | the position of the first bit that differs from the sign bit, counting from the MSB with the sign bit as position 0; 0xffffffff for 0 and 0xffffffff |
+
+`v_ffbh_i32` follows the RDNA 2 ISA definition (`D = -1; for i in 1..31, the first i with S0[31 - i] != S0[31]`), so 1 and 0xfffffffe give 31, and 0x40000000 and 0x80000000 give 1. It lowers as `v_ffbh_u32` of `m = a ^ (a >> 31)`, with an arithmetic shift, spelled `firstbitlow(reversebits(m))`. That is `31 - firstbithigh(m)` and reads 0xffffffff for `m = 0`, and it names `a` only twice. The `_e64`, SDWA and DPP forms, source and output modifiers, register ranges, `v_ffbh_u32`, `v_ffbl_b32` and the scalar `s_brev_b32` and `s_flbit_i32` stop the lowering with `Unsupported compute instruction`. An unknown, pending or descriptor source fails with `Unverified ALU operand`.
+
+The fixture is the read-compute-write kernel above with a 16-byte element per lane. For the source word `w`, it stores `bfrev(w)`, `ffbh_i32(w << (w & 31))`, `ffbh_i32(ashr(bfrev(w), (w >> 5) & 31))` and `((bfrev(gid) ^ ffbh_i32(cap)) + ffbh_i32(-1)) ^ bfrev(0x12345678)`, with `cap = params[0].y = 0xfffffffe`. Over the 70 active lanes, the scanned words have both signs, include 0 and 0xffffffff, and give every result from 1 to 30 except 14 and 16. The cap gives 31. The expected words come from Python bit loops written from the ISA text, not from the lowering. The WARP readback compares all 320 words for no active lane, a split wave and three groups with 70 active lanes. On the last dispatch, each of these must fail at the first word where it differs: a reference with one word off, lane 70 also writing, `ffbh_u32` for `ffbh_i32`, a count that leaves out the sign bit, an LSB-first index, 32 for 0 and -1, and `bfrev` as a copy. So must recompiled HLSL with `bfrev` as a copy or a complement, and `ffbh_i32` as `ffbh_u32`, with a logical sign fold, as an LSB-first index, as 32 for 0 and -1, or as the count minus one. Run `python -B tests/compute_alu_vop1_check.py controls` for the translator checks only, or `ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_vop1_(warp|hardware)$' -V`.
 #### Signed 24-bit multiply-add
 
 `v_mad_i32_i24 vD, a, b, c` (VOP3 opcode 0x142) is the signed counterpart of `v_mad_u32_u24`: each multiplicand is the signed integer in bits [23:0] of its word, and `c` is a whole word, so the result is `sext24(a) * sext24(b) + c`, modulo 2^32. It takes the same sources as `v_mad_u32_u24`. The lowering sign-extends with `asuint(asint(x << 8u) >> 8u)` and multiplies and adds as `uint`, which gives the same low 32 bits as the signed product. `clamp`, the text forms `-v` and `|v|` (LLVM rejects them for this opcode), a source that is not a known word, a byte offset (which stays a row pitch only for `v_mad_u32_u24`) and a destination past v255 each stop the lowering. `v_mul_i32_i24` and `v_mad_i64_i32` are still outside the subset.
@@ -14885,6 +14979,10 @@ with normalized clamp addressing, bilinear XY, point mip filtering, and
 zero minimum LOD and bias. Implicit, explicit-LOD, comparison, offset,
 and non-2D forms remain outside this slice.
 
+Plain `image_gather4` reports `requires the guest implicit mip level`.
+Translating it through the fixed-mip path could read a different level
+because Direct3D gather uses the first visible mip of the bound view.
+
 The sampler's Z address mode (`CLAMP_Z`, SQ_IMG_SAMP_WORD0 bits 8:6) is not
 checked: a 2D view has no third coordinate, and the Direct3D 11.3
 functional spec (22.4.2, gather4) says only the sampler's addressing modes
@@ -16568,7 +16666,7 @@ The checks are `tests/startup_gfx2hlsl_handler_arity_check.py`, `…_image_arity
 `…_operand_count_check.py` and `…_scalar_arity_check.py`. They run on Linux and Windows without D3D12 or game
 data, because a refusal is observable at the `Stage` entry point.
 
-## Startup translator: v_sad_u8, v_sad_u16 and v_sad_u32
+## Startup translator: v_sad_u8, v_sad_hi_u8, v_msad_u8, v_sad_u16 and v_sad_u32
 
 [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) now lowers the gfx1013 VOP3A unsigned sum-of-absolute-differences instructions `v_sad_u8` (`0x15a`), `v_sad_u16` (`0x15c`) and `v_sad_u32` (`0x15d`) in `VEC_U` to three on-demand preamble helpers emitted in `Pipeline.common()` only when referenced by a stage (`sad_u8`, `sad_u16`, `sad_u32`):
 
@@ -16577,10 +16675,13 @@ data, because a refusal is observable at the `Stage` entry point.
 - `sad_u32(uint a, uint b, uint c)` computes `(a > b ? a - b : b - a) + c` using unsigned comparison rather than signed `int` subtraction.
 - Output modifiers (`clamp`, `omod`), `op_sel`, the per-source `abs` bits (VOP3A `w0[10:8]`) and `neg` bits (`w1[31:29]`), and wrong operand counts remain refused: `check_encoding` refuses the `abs`/`neg` bits in the raw word so `neg` on an inline integer cannot print as `-N` and be read as a negative constant, and `Stage.u` refuses the printed `|vN|` and `-vN` forms, the modifier tokens and a wrong operand count.
 
+`v_sad_hi_u8` (`0x15b`, 347) and `v_msad_u8` (`0x171`, 369) reuse that four-lane sum through a shared on-demand helper `sad4_u8(uint a, uint b, bool masked)`, emitted only when one of them is referenced: `v_msad_u8` leaves out each byte lane whose `src1` byte is zero (`sad4_u8(a, b, true) + c`), while `v_sad_hi_u8` keeps every lane and shifts the sum before adding `src2` (`(sad4_u8(a, b, false) << 16u) + c`), both modulo 2^32. Those are the formulas of the `tools/pixel_aot.py` table, so the two translators agree, and the existing `sad_u8`, `sad_u16` and `sad_u32` helpers and their emitted text are unchanged. [`tests/startup_gfx2hlsl_sad_hi_msad_check.py`](../tests/startup_gfx2hlsl_sad_hi_msad_check.py) decodes synthetic gfx1013 VOP3A bytes via `G.decode()` only (no game data), checks that each form emits `sad4_u8` plus only its own wrapper and that the unchanged `v_sad_u8` output does not pull in `sad4_u8`, evaluates the emitted HLSL against the AOT formulas over 864 edge/grid triples per form plus pinned normal, zero-`src1`-byte and 2^32-carry rows, and checks the modifier/arity/encoding and unlowered refusals. The semantics are pinned to the AOT reference, not measured on a console: the only hardware draws of these two forms are those of `tests/pixel_aot_check.py`, and what `v_sad_hi_u8` leaves in the high half on Scarlett is not measured here.
+
 [`tests/startup_gfx2hlsl_sad_check.py`](../tests/startup_gfx2hlsl_sad_check.py) decodes synthetic gfx1013 VOP3A bytes via `G.decode()` only (no game data), verifies on-demand helper emission across `Pipeline` and `ComputePipeline`, evaluates the emitted HLSL across 600 edge/grid triples for `v_sad_u8`, 600 for `v_sad_u16` and 605 for `v_sad_u32` (covering `0xffffffff`, `0x80000000`, `0x7fffffff`, byte/halfword boundary carries and `S2` wraparound), checks all modifier/arity/unlowered refusals, and runs mutated-HLSL negative controls (dropped high byte, dropped high halfword, signed `int` subtraction). The encoding guard is pinned per source slot: one row each for `abs` on sources 0, 1 and 2, one for `neg` on each of them, and the same six again with the modifier on an inline `1` (36 rows), and each row reads the refusal back from `G.decode()`'s refusals list and asserts the exact `v_sad_* with neg/abs` reason. That matters because a narrowed mask still ends up refused, just later and by a different guard: with `w0 & 0x700` narrowed to `w0 & 0x100` the `abs` word decodes to `|v1|` and `Stage.u` refuses it, so the pipeline-level control alone passes; the reason check fails, as does the `w1 & 0xe0000000` → `w1 & 0x20000000` narrowing (which silently accepts `neg` on an inline `1` as `-1`). In `draw` mode on Microsoft WARP (`10.0.26100.9818`, DXC `ps_6_0` and FXC `10.0.26100` `ps_5_1`), all 18 good draws (9 per compiler) matched the Python reference and all 6 mutated draws (3 per compiler) produced the exact mutated readback words; the same 18 good and 6 mutated draws also pass on the NVIDIA GeForce GTX 1660 SUPER (driver 32.0.16.1074, Windows build 26200), where the debug layer is not installed and so the `_debug1` variants skip with exit 77.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sad_(controls|warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sad_hi_msad_controls$' -V
 ## Startup translator: signed 4-bit offset conversion (`v_cvt_off_f32_i4`)
 
 `tools/startup/gfx2hlsl.py` lowers `v_cvt_off_f32_i4` in VOP1 `_e32` (`0x0e`) and VOP3A `_e64` (`0x18e`) via
