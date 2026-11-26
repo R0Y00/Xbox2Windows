@@ -2795,7 +2795,8 @@ class Stage:
         bit of every lane the model skips as the wave has it (see execz_refusals), and after the join it is only read per
         lane. A lane the model skips has its exec bit clear for the whole block (the exec proof), and the wave runs the block
         iff some lane is active, so the model is exact iff the block never changes that lane's bit of M. Every write of M
-        in the block is one of (mask_write_class), a 32-bit M written alone:
+        in the block is one of (mask_write_class), a 32-bit M written alone. Every mask it uses must hold lane bits
+        (lane_bit_keys, or a block temp): the model keeps a lane's bit at bit 0 where the wave has it at bit `lane`:
           'keep'  s_andn2 M, M, exec_lo; s_or M, M, T with T written in the block by s_and with exec_lo or a v_cmp
                   (bit 0 for a lane whose exec bit is clear): the lane's bit is unchanged, whatever M held before.
           'zero'  s_mov M, exec_lo; s_and M, X, exec_lo; a v_cmp into M (VOPC writes 0 for an inactive lane): bit 0,
@@ -2806,6 +2807,7 @@ class Stage:
         write overwrites it, since a 'keep' write would carry its bits for a skipped lane. The caller has checked that the block is straight-line."""
         name = 'vcc_lo' if key == 'vcc' else key
         classes, temps, stale = set(), set(), False
+        enc = self.lane_bit_keys(b, effects, targets, index)
         for i in range(b + 1, t):
             wrote = effects[i][2]
             _, ops, _ = parse(self.ins[i][3])
@@ -2813,19 +2815,25 @@ class Stage:
             if key in wrote:
                 if not ops or ops[0] != name:
                     return False
-                kind = self.mask_write_class(base, ops, name, temps)
+                kind = self.mask_write_class(base, ops, name, temps, enc)
                 if kind is None:
                     stale = True   # data in M (an s_movk used as an offset): only a later full overwrite makes it exact
                 else:
                     classes.add(kind)
                     stale = stale and kind == 'keep'
             for w in wrote - {key} - EXEC_KEYS:
-                if self.exec_masked_def(base, ops, w):
+                # T must also hold lane bits: an s_and of exec with a lane mask (not with a group id or other data)
+                lane_src = base != 's_and_b32' or any(
+                    ('vcc' if x == 'vcc_lo' else x) in temps | enc for x in ops[1:] if x != 'exec_lo')
+                if self.exec_masked_def(base, ops, w) and lane_src:
                     temps.add(w)
                 else:
                     temps.discard(w)
+                enc.discard(w)
         if stale or ('zero' in classes and 'ones' in classes):
             return False
+        if 'keep' in classes and key not in self.lane_bit_keys(b, effects, targets, index):
+            return False   # M's bits before the block must already be lane bits (bit 0 = this lane), not data
         need = {'zero': '0', 'ones': '-1'}.get(next(iter(classes & {'zero', 'ones'}), None))
         if need is not None:
             # The setting: the last instruction before the branch that may write M.
@@ -2851,6 +2859,25 @@ class Stage:
                 todo.extend(succ[i])
         return True
 
+    def lane_bit_keys(self, b, effects, targets, index):
+        """Keys ('vcc' or 'sN') whose value at the s_cbranch_execz at b holds the lane's own bit as bit 0, the encoding the
+        one-lane model gives a lane mask: the last write before b is a v_cmp, an s_and with exec_lo, a copy of exec_lo, or
+        0 / -1 (every bit alike), with no branch or branch target between it and b. A value from anywhere else (a group id,
+        an offset, `s_mov_b32 M, 16`) has the wave's lane bit at bit `lane`, which the model reads from bit 0."""
+        found, seen = set(), set()
+        for k in range(b - 1, -1, -1):
+            if self.ins[k][2].startswith(('s_cbranch', 's_branch', 's_setpc')) or any(index.get(x) == k + 1 for x in targets):
+                break
+            _, ops, _ = parse(self.ins[k][3])
+            base = re.sub(r'_e(32|64)$', '', self.ins[k][2])
+            for w in effects[k][2] - EXEC_KEYS - seen:
+                seen.add(w)
+                name = 'vcc_lo' if w == 'vcc' else w
+                if self.exec_masked_def(base, ops, w) or (base in ('s_mov_b32', 's_movk_i32') and ops == [name, 'exec_lo']) or \
+                        (base in ('s_mov_b32', 's_movk_i32') and len(ops) == 2 and ops[0] == name and ops[1] in ('0', '-1')):
+                    found.add(w)
+        return found
+
     @staticmethod
     def exec_masked_def(base, ops, key):
         """True when this instruction writes `key` ('sN' or 'vcc') with a value whose bit is 0 for a lane whose exec bit is
@@ -2863,16 +2890,17 @@ class Stage:
         return base.startswith('v_cmp') and not base.startswith('v_cmpx')
 
     @staticmethod
-    def mask_write_class(base, ops, name, temps):
+    def mask_write_class(base, ops, name, temps, enc=frozenset()):
         """'keep', 'zero' or 'ones' for a write of mask `name` inside an execz block (see phi_mask_ok), else None."""
         key = 'vcc' if name == 'vcc_lo' else name
         if base == 's_mov_b32' and ops[1:] == ['exec_lo']:
             return 'zero'
+        lane = lambda x: ('vcc' if x == 'vcc_lo' else x) in temps | enc   # a lane mask: bit 0 is this lane's bit
         if base == 's_and_b32' and len(ops) == 3 and 'exec_lo' in ops[1:]:
             return 'zero'
         if base.startswith('v_cmp') and not base.startswith('v_cmpx'):
             return 'zero'
-        if base == 's_orn2_b32' and len(ops) == 3 and ops[2] == 'exec_lo':
+        if base == 's_orn2_b32' and len(ops) == 3 and ops[2] == 'exec_lo' and lane(ops[1]):
             return 'ones'
         if base == 's_andn2_b32' and ops == [name, name, 'exec_lo']:
             return 'keep'

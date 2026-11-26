@@ -15359,13 +15359,24 @@ be the lane select of `v_cndmask`, the carry-in of `v_addc`, `v_subb`, `v_add_co
 `s_and_saveexec_b32` / `s_and_b32` with exec. `s_cbranch_vccz`, `s_cbranch_vccnz`, `s_cmp`, a copy of M and M
 as a data operand see the other lanes' bits, which the one-lane model does not have, and keep the refusal.
 
+The same lane mask is accepted with three more block writes, each exact only under a condition. All of them need
+every mask the write uses to hold lane bits (bit 0 is the lane's own bit: a `v_cmp`, an `s_and` with exec, a copy
+of exec, or 0 / -1), not data such as a group id or `s_mov_b32 M, 16`, whose lane bit sits at bit `lane` in the wave:
+- preserving: `s_andn2_b32 M, M, exec_lo` and `s_or_b32 M, M, T`, with T written in the block by a `v_cmp` or an
+  `s_and` of exec and a lane mask. A skipped lane keeps its bit, so M needs no zeroing, but M's last write before the
+  branch must itself hold lane bits (no branch or branch target after it);
+- compare: a `v_cmp` (not `v_cmpx`) into M, only when `s_mov_b32 M, 0` is the last write before the branch;
+- all ones: `s_orn2_b32 M, X, exec_lo`, X a lane mask, only when `s_mov_b32 M, -1` is the last write before the branch.
+Zeroing and all-ones writes do not mix, and any other write of M that no later zeroing or all-ones write overwrites
+keeps the refusal.
+
 The block is still refused in these cases:
 - a definition that is live at the join, unless the absorbed-read or narrowed-mask rule proves every read of it
   or it is the lane mask above; a lane mask with a failed condition stays refused (zeroing with a value other
   than 0 or missing, a branch or a branch target between the zeroing and the branch, a write of M that is not
-  from exec, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
+  one of the forms above, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
 - any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
-  some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
+  some of the paths, written by a form the pass does not follow (`s_orn2` outside the lane mask above, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
   the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven
   calculated `s_setpc_b64` jump counts), or restored from a copy of the other exec half;
 - an effect outside scalar registers, such as a scalar store or atomic, a barrier, `s_endpgm` or `v_writelane`;

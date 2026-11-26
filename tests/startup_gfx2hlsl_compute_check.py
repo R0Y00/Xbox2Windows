@@ -1718,26 +1718,36 @@ def check_controls():
                    's_or_b32 s20, s20, s22': '14161488', 's_or_b32 vcc_lo, vcc_lo, s22': '6a166a88',
                    's_or_b32 s20, s20, s7': '14071488', 's_andn2_b32 s20, s7, exec_lo': '077e148a',
                    's_orn2_b32 s20, s7, exec_lo': '077e148b', 'v_cmp_gt_u32 vcc_lo, 3, v0': '8300887d'})
-    blend = ['s_andn2_b32 s20, s20, exec_lo', 's_and_b32 s22, s7, exec_lo', 's_or_b32 s20, s20, s22']
-    for write, read in ((blend, cnd_s), (blend[:1], cnd_s),
-                        (['s_andn2_b32 vcc_lo, vcc_lo, exec_lo', 's_and_b32 s22, s7, exec_lo',
-                          's_or_b32 vcc_lo, vcc_lo, s22'], cnd_vcc)):
-        phi_text(phi([], write, read))
+    # T and M hold lane bits (bit 0 = the lane's bit, the model's encoding): T from a compare, M zeroed before the branch.
+    # Group-id data (s7) as T, or `s_mov_b32 M, 16` as M, has the wave's lane bit at bit `lane` and is refused.
+    cmp_t = ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_and_b32 s22, vcc_lo, exec_lo']
+    SPLICE.update({'s_and_b32 s22, vcc_lo, exec_lo': '6a7e1687', 's_mov_b32 s20, 16': '9003 94be'.replace(' ', ''),
+                   's_orn2_b32 s20, vcc_lo, exec_lo': '6a7e148b'})
+    blend = ['s_andn2_b32 s20, s20, exec_lo', *cmp_t, 's_or_b32 s20, s20, s22']
+    z20, zv = ['s_mov_b32 s20, 0'], ['s_mov_b32 vcc_lo, 0']
+    for zero, write, read in ((z20, blend, cnd_s), (z20, blend[:1], cnd_s),
+                              (zv, ['s_andn2_b32 vcc_lo, vcc_lo, exec_lo', 's_and_b32 s22, vcc_lo, exec_lo',
+                                    's_or_b32 vcc_lo, vcc_lo, s22'], cnd_vcc)):
+        phi_text(phi(zero, write, read))
     phi_text(phi(['s_mov_b32 vcc_lo, 0'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc))       # compare into a zeroed M
-    phi_text(phi(['s_mov_b32 s20, -1'], ['s_orn2_b32 s20, s7, exec_lo'], cnd_s))           # orn2 into an all-ones M
+    phi_text(phi(['s_mov_b32 s20, -1'], ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_orn2_b32 s20, vcc_lo, exec_lo'], cnd_s))  # orn2
     # controls: the same writes without their set-up, an unmasked term, M not the first source, mixed classes,
-    # and a whole-mask read after a preserving block
+    # M or an operand that is not a lane mask, and a whole-mask read after a preserving block
     refused(live('vcc'), lambda: phi_text(phi([], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
     refused(live('vcc'), lambda: phi_text(phi(['s_mov_b32 vcc_lo, -1'], ['v_cmp_gt_u32 vcc_lo, 3, v0'], cnd_vcc)))
-    for zero in ([], ['s_mov_b32 s20, 0']):
+    for zero in ([], z20):
         refused(live('s20'), lambda zero=zero: phi_text(phi(zero, ['s_orn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, -1'], ['s_orn2_b32 s20, s7, exec_lo'], cnd_s)))
     refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, -1'], ['s_mov_b32 s20, exec_lo'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 0'], ['s_mov_b32 s20, exec_lo', 's_orn2_b32 s20, s7, exec_lo'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi([], [blend[0], 's_or_b32 s20, s20, s7'], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi([], [blend[0], 's_and_b32 s22, s7, s7', blend[2]], cnd_s)))
-    refused(live('s20'), lambda: phi_text(phi([], ['s_andn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(z20, ['s_mov_b32 s20, exec_lo', 's_orn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], *cmp_t, 's_or_b32 s20, s20, s7'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, exec_lo', blend[3]], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, s7', blend[3]], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi(z20, ['s_andn2_b32 s20, s7, exec_lo'], cnd_s)))
+    refused(live('s20'), lambda: phi_text(phi([], blend, cnd_s)))                       # M unknown before the block
+    refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 16'], blend, cnd_s)))    # M holds data, not lane bits
     for read in (['s_cmp_eq_u32 s20, 0'] + cnd_s, ['s_mov_b32 s7, s20'] + cnd_s):
-        refused(live('s20'), lambda read=read: phi_text(phi([], blend, read)))
+        refused(live('s20'), lambda read=read: phi_text(phi(z20, blend, read)))
     # An implicit-LOD sample has no derivatives in a compute lane; the level-zero form translates.
     load = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40')
     sample = 'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D'
