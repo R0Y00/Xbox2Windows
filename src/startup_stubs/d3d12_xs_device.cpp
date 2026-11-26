@@ -4096,6 +4096,39 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     return S_OK;
 }
 
+// A null R8G8B8A8_UNORM SRV of a texture dimension (2 to 10; any other value gives texture 2D). A null resource
+// reads no more of the description than its format and dimension.
+D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc(unsigned dimension)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(x2w_view_dimension::refused_srv_null_dimension(dimension));
+    switch (desc.ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
+    default: desc.Texture2D.MipLevels = 1; break;
+    }
+    return desc;
+}
+
+// X2W_D3D12_VIEW_DEFAULTS (view_dimension.h): which slots give an unknown-dimension view the resource's default view.
+x2w_view_dimension::DefaultViews view_defaults_mode()
+{
+    static const x2w_view_dimension::DefaultViews mode = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_D3D12_VIEW_DEFAULTS", value, sizeof(value));
+        return x2w_view_dimension::default_views_mode(n && n < sizeof(value) ? value : nullptr);
+    }();
+    return mode;
+}
+
 // Device view slots: forwarded with the destination CPU handle (argument D, 0-based after the
 // object) translated from title to desktop.
 // Desktop removes the device (DXGI_ERROR_INVALID_CALL) on view calls it rejects, so they are checked
@@ -4141,9 +4174,16 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             const D3D12_RESOURCE_DESC resource_desc = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc();
             const auto dimension = static_cast<unsigned>(resource_desc.Dimension);
             if (view_dimension == 0) {
-                // UNKNOWN: desktop refuses it; make the resource's default view where that is allowed.
-                if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format)))
+                // UNKNOWN: desktop refuses it; make the resource's default view where that is allowed. By default only
+                // SRVs (slot 18) get one; UAV, RTV and DSV need X2W_D3D12_VIEW_DEFAULTS=all (view_dimension.h).
+                const auto mode = view_defaults_mode();
+                if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format), mode))
                     default_view = true;
+                else if (x2w_view_dimension::default_view_allowed(N, dimension, static_cast<unsigned>(resource_desc.Format),
+                                                                  x2w_view_dimension::DefaultViews::all))
+                    skip = mode == x2w_view_dimension::DefaultViews::off
+                        ? "unknown view dimension, and default views are off (X2W_D3D12_VIEW_DEFAULTS=off)"
+                        : "unknown view dimension; a default view of this type needs X2W_D3D12_VIEW_DEFAULTS=all";
                 else
                     skip = "unknown view dimension, and the resource has no default view";
                 static LONG unknown_dimension;
@@ -4160,8 +4200,21 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             }
         }
     }
+    // A refused SRV leaves a null SRV in its destination: the skipped call would otherwise leave the slot's previous
+    // descriptor there, still bindable and copied by CopyDescriptors, while record_view(false) has already dropped the
+    // reference that kept its resource alive. The null takes the requested dimension where it is a texture one.
+    const auto clear_refused_srv = [&] {
+        if constexpr (N == 18) {
+            UINT requested = D3D12_SRV_DIMENSION_TEXTURE2D;
+            if (args[1] && x2w_local::readable(reinterpret_cast<const void*>(args[1]), 8))
+                std::memcpy(&requested, reinterpret_cast<const unsigned char*>(args[1]) + 4, sizeof(requested));
+            const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = null_srv_desc(requested);
+            device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+        }
+    };
     if (skip) {
         record_view(false);
+        clear_refused_srv();
         static LONG skipped;
         if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
         return 0;
@@ -4184,6 +4237,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             const auto verdict = x2w_startup::packed_view(mapped, actual, x2w_startup::packed_stand_in_of(resource));
             if (verdict == x2w_startup::PackedView::refused) {
                 record_view(false);
+                clear_refused_srv();
                 static LONG refused;
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 Device::slot%d view skipped: packed format %d on a texture of format %d that does not stand in for it",
@@ -4906,28 +4960,9 @@ void retire_resource(Wrapper* w)
 // resolves to nothing). A null resource reads no more of the description than its format and dimension.
 D3D12_SHADER_RESOURCE_VIEW_DESC retire_null_srv_desc(const ViewRecord& record)
 {
-    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    if (record.desc_bytes >= 40) {
-        D3D12_SRV_DIMENSION dimension;
-        std::memcpy(&dimension, record.desc + 4, sizeof(dimension));
-        if (dimension >= D3D12_SRV_DIMENSION_TEXTURE1D && dimension <= D3D12_SRV_DIMENSION_TEXTURECUBEARRAY)
-            desc.ViewDimension = dimension;
-    }
-    switch (desc.ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE1D: desc.Texture1D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: desc.Texture1DArray.MipLevels = 1; desc.Texture1DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: desc.Texture2DArray.MipLevels = 1; desc.Texture2DArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: desc.Texture2DMSArray.ArraySize = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE3D: desc.Texture3D.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBE: desc.TextureCube.MipLevels = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: desc.TextureCubeArray.MipLevels = 1; desc.TextureCubeArray.NumCubes = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
-    default: desc.Texture2D.MipLevels = 1; break;
-    }
-    return desc;
+    unsigned dimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    if (record.desc_bytes >= 40) std::memcpy(&dimension, record.desc + 4, sizeof(dimension));
+    return null_srv_desc(dimension);
 }
 
 // True when the release-time fence of every queue has passed (retire_lock held).

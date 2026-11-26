@@ -1,7 +1,8 @@
 // Source-built control for view_dimension.h: whether a view's ViewDimension suits the dimension of
 // the resource it is made on (desktop D3D12 removes the device for a mismatch). Values are the
 // public d3d12.h enumerations. --control swaps the resource dimension of the mismatched cases for
-// the matching one, so the checks that expect a refusal must print FAIL.
+// the matching one and enables default views for every slot in the gated cases, so the checks
+// that expect a refusal must print FAIL.
 #include <cstdio>
 #include <cstring>
 
@@ -63,21 +64,54 @@ int main(int argc, char** argv)
     check("RTV texture 3D on a 2D texture is refused", refused(20, 8, texture2d));
     check("DSV texture 2D on a 1D texture is refused", refused(21, 3, texture1d));
 
-    // ViewDimension 0 (unknown): a default view only where desktop allows a null description.
-    check("default SRV of an RGBA8 2D texture", default_view_allowed(18, texture2d, 28));
-    check("default RTV of an RGBA8 2D texture", default_view_allowed(20, texture2d, 28));
-    check("default DSV of a D32 2D texture", default_view_allowed(21, texture2d, 40));
-    check("default SRV of a 3D texture", default_view_allowed(18, texture3d, 10));
-    const auto no_default = [](int slot, unsigned dimension, unsigned format) {
+    // ViewDimension 0 (unknown): a default view only where desktop allows a null description. Under
+    // X2W_D3D12_VIEW_DEFAULTS=all (experimental) every view type may get one.
+    const auto all = DefaultViews::all, srv = DefaultViews::srv, off = DefaultViews::off;
+    check("default SRV of an RGBA8 2D texture", default_view_allowed(18, texture2d, 28, all));
+    check("default RTV of an RGBA8 2D texture", default_view_allowed(20, texture2d, 28, all));
+    check("default DSV of a D32 2D texture", default_view_allowed(21, texture2d, 40, all));
+    check("default SRV of a 3D texture", default_view_allowed(18, texture3d, 10, all));
+    const auto no_default = [all](int slot, unsigned dimension, unsigned format) {
         if (control) dimension = texture2d, format = 28;  // a texture that has a default view
-        return !default_view_allowed(slot, dimension, format);
+        return !default_view_allowed(slot, dimension, format, all);
     };
     check("no default view of a buffer", no_default(18, buffer, 28));
     check("no default view of a typeless texture", no_default(18, texture2d, 27));
     check("no default view of a typeless BC7 texture", no_default(19, texture2d, 97));
     check("no default SRV of a depth texture", no_default(18, texture2d, 40));
     check("no default view of an unknown format", no_default(18, texture2d, 0));
-    check("no default view on the constant-buffer slot", !default_view_allowed(17, texture2d, 28));
+    check("no default view on the constant-buffer slot", !default_view_allowed(17, texture2d, 28, all));
+
+    // The default (srv): only the measured typed-SRV case; UAV, RTV and DSV need the experiment.
+    // The control enables all slots, so the three refusals print FAIL.
+    const auto gated = [all, srv](int slot, unsigned dimension, unsigned format) {
+        return !default_view_allowed(slot, dimension, format, control ? all : srv);
+    };
+    check("default SRV of an RGBA8 2D texture without the experiment", default_view_allowed(18, texture2d, 28, srv));
+    check("default SRV of a 3D texture without the experiment", default_view_allowed(18, texture3d, 10, srv));
+    check("no default SRV of a depth texture without the experiment", !default_view_allowed(18, texture2d, 40, srv));
+    check("no default UAV without the experiment", gated(19, texture2d, 28));
+    check("no default RTV without the experiment", gated(20, texture2d, 28));
+    check("no default DSV without the experiment", gated(21, texture2d, 40));
+    check("off: no default SRV", !default_view_allowed(18, texture2d, 28, off));
+    check("off: no default RTV", !default_view_allowed(20, texture2d, 28, off));
+
+    // X2W_D3D12_VIEW_DEFAULTS parsing: exact "all" or "off", anything else is the default.
+    check("unset is srv", default_views_mode(nullptr) == srv);
+    check("empty is srv", default_views_mode("") == srv);
+    check("all", default_views_mode("all") == all);
+    check("off", default_views_mode("off") == off);
+    check("ALL is srv", default_views_mode("ALL") == srv);
+    check("allx is srv", default_views_mode("allx") == srv);
+    check("1 is srv", default_views_mode("1") == srv);
+
+    // A refused SRV's null descriptor keeps a texture dimension and turns the rest into texture 2D.
+    check("null for a refused 3D view is 3D", refused_srv_null_dimension(8) == 8);
+    check("null for a refused cube array is a cube array", refused_srv_null_dimension(10) == 10);
+    check("null for a refused 1D view is 1D", refused_srv_null_dimension(2) == 2);
+    check("null for a refused unknown view is 2D", refused_srv_null_dimension(0) == 4);
+    check("null for a refused buffer view is 2D", refused_srv_null_dimension(1) == 4);
+    check("null for a refused raytracing view is 2D", refused_srv_null_dimension(11) == 4);
 
     if (failures) {
         std::printf("startup_view_dimension: FAIL (%d)\n", failures);

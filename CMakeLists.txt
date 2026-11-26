@@ -622,6 +622,22 @@ target_compile_features(startup_view_dimension PRIVATE cxx_std_17)
 add_test(NAME startup_view_dimension COMMAND startup_view_dimension)
 add_test(NAME startup_view_dimension_control COMMAND startup_view_dimension --control)
 set_tests_properties(startup_view_dimension_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+# The same through d3d12_xs.dll: an unknown-dimension SRV samples its texture's colour, an incompatible explicit SRV is
+# refused without device removal, and a refused replacement leaves a null descriptor, not the slot's old view. The
+# off control (X2W_D3D12_VIEW_DEFAULTS=off) must fail on the missing default view alone, with the device not removed.
+add_executable(startup_view_dimension_device tests/startup_view_dimension_device.cpp)
+target_compile_features(startup_view_dimension_device PRIVATE cxx_std_17)
+target_link_libraries(startup_view_dimension_device PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_view_dimension_${backend} COMMAND startup_view_dimension_device ${backend})
+    set_tests_properties(startup_view_dimension_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0")
+endforeach()
+add_test(NAME startup_view_dimension_off_control_warp COMMAND startup_view_dimension_device warp off)
+set_tests_properties(startup_view_dimension_off_control_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_D3D12_VIEW_DEFAULTS=off"
+    PASS_REGULAR_EXPRESSION "FAIL: \\(a\\) default view reads 0\\.000 0\\.000 0\\.000 0\\.000, expected 0\\.200 0\\.600 0\\.800 1\\.000; device not removed.*cases complete"
+    FAIL_REGULAR_EXPRESSION "FAIL: setup|FAIL: \\(b\\)|FAIL: \\(c\\)|DEVICE REMOVED|removed the device")
 # The slot and label of the x2w-render totals line each null-binding cause is counted under
 # (src/startup_stubs/null_binding_cause.h). The mutated run is the negative control.
 add_executable(startup_null_cause_labels_check tests/startup_null_cause_labels_check.cpp)

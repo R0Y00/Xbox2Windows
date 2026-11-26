@@ -293,10 +293,22 @@ ViewDimension in the View Desc is incompatible with the type of the Resource"). 
 package module made such SRVs on 2D RGBA8 textures. Views of device slots 18 to 21 (shader resource,
 unordered access, render target, depth stencil) are now checked before they are forwarded:
 
-- dimension 0 gets the resource's default view (a null description) where desktop allows one: not
-  for buffers, typeless or unknown formats, or depth formats in an SRV. Otherwise the view is
-  skipped;
+- an SRV (slot 18) with dimension 0 gets the resource's default view (a null description) where
+  desktop allows one: a texture with a typed format that is not a depth format. The default view
+  replaces the whole description, including its format and component mapping. Only this SRV case is
+  measured. With dimension 0 every other view is skipped;
 - a dimension whose resource dimension differs from the resource's is skipped.
+
+The default view for UAV, RTV and DSV descriptions with dimension 0 is an explicit experiment,
+`X2W_D3D12_VIEW_DEFAULTS=all`: it is unmeasured, and it drops the requested format the same way.
+`X2W_D3D12_VIEW_DEFAULTS=off` skips the SRV case too. Any other value, or none, keeps the SRV
+default.
+
+A refused SRV, for any reason, writes a null SRV (R8G8B8A8_UNORM, the requested dimension where it
+is a texture dimension, else 2D) into its destination descriptor. Otherwise the slot would keep the
+view it held before. That view would still be bindable and would be copied by `CopyDescriptors`,
+although the slot's record no longer keeps its resource alive. Translated draws already resolve the
+slot to nothing.
 
 The first of each are logged (`x2w-d3d12 Device::slot<n> view dimension ...`), and when a view still
 removes the device, its forwarded description and the resource's shape are logged
@@ -304,6 +316,18 @@ removes the device, its forwarded description and the resource's shape are logge
 `ctest --preset dev --no-tests=error -R '^startup_view_dimension(_control)?$'`
 (`src/startup_stubs/view_dimension.h`); the control swaps the resource dimension of the mismatched
 cases for the matching one and must print `FAIL:`.
+
+`startup_view_dimension_warp` goes through `d3d12_xs.dll` on WARP. A compute shader samples each
+descriptor of a shader-visible heap through the wrapper's desktop heap. The fixture checks three
+cases. An unknown-dimension SRV of a texture filled with one distinct colour must read back that
+colour. An explicit TEXTURE3D SRV of a 2D texture must be refused with the device not removed.
+A descriptor slot that held a valid view of a second colour, then receives a refused TEXTURE2D
+SRV of a buffer, must read zero, and so must a `CopyDescriptorsSimple` copy of it. The slot gate
+for UAV, RTV and DSV is checked without a device by `startup_view_dimension`.
+`startup_view_dimension_off_control_warp` runs the same fixture with
+`X2W_D3D12_VIEW_DEFAULTS=off`. It must print `FAIL: (a) default view` with `device not removed`,
+so it fails on the missing default view and not on setup or a removed device. Both return 77
+without WARP.
 
 ## 16-bit packed targets
 
@@ -1369,6 +1393,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
+| `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |

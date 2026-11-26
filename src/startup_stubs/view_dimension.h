@@ -68,13 +68,38 @@ inline bool typeless(unsigned format) noexcept
 
 inline bool depth_format(unsigned format) noexcept { return format == 20 || format == 40 || format == 45 || format == 55; }
 
-inline bool default_view_allowed(int slot, unsigned resource_dimension, unsigned resource_format) noexcept
+// Which slots may get the default view. It is measured only for shader resource views (slot 18) of
+// typed textures, so that is the default. The default view also drops the requested format and
+// component mapping, so for the other view types it stays an explicit experiment
+// (X2W_D3D12_VIEW_DEFAULTS=all). off: every unknown-dimension view is skipped.
+enum class DefaultViews : unsigned { off, srv, all };
+
+// X2W_D3D12_VIEW_DEFAULTS: "all" or "off"; anything else, or unset, is srv.
+inline DefaultViews default_views_mode(const char* value) noexcept
+{
+    if (!value) return DefaultViews::srv;
+    if (value[0] == 'a' && value[1] == 'l' && value[2] == 'l' && value[3] == 0) return DefaultViews::all;
+    if (value[0] == 'o' && value[1] == 'f' && value[2] == 'f' && value[3] == 0) return DefaultViews::off;
+    return DefaultViews::srv;
+}
+
+inline bool default_view_allowed(int slot, unsigned resource_dimension, unsigned resource_format, DefaultViews mode) noexcept
 {
     if (slot < 18 || slot > 21) return false;
+    if (mode == DefaultViews::off || (mode == DefaultViews::srv && slot != 18)) return false;
     if (resource_dimension == unknown || resource_dimension == buffer) return false;
     if (resource_format == 0 || typeless(resource_format)) return false;
     if (slot == 18 && depth_format(resource_format)) return false;
     return true;
+}
+
+// The dimension of the null SRV that replaces a refused one in its destination slot, so that the slot
+// cannot keep the view it held before (a skipped call would otherwise leave that descriptor in place,
+// bindable and copyable, after the slot's record has dropped its resource). The requested dimension
+// when it is a texture dimension (2 to 10), else texture 2D (4).
+inline unsigned refused_srv_null_dimension(unsigned requested) noexcept
+{
+    return requested >= 2 && requested <= 10 ? requested : 4;
 }
 
 }  // namespace x2w_view_dimension
