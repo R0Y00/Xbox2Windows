@@ -285,6 +285,26 @@ dimensions, formats, resources and counters that are left alone. A rewrite must 
 field of the description. `startup_null_texture_view_unchecked_fallback_control` rewrites without
 asking about R8G8B8A8 and must fail.
 
+## Unknown and mismatched view dimensions
+
+A view description with `ViewDimension` 0 (UNKNOWN) makes desktop D3D12 remove the device instead of
+failing the call, and so does a dimension that does not suit the resource (debug layer: "The
+ViewDimension in the View Desc is incompatible with the type of the Resource"). Measured: a console
+package module made such SRVs on 2D RGBA8 textures. Views of device slots 18 to 21 (shader resource,
+unordered access, render target, depth stencil) are now checked before they are forwarded:
+
+- dimension 0 gets the resource's default view (a null description) where desktop allows one: not
+  for buffers, typeless or unknown formats, or depth formats in an SRV. Otherwise the view is
+  skipped;
+- a dimension whose resource dimension differs from the resource's is skipped.
+
+The first of each are logged (`x2w-d3d12 Device::slot<n> view dimension ...`), and when a view still
+removes the device, its forwarded description and the resource's shape are logged
+(`removing view desc`). Run
+`ctest --preset dev --no-tests=error -R '^startup_view_dimension(_control)?$'`
+(`src/startup_stubs/view_dimension.h`); the control swaps the resource dimension of the mismatched
+cases for the matching one and must print `FAIL:`.
+
 ## 16-bit packed targets
 
 A description that asks for a B5G5R5A1_UNORM, B4G4R4A4_UNORM or B5G6R5_UNORM render target is created as
